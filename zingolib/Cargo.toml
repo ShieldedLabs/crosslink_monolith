@@ -1,0 +1,107 @@
+[package]
+name = "zingolib"
+description = "Zingo backend library."
+version = "0.0.1"
+authors = ["<zingo@zingolabs.org>"]
+edition = "2024"
+repository = "https://github.com/zingolabs/zingolib"
+homepage = "https://github.com/zingolabs/zingolib"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = []
+ci = []
+darkside_tests = ["pepper-sync/darkside_test"]
+testutils = ["portpicker", "zingo_test_vectors", "tempfile", "zingo_common_components/for_test"]
+zaino-test = ['testutils']
+
+[dependencies]
+
+# zingolib
+zingo-memo = { workspace = true }
+zingo-status = { workspace = true }
+pepper-sync = { workspace = true }
+zingo-price = { workspace = true }
+
+# zingo
+zingo_common_components = { workspace = true }
+zingo_netutils = { workspace = true }
+
+# testutils feature
+zingo_test_vectors = { git = "https://github.com/zingolabs/infrastructure.git", branch = "dev", optional = true}
+
+# blockchain
+zebra-chain = { workspace = true }
+orchard = { workspace = true }
+shardtree = { workspace = true, features = ["legacy-api"] }
+incrementalmerkletree = { workspace = true }
+zcash_address = { workspace = true }
+zcash_client_backend = { workspace = true, features = [
+    "unstable",
+    "transparent-inputs",
+    "unstable-serialization",
+    "unstable-spanning-tree",
+] }
+zcash_encoding = { workspace = true }
+zcash_keys = { workspace = true }
+zcash_primitives = { workspace = true }
+zcash_proofs = { workspace = true, features = ["download-params"] }
+zcash_protocol = { workspace = true }
+zcash_transparent = { workspace = true }
+zip32.workspace = true
+bip0039.workspace = true
+bip32 = { workspace = true, features = ["secp256k1-ffi"] }
+bs58 = { workspace = true, features = ["check"] }
+sapling-crypto.workspace = true
+
+# network
+hyper-rustls = { workspace = true }
+hyper-util = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+tower = { workspace = true }
+
+# other
+
+append-only-vec = { workspace = true }
+byteorder = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+dirs.workspace = true
+futures = { workspace = true }
+hex = { workspace = true }
+http.workspace = true
+json = { workspace = true }
+jubjub = { workspace = true }
+log = { workspace = true }
+log4rs.workspace = true
+nonempty.workspace = true
+portpicker = { workspace = true, optional = true }
+prost = { workspace = true }
+rand = { workspace = true }
+ring = { workspace = true }
+rustls.workspace = true
+secp256k1 = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tonic = { workspace = true }
+tracing-subscriber = { workspace = true }
+bech32 = { workspace = true }
+rust-embed = { workspace = true, features = ["debug-embed"] }
+tracing.workspace = true
+
+[dev-dependencies]
+zingolib = { workspace = true, features = ["testutils"] }
+zcash_local_net = { git = "https://github.com/zingolabs/infrastructure.git", branch = "dev" }
+portpicker = { workspace = true }
+concat-idents = { workspace = true }
+tempfile = { workspace = true }
+
+[build-dependencies]
+zcash_proofs = { workspace = true, features = ["download-params"] }
