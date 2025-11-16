@@ -1,0 +1,32 @@
+[package]
+name = "zingo_netutils"
+version = "0.1.0"
+authors = ["zingo@zingolabs.org"]
+edition = "2024"
+
+[dependencies]
+http-body.workspace = true
+http.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+hyper.workspace = true
+tokio-rustls.workspace = true
+tonic.workspace = true
+tower.workspace = true
+webpki-roots = "0.25"
+
+
+thiserror.workspace = true
+
+zcash_client_backend = { version = "0.20", features = [
+    "lightwalletd-tonic",
+    "orchard",
+    "transparent-inputs",
+    "tor",
+] }
+
+[features]
+test-features = []
+
+[dev-dependencies]
+rustls-pemfile.workspace = true

@@ -1,0 +1,25 @@
+[workspace]
+members = ["zingo_common_components", "zingo_netutils" ]
+resolver = "2"
+
+[workspace.dependencies]
+
+# content
+zebra-chain = "3.0"
+
+# network
+http = "1.1.0"
+http-body = "1"
+hyper-util = "0.1"
+hyper = { version = "1", features = ["full"] }
+hyper-rustls = { version = "0.27", features = ["http2"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+tonic = { version = "0.13", features = [
+    "tls-webpki-roots",
+] }
+tower = { version = "0.5" }
+webpki-roots = "0.25"
+
+# exceptions
+thiserror = "1.0.64"

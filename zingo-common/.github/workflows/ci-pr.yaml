@@ -1,0 +1,54 @@
+name: CI - PR
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    tags:
+      - '**'
+  pull_request:
+
+jobs:
+  reject-trailing-whitespace:
+    uses: zingolabs/infrastructure/.github/workflows/trailing-whitespace.yaml@20485fed7a080e381130ed8120419dc81acae641
+
+  cargo-shear:
+    name: Cargo Shear
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ inputs.toolchain }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run cargo-shear
+        uses: zingolabs/infrastructure/.github/actions/cargo-shear@20485fed7a080e381130ed8120419dc81acae641
+
+  cargo-checkmate:
+    uses: zingolabs/infrastructure/.github/workflows/cargo-checkmate.yaml@20485fed7a080e381130ed8120419dc81acae641
+
+  cargo-hack-check:
+    name: Cargo Hack Check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ inputs.toolchain }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run cargo-hack
+        uses: zingolabs/infrastructure/.github/actions/cargo-hack@20485fed7a080e381130ed8120419dc81acae641
+        with:
+          hack-subcommand: check
