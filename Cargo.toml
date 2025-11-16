@@ -1,0 +1,31 @@
+[package]
+name = "visualizer_zcash"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = "0.30.12"
+softbuffer = "0.4.6"
+num_cpus = "1.17.0"
+twox-hash = "2.1.2"
+rand = "0.9.2"
+rustybuzz = "0.20.1"
+swash = "0.2.6"
+rodio = "0.21.1"
+arboard = "3.6.1"
+
+[profile.release]
+debug = 2   # full debug info (0 = none, 1 = line tables only, 2 = full)
+incremental = false      # incremental confuses symbol mapping
+codegen-units = 1        # easier to debug single unit
+split-debuginfo = "unpacked"  # produce separate .pdb files
+
+[profile.dev]
+opt-level = 0            # no optimizations
+debug = 2   # full debug info (0 = none, 1 = line tables only, 2 = full)
+debug-assertions = true
+overflow-checks = true
+incremental = false      # incremental confuses symbol mapping
+codegen-units = 1        # easier to debug single unit
+split-debuginfo = "unpacked"  # produce separate .pdb files
+lto = false
