@@ -1970,6 +1970,14 @@ dependencies = [
 [[package]]
 name = "equihash"
 version = "0.2.2"
+dependencies = [
+ "blake2b_simd",
+ "core2 0.3.3",
+]
+
+[[package]]
+name = "equihash"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca4f333d4ccc9d23c06593733673026efa71a332e028b00f12cf427b9677dce9"
 dependencies = [
@@ -1977,15 +1985,6 @@ dependencies = [
  "cc",
  "core2 0.3.3",
  "document-features",
-]
-
-[[package]]
-name = "equihash"
-version = "0.2.2"
-source = "git+https://github.com/ShieldedLabs/librustzcash.git?branch=crosslink_tx#0b7bda90c1acd77d6e32eb875b26b1a477ce6eb6"
-dependencies = [
- "blake2b_simd",
- "core2 0.3.3",
 ]
 
 [[package]]
@@ -2039,7 +2038,6 @@ dependencies = [
 [[package]]
 name = "f4jumble"
 version = "0.1.1"
-source = "git+https://github.com/ShieldedLabs/librustzcash.git?branch=crosslink_tx#0b7bda90c1acd77d6e32eb875b26b1a477ce6eb6"
 dependencies = [
  "blake2b_simd",
 ]
@@ -8619,7 +8617,6 @@ dependencies = [
 [[package]]
 name = "zcash_address"
 version = "0.9.0"
-source = "git+https://github.com/ShieldedLabs/librustzcash.git?branch=crosslink_tx#0b7bda90c1acd77d6e32eb875b26b1a477ce6eb6"
 dependencies = [
  "bech32",
  "bs58",
@@ -8632,7 +8629,6 @@ dependencies = [
 [[package]]
 name = "zcash_encoding"
 version = "0.3.0"
-source = "git+https://github.com/ShieldedLabs/librustzcash.git?branch=crosslink_tx#0b7bda90c1acd77d6e32eb875b26b1a477ce6eb6"
 dependencies = [
  "core2 0.3.3",
  "nonempty",
@@ -8641,7 +8637,6 @@ dependencies = [
 [[package]]
 name = "zcash_history"
 version = "0.4.0"
-source = "git+https://github.com/ShieldedLabs/librustzcash.git?branch=crosslink_tx#0b7bda90c1acd77d6e32eb875b26b1a477ce6eb6"
 dependencies = [
  "blake2b_simd",
  "byteorder",
@@ -8651,7 +8646,6 @@ dependencies = [
 [[package]]
 name = "zcash_keys"
 version = "0.10.0"
-source = "git+https://github.com/ShieldedLabs/librustzcash.git?branch=crosslink_tx#0b7bda90c1acd77d6e32eb875b26b1a477ce6eb6"
 dependencies = [
  "bech32",
  "blake2b_simd",
@@ -8689,7 +8683,6 @@ dependencies = [
 [[package]]
 name = "zcash_primitives"
 version = "0.24.0"
-source = "git+https://github.com/ShieldedLabs/librustzcash.git?branch=crosslink_tx#0b7bda90c1acd77d6e32eb875b26b1a477ce6eb6"
 dependencies = [
  "bip32",
  "blake2b_simd",
@@ -8699,7 +8692,7 @@ dependencies = [
  "crypto-common 0.2.0-rc.1",
  "document-features",
  "ed25519-zebra",
- "equihash 0.2.2 (git+https://github.com/ShieldedLabs/librustzcash.git?branch=crosslink_tx)",
+ "equihash 0.2.2",
  "ff",
  "fpe",
  "getset",
@@ -8716,6 +8709,7 @@ dependencies = [
  "ripemd 0.1.3",
  "sapling-crypto",
  "secp256k1",
+ "serde",
  "sha2 0.10.9",
  "subtle",
  "tracing",
@@ -8731,7 +8725,6 @@ dependencies = [
 [[package]]
 name = "zcash_proofs"
 version = "0.24.0"
-source = "git+https://github.com/ShieldedLabs/librustzcash.git?branch=crosslink_tx#0b7bda90c1acd77d6e32eb875b26b1a477ce6eb6"
 dependencies = [
  "bellman",
  "blake2b_simd",
@@ -8754,7 +8747,6 @@ dependencies = [
 [[package]]
 name = "zcash_protocol"
 version = "0.6.1"
-source = "git+https://github.com/ShieldedLabs/librustzcash.git?branch=crosslink_tx#0b7bda90c1acd77d6e32eb875b26b1a477ce6eb6"
 dependencies = [
  "core2 0.3.3",
  "document-features",
@@ -8792,7 +8784,6 @@ dependencies = [
 [[package]]
 name = "zcash_transparent"
 version = "0.4.0"
-source = "git+https://github.com/ShieldedLabs/librustzcash.git?branch=crosslink_tx#0b7bda90c1acd77d6e32eb875b26b1a477ce6eb6"
 dependencies = [
  "bip32",
  "blake2b_simd",
