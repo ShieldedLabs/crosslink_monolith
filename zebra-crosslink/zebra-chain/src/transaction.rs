@@ -1672,6 +1672,9 @@ impl Transaction {
                 *network_upgrade = nu;
                 Ok(())
             }
+
+            // @TODO
+            Transaction::VCrosslink { .. } => todo!(),
         }
     }
 
@@ -1702,6 +1705,9 @@ impl Transaction {
                 ref mut expiry_height,
                 ..
             } => expiry_height,
+
+            // @TODO: CROSSLINK TRANSACTION
+            Transaction::VCrosslink { .. } => todo!(),
         }
     }
 
@@ -1715,6 +1721,9 @@ impl Transaction {
             Transaction::V5 { ref mut inputs, .. } => inputs,
             #[cfg(feature = "tx_v6")]
             Transaction::V6 { ref mut inputs, .. } => inputs,
+
+            // @TODO: CROSSLINK TRANSACTION
+            Transaction::VCrosslink { .. } => todo!(),
         }
     }
 
@@ -1762,6 +1771,9 @@ impl Transaction {
                 sapling_shielded_data: None,
                 ..
             } => None,
+
+            // @TODO: CROSSLINK TRANSACTION
+            Transaction::VCrosslink { .. } => todo!(),
         }
     }
 
@@ -1812,6 +1824,9 @@ impl Transaction {
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
             #[cfg(feature = "tx_v6")]
             Transaction::V6 { .. } => Box::new(std::iter::empty()),
+
+            // @TODO: CROSSLINK TRANSACTION
+            Transaction::VCrosslink { .. } => todo!(),
         }
     }
 
@@ -1862,6 +1877,9 @@ impl Transaction {
             | Transaction::V5 { .. } => Box::new(std::iter::empty()),
             #[cfg(feature = "tx_v6")]
             Transaction::V6 { .. } => Box::new(std::iter::empty()),
+
+            // @TODO: CROSSLINK TRANSACTION
+            Transaction::VCrosslink { .. } => todo!(),
         }
     }
 
@@ -1899,6 +1917,9 @@ impl Transaction {
                 orchard_shielded_data: None,
                 ..
             } => None,
+
+            // @TODO: CROSSLINK TRANSACTION
+            Transaction::VCrosslink { .. } => todo!(),
         }
     }
 
@@ -1924,6 +1945,9 @@ impl Transaction {
             Transaction::V6 {
                 ref mut outputs, ..
             } => outputs,
+
+            // @TODO: CROSSLINK TRANSACTION
+            Transaction::VCrosslink { .. } => todo!(),
         }
     }
 }

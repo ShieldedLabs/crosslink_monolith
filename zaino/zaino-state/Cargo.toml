@@ -62,7 +62,7 @@ derive_more = { workspace = true, features = ["from"] }
 
 
 [dev-dependencies]
-zcash_local_net = { git = "https://github.com/zingolabs/infrastructure.git", tag = "zcash_local_net_v0.1.0" }
+zcash_local_net = { path = "../../zingo-infrastructure/zcash_local_net" }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 once_cell = { workspace = true }

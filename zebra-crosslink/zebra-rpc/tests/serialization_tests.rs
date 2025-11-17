@@ -1055,8 +1055,7 @@ fn test_get_block_template_response() -> Result<(), Box<dyn std::error::Error>> 
         height,
         max_time,
         submit_old,
-        zebra_chain::block::FatPointerToBftBlock::null(),
-        zebra_chain::block::CommandBuf::empty(),
+        zebra_chain::block::FatPointerToBftBlock::null()
     )));
 
     assert_eq!(obj, new_obj);

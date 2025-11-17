@@ -10,13 +10,11 @@ github = { repository = "zingolabs/infrastructure/services" }
 [dependencies]
 
 # zingo
-zingo_common_components = { git = "https://github.com/zingolabs/zingo-common.git", branch = "dev", features = [ "for_test" ]}
+zingo_common_components = { path = "../../zingo-common/zingo_common_components", features = [ "for_test" ]}
 zingo_test_vectors = { workspace = true }
 
 # zcash
-zcash_protocol = { version = "0.7", features = [
-    "local-consensus",
-] }
+zcash_protocol = { path = "../../librustzcash/components/zcash_protocol", features = ["local-consensus"] } # version = "0.7"
 
 # zebra
 zebra-node-services = { workspace = true }

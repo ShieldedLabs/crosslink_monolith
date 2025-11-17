@@ -26,17 +26,17 @@ version = "0.1.2"
 
 [workspace.dependencies]
 # Librustzcash
-zcash_address = { version = "0.9", path = "../librustzcash/components/zcash_address" }
-zcash_keys = { version = "0.10", path = "../librustzcash/zcash_keys" }
-zcash_primitives = { version = "0.24", path = "../librustzcash/zcash_primitives" }
+zcash_address = { path = "../librustzcash/components/zcash_address" } # version = "0.9"
+zcash_keys = { path = "../librustzcash/zcash_keys" } # version = "0.10"
+zcash_primitives = { path = "../librustzcash/zcash_primitives" } # version = "0.24"
 zcash_proofs = { path = "../librustzcash/zcash_proofs" }
-zcash_protocol = { version = "0.6", path = "../librustzcash/components/zcash_protocol" }
-zcash_transparent = { version = "0.4", path = "../librustzcash/zcash_transparent" }
+zcash_protocol = { path = "../librustzcash/components/zcash_protocol" } # version = "0.6"
+zcash_transparent = { path = "../librustzcash/zcash_transparent" } # version = "0.4"
 
 # Zebra
-zebra-chain = { version = "2.0", path = "../zebra-crosslink/zebra-chain" }
-zebra-state = { version = "2.0", path = "../zebra-crosslink/zebra-state" }
-zebra-rpc = { version = "2.0", path = "../zebra-crosslink/zebra-rpc" }
+zebra-chain = { path = "../zebra-crosslink/zebra-chain" } # version = "2.0"
+zebra-state = { path = "../zebra-crosslink/zebra-state" } # version = "2.0"
+zebra-rpc = { path = "../zebra-crosslink/zebra-rpc" } # version = "2.0"
 
 # Runtime
 tokio = { version = "1.38", features = ["full"] }
@@ -120,9 +120,7 @@ figment = "0.10"
 nonempty = "0.11.0"
 proptest = "~1.2"
 zip32 = "0.2.1"
-zingolib = { git = "https://github.com/zingolabs/zingolib.git", rev = "f88e1d76ea244d6cc48d7fd4c3a609c6598318dc", features = [
-    "testutils",
-] }
+zingolib = { path = "../zingo-lib/zingolib", features = ["testutils"] }
 
 # Patch for vulnerable dependency
 slab = "0.4.11"

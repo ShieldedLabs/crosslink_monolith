@@ -1007,6 +1007,9 @@ fn binding_signatures() {
                             at_least_one_v5_checked = true;
                         }
                     }
+
+                    // @TODO
+                    Transaction::VCrosslink { .. } => todo!(),
                 }
             }
         }

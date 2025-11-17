@@ -936,6 +936,9 @@ pub fn transaction_to_fake_v5(
         v5 @ V5 { .. } => v5.clone(),
         #[cfg(feature = "tx_v6")]
         v6 @ V6 { .. } => v6.clone(),
+
+        // @TODO
+        VCrosslink { .. } => todo!(),
     }
 }
 
@@ -1022,6 +1025,9 @@ pub fn v5_transactions<'b>(
         ref tx @ Transaction::V5 { .. } => Some(tx.clone()),
         #[cfg(feature = "tx_v6")]
         ref tx @ Transaction::V6 { .. } => Some(tx.clone()),
+
+        // @TODO
+        Transaction::VCrosslink { .. } => todo!(),
     })
 }
 
