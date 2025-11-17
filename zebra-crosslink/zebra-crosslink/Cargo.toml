@@ -7,6 +7,7 @@ edition = "2021"
 zebra-chain = { path = "../zebra-chain", version = "2.0.0" }
 zebra-state = { path = "../zebra-state", version = "2.0.0" }
 zebra-node-services = { path = "../zebra-node-services", version = "1.0.1" }
+wallet = { path = "./wallet" }
 
 serde = { workspace = true, features = ["serde_derive"] }
 toml = { workspace = true }

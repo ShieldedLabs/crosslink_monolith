@@ -37,6 +37,8 @@ use bytes::{Bytes, BytesMut};
 use ed25519_zebra::SigningKey as MalPrivateKey;
 use ed25519_zebra::VerificationKeyBytes as MalPublicKey;
 
+pub use wallet;
+
 pub mod chain;
 use chain::*;
 

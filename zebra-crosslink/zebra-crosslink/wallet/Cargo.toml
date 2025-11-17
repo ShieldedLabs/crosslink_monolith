@@ -1,0 +1,22 @@
+[package]
+name = "wallet"
+version = "1.0.0-beta.1"
+edition = "2021"
+
+[dependencies]
+zcash_primitives = { workspace = true } # version = "0.26.1"
+zcash_client_backend = { path = "../../../librustzcash/zcash_client_backend", features = ["lightwalletd-tonic"] } # version = "0.21.0"
+zcash_client_sqlite = { path = "../../../librustzcash/zcash_client_sqlite", features = ["orchard"] } # version = "0.19.0"
+zcash_protocol = { workspace = true } # version = "0.7.1"
+zcash_transparent = { workspace = true } # version = "0.6.1"
+zcash_note_encryption = { workspace = true } # version = "0.4.1"
+
+tonic = { version = "0.13", features = ["transport", "channel", "tls-ring", "tls-webpki-roots", "prost"] }
+rustls = { version = "0.23.31", default-features = false, features = ["ring"] }
+tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "tracing", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false }
+tokio-stream = { workspace = true, features = ["time"] }
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "rustls-tls"] }
+
+sapling-crypto = "0.5.0"
+orchard = "0.11.0"

@@ -1,0 +1,20 @@
+// Project-local debug tasks
+//
+// For more documentation on how to configure debug tasks,
+// see: https://zed.dev/docs/debugger
+[
+  {
+    "label": "Zebra Visualizer (REGTEST)",
+    "build": {
+      "command": "cargo",
+      "args": ["build", "-Fviz_gui"],
+      "cwd": "$ZED_WORKTREE_ROOT/zebra-crosslink/"
+    },
+    "program": "$ZED_WORKTREE_ROOT/zebra-crosslink/target/debug/zebrad",
+    "args": ["-c", "$ZED_WORKTREE_ROOT/zebra-crosslink/regtest.local.toml"],
+    // sourceLanguages is required for CodeLLDB (not GDB) when using Rust
+    "sourceLanguages": ["rust"],
+    "request": "launch",
+    "adapter": "CodeLLDB"
+  }
+]
