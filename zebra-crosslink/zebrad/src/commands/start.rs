@@ -406,7 +406,7 @@ backend = \"fetch\"
 # Optional: Some enables Zaino's JsonRPC server.
 [json_server_settings]
   # JsonRPC server listen addr. Required if json_server_settings is Some.
-  json_rpc_listen_address = \"127.0.0.1:8232\"
+  json_rpc_listen_address = \"127.0.0.1:18232\"
 
   # Some enables cookie-based authentication for JsonRPC server.
   # An empty PathBuf that is still Some will have a default emphemeral path assigned to it when zaino loads the config.
@@ -420,7 +420,7 @@ backend = \"fetch\"
 [grpc_settings]
 # Zainod's gRPC server listen address.
   # SocketAddress, Required.
-  grpc_listen_address = \"127.0.0.1:8232\"
+  grpc_listen_address = \"127.0.0.1:18232\"
 
   # Some Enables TLS for the gRPC server.
   # tls: Option<GrpcTls>,
