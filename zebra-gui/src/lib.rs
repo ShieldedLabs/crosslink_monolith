@@ -284,6 +284,7 @@ impl DrawCtx {
             let text_x = text_x.floor() as isize;
             let text_y = text_y.floor() as isize;
             let text_height = text_height.floor() as usize;
+            if text_y + text_height as isize <= 0 || text_y >= self.window_height { return; }
 
             let (tracker, tracker_id) = self._find_or_create_font_tracker(text_height, false);
             tracker.how_many_times_was_i_used += 1;
@@ -320,6 +321,7 @@ impl DrawCtx {
             }
 
             *self.glyph_bitmap_run_allocator_position += glyph_bitmap_run_count;
+            assert!(*self.glyph_bitmap_run_allocator_position < GLYPH_RUN_MAX);
 
             let actual_height = if tracker.fudge_to_px_height == usize::MAX { tracker.target_px_height } else { tracker.fudge_to_px_height };
             for y in 0..actual_height {
@@ -383,6 +385,7 @@ impl DrawCtx {
             let text_x = text_x.floor() as isize;
             let text_y = text_y.floor() as isize;
             let text_height = text_height.floor() as usize;
+            if text_y + text_height as isize <= 0 || text_y >= self.window_height { return; }
 
             let (tracker, tracker_id) = self._find_or_create_font_tracker(text_height, true);
             tracker.how_many_times_was_i_used += 1;
@@ -419,6 +422,7 @@ impl DrawCtx {
             }
 
             *self.glyph_bitmap_run_allocator_position += glyph_bitmap_run_count;
+            assert!(*self.glyph_bitmap_run_allocator_position < GLYPH_RUN_MAX);
 
             let actual_height = if tracker.fudge_to_px_height == usize::MAX { tracker.target_px_height } else { tracker.fudge_to_px_height };
             for y in 0..actual_height {
@@ -769,6 +773,9 @@ pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
 pub static SOUND_UI_WOOSH: &[u8] = include_bytes!("../assets/ui_woosh.ogg");
 pub static SOUND_UI_HOVER: &[u8] = include_bytes!("../assets/ui_hover.ogg");
 
+const DRAW_CALL_MAX: usize = 16384;
+const GLYPH_RUN_MAX: usize = 16384;
+
 pub fn main_thread_run_program() {
 
     let mut viz_state = viz_gui_init();
@@ -855,9 +862,9 @@ pub fn main_thread_run_program() {
     let mut draw_ctx = unsafe { DrawCtx {
         window_width: 0,
         window_height: 0,
-        draw_command_buffer: alloc(Layout::array::<DrawCommand>(8192).unwrap()) as *mut DrawCommand,
+        draw_command_buffer: alloc(Layout::array::<DrawCommand>(DRAW_CALL_MAX).unwrap()) as *mut DrawCommand,
         draw_command_count: (&mut _draw_command_count) as *mut usize,
-        glyph_bitmap_run_allocator: alloc(Layout::array::<(u16, i16)>(8192).unwrap()) as *mut (u16, i16),
+        glyph_bitmap_run_allocator: alloc(Layout::array::<(u16, i16)>(GLYPH_RUN_MAX).unwrap()) as *mut (u16, i16),
         glyph_bitmap_run_allocator_position: (&mut _glyph_bitmap_run_allocator_position) as *mut usize,
         font_tracker_buffer: alloc(Layout::array::<FontTracker>(8192).unwrap()) as *mut FontTracker,
         font_tracker_count: (&mut _font_tracker_count) as *mut usize,
@@ -1167,6 +1174,8 @@ pub fn main_thread_run_program() {
                                             input_ctx.scroll_delta = (0.0, 0.0);
                                             input_ctx.zoom_delta = 0.0;
 
+                                            assert!(*draw_ctx.glyph_bitmap_run_allocator_position < GLYPH_RUN_MAX);
+                                            assert!(*draw_ctx.draw_command_count < DRAW_CALL_MAX);
                                             prev_frame_time_single_threaded_us = begin_frame_instant.elapsed().as_micros() as usize;
 
 
