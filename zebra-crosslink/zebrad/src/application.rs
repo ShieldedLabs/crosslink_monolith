@@ -617,11 +617,9 @@ pub fn boot(app_cell: &'static AppCell<ZebradApp>) -> ! {
     let args = EntryPoint::process_cli_args(env::args_os().collect()).unwrap_or_else(|err| err.exit());
 
     #[cfg(feature = "viz_gui")]
-    {
-        std::thread::spawn(move || {
-            zebra_crosslink::wallet::wallet_test();
-        });
-    }
+    std::thread::spawn(move || {
+        zebra_crosslink::wallet::wallet_main();
+    });
 
     #[cfg(feature = "viz_gui")]
     {

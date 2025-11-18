@@ -182,7 +182,7 @@ impl Network {
 
     /// Returns true if the network is Regtest, or false otherwise.
     pub fn is_regtest(&self) -> bool {
-        return true; // @TODO(JUDAH): TEMPORARY
+        return true;
 
         if let Self::Testnet(params) = self {
             params.is_regtest()

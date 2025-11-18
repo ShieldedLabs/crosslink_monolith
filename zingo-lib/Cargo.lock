@@ -9329,6 +9329,7 @@ name = "wallet"
 version = "1.0.0-beta.1"
 dependencies = [
  "orchard",
+ "prost 0.13.5",
  "reqwest",
  "rustls 0.23.35",
  "sapling-crypto",
@@ -9336,6 +9337,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tonic 0.13.1",
+ "tonic-build 0.13.1",
  "zcash_client_backend",
  "zcash_client_sqlite",
  "zcash_note_encryption",

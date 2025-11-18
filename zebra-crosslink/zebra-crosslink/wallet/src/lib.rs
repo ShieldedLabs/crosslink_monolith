@@ -2,7 +2,9 @@
 
 use orchard::note_encryption::{CompactAction};
 use tokio_rustls::rustls;
+use tonic::client::GrpcService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
+use zcash_client_backend::proto::compact_formats::CompactTx;
 use zcash_client_backend::proto::service::ChainSpec;
 use zcash_client_backend::proto::service::Duration;
 use zcash_client_backend::proto::service::Empty;
@@ -64,7 +66,7 @@ async fn wait_for_zainod() {
     }
 }
 
-pub fn wallet_test() {
+pub fn wallet_main() {
     the_future_is_now(async {
         println!("waiting for zaino to be ready...");
         wait_for_zainod().await;
@@ -75,19 +77,14 @@ pub fn wallet_test() {
 
     loop {
         the_future_is_now(async {
-            let mut client = CompactTxStreamerClient::new({
-                let conf = ClientTlsConfig::new().with_webpki_roots();
-                let chan = Channel::from_static("http://localhost:18232").tls_config(conf).unwrap();
-                chan.connect().await.unwrap()
-            });
-
+            let mut client = CompactTxStreamerClient::new(Channel::from_static("http://localhost:18233").connect().await.unwrap());
             match client.get_latest_block(ChainSpec::default()).await {
                 Ok(latest_block) => {
                     let latest_block = latest_block.into_inner();
                     println!("******* LATEST BLOCK: {:?}", latest_block);
                 }
                 Err(err) => {
-                    println!("******* LATEST BLOCK ERROR: {:?}", err);
+                    // println!("******* LATEST BLOCK ERROR: {:?}", err);
                 }
             }
 

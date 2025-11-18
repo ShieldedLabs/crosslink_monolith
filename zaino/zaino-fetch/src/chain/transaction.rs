@@ -8,6 +8,7 @@ use std::io::Cursor;
 use zaino_proto::proto::compact_formats::{
     CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend, CompactTx,
 };
+use zcash_primitives::{constants::{VCROSSLINK_TX_VERSION, VCROSSLINK_VERSION_GROUP_ID}, transaction::StakingAction};
 
 /// Txin format as described in <https://en.bitcoin.it/wiki/Transaction>
 #[derive(Debug, Clone)]
@@ -464,6 +465,8 @@ struct TransactionData {
     /// In the coinbase transaction, this commits to the final Orchard tree state for the current block — i.e., it *is* the block's authDataRoot.
     /// Present in v5 transactions only, if any Orchard actions exist in the block.
     anchor_orchard: Option<Vec<u8>>,
+
+    staking_action: Option<StakingAction>,
 }
 
 impl TransactionData {
@@ -504,6 +507,7 @@ impl TransactionData {
                 orchard_actions: Vec::new(),
                 value_balance_orchard: None,
                 anchor_orchard: None,
+                staking_action: None,
             },
         ))
     }
@@ -572,6 +576,7 @@ impl TransactionData {
                 orchard_actions: Vec::new(),
                 value_balance_orchard: None,
                 anchor_orchard: None,
+                staking_action: None,
             },
         ))
     }
@@ -655,6 +660,7 @@ impl TransactionData {
                 orchard_actions: Vec::new(),
                 value_balance_orchard: None,
                 anchor_orchard: None,
+                staking_action: None,
             },
         ))
     }
@@ -750,6 +756,7 @@ impl TransactionData {
                 orchard_actions: Vec::new(),
                 value_balance_orchard: None,
                 anchor_orchard: None,
+                staking_action: None,
             },
         ))
     }
@@ -914,6 +921,175 @@ impl TransactionData {
                 orchard_actions,
                 value_balance_orchard,
                 anchor_orchard,
+                staking_action: None,
+            },
+        ))
+    }
+
+
+    fn parse_vcrosslink(
+        data: &[u8],
+        version: u32,
+        n_version_group_id: u32,
+    ) -> Result<(&[u8], Self), ParseError> {
+        if n_version_group_id != VCROSSLINK_VERSION_GROUP_ID {
+            return Err(ParseError::InvalidData(format!(
+                "version group ID {n_version_group_id:x} must be {VCROSSLINK_VERSION_GROUP_ID} for vcrosslink transactions"
+            )));
+        }
+        let mut cursor = Cursor::new(data);
+
+        let consensus_branch_id = read_u32(
+            &mut cursor,
+            "Error reading TransactionData::ConsensusBranchId",
+        )?;
+
+        skip_bytes(&mut cursor, 4, "Error skipping TransactionData::nLockTime")?;
+        skip_bytes(
+            &mut cursor,
+            4,
+            "Error skipping TransactionData::nExpiryHeight",
+        )?;
+
+        let (remaining_data, transparent_inputs, transparent_outputs) =
+            parse_transparent(&data[cursor.position() as usize..])?;
+        cursor.set_position(data.len() as u64 - remaining_data.len() as u64);
+
+        let spend_count = CompactSize::read(&mut cursor)?;
+        if spend_count >= (1 << 16) {
+            return Err(ParseError::InvalidData(format!(
+                "spendCount ({spend_count}) must be less than 2^16"
+            )));
+        }
+        let mut shielded_spends = Vec::with_capacity(spend_count as usize);
+        for _ in 0..spend_count {
+            let (remaining_data, spend) =
+                Spend::parse_from_slice(&data[cursor.position() as usize..], None, Some(5))?;
+            shielded_spends.push(spend);
+            cursor.set_position(data.len() as u64 - remaining_data.len() as u64);
+        }
+        let output_count = CompactSize::read(&mut cursor)?;
+        if output_count >= (1 << 16) {
+            return Err(ParseError::InvalidData(format!(
+                "outputCount ({output_count}) must be less than 2^16"
+            )));
+        }
+        let mut shielded_outputs = Vec::with_capacity(output_count as usize);
+        for _ in 0..output_count {
+            let (remaining_data, output) =
+                Output::parse_from_slice(&data[cursor.position() as usize..], None, Some(5))?;
+            shielded_outputs.push(output);
+            cursor.set_position(data.len() as u64 - remaining_data.len() as u64);
+        }
+
+        let value_balance_sapling = if spend_count + output_count > 0 {
+            Some(read_i64(
+                &mut cursor,
+                "Error reading TransactionData::valueBalanceSapling",
+            )?)
+        } else {
+            None
+        };
+        if spend_count > 0 {
+            skip_bytes(
+                &mut cursor,
+                32,
+                "Error skipping TransactionData::anchorSapling",
+            )?;
+            skip_bytes(
+                &mut cursor,
+                (192 * spend_count) as usize,
+                "Error skipping TransactionData::vSpendProofsSapling",
+            )?;
+            skip_bytes(
+                &mut cursor,
+                (64 * spend_count) as usize,
+                "Error skipping TransactionData::vSpendAuthSigsSapling",
+            )?;
+        }
+        if output_count > 0 {
+            skip_bytes(
+                &mut cursor,
+                (192 * output_count) as usize,
+                "Error skipping TransactionData::vOutputProofsSapling",
+            )?;
+        }
+        if spend_count + output_count > 0 {
+            skip_bytes(
+                &mut cursor,
+                64,
+                "Error skipping TransactionData::bindingSigSapling",
+            )?;
+        }
+
+        let actions_count = CompactSize::read(&mut cursor)?;
+        if actions_count >= (1 << 16) {
+            return Err(ParseError::InvalidData(format!(
+                "actionsCount ({actions_count}) must be less than 2^16"
+            )));
+        }
+        let mut orchard_actions = Vec::with_capacity(actions_count as usize);
+        for _ in 0..actions_count {
+            let (remaining_data, action) =
+                Action::parse_from_slice(&data[cursor.position() as usize..], None, None)?;
+            orchard_actions.push(action);
+            cursor.set_position(data.len() as u64 - remaining_data.len() as u64);
+        }
+
+        let mut value_balance_orchard = None;
+        let mut anchor_orchard = None;
+        if actions_count > 0 {
+            skip_bytes(
+                &mut cursor,
+                1,
+                "Error skipping TransactionData::flagsOrchard",
+            )?;
+            value_balance_orchard = Some(read_i64(
+                &mut cursor,
+                "Error reading TransactionData::valueBalanceOrchard",
+            )?);
+            anchor_orchard = Some(read_bytes(
+                &mut cursor,
+                32,
+                "Error reading TransactionData::anchorOrchard",
+            )?);
+            let proofs_count = CompactSize::read(&mut cursor)?;
+            skip_bytes(
+                &mut cursor,
+                proofs_count as usize,
+                "Error skipping TransactionData::proofsOrchard",
+            )?;
+            skip_bytes(
+                &mut cursor,
+                (64 * actions_count) as usize,
+                "Error skipping TransactionData::vSpendAuthSigsOrchard",
+            )?;
+            skip_bytes(
+                &mut cursor,
+                64,
+                "Error skipping TransactionData::bindingSigOrchard",
+            )?;
+        }
+
+        let staking_action = StakingAction::read(&mut cursor)?;
+
+        Ok((
+            &data[cursor.position() as usize..],
+            TransactionData {
+                f_overwintered: true,
+                version,
+                n_version_group_id: Some(n_version_group_id),
+                consensus_branch_id,
+                transparent_inputs,
+                transparent_outputs,
+                value_balance_sapling,
+                shielded_spends,
+                shielded_outputs,
+                join_splits: Vec::new(),
+                orchard_actions,
+                value_balance_orchard,
+                anchor_orchard,
+                staking_action,
             },
         ))
     }
@@ -1005,6 +1181,11 @@ impl ParseFromSlice for FullTransaction {
                 n_version_group_id.unwrap(), // This won't fail, because of the above match
             )?,
 
+            VCROSSLINK_TX_VERSION => TransactionData::parse_vcrosslink(
+                &data[cursor.position() as usize..],
+                version,
+                n_version_group_id.unwrap(), // This won't fail, because of the above match
+            )?,
             _ => {
                 return Err(ParseError::InvalidData(format!(
                     "Unsupported tx version {version}"

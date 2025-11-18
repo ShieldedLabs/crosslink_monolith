@@ -1350,6 +1350,7 @@ where
 
     #[allow(clippy::unwrap_in_result)]
     async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse> {
+        println!("********** DOING THE THING");
         let debug_force_finished_sync = self.debug_force_finished_sync;
         let network = &self.network;
 
@@ -1451,6 +1452,8 @@ where
                     .unwrap_or(ConsensusBranchId::RPC_MISSING_ID),
             ),
         };
+
+        println!("****************** THE THING: {:?}", tip_height);
 
         let response = GetBlockchainInfoResponse {
             chain: network.bip70_network_name(),

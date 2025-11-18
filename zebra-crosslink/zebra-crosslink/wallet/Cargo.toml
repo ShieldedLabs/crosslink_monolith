@@ -11,7 +11,9 @@ zcash_protocol = { workspace = true } # version = "0.7.1"
 zcash_transparent = { workspace = true } # version = "0.6.1"
 zcash_note_encryption = { workspace = true } # version = "0.4.1"
 
-tonic = { version = "0.13", features = ["transport", "channel", "tls-ring", "tls-webpki-roots", "prost"] }
+prost = "0.13"
+tonic = { version = "0.13", default-features = false, features = ["transport", "channel", "tls-ring", "tls-webpki-roots", "prost"] }
+tonic-build = { version = "0.13", default-features = false }
 rustls = { version = "0.23.31", default-features = false, features = ["ring"] }
 tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "tracing", "signal"] }
 tokio-rustls = { version = "0.26", default-features = false }

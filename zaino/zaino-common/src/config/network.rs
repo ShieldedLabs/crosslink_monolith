@@ -278,12 +278,10 @@ impl From<zebra_chain::parameters::Network> for Network {
 impl From<Network> for zebra_chain::parameters::Network {
     fn from(val: Network) -> Self {
         match val {
-            Network::Regtest(activation_heights) => {
-                zebra_chain::parameters::Network::new_regtest(RegtestParameters{
-                    activation_heights: activation_heights.into(),
-                    funding_streams: None,
-                })
-            }
+            Network::Regtest(activation_heights) => zebra_chain::parameters::Network::new_regtest(RegtestParameters{
+                activation_heights: activation_heights.into(),
+                funding_streams: None,
+            }),
             Network::Testnet => zebra_chain::parameters::Network::new_default_testnet(),
             Network::Mainnet => zebra_chain::parameters::Network::Mainnet,
         }
