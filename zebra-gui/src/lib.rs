@@ -1159,6 +1159,7 @@ pub fn main_thread_run_program() {
                                             gui_ctx.delta = dt;
                                             gui_ctx.input = &input_ctx;
                                             gui_ctx.draw  = &draw_ctx;
+                                            gui_ctx.dpi_scale = window.scale_factor() as f32;
 
                                             viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &draw_ctx, dt as f32, &input_ctx);
 
