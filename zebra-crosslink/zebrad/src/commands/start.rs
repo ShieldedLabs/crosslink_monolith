@@ -578,6 +578,7 @@ let zaino_config_str ="
 # - \"fetch\" - Uses JsonRPC client to fetch data (Zcashd, Zainod).
 # - \"state\" - Uses ReadStateService to fetch data (Zebrad).
 backend = \"fetch\"
+network = \"Regtest\"
 
 # Zainod JsonRPC server config:
 # Optional: Some enables Zaino's JsonRPC server.
@@ -636,9 +637,7 @@ backend = \"fetch\"
     #
 #  Service-level configuration (timeout, channel size).
 #  Required.
-#  [service]
 #  ...
-
 #  Storage configuration (cache and database).
 #  Required.
 #  [storage]

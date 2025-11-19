@@ -74,15 +74,10 @@ impl NonFinalisedState {
             .map_err(|_| NonFinalisedStateError::Custom("Failed to fetch blockchain info".into()))?
             .blocks
             .0;
-        // We do not fetch pre sapling activation.
-        for height in chain_height.saturating_sub(99).max(
-            non_finalised_state
-                .config
-                .network
-                .to_zebra_network()
-                .sapling_activation_height()
-                .0,
-        )..=chain_height
+
+        // Ensure we always try to fetch a block
+        let start_height = if chain_height == 0 { 0 } else { chain_height.saturating_sub(99).max(non_finalised_state.config.network.to_zebra_network().sapling_activation_height().0) };
+        for height in start_height..=chain_height
         {
             loop {
                 match fetch_block_from_node(
