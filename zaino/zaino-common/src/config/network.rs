@@ -17,7 +17,7 @@ pub const ZEBRAD_DEFAULT_ACTIVATION_HEIGHTS: ActivationHeights = ActivationHeigh
 };
 
 /// Network type for Zaino configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(from = "NetworkDeserialize")]
 pub enum Network {
     /// Mainnet network
@@ -26,6 +26,21 @@ pub enum Network {
     Testnet,
     /// Regtest network (for local testing)
     Regtest(ActivationHeights),
+}
+
+impl serde::Serialize for Network {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let intermediate = match self {
+            Network::Mainnet => NetworkDeserialize::Mainnet,
+            Network::Testnet => NetworkDeserialize::Testnet,
+            Network::Regtest(_) => NetworkDeserialize::Regtest,
+        };
+
+        intermediate.serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -279,7 +294,7 @@ impl From<Network> for zebra_chain::parameters::Network {
     fn from(val: Network) -> Self {
         match val {
             Network::Regtest(activation_heights) => {
-                zebra_chain::parameters::Network::new_regtest(RegtestParameters{
+                zebra_chain::parameters::Network::new_regtest(RegtestParameters {
                     activation_heights: activation_heights.into(),
                     funding_streams: None,
                 })

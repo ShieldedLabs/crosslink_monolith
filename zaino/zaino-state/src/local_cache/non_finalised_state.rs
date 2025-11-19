@@ -66,24 +66,39 @@ impl NonFinalisedState {
             config,
         };
 
+        info!("WAITING ON SERVER..");
+
         non_finalised_state.wait_on_server().await?;
 
-        let chain_height = fetcher
-            .get_blockchain_info()
-            .await
-            .map_err(|_| NonFinalisedStateError::Custom("Failed to fetch blockchain info".into()))?
-            .blocks
+        info!("SERVER WAIT COMPLETED");
+
+        let chain_height = fetcher.get_block_count().await.unwrap().0;
+
+        error!("CURRENT chain_height: {0}", chain_height.0);
+
+        let sapling_activation_height = non_finalised_state
+            .config
+            .network
+            .to_zebra_network()
+            .sapling_activation_height()
             .0;
+
+        error!(
+            "chain_height: {0}, sapling_activation_height: {sapling_activation_height}",
+            chain_height.0
+        );
         // We do not fetch pre sapling activation.
-        for height in chain_height.saturating_sub(99).max(
+        for height in chain_height.0.saturating_sub(99).max(
             non_finalised_state
                 .config
                 .network
                 .to_zebra_network()
                 .sapling_activation_height()
                 .0,
-        )..=chain_height
+        )..=chain_height.0
         {
+            error!("====> Attempting to fetch blockheight {}", height);
+
             loop {
                 match fetch_block_from_node(
                     non_finalised_state.state.as_ref(),
@@ -104,7 +119,7 @@ impl NonFinalisedState {
                     }
                     Err(e) => {
                         non_finalised_state.update_status_and_notify(StatusType::RecoverableError);
-                        warn!("{e}");
+                        warn!("SPAWN, FETCH BLOCK FROM NODE FAILED: {e}");
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
                 }
@@ -135,11 +150,14 @@ impl NonFinalisedState {
             loop {
                 match non_finalised_state.fetcher.get_blockchain_info().await {
                     Ok(chain_info) => {
+                        dbg!(&chain_info);
+                        // error!("best_block_hash: {}", chain_info.best_block_hash);
                         best_block_hash = chain_info.best_block_hash;
                         non_finalised_state.status.store(StatusType::Ready);
                         break;
                     }
                     Err(e) => {
+                        warn!("Failed to fetch blockchain info: {e}");
                         non_finalised_state.update_status_and_notify(StatusType::RecoverableError);
                         warn!("{e}");
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -164,6 +182,9 @@ impl NonFinalisedState {
                         continue;
                     }
                 }
+
+                // NOT AN ERROR. USED TO DIFFERENTIATE IN LOGS, oops
+                error!("best_block_hash: {best_block_hash}, check_block_hash: {check_block_hash}");
 
                 if check_block_hash != best_block_hash {
                     best_block_hash = check_block_hash;
@@ -200,10 +221,95 @@ impl NonFinalisedState {
         Ok(sync_handle)
     }
 
+    async fn fetch_tip_height(&self) -> Result<u32, NonFinalisedStateError> {
+        let info = self.fetcher.get_blockchain_info().await.map_err(|e| {
+            NonFinalisedStateError::Custom(format!("Failed to fetch blockchain info: {e}"))
+        })?;
+
+        let tip_hash = info.best_block_hash;
+
+        let (_hash, block) = fetch_block_from_node(
+            self.state.as_ref(),
+            Some(&self.config.network.to_zebra_network()),
+            &self.fetcher,
+            HashOrHeight::Hash(tip_hash),
+        )
+        .await
+        .map_err(|e| NonFinalisedStateError::Custom(format!("Failed to fetch tip block: {e}")))?;
+
+        Ok(block.height as u32)
+    }
+
     /// Looks back through the chain to find reorg height and repopulates block cache.
     ///
     /// Newly mined blocks are treated as a reorg at chain_height[-0].
     async fn fill_from_reorg(&self) -> Result<(), NonFinalisedStateError> {
+        let len = self.heights_to_hashes.get_state().len();
+
+        info!("Repopulating non-finalised state from reorg. Length: {len}");
+
+        // nitial sync: no cached blocks yet
+        if len == 0 {
+            tracing::info!("Non-finalised cache is empty, doing initial backfill from chain tip");
+
+            let chain_height = self.fetch_tip_height().await?;
+
+            let sapling_height = self
+                .config
+                .network
+                .to_zebra_network()
+                .sapling_activation_height()
+                .0;
+
+            let start = chain_height.saturating_sub(99).max(sapling_height);
+
+            info!(
+                "Initial backfill non-finalised window: start={}, tip={}",
+                start, chain_height
+            );
+
+            for h in start..=chain_height {
+                loop {
+                    match fetch_block_from_node(
+                        self.state.as_ref(),
+                        Some(&self.config.network.to_zebra_network()),
+                        &self.fetcher,
+                        HashOrHeight::Height(Height(h)),
+                    )
+                    .await
+                    {
+                        Ok((hash, block)) => {
+                            self.heights_to_hashes.insert(Height(h), hash, None);
+                            self.hashes_to_blocks.insert(hash, block, None);
+                            break;
+                        }
+                        Err(e) => {
+                            self.update_status_and_notify(StatusType::RecoverableError);
+                            tracing::warn!(
+                                "initial fill: FETCH BLOCK FROM NODE FAILED at height {}: {}",
+                                h,
+                                e
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+            }
+
+            info!(
+                "Initial non-finalised fill complete: cached {} blocks ({}..={})",
+                chain_height.saturating_sub(start) + 1,
+                start,
+                chain_height
+            );
+
+            return Ok(());
+        }
+
+        info!(
+            "->>>>>>>>>>>> Repopulating non-finalised state from reorg. Length: {}",
+            len
+        );
         let mut reorg_height = *self
             .heights_to_hashes
             .get_state()
@@ -359,7 +465,7 @@ impl NonFinalisedState {
                     }
                     Err(e) => {
                         self.update_status_and_notify(StatusType::RecoverableError);
-                        warn!("{e}");
+                        warn!("NFS: FILL FROM REORG FAILED: {e}");
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
                 }

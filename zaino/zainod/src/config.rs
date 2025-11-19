@@ -17,8 +17,8 @@ use serde::{
 use tracing::warn;
 use tracing::{error, info};
 use zaino_common::{
-    CacheConfig, DatabaseConfig, DatabaseSize, Network, ServiceConfig, StorageConfig,
-    ValidatorConfig,
+    ActivationHeights, CacheConfig, DatabaseConfig, DatabaseSize, Network, ServiceConfig,
+    StorageConfig, ValidatorConfig,
 };
 use zaino_serve::server::config::{GrpcServerConfig, JsonRpcServerConfig};
 
@@ -199,7 +199,7 @@ impl Default for ZainodConfig {
             },
             validator_settings: ValidatorConfig {
                 validator_grpc_listen_address: "127.0.0.1:18230".parse().unwrap(),
-                validator_jsonrpc_listen_address: "127.0.0.1:18232".parse().unwrap(),
+                validator_jsonrpc_listen_address: "127.0.0.1:8232".parse().unwrap(),
                 validator_cookie_path: None,
                 validator_user: Some("xxxxxx".to_string()),
                 validator_password: Some("xxxxxx".to_string()),
@@ -213,7 +213,18 @@ impl Default for ZainodConfig {
                 },
             },
             zebra_db_path: default_zebra_db_path().unwrap(),
-            network: Network::Testnet,
+            network: Network::Regtest(ActivationHeights {
+                before_overwinter: Some(1),
+                overwinter: Some(1),
+                sapling: Some(1),
+                blossom: Some(1),
+                heartwood: Some(1),
+                canopy: Some(1),
+                nu5: Some(1),
+                nu6: Some(1),
+                nu6_1: None,
+                nu7: None,
+            }),
         }
     }
 }

@@ -725,7 +725,7 @@ impl ResponseToError for GetBlockResponse {
 
 /// Contains the height of the most recent block in the best valid block chain
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct GetBlockCountResponse(Height);
+pub struct GetBlockCountResponse(pub Height);
 
 impl ResponseToError for GetBlockCountResponse {
     type RpcError = Infallible;
