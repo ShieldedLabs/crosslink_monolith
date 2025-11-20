@@ -1159,7 +1159,7 @@ pub fn main_thread_run_program() {
                                             {
                                                 let put = draw_ctx.draw_command_buffer.add(*draw_ctx.draw_command_count);
                                                 *draw_ctx.draw_command_count += 1;
-                                                *put = DrawCommand::ClearScreenToColor { color: 0x111111 };
+                                                *put = DrawCommand::ClearScreenToColor { color: 0x090909 };
                                             }
 
                                             gui_ctx.delta = dt;
