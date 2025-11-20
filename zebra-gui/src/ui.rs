@@ -155,44 +155,60 @@ fn dbg_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
 fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
     let mut result = false;
 
+    const MIN_ZOOM: f32 = 0.5;
+    const MAX_ZOOM: f32 = 2.0;
+
     if ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight) {
         if ui.input().key_pressed(KeyCode::Equal) {
-            ui.zoom *= 1.0f32 + 1.0f32 / 8f32;
+            let new_zoom = ui.zoom * (1.0f32 + 1.0f32 / 8f32);
+            if new_zoom <= MAX_ZOOM {
+                ui.zoom = new_zoom;
+            }
         }
         if ui.input().key_pressed(KeyCode::Minus) {
-            ui.zoom /= 1.0f32 + 1.0f32 / 8f32;
+            let new_zoom = ui.zoom / (1.0f32 + 1.0f32 / 8f32);
+            if new_zoom >= MIN_ZOOM {
+                ui.zoom = new_zoom;
+            }
         }
         if ui.input().key_pressed(KeyCode::Digit0) {
             ui.zoom = 1.0f32;
         }
     }
-    if ui.zoom < 0.5f32 {
-        ui.zoom = 0.5f32;
+    if ui.zoom < MIN_ZOOM {
+        ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
     }
-    if ui.zoom > 3.0f32 {
-        ui.zoom = 3.0f32;
+    if ui.zoom > MAX_ZOOM {
+        ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
     }
     ui.scale = ui.zoom * ui.dpi_scale;
 
     let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_height as f32);
     let mouse_pos = (ui.input().mouse_pos().0 as f32, ui.input().mouse_pos().1 as f32);
 
-    let padding = &clay::layout::Padding::all(ui.scale16(8.0));
     let child_gap = ui.scale16(8.0);
-    const pane_col: clay::Color = clay::Color::rgb(0x12 as f32, 0x12 as f32, 0x12 as f32);
-    const WHITE:    clay::Color = clay::Color::rgb(0xff as f32, 0x12 as f32, 0x12 as f32);
-    let radius = ui.scale(24.0);
+    let padding = &clay::layout::Padding::all(child_gap);
+    const WHITE:            clay::Color = clay::Color::rgb(0xff as f32, 0xff as f32, 0xff as f32);
+    const pane_col:         clay::Color = clay::Color::rgb(0x12 as f32, 0x12 as f32, 0x12 as f32);
+    const inactive_tab_col: clay::Color = clay::Color::rgb(0x0f as f32, 0x0f as f32, 0x0f as f32);
+    const active_tab_col:   clay::Color = pane_col;
+
+    const button_col:       clay::Color = clay::Color::rgb(0x24 as f32, 0x24 as f32, 0x24 as f32);
+
+    const align_center_center: clay::layout::Alignment = clay::layout::Alignment { x: clay::layout::LayoutAlignmentX::Center, y: clay::layout::LayoutAlignmentY::Center };
+
+
+    let radius = ui.scale(8.0);
 
     // Begin the layout
     let clay = magic(ui).clay();
     clay.set_layout_dimensions((window_w as f32, window_h as f32).into());
     clay.pointer_state(mouse_pos.into(), ui.input().mouse_held(winit::event::MouseButton::Left));
-    clay.set_measure_text_function_user_data(ui.draw(),
-        |string, text_config, draw| {
-            let h = text_config.font_size as f32;
-            let w = draw.measure_text_line(h, string);
-            clay::math::Dimensions::new(w, h)
-        });
+    clay.set_measure_text_function_user_data(ui.draw(), |string, text_config, draw| {
+        let h = text_config.font_size as f32;
+        let w = draw.measure_text_line(h, string);
+        clay::math::Dimensions::new(w, h)
+    });
 
     let mut c = clay.begin::<(), ()>();
 
@@ -200,63 +216,146 @@ fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
         .layout()
             .width(grow!())
             .height(grow!())
-            .padding(Padding(padding)).child_gap(child_gap)
+            .padding(Padding(padding))
+            .child_gap(child_gap)
         .end(), |c| {
-        let pane_pct = clay::layout::Sizing::Percent((0.33 * ui.scale).min(0.33));
+        let pane_pct = {
+            let pct = 0.25;
+            // clay::layout::Sizing::Percent((pct * ui.scale).min(pct))
+            clay::layout::Sizing::Percent(pct * ui.scale)
+        };
 
         // left pane
         c.with(&Declaration::new()
-            .corner_radius().all(radius).end()
             .layout()
                 .direction(clay::layout::LayoutDirection::TopToBottom)
                 .width(pane_pct)
                 .height(grow!())
-                .padding(Padding(padding)).child_gap(0)
             .end()
-            .background_color(pane_col), |c| {
+            , |c| {
+
+            // tab bar
             c.with(&Declaration::new()
                 .layout()
                     .width(percent!(1.0))
-                    .height(percent!(0.1))
+                    .height(fit!())
                     .child_gap(child_gap)
+                    .child_alignment(align_center_center)
                 .end(), |c| {
+                let tab_text_h = ui.scale16(18.0);
+
+                // Wallet tab
                 c.with(&Declaration::new()
+                    .background_color(active_tab_col)
                     .corner_radius().top_left(radius).top_right(radius).end()
-                    .background_color((0xff, 0, 0).into())
                     .layout()
                         .width(grow!())
                         .height(grow!())
+                        .padding(Padding(padding))
+                        .child_alignment(align_center_center)
                     .end(), |c| {
-                    // c.text("0.0000 cTAZ. Hello, World! What a convenient automatic English text wrapping situation that we are living in at the current moment!", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
-                    c.text("Wallet", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
+                    c.text("Wallet", clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE).alignment(clay::text::TextAlignment::Center).end());
                 });
+
+                // Finalizers tab
                 c.with(&Declaration::new()
+                    .background_color(inactive_tab_col)
                     .corner_radius().top_left(radius).top_right(radius).end()
-                    .background_color((0xff, 0, 0).into())
                     .layout()
                         .width(grow!())
                         .height(grow!())
+                        .padding(Padding(padding))
+                        .child_alignment(align_center_center)
                     .end(), |c| {
-                    // c.text("0.0000 cTAZ. Hello, World! What a convenient automatic English text wrapping situation that we are living in at the current moment!", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
-                    c.text("Finalizers", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
+                    c.text("Finalizers", clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE).alignment(clay::text::TextAlignment::Center).end());
                 });
+
+                // History tab
                 c.with(&Declaration::new()
+                    .background_color(inactive_tab_col)
                     .corner_radius().top_left(radius).top_right(radius).end()
-                    .background_color((0xff, 0, 0).into())
                     .layout()
                         .width(grow!())
                         .height(grow!())
+                        .padding(Padding(padding))
+                        .child_alignment(align_center_center)
                     .end(), |c| {
-                    // c.text("0.0000 cTAZ. Hello, World! What a convenient automatic English text wrapping situation that we are living in at the current moment!", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
-                    c.text("History", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
+                    c.text("History", clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE).alignment(clay::text::TextAlignment::Center).end());
                 });
             });
+
+            let balance_text_h = ui.scale16(48.0);
+
+            // Main contents
             c.with(&Declaration::new()
-                .background_color((0xff, 0, 0).into())
+                .background_color(pane_col)
+                .corner_radius().bottom_left(radius).bottom_right(radius).end()
                 .layout()
-                    .width(grow!())
+                    .direction(clay::layout::LayoutDirection::TopToBottom)
+                    .width(percent!(1.0))
                     .height(grow!())
                 .end(), |c| {
+
+                // spacer
+                c.with(&Declaration::new().layout().width(grow!()).height(fixed!(ui.scale(32.0))).end(), |c| {});
+
+                // balance container
+                c.with(&Declaration::new()
+                    .layout()
+                        .width(percent!(1.0))
+                        .height(fit!())
+                        .padding(Padding(padding))
+                        .child_alignment(align_center_center)
+                    .end(), |c| {
+                    c.text("0.0000 cTAZ", clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE).alignment(clay::text::TextAlignment::Center).end());
+                });
+
+                // buttons container
+                c.with(&Declaration::new()
+                    .layout()
+                        .width(percent!(1.0))
+                        .height(fit!())
+                        .padding(Padding(padding))
+                        .child_gap(child_gap)
+                        .child_alignment(align_center_center)
+                    .end(), |c| {
+
+                    let button_radius = ui.scale(24.0);
+                    let buttons = ["Send", "Receive", "Claim", "Stake", "Unstake"];
+
+                    for button in buttons {
+                        c.with(&Declaration::new()
+                            .layout()
+                                .direction(clay::layout::LayoutDirection::TopToBottom)
+                                .width(fit!())
+                                .height(fit!())
+                                .child_gap(child_gap)
+                                .child_alignment(align_center_center)
+                            .end(), |c| {
+
+                            // Button circle
+                            c.with(&Declaration::new()
+                                .background_color(button_col)
+                                .corner_radius().all(button_radius).end()
+                                .layout()
+                                    .width (fixed!(button_radius * 2.0))
+                                    .height(fixed!(button_radius * 2.0))
+                                    .padding(Padding(padding))
+                                    .child_gap(child_gap)
+                                    .child_alignment(align_center_center)
+                                .end()
+                                , |c| {
+                                // let temp_letter_symbol_h = ui.scale16(32.0);
+                                // c.text(&button[..1], clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE).alignment(clay::text::TextAlignment::Center).end());
+                            });
+
+                            let button_text_h = ui.scale16(16.0);
+                            c.text(button, clay::text::TextConfig::new().font_size(button_text_h).color(WHITE).alignment(clay::text::TextAlignment::Center).end());
+                        });
+                    }
+
+                });
+
             });
         });
 
@@ -266,39 +365,48 @@ fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
             .layout()
                 .width(grow!())
                 .height(grow!())
-                .padding(Padding(padding)).child_gap(child_gap)
-            .end(), |_| {});
+                .padding(Padding(padding))
+                .child_gap(child_gap)
+            .end()
+            , |_| {
+        });
 
+        /*
         // right pane
         c.with(&Declaration::new()
+            .background_color(pane_col)
             .corner_radius().all(radius).end()
             .layout()
                 .width(pane_pct)
                 .height(grow!())
-                .padding(Padding(padding)).child_gap(child_gap)
+                .padding(Padding(padding))
+                .child_gap(child_gap)
             .end()
-            .background_color(pane_col), |_| {});
+            , |_| {
+        });
+        */
     });
 
 
     // Return the list of render commands of your layout
     let render_commands = c.end();
 
-    fn clay_color_to_u32(color: clay::Color) -> u32 {
-        let r = color.r as u32;
-        let g = color.g as u32;
-        let b = color.b as u32;
-        let a = color.a as u32;
-        let color = (a << 24) | (r << 16) | (g << 8) | b;
-        color
-    }
-
     if is_rendering {
         for command in render_commands {
+            fn clay_color_to_u32(color: clay::Color) -> u32 {
+                let r = color.r as u32;
+                let g = color.g as u32;
+                let b = color.b as u32;
+                let a = color.a as u32;
+                let color = (a << 24) | (r << 16) | (g << 8) | b;
+                color
+            }
+
             let x1 = (command.bounding_box.x)                               as isize;
             let y1 = (command.bounding_box.y)                               as isize;
             let x2 = (command.bounding_box.x + command.bounding_box.width)  as isize;
             let y2 = (command.bounding_box.y + command.bounding_box.height) as isize;
+
             match command.config {
                 Rectangle(config) => {
                     let radius_tl = config.corner_radii.top_left     as isize;
@@ -316,6 +424,17 @@ fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
                     ui.draw().text_line(x1 as f32, y1 as f32, config.font_size as f32, config.text, clay_color_to_u32(config.color));
                 }
                 misc => { todo!("Unsupported clay render command: {:?}", misc) }
+            }
+
+            if ui.debug {
+                let thickness = 2.0;
+                let color = 0x80ff00ff;
+                let t  = (thickness / 2.0) as isize;
+
+                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x1+t) as f32, (y2+t) as f32, color);
+                ui.draw().rectangle((x2-t) as f32, (y1-t) as f32, (x2+t) as f32, (y2+t) as f32, color);
+                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x2-t) as f32, (y1+t) as f32, color);
+                ui.draw().rectangle((x1-t) as f32, (y2-t) as f32, (x2-t) as f32, (y2+t) as f32, color);
             }
         }
     }
@@ -341,9 +460,9 @@ pub fn demo_of_rendering_stuff_with_context_that_allocates_in_the_background(ui:
 
         ..Default::default()
     };
-    let real_input = ui.input;
-    let result =           run_ui(ui, data, false); ui.input = &dummy_input;
-    let result = result || run_ui(ui, data, true);  ui.input =   real_input;
+    let real_input = ui.input; let result =           run_ui(ui, data, false);
+    ui.input = &dummy_input;   let result = result || run_ui(ui, data, true);
+    ui.input =   real_input;
     return result;
 }
 

@@ -191,7 +191,7 @@ impl DrawCtx {
                 if is_mono {
                     found_font = self._init_font_tracker(DEJA_VU_SANS_MONO, target_px_height, true, usize::MAX);
                 } else {
-                    found_font = self._init_font_tracker(SOURCE_SERIF, target_px_height, false, usize::MAX);
+                    found_font = self._init_font_tracker(INTER, target_px_height, false, usize::MAX);
                 }
             }
             let tracker: &mut FontTracker = &mut *found_font;
@@ -786,7 +786,8 @@ fn okay_but_is_it_wayland(elwt: &winit::event_loop::ActiveEventLoop) -> bool {
     }
 }
 
-pub static SOURCE_SERIF: &[u8] = include_bytes!("../assets/source_serif_4.ttf");
+// pub static SOURCE_SERIF: &[u8] = include_bytes!("../assets/source_serif_4.ttf");
+pub static INTER: &[u8] = include_bytes!("../assets/Inter-VariableFont_opsz,wght.ttf");
 pub static DEJA_VU_SANS_MONO: &[u8] = include_bytes!("../assets/deja_vu_sans_mono.ttf");
 pub static FONT_PIXEL_3X3_MONO: &[u8] = include_bytes!("../assets/3x3-Mono.ttf");
 pub static FONT_PIXEL_TINY5: &[u8] = include_bytes!("../assets/Tiny5-Regular.ttf");
@@ -1182,7 +1183,7 @@ pub fn main_thread_run_program() {
                                                 let mut put = 0;
                                                 for i in 0..*draw_ctx.font_tracker_count {
                                                     let take_ptr = draw_ctx.font_tracker_buffer.add(i);
-                                                    if (*take_ptr).how_many_times_was_i_used == 0 && ((*take_ptr).ttf_file == DEJA_VU_SANS_MONO || (*take_ptr).ttf_file == SOURCE_SERIF) {
+                                                    if (*take_ptr).how_many_times_was_i_used == 0 && ((*take_ptr).ttf_file == DEJA_VU_SANS_MONO || (*take_ptr).ttf_file == INTER) {
                                                         std::ptr::drop_in_place(take_ptr);
                                                     } else {
                                                         let put_ptr = draw_ctx.font_tracker_buffer.add(put);
