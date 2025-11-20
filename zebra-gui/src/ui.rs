@@ -103,7 +103,7 @@ pub struct SomeDataToKeepAround {
     pub can_send_messages: bool,
 }
 
-fn run_ui(ui: &mut Context, data: &mut SomeDataToKeepAround) -> bool {
+fn run_ui(ui: &mut Context, data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
     if ui.input().key_pressed(KeyCode::Tab) {
         ui.debug = !ui.debug;
     }
@@ -117,6 +117,7 @@ fn run_ui(ui: &mut Context, data: &mut SomeDataToKeepAround) -> bool {
             }
         }
     }
+
     if ui.pixel_inspector_primed {
         if ui.input().mouse_pressed(MouseButton::Left) {
             unsafe {
@@ -125,27 +126,40 @@ fn run_ui(ui: &mut Context, data: &mut SomeDataToKeepAround) -> bool {
             ui.pixel_inspector_primed = false;
         }
     }
-    if ui.pixel_inspector_primed {
-        ui.draw().mono_text_line(0.0, 0.0, 16.0, "Pixel Inspector is Primed! Click to select pixel.", 0xff_00ff00);
-    }
-    if let Some((x, y)) = unsafe { *ui.draw().debug_pixel_inspector } {
-        let x = x as isize; let y = y as isize;
-        let mut draw_x = 0;
-        let mut draw_y = 0;
-        if x < ui.draw().window_width/2 { draw_x = ui.draw().window_width - 256};
-        if y < ui.draw().window_height/2 { draw_y = ui.draw().window_height - 256};
-        let color = unsafe { *ui.draw().debug_pixel_inspector_last_color };
-        ui.draw().rectangle(draw_x as f32, draw_y as f32, draw_x as f32 + 256.0, draw_y as f32 + 256.0, 0xff_000000 | color);
-        ui.draw().mono_text_line(draw_x as f32, draw_y as f32, 12.0, &format!("({},{}) = {:X}", x, y, color), 0xff_000000 | (color ^ u32::MAX));
+
+    if is_rendering {
+        if ui.pixel_inspector_primed {
+            ui.draw().mono_text_line(0.0, 0.0, 16.0, "Pixel Inspector is Primed! Click to select pixel.", 0xff_00ff00);
+        }
+        if let Some((x, y)) = unsafe { *ui.draw().debug_pixel_inspector } {
+            let x = x as isize; let y = y as isize;
+            let mut draw_x = 0;
+            let mut draw_y = 0;
+            if x < ui.draw().window_width/2 { draw_x = ui.draw().window_width - 256 };
+            if y < ui.draw().window_height/2 { draw_y = ui.draw().window_height - 256 };
+            let color = unsafe { *ui.draw().debug_pixel_inspector_last_color };
+            ui.draw().rectangle(draw_x as f32, draw_y as f32, draw_x as f32 + 256.0, draw_y as f32 + 256.0, 0xff_000000 | color);
+            ui.draw().mono_text_line(draw_x as f32, draw_y as f32, 12.0, &format!("({},{}) = {:X}", x, y, color), 0xff_000000 | (color ^ u32::MAX));
+        }
     }
 
     return false;
 }
 
 pub fn demo_of_rendering_stuff_with_context_that_allocates_in_the_background(ui: &mut Context, data: &mut SomeDataToKeepAround) -> bool {
-    let result =           run_ui(ui, data);
-    // TODO: let dummy_input = InputCtx { ..Default::default() };
-    // let result = result || run_ui(ui, data);
+    let dummy_input = InputCtx {
+        this_mouse_pos: ui.input().this_mouse_pos,
+        last_mouse_pos: ui.input().last_mouse_pos,
+
+        mouse_down: ui.input().mouse_down,
+        keys_down1: ui.input().keys_down1,
+        keys_down2: ui.input().keys_down2,
+
+        ..Default::default()
+    };
+    let real_input = ui.input;
+    let result =           run_ui(ui, data, false); ui.input = &dummy_input;
+    let result = result || run_ui(ui, data, true);  ui.input =   real_input;
     return result;
 }
 

@@ -521,7 +521,7 @@ impl DrawCtx {
 }
 
 
-#[derive(Debug)]
+#[derive(Debug, Default, Clone)]
 struct InputCtx {
     mouse_moved:                 bool,
     should_process_mouse_events: bool,
