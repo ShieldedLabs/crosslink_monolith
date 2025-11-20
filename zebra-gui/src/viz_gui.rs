@@ -1,6 +1,8 @@
+#![allow(warnings)]
+
 use std::{collections::HashMap, hash::Hash, sync::Mutex};
 
-use twox_hash::XxHash3_64;
+// use twox_hash::XxHash3_64;
 use winit::event::MouseButton;
 
 use super::*;
@@ -159,7 +161,7 @@ pub fn viz_gui_init() -> VizState {
     *REQUESTS_TO_ZEBRA.lock().unwrap() = Some(zebra_receive);
     *RESPONSES_FROM_ZEBRA.lock().unwrap() = Some(zebra_send);
 
-    let mut viz_state = VizState {
+    let viz_state = VizState {
         camera_x: 0.0,
         camera_y: 0.0,
         zoom: 0.0,
@@ -459,11 +461,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, dr
     }
 }
 
-fn split_vector(mut x: f32, mut y: f32) -> (f32, f32, f32) {
-    let len = f32::sqrt(x*x + y*y);
-    if len < 0.0000001 { return (0.0, 0.0, 0.0); }
-    (x/len, y/len, len)
-}
+// fn split_vector(x: f32, y: f32) -> (f32, f32, f32) {
+//     let len = f32::sqrt(x*x + y*y);
+//     if len < 0.0000001 { return (0.0, 0.0, 0.0); }
+//     (x/len, y/len, len)
+// }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hash32 {

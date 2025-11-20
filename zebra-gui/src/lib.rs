@@ -1,4 +1,5 @@
 #![allow(unsafe_code)]
+#![allow(warnings)]
 
 mod ui;
 use ui::*;
@@ -8,11 +9,13 @@ pub use viz_gui::*;
 
 const TURN_OFF_HASH_BASED_LAZY_RENDER: usize = 0;
 
+#[allow(unused_imports)]
 use std::{alloc::{alloc, dealloc, Layout}, hash::Hasher, hint::spin_loop, mem::{swap, transmute, MaybeUninit}, ptr::{copy_nonoverlapping, slice_from_raw_parts}, rc::Rc, sync::{atomic::{AtomicU32, Ordering}, Barrier}, time::{Duration, Instant}, u32};
 use twox_hash::xxhash3_64;
 use winit::{dpi::Size, keyboard::KeyCode};
 
 use rustybuzz::{shape, Face as RbFace, UnicodeBuffer};
+#[allow(unused_imports)]
 use swash::{scale::ScaleContext, text, FontRef};
 
 const RENDER_TILE_SHIFT: usize = 7;
@@ -38,7 +41,7 @@ type WideWorkFn = fn(thread_id: usize, work_id: usize, work_count: usize, user_p
 fn worker_thread_loop(thread_id: usize, p_thread_context: usize) {
     unsafe {
         let p_thread_context = p_thread_context as *mut ThreadContext;
-        let thread_count = (*p_thread_context).thread_count;
+        // let thread_count = (*p_thread_context).thread_count;
         loop {
             (*p_thread_context).wake_up_barrier.wait();
             while (*p_thread_context).wake_up_gate.load(Ordering::Acquire) == 0 { spin_loop(); }
@@ -91,7 +94,7 @@ fn worker_thread_loop(thread_id: usize, p_thread_context: usize) {
 
 fn dennis_parallel_for(p_thread_context: *mut ThreadContext, is_last_time: bool, work_count: usize, work_user_pointer: usize, work_user_function: WideWorkFn) {
     unsafe {
-        let thread_count = (*p_thread_context).thread_count;
+        // let thread_count = (*p_thread_context).thread_count;
 
         // Begin work gate should be closed.
         // We wait for the job site to be clear.
@@ -443,8 +446,8 @@ impl DrawCtx {
         }
     }
 
-    pub fn set_scissor(&self, x1: isize, y1: isize, x2: isize, y2: isize) {
-    }
+    // pub fn set_scissor(&self, x1: isize, y1: isize, x2: isize, y2: isize) {
+    // }
 
     pub fn rectangle(&self, x1: f32, y1: f32, x2: f32, y2: f32, color: u32) {
         unsafe {
@@ -714,6 +717,7 @@ impl FrameStat {
     };
 }
 
+#[allow(non_upper_case_globals)]
 pub fn loop_curve(t: f64) -> (f64, f64) {
     // Tunables:
     const R: f64 = 5.0; // fixed circle radius
@@ -726,6 +730,7 @@ pub fn loop_curve(t: f64) -> (f64, f64) {
     (x, y)
 }
 
+#[allow(unused_variables)]
 fn okay_but_is_it_wayland(elwt: &winit::event_loop::ActiveEventLoop) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -891,11 +896,12 @@ pub fn main_thread_run_program() {
     let mut gui_ctx = ui::Context::new(ui::Style::dark());
     let mut some_data_to_keep_around = ui::SomeDataToKeepAround{ ..Default::default() };
 
-    let mut t: f64 = 0.0;
+    // let mut t: f64 = 0.0;
 
     let mut window: Option<Rc<winit::window::Window>> = None;
     let mut softbuffer_context: Option<softbuffer::Context<Rc<winit::window::Window>>> = None;
     let mut softbuffer_surface: Option<softbuffer::Surface<Rc<winit::window::Window>, Rc<winit::window::Window>>> = None;
+    #[allow(deprecated)]
     event_loop.run(move |event, elwt: &winit::event_loop::ActiveEventLoop| {
         match event {
             winit::event::Event::Resumed => { // Runs at startup and is where we have to do init.

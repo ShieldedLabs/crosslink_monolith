@@ -1,9 +1,12 @@
+#![allow(warnings)]
+
 use std::{hash::Hash};
 use winit::{event::MouseButton, keyboard::KeyCode};
 
 use super::*;
 
 // make widgets nicer to construct
+#[allow(unused_macros)]
 macro_rules! widget {
     // Base case: only id and flags, no fields
     ($id:expr, $flags:expr) => {{
@@ -103,7 +106,7 @@ pub struct SomeDataToKeepAround {
     pub can_send_messages: bool,
 }
 
-fn run_ui(ui: &mut Context, data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
+fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
     if ui.input().key_pressed(KeyCode::Tab) {
         ui.debug = !ui.debug;
     }
@@ -179,7 +182,7 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(style: Style) -> Context {
+    pub fn new(_style: Style) -> Context {
         Context { ..Default::default() }
     }
     fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw  } }
