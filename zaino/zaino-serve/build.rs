@@ -21,13 +21,17 @@ fn main() -> io::Result<()> {
     let branch = String::from_utf8(branch).expect("Invalid UTF-8 sequence");
     println!("cargo:rustc-env=BRANCH={}", branch.trim());
 
+    // @Todo: `date` is not guaranteed to exist on Windows. What to do?
+
     // Set the build date
-    let build_date = Command::new("date")
-        .output()
-        .expect("Failed to get build date")
-        .stdout;
-    let build_date = String::from_utf8(build_date).expect("Invalid UTF-8 sequence");
-    println!("cargo:rustc-env=BUILD_DATE={}", build_date.trim());
+    // let build_date = Command::new("date")
+    //     .output()
+    //     .expect("Failed to get build date")
+    //     .stdout;
+    // let build_date = String::from_utf8(build_date).expect("Invalid UTF-8 sequence");
+    // println!("cargo:rustc-env=BUILD_DATE={}", build_date.trim());
+    println!("cargo:rustc-env=BUILD_DATE=Thu Nov 20 04:25:20 UTC 2025");
+    
 
     // Set the build user
     let build_user = whoami::username();
