@@ -179,7 +179,8 @@ fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
     let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_height as f32);
     let mouse_pos = (ui.input().mouse_pos().0 as f32, ui.input().mouse_pos().1 as f32);
 
-    let padding = { let x = ui.scale(8f32) as u16; clay::layout::Padding::new(x, x, x, x) };
+    let padding = &clay::layout::Padding::all(ui.scale16(8.0));
+    let child_gap = ui.scale16(8.0);
     const pane_col: clay::Color = clay::Color::rgb(0x12 as f32, 0x12 as f32, 0x12 as f32);
     const WHITE:    clay::Color = clay::Color::rgb(0xff as f32, 0x12 as f32, 0x12 as f32);
     let radius = ui.scale(24.0);
@@ -197,55 +198,88 @@ fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
 
     let mut c = clay.begin::<(), ()>();
 
-    c.with(
-        &Declaration::new()
+    c.with(&Declaration::new()
+        .layout()
+            .width(grow!())
+            .height(grow!())
+            .padding(Padding(padding)).child_gap(child_gap)
+        .end(), |c| {
+        let pane_pct = clay::layout::Sizing::Percent((0.33 * ui.scale).min(0.33));
+
+        // left pane
+        c.with(&Declaration::new()
+            .corner_radius().all(radius).end()
             .layout()
-                .width(grow!())
+                .direction(clay::layout::LayoutDirection::TopToBottom)
+                .width(pane_pct)
                 .height(grow!())
-            .padding(padding)
-            .child_gap(8)
-            .end(),
-        |c| {
-            let pane_pct = clay::layout::Sizing::Percent((0.33 * ui.scale).min(0.33));
-
-            // left pane
-            c.with(
-                &Declaration::new()
+                .padding(Padding(padding)).child_gap(0)
+            .end()
+            .background_color(pane_col), |c| {
+            c.with(&Declaration::new()
+                .layout()
+                    .width(percent!(1.0))
+                    .height(percent!(0.1))
+                .end(), |c| {
+                c.with(&Declaration::new()
                     .corner_radius().all(radius).end()
-                    .layout()
-                        .width(pane_pct)
-                        .height(grow!())
-                    .end()
-                    .background_color(pane_col),
-                |c| {
-                    c.text("0.0000 cTAZ. Hello, World! What a convenient automatic English text wrapping situation that we are living in at the current moment!", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
-                }
-            );
-
-            // central gap
-            c.with(
-                &Declaration::new()
-                    .corner_radius().all(radius).end()
+                    .background_color((0xff, 0, 0).into())
                     .layout()
                         .width(grow!())
                         .height(grow!())
-                    .end(),
-                |_| {}
-            );
-
-            // right pane
-            c.with(
-                &Declaration::new()
+                    .end(), |c| {
+                    // c.text("0.0000 cTAZ. Hello, World! What a convenient automatic English text wrapping situation that we are living in at the current moment!", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
+                    c.text("Wallet", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
+                });
+                c.with(&Declaration::new()
                     .corner_radius().all(radius).end()
+                    .background_color((0xff, 0, 0).into())
                     .layout()
-                        .width(pane_pct)
+                        .width(grow!())
                         .height(grow!())
-                    .end()
-                    .background_color(pane_col),
-                |_| {}
-            );
-        },
-    );
+                    .end(), |c| {
+                    // c.text("0.0000 cTAZ. Hello, World! What a convenient automatic English text wrapping situation that we are living in at the current moment!", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
+                    c.text("Finalizers", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
+                });
+                c.with(&Declaration::new()
+                    .corner_radius().all(radius).end()
+                    .background_color((0xff, 0, 0).into())
+                    .layout()
+                        .width(grow!())
+                        .height(grow!())
+                    .end(), |c| {
+                    // c.text("0.0000 cTAZ. Hello, World! What a convenient automatic English text wrapping situation that we are living in at the current moment!", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
+                    c.text("History", clay::text::TextConfig::new().font_size(ui.scale(24.0) as u16).color((0xff, 0xff, 0xff).into()).end());
+                });
+            });
+            c.with(&Declaration::new()
+                .background_color((0xff, 0, 0).into())
+                .layout()
+                    .width(grow!())
+                    .height(grow!())
+                .end(), |c| {
+            });
+        });
+
+        // central gap
+        c.with(&Declaration::new()
+            .corner_radius().all(radius).end()
+            .layout()
+                .width(grow!())
+                .height(grow!())
+                .padding(Padding(padding)).child_gap(child_gap)
+            .end(), |_| {});
+
+        // right pane
+        c.with(&Declaration::new()
+            .corner_radius().all(radius).end()
+            .layout()
+                .width(pane_pct)
+                .height(grow!())
+                .padding(Padding(padding)).child_gap(child_gap)
+            .end()
+            .background_color(pane_col), |_| {});
+    });
 
 
     // Return the list of render commands of your layout
@@ -282,6 +316,11 @@ fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
     result |= dbg_ui(ui, _data, is_rendering);
 
     result
+}
+
+// @Hack this is annoying!
+pub fn Padding(padding: &clay::layout::Padding) -> clay::layout::Padding {
+    clay::layout::Padding::new(padding.left, padding.right, padding.top, padding.bottom)
 }
 
 pub fn demo_of_rendering_stuff_with_context_that_allocates_in_the_background(ui: &mut Context, data: &mut SomeDataToKeepAround) -> bool {
@@ -326,6 +365,8 @@ impl Context {
     fn clay(&self)  -> &mut Clay { unsafe { &mut *self.clay } }
 
     fn scale(&self, size: f32) -> f32 { (size * self.scale).floor() }
+    fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
+    fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
 
     fn button(&self) -> bool {
         false
