@@ -222,6 +222,8 @@ impl Default for ZainodConfig {
 pub fn default_ephemeral_cookie_path() -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(runtime_dir).join("zaino").join(".cookie")
+    } else if let Ok(runtime_dir) = std::env::var("TEMP") {
+        PathBuf::from(runtime_dir).join("zaino").join(".cookie")
     } else {
         PathBuf::from("/tmp").join("zaino").join(".cookie")
     }
@@ -231,7 +233,10 @@ pub fn default_ephemeral_cookie_path() -> PathBuf {
 pub fn default_zaino_db_path() -> PathBuf {
     match std::env::var("HOME") {
         Ok(home) => PathBuf::from(home).join(".cache").join("zaino"),
-        Err(_) => PathBuf::from("/tmp").join("zaino").join(".cache"),
+        Err(_) => match std::env::var("USERPROFILE") {
+            Ok(home) => PathBuf::from(home).join(".cache").join("zaino"),
+            Err(_) => PathBuf::from("/tmp").join("zaino").join(".cache"),
+        }
     }
 }
 
@@ -239,9 +244,12 @@ pub fn default_zaino_db_path() -> PathBuf {
 pub fn default_zebra_db_path() -> Result<PathBuf, IndexerError> {
     match std::env::var("HOME") {
         Ok(home) => Ok(PathBuf::from(home).join(".cache").join("zebra")),
-        Err(e) => Err(IndexerError::ConfigError(format!(
-            "Unable to find home directory: {e}",
-        ))),
+        Err(e) => match std::env::var("USERPROFILE") {
+            Ok(home) => Ok(PathBuf::from(home).join(".cache").join("zebra")),
+            Err(e) => Err(IndexerError::ConfigError(format!(
+                "Unable to find home directory: {e}",
+            ))),
+        }
     }
 }
 
