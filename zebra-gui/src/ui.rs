@@ -479,7 +479,7 @@ fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
                     .end(), |c| {
 
                     let radius = ui.scale(24.0).dup4();
-                    let buttons = ["Send", "Receive", "Claim", "Stake", "Unstake"];
+                    let buttons = ["Send", "Receive", "Faucet", "Stake", "Unstake"];
 
                     for button in buttons {
                         let id = c.id(button);
