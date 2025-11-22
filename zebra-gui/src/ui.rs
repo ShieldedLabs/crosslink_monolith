@@ -445,17 +445,17 @@ fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
             let balance_text_h = ui.scale16(48.0);
 
             // Main contents
-            c.with(&Declaration::new()
-                .background_color(pane_col)
-                .corner_radius().bottom_left(radius).bottom_right(radius).end()
-                .layout()
-                    .direction(clay::layout::LayoutDirection::TopToBottom)
-                    .width(percent!(1.0))
-                    .height(grow!())
-                .end(), |c| {
+            ui.item(c, Item {
+                colour: (0x12, 0x12, 0x12, 0xff),
+                radius: (0.0, 0.0, radius, radius),
+                direction: Direction::TopToBottom,
+                width: Percent!(1.0),
+                height: Grow!(),
+                ..Default::default()
+            }, |c| {
 
                 // spacer
-                c.with(&Declaration::new().layout().width(grow!()).height(fixed!(ui.scale(32.0))).end(), |c| {});
+                ui.item(c, Item { width: Grow!(), height: Fixed!(ui.scale(32.0)), ..Default::default() }, |c| {});
 
                 // balance container
                 c.with(&Declaration::new()
@@ -468,15 +468,16 @@ fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
                     c.text("0.0000 cTAZ", clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE).alignment(clay::text::TextAlignment::Center).end());
                 });
 
+                let child_gap = child_gap as f32;
+                let padding = child_gap.dup4();
+
                 // buttons container
-                c.with(&Declaration::new()
-                    .layout()
-                        .width(percent!(1.0))
-                        .height(fit!())
-                        .padding(Padding(padding))
-                        .child_gap(child_gap)
-                        .child_alignment(align_center_center)
-                    .end(), |c| {
+                ui.item(c, Item {
+                    padding, child_gap, align: Align::Center,
+                    width: Percent!(1.0),
+                    height: Fit!(),
+                    ..Default::default()
+                }, |c| {
 
                     let radius = ui.scale(24.0).dup4();
                     let buttons = ["Send", "Receive", "Faucet", "Stake", "Unstake"];
@@ -485,9 +486,6 @@ fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
                         let id = c.id(button);
                         let hover = c.pointer_over(id);
                         let (down, click) = (hover && mouse_held, hover && mouse_clicked);
-
-                        let child_gap = child_gap as f32;
-                        let padding = child_gap.dup4();
 
                         const button_col:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff);
                         const button_hover_col: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
@@ -533,8 +531,7 @@ fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
                 .height(grow!())
                 .padding(Padding(padding))
                 .child_gap(child_gap)
-            .end()
-            , |_| {
+            .end(), |c| {
         });
 
         /*
@@ -547,8 +544,7 @@ fn run_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
                 .height(grow!())
                 .padding(Padding(padding))
                 .child_gap(child_gap)
-            .end()
-            , |_| {
+            .end(), |c| {
         });
         */
     });
