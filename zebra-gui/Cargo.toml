@@ -13,7 +13,7 @@ rustybuzz = "0.20.1"
 swash = "0.2.6"
 rodio = "0.21.1"
 arboard = "3.6.1"
-clay-layout = "0.4"
+clay-layout = { path = "../clay-rs" }
 wallet = { path = "../zebra-crosslink/wallet" }
 
 [profile.release]

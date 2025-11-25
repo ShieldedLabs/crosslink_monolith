@@ -1102,8 +1102,6 @@ checksum = "b94f61472cee1439c0b966b47e3aca9ae07e45d070759512cd390ea2bebc6675"
 [[package]]
 name = "clay-layout"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9093371d1d7b694c06c4a1707f80432cad37393a4e86cbf9aa9f42373445223e"
 dependencies = [
  "cc",
 ]

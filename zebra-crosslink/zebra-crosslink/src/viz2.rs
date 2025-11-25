@@ -144,6 +144,8 @@ pub async fn service_viz_requests(
                                 parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
                                 this_height: lo_height.0 as u64 + i as u64,
                                 is_best_chain: true,
+                                is_finalized: false,
+                                is_implicated_by_bft: false,
                                 points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash()),
                             });
                         }

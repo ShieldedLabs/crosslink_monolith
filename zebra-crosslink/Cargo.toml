@@ -38,7 +38,7 @@ zcash_encoding = { path = "../librustzcash/components/zcash_encoding" }
 zcash_history = { path = "../librustzcash/zcash_history" }
 zcash_keys = { path = "../librustzcash/zcash_keys" }
 zcash_primitives = { path = "../librustzcash/zcash_primitives" }
-zcash_proofs = { path = "../librustzcash/zcash_proofs" }
+zcash_proofs = { path = "../librustzcash/zcash_proofs", features = ["bundled-prover"] }
 zcash_transparent = { path = "../librustzcash/zcash_transparent" }
 zcash_protocol = { path = "../librustzcash/components/zcash_protocol" }
 
