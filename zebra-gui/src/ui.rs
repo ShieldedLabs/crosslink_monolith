@@ -144,6 +144,70 @@ impl Id {
     }
 }
 
+struct CloseElement {}
+fn item() -> CloseElement { unsafe { clay::Clay__OpenElement(); } CloseElement {} }
+impl Drop for CloseElement { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
+macro_rules! item { () => { let _item = item(); } }
+
+fn decl<
+    'render,
+    'clay: 'render,
+    ImageElementData: 'render,
+    CustomElementData: 'render
+>(
+    c: &clay::ClayLayoutScope<'clay, 'render, ImageElementData, CustomElementData>,
+    item: Item
+) {
+    fn sizing(sizing: Sizing) -> clay::layout::Sizing {
+        match sizing {
+            Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
+            Sizing::Grow(min, max) => { clay::layout::Sizing::Grow(min, max) }
+            Sizing::Fixed(x)       => { clay::layout::Sizing::Fixed(x) }
+            Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
+        }
+    }
+    let decl = Declaration::<ImageElementData, CustomElementData>::new()
+        .background_color(item.colour.into())
+        .id(item.id.clay())
+        // .clip(true, true, clay::math::Vector2 { x: 0.0, y: 0.0 })
+        .layout()
+            .width(sizing(item.width))
+            .height(sizing(item.height))
+            .padding(clay::layout::Padding {
+                left:   item.padding.0 as u16,
+                right:  item.padding.1 as u16,
+                top:    item.padding.2 as u16,
+                bottom: item.padding.3 as u16,
+            })
+            .child_gap(item.child_gap as u16)
+            .child_alignment(Alignment {
+                x: match item.align.x {
+                    AlignX::Left   => { LayoutAlignmentX::Left }
+                    AlignX::Center => { LayoutAlignmentX::Center }
+                    AlignX::Right  => { LayoutAlignmentX::Right }
+                },
+                y: match item.align.y {
+                    AlignY::Top     => { LayoutAlignmentY::Top }
+                    AlignY::Center  => { LayoutAlignmentY::Center }
+                    AlignY::Bottom  => { LayoutAlignmentY::Bottom }
+                }
+            })
+            .direction(match item.direction {
+                Direction::TopToBottom => { clay::layout::LayoutDirection::TopToBottom }
+                Direction::LeftToRight => { clay::layout::LayoutDirection::LeftToRight }
+            })
+        .end()
+        .corner_radius()
+            .top_left(item.radius.0)
+            .top_right(item.radius.1)
+            .bottom_left(item.radius.2)
+            .bottom_right(item.radius.3)
+        .end()
+        .inner;
+
+    unsafe { clay::Clay__ConfigureOpenElement(decl); }
+}
+
 impl Context {
     pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, ..Default::default() } }
     fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw  } }
@@ -167,70 +231,11 @@ impl Context {
         g: G,
         f: F
     ) {
-        unsafe {
-            clay::Clay_SetCurrentContext(c.clay.context);
-            clay::Clay__OpenElement();
-        }
+        item!();
 
-        let item = g(c);
-
-        fn sizing(sizing: Sizing) -> clay::layout::Sizing {
-            match sizing {
-                Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
-                Sizing::Grow(min, max) => { clay::layout::Sizing::Grow(min, max) }
-                Sizing::Fixed(x)       => { clay::layout::Sizing::Fixed(x) }
-                Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
-            }
-        }
-
-        let decl = Declaration::<ImageElementData, CustomElementData>::new()
-            .background_color(item.colour.into())
-            .id(item.id.clay())
-            // .clip(true, true, clay::math::Vector2 { x: 0.0, y: 0.0 })
-            .layout()
-                .width(sizing(item.width))
-                .height(sizing(item.height))
-                .padding(clay::layout::Padding {
-                    left:   item.padding.0 as u16,
-                    right:  item.padding.1 as u16,
-                    top:    item.padding.2 as u16,
-                    bottom: item.padding.3 as u16,
-                })
-                .child_gap(item.child_gap as u16)
-                .child_alignment(Alignment {
-                    x: match item.align.x {
-                        AlignX::Left   => { LayoutAlignmentX::Left }
-                        AlignX::Center => { LayoutAlignmentX::Center }
-                        AlignX::Right  => { LayoutAlignmentX::Right }
-                    },
-                    y: match item.align.y {
-                        AlignY::Top     => { LayoutAlignmentY::Top }
-                        AlignY::Center  => { LayoutAlignmentY::Center }
-                        AlignY::Bottom  => { LayoutAlignmentY::Bottom }
-                    }
-                })
-                .direction(match item.direction {
-                    Direction::TopToBottom => { clay::layout::LayoutDirection::TopToBottom }
-                    Direction::LeftToRight => { clay::layout::LayoutDirection::LeftToRight }
-                })
-            .end()
-            .corner_radius()
-                .top_left(item.radius.0)
-                .top_right(item.radius.1)
-                .bottom_left(item.radius.2)
-                .bottom_right(item.radius.3)
-            .end()
-            .inner;
-
-        unsafe {
-            clay::Clay__ConfigureOpenElement(decl);
-        }
+        decl(c, g(c));
 
         f(c);
-
-        unsafe {
-            clay::Clay__CloseElement();
-        }
     }
 
     fn button<
@@ -350,6 +355,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
 
     let mut c = clay.begin::<(), ()>();
 
+    unsafe { clay::Clay_SetCurrentContext(c.clay.context); }
+
     ui.item(&c, |c| Item {
         id: Id::id("Main"),
         padding, child_gap,
@@ -460,8 +467,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                         ..Default::default()
                     }, |c| {
 
-                        let mut f = |button| {
-                            let id = Id::id(button);
+                        let mut button = |label| {
+                            let id = Id::id(label);
                             let (clicked, colour) = ui.button(c, &mut clicked_id, id);
                             ui.item(c, |c| Item {
                                 id, child_gap, align: Align::Center,
@@ -481,20 +488,20 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                                     ..Default::default()
                                 }, |c| {
                                     let temp_letter_symbol_h = ui.scale16(32.0);
-                                    c.text(&button[..1], clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                                    c.text(&label[..1], clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
                                 });
 
                                 let button_text_h = ui.scale16(16.0);
-                                c.text(button, clay::text::TextConfig::new().font_size(button_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                                c.text(label, clay::text::TextConfig::new().font_size(button_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
                             });
                             clicked
                         };
 
-                        if f("Send")    { println!("Send!");    }
-                        if f("Receive") { println!("Receive!"); }
-                        if f("Faucet")  { println!("Faucet!");  }
-                        if f("Stake")   { println!("Stake!");   }
-                        if f("Unstake") { println!("Unstake!"); }
+                        if button("Send")    { println!("Send!");    }
+                        if button("Receive") { println!("Receive!"); }
+                        if button("Faucet")  { println!("Faucet!");  }
+                        if button("Stake")   { println!("Stake!");   }
+                        if button("Unstake") { println!("Unstake!"); }
 
                     });
 
