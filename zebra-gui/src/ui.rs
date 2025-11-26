@@ -104,6 +104,8 @@ impl Align {
     }};
 }
 
+use Direction::*;
+
 
 #[derive(Debug, Default, Copy, Clone)]
 struct Decl {
@@ -405,7 +407,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
 
         if let _ = elem() && decl(Decl {
             id: id("Left Pane"),
-            direction: Direction::TopToBottom,
+            direction: TopToBottom,
             width: pane_pct,
             height: Grow!(),
             ..Decl::default()
@@ -434,7 +436,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                 id: id("Main Contents"),
                 colour: PANE_COL,
                 radius: (0.0, 0.0, radius.2, radius.3),
-                direction: Direction::TopToBottom,
+                direction: TopToBottom,
                 width: Percent!(1.0),
                 height: Grow!(),
                 ..Decl::default()
@@ -478,7 +480,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                             let (clicked, colour) = ui.button(&mut clicked_id, id);
                             if let _ = elem() && decl(Decl {
                                 id, child_gap, align: Align::Center,
-                                direction: Direction::TopToBottom,
+                                direction: TopToBottom,
                                 width: Fit!(),
                                 height: Fit!(),
                                 ..Decl::default()
@@ -542,7 +544,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
 
         if let _ = elem() && decl(Decl {
             id: id("Right Pane"),
-            direction: Direction::TopToBottom,
+            direction: TopToBottom,
             width: pane_pct,
             height: Grow!(),
             ..Decl::default()
@@ -571,7 +573,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                 id: id("Main Contents"),
                 colour: PANE_COL,
                 radius: (0.0, 0.0, radius.2, radius.3),
-                direction: Direction::TopToBottom,
+                direction: TopToBottom,
                 width: Percent!(1.0),
                 height: Grow!(),
                 ..Decl::default()
