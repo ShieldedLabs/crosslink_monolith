@@ -6,9 +6,12 @@ use crate::chain::{
     utils::{read_bytes, read_i32, read_u32, read_zcash_script_i64, CompactSize, ParseFromSlice},
 };
 use sha2::{Digest, Sha256};
-use zebra_chain::{block::FatPointerToBftBlock, serialization::ZcashDeserialize};
 use std::io::Cursor;
 use zaino_proto::proto::compact_formats::{ChainMetadata, CompactBlock};
+use zebra_chain::{
+    block::FatPointerToBftBlock,
+    serialization::{ZcashDeserialize, ZcashSerialize},
+};
 
 /// A block header, containing metadata about a block.
 ///
@@ -150,7 +153,8 @@ impl ParseFromSlice for BlockHeaderData {
         };
 
         let fat_pointer_to_bft_block = if logical_version >= 5 {
-            FatPointerToBftBlock::zcash_deserialize(&mut cursor).expect("Error reading BlockHeaderData::fat_pointer_to_bft_block")
+            FatPointerToBftBlock::zcash_deserialize(&mut cursor)
+                .expect("Error reading BlockHeaderData::fat_pointer_to_bft_block")
         } else {
             FatPointerToBftBlock::null()
         };
@@ -188,6 +192,20 @@ impl BlockHeaderData {
         CompactSize::write(&mut solution_compact_size, self.solution.len())?;
         buffer.extend(solution_compact_size);
         buffer.extend(&self.solution);
+
+        let logical_version = if &self.version & 0xffff_0000u32 as i32 != 0 {
+            self.version.reverse_bits()
+        } else {
+            self.version
+        };
+
+        if logical_version >= 5 as i32 {
+            let mut tmp = Vec::new();
+            self.fat_pointer_to_bft_block
+                .zcash_serialize(&mut tmp)
+                .map_err(|e| ParseError::InvalidData(e.to_string()))?;
+            buffer.extend(tmp);
+        }
 
         Ok(buffer)
     }

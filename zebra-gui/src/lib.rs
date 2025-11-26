@@ -961,7 +961,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
 
     let mut gui_clay = clay_layout::Clay::new((1280., 720.).into());
 
-    let mut gui_ctx = ui::Context::new(ui::Style::dark());
+    let mut gui_ctx = ui::Context::new();
     let mut some_data_to_keep_around = ui::SomeDataToKeepAround{ ..Default::default() };
 
     gui_ctx.clay = &mut gui_clay;
@@ -1232,7 +1232,6 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                 *put = DrawCommand::ClearScreenToColor { color: 0x090909 };
                                             }
 
-                                            gui_ctx.delta = dt;
                                             gui_ctx.input = &input_ctx;
                                             gui_ctx.draw  = &draw_ctx;
                                             gui_ctx.dpi_scale = window.scale_factor() as f32;

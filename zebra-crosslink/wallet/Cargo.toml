@@ -13,7 +13,7 @@ zcash_keys = { workspace = true, features=["transparent-inputs"] }
 zcash_protocol = { workspace = true } # version = "0.7.1"
 zcash_transparent = { workspace = true } # version = "0.6.1"
 zcash_note_encryption = { workspace = true } # version = "0.4.1"
-zcash_proofs = { workspace = true }
+zcash_proofs = { workspace = true, features = ["bundled-prover"] }
 zebra-chain = { path = "../zebra-chain" }
 
 

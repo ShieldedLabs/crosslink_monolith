@@ -4,106 +4,17 @@ use std::thread::current;
 use std::{hash::Hash};
 use winit::{event::MouseButton, keyboard::KeyCode};
 use clay_layout as clay;
-use clay::{fit, fixed, grow, percent, Clay, Declaration};
+use clay::{Clay, Declaration};
 use clay::render_commands::RenderCommandConfig::{Rectangle, Text};
 use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
+//use clay::*; // @Temporary
 
 use super::*;
-
-// make widgets nicer to construct
-#[allow(unused_macros)]
-macro_rules! widget {
-    // Base case: only id and flags, no fields
-    ($id:expr, $flags:expr) => {{
-        Widget {
-            id: $id,
-            flags: $flags,
-            ..Default::default()
-        }
-    }};
-
-    // Case with fields: id, flags, then key-value pairs
-    ($id:expr, $flags:expr, $($field:ident: $value:expr),* $(,)?) => {{
-        Widget {
-            id: $id,
-            flags: $flags,
-            $($field: $value,)*
-            ..Default::default()
-        }
-    }};
-}
-
-// poor man's bitset
-macro_rules! bitset {
-    // bitset with no type, defaults to u64
-    ($name:ident, $($flag:ident = $value:expr),* $(,)?) => {
-        bitset!($name<u64>, $($flag = $value),*);
-    };
-
-    // bitset with provided type
-    ($name:ident<$type:ty>, $($flag:ident = $value:expr),* $(,)?) => {
-        #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
-        pub struct $name($type);
-
-        #[allow(dead_code)]
-        impl $name {
-            $(pub const $flag: Self = Self($value);)*
-
-            pub const fn has(&self, flag: Self) -> bool {
-                self.0 & flag.0 != 0
-            }
-        }
-
-        impl Into<$type> for $name {
-            fn into(self) -> $type {
-                self.0
-            }
-        }
-
-        impl From<$type> for $name {
-            fn from(value: $type) -> Self {
-                Self(value)
-            }
-        }
-
-        impl std::ops::BitOr for $name {
-            type Output = Self;
-            fn bitor(self, rhs: Self) -> Self::Output {
-                Self(self.0 | rhs.0)
-            }
-        }
-        impl std::ops::BitOrAssign for $name {
-            fn bitor_assign(&mut self, rhs: Self) {
-                self.0 |= rhs.0;
-            }
-        }
-
-        impl std::ops::BitAnd for $name {
-            type Output = Self;
-            fn bitand(self, rhs: Self) -> Self::Output {
-                Self(self.0 & rhs.0)
-            }
-        }
-        impl std::ops::BitAndAssign for $name {
-            fn bitand_assign(&mut self, rhs: Self) {
-                self.0 &= rhs.0;
-            }
-        }
-
-        impl std::ops::Not for $name {
-            type Output = Self;
-            fn not(self) -> Self::Output {
-                Self(!self.0)
-            }
-        }
-    };
-}
 
 pub fn magic<'a, 'b, T>(mut_ref: &'a mut T) -> &'b mut T {
     let mut_ref = mut_ref as *mut T;
     return unsafe { &mut *mut_ref };
 }
-
 
 #[derive(Debug, Default)]
 pub struct SomeDataToKeepAround {
@@ -155,11 +66,11 @@ fn dbg_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
 }
 
 #[derive(Debug, Default, Copy, Clone)] enum Direction { #[default] LeftToRight, TopToBottom }
-#[derive(Debug, Default, Copy, Clone)] enum AlignX    { #[default] Left, Center, Right }
-#[derive(Debug, Default, Copy, Clone)] enum AlignY    { #[default] Top, Center, Bottom }
+#[derive(Debug, Default, Copy, Clone)] enum AlignX    { #[default] Left, Right, Center }
+#[derive(Debug, Default, Copy, Clone)] enum AlignY    { #[default] Top, Bottom, Center }
 #[derive(Debug, Default, Copy, Clone)] struct Align   { x: AlignX, y: AlignY }
 #[derive(Debug,          Copy, Clone)] enum Sizing    { Fit(f32, f32), Grow(f32, f32), Fixed(f32), Percent(f32) }
-#[derive(Debug, Default, Copy, Clone)] struct Id      { base_id: u32, id: u32, offset: u32, chars: *const u8, len: usize }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] struct Id { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
 impl Default for Sizing { fn default() -> Self { Self::Fit(0.0, f32::MAX) } }
 impl Align {
     const TopLeft:     Self = Self { y: AlignY::Top,    x: AlignX::Left };
@@ -172,18 +83,18 @@ impl Align {
     const Bottom:      Self = Self { y: AlignY::Bottom, x: AlignX::Center };
     const BottomRight: Self = Self { y: AlignY::Bottom, x: AlignX::Right };
 }
-#[macro_export] macro_rules! Fit {
+#[macro_export] macro_rules! fit {
     ($min:expr, $max:expr) => { Sizing::Fit($min, $max) };
-    ($min:expr)            => { Fit!($min, f32::MAX) };
-    ()                     => { Fit!(0.0) };
+    ($min:expr)            => { fit!($min, f32::MAX) };
+    ()                     => { fit!(0.0) };
 }
-#[macro_export] macro_rules! Grow {
+#[macro_export] macro_rules! grow {
     ($min:expr, $max:expr) => { Sizing::Grow($min, $max) };
-    ($min:expr)            => { Grow!($min, f32::MAX) };
-    ()                     => { Grow!(0.0) };
+    ($min:expr)            => { grow!($min, f32::MAX) };
+    ()                     => { grow!(0.0) };
 }
-#[macro_export] macro_rules! Fixed { ($val:expr) => { Sizing::Fixed($val) }; }
-#[macro_export] macro_rules! Percent {
+#[macro_export] macro_rules! fixed { ($val:expr) => { Sizing::Fixed($val) }; }
+#[macro_export] macro_rules! percent {
     ($percent:expr) => {{
         const _: () = assert!(
             $percent >= 0.0 && $percent <= 1.0,
@@ -193,9 +104,11 @@ impl Align {
     }};
 }
 
+use Direction::*;
+
 
 #[derive(Debug, Default, Copy, Clone)]
-struct Item {
+struct Decl {
     id: Id,
     direction: Direction,
     colour: (u8, u8, u8, u8),
@@ -208,151 +121,206 @@ struct Item {
 }
 
 impl Id {
-    fn from_clay(id: clay::id::Id) -> Self {
-        Self {
-            base_id: id.id.baseId,
-            id: id.id.id,
-            offset: id.id.offset,
-            chars: id.id.stringId.chars as *const u8,
-            len: id.id.stringId.length as usize
-        }
-    }
-    fn to_clay(id: Self) -> clay::id::Id {
+    fn clay(&self) -> clay::id::Id {
         clay::id::Id {
             id: clay::Clay_ElementId {
-                baseId: id.base_id,
-                id: id.id,
-                offset: id.offset,
+                id: self.id,
+                offset: self.offset,
+                baseId: self.base_id,
                 stringId: clay::Clay_String {
                     isStaticallyAllocated: false,
-                    chars: id.chars as *const i8,
-                    length: id.len as i32
+                    length: self.len as i32,
+                    chars: self.chars as *const i8
                 }
             }
         }
     }
+    fn id(label: &str) -> Self {
+        let id = unsafe { clay::Clay__HashString(label.into(), 0, clay::Clay__GetParentElementId()) };
+        Self {
+            id: id.id,
+            offset: id.offset,
+            base_id: id.baseId,
+            len: id.stringId.length as usize,
+            chars: id.stringId.chars as *const u8
+        }
+    }
 }
 
-// fn clay_string_from(s: &[u8]) -> clay::Clay_String {
-//     clay::Clay_String {
-//         chars: s.as_ptr() as *const i8,
-//         isStaticallyAllocated: true,
-//         length: s.len() as i32,
-//     }
-// }
+fn id(label: &str) -> Id { Id::id(label) }
 
-// pub fn clay_test() {
-//     unsafe {
-//         clay::Clay_SetCurrentContext(std::ptr::null_mut() as *mut clay::Clay_Context);
-//         clay::Clay__OpenElement();
-//         let decl = clay::Clay_ElementDeclaration {
-//             backgroundColor: (0.0, 0.0, 0.0, 0.0).into(),
-//
-//         };
-//         clay::Clay__ConfigureOpenElement();
-//     }
-// }
+struct CloseElement {}
+fn elem() -> CloseElement { unsafe { clay::Clay__OpenElement(); } CloseElement {} }
+impl Drop for CloseElement { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
+impl CloseElement { fn decl(&self, item: Decl) -> &Self { decl(item); self } }
+
+const Clay_ElementId_ZERO: clay::Clay_ElementId = clay::Clay_ElementId { id: 0, offset: 0, baseId: 0, stringId: clay::Clay_String { isStaticallyAllocated: false, length: 0, chars: std::ptr::null() } };
+const Clay_SizingMinMax_ZERO: clay::Clay_SizingMinMax = clay::Clay_SizingMinMax { min: 0f32, max: f32::MAX };
+const Clay_SizingAxis_ZERO: clay::Clay_SizingAxis = clay::Clay_SizingAxis {
+    size: clay::Clay_SizingAxis__bindgen_ty_1 { minMax: Clay_SizingMinMax_ZERO },
+    type_: clay::Clay__SizingType_CLAY__SIZING_TYPE_FIT
+};
+const Clay_Sizing_ZERO: clay::Clay_Sizing = clay::Clay_Sizing { width: Clay_SizingAxis_ZERO, height: Clay_SizingAxis_ZERO };
+const Clay_Padding_ZERO: clay::Clay_Padding = clay::Clay_Padding { left: 0, right: 0, top: 0, bottom: 0 };
+const Clay_ChildAlignment_ZERO: clay::Clay_ChildAlignment = clay::Clay_ChildAlignment { x: 0 as _, y: 0 as _ };
+const Clay_LayoutConfig_ZERO: clay::Clay_LayoutConfig = clay::Clay_LayoutConfig {
+    sizing: Clay_Sizing_ZERO,
+    padding: Clay_Padding_ZERO,
+    childGap: 0,
+    childAlignment: Clay_ChildAlignment_ZERO,
+    layoutDirection: clay::Clay_LayoutDirection_CLAY_LEFT_TO_RIGHT,
+};
+const Clay_Color_ZERO: clay::Clay_Color = clay::Clay_Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+const Clay_CornerRadius_ZERO: clay::Clay_CornerRadius = clay::Clay_CornerRadius { topLeft: 0f32, topRight: 0f32, bottomLeft: 0f32, bottomRight: 0f32 };
+const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Clay_ElementDeclaration {
+    id: Clay_ElementId_ZERO,
+    layout: Clay_LayoutConfig_ZERO,
+    backgroundColor: Clay_Color_ZERO,
+    cornerRadius: Clay_CornerRadius_ZERO,
+    aspectRatio: clay::Clay_AspectRatioElementConfig { aspectRatio: 0.0 },
+    image: clay::Clay_ImageElementConfig { imageData: std::ptr::null_mut() },
+    floating: clay::Clay_FloatingElementConfig {
+        offset: clay::Clay_Vector2 { x: 0f32, y: 0f32 },
+        expand: clay::Clay_Dimensions { width: 0f32, height: 0f32 },
+        parentId: 0,
+        zIndex: 0,
+        attachPoints: clay::Clay_FloatingAttachPoints {
+            element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
+            parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
+        },
+        pointerCaptureMode: clay::Clay_PointerCaptureMode_CLAY_POINTER_CAPTURE_MODE_CAPTURE,
+        attachTo: clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_NONE,
+        clipTo: clay::Clay_FloatingClipToElement_CLAY_CLIP_TO_NONE
+    },
+    custom: clay::Clay_CustomElementConfig { customData: std::ptr::null_mut() },
+    clip: clay::Clay_ClipElementConfig { horizontal: false, vertical: false, childOffset: clay::Clay_Vector2 { x: 0f32, y: 0f32 } },
+    border: clay::Clay_BorderElementConfig {
+        color: Clay_Color_ZERO,
+        width: clay::Clay_BorderWidth { left: 0, right: 0, top: 0, bottom: 0, betweenChildren: 0 }
+    },
+    userData: std::ptr::null_mut(),
+};
+
+fn decl(item: Decl) {
+    fn sizing(sizing: Sizing) -> clay::layout::Sizing {
+        match sizing {
+            Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
+            Sizing::Grow(min, max) => { clay::layout::Sizing::Grow(min, max) }
+            Sizing::Fixed(x)       => { clay::layout::Sizing::Fixed(x) }
+            Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
+        }
+    }
+    
+
+    let mut decl = Clay_ElementDeclaration_ZERO;
+    decl.backgroundColor = clay::Clay_Color {
+        r: item.colour.0 as f32,
+        g: item.colour.1 as f32,
+        b: item.colour.2 as f32,
+        a: item.colour.3 as f32
+    };
+    decl.id = item.id.clay().id;
+    // decl.clip = Clay_ClipElementConfig { true, true, Clay_Vector2 { x: 0.0, y: 0.0 } };
+    decl.layout.sizing.width  = clay::Clay_SizingAxis::from(sizing(item.width));
+    decl.layout.sizing.height = clay::Clay_SizingAxis::from(sizing(item.height));
+    decl.layout.padding = clay::Clay_Padding::from(clay::Clay_Padding {
+        left:   item.padding.0 as u16,
+        right:  item.padding.1 as u16,
+        top:    item.padding.2 as u16,
+        bottom: item.padding.3 as u16,
+    });
+    decl.layout.childGap = item.child_gap as u16;
+    decl.layout.childAlignment = clay::Clay_ChildAlignment { x: item.align.x as _, y: item.align.y as _ };
+    decl.layout.layoutDirection = item.direction as _;
+    decl.cornerRadius = clay::Clay_CornerRadius {
+        topLeft:     item.radius.0,
+        topRight:    item.radius.1,
+        bottomLeft:  item.radius.2,
+        bottomRight: item.radius.3
+    };
+
+    unsafe { clay::Clay__ConfigureOpenElement(decl); }
+}
+
+const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
+const WHITE_CLAY:       clay::Color = clay::Color::rgba(WHITE.0 as f32, WHITE.1 as f32, WHITE.2 as f32, WHITE.3 as f32);
+const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff);
+const INACTIVE_TAB_COL: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
+const ACTIVE_TAB_COL:   (u8, u8, u8, u8) = PANE_COL;
+const BUTTON_COL:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff);
+const BUTTON_HOVER_COL: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
+const BUTTON_DOWN_COL:  (u8, u8, u8, u8) = (0x1e, 0x1e, 0x1e, 0xff);
+
 
 impl Context {
-    fn item<
-        'render,
-        'clay: 'render,
-        ImageElementData: 'render,
-        CustomElementData: 'render,
-        T: FnOnce(&mut clay::ClayLayoutScope<'clay, 'render, ImageElementData, CustomElementData>)
-    >(
-        &self,
-        c: &mut clay::ClayLayoutScope<'clay, 'render, ImageElementData, CustomElementData>,
-        item: Item,
-        F: T
-    ) {
-        fn sizing(sizing: Sizing) -> clay::layout::Sizing {
-            match sizing {
-                Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
-                Sizing::Grow(min, max) => { clay::layout::Sizing::Grow(min, max) }
-                Sizing::Fixed(x)       => { clay::layout::Sizing::Fixed(x) }
-                Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
-            }
-        }
-        c.with(
-            &Declaration::new()
-            .background_color(item.colour.into())
-            .id(Id::to_clay(item.id))
-            // .clip(true, true, clay::math::Vector2 { x: 0.0, y: 0.0 })
-            .layout()
-                .width(sizing(item.width))
-                .height(sizing(item.height))
-                .padding(clay::layout::Padding {
-                    left:   item.padding.0 as u16,
-                    right:  item.padding.1 as u16,
-                    top:    item.padding.2 as u16,
-                    bottom: item.padding.3 as u16,
-                })
-                .child_gap(item.child_gap as u16)
-                .child_alignment(Alignment {
-                    x: match item.align.x {
-                        AlignX::Left   => { LayoutAlignmentX::Left }
-                        AlignX::Center => { LayoutAlignmentX::Center }
-                        AlignX::Right  => { LayoutAlignmentX::Right }
-                    },
-                    y: match item.align.y {
-                        AlignY::Top     => { LayoutAlignmentY::Top }
-                        AlignY::Center  => { LayoutAlignmentY::Center }
-                        AlignY::Bottom  => { LayoutAlignmentY::Bottom }
-                    }
-                })
-                .direction(match item.direction {
-                    Direction::TopToBottom => { clay::layout::LayoutDirection::TopToBottom }
-                    Direction::LeftToRight => { clay::layout::LayoutDirection::LeftToRight }
-                })
-            .end()
-            .corner_radius()
-                .top_left(item.radius.0)
-                .top_right(item.radius.1)
-                .bottom_left(item.radius.2)
-                .bottom_right(item.radius.3)
-            .end(),
-            F
-        );
-    }
+    pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, ..Default::default() } }
+    fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw     } }
+    fn input(&self) -> &InputCtx { unsafe { &*self.input    } }
+    fn clay(&self)  -> &mut Clay { unsafe { &mut *self.clay } }
 
-    fn button<
-        'render,
-        'clay: 'render,
-        ImageElementData: 'render,
-        CustomElementData: 'render,
-    >(
-        &self,
-        c: &mut clay::ClayLayoutScope<'clay, 'render, ImageElementData, CustomElementData>,
-        clicked_id: &mut Id,
-        id: Id
-    ) -> (bool, (u8, u8, u8, u8)) {
+    fn scale(&self, size: f32) -> f32 { (size * self.scale).floor() }
+    fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
+    fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
+
+    fn button(&self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) {
         let mouse_held    = self.input().mouse_held(winit::event::MouseButton::Left);
         let mouse_clicked = self.input().mouse_pressed(winit::event::MouseButton::Left);
 
-        let hover = c.pointer_over(Id::to_clay(id));
+        let hover = unsafe { clay::Clay_PointerOver(id.clay().id) };
         let (down, click) = (hover && mouse_held, hover && mouse_clicked);
         if click {
             *clicked_id = id;
         }
 
-        const button_col:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff);
-        const button_hover_col: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
-        const button_down_col:  (u8, u8, u8, u8) = (0x1e, 0x1e, 0x1e, 0xff);
-
         let colour = if down || click {
             if clicked_id.id == id.id {
-                button_down_col
+                BUTTON_DOWN_COL
             } else {
-                button_col
+                BUTTON_COL
             }
         } else if hover {
-            button_hover_col
+            BUTTON_HOVER_COL
         } else {
-            button_col
+            BUTTON_COL
         };
 
         (click, colour)
+    }
+
+    fn text(&self, label: &str, config: clay::text::TextElementConfig) {
+        unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
+    }
+
+    fn tab(&self,
+           radius: (f32, f32, f32, f32),
+           padding: (f32, f32, f32, f32),
+           tab_id: &mut Id,
+           clicked_id: &mut Id,
+           label: &str) -> Id {
+        let tab_text_h = self.scale16(18.0);
+
+        let radius = (radius.0, radius.1, 0.0, 0.0);
+
+        let id = Id::id(label);
+
+        let (clicked, _) = self.button(clicked_id, id);
+        if clicked || *tab_id == Id::default() {
+            *tab_id = id;
+        }
+
+        if let _ = elem().decl(Decl {
+            id,
+            radius, padding,
+            colour: if *tab_id == id { ACTIVE_TAB_COL } else { INACTIVE_TAB_COL },
+            width: grow!(),
+            height: grow!(),
+            align: Align::Center,
+            ..Decl::default()
+        }) {
+            self.text(label, clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+        }
+
+        id
     }
 }
 
@@ -362,6 +330,7 @@ trait         Dup3: Copy { fn dup3(self) -> (Self, Self, Self); }
 impl<T: Copy> Dup3 for T { fn dup3(self) -> (Self, Self, Self) { (self, self, self) } }
 trait         Dup4: Copy { fn dup4(self) -> (Self, Self, Self, Self); }
 impl<T: Copy> Dup4 for T { fn dup4(self) -> (Self, Self, Self, Self) { (self, self, self, self) } }
+
 
 fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
     let mut result = false;
@@ -401,14 +370,6 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
     let child_gap = ui.scale(8.0);
     let padding = child_gap.dup4();
 
-    const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
-    const WHITE_CLAY:       clay::Color = clay::Color::rgba(WHITE.0 as f32, WHITE.1 as f32, WHITE.2 as f32, WHITE.3 as f32);
-    const pane_col:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff);
-    const inactive_tab_col: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
-    const active_tab_col:   (u8, u8, u8, u8) = pane_col;
-    const button_col:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff);
-    const button_hover_col: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
-
     const align_center_center: Alignment = Alignment { x: LayoutAlignmentX::Center, y: LayoutAlignmentY::Center };
 
     let mouse_held    = ui.input().mouse_held(winit::event::MouseButton::Left);
@@ -427,198 +388,205 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
     });
 
     let mut clicked_id = ui.clicked_id;
-    let mut tab_id = ui.tab_id;
+    let mut pane_tab_l = ui.pane_tab_l; // @Todo: how to not have to do this in rust?
+    let mut pane_tab_r = ui.pane_tab_r; // @Todo: how to not have to do this in rust?
 
     let mut c = clay.begin::<(), ()>();
 
-    ui.item(&mut c, Item {
-        padding, child_gap,
-        width: Grow!(),
-        height: Grow!(),
-        ..Default::default()
-    }, |c| {
+    unsafe { clay::Clay_SetCurrentContext(c.clay.context); }
+
+    if let _ = elem().decl(Decl {
+        id: id("Main"),
+        padding: (0.0, 0.0, padding.2, padding.3), child_gap,
+        width: grow!(),
+        height: grow!(),
+        ..Decl::default()
+    }) {
         let pane_pct = {
             let pct = 0.25;
             // clay::layout::Sizing::Percent((pct * ui.scale).min(pct))
             Sizing::Percent(pct * ui.scale)
         };
 
-        let mut current_tab = 0;
-
-        // left pane
-        ui.item(c, Item {
-            direction: Direction::TopToBottom,
+        if let _ = elem().decl(Decl {
+            id: id("Left Pane"),
+            direction: TopToBottom,
             width: pane_pct,
-            height: Grow!(),
-            ..Default::default()
-        }, |c| {
+            height: grow!(),
+            ..Decl::default()
+        }) {
 
-            // tab bar
-            ui.item(c, Item {
+            let mut tab_id_wallet = Id::default();
+            let mut tab_id_finalizers = Id::default();
+            let mut tab_id_history = Id::default();
+
+            if let _ = elem().decl(Decl {
+                id: id("Tab Bar"),
                 child_gap,
-                width: Percent!(1.0),
-                height: Fit!(),
+                width: percent!(1.0),
+                height: fit!(),
                 align: Align::Center,
-                ..Default::default()
-            }, |c| {
-                let tab_text_h = ui.scale16(18.0);
-
-                let radius = (radius.0, radius.1, 0.0, 0.0);
-
-                let mut tab = |name| {
-                    let id = Id::from_clay(c.id(name));
-                    let (_, color) = ui.button(c, &mut tab_id, id);
-                    ui.item(c, Item {
-                        id,
-                        radius,
-                        padding,
-                        colour: color,
-                        width: Grow!(),
-                        height: Grow!(),
-                        align: Align::Center,
-                        ..Default::default()
-                    }, |c| {
-                        c.text(name, clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
-                    });
-
-                    tab_id.id == id.id
-                };
-
-                if tab("Wallet") {
-                    current_tab = 0;
-                }
-                if tab("Finalizers") {
-                    current_tab = 1;
-                }
-                if tab("History") {
-                    current_tab = 2;
-                }
-            });
-
-            let balance_text_h = ui.scale16(48.0);
+                ..Decl::default()
+            }) {
+                tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, &mut pane_tab_l, &mut clicked_id, "Wallet");
+                tab_id_finalizers = ui.tab(radius, padding, &mut pane_tab_l, &mut clicked_id, "Finalizers");
+                tab_id_history    = ui.tab(radius, padding, &mut pane_tab_l, &mut clicked_id, "History");
+            }
 
             // Main contents
-            ui.item(c, Item {
-                colour: (0x12, 0x12, 0x12, 0xff),
-                radius: (0.0, 0.0, radius.2, radius.3),
-                direction: Direction::TopToBottom,
-                width: Percent!(1.0),
-                height: Grow!(),
-                ..Default::default()
-            }, |c| {
+            if let _ = elem().decl(Decl {
+                id: id("Main Contents"),
+                colour: PANE_COL,
+                radius: (0.0, 0.0, radius.2, 0.0),
+                direction: TopToBottom,
+                width: percent!(1.0),
+                height: grow!(),
+                ..Decl::default()
+            }) {
+                let balance_text_h = ui.scale16(48.0);
+
                 // spacer
-                ui.item(c, Item { width: Grow!(), height: Fixed!(ui.scale(32.0)), ..Default::default() }, |c| {});
+                if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
-                match current_tab {
-                    0 /* wallet */ =>  {
-                        // balance container
-                        ui.item(c, Item {
-                            width: Percent!(1.0),
-                            height: Fit!(),
-                            padding,
-                            align: Align::Center,
-                            ..Default::default()
-                        }, |c| {
-                            let balance = wallet_state.lock().unwrap().balance;
-                            let zec_full = balance / 100_000_000;
-                            let zec_part = balance % 100_000_000;
-                            balance_str = format!("{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
-                            c.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
-                        });
+                if pane_tab_l == tab_id_wallet {
 
-                        let child_gap = child_gap as f32;
-                        let padding = child_gap.dup4();
-
-                        // buttons container
-                        ui.item(c, Item {
-                            padding, child_gap, align: Align::Center,
-                            width: Percent!(1.0),
-                            height: Fit!(),
-                            ..Default::default()
-                        }, |c| {
-                            let mut f = |button| {
-                                let id = Id::from_clay(c.id(button));
-                                let (clicked, colour) = ui.button(c, &mut clicked_id, id);
-                                ui.item(c, Item {
-                                    id,
-                                    child_gap,
-                                    align: Align::Center,
-                                    direction: Direction::TopToBottom,
-                                    width: Fit!(),
-                                    height: Fit!(),
-                                    ..Default::default()
-                                }, |c| {
-                                    let radius = ui.scale(24.0);
-
-                                    // Button circle
-                                    ui.item(c, Item {
-                                        colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
-                                        width:  Fixed!(radius * 2.0),
-                                        height: Fixed!(radius * 2.0),
-                                        ..Default::default()
-                                    }, |c| {
-                                        let temp_letter_symbol_h = ui.scale16(32.0);
-                                        c.text(&button[..1], clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
-                                    });
-
-                                    let button_text_h = ui.scale16(16.0);
-                                    c.text(button, clay::text::TextConfig::new().font_size(button_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
-                                });
-                                clicked
-                            };
-
-                            if f("Send")    { println!("Send!");    }
-                            if f("Receive") { println!("Receive!"); }
-                            if f("Faucet")  { println!("Faucet!");  }
-                            if f("Stake")   { println!("Stake!");   }
-                            if f("Unstake") { println!("Unstake!"); }
-                        });
+                    // balance container
+                    if let _ = elem().decl(Decl {
+                        width: percent!(1.0),
+                        height: fit!(),
+                        padding,
+                        align: Align::Center,
+                        ..Decl::default()
+                    }) {
+                        let balance = wallet_state.lock().unwrap().balance;
+                        let zec_full = balance / 100_000_000;
+                        let zec_part = balance % 100_000_000;
+                        balance_str = format!("{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
+                        ui.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
                     }
-                    1 /* finalizers */ =>  {
+
+                    let child_gap = child_gap as f32;
+                    let padding = child_gap.dup4();
+
+                    // buttons container
+                    if let _ = elem().decl(Decl {
+                        id: id("Buttons Container"),
+                        padding, child_gap, align: Align::Center,
+                        width: percent!(1.0),
+                        height: fit!(),
+                        ..Decl::default()
+                    }) {
+
+                        let mut button = |label| {
+                            let id = Id::id(label);
+                            let (clicked, colour) = ui.button(&mut clicked_id, id);
+                            if let _ = elem().decl(Decl {
+                                id, child_gap, align: Align::Center,
+                                direction: TopToBottom,
+                                width: fit!(),
+                                height: fit!(),
+                                ..Decl::default()
+                            }) {
+
+                                let radius = ui.scale(24.0);
+
+                                // Button circle
+                                if let _ = elem().decl(Decl {
+                                    colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
+                                    width:  fixed!(radius * 2.0),
+                                    height: fixed!(radius * 2.0),
+                                    ..Decl::default()
+                                }) {
+                                    let temp_letter_symbol_h = ui.scale16(32.0);
+                                    ui.text(&label[..1], clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                                }
+
+                                let button_text_h = ui.scale16(16.0);
+                                ui.text(label, clay::text::TextConfig::new().font_size(button_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                            }
+                            clicked
+                        };
+
+                        if button("Send")    { println!("Send!");    }
+                        if button("Receive") { println!("Receive!"); }
+                        if button("Faucet")  { println!("Faucet!");  }
+                        if button("Stake")   { println!("Stake!");   }
+                        if button("Unstake") { println!("Unstake!"); }
+
                     }
-                    2 /* history */ =>  {
-                        ui.item(c, Item {
-                            width: Percent!(1.0),
-                            height: Fit!(),
-                            padding,
-                            align: Align::Center,
-                            ..Default::default()
-                        }, |c| {
-                            let balance = wallet_state.lock().unwrap().balance;
-                            let zec_full = balance / 100_000_000;
-                            let zec_part = balance % 100_000_000;
-                            balance_str = format!("{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
-                            c.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
-                        });
+
+                } else if pane_tab_l == tab_id_finalizers {
+                } else if pane_tab_l == tab_id_history {
+                    if let _ = elem().decl(Decl {
+                        id: id("Balance"),
+                        padding,
+                        width: percent!(1.0),
+                        height: fit!(),
+                        align: Align::Center,
+                        ..Decl::default()
+                    }) {
+                        let balance = wallet_state.lock().unwrap().balance;
+                        let zec_full = balance / 100_000_000;
+                        let zec_part = balance % 100_000_000;
+                        balance_str = format!("{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
+                        ui.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
                     }
-                    _ => {},
                 }
-            });
-        });
+            }
+        }
 
-        // central gap
-        ui.item(c, Item {
+        if let _ = elem().decl(Decl {
+            id: id("Central Gap"),
             radius, padding, child_gap,
-            width: Grow!(),
-            height: Grow!(),
-            ..Default::default()
-        }, |c| {
-        });
+            width: grow!(),
+            height: grow!(),
+            ..Decl::default()
+        }) {
+        }
 
-        // right pane
-        ui.item(c, Item {
-            radius, padding, child_gap,
-            colour: pane_col,
+        if let _ = elem().decl(Decl {
+            id: id("Right Pane"),
+            direction: TopToBottom,
             width: pane_pct,
-            height: Grow!(),
-            ..Default::default()
-        }, |c| {
-        });
-    });
+            height: grow!(),
+            ..Decl::default()
+        }) {
+
+            let mut tab_id_faucet = Id::default();
+            let mut tab_id_roster = Id::default();
+            let mut tab_id_settings = Id::default();
+
+            if let _ = elem().decl(Decl {
+                id: id("Tab Bar"),
+                child_gap,
+                width: percent!(1.0),
+                height: fit!(),
+                align: Align::Center,
+                ..Decl::default()
+            }) {
+                tab_id_faucet   = ui.tab(radius, padding, &mut pane_tab_r, &mut clicked_id, "Faucet");
+                tab_id_roster   = ui.tab(radius, padding, &mut pane_tab_r, &mut clicked_id, "Roster");
+                tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, &mut pane_tab_r, &mut clicked_id, "Settings");
+            }
+
+            // Main contents
+            if let _ = elem().decl(Decl {
+                id: id("Main Contents"),
+                colour: PANE_COL,
+                radius: (0.0, 0.0, 0.0, radius.3),
+                direction: TopToBottom,
+                width: percent!(1.0),
+                height: grow!(),
+                ..Decl::default()
+            }) {
+            }
+
+        }
+    }
 
     ui.clicked_id = clicked_id;
-    ui.tab_id = tab_id;
-
+    ui.pane_tab_l = pane_tab_l;
+    ui.pane_tab_r = pane_tab_r;
 
     // Return the list of render commands of your layout
     let render_commands = c.end();
@@ -676,11 +644,6 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
     result
 }
 
-// @Hack this is annoying!
-pub fn Padding(padding: &clay::layout::Padding) -> clay::layout::Padding {
-    clay::layout::Padding::new(padding.left, padding.right, padding.top, padding.bottom)
-}
-
 pub fn demo_of_rendering_stuff_with_context_that_allocates_in_the_background(ui: &mut Context, data: &mut SomeDataToKeepAround, wallet_state: Arc<Mutex<wallet::WalletState>>) -> bool {
     let dummy_input = InputCtx {
         this_mouse_pos: ui.input().this_mouse_pos,
@@ -707,8 +670,6 @@ pub struct Context {
     pub debug: bool,
     pub pixel_inspector_primed: bool,
 
-    pub delta: f64,
-    pub default_style: Style,
     pub draw_commands: Vec<DrawCommand>,
 
     pub scale:     f32,
@@ -716,364 +677,10 @@ pub struct Context {
     pub dpi_scale: f32,
 
     pub clicked_id: Id,
-    pub tab_id: Id,
+
+    pub pane_tab_l: Id,
+    pub pane_tab_r: Id,
 }
-
-impl Context {
-    pub fn new(_style: Style) -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, ..Default::default() } }
-    fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw  } }
-    fn input(&self) -> &InputCtx { unsafe { &*self.input } }
-    fn clay(&self)  -> &mut Clay { unsafe { &mut *self.clay } }
-
-    fn scale(&self, size: f32) -> f32 { (size * self.scale).floor() }
-    fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
-    fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
-}
-
-bitset!(Flags<u64>,
-    NONE = 0 << 0,
-
-    HIDDEN     = 1 << 1,
-    DISABLED   = 1 << 2,
-
-    // HOVERABLE   = 1 <<  9,
-    CLICKABLE   = 1 << 10,
-    CHECKABLE   = 1 << 11,
-    TYPEABLE    = 1 << 12,
-    RESIZABLE_X = 1 << 13,
-    RESIZABLE_Y = 1 << 14,
-
-    DRAW_MONO_TEXT  = 1 << 17,
-    DRAW_SERIF_TEXT = 1 << 18,
-    DRAW_BACKGROUND = 1 << 19,
-    DRAW_BORDER     = 1 << 20,
-    DRAW_PIP        = 1 << 21,
-
-    CLIP_CHILDREN = 1 << 25,
-    KEEP_FOCUS    = 1 << 26,
-
-
-    // Widget Defaults
-    //////////////////
-
-    DEFAULT_LABEL_FLAGS = Flags::DRAW_MONO_TEXT.0,
-
-    DEFAULT_BUTTON_FLAGS = Flags::CLICKABLE.0
-                         | Flags::DRAW_MONO_TEXT.0
-                         | Flags::DRAW_BACKGROUND.0
-                         | Flags::DRAW_BORDER.0,
-
-    DEFAULT_CHECKBOX_FLAGS = Flags::CHECKABLE.0
-                           | Flags::CLICKABLE.0
-                           | Flags::DRAW_MONO_TEXT.0
-                           | Flags::DRAW_PIP.0,
-
-    DEFAULT_TEXTBOX_FLAGS = Flags::TYPEABLE.0
-                          | Flags::CLICKABLE.0
-                          | Flags::DRAW_MONO_TEXT.0
-                          | Flags::DRAW_BACKGROUND.0
-                          | Flags::DRAW_BORDER.0,
-
-    DEFAULT_CONTAINER_FLAGS = Self::DRAW_MONO_TEXT.0
-                            | Self::DRAW_SERIF_TEXT.0
-                            | Self::DRAW_BACKGROUND.0
-                            | Self::DRAW_BORDER.0,
-);
-
-#[derive(Debug, Default, Copy, Clone, Eq, Hash, PartialEq, PartialOrd)]
-pub struct WidgetId(u64);
-
-impl WidgetId {
-    pub const INVALID: WidgetId = WidgetId(0);
-}
-
-#[derive(Debug, Default, Copy, Clone)]
-enum Size {
-    #[default]
-    None,
-    Exact(f32),
-    TextContent(Font),
-    PercentOfParent {
-        amount:    f32,
-        tolerance: f32,
-    },
-    SumOfChildren {
-        tolerance: f32,
-    },
-}
-
-/* #[derive(Debug, Default, Clone)]
-struct Widget {
-    id:    WidgetId,
-    flags: Flags,
-
-    parent:   Option<WidgetId>,
-    children: Vec<WidgetId>,
-    size:     (Size, Size), // semantic size (x-axis, y-axis)
-
-    // CALCULATED PER FRAME
-    abs_rect: Rect,    // absolute rect
-    viz_rect: Rect,    // positioned rectangle - used to render
-    interior: Rect,    // interior available content rectangle
-    cursor:   (f32, f32), // layout cursor
-    line_height: f32, // max height of all items on this line
-
-    // CONTROL FIELDS
-    display_text: String,
-
-    text_idx: usize,
-    text_buf: Vec<char>,
-
-    slider_value:     f32,
-    slider_value_min: f32,
-    slider_value_max: f32,
-
-    checked: bool,
-} */
-
-#[derive(Debug, Default, Clone)]
-pub struct WidgetEvents {
-    mouse:      (isize, isize),
-    drag_delta: (isize, isize),
-
-    clicked:        bool,
-    right_clicked:  bool,
-
-    pressed:  bool,
-    released: bool,
-    resizing: bool,
-    hovering: bool,
-
-    text:      String,
-    submitted: bool,
-}
-
-/* #[derive(Debug, Clone)]
-pub enum DrawCommand {
-    Scissor(Rect),
-    Rect(Rect, Option<isize>, Color),
-    Circle(f32, f32, f32, Color),
-    Box(Rect, f32, Color),
-    Text(Font, isize, isize, Color, String),
-} */
 
 #[derive(Debug, Default, Copy, Clone)]
 pub struct Font(u64);
-
-//////////////////////////////////////
-
-/* #[derive(Debug, Default, Clone, Copy)]
-pub struct Rect {
-    pub x1: f32,
-    pub y1: f32,
-    pub x2: f32,
-    pub y2: f32,
-}
-
-impl Rect {
-    pub const ZERO: Self = Self { x1: 0f32, y1: 0f32, x2: 0f32, y2: 0f32 };
-
-    pub fn new(x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
-        Self { x1, y1, x2, y2 }
-    }
-
-    pub fn width(&self) -> f32 {
-        (self.x2 - self.x1).max(0f32)
-    }
-
-    pub fn height(&self) -> f32 {
-        (self.y2 - self.y1).max(0f32)
-    }
-
-    pub fn point_within(&self, px: f32, py: f32) -> bool {
-        return px >= self.x1 && px <= self.x2
-            && py >= self.y1 && py <= self.y2;
-    }
-
-    pub fn cut_from_left(&mut self, a: f32) -> Self {
-        let minx = self.x1;
-        self.x1  = self.x2.min(self.x1 + a);
-        return Self::new(minx, self.y1, self.x1, self.y2);
-    }
-
-    pub fn cut_from_right(&mut self, a: f32) -> Self {
-        let maxx = self.x2;
-        self.x2  = self.x1.max(self.x2 - a);
-        return Self::new(self.x2, self.y1, maxx, self.y2);
-    }
-
-    pub fn cut_from_top(&mut self, a: f32) -> Self {
-        let miny = self.y1;
-        self.y1  = self.y2.min(self.y1 + a);
-        return Self::new(self.x1, miny, self.x2, self.y1);
-    }
-
-    pub fn cut_from_bottom(&mut self, a: f32) -> Self {
-        let maxy = self.y2;
-        self.y2  = self.y1.max(self.y2 - a);
-        return Self::new(self.x1, self.y2, self.x2, maxy);
-    }
-
-    pub fn inset(&self, amount: f32) -> Self {
-        Self::new(self.x1 + amount, self.y1 + amount, self.x2 - amount, self.y2 - amount)
-    }
-
-    pub fn outset(&self, amount: f32) -> Self {
-        Self::new(self.x1 - amount, self.y1 - amount, self.x2 + amount, self.y2 + amount)
-    }
-
-    pub fn prepare(&mut self, from: CutFrom) -> Cut {
-        return Cut{ rect: self, from }
-    }
-
-    pub fn intersect(&self, other: Self) -> Self {
-        let x1 = self.x1.max(other.x1);
-        let y1 = self.y1.max(other.y1);
-        let x2 = self.x2.min(other.x2);
-        let y2 = self.y2.min(other.y2);
-        Self::new(x1, y1, x2, y2)
-    }
-}
-
-#[derive(Debug)]
-pub struct Cut {
-    rect: *mut Rect,
-    from: CutFrom,
-}
-
-#[derive(Debug, Clone)]
-pub enum CutFrom {
-    Top,
-    Bottom,
-    Left,
-    Right,
-}
-
-impl Cut {
-    pub fn make(&self, amount: f32) -> Rect {
-        match self.from {
-            CutFrom::Top    => unsafe { (*self.rect).cut_from_top(amount)    },
-            CutFrom::Bottom => unsafe { (*self.rect).cut_from_bottom(amount) },
-            CutFrom::Left   => unsafe { (*self.rect).cut_from_left(amount)   },
-            CutFrom::Right  => unsafe { (*self.rect).cut_from_right(amount)  },
-        }
-    }
-}
-*/
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Color {
-    pub r: f32,
-    pub g: f32,
-    pub b: f32,
-    pub a: f32,
-}
-
-impl Color {
-    pub const DEBUG_RED:     Self = Self { r: 1.0, g: 0.0, b: 0.0, a: 1.0 };
-    pub const DEBUG_GREEN:   Self = Self { r: 0.0, g: 1.0, b: 0.0, a: 1.0 };
-    pub const DEBUG_BLUE:    Self = Self { r: 0.0, g: 0.0, b: 1.0, a: 1.0 };
-    pub const DEBUG_YELLOW:  Self = Self { r: 1.0, g: 1.0, b: 0.0, a: 1.0 };
-    pub const DEBUG_MAGENTA: Self = Self { r: 1.0, g: 0.0, b: 1.0, a: 1.0 };
-    pub const DEBUG_CYAN:    Self = Self { r: 0.0, g: 1.0, b: 1.0, a: 1.0 };
-
-    pub fn rgb(r: f32, g: f32, b: f32) -> Self {
-        Self { r, g, b, a: 1.0 }
-    }
-
-    pub fn rgba(r: f32, g: f32, b: f32, a: f32) -> Self {
-        Self { r, g, b, a }
-    }
-
-    pub fn dim(&self, factor: f32) -> Self {
-        Self {
-            r: self.r * factor,
-            g: self.g * factor,
-            b: self.b * factor,
-            a: self.a,
-        }
-    }
-
-    pub fn fade(&self, factor: f32) -> Self {
-        Self {
-            r: self.r,
-            g: self.g,
-            b: self.b,
-            a: self.a * factor,
-        }
-    }
-}
-
-impl Into<u32> for Color {
-    fn into(self) -> u32 {
-        ((self.a * 255.0) as u8 as u32) << 24 |
-        ((self.r * 255.0) as u8 as u32) << 16 |
-        ((self.g * 255.0) as u8 as u32) << 8 |
-        ((self.b * 255.0) as u8 as u32)
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Style {
-    pub background: Color,
-    pub foreground: Color,
-    pub accent:     Color,
-    pub border:     Color,
-    pub highlight:  Color,
-
-    pub padding: f32,
-    pub spacing: f32,
-    pub border_width: f32,
-    pub rounded_corner_radius: f32,
-}
-
-impl Style {
-    pub fn dark() -> Self {
-        Self {
-            background: Color::rgb(0.1, 0.1, 0.1),
-            foreground: Color::rgb(0.9, 0.9, 0.9),
-            accent:     Color::rgb(0.5, 0.5, 0.5),
-            border:     Color::rgb(0.3, 0.3, 0.3),
-            highlight:  Color::rgb(0.2, 0.2, 0.2),
-
-            padding: 4f32,
-            spacing: 8f32,
-            border_width: 2f32,
-            rounded_corner_radius: 8f32,
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct Stack<T>(std::vec::Vec<T>);
-
-impl<T> Stack<T> {
-    fn new() -> Self {
-        Self(std::vec::Vec::new())
-    }
-
-    fn push(&mut self, item: T) {
-        return self.0.push(item);
-    }
-
-    fn empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    #[track_caller]
-    fn pop(&mut self) -> T {
-        return self.0.pop().expect("stack was empty!");
-    }
-
-    #[track_caller]
-    fn peek(&self) -> &T {
-        return self.0.last().expect("stack was empty!");
-    }
-
-    fn peek_mut(&mut self) -> &mut T {
-        return self.0.last_mut().expect("stack was empty!");
-    }
-
-    fn reset(&mut self) {
-        self.0.clear();
-    }
-}

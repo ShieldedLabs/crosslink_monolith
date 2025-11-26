@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 //! Types related to the construction and evaluation of transaction proposals.
 
 use std::{
