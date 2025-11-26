@@ -144,94 +144,89 @@ impl Id {
     }
 }
 
+struct CloseElement {}
+fn item() -> CloseElement { unsafe { clay::Clay__OpenElement(); } CloseElement {} }
+impl Drop for CloseElement { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
+macro_rules! item { () => { let _item = item(); } }
+
+fn decl<
+    'render,
+    'clay: 'render,
+    ImageElementData: 'render,
+    CustomElementData: 'render
+>(
+    c: &clay::ClayLayoutScope<'clay, 'render, ImageElementData, CustomElementData>,
+    item: Item
+) {
+    fn sizing(sizing: Sizing) -> clay::layout::Sizing {
+        match sizing {
+            Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
+            Sizing::Grow(min, max) => { clay::layout::Sizing::Grow(min, max) }
+            Sizing::Fixed(x)       => { clay::layout::Sizing::Fixed(x) }
+            Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
+        }
+    }
+    let decl = Declaration::<ImageElementData, CustomElementData>::new()
+        .background_color(item.colour.into())
+        .id(item.id.clay())
+        // .clip(true, true, clay::math::Vector2 { x: 0.0, y: 0.0 })
+        .layout()
+            .width(sizing(item.width))
+            .height(sizing(item.height))
+            .padding(clay::layout::Padding {
+                left:   item.padding.0 as u16,
+                right:  item.padding.1 as u16,
+                top:    item.padding.2 as u16,
+                bottom: item.padding.3 as u16,
+            })
+            .child_gap(item.child_gap as u16)
+            .child_alignment(Alignment {
+                x: match item.align.x {
+                    AlignX::Left   => { LayoutAlignmentX::Left }
+                    AlignX::Center => { LayoutAlignmentX::Center }
+                    AlignX::Right  => { LayoutAlignmentX::Right }
+                },
+                y: match item.align.y {
+                    AlignY::Top     => { LayoutAlignmentY::Top }
+                    AlignY::Center  => { LayoutAlignmentY::Center }
+                    AlignY::Bottom  => { LayoutAlignmentY::Bottom }
+                }
+            })
+            .direction(match item.direction {
+                Direction::TopToBottom => { clay::layout::LayoutDirection::TopToBottom }
+                Direction::LeftToRight => { clay::layout::LayoutDirection::LeftToRight }
+            })
+        .end()
+        .corner_radius()
+            .top_left(item.radius.0)
+            .top_right(item.radius.1)
+            .bottom_left(item.radius.2)
+            .bottom_right(item.radius.3)
+        .end()
+        .inner;
+
+    unsafe { clay::Clay__ConfigureOpenElement(decl); }
+}
+
+const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
+const WHITE_CLAY:       clay::Color = clay::Color::rgba(WHITE.0 as f32, WHITE.1 as f32, WHITE.2 as f32, WHITE.3 as f32);
+const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff);
+const INACTIVE_TAB_COL: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
+const ACTIVE_TAB_COL:   (u8, u8, u8, u8) = PANE_COL;
+const BUTTON_COL:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff);
+const BUTTON_HOVER_COL: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
+const BUTTON_DOWN_COL:  (u8, u8, u8, u8) = (0x1e, 0x1e, 0x1e, 0xff);
+
+
 impl Context {
     pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, ..Default::default() } }
-    fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw  } }
-    fn input(&self) -> &InputCtx { unsafe { &*self.input } }
+    fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw     } }
+    fn input(&self) -> &InputCtx { unsafe { &*self.input    } }
     fn clay(&self)  -> &mut Clay { unsafe { &mut *self.clay } }
 
     fn scale(&self, size: f32) -> f32 { (size * self.scale).floor() }
     fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
     fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
-
-    fn item<
-        'render,
-        'clay: 'render,
-        ImageElementData: 'render,
-        CustomElementData: 'render,
-        G: FnOnce(&clay::ClayLayoutScope<'clay, 'render, ImageElementData, CustomElementData>) -> Item,
-        F: FnOnce(&clay::ClayLayoutScope<'clay, 'render, ImageElementData, CustomElementData>)
-    >(
-        &self,
-        c: &clay::ClayLayoutScope<'clay, 'render, ImageElementData, CustomElementData>,
-        g: G,
-        f: F
-    ) {
-        unsafe {
-            clay::Clay_SetCurrentContext(c.clay.context);
-            clay::Clay__OpenElement();
-        }
-
-        let item = g(c);
-
-        fn sizing(sizing: Sizing) -> clay::layout::Sizing {
-            match sizing {
-                Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
-                Sizing::Grow(min, max) => { clay::layout::Sizing::Grow(min, max) }
-                Sizing::Fixed(x)       => { clay::layout::Sizing::Fixed(x) }
-                Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
-            }
-        }
-
-        let decl = Declaration::<ImageElementData, CustomElementData>::new()
-            .background_color(item.colour.into())
-            .id(item.id.clay())
-            // .clip(true, true, clay::math::Vector2 { x: 0.0, y: 0.0 })
-            .layout()
-                .width(sizing(item.width))
-                .height(sizing(item.height))
-                .padding(clay::layout::Padding {
-                    left:   item.padding.0 as u16,
-                    right:  item.padding.1 as u16,
-                    top:    item.padding.2 as u16,
-                    bottom: item.padding.3 as u16,
-                })
-                .child_gap(item.child_gap as u16)
-                .child_alignment(Alignment {
-                    x: match item.align.x {
-                        AlignX::Left   => { LayoutAlignmentX::Left }
-                        AlignX::Center => { LayoutAlignmentX::Center }
-                        AlignX::Right  => { LayoutAlignmentX::Right }
-                    },
-                    y: match item.align.y {
-                        AlignY::Top     => { LayoutAlignmentY::Top }
-                        AlignY::Center  => { LayoutAlignmentY::Center }
-                        AlignY::Bottom  => { LayoutAlignmentY::Bottom }
-                    }
-                })
-                .direction(match item.direction {
-                    Direction::TopToBottom => { clay::layout::LayoutDirection::TopToBottom }
-                    Direction::LeftToRight => { clay::layout::LayoutDirection::LeftToRight }
-                })
-            .end()
-            .corner_radius()
-                .top_left(item.radius.0)
-                .top_right(item.radius.1)
-                .bottom_left(item.radius.2)
-                .bottom_right(item.radius.3)
-            .end()
-            .inner;
-
-        unsafe {
-            clay::Clay__ConfigureOpenElement(decl);
-        }
-
-        f(c);
-
-        unsafe {
-            clay::Clay__CloseElement();
-        }
-    }
 
     fn button<
         'render,
@@ -253,23 +248,60 @@ impl Context {
             *clicked_id = id;
         }
 
-        const button_col:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff);
-        const button_hover_col: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
-        const button_down_col:  (u8, u8, u8, u8) = (0x1e, 0x1e, 0x1e, 0xff);
-
         let colour = if down || click {
             if clicked_id.id == id.id {
-                button_down_col
+                BUTTON_DOWN_COL
             } else {
-                button_col
+                BUTTON_COL
             }
         } else if hover {
-            button_hover_col
+            BUTTON_HOVER_COL
         } else {
-            button_col
+            BUTTON_COL
         };
 
         (click, colour)
+    }
+
+    fn tab<
+        'render,
+        'clay: 'render,
+        ImageElementData: 'render,
+        CustomElementData: 'render,
+    >(
+        &self,
+        c: &clay::ClayLayoutScope<'clay, 'render, ImageElementData, CustomElementData>,
+        radius: (f32, f32, f32, f32),
+        padding: (f32, f32, f32, f32),
+        tab_id: &mut Id,
+        clicked_id: &mut Id,
+        label: &str
+    ) -> Id {
+        let tab_text_h = self.scale16(18.0);
+
+        let radius = (radius.0, radius.1, 0.0, 0.0);
+
+        let id = Id::id(label);
+
+        let (clicked, _) = self.button(&c, clicked_id, id);
+        if clicked || *tab_id == Id::default() {
+            *tab_id = id;
+        }
+
+        {
+            item!(); decl(&c, Item {
+                id,
+                radius, padding,
+                colour: if *tab_id == id { ACTIVE_TAB_COL } else { INACTIVE_TAB_COL },
+                width: Grow!(),
+                height: Grow!(),
+                align: Align::Center,
+                ..Default::default()
+            } );
+            c.text(label, clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+        }
+
+        id
     }
 }
 
@@ -319,14 +351,6 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
     let child_gap = ui.scale(8.0);
     let padding = child_gap.dup4();
 
-    const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
-    const WHITE_CLAY:       clay::Color = clay::Color::rgba(WHITE.0 as f32, WHITE.1 as f32, WHITE.2 as f32, WHITE.3 as f32);
-    const pane_col:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff);
-    const inactive_tab_col: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
-    const active_tab_col:   (u8, u8, u8, u8) = pane_col;
-    const button_col:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff);
-    const button_hover_col: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
-
     const align_center_center: Alignment = Alignment { x: LayoutAlignmentX::Center, y: LayoutAlignmentY::Center };
 
     let mouse_held    = ui.input().mouse_held(winit::event::MouseButton::Left);
@@ -350,249 +374,212 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
 
     let mut c = clay.begin::<(), ()>();
 
-    ui.item(&c, |c| Item {
-        id: Id::id("Main"),
-        padding, child_gap,
-        width: Grow!(),
-        height: Grow!(),
-        ..Default::default()
-    }, |c| {
+    unsafe { clay::Clay_SetCurrentContext(c.clay.context); }
+
+    {
+        item!(); decl(&c, Item {
+            id: Id::id("Main"),
+            padding, child_gap,
+            width: Grow!(),
+            height: Grow!(),
+            ..Default::default()
+        } );
         let pane_pct = {
             let pct = 0.25;
             // clay::layout::Sizing::Percent((pct * ui.scale).min(pct))
             Sizing::Percent(pct * ui.scale)
         };
 
-        ui.item(c, |c| Item {
-            id: Id::id("Left Pane"),
-            direction: Direction::TopToBottom,
-            width: pane_pct,
-            height: Grow!(),
-            ..Default::default()
-        }, |c| {
+        {
+            item!(); decl(&c, Item {
+                id: Id::id("Left Pane"),
+                direction: Direction::TopToBottom,
+                width: pane_pct,
+                height: Grow!(),
+                ..Default::default()
+            } );
 
             let mut tab_id_wallet = Id::default();
             let mut tab_id_finalizers = Id::default();
             let mut tab_id_history = Id::default();
 
-            ui.item(c, |c| Item {
-                id: Id::id("Tab Bar"),
-                child_gap,
-                width: Percent!(1.0),
-                height: Fit!(),
-                align: Align::Center,
-                ..Default::default()
-            }, |c| {
+            {
+                item!(); decl(&c, Item {
+                    id: Id::id("Tab Bar"),
+                    child_gap,
+                    width: Percent!(1.0),
+                    height: Fit!(),
+                    align: Align::Center,
+                    ..Default::default()
+                } );
+                tab_id_wallet     = ui.tab(&c, radius, padding, &mut pane_tab_l, &mut clicked_id, "Wallet");
+                tab_id_finalizers = ui.tab(&c, radius, padding, &mut pane_tab_l, &mut clicked_id, "Finalizers");
+                tab_id_history    = ui.tab(&c, radius, padding, &mut pane_tab_l, &mut clicked_id, "History");
 
-                let mut tab = |tab_id: &mut Id, label| {
-                    let tab_text_h = ui.scale16(18.0);
-
-                    let radius = (radius.0, radius.1, 0.0, 0.0);
-
-                    let id = Id::id(label);
-
-                    let (clicked, _) = ui.button(c, &mut clicked_id, id);
-                    if clicked || *tab_id == Id::default() {
-                        *tab_id = id;
-                    }
-
-                    ui.item(c, |c| Item {
-                        id,
-                        radius, padding,
-                        colour: if *tab_id == id { active_tab_col } else { inactive_tab_col },
-                        width: Grow!(),
-                        height: Grow!(),
-                        align: Align::Center,
-                        ..Default::default()
-                    }, |c| {
-                        c.text(label, clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
-                    });
-
-                    id
-                };
-                tab_id_wallet     = tab(&mut pane_tab_l, "Wallet");
-                tab_id_finalizers = tab(&mut pane_tab_l, "Finalizers");
-                tab_id_history    = tab(&mut pane_tab_l, "History");
-
-            });
+            }
 
             // Main contents
-            ui.item(c, |c| Item {
-                id: Id::id("Main Contents"),
-                colour: (0x12, 0x12, 0x12, 0xff),
-                radius: (0.0, 0.0, radius.2, radius.3),
-                direction: Direction::TopToBottom,
-                width: Percent!(1.0),
-                height: Grow!(),
-                ..Default::default()
-            }, |c| {
+            {
+                item!(); decl(&c, Item {
+                    id: Id::id("Main Contents"),
+                    colour: (0x12, 0x12, 0x12, 0xff),
+                    radius: (0.0, 0.0, radius.2, radius.3),
+                    direction: Direction::TopToBottom,
+                    width: Percent!(1.0),
+                    height: Grow!(),
+                    ..Default::default()
+                } );
                 let balance_text_h = ui.scale16(48.0);
 
                 // spacer
-                ui.item(c, |c| Item { width: Grow!(), height: Fixed!(ui.scale(32.0)), ..Default::default() }, |c| {});
+                {
+                    item!(); decl(&c, Item { width: Grow!(), height: Fixed!(ui.scale(32.0)), ..Default::default() });
+                }
 
                 if pane_tab_l == tab_id_wallet {
 
                     // balance container
-                    ui.item(c, |c| Item {
-                        width: Percent!(1.0),
-                        height: Fit!(),
-                        padding,
-                        align: Align::Center,
-                        ..Default::default()
-                    }, |c| {
+                    {
+                        item!(); decl(&c, Item {
+                            width: Percent!(1.0),
+                            height: Fit!(),
+                            padding,
+                            align: Align::Center,
+                            ..Default::default()
+                        } );
                         let balance = wallet_state.lock().unwrap().balance;
                         let zec_full = balance / 100_000_000;
                         let zec_part = balance % 100_000_000;
                         balance_str = format!("{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
                         c.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
-                    });
+                    }
 
                     let child_gap = child_gap as f32;
                     let padding = child_gap.dup4();
 
                     // buttons container
-                    ui.item(c, |c| Item {
-                        id: Id::id("Buttons Container"),
-                        padding, child_gap, align: Align::Center,
-                        width: Percent!(1.0),
-                        height: Fit!(),
-                        ..Default::default()
-                    }, |c| {
+                    {
+                        item!(); decl(&c, Item {
+                            id: Id::id("Buttons Container"),
+                            padding, child_gap, align: Align::Center,
+                            width: Percent!(1.0),
+                            height: Fit!(),
+                            ..Default::default()
+                        } );
 
-                        let mut f = |button| {
-                            let id = Id::id(button);
-                            let (clicked, colour) = ui.button(c, &mut clicked_id, id);
-                            ui.item(c, |c| Item {
+                        let mut button = |label| {
+                            let id = Id::id(label);
+                            let (clicked, colour) = ui.button(&c, &mut clicked_id, id);
+                            {
+                                item!(); decl(&c, Item {
                                 id, child_gap, align: Align::Center,
                                 direction: Direction::TopToBottom,
                                 width: Fit!(),
                                 height: Fit!(),
                                 ..Default::default()
-                            }, |c| {
+                            } );
 
                                 let radius = ui.scale(24.0);
 
                                 // Button circle
-                                ui.item(c, |c| Item {
-                                    colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
-                                    width:  Fixed!(radius * 2.0),
-                                    height: Fixed!(radius * 2.0),
-                                    ..Default::default()
-                                }, |c| {
+                                {
+                                    item!(); decl(&c, Item {
+                                        colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
+                                        width:  Fixed!(radius * 2.0),
+                                        height: Fixed!(radius * 2.0),
+                                        ..Default::default()
+                                    } );
                                     let temp_letter_symbol_h = ui.scale16(32.0);
-                                    c.text(&button[..1], clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
-                                });
+                                    c.text(&label[..1], clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                                }
 
                                 let button_text_h = ui.scale16(16.0);
-                                c.text(button, clay::text::TextConfig::new().font_size(button_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
-                            });
+                                c.text(label, clay::text::TextConfig::new().font_size(button_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                            }
                             clicked
                         };
 
-                        if f("Send")    { println!("Send!");    }
-                        if f("Receive") { println!("Receive!"); }
-                        if f("Faucet")  { println!("Faucet!");  }
-                        if f("Stake")   { println!("Stake!");   }
-                        if f("Unstake") { println!("Unstake!"); }
+                        if button("Send")    { println!("Send!");    }
+                        if button("Receive") { println!("Receive!"); }
+                        if button("Faucet")  { println!("Faucet!");  }
+                        if button("Stake")   { println!("Stake!");   }
+                        if button("Unstake") { println!("Unstake!"); }
 
-                    });
+                    }
 
                 } else if pane_tab_l == tab_id_finalizers {
                 } else if pane_tab_l == tab_id_history {
-                    ui.item(c, |c| Item {
-                        width: Percent!(1.0),
-                        height: Fit!(),
-                        padding,
-                        align: Align::Center,
-                        ..Default::default()
-                    }, |c| {
+                    {
+                        item!(); decl(&c, Item {
+                            width: Percent!(1.0),
+                            height: Fit!(),
+                            padding,
+                            align: Align::Center,
+                            ..Default::default()
+                        } );
                         let balance = wallet_state.lock().unwrap().balance;
                         let zec_full = balance / 100_000_000;
                         let zec_part = balance % 100_000_000;
                         balance_str = format!("{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
                         c.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
-                    });
+                    }
                 }
-            });
-        });
+            }
+        }
 
-        ui.item(c, |c| Item {
-            id: Id::id("Central Gap"),
-            radius, padding, child_gap,
-            width: Grow!(),
-            height: Grow!(),
-            ..Default::default()
-        }, |c| {
-        });
+        {
+            item!(); decl(&c, Item {
+                id: Id::id("Central Gap"),
+                radius, padding, child_gap,
+                width: Grow!(),
+                height: Grow!(),
+                ..Default::default()
+            } );
+        }
 
-        ui.item(c, |c| Item {
-            id: Id::id("Right Pane"),
-            direction: Direction::TopToBottom,
-            width: pane_pct,
-            height: Grow!(),
-            ..Default::default()
-        }, |c| {
+        {
+            item!(); decl(&c, Item {
+                id: Id::id("Right Pane"),
+                direction: Direction::TopToBottom,
+                width: pane_pct,
+                height: Grow!(),
+                ..Default::default()
+            } );
 
             let mut tab_id_faucet = Id::default();
             let mut tab_id_roster = Id::default();
             let mut tab_id_settings = Id::default();
 
-            ui.item(c, |c| Item {
-                id: Id::id("Tab Bar"),
-                child_gap,
-                width: Percent!(1.0),
-                height: Fit!(),
-                align: Align::Center,
-                ..Default::default()
-            }, |c| {
+            {
+                item!(); decl(&c, Item {
+                    id: Id::id("Tab Bar"),
+                    child_gap,
+                    width: Percent!(1.0),
+                    height: Fit!(),
+                    align: Align::Center,
+                    ..Default::default()
+                } );
 
-                let mut tab = |tab_id: &mut Id, label| {
-                    let tab_text_h = ui.scale16(18.0);
-
-                    let radius = (radius.0, radius.1, 0.0, 0.0);
-
-                    let id = Id::id(label);
-
-                    let (clicked, _) = ui.button(c, &mut clicked_id, id);
-                    if clicked || *tab_id == Id::default() {
-                        *tab_id = id;
-                    }
-
-                    ui.item(c, |c| Item {
-                        id,
-                        radius, padding,
-                        colour: if *tab_id == id { active_tab_col } else { inactive_tab_col },
-                        width: Grow!(),
-                        height: Grow!(),
-                        align: Align::Center,
-                        ..Default::default()
-                    }, |c| {
-                        c.text(label, clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
-                    });
-
-                    id
-                };
-
-                tab_id_faucet   = tab(&mut pane_tab_r, "Faucet");
-                tab_id_roster   = tab(&mut pane_tab_r, "Roster");
-                tab_id_settings = tab(&mut pane_tab_r, "Settings");
-            });
+                tab_id_faucet   = ui.tab(&c, radius, padding, &mut pane_tab_r, &mut clicked_id, "Faucet");
+                tab_id_roster   = ui.tab(&c, radius, padding, &mut pane_tab_r, &mut clicked_id, "Roster");
+                tab_id_settings = ui.tab(&c, radius, padding, &mut pane_tab_r, &mut clicked_id, "Settings");
+            }
 
             // Main contents
-            ui.item(c, |c| Item {
-                id: Id::id("Main Contents"),
-                colour: (0x12, 0x12, 0x12, 0xff),
-                radius: (0.0, 0.0, radius.2, radius.3),
-                direction: Direction::TopToBottom,
-                width: Percent!(1.0),
-                height: Grow!(),
-                ..Default::default()
-            }, |c| {
-            });
+            {
+                item!(); decl(&c, Item {
+                    id: Id::id("Main Contents"),
+                    colour: (0x12, 0x12, 0x12, 0xff),
+                    radius: (0.0, 0.0, radius.2, radius.3),
+                    direction: Direction::TopToBottom,
+                    width: Percent!(1.0),
+                    height: Grow!(),
+                    ..Default::default()
+                } );
+            }
 
-        });
-    });
+        }
+    }
 
     ui.clicked_id = clicked_id;
     ui.pane_tab_l = pane_tab_l;
