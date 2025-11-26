@@ -23,7 +23,7 @@ use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::Zatoshis;
 use zcash_transparent::builder::{TransparentBuilder, TransparentSigningSet, Unauthorized};
 use zcash_transparent::bundle::OutPoint;
-use zebra_chain::block::Height;
+use zebra_chain::block::{Hash as BlockHash, Height};
 use zebra_chain::parameters::NetworkUpgrade;
 use zebra_chain::{serialization::ZcashSerialize};
 use zebra_chain::transaction::{LockTime, Transaction};
@@ -249,14 +249,17 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     let mut grpc_stream = res.into_inner();
                     let mut blocks = Vec::new();
                     loop {
-                        if let Ok(msg) = grpc_stream.message().await {
-                            if let Some(block) = msg {
-                                blocks.push(block);
-                            } else {
-                                break Some(blocks);
+                         match grpc_stream.message().await {
+                             Ok(Some(block)) => blocks.push(block),
+                             Ok(None) => break Some(blocks),
+                             Err(err) => {
+                                 if err.code() == tonic::Code::OutOfRange {
+                                     break Some(blocks);
+                                 } else {
+                                    println!("Get block range message error: {err:?}");
+                                    break None;
+                                 }
                             }
-                        } else {
-                            break None;
                         }
                     }
                 }
@@ -310,7 +313,9 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
 
             if let Some(new_blocks) = new_blocks {
-                for block in &new_blocks {
+                for (i, block) in new_blocks.iter().enumerate() {
+                    let Ok(hash_bytes) = <[u8;32]>::try_from(&block.hash[..]) else { continue; };
+                    println!("{i:02}: block {} has {} transactions", BlockHash::from(hash_bytes), block.vtx.len());
                     // txs_seen_block_height = txs_seen_block_height.max(block.height);
                     for tx in &block.vtx {
                         println!("tx: {tx:?}");

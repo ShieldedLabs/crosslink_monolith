@@ -304,11 +304,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, dr
         viz_state.camera_x += (dxm / old_screen_unit) - (dxm / new_screen_unit);
         viz_state.camera_y += (dym / old_screen_unit) - (dym / new_screen_unit);
     }
-    
+
     let zoom = ZOOM_FACTOR.powf(viz_state.zoom);
     // origin
     let screen_unit = SCREEN_UNIT_CONST * zoom;
-    
+
     if input_ctx.mouse_held(MouseButton::Left) {
         viz_state.camera_x -= input_ctx.mouse_delta().0 as f32 / screen_unit;
         viz_state.camera_y -= input_ctx.mouse_delta().1 as f32 / screen_unit;
