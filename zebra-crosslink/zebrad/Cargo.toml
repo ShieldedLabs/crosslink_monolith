@@ -249,7 +249,7 @@ proptest-derive = { workspace = true, optional = true }
 console-subscriber = { workspace = true, optional = true }
 
 tempfile = "3.19.1"
-zainod = { path = "../../zaino/zainod" }
+zainod = { path = "../../zaino/zainod", features = ["no_tls_use_unencrypted_traffic"] }
 zaino-state = { path = "../../zaino/zaino-state" }
 zaino-common = { path = "../../zaino/zaino-common" }
 zaino-serve = { path = "../../zaino/zaino-serve" }

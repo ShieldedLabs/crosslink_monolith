@@ -578,7 +578,7 @@ impl StartCmd {
                     cookie_dir: None,
                 }),
                 grpc_settings: zaino_serve::server::config::GrpcServerConfig {
-                    listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 18233),
+                    listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 18233),
                     tls: None,
                 },
                 validator_settings: zaino_common::ValidatorConfig {
