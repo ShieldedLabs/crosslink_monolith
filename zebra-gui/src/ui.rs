@@ -106,7 +106,7 @@ impl Align {
 
 
 #[derive(Debug, Default, Copy, Clone)]
-struct Item {
+struct Decl {
     id: Id,
     direction: Direction,
     colour: (u8, u8, u8, u8),
@@ -145,10 +145,11 @@ impl Id {
     }
 }
 
+fn id(label: &str) -> Id { Id::id(label) }
+
 struct CloseElement {}
-fn item() -> CloseElement { unsafe { clay::Clay__OpenElement(); } CloseElement {} }
+fn elem() -> CloseElement { unsafe { clay::Clay__OpenElement(); } CloseElement {} }
 impl Drop for CloseElement { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
-macro_rules! item { () => { let _item = item(); } }
 
 const Clay_ElementId_ZERO: clay::Clay_ElementId = clay::Clay_ElementId { id: 0, offset: 0, baseId: 0, stringId: clay::Clay_String { isStaticallyAllocated: false, length: 0, chars: std::ptr::null() } };
 const Clay_SizingMinMax_ZERO: Clay_SizingMinMax = clay::Clay_SizingMinMax { min: 0f32, max: f32::MAX };
@@ -197,7 +198,7 @@ const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Clay_E
     userData: std::ptr::null_mut(),
 };
 
-fn decl(item: Item) -> bool {
+fn decl(item: Decl) -> bool {
     fn sizing(sizing: Sizing) -> clay::layout::Sizing {
         match sizing {
             Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
@@ -302,16 +303,15 @@ impl Context {
             *tab_id = id;
         }
 
-        {
-            item!(); decl(Item {
-                id,
-                radius, padding,
-                colour: if *tab_id == id { ACTIVE_TAB_COL } else { INACTIVE_TAB_COL },
-                width: Grow!(),
-                height: Grow!(),
-                align: Align::Center,
-                ..Default::default()
-            } );
+        if let _ = elem() && decl(Decl {
+            id,
+            radius, padding,
+            colour: if *tab_id == id { ACTIVE_TAB_COL } else { INACTIVE_TAB_COL },
+            width: Grow!(),
+            height: Grow!(),
+            align: Align::Center,
+            ..Decl::default()
+        }) {
             unsafe { Clay__OpenTextElement(label.into(), clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end().into()) };
         }
 
@@ -390,42 +390,39 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
 
     unsafe { clay::Clay_SetCurrentContext(c.clay.context); }
 
-    {
-        item!(); decl(Item {
-            id: Id::id("Main"),
-            padding, child_gap,
-            width: Grow!(),
-            height: Grow!(),
-            ..Default::default()
-        } );
+    if let _ = elem() && decl(Decl {
+        id: Id::id("Main"),
+        padding, child_gap,
+        width: Grow!(),
+        height: Grow!(),
+        ..Decl::default()
+    }) {
         let pane_pct = {
             let pct = 0.25;
             // clay::layout::Sizing::Percent((pct * ui.scale).min(pct))
             Sizing::Percent(pct * ui.scale)
         };
 
-        {
-            item!(); decl(Item {
-                id: Id::id("Left Pane"),
-                direction: Direction::TopToBottom,
-                width: pane_pct,
-                height: Grow!(),
-                ..Default::default()
-            } );
+        if let _ = elem() && decl(Decl {
+            id: Id::id("Left Pane"),
+            direction: Direction::TopToBottom,
+            width: pane_pct,
+            height: Grow!(),
+            ..Decl::default()
+        }) {
 
             let mut tab_id_wallet = Id::default();
             let mut tab_id_finalizers = Id::default();
             let mut tab_id_history = Id::default();
 
-            {
-                item!(); decl(Item {
-                    id: Id::id("Tab Bar"),
-                    child_gap,
-                    width: Percent!(1.0),
-                    height: Fit!(),
-                    align: Align::Center,
-                    ..Default::default()
-                } );
+            if let _ = elem() && decl(Decl {
+                id: Id::id("Tab Bar"),
+                child_gap,
+                width: Percent!(1.0),
+                height: Fit!(),
+                align: Align::Center,
+                ..Decl::default()
+            }) {
                 tab_id_wallet     = ui.tab(radius, padding, &mut pane_tab_l, &mut clicked_id, "Wallet");
                 tab_id_finalizers = ui.tab(radius, padding, &mut pane_tab_l, &mut clicked_id, "Finalizers");
                 tab_id_history    = ui.tab(radius, padding, &mut pane_tab_l, &mut clicked_id, "History");
@@ -433,34 +430,30 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             }
 
             // Main contents
-            {
-                item!(); decl(Item {
-                    id: Id::id("Main Contents"),
-                    colour: (0x12, 0x12, 0x12, 0xff),
-                    radius: (0.0, 0.0, radius.2, radius.3),
-                    direction: Direction::TopToBottom,
-                    width: Percent!(1.0),
-                    height: Grow!(),
-                    ..Default::default()
-                } );
+            if let _ = elem() && decl(Decl {
+                id: Id::id("Main Contents"),
+                colour: (0x12, 0x12, 0x12, 0xff),
+                radius: (0.0, 0.0, radius.2, radius.3),
+                direction: Direction::TopToBottom,
+                width: Percent!(1.0),
+                height: Grow!(),
+                ..Decl::default()
+            }) {
                 let balance_text_h = ui.scale16(48.0);
 
                 // spacer
-                {
-                    item!(); decl(Item { width: Grow!(), height: Fixed!(ui.scale(32.0)), ..Default::default() });
-                }
+                if let _ = elem() && decl(Decl { width: Grow!(), height: Fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
                 if pane_tab_l == tab_id_wallet {
 
                     // balance container
-                    {
-                        item!(); decl(Item {
-                            width: Percent!(1.0),
-                            height: Fit!(),
-                            padding,
-                            align: Align::Center,
-                            ..Default::default()
-                        } );
+                    if let _ = elem() && decl(Decl {
+                        width: Percent!(1.0),
+                        height: Fit!(),
+                        padding,
+                        align: Align::Center,
+                        ..Decl::default()
+                    }) {
                         let balance = wallet_state.lock().unwrap().balance;
                         let zec_full = balance / 100_000_000;
                         let zec_part = balance % 100_000_000;
@@ -472,37 +465,34 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                     let padding = child_gap.dup4();
 
                     // buttons container
-                    {
-                        item!(); decl(Item {
-                            id: Id::id("Buttons Container"),
-                            padding, child_gap, align: Align::Center,
-                            width: Percent!(1.0),
-                            height: Fit!(),
-                            ..Default::default()
-                        } );
+                    if let _ = elem() && decl(Decl {
+                        id: Id::id("Buttons Container"),
+                        padding, child_gap, align: Align::Center,
+                        width: Percent!(1.0),
+                        height: Fit!(),
+                        ..Decl::default()
+                    }) {
 
                         let mut button = |label| {
                             let id = Id::id(label);
                             let (clicked, colour) = ui.button(&mut clicked_id, id);
-                            {
-                                item!(); decl(Item {
+                            if let _ = elem() && decl(Decl {
                                 id, child_gap, align: Align::Center,
                                 direction: Direction::TopToBottom,
                                 width: Fit!(),
                                 height: Fit!(),
-                                ..Default::default()
-                            } );
+                                ..Decl::default()
+                            }) {
 
                                 let radius = ui.scale(24.0);
 
                                 // Button circle
-                                {
-                                    item!(); decl(Item {
-                                        colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
-                                        width:  Fixed!(radius * 2.0),
-                                        height: Fixed!(radius * 2.0),
-                                        ..Default::default()
-                                    } );
+                                if let _ = elem() && decl(Decl {
+                                    colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
+                                    width:  Fixed!(radius * 2.0),
+                                    height: Fixed!(radius * 2.0),
+                                    ..Decl::default()
+                                }) {
                                     let temp_letter_symbol_h = ui.scale16(32.0);
                                     c.text(&label[..1], clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
                                 }
@@ -523,14 +513,14 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
 
                 } else if pane_tab_l == tab_id_finalizers {
                 } else if pane_tab_l == tab_id_history {
-                    {
-                        item!(); decl(Item {
-                            width: Percent!(1.0),
-                            height: Fit!(),
-                            padding,
-                            align: Align::Center,
-                            ..Default::default()
-                        } );
+                    if let _ = elem() && decl(Decl {
+                        id: Id::id("Balance"),
+                        padding,
+                        width: Percent!(1.0),
+                        height: Fit!(),
+                        align: Align::Center,
+                        ..Decl::default()
+                    }) {
                         let balance = wallet_state.lock().unwrap().balance;
                         let zec_full = balance / 100_000_000;
                         let zec_part = balance % 100_000_000;
@@ -541,38 +531,35 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             }
         }
 
-        {
-            item!(); decl(Item {
-                id: Id::id("Central Gap"),
-                radius, padding, child_gap,
-                width: Grow!(),
-                height: Grow!(),
-                ..Default::default()
-            } );
+        if let _ = elem() && decl(Decl {
+            id: Id::id("Central Gap"),
+            radius, padding, child_gap,
+            width: Grow!(),
+            height: Grow!(),
+            ..Decl::default()
+        }) {
         }
 
-        {
-            item!(); decl(Item {
-                id: Id::id("Right Pane"),
-                direction: Direction::TopToBottom,
-                width: pane_pct,
-                height: Grow!(),
-                ..Default::default()
-            } );
+        if let _ = elem() && decl(Decl {
+            id: Id::id("Right Pane"),
+            direction: Direction::TopToBottom,
+            width: pane_pct,
+            height: Grow!(),
+            ..Decl::default()
+        }) {
 
             let mut tab_id_faucet = Id::default();
             let mut tab_id_roster = Id::default();
             let mut tab_id_settings = Id::default();
 
-            {
-                item!(); decl(Item {
-                    id: Id::id("Tab Bar"),
-                    child_gap,
-                    width: Percent!(1.0),
-                    height: Fit!(),
-                    align: Align::Center,
-                    ..Default::default()
-                } );
+            if let _ = elem() && decl(Decl {
+                id: Id::id("Tab Bar"),
+                child_gap,
+                width: Percent!(1.0),
+                height: Fit!(),
+                align: Align::Center,
+                ..Decl::default()
+            }) {
 
                 tab_id_faucet   = ui.tab(radius, padding, &mut pane_tab_r, &mut clicked_id, "Faucet");
                 tab_id_roster   = ui.tab(radius, padding, &mut pane_tab_r, &mut clicked_id, "Roster");
@@ -580,16 +567,15 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             }
 
             // Main contents
-            {
-                item!(); decl(Item {
-                    id: Id::id("Main Contents"),
-                    colour: (0x12, 0x12, 0x12, 0xff),
-                    radius: (0.0, 0.0, radius.2, radius.3),
-                    direction: Direction::TopToBottom,
-                    width: Percent!(1.0),
-                    height: Grow!(),
-                    ..Default::default()
-                } );
+            if let _ = elem() && decl(Decl {
+                id: Id::id("Main Contents"),
+                colour: (0x12, 0x12, 0x12, 0xff),
+                radius: (0.0, 0.0, radius.2, radius.3),
+                direction: Direction::TopToBottom,
+                width: Percent!(1.0),
+                height: Grow!(),
+                ..Decl::default()
+            }) {
             }
 
         }
