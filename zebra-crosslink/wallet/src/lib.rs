@@ -1,4 +1,5 @@
 //! Internal wallet
+#![allow(warnings)]
 
 use orchard::keys::SpendAuthorizingKey;
 use orchard::note_encryption::{CompactAction};

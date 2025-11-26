@@ -7,6 +7,7 @@ use clay_layout as clay;
 use clay::{fit, fixed, grow, percent, Clay, Declaration};
 use clay::render_commands::RenderCommandConfig::{Rectangle, Text};
 use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
+use clay::*; // @Temporary
 
 use super::*;
 
@@ -65,8 +66,8 @@ fn dbg_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
 }
 
 #[derive(Debug, Default, Copy, Clone)] enum Direction { #[default] LeftToRight, TopToBottom }
-#[derive(Debug, Default, Copy, Clone)] enum AlignX    { #[default] Left, Center, Right }
-#[derive(Debug, Default, Copy, Clone)] enum AlignY    { #[default] Top, Center, Bottom }
+#[derive(Debug, Default, Copy, Clone)] enum AlignX    { #[default] Left, Right, Center }
+#[derive(Debug, Default, Copy, Clone)] enum AlignY    { #[default] Top, Bottom, Center }
 #[derive(Debug, Default, Copy, Clone)] struct Align   { x: AlignX, y: AlignY }
 #[derive(Debug,          Copy, Clone)] enum Sizing    { Fit(f32, f32), Grow(f32, f32), Fixed(f32), Percent(f32) }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] struct Id { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
@@ -149,15 +150,54 @@ fn item() -> CloseElement { unsafe { clay::Clay__OpenElement(); } CloseElement {
 impl Drop for CloseElement { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
 macro_rules! item { () => { let _item = item(); } }
 
-fn decl<
-    'render,
-    'clay: 'render,
-    ImageElementData: 'render,
-    CustomElementData: 'render
->(
-    c: &clay::ClayLayoutScope<'clay, 'render, ImageElementData, CustomElementData>,
-    item: Item
-) {
+const Clay_ElementId_ZERO: clay::Clay_ElementId = clay::Clay_ElementId { id: 0, offset: 0, baseId: 0, stringId: clay::Clay_String { isStaticallyAllocated: false, length: 0, chars: std::ptr::null() } };
+const Clay_SizingMinMax_ZERO: Clay_SizingMinMax = clay::Clay_SizingMinMax { min: 0f32, max: f32::MAX };
+const Clay_SizingAxis_ZERO: Clay_SizingAxis = clay::Clay_SizingAxis {
+    size: clay::Clay_SizingAxis__bindgen_ty_1 { minMax: Clay_SizingMinMax_ZERO },
+    type_: clay::Clay__SizingType_CLAY__SIZING_TYPE_FIT
+};
+const Clay_Sizing_ZERO: Clay_Sizing = clay::Clay_Sizing { width: Clay_SizingAxis_ZERO, height: Clay_SizingAxis_ZERO };
+const Clay_Padding_ZERO: Clay_Padding = Clay_Padding { left: 0, right: 0, top: 0, bottom: 0 };
+const Clay_ChildAlignment_ZERO: Clay_ChildAlignment = Clay_ChildAlignment { x: 0 as _, y: 0 as _ };
+const Clay_LayoutConfig_ZERO: Clay_LayoutConfig = clay::Clay_LayoutConfig {
+    sizing: Clay_Sizing_ZERO,
+    padding: Clay_Padding_ZERO,
+    childGap: 0,
+    childAlignment: Clay_ChildAlignment_ZERO,
+    layoutDirection: Clay_LayoutDirection_CLAY_LEFT_TO_RIGHT,
+};
+const Clay_Color_ZERO: clay::Clay_Color = clay::Clay_Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+const Clay_CornerRadius_ZERO: Clay_CornerRadius = Clay_CornerRadius { topLeft: 0f32, topRight: 0f32, bottomLeft: 0f32, bottomRight: 0f32 };
+const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Clay_ElementDeclaration {
+    id: Clay_ElementId_ZERO,
+    layout: Clay_LayoutConfig_ZERO,
+    backgroundColor: Clay_Color_ZERO,
+    cornerRadius: Clay_CornerRadius_ZERO,
+    aspectRatio: clay::Clay_AspectRatioElementConfig { aspectRatio: 0.0 },
+    image: clay::Clay_ImageElementConfig { imageData: std::ptr::null_mut() },
+    floating: clay::Clay_FloatingElementConfig {
+        offset: clay::Clay_Vector2 { x: 0f32, y: 0f32 },
+        expand: clay::Clay_Dimensions { width: 0f32, height: 0f32 },
+        parentId: 0,
+        zIndex: 0,
+        attachPoints: clay::Clay_FloatingAttachPoints {
+            element: Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
+            parent:  Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
+        },
+        pointerCaptureMode: Clay_PointerCaptureMode_CLAY_POINTER_CAPTURE_MODE_CAPTURE,
+        attachTo: Clay_FloatingAttachToElement_CLAY_ATTACH_TO_NONE,
+        clipTo: Clay_FloatingClipToElement_CLAY_CLIP_TO_NONE
+    },
+    custom: clay::Clay_CustomElementConfig { customData: std::ptr::null_mut() },
+    clip: clay::Clay_ClipElementConfig { horizontal: false, vertical: false, childOffset: clay::Clay_Vector2 { x: 0f32, y: 0f32 } },
+    border: clay::Clay_BorderElementConfig {
+        color: Clay_Color_ZERO,
+        width: clay::Clay_BorderWidth { left: 0, right: 0, top: 0, bottom: 0, betweenChildren: 0 }
+    },
+    userData: std::ptr::null_mut(),
+};
+
+fn decl(item: Item) -> bool {
     fn sizing(sizing: Sizing) -> clay::layout::Sizing {
         match sizing {
             Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
@@ -166,46 +206,38 @@ fn decl<
             Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
         }
     }
-    let decl = Declaration::<ImageElementData, CustomElementData>::new()
-        .background_color(item.colour.into())
-        .id(item.id.clay())
-        // .clip(true, true, clay::math::Vector2 { x: 0.0, y: 0.0 })
-        .layout()
-            .width(sizing(item.width))
-            .height(sizing(item.height))
-            .padding(clay::layout::Padding {
-                left:   item.padding.0 as u16,
-                right:  item.padding.1 as u16,
-                top:    item.padding.2 as u16,
-                bottom: item.padding.3 as u16,
-            })
-            .child_gap(item.child_gap as u16)
-            .child_alignment(Alignment {
-                x: match item.align.x {
-                    AlignX::Left   => { LayoutAlignmentX::Left }
-                    AlignX::Center => { LayoutAlignmentX::Center }
-                    AlignX::Right  => { LayoutAlignmentX::Right }
-                },
-                y: match item.align.y {
-                    AlignY::Top     => { LayoutAlignmentY::Top }
-                    AlignY::Center  => { LayoutAlignmentY::Center }
-                    AlignY::Bottom  => { LayoutAlignmentY::Bottom }
-                }
-            })
-            .direction(match item.direction {
-                Direction::TopToBottom => { clay::layout::LayoutDirection::TopToBottom }
-                Direction::LeftToRight => { clay::layout::LayoutDirection::LeftToRight }
-            })
-        .end()
-        .corner_radius()
-            .top_left(item.radius.0)
-            .top_right(item.radius.1)
-            .bottom_left(item.radius.2)
-            .bottom_right(item.radius.3)
-        .end()
-        .inner;
+    
+
+    let mut decl = Clay_ElementDeclaration_ZERO;
+    decl.backgroundColor = Clay_Color {
+        r: item.colour.0 as f32,
+        g: item.colour.1 as f32,
+        b: item.colour.2 as f32,
+        a: item.colour.3 as f32
+    };
+    decl.id = item.id.clay().id;
+    // decl.clip = Clay_ClipElementConfig { true, true, Clay_Vector2 { x: 0.0, y: 0.0 } };
+    decl.layout.sizing.width  = Clay_SizingAxis::from(sizing(item.width));
+    decl.layout.sizing.height = Clay_SizingAxis::from(sizing(item.height));
+    decl.layout.padding = Clay_Padding::from(Clay_Padding {
+        left:   item.padding.0 as u16,
+        right:  item.padding.1 as u16,
+        top:    item.padding.2 as u16,
+        bottom: item.padding.3 as u16,
+    });
+    decl.layout.childGap = item.child_gap as u16;
+    decl.layout.childAlignment = Clay_ChildAlignment { x: item.align.x as _, y: item.align.y as _ };
+    decl.layout.layoutDirection = item.direction as _;
+    decl.cornerRadius = Clay_CornerRadius {
+        topLeft:     item.radius.0,
+        topRight:    item.radius.1,
+        bottomLeft:  item.radius.2,
+        bottomRight: item.radius.3
+    };
 
     unsafe { clay::Clay__ConfigureOpenElement(decl); }
+
+    true
 }
 
 const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
@@ -228,21 +260,11 @@ impl Context {
     fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
     fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
 
-    fn button<
-        'render,
-        'clay: 'render,
-        ImageElementData: 'render,
-        CustomElementData: 'render,
-    >(
-        &self,
-        c: &clay::ClayLayoutScope<'clay, 'render, ImageElementData, CustomElementData>,
-        clicked_id: &mut Id,
-        id: Id
-    ) -> (bool, (u8, u8, u8, u8)) {
+    fn button(&self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) {
         let mouse_held    = self.input().mouse_held(winit::event::MouseButton::Left);
         let mouse_clicked = self.input().mouse_pressed(winit::event::MouseButton::Left);
 
-        let hover = c.pointer_over(id.clay());
+        let hover = unsafe { Clay_PointerOver(id.clay().id) };
         let (down, click) = (hover && mouse_held, hover && mouse_clicked);
         if click {
             *clicked_id = id;
@@ -263,33 +285,25 @@ impl Context {
         (click, colour)
     }
 
-    fn tab<
-        'render,
-        'clay: 'render,
-        ImageElementData: 'render,
-        CustomElementData: 'render,
-    >(
-        &self,
-        c: &clay::ClayLayoutScope<'clay, 'render, ImageElementData, CustomElementData>,
-        radius: (f32, f32, f32, f32),
-        padding: (f32, f32, f32, f32),
-        tab_id: &mut Id,
-        clicked_id: &mut Id,
-        label: &str
-    ) -> Id {
+    fn tab(&self,
+           radius: (f32, f32, f32, f32),
+           padding: (f32, f32, f32, f32),
+           tab_id: &mut Id,
+           clicked_id: &mut Id,
+           label: &str) -> Id {
         let tab_text_h = self.scale16(18.0);
 
         let radius = (radius.0, radius.1, 0.0, 0.0);
 
         let id = Id::id(label);
 
-        let (clicked, _) = self.button(&c, clicked_id, id);
+        let (clicked, _) = self.button(clicked_id, id);
         if clicked || *tab_id == Id::default() {
             *tab_id = id;
         }
 
         {
-            item!(); decl(&c, Item {
+            item!(); decl(Item {
                 id,
                 radius, padding,
                 colour: if *tab_id == id { ACTIVE_TAB_COL } else { INACTIVE_TAB_COL },
@@ -298,7 +312,7 @@ impl Context {
                 align: Align::Center,
                 ..Default::default()
             } );
-            c.text(label, clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+            unsafe { Clay__OpenTextElement(label.into(), clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end().into()) };
         }
 
         id
@@ -377,7 +391,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
     unsafe { clay::Clay_SetCurrentContext(c.clay.context); }
 
     {
-        item!(); decl(&c, Item {
+        item!(); decl(Item {
             id: Id::id("Main"),
             padding, child_gap,
             width: Grow!(),
@@ -391,7 +405,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
         };
 
         {
-            item!(); decl(&c, Item {
+            item!(); decl(Item {
                 id: Id::id("Left Pane"),
                 direction: Direction::TopToBottom,
                 width: pane_pct,
@@ -404,7 +418,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             let mut tab_id_history = Id::default();
 
             {
-                item!(); decl(&c, Item {
+                item!(); decl(Item {
                     id: Id::id("Tab Bar"),
                     child_gap,
                     width: Percent!(1.0),
@@ -412,15 +426,15 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                     align: Align::Center,
                     ..Default::default()
                 } );
-                tab_id_wallet     = ui.tab(&c, radius, padding, &mut pane_tab_l, &mut clicked_id, "Wallet");
-                tab_id_finalizers = ui.tab(&c, radius, padding, &mut pane_tab_l, &mut clicked_id, "Finalizers");
-                tab_id_history    = ui.tab(&c, radius, padding, &mut pane_tab_l, &mut clicked_id, "History");
+                tab_id_wallet     = ui.tab(radius, padding, &mut pane_tab_l, &mut clicked_id, "Wallet");
+                tab_id_finalizers = ui.tab(radius, padding, &mut pane_tab_l, &mut clicked_id, "Finalizers");
+                tab_id_history    = ui.tab(radius, padding, &mut pane_tab_l, &mut clicked_id, "History");
 
             }
 
             // Main contents
             {
-                item!(); decl(&c, Item {
+                item!(); decl(Item {
                     id: Id::id("Main Contents"),
                     colour: (0x12, 0x12, 0x12, 0xff),
                     radius: (0.0, 0.0, radius.2, radius.3),
@@ -433,14 +447,14 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
 
                 // spacer
                 {
-                    item!(); decl(&c, Item { width: Grow!(), height: Fixed!(ui.scale(32.0)), ..Default::default() });
+                    item!(); decl(Item { width: Grow!(), height: Fixed!(ui.scale(32.0)), ..Default::default() });
                 }
 
                 if pane_tab_l == tab_id_wallet {
 
                     // balance container
                     {
-                        item!(); decl(&c, Item {
+                        item!(); decl(Item {
                             width: Percent!(1.0),
                             height: Fit!(),
                             padding,
@@ -459,7 +473,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
 
                     // buttons container
                     {
-                        item!(); decl(&c, Item {
+                        item!(); decl(Item {
                             id: Id::id("Buttons Container"),
                             padding, child_gap, align: Align::Center,
                             width: Percent!(1.0),
@@ -469,9 +483,9 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
 
                         let mut button = |label| {
                             let id = Id::id(label);
-                            let (clicked, colour) = ui.button(&c, &mut clicked_id, id);
+                            let (clicked, colour) = ui.button(&mut clicked_id, id);
                             {
-                                item!(); decl(&c, Item {
+                                item!(); decl(Item {
                                 id, child_gap, align: Align::Center,
                                 direction: Direction::TopToBottom,
                                 width: Fit!(),
@@ -483,7 +497,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
 
                                 // Button circle
                                 {
-                                    item!(); decl(&c, Item {
+                                    item!(); decl(Item {
                                         colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
                                         width:  Fixed!(radius * 2.0),
                                         height: Fixed!(radius * 2.0),
@@ -510,7 +524,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                 } else if pane_tab_l == tab_id_finalizers {
                 } else if pane_tab_l == tab_id_history {
                     {
-                        item!(); decl(&c, Item {
+                        item!(); decl(Item {
                             width: Percent!(1.0),
                             height: Fit!(),
                             padding,
@@ -528,7 +542,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
         }
 
         {
-            item!(); decl(&c, Item {
+            item!(); decl(Item {
                 id: Id::id("Central Gap"),
                 radius, padding, child_gap,
                 width: Grow!(),
@@ -538,7 +552,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
         }
 
         {
-            item!(); decl(&c, Item {
+            item!(); decl(Item {
                 id: Id::id("Right Pane"),
                 direction: Direction::TopToBottom,
                 width: pane_pct,
@@ -551,7 +565,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             let mut tab_id_settings = Id::default();
 
             {
-                item!(); decl(&c, Item {
+                item!(); decl(Item {
                     id: Id::id("Tab Bar"),
                     child_gap,
                     width: Percent!(1.0),
@@ -560,14 +574,14 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                     ..Default::default()
                 } );
 
-                tab_id_faucet   = ui.tab(&c, radius, padding, &mut pane_tab_r, &mut clicked_id, "Faucet");
-                tab_id_roster   = ui.tab(&c, radius, padding, &mut pane_tab_r, &mut clicked_id, "Roster");
-                tab_id_settings = ui.tab(&c, radius, padding, &mut pane_tab_r, &mut clicked_id, "Settings");
+                tab_id_faucet   = ui.tab(radius, padding, &mut pane_tab_r, &mut clicked_id, "Faucet");
+                tab_id_roster   = ui.tab(radius, padding, &mut pane_tab_r, &mut clicked_id, "Roster");
+                tab_id_settings = ui.tab(radius, padding, &mut pane_tab_r, &mut clicked_id, "Settings");
             }
 
             // Main contents
             {
-                item!(); decl(&c, Item {
+                item!(); decl(Item {
                     id: Id::id("Main Contents"),
                     colour: (0x12, 0x12, 0x12, 0xff),
                     radius: (0.0, 0.0, radius.2, radius.3),

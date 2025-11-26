@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 use crossbeam_channel as channel;
 use std::collections::HashMap;
 use std::fmt;

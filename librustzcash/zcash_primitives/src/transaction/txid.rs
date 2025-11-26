@@ -1,3 +1,5 @@
+#![allow(warnings)]
+
 use crate::encoding::{StateWrite, WriteBytesExt};
 use core::borrow::Borrow;
 use core::convert::TryFrom;
