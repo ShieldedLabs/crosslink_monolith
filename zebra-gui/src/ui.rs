@@ -4,10 +4,10 @@ use std::thread::current;
 use std::{hash::Hash};
 use winit::{event::MouseButton, keyboard::KeyCode};
 use clay_layout as clay;
-use clay::{fit, fixed, grow, percent, Clay, Declaration};
+use clay::{Clay, Declaration};
 use clay::render_commands::RenderCommandConfig::{Rectangle, Text};
 use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
-use clay::*; // @Temporary
+//use clay::*; // @Temporary
 
 use super::*;
 
@@ -83,18 +83,18 @@ impl Align {
     const Bottom:      Self = Self { y: AlignY::Bottom, x: AlignX::Center };
     const BottomRight: Self = Self { y: AlignY::Bottom, x: AlignX::Right };
 }
-#[macro_export] macro_rules! Fit {
+#[macro_export] macro_rules! fit {
     ($min:expr, $max:expr) => { Sizing::Fit($min, $max) };
-    ($min:expr)            => { Fit!($min, f32::MAX) };
-    ()                     => { Fit!(0.0) };
+    ($min:expr)            => { fit!($min, f32::MAX) };
+    ()                     => { fit!(0.0) };
 }
-#[macro_export] macro_rules! Grow {
+#[macro_export] macro_rules! grow {
     ($min:expr, $max:expr) => { Sizing::Grow($min, $max) };
-    ($min:expr)            => { Grow!($min, f32::MAX) };
-    ()                     => { Grow!(0.0) };
+    ($min:expr)            => { grow!($min, f32::MAX) };
+    ()                     => { grow!(0.0) };
 }
-#[macro_export] macro_rules! Fixed { ($val:expr) => { Sizing::Fixed($val) }; }
-#[macro_export] macro_rules! Percent {
+#[macro_export] macro_rules! fixed { ($val:expr) => { Sizing::Fixed($val) }; }
+#[macro_export] macro_rules! percent {
     ($percent:expr) => {{
         const _: () = assert!(
             $percent >= 0.0 && $percent <= 1.0,
@@ -154,23 +154,23 @@ fn elem() -> CloseElement { unsafe { clay::Clay__OpenElement(); } CloseElement {
 impl Drop for CloseElement { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
 
 const Clay_ElementId_ZERO: clay::Clay_ElementId = clay::Clay_ElementId { id: 0, offset: 0, baseId: 0, stringId: clay::Clay_String { isStaticallyAllocated: false, length: 0, chars: std::ptr::null() } };
-const Clay_SizingMinMax_ZERO: Clay_SizingMinMax = clay::Clay_SizingMinMax { min: 0f32, max: f32::MAX };
-const Clay_SizingAxis_ZERO: Clay_SizingAxis = clay::Clay_SizingAxis {
+const Clay_SizingMinMax_ZERO: clay::Clay_SizingMinMax = clay::Clay_SizingMinMax { min: 0f32, max: f32::MAX };
+const Clay_SizingAxis_ZERO: clay::Clay_SizingAxis = clay::Clay_SizingAxis {
     size: clay::Clay_SizingAxis__bindgen_ty_1 { minMax: Clay_SizingMinMax_ZERO },
     type_: clay::Clay__SizingType_CLAY__SIZING_TYPE_FIT
 };
-const Clay_Sizing_ZERO: Clay_Sizing = clay::Clay_Sizing { width: Clay_SizingAxis_ZERO, height: Clay_SizingAxis_ZERO };
-const Clay_Padding_ZERO: Clay_Padding = Clay_Padding { left: 0, right: 0, top: 0, bottom: 0 };
-const Clay_ChildAlignment_ZERO: Clay_ChildAlignment = Clay_ChildAlignment { x: 0 as _, y: 0 as _ };
-const Clay_LayoutConfig_ZERO: Clay_LayoutConfig = clay::Clay_LayoutConfig {
+const Clay_Sizing_ZERO: clay::Clay_Sizing = clay::Clay_Sizing { width: Clay_SizingAxis_ZERO, height: Clay_SizingAxis_ZERO };
+const Clay_Padding_ZERO: clay::Clay_Padding = clay::Clay_Padding { left: 0, right: 0, top: 0, bottom: 0 };
+const Clay_ChildAlignment_ZERO: clay::Clay_ChildAlignment = clay::Clay_ChildAlignment { x: 0 as _, y: 0 as _ };
+const Clay_LayoutConfig_ZERO: clay::Clay_LayoutConfig = clay::Clay_LayoutConfig {
     sizing: Clay_Sizing_ZERO,
     padding: Clay_Padding_ZERO,
     childGap: 0,
     childAlignment: Clay_ChildAlignment_ZERO,
-    layoutDirection: Clay_LayoutDirection_CLAY_LEFT_TO_RIGHT,
+    layoutDirection: clay::Clay_LayoutDirection_CLAY_LEFT_TO_RIGHT,
 };
 const Clay_Color_ZERO: clay::Clay_Color = clay::Clay_Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
-const Clay_CornerRadius_ZERO: Clay_CornerRadius = Clay_CornerRadius { topLeft: 0f32, topRight: 0f32, bottomLeft: 0f32, bottomRight: 0f32 };
+const Clay_CornerRadius_ZERO: clay::Clay_CornerRadius = clay::Clay_CornerRadius { topLeft: 0f32, topRight: 0f32, bottomLeft: 0f32, bottomRight: 0f32 };
 const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Clay_ElementDeclaration {
     id: Clay_ElementId_ZERO,
     layout: Clay_LayoutConfig_ZERO,
@@ -184,12 +184,12 @@ const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Clay_E
         parentId: 0,
         zIndex: 0,
         attachPoints: clay::Clay_FloatingAttachPoints {
-            element: Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
-            parent:  Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
+            element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
+            parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
         },
-        pointerCaptureMode: Clay_PointerCaptureMode_CLAY_POINTER_CAPTURE_MODE_CAPTURE,
-        attachTo: Clay_FloatingAttachToElement_CLAY_ATTACH_TO_NONE,
-        clipTo: Clay_FloatingClipToElement_CLAY_CLIP_TO_NONE
+        pointerCaptureMode: clay::Clay_PointerCaptureMode_CLAY_POINTER_CAPTURE_MODE_CAPTURE,
+        attachTo: clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_NONE,
+        clipTo: clay::Clay_FloatingClipToElement_CLAY_CLIP_TO_NONE
     },
     custom: clay::Clay_CustomElementConfig { customData: std::ptr::null_mut() },
     clip: clay::Clay_ClipElementConfig { horizontal: false, vertical: false, childOffset: clay::Clay_Vector2 { x: 0f32, y: 0f32 } },
@@ -212,7 +212,7 @@ fn decl(item: Decl) -> bool {
     
 
     let mut decl = Clay_ElementDeclaration_ZERO;
-    decl.backgroundColor = Clay_Color {
+    decl.backgroundColor = clay::Clay_Color {
         r: item.colour.0 as f32,
         g: item.colour.1 as f32,
         b: item.colour.2 as f32,
@@ -220,18 +220,18 @@ fn decl(item: Decl) -> bool {
     };
     decl.id = item.id.clay().id;
     // decl.clip = Clay_ClipElementConfig { true, true, Clay_Vector2 { x: 0.0, y: 0.0 } };
-    decl.layout.sizing.width  = Clay_SizingAxis::from(sizing(item.width));
-    decl.layout.sizing.height = Clay_SizingAxis::from(sizing(item.height));
-    decl.layout.padding = Clay_Padding::from(Clay_Padding {
+    decl.layout.sizing.width  = clay::Clay_SizingAxis::from(sizing(item.width));
+    decl.layout.sizing.height = clay::Clay_SizingAxis::from(sizing(item.height));
+    decl.layout.padding = clay::Clay_Padding::from(clay::Clay_Padding {
         left:   item.padding.0 as u16,
         right:  item.padding.1 as u16,
         top:    item.padding.2 as u16,
         bottom: item.padding.3 as u16,
     });
     decl.layout.childGap = item.child_gap as u16;
-    decl.layout.childAlignment = Clay_ChildAlignment { x: item.align.x as _, y: item.align.y as _ };
+    decl.layout.childAlignment = clay::Clay_ChildAlignment { x: item.align.x as _, y: item.align.y as _ };
     decl.layout.layoutDirection = item.direction as _;
-    decl.cornerRadius = Clay_CornerRadius {
+    decl.cornerRadius = clay::Clay_CornerRadius {
         topLeft:     item.radius.0,
         topRight:    item.radius.1,
         bottomLeft:  item.radius.2,
@@ -267,7 +267,7 @@ impl Context {
         let mouse_held    = self.input().mouse_held(winit::event::MouseButton::Left);
         let mouse_clicked = self.input().mouse_pressed(winit::event::MouseButton::Left);
 
-        let hover = unsafe { Clay_PointerOver(id.clay().id) };
+        let hover = unsafe { clay::Clay_PointerOver(id.clay().id) };
         let (down, click) = (hover && mouse_held, hover && mouse_clicked);
         if click {
             *clicked_id = id;
@@ -286,6 +286,10 @@ impl Context {
         };
 
         (click, colour)
+    }
+
+    fn text(&self, label: &str, config: clay::text::TextElementConfig) {
+        unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
 
     fn tab(&self,
@@ -309,12 +313,12 @@ impl Context {
             id,
             radius, padding,
             colour: if *tab_id == id { ACTIVE_TAB_COL } else { INACTIVE_TAB_COL },
-            width: Grow!(),
-            height: Grow!(),
+            width: grow!(),
+            height: grow!(),
             align: Align::Center,
             ..Decl::default()
         }) {
-            unsafe { Clay__OpenTextElement(label.into(), clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end().into()) };
+            self.text(label, clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
         }
 
         id
@@ -395,8 +399,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
     if let _ = elem() && decl(Decl {
         id: id("Main"),
         padding, child_gap,
-        width: Grow!(),
-        height: Grow!(),
+        width: grow!(),
+        height: grow!(),
         ..Decl::default()
     }) {
         let pane_pct = {
@@ -409,7 +413,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             id: id("Left Pane"),
             direction: TopToBottom,
             width: pane_pct,
-            height: Grow!(),
+            height: grow!(),
             ..Decl::default()
         }) {
 
@@ -420,8 +424,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             if let _ = elem() && decl(Decl {
                 id: id("Tab Bar"),
                 child_gap,
-                width: Percent!(1.0),
-                height: Fit!(),
+                width: percent!(1.0),
+                height: fit!(),
                 align: Align::Center,
                 ..Decl::default()
             }) {
@@ -437,21 +441,21 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                 colour: PANE_COL,
                 radius: (0.0, 0.0, radius.2, radius.3),
                 direction: TopToBottom,
-                width: Percent!(1.0),
-                height: Grow!(),
+                width: percent!(1.0),
+                height: grow!(),
                 ..Decl::default()
             }) {
                 let balance_text_h = ui.scale16(48.0);
 
                 // spacer
-                if let _ = elem() && decl(Decl { width: Grow!(), height: Fixed!(ui.scale(32.0)), ..Default::default() }) {}
+                if let _ = elem() && decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
                 if pane_tab_l == tab_id_wallet {
 
                     // balance container
                     if let _ = elem() && decl(Decl {
-                        width: Percent!(1.0),
-                        height: Fit!(),
+                        width: percent!(1.0),
+                        height: fit!(),
                         padding,
                         align: Align::Center,
                         ..Decl::default()
@@ -460,7 +464,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                         let zec_full = balance / 100_000_000;
                         let zec_part = balance % 100_000_000;
                         balance_str = format!("{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
-                        c.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                        ui.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
                     }
 
                     let child_gap = child_gap as f32;
@@ -470,8 +474,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                     if let _ = elem() && decl(Decl {
                         id: id("Buttons Container"),
                         padding, child_gap, align: Align::Center,
-                        width: Percent!(1.0),
-                        height: Fit!(),
+                        width: percent!(1.0),
+                        height: fit!(),
                         ..Decl::default()
                     }) {
 
@@ -481,8 +485,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                             if let _ = elem() && decl(Decl {
                                 id, child_gap, align: Align::Center,
                                 direction: TopToBottom,
-                                width: Fit!(),
-                                height: Fit!(),
+                                width: fit!(),
+                                height: fit!(),
                                 ..Decl::default()
                             }) {
 
@@ -491,16 +495,16 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                                 // Button circle
                                 if let _ = elem() && decl(Decl {
                                     colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
-                                    width:  Fixed!(radius * 2.0),
-                                    height: Fixed!(radius * 2.0),
+                                    width:  fixed!(radius * 2.0),
+                                    height: fixed!(radius * 2.0),
                                     ..Decl::default()
                                 }) {
                                     let temp_letter_symbol_h = ui.scale16(32.0);
-                                    c.text(&label[..1], clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                                    ui.text(&label[..1], clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
                                 }
 
                                 let button_text_h = ui.scale16(16.0);
-                                c.text(label, clay::text::TextConfig::new().font_size(button_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                                ui.text(label, clay::text::TextConfig::new().font_size(button_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
                             }
                             clicked
                         };
@@ -518,8 +522,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                     if let _ = elem() && decl(Decl {
                         id: id("Balance"),
                         padding,
-                        width: Percent!(1.0),
-                        height: Fit!(),
+                        width: percent!(1.0),
+                        height: fit!(),
                         align: Align::Center,
                         ..Decl::default()
                     }) {
@@ -527,7 +531,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                         let zec_full = balance / 100_000_000;
                         let zec_part = balance % 100_000_000;
                         balance_str = format!("{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
-                        c.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                        ui.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
                     }
                 }
             }
@@ -536,8 +540,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
         if let _ = elem() && decl(Decl {
             id: id("Central Gap"),
             radius, padding, child_gap,
-            width: Grow!(),
-            height: Grow!(),
+            width: grow!(),
+            height: grow!(),
             ..Decl::default()
         }) {
         }
@@ -546,7 +550,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             id: id("Right Pane"),
             direction: TopToBottom,
             width: pane_pct,
-            height: Grow!(),
+            height: grow!(),
             ..Decl::default()
         }) {
 
@@ -557,8 +561,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             if let _ = elem() && decl(Decl {
                 id: id("Tab Bar"),
                 child_gap,
-                width: Percent!(1.0),
-                height: Fit!(),
+                width: percent!(1.0),
+                height: fit!(),
                 align: Align::Center,
                 ..Decl::default()
             }) {
@@ -574,8 +578,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                 colour: PANE_COL,
                 radius: (0.0, 0.0, radius.2, radius.3),
                 direction: TopToBottom,
-                width: Percent!(1.0),
-                height: Grow!(),
+                width: percent!(1.0),
+                height: grow!(),
                 ..Decl::default()
             }) {
             }
