@@ -398,7 +398,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
 
     if let _ = elem() && decl(Decl {
         id: id("Main"),
-        padding, child_gap,
+        padding: (0.0, 0.0, padding.2, padding.3), child_gap,
         width: grow!(),
         height: grow!(),
         ..Decl::default()
@@ -429,7 +429,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                 align: Align::Center,
                 ..Decl::default()
             }) {
-                tab_id_wallet     = ui.tab(radius, padding, &mut pane_tab_l, &mut clicked_id, "Wallet");
+                tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, &mut pane_tab_l, &mut clicked_id, "Wallet");
                 tab_id_finalizers = ui.tab(radius, padding, &mut pane_tab_l, &mut clicked_id, "Finalizers");
                 tab_id_history    = ui.tab(radius, padding, &mut pane_tab_l, &mut clicked_id, "History");
 
@@ -439,7 +439,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             if let _ = elem() && decl(Decl {
                 id: id("Main Contents"),
                 colour: PANE_COL,
-                radius: (0.0, 0.0, radius.2, radius.3),
+                radius: (0.0, 0.0, radius.2, 0.0),
                 direction: TopToBottom,
                 width: percent!(1.0),
                 height: grow!(),
@@ -569,14 +569,14 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
 
                 tab_id_faucet   = ui.tab(radius, padding, &mut pane_tab_r, &mut clicked_id, "Faucet");
                 tab_id_roster   = ui.tab(radius, padding, &mut pane_tab_r, &mut clicked_id, "Roster");
-                tab_id_settings = ui.tab(radius, padding, &mut pane_tab_r, &mut clicked_id, "Settings");
+                tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, &mut pane_tab_r, &mut clicked_id, "Settings");
             }
 
             // Main contents
             if let _ = elem() && decl(Decl {
                 id: id("Main Contents"),
                 colour: PANE_COL,
-                radius: (0.0, 0.0, radius.2, radius.3),
+                radius: (0.0, 0.0, 0.0, radius.3),
                 direction: TopToBottom,
                 width: percent!(1.0),
                 height: grow!(),
