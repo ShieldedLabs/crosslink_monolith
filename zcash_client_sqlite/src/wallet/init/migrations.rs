@@ -7,8 +7,10 @@
 //! Omitted versions had the same migration state as the first prior version that is
 //! included.
 
+mod account_delete_cascade;
 mod add_account_birthdays;
 mod add_account_uuids;
+mod add_transaction_trust_marker;
 mod add_transaction_views;
 mod add_utxo_account;
 mod addresses_table;
@@ -18,6 +20,7 @@ mod ephemeral_addresses;
 mod fix_bad_change_flagging;
 mod fix_broken_commitment_trees;
 mod fix_transparent_received_outputs;
+mod fix_v_transactions_expired_unmined;
 mod full_account_ids;
 mod initial_setup;
 mod nullifier_map;
@@ -32,24 +35,27 @@ mod spend_key_available;
 mod support_legacy_sqlite;
 mod support_zcashd_wallet_import;
 mod transparent_gap_limit_handling;
+mod tx_observation_height;
 mod tx_retrieval_queue;
 mod tx_retrieval_queue_expiry;
 mod ufvk_support;
 mod utxos_table;
 mod utxos_to_txos;
+mod v_received_output_spends_account;
 mod v_sapling_shard_unscanned_ranges;
 mod v_transactions_additional_totals;
 mod v_transactions_net;
 mod v_transactions_note_uniqueness;
 mod v_transactions_shielding_balance;
 mod v_transactions_transparent_history;
+mod v_tx_outputs_return_addrs;
 mod v_tx_outputs_use_legacy_false;
 mod wallet_summaries;
 
 use std::{rc::Rc, sync::Mutex};
 
 use rand_core::RngCore;
-use rusqlite::{named_params, OptionalExtension};
+use rusqlite::{OptionalExtension, named_params};
 use schemerz_rusqlite::RusqliteMigration;
 use secrecy::SecretVec;
 use uuid::Uuid;
@@ -82,40 +88,49 @@ pub(super) fn all_migrations<
     //                                               |
     //                                       v_transactions_net
     //                                               |
-    //                                            received_notes_nullable_nf----------------------
+    //                                            received_notes_nullable_nf---------------------.
     //                                            /           |                                   \
     //                                           /            |                                    \
-    //           --------------- shardtree_support    sapling_memo_consistency                    nullifier_map
+    //           ,-------------- shardtree_support    sapling_memo_consistency                    nullifier_map
     //          /                     /           \                       \                                  |
     // orchard_shardtree   add_account_birthdays   receiving_key_scopes   v_transactions_transparent_history |
     //   |                    |                 \            |                     |                         |
     //   |   v_sapling_shard_unscanned_ranges    \           |       v_tx_outputs_use_legacy_false           |
     //   |                    |                   \          |                     |                         |
-    //   |            wallet_summaries             \         |      v_transactions_shielding_balance         |
-    //   |                    \                     \        |                     |                        /
+    //   |            wallet_summaries             \         |      v_transactions_shielding_balance         /
+    //   \                    \                     \        |                     |                        /
     //    \                    \                     \       |      v_transactions_note_uniqueness         /
     //     \                    \                     \      |        /                                   /
-    //      \                    -------------------- full_account_ids                                   /
+    //      \                    `------------------- full_account_ids                                   /
     //       \                                        /               \                                 /
     //        \                         orchard_received_notes        spend_key_available              /
-    //         \                             /         \                      /                       /
+    //         \                            /          \                      /                       /
     //          \     ensure_orchard_ua_receiver     utxos_to_txos           /                       /
     //           \                          \              |                /                       /
     //            \                          \     ephemeral_addresses     /                       /
     //             \                          \            |              /                       /
-    //              ------------------------------ tx_retrieval_queue ----------------------------
-    //                                              |              \
-    //                                    support_legacy_sqlite    tx_retrieval_queue_expiry
-    //                                       /              \
-    //                  fix_broken_commitment_trees         add_account_uuids
-    //                             /                                /        \
-    //          fix_bad_change_flagging      transparent_gap_limit_handling   v_transactions_additional_totals
-    //                             \                       |                      /
-    //                              \      ensure_default_transparent_address    /
-    //                               \                     |                    /
-    //                                `---- fix_transparent_received_outputs --'
-    //                                                     |
-    //                                        support_zcashd_wallet_import
+    //              `----------------------------- tx_retrieval_queue ---------------------------'
+    //                                                  /    \
+    //                              support_legacy_sqlite    tx_retrieval_queue_expiry ----------------.
+    //                                 /              \                                                 \
+    //            fix_broken_commitment_trees         add_account_uuids                                  \
+    //                       /                                /        \                                  \
+    //    fix_bad_change_flagging      transparent_gap_limit_handling   v_transactions_additional_totals   \
+    //                       \                       |                      /                               \
+    //                        \      ensure_default_transparent_address    /                                 \
+    //                         \                     |                    /                                   \
+    //                          `---- fix_transparent_received_outputs --'                                     \
+    //                                  /         /               \                                            |
+    //           support_zcashd_wallet_import    /             fix_v_transactions_expired_unmined              |
+    //                \                         /                    /        |         \                      |
+    //                 \      tx_observation_height                 /         |          \                     |
+    //                  \                       \                  /          |           \                    /
+    //                   \                   add_transaction_trust_marker     |  v_tx_outputs_return_addrs    /
+    //                    \                       \                           |                     /        /
+    //                     \                       \         v_received_output_spends_account      /        /
+    //                      \                       \               /                             /        /
+    //                       `------------------- account_delete_cascade ---------------------------------'
+    //
     let rng = Rc::new(Mutex::new(rng));
     vec![
         Box::new(initial_setup::Migration {}),
@@ -192,6 +207,14 @@ pub(super) fn all_migrations<
         Box::new(tx_retrieval_queue_expiry::Migration),
         Box::new(fix_transparent_received_outputs::Migration),
         Box::new(support_zcashd_wallet_import::Migration),
+        Box::new(fix_v_transactions_expired_unmined::Migration),
+        Box::new(v_tx_outputs_return_addrs::Migration),
+        Box::new(tx_observation_height::Migration {
+            params: params.clone(),
+        }),
+        Box::new(v_received_output_spends_account::Migration),
+        Box::new(add_transaction_trust_marker::Migration),
+        Box::new(account_delete_cascade::Migration),
     ]
 }
 
@@ -200,10 +223,11 @@ pub(super) fn all_migrations<
 ///
 /// Omitted versions had the same migration state as the first prior version that is
 /// included.
-#[allow(dead_code)]
+#[allow(dead_code)] // marked as dead code so that this appears in docs with --document-private-items
 const PUBLIC_MIGRATION_STATES: &[&[Uuid]] = &[
     V_0_4_0, V_0_6_0, V_0_8_0, V_0_9_0, V_0_10_0, V_0_10_3, V_0_11_0, V_0_11_1, V_0_11_2, V_0_12_0,
-    V_0_13_0, V_0_14_0, V_0_15_0, V_0_16_0, V_0_16_2,
+    V_0_13_0, V_0_14_0, V_0_15_0, V_0_16_0, V_0_16_2, V_0_16_4, V_0_17_2, V_0_17_3, V_0_18_0,
+    V_0_18_5, V_0_19_0,
 ];
 
 /// Leaf migrations in the 0.4.0 release.
@@ -276,18 +300,62 @@ pub const V_0_15_0: &[Uuid] = &[
 ];
 
 /// Leaf migrations in the 0.16.0 release.
-const V_0_16_0: &[Uuid] = &[
+pub const V_0_16_0: &[Uuid] = &[
     fix_bad_change_flagging::MIGRATION_ID,
     v_transactions_additional_totals::MIGRATION_ID,
     transparent_gap_limit_handling::MIGRATION_ID,
 ];
 
 /// Leaf migrations in the 0.16.2 release.
-const V_0_16_2: &[Uuid] = &[
+pub const V_0_16_2: &[Uuid] = &[
     fix_bad_change_flagging::MIGRATION_ID,
     v_transactions_additional_totals::MIGRATION_ID,
     ensure_default_transparent_address::MIGRATION_ID,
 ];
+
+/// Leaf migrations in the 0.16.4 release.
+pub const V_0_16_4: &[Uuid] = &[
+    fix_bad_change_flagging::MIGRATION_ID,
+    v_transactions_additional_totals::MIGRATION_ID,
+    ensure_default_transparent_address::MIGRATION_ID,
+    tx_retrieval_queue_expiry::MIGRATION_ID,
+];
+
+/// Leaf migrations in the 0.17.0 release.
+pub const V_0_17_0: &[Uuid] = &[fix_transparent_received_outputs::MIGRATION_ID];
+
+/// Leaf migrations in the 0.17.2 release.
+pub const V_0_17_2: &[Uuid] = &[
+    tx_retrieval_queue_expiry::MIGRATION_ID,
+    fix_transparent_received_outputs::MIGRATION_ID,
+];
+
+/// Leaf migrations in the 0.17.3 release.
+pub const V_0_17_3: &[Uuid] = &[
+    tx_retrieval_queue_expiry::MIGRATION_ID,
+    fix_v_transactions_expired_unmined::MIGRATION_ID,
+];
+
+/// Leaf migrations in the 0.18.0 release.
+pub const V_0_18_0: &[Uuid] = &[
+    tx_retrieval_queue_expiry::MIGRATION_ID,
+    support_zcashd_wallet_import::MIGRATION_ID,
+    v_tx_outputs_return_addrs::MIGRATION_ID,
+];
+
+/// Leaf migrations in the 0.18.5 release.
+pub const V_0_18_5: &[Uuid] = &[
+    tx_retrieval_queue_expiry::MIGRATION_ID,
+    support_zcashd_wallet_import::MIGRATION_ID,
+    v_tx_outputs_return_addrs::MIGRATION_ID,
+    tx_observation_height::MIGRATION_ID,
+];
+
+/// Leaf migrations in the 0.19.0 release.
+pub const V_0_19_0: &[Uuid] = &[account_delete_cascade::MIGRATION_ID];
+
+/// Leaf migrations as of the current repository state.
+pub const CURRENT_LEAF_MIGRATIONS: &[Uuid] = &[account_delete_cascade::MIGRATION_ID];
 
 pub(super) fn verify_network_compatibility<P: consensus::Parameters>(
     conn: &rusqlite::Connection,
@@ -346,9 +414,9 @@ mod tests {
     use zcash_protocol::consensus::Network;
 
     use crate::{
+        WalletDb,
         testing::db::{test_clock, test_rng},
         wallet::init::WalletMigrator,
-        WalletDb,
     };
 
     /// Tests that we can migrate from a completely empty wallet database to the target

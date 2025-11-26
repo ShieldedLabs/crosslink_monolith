@@ -10,7 +10,7 @@
 
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, doc(auto_cfg))]
 // Catch documentation errors caused by code changes.
 #![deny(rustdoc::broken_intra_doc_links)]
 // Temporary until we have addressed all Result<T, ()> cases.
@@ -35,7 +35,7 @@ mod txid;
 pub use txid::TxId;
 
 /// A Zcash shielded transfer protocol.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ShieldedProtocol {
     /// The Sapling protocol
     Sapling,

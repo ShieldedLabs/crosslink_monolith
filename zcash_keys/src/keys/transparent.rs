@@ -7,7 +7,7 @@ use core::array::TryFromSliceError;
 
 use bip32::{PrivateKey, PrivateKeyBytes};
 use secp256k1::{PublicKey, Secp256k1, SecretKey, Signing};
-use secrecy::{zeroize::ZeroizeOnDrop, ExposeSecret, SecretString, SecretVec, Zeroize};
+use secrecy::{ExposeSecret, SecretString, SecretVec, Zeroize, zeroize::ZeroizeOnDrop};
 use zcash_protocol::consensus::NetworkConstants;
 
 /// Errors that can occur in the parsing of Bitcoin-style base58-encoded secret key material
@@ -66,7 +66,7 @@ impl Key {
                 .with_check(None)
                 .into_vec()?,
         );
-        let prefix = network.b58_script_address_prefix();
+        let prefix = network.b58_secret_key_prefix();
         let decoded_len = decoded.expose_secret().len();
         let compressed =
             decoded_len == (33 + prefix.len()) && decoded.expose_secret().last() == Some(&1);
@@ -339,10 +339,11 @@ mod tests {
     use secrecy::SecretString;
     use transparent::address::TransparentAddress;
     use zcash_protocol::consensus::NetworkType;
+    use zcash_script::script::Evaluable;
 
     use super::{
-        test_vectors::{VectorKind, INVALID, VALID},
         Key,
+        test_vectors::{INVALID, VALID, VectorKind},
     };
 
     #[test]
@@ -387,14 +388,16 @@ mod tests {
                             .convert_if_network(v.network)
                             .unwrap();
                     let script = destination.script();
-                    assert_eq!(hex::encode(&script.0), v.raw_bytes_hex);
+                    assert_eq!(hex::encode(script.to_bytes()), v.raw_bytes_hex);
 
                     // Public key must be invalid private key
-                    assert!(Key::decode_base58(
-                        &v.network,
-                        &SecretString::new(v.base58_encoding.into())
-                    )
-                    .is_err());
+                    assert!(
+                        Key::decode_base58(
+                            &v.network,
+                            &SecretString::new(v.base58_encoding.into())
+                        )
+                        .is_err()
+                    );
                 }
             }
         }

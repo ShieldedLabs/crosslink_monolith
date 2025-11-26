@@ -5,10 +5,11 @@ use core::convert::Infallible;
 
 use crate::transaction::fees::zip317::P2PKH_STANDARD_INPUT_SIZE;
 use transparent::{
-    address::{Script, TransparentAddress},
+    address::Script,
     bundle::{OutPoint, TxOut},
 };
 use zcash_protocol::value::Zatoshis;
+use zcash_script::{script, solver};
 
 #[cfg(feature = "transparent-inputs")]
 use transparent::builder::TransparentInputInfo;
@@ -38,10 +39,16 @@ pub trait InputView: core::fmt::Debug {
     /// The previous output being spent.
     fn coin(&self) -> &TxOut;
 
-    /// The size of the transparent script required to spend this input.
+    /// The size of this transparent input in a transaction, as used in [ZIP 317].
+    ///
+    /// [ZIP 317]: https://zips.z.cash/zip-0317#rationale-for-the-chosen-parameters
     fn serialized_size(&self) -> InputSize {
-        match self.coin().script_pubkey.address() {
-            Some(TransparentAddress::PublicKeyHash(_)) => InputSize::STANDARD_P2PKH,
+        match script::PubKey::parse(&self.coin().script_pubkey().0)
+            .ok()
+            .as_ref()
+            .and_then(solver::standard)
+        {
+            Some(solver::ScriptKind::PubKeyHash { .. }) => InputSize::STANDARD_P2PKH,
             _ => InputSize::Unknown(self.outpoint().clone()),
         }
     }
@@ -55,6 +62,13 @@ impl InputView for TransparentInputInfo {
 
     fn coin(&self) -> &TxOut {
         self.coin()
+    }
+
+    fn serialized_size(&self) -> InputSize {
+        self.serialized_len().map_or(
+            InputSize::Unknown(self.outpoint().clone()),
+            InputSize::Known,
+        )
     }
 }
 
@@ -86,10 +100,10 @@ pub trait OutputView: core::fmt::Debug {
 
 impl OutputView for TxOut {
     fn value(&self) -> Zatoshis {
-        self.value
+        self.value()
     }
 
     fn script_pubkey(&self) -> &Script {
-        &self.script_pubkey
+        self.script_pubkey()
     }
 }

@@ -9,6 +9,30 @@ workspace.
 
 ## [Unreleased]
 
+### Changed
+- MSRV is now 1.85.1.
+
+## [0.12.0] - 2025-10-13
+
+### Changed
+- Migrated to `zcash_protocol 0.7`, `zcash_address 0.10`, `zcash_transparent 0.6`
+
+## [0.11.0] - 2025-09-25
+
+### Added
+- `zcash_keys::address::UnifiedAddress::to_zcash_address`
+
+### Changed
+- Migrated to `zcash_transparent 0.5`.
+- `zcash_keys::keys::AddressGenerationError` has added variants `UnsupportedTransparentKeyScope`
+  and `Bip32DerivationError` when the `transparent-inputs` feature flag is enabled.
+
+## [0.10.1] - 2025-08-06
+
+### Fixed
+- Use of an incorrect prefix for transparent secret key Base58 encoding
+  (available under the `transparent-key-encoding` feature) has been fixed.
+
 ## [0.10.0] - 2025-08-06
 
 ### Added

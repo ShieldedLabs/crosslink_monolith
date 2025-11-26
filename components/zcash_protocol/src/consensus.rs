@@ -29,7 +29,7 @@ impl BlockHeight {
         BlockHeight(v)
     }
 
-    /// Subtracts the provided value from this height, returning `H0` if this would result in
+    /// Subtracts the provided value from this height, returning [`H0`] if this would result in
     /// underflow of the wrapped `u32`.
     pub fn saturating_sub(self, v: u32) -> BlockHeight {
         BlockHeight(self.0.saturating_sub(v))
@@ -432,7 +432,7 @@ impl Parameters for MainNetwork {
             NetworkUpgrade::Canopy => Some(BlockHeight(1_046_400)),
             NetworkUpgrade::Nu5 => Some(BlockHeight(1_687_104)),
             NetworkUpgrade::Nu6 => Some(BlockHeight(2_726_400)),
-            NetworkUpgrade::Nu6_1 => None,
+            NetworkUpgrade::Nu6_1 => Some(BlockHeight(3_146_400)),
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => None,
             #[cfg(zcash_unstable = "zfuture")]
@@ -458,14 +458,25 @@ impl Parameters for TestNetwork {
 
     fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
         match nu {
-            NetworkUpgrade::Overwinter => Some(BlockHeight(207_500)),
-            NetworkUpgrade::Sapling => Some(BlockHeight(280_000)),
-            NetworkUpgrade::Blossom => Some(BlockHeight(584_000)),
-            NetworkUpgrade::Heartwood => Some(BlockHeight(903_800)),
-            NetworkUpgrade::Canopy => Some(BlockHeight(1_028_500)),
-            NetworkUpgrade::Nu5 => Some(BlockHeight(1_842_420)),
-            NetworkUpgrade::Nu6 => Some(BlockHeight(2_976_000)),
+            // NetworkUpgrade::Overwinter => Some(BlockHeight(207_500)),
+            // NetworkUpgrade::Sapling => Some(BlockHeight(280_000)),
+            // NetworkUpgrade::Blossom => Some(BlockHeight(584_000)),
+            // NetworkUpgrade::Heartwood => Some(BlockHeight(903_800)),
+            // NetworkUpgrade::Canopy => Some(BlockHeight(1_028_500)),
+            // NetworkUpgrade::Nu5 => Some(BlockHeight(1_842_420)),
+            // NetworkUpgrade::Nu6 => Some(BlockHeight(2_976_000)),
+            // NetworkUpgrade::Nu6_1 => Some(BlockHeight(3_536_500)),
+
+            // @TODO(JUDAH): Should be driven by regtest config!!!!!
+            NetworkUpgrade::Overwinter => Some(BlockHeight(1)),
+            NetworkUpgrade::Sapling => Some(BlockHeight(1)),
+            NetworkUpgrade::Blossom => Some(BlockHeight(1)),
+            NetworkUpgrade::Heartwood => Some(BlockHeight(1)),
+            NetworkUpgrade::Canopy => Some(BlockHeight(1)),
+            NetworkUpgrade::Nu5 => Some(BlockHeight(1)),
+            NetworkUpgrade::Nu6 => Some(BlockHeight(1)),
             NetworkUpgrade::Nu6_1 => Some(BlockHeight(3_536_500)),
+
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => None,
             #[cfg(zcash_unstable = "zfuture")]
@@ -917,8 +928,12 @@ mod tests {
             BranchId::Nu6,
         );
         assert_eq!(
+            BranchId::for_height(&MAIN_NETWORK, BlockHeight(3_146_400)),
+            BranchId::Nu6_1,
+        );
+        assert_eq!(
             BranchId::for_height(&MAIN_NETWORK, BlockHeight(5_000_000)),
-            BranchId::Nu6,
+            BranchId::Nu6_1,
         );
     }
 }

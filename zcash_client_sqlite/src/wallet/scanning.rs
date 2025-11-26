@@ -1,5 +1,5 @@
 use incrementalmerkletree::{Address, Position};
-use rusqlite::{self, named_params, types::Value, OptionalExtension};
+use rusqlite::{self, OptionalExtension, named_params, types::Value};
 use std::cmp::{max, min};
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -7,19 +7,19 @@ use std::rc::Rc;
 use tracing::{debug, trace};
 
 use zcash_client_backend::data_api::{
-    scanning::{spanning_tree::SpanningTree, ScanPriority, ScanRange},
     SAPLING_SHARD_HEIGHT,
+    scanning::{ScanPriority, ScanRange, spanning_tree::SpanningTree},
 };
 use zcash_protocol::{
-    consensus::{self, BlockHeight, NetworkUpgrade},
     ShieldedProtocol,
+    consensus::{self, BlockHeight, NetworkUpgrade},
 };
 
 use crate::TableConstants;
 use crate::{
+    PRUNING_DEPTH, VERIFY_LOOKAHEAD,
     error::SqliteClientError,
     wallet::{block_height_extrema, init::WalletMigrationError},
-    PRUNING_DEPTH, VERIFY_LOOKAHEAD,
 };
 
 use super::common::table_constants;
@@ -548,6 +548,7 @@ pub(crate) fn update_chain_tip<P: consensus::Parameters>(
         None => tip_entry.block_range().clone(),
     };
 
+    // persist the updated scan queue entries
     replace_queue_entries::<SqliteClientError>(
         conn,
         &query_range,
@@ -562,17 +563,18 @@ pub(crate) fn update_chain_tip<P: consensus::Parameters>(
 pub(crate) mod tests {
     use std::num::NonZeroU8;
 
-    use incrementalmerkletree::{frontier::Frontier, Hashable, Position};
+    use incrementalmerkletree::{Hashable, Position, frontier::Frontier};
 
     use secrecy::SecretVec;
     use zcash_client_backend::data_api::{
-        chain::{ChainState, CommitmentTreeRoot},
-        scanning::{spanning_tree::testing::scan_range, ScanPriority},
-        testing::{
-            pool::ShieldedPoolTester, sapling::SaplingPoolTester, AddressType, FakeCompactOutput,
-            InitialChainState, TestBuilder, TestState,
-        },
         AccountBirthday, Ratio, WalletRead, WalletWrite,
+        chain::{ChainState, CommitmentTreeRoot},
+        scanning::{ScanPriority, spanning_tree::testing::scan_range},
+        testing::{
+            AddressType, FakeCompactOutput, InitialChainState, TestBuilder, TestState,
+            pool::ShieldedPoolTester, sapling::SaplingPoolTester,
+        },
+        wallet::ConfirmationsPolicy,
     };
     use zcash_primitives::block::BlockHash;
     use zcash_protocol::{
@@ -582,26 +584,26 @@ pub(crate) mod tests {
     };
 
     use crate::{
+        VERIFY_LOOKAHEAD,
         error::SqliteClientError,
         testing::{
-            db::{TestDb, TestDbFactory},
             BlockCache,
+            db::{TestDb, TestDbFactory},
         },
         wallet::scanning::{insert_queue_entries, replace_queue_entries, suggest_scan_ranges},
-        VERIFY_LOOKAHEAD,
     };
 
     #[cfg(feature = "orchard")]
     use {
         incrementalmerkletree::Level,
         orchard::tree::MerkleHashOrchard,
-        std::{convert::Infallible, num::NonZeroU32},
+        std::convert::Infallible,
         zcash_client_backend::{
             data_api::{
-                testing::orchard::OrchardPoolTester, wallet::input_selection::GreedyInputSelector,
-                WalletCommitmentTrees,
+                WalletCommitmentTrees, testing::orchard::OrchardPoolTester,
+                wallet::input_selection::GreedyInputSelector,
             },
-            fees::{standard, DustOutputPolicy, StandardFeeRule},
+            fees::{DustOutputPolicy, StandardFeeRule, standard},
             wallet::OvkPolicy,
         },
         zcash_protocol::memo::Memo,
@@ -769,7 +771,7 @@ pub(crate) mod tests {
         // shard is incomplete.
         assert_eq!(
             st.wallet()
-                .get_wallet_summary(0)
+                .get_wallet_summary(ConfirmationsPolicy::MIN)
                 .unwrap()
                 .map(|s| T::next_subtree_index(&s)),
             Some(2),
@@ -1304,7 +1306,7 @@ pub(crate) mod tests {
         // We have scan ranges and a subtree, but have scanned no blocks. Given the number of
         // blocks scanned in the previous subtree, we estimate the number of notes in the current
         // subtree
-        let summary = st.get_wallet_summary(1);
+        let summary = st.get_wallet_summary(ConfirmationsPolicy::MIN);
         assert_eq!(
             summary.as_ref().and_then(|s| s.progress().recovery()),
             no_recovery,
@@ -1347,7 +1349,7 @@ pub(crate) mod tests {
 
         // We have scanned a block, so we now have a starting tree position, 500 blocks above the
         // wallet birthday but before the end of the shard.
-        let summary = st.get_wallet_summary(1);
+        let summary = st.get_wallet_summary(ConfirmationsPolicy::MIN);
         assert_eq!(summary.as_ref().map(|s| T::next_subtree_index(s)), Some(0));
 
         assert_eq!(
@@ -1454,7 +1456,7 @@ pub(crate) mod tests {
             + (10
                 + ((1234 + 10) * (new_tip - max_scanned))
                     / (max_scanned - (birthday.height() - 10)));
-        let summary = st.get_wallet_summary(1);
+        let summary = st.get_wallet_summary(ConfirmationsPolicy::MIN);
         assert_eq!(
             summary.map(|s| s.progress().scan()),
             Some(Ratio::new(1, u64::from(expected_denom)))
@@ -1648,13 +1650,13 @@ pub(crate) mod tests {
             // Generate the birthday block plus 10 more
             for _ in 0..11 {
                 let (_, res, _) = st.generate_next_block_multi(&vec![fake_output(false); 4]);
-                for c in res.orchard() {
+                for c in res.note_commitments().orchard() {
                     final_orchard_tree.append(*c);
                 }
             }
 
             // Generate a block with the last note in the block belonging to the wallet
-            let (_, res, _) = st.generate_next_block_multi(&vec![
+            let (_, res, _) = st.generate_next_block_multi(&[
                 // 3 Orchard notes not for this wallet
                 fake_output(false),
                 fake_output(false),
@@ -1662,7 +1664,7 @@ pub(crate) mod tests {
                 // One Orchard note for this wallet
                 fake_output(true),
             ]);
-            for c in res.orchard() {
+            for c in res.note_commitments().orchard() {
                 final_orchard_tree.append(*c);
             }
 
@@ -1673,7 +1675,7 @@ pub(crate) mod tests {
             // Add two note commitments to the Orchard frontier to complete the 2^16 subtree. We
             // can then add that subtree root to the Orchard frontier, so that we can compute the
             // root of the completed subtree.
-            for c in res.orchard().iter().take(2) {
+            for c in res.note_commitments().orchard().iter().take(2) {
                 final_orchard_tree.append(*c);
             }
 
@@ -1701,8 +1703,8 @@ pub(crate) mod tests {
             // Add blocks up to the chain tip.
             let mut chain_tip_height = spanning_block_height;
             for _ in 0..110 {
-                let (h, res, _) = st.generate_next_block_multi(&vec![fake_output(false)]);
-                for c in res.orchard() {
+                let (h, res, _) = st.generate_next_block_multi(&[fake_output(false)]);
+                for c in res.note_commitments().orchard() {
                     final_orchard_tree.append(*c);
                 }
                 chain_tip_height = h;
@@ -1717,7 +1719,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg(feature = "orchard")]
     fn orchard_block_spanning_tip_boundary_complete() {
-        use zcash_client_backend::data_api::Account as _;
+        use zcash_client_backend::data_api::{Account as _, wallet::ConfirmationsPolicy};
 
         let mut st = prepare_orchard_block_spanning_test(true);
         let account = st.test_account().cloned().unwrap();
@@ -1763,7 +1765,7 @@ pub(crate) mod tests {
             Zatoshis::const_from_u64(100000)
         );
         assert_eq!(
-            st.get_spendable_balance(account.id(), 10),
+            st.get_spendable_balance(account.id(), ConfirmationsPolicy::default()),
             Zatoshis::const_from_u64(100000)
         );
 
@@ -1793,7 +1795,7 @@ pub(crate) mod tests {
                 &input_selector,
                 &change_strategy,
                 request,
-                NonZeroU32::new(10).unwrap(),
+                ConfirmationsPolicy::default(),
             )
             .unwrap();
 
@@ -1811,7 +1813,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg(feature = "orchard")]
     fn orchard_block_spanning_tip_boundary_incomplete() {
-        use zcash_client_backend::data_api::Account as _;
+        use zcash_client_backend::data_api::{Account as _, wallet::ConfirmationsPolicy};
 
         let mut st = prepare_orchard_block_spanning_test(false);
         let account = st.test_account().cloned().unwrap();
@@ -1852,7 +1854,10 @@ pub(crate) mod tests {
             st.get_total_balance(account.id()),
             Zatoshis::const_from_u64(100000)
         );
-        assert_eq!(st.get_spendable_balance(account.id(), 10), Zatoshis::ZERO);
+        assert_eq!(
+            st.get_spendable_balance(account.id(), ConfirmationsPolicy::default()),
+            Zatoshis::ZERO
+        );
 
         // Attempting to spend the note should fail to generate a proposal
         let to_extsk = OrchardPoolTester::sk(&[0xf5; 32]);
@@ -1879,7 +1884,7 @@ pub(crate) mod tests {
             &input_selector,
             &change_strategy,
             request.clone(),
-            NonZeroU32::new(10).unwrap(),
+            ConfirmationsPolicy::default(),
         );
 
         assert_matches!(proposal, Err(_));
@@ -1893,7 +1898,7 @@ pub(crate) mod tests {
             &input_selector,
             &change_strategy,
             request,
-            NonZeroU32::new(10).unwrap(),
+            ConfirmationsPolicy::default(),
         );
 
         assert_matches!(proposal, Ok(_));

@@ -5,8 +5,8 @@ use alloc::vec::Vec;
 
 use transparent::address::TransparentAddress;
 use zcash_address::{
-    unified::{self, Container, Encoding, Typecode},
     ConversionError, ToAddress, TryFromAddress, ZcashAddress,
+    unified::{self, Container, Encoding, Typecode},
 };
 use zcash_protocol::consensus::{self, NetworkType};
 
@@ -176,7 +176,8 @@ impl UnifiedAddress {
         &self.unknown
     }
 
-    fn to_address(&self, net: NetworkType) -> ZcashAddress {
+    /// Serializes this [`UnifiedAddress`] as a [`ZcashAddress`] for the given network.
+    pub fn to_zcash_address(&self, net: NetworkType) -> ZcashAddress {
         let items = self
             .unknown
             .iter()
@@ -213,7 +214,7 @@ impl UnifiedAddress {
 
     /// Returns the string encoding of this `UnifiedAddress` for the given network.
     pub fn encode<P: consensus::Parameters>(&self, params: &P) -> String {
-        self.to_address(params.network_type()).to_string()
+        self.to_zcash_address(params.network_type()).to_string()
     }
 
     /// Returns the set of receiver typecodes.
@@ -391,7 +392,8 @@ impl Address {
     /// Attempts to decode an [`Address`] value from its [`ZcashAddress`] encoded representation.
     ///
     /// Returns `None` if any error is encountered in decoding. Use
-    /// [`Self::try_from_zcash_address(s.parse()?)?`] if you need detailed error information.
+    /// [`Self::try_from_zcash_address`] passing in `s.parse()?` if you need detailed
+    /// error information.
     pub fn decode<P: consensus::Parameters>(params: &P, s: &str) -> Option<Self> {
         Self::try_from_zcash_address(params, s.parse::<ZcashAddress>().ok()?).ok()
     }
@@ -419,7 +421,7 @@ impl Address {
                     ZcashAddress::from_transparent_p2sh(net, *data)
                 }
             },
-            Address::Unified(ua) => ua.to_address(net),
+            Address::Unified(ua) => ua.to_zcash_address(net),
             Address::Tex(data) => ZcashAddress::from_tex(net, *data),
         }
     }
@@ -507,7 +509,7 @@ pub mod testing {
     use proptest::prelude::*;
     use zcash_protocol::consensus::Network;
 
-    use crate::keys::{testing::arb_unified_spending_key, UnifiedAddressRequest};
+    use crate::keys::{UnifiedAddressRequest, testing::arb_unified_spending_key};
 
     use super::{Address, UnifiedAddress};
 

@@ -1,5 +1,6 @@
 //! # Functions for creating Zcash transactions that spend funds belonging to the wallet
 //!
+//!
 //! This module contains several different ways of creating Zcash transactions. This module is
 //! designed around the idea that a Zcash wallet holds its funds in notes in either the Orchard
 //! or Sapling shielded pool. In order to better preserve users' privacy, it does not provide any
@@ -35,64 +36,67 @@ to a wallet-internal shielded address, as described in [ZIP 316](https://zips.z.
 
 use nonempty::NonEmpty;
 use rand_core::OsRng;
-use std::num::NonZeroU32;
+use std::{
+    num::NonZeroU32,
+    ops::{Add, Sub},
+};
 
 use shardtree::error::{QueryError, ShardTreeError};
 
 use super::InputSource;
 use crate::{
     data_api::{
-        error::Error, Account, SentTransaction, SentTransactionOutput, WalletCommitmentTrees,
-        WalletRead, WalletWrite,
+        Account, MaxSpendMode, SentTransaction, SentTransactionOutput, WalletCommitmentTrees,
+        WalletRead, WalletWrite, error::Error, wallet::input_selection::propose_send_max,
     },
     decrypt_transaction,
     fees::{
-        standard::SingleOutputChangeStrategy, ChangeStrategy, DustOutputPolicy, StandardFeeRule,
+        ChangeStrategy, DustOutputPolicy, StandardFeeRule, standard::SingleOutputChangeStrategy,
     },
     proposal::{Proposal, ProposalError, Step, StepOutputIndex},
     wallet::{Note, OvkPolicy, Recipient},
 };
-use ::sapling::{
-    note_encryption::{try_sapling_note_decryption, PreparedIncomingViewingKey},
+use sapling::{
+    note_encryption::{PreparedIncomingViewingKey, try_sapling_note_decryption},
     prover::{OutputProver, SpendProver},
 };
-use ::transparent::{
-    address::TransparentAddress, builder::TransparentSigningSet, bundle::OutPoint,
-};
+use transparent::{address::TransparentAddress, builder::TransparentSigningSet, bundle::OutPoint};
 use zcash_address::ZcashAddress;
 use zcash_keys::{
     address::Address,
     keys::{UnifiedFullViewingKey, UnifiedSpendingKey},
 };
 use zcash_primitives::transaction::{
+    Transaction, TxId,
     builder::{BuildConfig, BuildResult, Builder},
     components::sapling::zip212_enforcement,
     fees::FeeRule,
-    Transaction, TxId,
 };
 use zcash_protocol::{
+    PoolType, ShieldedProtocol,
     consensus::{self, BlockHeight},
     memo::MemoBytes,
-    value::Zatoshis,
-    PoolType, ShieldedProtocol,
+    value::{BalanceError, Zatoshis},
 };
 use zip32::Scope;
 use zip321::Payment;
 
 #[cfg(feature = "transparent-inputs")]
 use {
-    crate::{fees::ChangeValue, proposal::StepOutput, wallet::TransparentAddressMetadata},
-    ::transparent::bundle::TxOut,
+    crate::{
+        fees::ChangeValue,
+        proposal::StepOutput,
+        wallet::{TransparentAddressMetadata, TransparentAddressSource},
+    },
     core::convert::Infallible,
     input_selection::ShieldingSelector,
     std::collections::HashMap,
-    zcash_keys::encoding::AddressCodec,
+    transparent::bundle::TxOut,
 };
 
 #[cfg(feature = "pczt")]
 use {
     crate::data_api::error::PcztError,
-    ::transparent::pczt::Bip32Derivation,
     bip32::ChildNumber,
     orchard::note_encryption::OrchardDomain,
     pczt::roles::{
@@ -101,8 +105,9 @@ use {
     },
     sapling::note_encryption::SaplingDomain,
     serde::{Deserialize, Serialize},
+    transparent::pczt::Bip32Derivation,
     zcash_note_encryption::try_output_recovery_with_pkd_esk,
-    zcash_protocol::{consensus::NetworkConstants, value::BalanceError},
+    zcash_protocol::consensus::NetworkConstants,
 };
 
 pub mod input_selection;
@@ -113,6 +118,27 @@ const PROPRIETARY_PROPOSAL_INFO: &str = "zcash_client_backend:proposal_info";
 #[cfg(feature = "pczt")]
 const PROPRIETARY_OUTPUT_INFO: &str = "zcash_client_backend:output_info";
 
+#[cfg(feature = "pczt")]
+fn serialize_target_height<S>(
+    target_height: &TargetHeight,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let u: u32 = BlockHeight::from(*target_height).into();
+    u.serialize(serializer)
+}
+
+#[cfg(feature = "pczt")]
+fn deserialize_target_height<'de, D>(deserializer: D) -> Result<TargetHeight, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let u = u32::deserialize(deserializer)?;
+    Ok(BlockHeight::from_u32(u).into())
+}
+
 /// Information about the proposal from which a PCZT was created.
 ///
 /// Stored under the proprietary field `PROPRIETARY_PROPOSAL_INFO`.
@@ -120,7 +146,11 @@ const PROPRIETARY_OUTPUT_INFO: &str = "zcash_client_backend:output_info";
 #[derive(Serialize, Deserialize)]
 struct ProposalInfo<AccountId> {
     from_account: AccountId,
-    target_height: u32,
+    #[serde(
+        serialize_with = "serialize_target_height",
+        deserialize_with = "deserialize_target_height"
+    )]
+    target_height: TargetHeight,
 }
 
 /// Reduced version of [`Recipient`] stored inside a PCZT.
@@ -201,6 +231,18 @@ pub type ProposeTransferErrT<DbT, CommitmentTreeErrT, InputsT, ChangeT> = Error<
     <<InputsT as InputSelector>::InputSource as InputSource>::NoteRef,
 >;
 
+/// Errors that may be generated in construction of proposals for shielded->shielded or
+/// shielded->transparent transactions that transfer the maximum value available within an account
+/// and do not produce change outputs.
+pub type ProposeSendMaxErrT<DbT, CommitmentTreeErrT, FeeRuleT> = Error<
+    <DbT as WalletRead>::Error,
+    CommitmentTreeErrT,
+    BalanceError,
+    <FeeRuleT as FeeRule>::Error,
+    <FeeRuleT as FeeRule>::Error,
+    <DbT as InputSource>::NoteRef,
+>;
+
 /// Errors that may be generated in construction of proposals for transparent->shielded
 /// wallet-internal transfers.
 #[cfg(feature = "transparent-inputs")]
@@ -255,6 +297,223 @@ pub type ExtractErrT<DbT, N> = Error<
     N,
 >;
 
+/// A wrapper type around [`BlockHeight`] that represents the _next_ chain tip.
+///
+/// Addition and subtraction are provided by proxying to [`BlockHeight`].
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TargetHeight(BlockHeight);
+
+impl TargetHeight {
+    /// Subtracts the provided value from this height, returning [`zcash_protocol::consensus::H0`]
+    /// if this would result in underflow of the wrapped `u32`.
+    pub fn saturating_sub(self, value: u32) -> BlockHeight {
+        self.0.saturating_sub(value)
+    }
+}
+
+impl From<BlockHeight> for TargetHeight {
+    fn from(value: BlockHeight) -> Self {
+        TargetHeight(value)
+    }
+}
+
+impl From<TargetHeight> for BlockHeight {
+    fn from(value: TargetHeight) -> Self {
+        value.0
+    }
+}
+
+impl From<TargetHeight> for u32 {
+    fn from(value: TargetHeight) -> Self {
+        u32::from(value.0)
+    }
+}
+
+impl From<u32> for TargetHeight {
+    fn from(value: u32) -> Self {
+        TargetHeight(BlockHeight::from_u32(value))
+    }
+}
+
+impl<I> Add<I> for TargetHeight
+where
+    BlockHeight: Add<I>,
+{
+    type Output = <BlockHeight as Add<I>>::Output;
+
+    fn add(self, rhs: I) -> Self::Output {
+        self.0 + rhs
+    }
+}
+
+impl<I> Sub<I> for TargetHeight
+where
+    BlockHeight: Sub<I>,
+{
+    type Output = <BlockHeight as Sub<I>>::Output;
+
+    fn sub(self, rhs: I) -> Self::Output {
+        self.0 - rhs
+    }
+}
+
+/// A description of the policy that is used to determine what notes are available for spending,
+/// based upon the number of confirmations (the number of blocks in the chain since and including
+/// the block in which a note was produced.)
+///
+/// See [`ZIP 315`] for details including the definitions of "trusted" and "untrusted" notes.
+///
+/// [`ZIP 315`]: https://zips.z.cash/zip-0315
+#[derive(Clone, Copy, Debug)]
+pub struct ConfirmationsPolicy {
+    trusted: NonZeroU32,
+    untrusted: NonZeroU32,
+    #[cfg(feature = "transparent-inputs")]
+    allow_zero_conf_shielding: bool,
+}
+
+/// The default confirmations policy according to [`ZIP 315`].
+///
+/// * Require 3 confirmations for "trusted" transaction outputs (outputs produced by the wallet)
+/// * Require 10 confirmations for "untrusted" outputs (those sent to the wallet by external/third
+///   parties)
+/// * Allow zero-conf shielding of transparent UTXOs irrespective of their origin, but treat the
+///   resulting shielding transaction's outputs as though the original transparent UTXOs had
+///   instead been received as untrusted shielded outputs.
+///
+/// [`ZIP 315`]: https://zips.z.cash/zip-0315
+impl Default for ConfirmationsPolicy {
+    fn default() -> Self {
+        ConfirmationsPolicy {
+            // 3
+            trusted: NonZeroU32::MIN.saturating_add(2),
+            // 10
+            untrusted: NonZeroU32::MIN.saturating_add(9),
+            #[cfg(feature = "transparent-inputs")]
+            allow_zero_conf_shielding: true,
+        }
+    }
+}
+
+impl ConfirmationsPolicy {
+    /// A policy to use the minimum number of confirmations possible: 1 confirmation for shielded
+    /// notes irrespective of origin, and 0 confirmations for spends of transparent UTXOs in
+    /// wallet-internal shielding transactions.
+    pub const MIN: Self = ConfirmationsPolicy {
+        trusted: NonZeroU32::MIN,
+        untrusted: NonZeroU32::MIN,
+        #[cfg(feature = "transparent-inputs")]
+        allow_zero_conf_shielding: true,
+    };
+
+    /// Constructs a new `ConfirmationsPolicy` with `trusted` and `untrusted` fields set to the
+    /// provided values.
+    ///
+    /// The number of confirmations required for trusted notes must be less than or equal to the
+    /// number of confirmations required for untrusted notes; this returns `Err(())` if this
+    /// invariant is violated.
+    ///
+    /// WARNING: This should only be used with great care to avoid problems of transaction
+    /// distinguishability; prefer [`ConfirmationsPolicy::default()`] instead.
+    pub fn new(
+        trusted: NonZeroU32,
+        untrusted: NonZeroU32,
+        #[cfg(feature = "transparent-inputs")] allow_zero_conf_shielding: bool,
+    ) -> Result<Self, ()> {
+        if trusted > untrusted {
+            Err(())
+        } else {
+            Ok(Self {
+                trusted,
+                untrusted,
+                #[cfg(feature = "transparent-inputs")]
+                allow_zero_conf_shielding,
+            })
+        }
+    }
+
+    /// Constructs a new `ConfirmationsPolicy` with `trusted` and `untrusted` fields both
+    /// set to `min_confirmations`.
+    ///
+    /// WARNING: This should only be used with great care to avoid problems of transaction
+    /// distinguishability; prefer [`ConfirmationsPolicy::default()`] instead.
+    pub fn new_symmetrical(
+        min_confirmations: NonZeroU32,
+        #[cfg(feature = "transparent-inputs")] allow_zero_conf_shielding: bool,
+    ) -> Self {
+        Self {
+            trusted: min_confirmations,
+            untrusted: min_confirmations,
+            #[cfg(feature = "transparent-inputs")]
+            allow_zero_conf_shielding,
+        }
+    }
+
+    /// Constructs a new `ConfirmationsPolicy` with `trusted` and `untrusted` fields set to the
+    /// provided values, which must both be nonzero. The number of trusted confirmations required
+    /// must be less than or equal to the number of untrusted confirmations required.
+    ///
+    /// # Panics
+    /// Panics if `trusted > untrusted` or either argument value is zero.
+    #[cfg(any(test, feature = "test-dependencies"))]
+    pub fn new_unchecked(
+        trusted: u32,
+        untrusted: u32,
+        #[cfg(feature = "transparent-inputs")] allow_zero_conf_shielding: bool,
+    ) -> Self {
+        Self::new(
+            NonZeroU32::new(trusted).expect("trusted must be nonzero"),
+            NonZeroU32::new(untrusted).expect("untrusted must be nonzero"),
+            #[cfg(feature = "transparent-inputs")]
+            allow_zero_conf_shielding,
+        )
+        .expect("trusted must be <= untrusted")
+    }
+
+    /// Constructs a new `ConfirmationsPolicy` with `trusted` and `untrusted` fields both
+    /// set to `min_confirmations`.
+    ///
+    /// # Panics
+    /// Panics if `min_confirmations == 0`
+    #[cfg(any(test, feature = "test-dependencies"))]
+    pub fn new_symmetrical_unchecked(
+        min_confirmations: u32,
+        #[cfg(feature = "transparent-inputs")] allow_zero_conf_shielding: bool,
+    ) -> Self {
+        Self::new_symmetrical(
+            NonZeroU32::new(min_confirmations).expect("min_confirmations must be nonzero"),
+            #[cfg(feature = "transparent-inputs")]
+            allow_zero_conf_shielding,
+        )
+    }
+
+    /// Returns the number of confirmations required before trusted notes may be spent.
+    ///
+    /// See [`ZIP 315`] for details.
+    ///
+    /// [`ZIP 315`]: https://zips.z.cash/zip-0315#trusted-and-untrusted-txos
+    pub fn trusted(&self) -> NonZeroU32 {
+        self.trusted
+    }
+
+    /// Returns the number of confirmations required before untrusted notes may be spent.
+    ///
+    /// See [`ZIP 315`] for details.
+    ///
+    /// [`ZIP 315`]: https://zips.z.cash/zip-0315#trusted-and-untrusted-txos
+    pub fn untrusted(&self) -> NonZeroU32 {
+        self.untrusted
+    }
+
+    /// Returns whether or not transparent inputs may be spent with zero confirmations in shielding
+    /// transactions.
+    #[cfg(feature = "transparent-inputs")]
+    pub fn allow_zero_conf_shielding(&self) -> bool {
+        self.allow_zero_conf_shielding
+    }
+}
+
 /// Select transaction inputs, compute fees, and construct a proposal for a transaction or series
 /// of transactions that can then be authorized and made ready for submission to the network with
 /// [`create_proposed_transactions`].
@@ -267,7 +526,7 @@ pub fn propose_transfer<DbT, ParamsT, InputsT, ChangeT, CommitmentTreeErrT>(
     input_selector: &InputsT,
     change_strategy: &ChangeT,
     request: zip321::TransactionRequest,
-    min_confirmations: NonZeroU32,
+    confirmations_policy: ConfirmationsPolicy,
 ) -> Result<
     Proposal<ChangeT::FeeRule, <DbT as InputSource>::NoteRef>,
     ProposeTransferErrT<DbT, CommitmentTreeErrT, InputsT, ChangeT>,
@@ -279,22 +538,27 @@ where
     InputsT: InputSelector<InputSource = DbT>,
     ChangeT: ChangeStrategy<MetaSource = DbT>,
 {
-    let (target_height, anchor_height) = wallet_db
-        .get_target_and_anchor_heights(min_confirmations)
-        .map_err(|e| Error::from(InputSelectorError::DataSource(e)))?
-        .ok_or_else(|| Error::from(InputSelectorError::SyncRequired))?;
+    // Using the trusted confirmations results in an anchor_height that will
+    // include the maximum number of notes being selected, and we can filter
+    // later based on the input source (whether it's trusted or not) and the
+    // number of confirmations
+    let maybe_intial_heights = wallet_db
+        .get_target_and_anchor_heights(confirmations_policy.trusted)
+        .map_err(InputSelectorError::DataSource)?;
+    let (target_height, anchor_height) =
+        maybe_intial_heights.ok_or_else(|| InputSelectorError::SyncRequired)?;
 
-    input_selector
-        .propose_transaction(
-            params,
-            wallet_db,
-            target_height,
-            anchor_height,
-            spend_from_account,
-            request,
-            change_strategy,
-        )
-        .map_err(Error::from)
+    let proposal = input_selector.propose_transaction(
+        params,
+        wallet_db,
+        target_height,
+        anchor_height,
+        confirmations_policy,
+        spend_from_account,
+        request,
+        change_strategy,
+    )?;
+    Ok(proposal)
 }
 
 /// Proposes making a payment to the specified address from the given account.
@@ -312,7 +576,7 @@ where
 /// * `spend_from_account`: The unified account that controls the funds that will be spent
 ///   in the resulting transaction. This procedure will return an error if the
 ///   account ID does not correspond to an account known to the wallet.
-/// * `min_confirmations`: The minimum number of confirmations that a previously
+/// * `confirmations_policy`: The minimum number of confirmations that a previously
 ///   received note must have in the blockchain in order to be considered for being
 ///   spent. A value of 10 confirmations is recommended and 0-conf transactions are
 ///   not supported.
@@ -329,7 +593,7 @@ pub fn propose_standard_transfer_to_address<DbT, ParamsT, CommitmentTreeErrT>(
     params: &ParamsT,
     fee_rule: StandardFeeRule,
     spend_from_account: <DbT as InputSource>::AccountId,
-    min_confirmations: NonZeroU32,
+    confirmations_policy: ConfirmationsPolicy,
     to: &Address,
     amount: Zatoshis,
     memo: Option<MemoBytes>,
@@ -347,21 +611,20 @@ pub fn propose_standard_transfer_to_address<DbT, ParamsT, CommitmentTreeErrT>(
 where
     ParamsT: consensus::Parameters + Clone,
     DbT: InputSource,
-    DbT: WalletRead<
-        Error = <DbT as InputSource>::Error,
-        AccountId = <DbT as InputSource>::AccountId,
-    >,
+    DbT: WalletRead<Error = <DbT as InputSource>::Error, AccountId = <DbT as InputSource>::AccountId>,
     DbT::NoteRef: Copy + Eq + Ord,
 {
-    let request = zip321::TransactionRequest::new(vec![Payment::new(
-        to.to_zcash_address(params),
-        amount,
-        memo,
-        None,
-        None,
-        vec![],
-    )
-    .ok_or(Error::MemoForbidden)?])
+    let request = zip321::TransactionRequest::new(vec![
+        Payment::new(
+            to.to_zcash_address(params),
+            amount,
+            memo,
+            None,
+            None,
+            vec![],
+        )
+        .ok_or(Error::MemoForbidden)?,
+    ])
     .expect(
         "It should not be possible for this to violate ZIP 321 request construction invariants.",
     );
@@ -381,8 +644,59 @@ where
         &input_selector,
         &change_strategy,
         request,
-        min_confirmations,
+        confirmations_policy,
     )
+}
+
+/// Select transaction inputs, compute fees, and construct a proposal for a transaction or series
+/// of transactions that would spend all available funds from the given `spend_pool`s that can then
+/// be authorized and made ready for submission to the network with [`create_proposed_transactions`].
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn propose_send_max_transfer<DbT, ParamsT, FeeRuleT, CommitmentTreeErrT>(
+    wallet_db: &mut DbT,
+    params: &ParamsT,
+    spend_from_account: <DbT as InputSource>::AccountId,
+    spend_pools: &[ShieldedProtocol],
+    fee_rule: &FeeRuleT,
+    recipient: ZcashAddress,
+    memo: Option<MemoBytes>,
+    mode: MaxSpendMode,
+    confirmations_policy: ConfirmationsPolicy,
+) -> Result<
+    Proposal<FeeRuleT, <DbT as InputSource>::NoteRef>,
+    ProposeSendMaxErrT<DbT, CommitmentTreeErrT, FeeRuleT>,
+>
+where
+    DbT: WalletRead + InputSource<Error = <DbT as WalletRead>::Error>,
+    <DbT as InputSource>::NoteRef: Copy + Eq + Ord,
+    ParamsT: consensus::Parameters + Clone,
+    FeeRuleT: FeeRule + Clone,
+{
+    let (target_height, anchor_height) = wallet_db
+        .get_target_and_anchor_heights(confirmations_policy.trusted())
+        .map_err(|e| Error::from(InputSelectorError::DataSource(e)))?
+        .ok_or_else(|| Error::from(InputSelectorError::SyncRequired))?;
+
+    if memo.is_some() && !recipient.can_receive_memo() {
+        return Err(Error::MemoForbidden);
+    }
+
+    let proposal = propose_send_max(
+        params,
+        wallet_db,
+        fee_rule,
+        spend_from_account,
+        spend_pools,
+        target_height,
+        anchor_height,
+        mode,
+        confirmations_policy,
+        recipient,
+        memo,
+    )?;
+
+    Ok(proposal)
 }
 
 /// Constructs a proposal to shield all of the funds belonging to the provided set of
@@ -398,7 +712,7 @@ pub fn propose_shielding<DbT, ParamsT, InputsT, ChangeT, CommitmentTreeErrT>(
     shielding_threshold: Zatoshis,
     from_addrs: &[TransparentAddress],
     to_account: <DbT as InputSource>::AccountId,
-    min_confirmations: u32,
+    confirmations_policy: ConfirmationsPolicy,
 ) -> Result<
     Proposal<ChangeT::FeeRule, Infallible>,
     ProposeShieldingErrT<DbT, CommitmentTreeErrT, InputsT, ChangeT>,
@@ -422,8 +736,8 @@ where
             shielding_threshold,
             from_addrs,
             to_account,
-            chain_tip_height + 1,
-            min_confirmations,
+            (chain_tip_height + 1).into(),
+            confirmations_policy,
         )
         .map_err(Error::from)
 }
@@ -434,6 +748,44 @@ struct StepResult<AccountId> {
     fee_amount: Zatoshis,
     #[cfg(feature = "transparent-inputs")]
     utxos_spent: Vec<OutPoint>,
+}
+
+/// A set of spending keys for an account, for use in execution of transaction proposals.
+///
+/// This consists of a [`UnifiedSpendingKey`], plus (if the `transparent-key-import` feature is
+/// enabled) a set of standalone transparent spending keys corresponding to inputs being spent in a
+/// transaction under construction.
+pub struct SpendingKeys {
+    usk: UnifiedSpendingKey,
+    #[cfg(feature = "transparent-key-import")]
+    standalone_transparent_keys: HashMap<TransparentAddress, secp256k1::SecretKey>,
+}
+
+impl SpendingKeys {
+    /// Constructs a new [`SpendingKeys`] value from its constituent parts.
+    pub fn new(
+        usk: UnifiedSpendingKey,
+        #[cfg(feature = "transparent-key-import")] standalone_transparent_keys: HashMap<
+            TransparentAddress,
+            secp256k1::SecretKey,
+        >,
+    ) -> Self {
+        Self {
+            usk,
+            #[cfg(feature = "transparent-key-import")]
+            standalone_transparent_keys,
+        }
+    }
+
+    /// Constructs a new [`SpendingKeys`] value from a [`UnifiedSpendingKey`],
+    /// without standalone spending keys.
+    pub fn from_unified_spending_key(usk: UnifiedSpendingKey) -> Self {
+        Self {
+            usk,
+            #[cfg(feature = "transparent-key-import")]
+            standalone_transparent_keys: HashMap::new(),
+        }
+    }
 }
 
 /// Construct, prove, and sign a transaction or series of transactions using the inputs supplied by
@@ -454,7 +806,7 @@ pub fn create_proposed_transactions<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeEr
     params: &ParamsT,
     spend_prover: &impl SpendProver,
     output_prover: &impl OutputProver,
-    usk: &UnifiedSpendingKey,
+    spending_keys: &SpendingKeys,
     ovk_policy: OvkPolicy,
     proposal: &Proposal<FeeRuleT, N>,
 ) -> Result<NonEmpty<TxId>, CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>>
@@ -470,7 +822,7 @@ where
     let mut unused_transparent_outputs = HashMap::new();
 
     let account_id = wallet_db
-        .get_account_for_ufvk(&usk.to_unified_full_viewing_key())
+        .get_account_for_ufvk(&spending_keys.usk.to_unified_full_viewing_key())
         .map_err(Error::DataSource)?
         .ok_or(Error::KeyNotRecognized)?
         .id();
@@ -482,7 +834,7 @@ where
             params,
             spend_prover,
             output_prover,
-            usk,
+            spending_keys,
             account_id,
             ovk_policy.clone(),
             proposal.fee_rule(),
@@ -506,6 +858,7 @@ where
         }
     }
 
+    // TODO: This should be provided by a `Clock`
     let created = time::OffsetDateTime::now_utc();
 
     // Store the transactions only after creating all of them. This avoids undesired
@@ -633,7 +986,7 @@ fn build_proposed_transaction<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>
     ufvk: &UnifiedFullViewingKey,
     account_id: <DbT as WalletRead>::AccountId,
     ovk_policy: OvkPolicy,
-    min_target_height: BlockHeight,
+    min_target_height: TargetHeight,
     prior_step_results: &[(&Step<N>, StepResult<<DbT as WalletRead>::AccountId>)],
     proposal_step: &Step<N>,
     #[cfg(feature = "transparent-inputs")] unused_transparent_outputs: &mut HashMap<
@@ -776,7 +1129,7 @@ where
     // are no possible transparent inputs, so we ignore those here.
     let mut builder = Builder::new(
         params.clone(),
-        min_target_height,
+        BlockHeight::from(min_target_height),
         BuildConfig::Standard {
             sapling_anchor,
             orchard_anchor,
@@ -816,11 +1169,11 @@ where
     let mut cache = HashMap::<TransparentAddress, TransparentAddressMetadata>::new();
 
     #[cfg(feature = "transparent-inputs")]
-    let mut metadata_from_address = |addr: TransparentAddress| -> Result<
+    let mut metadata_from_address = |addr: &TransparentAddress| -> Result<
         TransparentAddressMetadata,
         CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>,
     > {
-        match cache.get(&addr) {
+        match cache.get(addr) {
             Some(result) => Ok(result.clone()),
             None => {
                 // `wallet_db.get_transparent_address_metadata` includes reserved ephemeral
@@ -832,10 +1185,11 @@ where
                 // already detected by this wallet instance).
 
                 let result = wallet_db
-                    .get_transparent_address_metadata(account_id, &addr)
+                    .get_transparent_address_metadata(account_id, addr)
                     .map_err(InputSelectorError::DataSource)?
-                    .ok_or(Error::AddressNotRecognized(addr))?;
-                cache.insert(addr, result.clone());
+                    .ok_or(Error::AddressNotRecognized(*addr))?;
+
+                cache.insert(*addr, result.clone());
                 Ok(result)
             }
         }
@@ -844,32 +1198,37 @@ where
     #[cfg(feature = "transparent-inputs")]
     let utxos_spent = {
         let mut utxos_spent: Vec<OutPoint> = vec![];
-        let add_transparent_input = |builder: &mut Builder<_, _>,
-                                     utxos_spent: &mut Vec<_>,
-                                     address_metadata: &TransparentAddressMetadata,
-                                     outpoint: OutPoint,
-                                     txout: TxOut|
-         -> Result<
-            (),
-            CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>,
-        > {
-            let pubkey = ufvk
-                .transparent()
-                .ok_or(Error::KeyNotAvailable(PoolType::Transparent))?
-                .derive_address_pubkey(address_metadata.scope(), address_metadata.address_index())
-                .expect("spending key derivation should not fail");
+        let mut add_transparent_input =
+            |builder: &mut Builder<_, _>,
+             utxos_spent: &mut Vec<_>,
+             recipient_address: &TransparentAddress,
+             outpoint: OutPoint,
+             txout: TxOut|
+             -> Result<(), CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>> {
+                let pubkey = match metadata_from_address(recipient_address)?.source() {
+                    TransparentAddressSource::Derived {
+                        scope,
+                        address_index,
+                    } => ufvk
+                        .transparent()
+                        .ok_or(Error::KeyNotAvailable(PoolType::Transparent))?
+                        .derive_address_pubkey(*scope, *address_index)
+                        .expect("spending key derivation should not fail"),
+                    #[cfg(feature = "transparent-key-import")]
+                    TransparentAddressSource::Standalone(pubkey) => *pubkey,
+                };
 
-            utxos_spent.push(outpoint.clone());
-            builder.add_transparent_input(pubkey, outpoint, txout)?;
+                utxos_spent.push(outpoint.clone());
+                builder.add_transparent_input(pubkey, outpoint, txout)?;
 
-            Ok(())
-        };
+                Ok(())
+            };
 
         for utxo in proposal_step.transparent_inputs() {
             add_transparent_input(
                 &mut builder,
                 &mut utxos_spent,
-                &metadata_from_address(*utxo.recipient_address())?,
+                utxo.recipient_address(),
                 utxo.outpoint().clone(),
                 utxo.txout().clone(),
             )?;
@@ -880,8 +1239,6 @@ where
             let (address, outpoint) = unused_transparent_outputs
                 .remove(input_ref)
                 .ok_or(Error::Proposal(ProposalError::ReferenceError(*input_ref)))?;
-
-            let address_metadata = metadata_from_address(address)?;
 
             let txout = &prior_step_results[input_ref.step_index()]
                 .1
@@ -894,7 +1251,7 @@ where
             add_transparent_input(
                 &mut builder,
                 &mut utxos_spent,
-                &address_metadata,
+                &address,
                 outpoint,
                 txout.clone(),
             )?;
@@ -1010,15 +1367,6 @@ where
              transparent_output_meta: &mut Vec<_>,
              to: TransparentAddress|
              -> Result<(), CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>> {
-                // Always reject sending to one of our known ephemeral addresses.
-                #[cfg(feature = "transparent-inputs")]
-                if wallet_db
-                    .find_account_for_ephemeral_address(&to)
-                    .map_err(Error::DataSource)?
-                    .is_some()
-                {
-                    return Err(Error::PaysEphemeralTransparentAddress(to.encode(params)));
-                }
                 if payment.memo().is_some() {
                     return Err(Error::MemoForbidden);
                 }
@@ -1155,7 +1503,7 @@ where
             .map_err(Error::DataSource)?;
         assert_eq!(addresses_and_metadata.len(), ephemeral_outputs.len());
 
-        // We don't need the TransparentAddressMetadata here; we can look it up from the data source later.
+        // We don't need the TransparentAddressSource here; we can look it up from the data source later.
         for ((change_index, change_value), (ephemeral_address, _)) in
             ephemeral_outputs.iter().zip(addresses_and_metadata)
         {
@@ -1199,11 +1547,11 @@ fn create_proposed_transaction<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N
     params: &ParamsT,
     spend_prover: &impl SpendProver,
     output_prover: &impl OutputProver,
-    usk: &UnifiedSpendingKey,
+    spending_keys: &SpendingKeys,
     account_id: <DbT as WalletRead>::AccountId,
     ovk_policy: OvkPolicy,
     fee_rule: &FeeRuleT,
-    min_target_height: BlockHeight,
+    min_target_height: TargetHeight,
     prior_step_results: &[(&Step<N>, StepResult<<DbT as WalletRead>::AccountId>)],
     proposal_step: &Step<N>,
     #[cfg(feature = "transparent-inputs")] unused_transparent_outputs: &mut HashMap<
@@ -1222,7 +1570,7 @@ where
     let build_state = build_proposed_transaction::<_, _, _, FeeRuleT, _, _>(
         wallet_db,
         params,
-        &usk.to_unified_full_viewing_key(),
+        &spending_keys.usk.to_unified_full_viewing_key(),
         account_id,
         ovk_policy,
         min_target_height,
@@ -1236,16 +1584,29 @@ where
     #[cfg_attr(not(feature = "transparent-inputs"), allow(unused_mut))]
     let mut transparent_signing_set = TransparentSigningSet::new();
     #[cfg(feature = "transparent-inputs")]
-    for (_, address_metadata) in build_state.transparent_input_addresses {
-        transparent_signing_set.add_key(
-            usk.transparent()
-                .derive_secret_key(address_metadata.scope(), address_metadata.address_index())
+    for (_address, address_metadata) in build_state.transparent_input_addresses {
+        transparent_signing_set.add_key(match address_metadata.source() {
+            TransparentAddressSource::Derived {
+                scope,
+                address_index,
+            } => spending_keys
+                .usk
+                .transparent()
+                .derive_secret_key(*scope, *address_index)
                 .expect("spending key derivation should not fail"),
-        );
+            #[cfg(feature = "transparent-key-import")]
+            TransparentAddressSource::Standalone(_) => *spending_keys
+                .standalone_transparent_keys
+                .get(&_address)
+                .ok_or(Error::AddressNotRecognized(_address))?,
+        });
     }
-    let sapling_extsks = &[usk.sapling().clone(), usk.sapling().derive_internal()];
+    let sapling_extsks = &[
+        spending_keys.usk.sapling().clone(),
+        spending_keys.usk.sapling().derive_internal(),
+    ];
     #[cfg(feature = "orchard")]
-    let orchard_saks = &[usk.orchard().into()];
+    let orchard_saks = &[spending_keys.usk.orchard().into()];
     #[cfg(not(feature = "orchard"))]
     let orchard_saks = &[];
     let build_result = build_state.builder.build(
@@ -1259,7 +1620,7 @@ where
     )?;
 
     #[cfg(feature = "orchard")]
-    let orchard_fvk: orchard::keys::FullViewingKey = usk.orchard().into();
+    let orchard_fvk: orchard::keys::FullViewingKey = spending_keys.usk.orchard().into();
     #[cfg(feature = "orchard")]
     let orchard_internal_ivk = orchard_fvk.to_ivk(orchard::keys::Scope::Internal);
     #[cfg(feature = "orchard")]
@@ -1286,7 +1647,10 @@ where
         },
     );
 
-    let sapling_dfvk = usk.sapling().to_diversifiable_full_viewing_key();
+    let sapling_dfvk = spending_keys
+        .usk
+        .sapling()
+        .to_diversifiable_full_viewing_key();
     let sapling_internal_ivk =
         PreparedIncomingViewingKey::new(&sapling_dfvk.to_ivk(Scope::Internal));
     let sapling_outputs = build_state.sapling_output_meta.into_iter().enumerate().map(
@@ -1304,7 +1668,7 @@ where
                         try_sapling_note_decryption(
                             &sapling_internal_ivk,
                             &bundle.shielded_outputs()[output_index],
-                            zip212_enforcement(params, min_target_height),
+                            zip212_enforcement(params, min_target_height.into()),
                         )
                         .map(|(note, _, _)| Note::Sapling(note))
                     })
@@ -1475,7 +1839,7 @@ where
                 PROPRIETARY_PROPOSAL_INFO.into(),
                 postcard::to_allocvec(&ProposalInfo::<DbT::AccountId> {
                     from_account: account_id,
-                    target_height: proposal.min_target_height().into(),
+                    target_height: proposal.min_target_height(),
                 })
                 .expect("postcard encoding of PCZT proposal metadata should not fail"),
             )
@@ -1595,17 +1959,16 @@ where
                         build_state
                             .transparent_input_addresses
                             .get(
-                                &input
-                                    .script_pubkey()
-                                    .address()
+                                &TransparentAddress::from_script_from_chain(input.script_pubkey())
                                     .expect("we created this with a supported transparent address"),
                             )
-                            .map(|address_metadata| {
-                                (
-                                    index,
-                                    address_metadata.scope(),
-                                    address_metadata.address_index(),
-                                )
+                            .and_then(|address_metadata| match address_metadata.source() {
+                                TransparentAddressSource::Derived {
+                                    scope,
+                                    address_index,
+                                } => Some((index, *scope, *address_index)),
+                                #[cfg(feature = "transparent-key-import")]
+                                TransparentAddressSource::Standalone(_) => None,
                             })
                     })
                     .collect::<Vec<_>>();
@@ -1697,7 +2060,7 @@ where
     DbT::AccountId: serde::de::DeserializeOwned,
 {
     use std::collections::BTreeMap;
-    use zcash_note_encryption::{Domain, ShieldedOutput, ENC_CIPHERTEXT_SIZE};
+    use zcash_note_encryption::{Domain, ENC_CIPHERTEXT_SIZE, ShieldedOutput};
 
     let finalized = SpendFinalizer::new(pczt).finalize_spends()?;
 
@@ -2032,7 +2395,7 @@ where
                         Ok(SentTransactionOutput::from_parts(
                             output_index,
                             recipient,
-                            output.value,
+                            output.value(),
                             None,
                         ))
                     })
@@ -2061,7 +2424,7 @@ where
     let transactions = vec![SentTransaction::new(
         &transaction,
         created,
-        BlockHeight::from_u32(proposal_info.target_height),
+        proposal_info.target_height,
         proposal_info.from_account,
         &outputs,
         fee_amount,
@@ -2120,10 +2483,10 @@ pub fn shield_transparent_funds<DbT, ParamsT, InputsT, ChangeT>(
     input_selector: &InputsT,
     change_strategy: &ChangeT,
     shielding_threshold: Zatoshis,
-    usk: &UnifiedSpendingKey,
+    spending_keys: &SpendingKeys,
     from_addrs: &[TransparentAddress],
     to_account: <DbT as InputSource>::AccountId,
-    min_confirmations: u32,
+    confirmations_policy: ConfirmationsPolicy,
 ) -> Result<NonEmpty<TxId>, ShieldErrT<DbT, InputsT, ChangeT>>
 where
     ParamsT: consensus::Parameters,
@@ -2139,7 +2502,7 @@ where
         shielding_threshold,
         from_addrs,
         to_account,
-        min_confirmations,
+        confirmations_policy,
     )?;
 
     create_proposed_transactions(
@@ -2147,7 +2510,7 @@ where
         params,
         spend_prover,
         output_prover,
-        usk,
+        spending_keys,
         OvkPolicy::Sender,
         &proposal,
     )

@@ -6,10 +6,10 @@ use alloc::vec::Vec;
 
 use bip32::ChildNumber;
 use getset::Getters;
-use zcash_protocol::{value::Zatoshis, TxId};
+use zcash_protocol::{TxId, value::Zatoshis};
+use zcash_script::script;
 
 use crate::{
-    address::Script,
     keys::{NonHardenedChildIndex, TransparentKeyScope},
     sighash::SighashType,
 };
@@ -107,7 +107,7 @@ pub struct Input {
     /// A satisfying witness for the `script_pubkey` of the input being spent.
     ///
     /// This is set by the Spend Finalizer.
-    pub(crate) script_sig: Option<Script>,
+    pub(crate) script_sig: Option<script::Sig>,
 
     /// The value of the input being spent.
     ///
@@ -121,12 +121,12 @@ pub struct Input {
     /// - This is set by the Constructor.
     /// - This is required by the IO Finalizer and Transaction Extractor, to derive the
     ///   shielded sighash needed for computing the binding signatures.
-    pub(crate) script_pubkey: Script,
+    pub(crate) script_pubkey: script::FromChain,
 
     /// The script required to spend this output, if it is P2SH.
     ///
     /// Set to `None` if this is a P2PKH output.
-    pub(crate) redeem_script: Option<Script>,
+    pub(crate) redeem_script: Option<script::FromChain>,
 
     /// A map from a pubkey to a signature created by it.
     ///
@@ -196,12 +196,12 @@ pub struct Output {
     pub(crate) value: Zatoshis,
 
     /// The script constraining how spending of this output must be authorized.
-    pub(crate) script_pubkey: Script,
+    pub(crate) script_pubkey: script::PubKey,
 
     /// The script required to spend this output, if it is P2SH.
     ///
     /// Set to `None` if this is a P2PKH output, or a P2SH with an unknown redeem script.
-    pub(crate) redeem_script: Option<Script>,
+    pub(crate) redeem_script: Option<script::Redeem>,
 
     /// A map from a pubkey to the BIP 32 derivation path at which its corresponding
     /// spending key can be found.
@@ -239,7 +239,7 @@ impl Bip32Derivation {
     /// Extracts the BIP 44 account index, scope, and address index from this derivation
     /// path.
     ///
-    /// Returns `None` if the seed fingerprints don't match, or if this is a non-standard
+    /// Returns `None` if the seed fingerprints don't match, or if this is not a BIP 44
     /// derivation path.
     pub fn extract_bip_44_fields(
         &self,
@@ -266,6 +266,54 @@ impl Bip32Derivation {
                         .expect("address_index is not hardened");
 
                     Some((account_index, scope, address_index))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Extracts the ZIP 48 account index, scope, and address index from this derivation
+    /// path.
+    ///
+    /// Returns `None` if the seed fingerprints don't match, or if this is not a ZIP 48
+    /// derivation path.
+    pub fn extract_zip_48_fields(
+        &self,
+        seed_fp: &zip32::fingerprint::SeedFingerprint,
+        expected_coin_type: ChildNumber,
+    ) -> Option<(zip32::AccountId, zip32::Scope, NonHardenedChildIndex)> {
+        if self.seed_fingerprint == seed_fp.to_bytes() {
+            match &self.derivation_path[..] {
+                [
+                    purpose,
+                    coin_type,
+                    account_index,
+                    script_type,
+                    scope,
+                    address_index,
+                ] if purpose == &ChildNumber(48 | ChildNumber::HARDENED_FLAG)
+                    && coin_type.is_hardened()
+                    && coin_type == &expected_coin_type
+                    && account_index.is_hardened()
+                    && script_type == &ChildNumber(133000 | ChildNumber::HARDENED_FLAG)
+                    && !scope.is_hardened()
+                    && !address_index.is_hardened() =>
+                {
+                    let account_index = zip32::AccountId::try_from(account_index.index())
+                        .expect("account_index is hardened");
+
+                    let scope = match scope.index() {
+                        0 => Some(zip32::Scope::External),
+                        1 => Some(zip32::Scope::Internal),
+                        _ => None,
+                    };
+
+                    let address_index = NonHardenedChildIndex::from_index(address_index.index())
+                        .expect("address_index is not hardened");
+
+                    scope.map(|scope| (account_index, scope, address_index))
                 }
                 _ => None,
             }

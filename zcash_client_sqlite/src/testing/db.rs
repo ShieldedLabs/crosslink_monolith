@@ -11,13 +11,16 @@ use tempfile::NamedTempFile;
 
 use rusqlite::{self};
 use secrecy::SecretVec;
-use shardtree::{error::ShardTreeError, ShardTree};
+use shardtree::{ShardTree, error::ShardTreeError};
+
 use zcash_client_backend::{
     data_api::{
+        TargetValue,
         chain::{ChainState, CommitmentTreeRoot},
         scanning::ScanRange,
         testing::{DataStoreFactory, Reset, TestState},
-        TargetValue, *,
+        wallet::{ConfirmationsPolicy, TargetHeight},
+        *,
     },
     wallet::{Note, NoteId, ReceivedNote, WalletTransparentOutput},
 };
@@ -30,22 +33,25 @@ use zcash_primitives::{
     transaction::{Transaction, TxId},
 };
 use zcash_protocol::{
-    consensus::BlockHeight, local_consensus::LocalNetwork, memo::Memo, ShieldedProtocol,
+    ShieldedProtocol, consensus::BlockHeight, local_consensus::LocalNetwork, memo::Memo,
 };
 use zip32::DiversifierIndex;
 
 use crate::{
-    error::SqliteClientError, util::testing::FixedClock, wallet::init::WalletMigrator, AccountUuid,
-    WalletDb,
+    AccountUuid, WalletDb, error::SqliteClientError, util::testing::FixedClock,
+    wallet::init::WalletMigrator,
 };
 
 #[cfg(feature = "transparent-inputs")]
 use {
     crate::TransparentAddressMetadata,
-    ::transparent::{address::TransparentAddress, bundle::OutPoint, keys::NonHardenedChildIndex},
+    ::transparent::{
+        address::TransparentAddress,
+        bundle::OutPoint,
+        keys::{NonHardenedChildIndex, TransparentKeyScope},
+    },
     core::ops::Range,
     testing::transparent::GapLimits,
-    zcash_protocol::value::Zatoshis,
 };
 
 /// Tuesday, 25 February 2025 00:00:00Z (the day the clock code was added).
@@ -131,7 +137,7 @@ impl TestDb {
     #[allow(dead_code)]
     #[cfg(feature = "unstable")]
     pub(crate) unsafe fn run_sqlite3(&self, command: &str) {
-        run_sqlite3(self.data_file.path(), command)
+        unsafe { run_sqlite3(self.data_file.path(), command) }
     }
 }
 
@@ -182,13 +188,13 @@ impl DataStoreFactory for TestDbFactory {
     fn new_data_store(
         &self,
         network: LocalNetwork,
-        #[cfg(feature = "transparent-inputs")] gap_limits: GapLimits,
+        #[cfg(feature = "transparent-inputs")] gap_limits: Option<GapLimits>,
     ) -> Result<Self::DataStore, Self::Error> {
         let data_file = NamedTempFile::new().unwrap();
         let mut db_data =
             WalletDb::for_path(data_file.path(), network, test_clock(), test_rng()).unwrap();
         #[cfg(feature = "transparent-inputs")]
-        {
+        if let Some(gap_limits) = gap_limits {
             db_data = db_data.with_gap_limits(gap_limits.into());
         }
 
@@ -219,7 +225,7 @@ impl Reset for TestDb {
                 .new_data_store(
                     network,
                     #[cfg(feature = "transparent-inputs")]
-                    gap_limits.into(),
+                    Some(gap_limits.into()),
                 )
                 .unwrap(),
         );

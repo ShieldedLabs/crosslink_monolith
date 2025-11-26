@@ -1,7 +1,7 @@
 [package]
 name = "zcash_primitives"
 description = "Rust implementations of the Zcash primitives"
-version = "0.24.0"
+version = "0.26.1"
 authors = [
     "Jack Grigg <jack@z.cash>",
     "Kris Nuttycombe <kris@electriccoin.co>"
@@ -26,6 +26,7 @@ equihash.workspace = true
 zcash_address.workspace = true
 zcash_encoding.workspace = true
 zcash_protocol.workspace = true
+zcash_script.workspace = true
 zip32.workspace = true
 
 # Dependencies exposed in a public API:
@@ -114,7 +115,7 @@ orchard = { workspace = true, features = ["test-dependencies"] }
 zcash_protocol = { workspace = true, features = ["test-dependencies"] }
 
 [target.'cfg(unix)'.dev-dependencies]
-pprof = { version = "0.14", features = ["criterion", "flamegraph"] }
+pprof = { version = "0.15", features = ["criterion", "flamegraph"] }
 
 [features]
 default = ["multicore", "std", "circuits"]
@@ -150,6 +151,9 @@ test-dependencies = [
 
 ## A feature used to isolate tests that are expensive to run. Test-only.
 expensive-tests = []
+
+## A feature used to ensure that expensive tests do not run when running with --all-features
+no-expensive-tests = []
 
 ## A feature that provides `FeeRule` implementations and constructors for
 ## non-standard fees.

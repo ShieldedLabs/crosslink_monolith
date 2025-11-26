@@ -1,7 +1,7 @@
 //! Migration that adds transaction summary views & add fee information to transactions.
 use std::collections::HashSet;
 
-use rusqlite::{self, params, types::ToSql, OptionalExtension};
+use rusqlite::{self, OptionalExtension, params, types::ToSql};
 use schemerz_rusqlite::RusqliteMigration;
 use uuid::Uuid;
 
@@ -273,16 +273,15 @@ mod tests {
     use zip32::AccountId;
 
     use crate::{
-        testing::db::{test_clock, test_rng},
-        wallet::init::{migrations::addresses_table, WalletMigrator},
         WalletDb,
+        testing::db::{test_clock, test_rng},
+        wallet::init::{WalletMigrator, migrations::addresses_table},
     };
 
     #[cfg(feature = "transparent-inputs")]
     use {
         crate::wallet::init::migrations::{ufvk_support, utxos_table},
         ::transparent::{
-            address::Script,
             bundle::{self as transparent, Authorized, OutPoint, TxIn, TxOut},
             keys::IncomingViewingKey,
         },
@@ -394,7 +393,7 @@ mod tests {
     #[test]
     #[cfg(feature = "transparent-inputs")]
     fn migrate_from_wm2() {
-        use ::transparent::keys::NonHardenedChildIndex;
+        use ::transparent::{address::Script, keys::NonHardenedChildIndex};
         use zcash_client_backend::keys::UnifiedAddressRequest;
         use zcash_keys::keys::ReceiverRequirement::*;
         use zcash_protocol::value::Zatoshis;
@@ -425,15 +424,11 @@ mod tests {
             ))]
             Zatoshis::ZERO,
             Some(transparent::Bundle {
-                vin: vec![TxIn {
-                    prevout: OutPoint::fake(),
-                    script_sig: Script(vec![]),
-                    sequence: 0,
-                }],
-                vout: vec![TxOut {
-                    value: Zatoshis::const_from_u64(1100000000),
-                    script_pubkey: Script(vec![]),
-                }],
+                vin: vec![TxIn::from_parts(OutPoint::fake(), Script::default(), 0)],
+                vout: vec![TxOut::new(
+                    Zatoshis::const_from_u64(1100000000),
+                    Script::default(),
+                )],
                 authorization: Authorized,
             }),
             None,

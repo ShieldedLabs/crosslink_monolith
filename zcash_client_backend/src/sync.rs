@@ -21,20 +21,19 @@ use tonic::{
 };
 use tracing::{debug, info};
 
-use zcash_keys::encoding::AddressCodec as _;
 use zcash_primitives::merkle_tree::HashSer;
 use zcash_protocol::consensus::{BlockHeight, Parameters};
 
 use crate::{
     data_api::{
+        WalletCommitmentTrees, WalletRead, WalletWrite,
         chain::{
-            error::Error as ChainError, scan_cached_blocks, BlockCache, ChainState,
-            CommitmentTreeRoot,
+            BlockCache, ChainState, CommitmentTreeRoot, error::Error as ChainError,
+            scan_cached_blocks,
         },
         scanning::{ScanPriority, ScanRange},
-        WalletCommitmentTrees, WalletRead, WalletWrite,
     },
-    proto::service::{self, compact_tx_streamer_client::CompactTxStreamerClient, BlockId},
+    proto::service::{self, BlockId, compact_tx_streamer_client::CompactTxStreamerClient},
     scanning::ScanError,
 };
 
@@ -48,7 +47,9 @@ use {
         address::Script,
         bundle::{OutPoint, TxOut},
     },
+    zcash_keys::encoding::AddressCodec as _,
     zcash_protocol::value::Zatoshis,
+    zcash_script::script,
 };
 
 /// Scans the chain until the wallet is up-to-date.
@@ -488,7 +489,7 @@ where
 {
     let request = service::GetAddressUtxosArg {
         addresses: db_data
-            .get_transparent_receivers(account_id, true)
+            .get_transparent_receivers(account_id, true, true)
             .map_err(Error::Wallet)?
             .into_keys()
             .map(|addr| addr.encode(params))
@@ -516,11 +517,11 @@ where
                             .try_into()
                             .map_err(|_| Error::MisbehavingServer)?,
                     ),
-                    TxOut {
-                        value: Zatoshis::from_nonnegative_i64(reply.value_zat)
+                    TxOut::new(
+                        Zatoshis::from_nonnegative_i64(reply.value_zat)
                             .map_err(|_| Error::MisbehavingServer)?,
-                        script_pubkey: Script(reply.script),
-                    },
+                        Script(script::Code(reply.script)),
+                    ),
                     Some(
                         BlockHeight::try_from(reply.height)
                             .map_err(|_| Error::MisbehavingServer)?,

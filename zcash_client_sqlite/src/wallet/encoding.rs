@@ -4,15 +4,17 @@
 use bitflags::bitflags;
 use transparent::address::TransparentAddress::*;
 use zcash_address::{
-    unified::{Container, Receiver},
     ConversionError, TryFromAddress,
+    unified::{Container, Receiver},
 };
 use zcash_client_backend::data_api::AccountSource;
+#[cfg(feature = "transparent-inputs")]
+use zcash_keys::keys::AddressGenerationError;
 use zcash_keys::{
     address::{Address, UnifiedAddress},
     keys::{ReceiverRequirement, ReceiverRequirements},
 };
-use zcash_protocol::{consensus::NetworkType, memo::MemoBytes, PoolType, ShieldedProtocol};
+use zcash_protocol::{PoolType, ShieldedProtocol, consensus::NetworkType, memo::MemoBytes};
 use zip32::DiversifierIndex;
 
 use crate::error::SqliteClientError;
@@ -22,6 +24,12 @@ use {
     super::transparent::SchedulingError, std::time::SystemTime,
     transparent::keys::TransparentKeyScope,
 };
+
+#[cfg(feature = "zcashd-compat")]
+use zcash_keys::keys::zcashd;
+
+/// The sentinel value representing an unset `zcashd_legacy_address_index` column.
+pub(crate) const LEGACY_ADDRESS_INDEX_NULL: i64 = -1;
 
 pub(crate) fn pool_code(pool_type: PoolType) -> i64 {
     // These constants are *incidentally* shared with the typecodes
@@ -48,14 +56,19 @@ pub(crate) fn encode_diversifier_index_be(idx: DiversifierIndex) -> [u8; 11] {
 }
 
 pub(crate) fn decode_diversifier_index_be(
-    di_be: &[u8],
-) -> Result<DiversifierIndex, SqliteClientError> {
-    let mut di_be: [u8; 11] = di_be.try_into().map_err(|_| {
-        SqliteClientError::CorruptedData("Diversifier index is not an 11-byte value".to_owned())
-    })?;
-    di_be.reverse();
-
-    Ok(DiversifierIndex::from(di_be))
+    di_be: Option<Vec<u8>>,
+) -> Result<Option<DiversifierIndex>, SqliteClientError> {
+    di_be
+        .map(|di_be_bytes| {
+            let mut di_be: [u8; 11] = di_be_bytes.try_into().map_err(|_| {
+                SqliteClientError::CorruptedData(
+                    "Diversifier index is not an 11-byte value".to_owned(),
+                )
+            })?;
+            di_be.reverse();
+            Ok(DiversifierIndex::from(di_be))
+        })
+        .transpose()
 }
 
 pub(crate) fn memo_repr(memo: Option<&MemoBytes>) -> Option<&[u8]> {
@@ -89,15 +102,21 @@ pub(crate) fn decode_epoch_seconds(i: i64) -> Result<SystemTime, SchedulingError
 ///
 /// This extends the [`zip32::Scope`] type to include the custom scope used to generate keys for
 /// ephemeral transparent addresses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum KeyScope {
     /// A key scope corresponding to a [`zip32::Scope`].
     Zip32(zip32::Scope),
     /// An ephemeral transparent address, which is derived from an account's transparent
     /// [`AccountPubKey`] with the BIP 44 path `change` level index set to the value `2`.
     ///
-    /// [`AccountPubKey`]: zcash_primitives::legacy::keys::AccountPubKey
+    /// [`AccountPubKey`]: transparent::keys::AccountPubKey
     Ephemeral,
+    /// A transparent address that is logically associated with an account (i.e. funds
+    /// controlled by the correponding secret key contribute to that account's balance)
+    /// but where the address is not associated with the account by any HD derivation relationship.
+    /// This scope is used to represent the situation where a standalone spending key has been
+    /// imported into a wallet and associated with an account for balance purposes.
+    Foreign,
 }
 
 impl KeyScope {
@@ -109,6 +128,7 @@ impl KeyScope {
             KeyScope::Zip32(zip32::Scope::External) => 0i64,
             KeyScope::Zip32(zip32::Scope::Internal) => 1i64,
             KeyScope::Ephemeral => 2i64,
+            KeyScope::Foreign => -1i64,
         }
     }
 
@@ -117,9 +137,19 @@ impl KeyScope {
             0i64 => Ok(KeyScope::EXTERNAL),
             1i64 => Ok(KeyScope::INTERNAL),
             2i64 => Ok(KeyScope::Ephemeral),
+            -1i64 => Ok(KeyScope::Foreign),
             other => Err(SqliteClientError::CorruptedData(format!(
                 "Invalid key scope code: {other}"
             ))),
+        }
+    }
+
+    #[cfg(feature = "transparent-inputs")]
+    pub(crate) fn as_transparent(&self) -> Option<TransparentKeyScope> {
+        match self {
+            KeyScope::Zip32(scope) => Some(TransparentKeyScope::from(*scope)),
+            KeyScope::Ephemeral => Some(TransparentKeyScope::custom(2).expect("valid scope")),
+            KeyScope::Foreign => None,
         }
     }
 }
@@ -131,11 +161,23 @@ impl From<zip32::Scope> for KeyScope {
 }
 
 #[cfg(feature = "transparent-inputs")]
-impl From<KeyScope> for TransparentKeyScope {
+impl From<KeyScope> for Option<TransparentKeyScope> {
     fn from(value: KeyScope) -> Self {
+        value.as_transparent()
+    }
+}
+
+#[cfg(feature = "transparent-inputs")]
+impl TryFrom<TransparentKeyScope> for KeyScope {
+    type Error = AddressGenerationError;
+    fn try_from(value: TransparentKeyScope) -> Result<Self, Self::Error> {
         match value {
-            KeyScope::Zip32(scope) => scope.into(),
-            KeyScope::Ephemeral => TransparentKeyScope::custom(2).expect("valid scope"),
+            TransparentKeyScope::EXTERNAL => Ok(KeyScope::EXTERNAL),
+            TransparentKeyScope::INTERNAL => Ok(KeyScope::INTERNAL),
+            TransparentKeyScope::EPHEMERAL => Ok(KeyScope::Ephemeral),
+            _ => Err(AddressGenerationError::UnsupportedTransparentKeyScope(
+                value,
+            )),
         }
     }
 }
@@ -146,7 +188,7 @@ impl TryFrom<KeyScope> for zip32::Scope {
     fn try_from(value: KeyScope) -> Result<Self, Self::Error> {
         match value {
             KeyScope::Zip32(scope) => Ok(scope),
-            KeyScope::Ephemeral => Err(()),
+            KeyScope::Ephemeral | KeyScope::Foreign => Err(()),
         }
     }
 }
@@ -286,4 +328,31 @@ impl TryFromAddress for ReceiverFlags {
     ) -> Result<Self, ConversionError<Self::Error>> {
         Ok(ReceiverFlags::P2PKH)
     }
+}
+
+#[cfg(feature = "zcashd-compat")]
+pub(crate) fn decode_legacy_account_index(
+    legacy_account_index: i64,
+) -> Result<Option<zcashd::LegacyAddressIndex>, SqliteClientError> {
+    match legacy_account_index {
+        LEGACY_ADDRESS_INDEX_NULL => Ok(None),
+        _ => u32::try_from(legacy_account_index)
+            .map_err(|_| ())
+            .and_then(zcashd::LegacyAddressIndex::try_from)
+            .map(Some)
+            .map_err(|_| {
+                SqliteClientError::CorruptedData(
+                    "Legacy zcashd address index is out of range.".to_string(),
+                )
+            }),
+    }
+}
+
+#[cfg(feature = "zcashd-compat")]
+pub(crate) fn encode_legacy_account_index(
+    legacy_account_index: Option<zcashd::LegacyAddressIndex>,
+) -> i64 {
+    legacy_account_index
+        .map(u32::from)
+        .map_or(LEGACY_ADDRESS_INDEX_NULL, i64::from)
 }

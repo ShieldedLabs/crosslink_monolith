@@ -3,9 +3,9 @@ use proptest::prelude::*;
 #[cfg(test)]
 use {
     crate::transaction::{
-        sighash::SignableInput, sighash_v4::v4_signature_hash, sighash_v5::v5_signature_hash,
-        testing::arb_tx, transparent, txid::TxIdDigester, Authorization, Transaction,
-        TransactionData, TxDigests, TxIn,
+        Authorization, Transaction, TransactionData, TxDigests, TxIn, sighash::SignableInput,
+        sighash_v4::v4_signature_hash, sighash_v5::v5_signature_hash, testing::arb_tx, transparent,
+        txid::TxIdDigester,
     },
     ::transparent::{
         address::Script, sighash::SighashType, sighash::TransparentAuthorizingContext,
@@ -14,6 +14,7 @@ use {
     blake2b_simd::Hash as Blake2bHash,
     core::ops::Deref,
     zcash_protocol::{consensus::BranchId, value::Zatoshis},
+    zcash_script::script,
 };
 
 #[cfg(all(test, zcash_unstable = "zfuture"))]
@@ -67,8 +68,7 @@ fn check_roundtrip(tx: Transaction) -> Result<(), TestCaseError> {
 
 proptest! {
     #[test]
-    #[ignore]
-    #[cfg(feature = "expensive-tests")]
+    #[cfg(all(feature = "expensive-tests", not(feature = "no-expensive-tests")))]
     fn tx_serialization_roundtrip_sprout(tx in arb_tx(BranchId::Sprout)) {
         check_roundtrip(tx)?;
     }
@@ -76,8 +76,7 @@ proptest! {
 
 proptest! {
     #[test]
-    #[ignore]
-    #[cfg(feature = "expensive-tests")]
+    #[cfg(all(feature = "expensive-tests", not(feature = "no-expensive-tests")))]
     fn tx_serialization_roundtrip_overwinter(tx in arb_tx(BranchId::Overwinter)) {
         check_roundtrip(tx)?;
     }
@@ -85,8 +84,7 @@ proptest! {
 
 proptest! {
     #[test]
-    #[ignore]
-    #[cfg(feature = "expensive-tests")]
+    #[cfg(all(feature = "expensive-tests", not(feature = "no-expensive-tests")))]
     fn tx_serialization_roundtrip_sapling(tx in arb_tx(BranchId::Sapling)) {
         check_roundtrip(tx)?;
     }
@@ -94,8 +92,7 @@ proptest! {
 
 proptest! {
     #[test]
-    #[ignore]
-    #[cfg(feature = "expensive-tests")]
+    #[cfg(all(feature = "expensive-tests", not(feature = "no-expensive-tests")))]
     fn tx_serialization_roundtrip_blossom(tx in arb_tx(BranchId::Blossom)) {
         check_roundtrip(tx)?;
     }
@@ -103,8 +100,7 @@ proptest! {
 
 proptest! {
     #[test]
-    #[ignore]
-    #[cfg(feature = "expensive-tests")]
+    #[cfg(all(feature = "expensive-tests", not(feature = "no-expensive-tests")))]
     fn tx_serialization_roundtrip_heartwood(tx in arb_tx(BranchId::Heartwood)) {
         check_roundtrip(tx)?;
     }
@@ -138,8 +134,7 @@ proptest! {
 #[cfg(zcash_unstable = "zfuture")]
 proptest! {
     #[test]
-    #[ignore]
-    #[cfg(feature = "expensive-tests")]
+    #[cfg(all(feature = "expensive-tests", not(feature = "no-expensive-tests")))]
     fn tx_serialization_roundtrip_future(tx in arb_tx(BranchId::ZFuture)) {
         check_roundtrip(tx)?;
     }
@@ -250,7 +245,9 @@ fn zip_0244() {
         let input_scriptpubkeys = tv
             .script_pubkeys
             .iter()
-            .map(|s| Script(s.clone()))
+            .cloned()
+            .map(script::Code)
+            .map(Script)
             .collect();
 
         let test_bundle = txdata
@@ -263,10 +260,12 @@ fn zip_0244() {
                 vin: b
                     .vin
                     .iter()
-                    .map(|vin| TxIn {
-                        prevout: vin.prevout.clone(),
-                        script_sig: vin.script_sig.clone(),
-                        sequence: vin.sequence,
+                    .map(|vin| {
+                        TxIn::from_parts(
+                            vin.prevout().clone(),
+                            vin.script_sig().clone(),
+                            vin.sequence(),
+                        )
                     })
                     .collect(),
                 vout: b.vout.clone(),
@@ -423,10 +422,12 @@ fn zip_0233() {
                 vin: b
                     .vin
                     .iter()
-                    .map(|vin| TxIn {
-                        prevout: vin.prevout.clone(),
-                        script_sig: vin.script_sig.clone(),
-                        sequence: vin.sequence,
+                    .map(|vin| {
+                        TxIn::from_parts(
+                            vin.prevout().clone(),
+                            vin.script_sig().clone(),
+                            vin.sequence(),
+                        )
                     })
                     .collect(),
                 vout: b.vout.clone(),
