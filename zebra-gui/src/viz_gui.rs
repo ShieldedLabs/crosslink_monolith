@@ -190,27 +190,27 @@ pub fn viz_gui_init() -> VizState {
 
         last_frame_hovered_hash: Hash32::from_u64(0),
     };
-    let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
-    viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-    let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(2), parent_hash: Hash32::from_u64(1), this_height: 1, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
-    viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-    let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(3), parent_hash: Hash32::from_u64(2), this_height: 2, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
-    viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-    let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(8), parent_hash: Hash32::from_u64(1), this_height: 1, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
-    viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-    let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(9), parent_hash: Hash32::from_u64(2), this_height: 2, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
-    viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-    let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(10), parent_hash: Hash32::from_u64(8), this_height: 2, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
-    viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-    let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(11), parent_hash: Hash32::from_u64(10), this_height: 3, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
-    viz_state.on_screen_bcs.insert(block.block.this_hash, block);
+    // let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
+    // viz_state.on_screen_bcs.insert(block.block.this_hash, block);
+    // let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(2), parent_hash: Hash32::from_u64(1), this_height: 1, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+    // viz_state.on_screen_bcs.insert(block.block.this_hash, block);
+    // let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(3), parent_hash: Hash32::from_u64(2), this_height: 2, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+    // viz_state.on_screen_bcs.insert(block.block.this_hash, block);
+    // let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(8), parent_hash: Hash32::from_u64(1), this_height: 1, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+    // viz_state.on_screen_bcs.insert(block.block.this_hash, block);
+    // let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(9), parent_hash: Hash32::from_u64(2), this_height: 2, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+    // viz_state.on_screen_bcs.insert(block.block.this_hash, block);
+    // let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(10), parent_hash: Hash32::from_u64(8), this_height: 2, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+    // viz_state.on_screen_bcs.insert(block.block.this_hash, block);
+    // let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(11), parent_hash: Hash32::from_u64(10), this_height: 3, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+    // viz_state.on_screen_bcs.insert(block.block.this_hash, block);
 
-    let block = OnScreenBft { block: BftBlock { this_hash: Hash32::from_u64(5), parent_hash: Hash32::from_u64(0), this_height: 0, points_at_bc_block: Hash32::from_u64(1), }, ..Default::default() };
-    viz_state.on_screen_bfts.insert(block.block.this_hash, block);
-    let block = OnScreenBft { block: BftBlock { this_hash: Hash32::from_u64(6), parent_hash: Hash32::from_u64(5), this_height: 1, points_at_bc_block: Hash32::from_u64(2), }, ..Default::default() };
-    viz_state.on_screen_bfts.insert(block.block.this_hash, block);
-    let block = OnScreenBft { block: BftBlock { this_hash: Hash32::from_u64(7), parent_hash: Hash32::from_u64(6), this_height: 2, points_at_bc_block: Hash32::from_u64(3), }, ..Default::default() };
-    viz_state.on_screen_bfts.insert(block.block.this_hash, block);
+    // let block = OnScreenBft { block: BftBlock { this_hash: Hash32::from_u64(5), parent_hash: Hash32::from_u64(0), this_height: 0, points_at_bc_block: Hash32::from_u64(1), }, ..Default::default() };
+    // viz_state.on_screen_bfts.insert(block.block.this_hash, block);
+    // let block = OnScreenBft { block: BftBlock { this_hash: Hash32::from_u64(6), parent_hash: Hash32::from_u64(5), this_height: 1, points_at_bc_block: Hash32::from_u64(2), }, ..Default::default() };
+    // viz_state.on_screen_bfts.insert(block.block.this_hash, block);
+    // let block = OnScreenBft { block: BftBlock { this_hash: Hash32::from_u64(7), parent_hash: Hash32::from_u64(6), this_height: 2, points_at_bc_block: Hash32::from_u64(3), }, ..Default::default() };
+    // viz_state.on_screen_bfts.insert(block.block.this_hash, block);
 
     viz_state
 }

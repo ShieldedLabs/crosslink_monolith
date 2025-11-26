@@ -203,7 +203,14 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut already_sent = false;
     loop {
         the_future_is_now(async {
-            let mut client = CompactTxStreamerClient::new(Channel::from_static("http://localhost:18233").connect().await.unwrap());
+            let mut client = CompactTxStreamerClient::new({
+                loop {
+                    if let Ok(channel) = Channel::from_static("http://localhost:18233").connect().await {
+                        break channel;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            });
             let latest_block = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
             let miner_utxos = match client.get_address_utxos(GetAddressUtxosArg {
                 addresses: vec![miner_t_addr_str.to_owned()],
@@ -296,7 +303,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 let mut tx_bytes = vec![];
                 tx.write(&mut tx_bytes).unwrap();
 
-                let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await.unwrap().into_inner();
+                let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
                 println!("******* res: {:?}", res);
 
                 already_sent = true;

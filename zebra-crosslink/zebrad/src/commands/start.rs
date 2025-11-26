@@ -570,6 +570,7 @@ impl StartCmd {
 
         {
             let tmp_dir = tempfile::TempDir::new().unwrap();
+            let _ = std::fs::remove_dir_all(tmp_dir.path());
 
             let zaino_config = zainodlib::config::ZainodConfig {
                 backend: zaino_state::BackendType::Fetch,

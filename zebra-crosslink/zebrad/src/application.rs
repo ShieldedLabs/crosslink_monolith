@@ -219,7 +219,7 @@ impl Application for ZebradApp {
                 let mut c = self.config.read().deref().clone();
                 if c.crosslink.do_not_manipulate_config == false {
                     c.mining.miner_address = Some(
-                        ZcashAddress::try_from_encoded("t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v")
+                        ZcashAddress::try_from_encoded("tmRB9AEVsxNAQsqtJPqJUje9KCaAijpS77z")
                             .unwrap(),
                     );
                     c.mining.internal_miner = true;
@@ -231,18 +231,19 @@ impl Application for ZebradApp {
                     c.network.initial_testnet_peers.clear();
                     c.network
                         .initial_testnet_peers
-                        .insert("80.78.31.51:8233".to_owned());
+                        .insert("70.34.201.202:8233".to_owned());
                     c.network
                         .initial_testnet_peers
-                        .insert("80.78.31.32:8233".to_owned());
-                    c.mempool.debug_enable_at_height = Some(0);
+                        .insert("45.76.30.90:8233".to_owned());
+                    c.mempool.debug_enable_at_height = Some(1);
+                    c.rpc.listen_addr = Some("127.0.0.1:8232".parse().unwrap());
                     c.rpc.enable_cookie_auth = false;
                     c.state
                         .cache_dir
-                        .push("zebra_crosslink_workshop_october_cache_delete_me");
+                        .push("zebra_crosslink_workshop_november_cache_delete_me");
 
                     c.crosslink.malachite_peers =
-                        vec!["80.78.31.51:8234".to_owned(), "80.78.31.32:8234".to_owned()];
+                        vec!["70.34.201.202:8234".to_owned(), "45.76.30.90:8234".to_owned()];
                 }
                 Arc::new(c)
             })

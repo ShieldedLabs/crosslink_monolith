@@ -135,6 +135,8 @@ impl FinalisedState {
         config: BlockCacheConfig,
     ) -> Result<Self, FinalisedStateError> {
         info!("Launching Finalised State..");
+        warn!("WAITING 10 SECONDS BECAUSE ZAINO WILL CRASH IF IT DOES STUFF BEFORE ZEBRA");
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         let db_size_bytes = config.storage.database.size.to_byte_count();
         let db_path_dir = match config.network.to_zebra_network().kind() {
             NetworkKind::Mainnet => "live",
