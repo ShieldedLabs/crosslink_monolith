@@ -64,7 +64,7 @@ use zcash_client_backend::{
         }
     },
 };
-use zcash_primitives::{
+use zcash_protocol::{
     consensus::{
         MAIN_NETWORK,
         TEST_NETWORK,
@@ -146,224 +146,224 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let network = &TEST_NETWORK;
 
-    // miner/faucet wallet setup
-    let (miner_t_addr, miner_pubkey, miner_privkey) = {
-        use secrecy::ExposeSecret;
+    // // miner/faucet wallet setup
+    // let (miner_t_addr, miner_pubkey, miner_privkey) = {
+    //     use secrecy::ExposeSecret;
 
-        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let mnemonic = bip39::Mnemonic::parse(phrase).unwrap();
-        let bip39_passphrase = ""; // optional
-        let seed64 = mnemonic.to_seed(bip39_passphrase);
-        let seed = secrecy::SecretVec::new(seed64[..32].to_vec());
+    //     let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    //     let mnemonic = bip39::Mnemonic::parse(phrase).unwrap();
+    //     let bip39_passphrase = ""; // optional
+    //     let seed64 = mnemonic.to_seed(bip39_passphrase);
+    //     let seed = secrecy::SecretVec::new(seed64[..32].to_vec());
 
-        // 2. Derive Unified Spending Key (USK) from seed
-        let account_id = zcash_primitives::zip32::AccountId::try_from(0).unwrap();
-        let usk = UnifiedSpendingKey::from_seed(network, seed.expose_secret(), account_id).unwrap();
-        let (t_addr, child_index) = usk.transparent()
-            .to_account_pubkey()
-            .derive_external_ivk()
-            .unwrap()
-            .default_address();
+    //     // 2. Derive Unified Spending Key (USK) from seed
+    //     let account_id = zip32::AccountId::try_from(0).unwrap();
+    //     let usk = UnifiedSpendingKey::from_seed(network, seed.expose_secret(), account_id).unwrap();
+    //     let (t_addr, child_index) = usk.transparent()
+    //         .to_account_pubkey()
+    //         .derive_external_ivk()
+    //         .unwrap()
+    //         .default_address();
 
-        let transparent = usk.transparent();
-        let account_pubkey = transparent.to_account_pubkey();
-        let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).unwrap();
-        let address_privkey = transparent.derive_external_secret_key(child_index).unwrap();
-        (TransparentAddress::from_pubkey(&address_pubkey), address_pubkey, address_privkey)
-    };
-    let miner_t_addr_str = miner_t_addr.encode(network);
-    println!("Faucet miner t-address: {}", miner_t_addr_str);
+    //     let transparent = usk.transparent();
+    //     let account_pubkey = transparent.to_account_pubkey();
+    //     let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).unwrap();
+    //     let address_privkey = transparent.derive_external_secret_key(child_index).unwrap();
+    //     (TransparentAddress::from_pubkey(&address_pubkey), address_pubkey, address_privkey)
+    // };
+    // let miner_t_addr_str = miner_t_addr.encode(network);
+    // println!("Faucet miner t-address: {}", miner_t_addr_str);
 
-    // user wallet setup
-    let user_t_addr = {
-        use secrecy::ExposeSecret;
+    // // user wallet setup
+    // let user_t_addr = {
+    //     use secrecy::ExposeSecret;
 
-        let phrase = "blur kit item praise brick misery muffin symptom cheese street tired evolve";
-        let mnemonic = bip39::Mnemonic::parse(phrase).unwrap();
-        let bip39_passphrase = ""; // optional
-        let seed64 = mnemonic.to_seed(bip39_passphrase);
-        let seed = secrecy::SecretVec::new(seed64[..32].to_vec());
+    //     let phrase = "blur kit item praise brick misery muffin symptom cheese street tired evolve";
+    //     let mnemonic = bip39::Mnemonic::parse(phrase).unwrap();
+    //     let bip39_passphrase = ""; // optional
+    //     let seed64 = mnemonic.to_seed(bip39_passphrase);
+    //     let seed = secrecy::SecretVec::new(seed64[..32].to_vec());
 
-        // 2. Derive Unified Spending Key (USK) from seed
-        let account_id = zcash_primitives::zip32::AccountId::try_from(0).unwrap();
-        let usk = UnifiedSpendingKey::from_seed(network, seed.expose_secret(), account_id).unwrap();
-        let (t_addr, child_index) = usk.transparent()
-            .to_account_pubkey()
-            .derive_external_ivk()
-            .unwrap()
-            .default_address();
-        let account_pubkey = usk.transparent().to_account_pubkey();
-        let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).unwrap();
-        TransparentAddress::from_pubkey(&address_pubkey)
-    };
-    let user_t_addr_str = user_t_addr.encode(network);
-    println!("User t-address: {}", user_t_addr_str);
+    //     // 2. Derive Unified Spending Key (USK) from seed
+    //     let account_id = zip32::AccountId::try_from(0).unwrap();
+    //     let usk = UnifiedSpendingKey::from_seed(network, seed.expose_secret(), account_id).unwrap();
+    //     let (t_addr, child_index) = usk.transparent()
+    //         .to_account_pubkey()
+    //         .derive_external_ivk()
+    //         .unwrap()
+    //         .default_address();
+    //     let account_pubkey = usk.transparent().to_account_pubkey();
+    //     let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).unwrap();
+    //     TransparentAddress::from_pubkey(&address_pubkey)
+    // };
+    // let user_t_addr_str = user_t_addr.encode(network);
+    // println!("User t-address: {}", user_t_addr_str);
 
     let mut txs_seen_block_height = 0;
     let mut already_sent = false;
-    loop {
-        the_future_is_now(async {
-            let mut client = CompactTxStreamerClient::new({
-                loop {
-                    if let Ok(channel) = Channel::from_static("http://localhost:18233").connect().await {
-                        break channel;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            });
-            let latest_block = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
-            let miner_utxos = match client.get_address_utxos(GetAddressUtxosArg {
-                addresses: vec![miner_t_addr_str.to_owned()],
-                start_height: 0,
-                max_entries: 0
-            }).await {
-                Err(err) => {
-                    println!("******* GET UTXOS ERROR: {:?}", err);
-                    vec![]
-                },
-                Ok(res) => res.into_inner().address_utxos,
-            };
+    // loop {
+    //     the_future_is_now(async {
+    //         let mut client = CompactTxStreamerClient::new({
+    //             loop {
+    //                 if let Ok(channel) = Channel::from_static("http://localhost:18233").connect().await {
+    //                     break channel;
+    //                 }
+    //                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    //             }
+    //         });
+    //         let latest_block = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
+    //         let miner_utxos = match client.get_address_utxos(GetAddressUtxosArg {
+    //             addresses: vec![miner_t_addr_str.to_owned()],
+    //             start_height: 0,
+    //             max_entries: 0
+    //         }).await {
+    //             Err(err) => {
+    //                 println!("******* GET UTXOS ERROR: {:?}", err);
+    //                 vec![]
+    //             },
+    //             Ok(res) => res.into_inner().address_utxos,
+    //         };
 
-            let user_utxos = match client.get_address_utxos(GetAddressUtxosArg {
-                addresses: vec![user_t_addr_str.to_owned()],
-                start_height: 0,
-                max_entries: 0
-            }).await {
-                Err(err) => {
-                    println!("******* GET UTXOS ERROR: {:?}", err);
-                    vec![]
-                },
-                Ok(res) => res.into_inner().address_utxos,
-            };
+    //         let user_utxos = match client.get_address_utxos(GetAddressUtxosArg {
+    //             addresses: vec![user_t_addr_str.to_owned()],
+    //             start_height: 0,
+    //             max_entries: 0
+    //         }).await {
+    //             Err(err) => {
+    //                 println!("******* GET UTXOS ERROR: {:?}", err);
+    //                 vec![]
+    //             },
+    //             Ok(res) => res.into_inner().address_utxos,
+    //         };
 
-            let block_range = BlockRange{
-                start: Some(BlockId{ height: txs_seen_block_height, hash: Vec::new() }),
-                end: Some(BlockId{ height: u32::MAX as u64, hash: Vec::new() }),
-            };
-            let new_blocks = match client.get_block_range(block_range).await {
-                Err(err) => {
-                    println!("******* GET BLOCK RANGE ERROR: {:?}", err);
-                    None
-                },
-                Ok(res) => {
-                    let mut grpc_stream = res.into_inner();
-                    let mut blocks = Vec::new();
-                    loop {
-                         match grpc_stream.message().await {
-                             Ok(Some(block)) => blocks.push(block),
-                             Ok(None) => break Some(blocks),
-                             Err(err) => {
-                                 if err.code() == tonic::Code::OutOfRange {
-                                     break Some(blocks);
-                                 } else {
-                                    println!("Get block range message error: {err:?}");
-                                    break None;
-                                 }
-                            }
-                        }
-                    }
-                }
-            };
+    //         let block_range = BlockRange{
+    //             start: Some(BlockId{ height: txs_seen_block_height, hash: Vec::new() }),
+    //             end: Some(BlockId{ height: u32::MAX as u64, hash: Vec::new() }),
+    //         };
+    //         let new_blocks = match client.get_block_range(block_range).await {
+    //             Err(err) => {
+    //                 println!("******* GET BLOCK RANGE ERROR: {:?}", err);
+    //                 None
+    //             },
+    //             Ok(res) => {
+    //                 let mut grpc_stream = res.into_inner();
+    //                 let mut blocks = Vec::new();
+    //                 loop {
+    //                      match grpc_stream.message().await {
+    //                          Ok(Some(block)) => blocks.push(block),
+    //                          Ok(None) => break Some(blocks),
+    //                          Err(err) => {
+    //                              if err.code() == tonic::Code::OutOfRange {
+    //                                  break Some(blocks);
+    //                              } else {
+    //                                 println!("Get block range message error: {err:?}");
+    //                                 break None;
+    //                              }
+    //                         }
+    //                     }
+    //                 }
+    //             }
+    //         };
 
-            if !already_sent && miner_utxos.len() != 0 && miner_utxos[0].height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64) < latest_block.height {
-                let mut signing_set = TransparentSigningSet::new();
-                signing_set.add_key(miner_privkey);
+    //         if !already_sent && miner_utxos.len() != 0 && miner_utxos[0].height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64) < latest_block.height {
+    //             let mut signing_set = TransparentSigningSet::new();
+    //             signing_set.add_key(miner_privkey);
 
-                let prover = LocalTxProver::bundled();
-                let extsk: &[ExtendedSpendingKey] = &[];
-                let sak: &[SpendAuthorizingKey] = &[];
+    //             let prover = LocalTxProver::bundled();
+    //             let extsk: &[ExtendedSpendingKey] = &[];
+    //             let sak: &[SpendAuthorizingKey] = &[];
 
-                let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
-                let script = zcash_transparent::address::Script(miner_utxos[0].script.clone());
+    //             let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
+    //             let script = zcash_transparent::address::Script(miner_utxos[0].script.clone());
 
-                let outpoint = OutPoint::new(miner_utxos[0].txid[..32].try_into().unwrap(), miner_utxos[0].index as u32);
+    //             let outpoint = OutPoint::new(miner_utxos[0].txid[..32].try_into().unwrap(), miner_utxos[0].index as u32);
 
-                let mut txb = TxBuilder::new(
-                    network,
-                    BlockHeight::from_u32(latest_block.height as u32),
-                    BuildConfig::Standard {
-                        sapling_anchor: None,
-                        orchard_anchor: None,
-                    },
-                );
+    //             let mut txb = TxBuilder::new(
+    //                 network,
+    //                 BlockHeight::from_u32(latest_block.height as u32),
+    //                 BuildConfig::Standard {
+    //                     sapling_anchor: None,
+    //                     orchard_anchor: None,
+    //                 },
+    //             );
 
-                txb.add_transparent_input(miner_pubkey, outpoint, TxOut::new((zats + MINIMUM_FEE).unwrap(), script)).unwrap();
-                txb.add_transparent_output(&user_t_addr, zats).unwrap();
+    //             txb.add_transparent_input(miner_pubkey, outpoint, TxOut::new((zats + MINIMUM_FEE).unwrap(), script)).unwrap();
+    //             txb.add_transparent_output(&user_t_addr, zats).unwrap();
 
-                use rand_chacha::ChaCha20Rng;
-                let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
-                let tx_res = txb.build(
-                    &signing_set,
-                    extsk,
-                    sak,
-                    rng,
-                    &prover,
-                    &prover,
-                    &zip317::FeeRule::standard(),
-                ).unwrap();
+    //             use rand_chacha::ChaCha20Rng;
+    //             let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+    //             let tx_res = txb.build(
+    //                 &signing_set,
+    //                 extsk,
+    //                 sak,
+    //                 rng,
+    //                 &prover,
+    //                 &prover,
+    //                 &zip317::FeeRule::standard(),
+    //             ).unwrap();
 
-                let tx = tx_res.transaction();
-                let mut tx_bytes = vec![];
-                tx.write(&mut tx_bytes).unwrap();
+    //             let tx = tx_res.transaction();
+    //             let mut tx_bytes = vec![];
+    //             tx.write(&mut tx_bytes).unwrap();
 
-                let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
-                println!("******* res: {:?}", res);
+    //             let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
+    //             println!("******* res: {:?}", res);
 
-                already_sent = true;
-            }
+    //             already_sent = true;
+    //         }
 
-            if let Some(new_blocks) = new_blocks {
-                for (i, block) in new_blocks.iter().enumerate() {
-                    let Ok(hash_bytes) = <[u8;32]>::try_from(&block.hash[..]) else { continue; };
-                    println!("{i:02}: block {} has {} transactions", BlockHash::from(hash_bytes), block.vtx.len());
-                    // txs_seen_block_height = txs_seen_block_height.max(block.height);
-                    for tx in &block.vtx {
-                        println!("tx: {tx:?}");
-                    }
-                }
-            }
+    //         if let Some(new_blocks) = new_blocks {
+    //             for (i, block) in new_blocks.iter().enumerate() {
+    //                 let Ok(hash_bytes) = <[u8;32]>::try_from(&block.hash[..]) else { continue; };
+    //                 println!("{i:02}: block {} has {} transactions", BlockHash::from(hash_bytes), block.vtx.len());
+    //                 // txs_seen_block_height = txs_seen_block_height.max(block.height);
+    //                 for tx in &block.vtx {
+    //                     println!("tx: {tx:?}");
+    //                 }
+    //             }
+    //         }
 
-            // let latest = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
-            // let consensus_branch_id = BranchId::for_height(network, BlockHeight::from_u32(latest.height as u32));
+    //         // let latest = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
+    //         // let consensus_branch_id = BranchId::for_height(network, BlockHeight::from_u32(latest.height as u32));
 
-            // let mut tbundle = TransparentBuilder::empty().build();
-            // // tbundle.add_output(&user_t_addr, Zatoshis::const_from_u64(500)).unwrap();
-            // // let tbundle = tbundle.build().unwrap();
+    //         // let mut tbundle = TransparentBuilder::empty().build();
+    //         // // tbundle.add_output(&user_t_addr, Zatoshis::const_from_u64(500)).unwrap();
+    //         // // let tbundle = tbundle.build().unwrap();
 
-            // let unauthed_tx: TransactionData::<zcash_primitives::transaction::Unauthorized> = TransactionData::from_parts(
-            //     TxVersion::VCrosslink,
-            //     consensus_branch_id,
-            //     0,
-            //     BlockHeight::from_u32(0),
-            //     tbundle,
-            //     None, None, None, None);
+    //         // let unauthed_tx: TransactionData::<zcash_protocol::transaction::Unauthorized> = TransactionData::from_parts(
+    //         //     TxVersion::VCrosslink,
+    //         //     consensus_branch_id,
+    //         //     0,
+    //         //     BlockHeight::from_u32(0),
+    //         //     tbundle,
+    //         //     None, None, None, None);
 
-            // let txid_parts = unauthed_tx.digest(TxIdDigester);
+    //         // let txid_parts = unauthed_tx.digest(TxIdDigester);
 
-            // let transparent_bundle = unauthed_tx
-            //     .transparent_bundle()
-            //     .map(|tb| tb.clone().apply_signatures(|thing| {
-            //         let sig_hash = signature_hash(&unauthed_tx, &SignableInput::Shielded, &txid_parts);
-            //         let sig_hash: [u8; 32] = sig_hash.as_ref().clone();
-            //         sig_hash
-            //     }, &TransparentSigningSet::default()).unwrap());
+    //         // let transparent_bundle = unauthed_tx
+    //         //     .transparent_bundle()
+    //         //     .map(|tb| tb.clone().apply_signatures(|thing| {
+    //         //         let sig_hash = signature_hash(&unauthed_tx, &SignableInput::Shielded, &txid_parts);
+    //         //         let sig_hash: [u8; 32] = sig_hash.as_ref().clone();
+    //         //         sig_hash
+    //         //     }, &TransparentSigningSet::default()).unwrap());
 
-            // let mut tx_bytes = vec![];
-            // tx_bytes.write(&mut tx_bytes).unwrap();
+    //         // let mut tx_bytes = vec![];
+    //         // tx_bytes.write(&mut tx_bytes).unwrap();
 
-            let mut user_sum = 0;
-            for utxo in &user_utxos {
-                user_sum += utxo.value_zat;
-            }
+    //         let mut user_sum = 0;
+    //         for utxo in &user_utxos {
+    //             user_sum += utxo.value_zat;
+    //         }
 
-            let zec_full = user_sum / 100_000_000;
-            let zec_part = user_sum % 100_000_000;
-            println!("user {} has {} UTXOs with {} zats = {}.{} cTAZ", user_t_addr_str, user_utxos.len(), user_sum, zec_full, zec_part);
+    //         let zec_full = user_sum / 100_000_000;
+    //         let zec_part = user_sum % 100_000_000;
+    //         println!("user {} has {} UTXOs with {} zats = {}.{} cTAZ", user_t_addr_str, user_utxos.len(), user_sum, zec_full, zec_part);
 
-            wallet_state.lock().unwrap().balance = user_sum;
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        });
-    }
+    //         wallet_state.lock().unwrap().balance = user_sum;
+    //         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    //     });
+    // }
 
     /*
     let uivk = UnifiedIncomingViewingKey::decode(&MAIN_NETWORK, "uivk1u7ty6ntudngulxlxedkad44w7g6nydknyrdsaw0jkacy0z8k8qk37t4v39jpz2qe3y98q4vs0s05f4u2vfj5e9t6tk9w5r0a3p4smfendjhhm5au324yvd84vsqe664snjfzv9st8z4s8faza5ytzvte5s9zruwy8vf0ze0mhq7ldfl2js8u58k5l9rjlz89w987a9akhgvug3zaz55d5h0d6ndyt4udl2ncwnm30pl456frnkj").unwrap();

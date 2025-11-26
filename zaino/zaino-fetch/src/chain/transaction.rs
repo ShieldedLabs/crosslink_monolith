@@ -8,7 +8,8 @@ use std::io::Cursor;
 use zaino_proto::proto::compact_formats::{
     CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend, CompactTx,
 };
-use zcash_primitives::{constants::{VCROSSLINK_TX_VERSION, VCROSSLINK_VERSION_GROUP_ID}, transaction::StakingAction};
+use zcash_protocol::constants::{VCROSSLINK_TX_VERSION, VCROSSLINK_VERSION_GROUP_ID};
+use zcash_primitives::transaction::StakingAction;
 
 /// Txin format as described in <https://en.bitcoin.it/wiki/Transaction>
 #[derive(Debug, Clone)]

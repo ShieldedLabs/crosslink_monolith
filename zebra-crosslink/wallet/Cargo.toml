@@ -8,6 +8,7 @@ bip39 = "2.2.0"
 
 zcash_primitives = { workspace = true } # version = "0.26.1"
 zcash_client_backend = { path = "../../librustzcash/zcash_client_backend", features = ["lightwalletd-tonic"] } # version = "0.21.0"
+zcash_client_memory = { path = "../../librustzcash/zcash_client_memory", features = ["orchard"] }
 zcash_client_sqlite = { path = "../../librustzcash/zcash_client_sqlite", features = ["orchard"] } # version = "0.19.0"
 zcash_keys = { workspace = true, features=["transparent-inputs"] }
 zcash_protocol = { workspace = true } # version = "0.7.1"
