@@ -10,6 +10,22 @@ workspace.
 
 ## [Unreleased]
 
+## [0.7.1] - 2025-10-18
+
+### Fixed
+- Adjusted doc features to fix builds on docs.rs after nightly Rust update.
+
+## [0.7.0] - 2025-10-02
+
+- The mainnet activation height has been set for `consensus::BranchId::Nu6_1`
+
+### Changed
+
+## [0.6.2] - 2025-09-25
+
+### Added
+- `impl Hash for zcash_protocol::ShieldedProtocol`
+
 ## [0.6.1] - 2025-08-06
 
 ### Added

@@ -4,7 +4,7 @@ use core::cmp::Ordering;
 use core::fmt;
 use rand::{CryptoRng, RngCore};
 
-use ::sapling::{builder::SaplingMetadata, Note, PaymentAddress};
+use ::sapling::{Note, PaymentAddress, builder::SaplingMetadata};
 use ::transparent::{address::TransparentAddress, builder::TransparentBuilder, bundle::TxOut};
 use zcash_protocol::{
     consensus::{self, BlockHeight, BranchId, NetworkUpgrade, Parameters},
@@ -13,11 +13,11 @@ use zcash_protocol::{
 };
 
 use crate::transaction::{
-    fees::{
-        transparent::{InputView, OutputView},
-        FeeRule,
-    },
     Transaction, TxVersion,
+    fees::{
+        FeeRule,
+        transparent::{InputView, OutputView},
+    },
 };
 
 #[cfg(feature = "std")]
@@ -26,9 +26,9 @@ use std::sync::mpsc::Sender;
 #[cfg(feature = "circuits")]
 use {
     crate::transaction::{
-        sighash::{signature_hash, SignableInput},
-        txid::TxIdDigester,
         TransactionData, Unauthorized,
+        sighash::{SignableInput, signature_hash},
+        txid::TxIdDigester,
     },
     ::sapling::prover::{OutputProver, SpendProver},
     ::transparent::builder::TransparentSigningSet,
@@ -36,7 +36,7 @@ use {
 };
 
 #[cfg(feature = "transparent-inputs")]
-use ::transparent::builder::TransparentInputInfo;
+use {::transparent::builder::TransparentInputInfo, zcash_script::script};
 
 #[cfg(not(feature = "transparent-inputs"))]
 use core::convert::Infallible;
@@ -514,7 +514,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
             .map_err(Error::SaplingBuild)
     }
 
-    /// Adds a transparent coin to be spent in this transaction.
+    /// Adds a transparent P2PKH coin to be spent in this transaction.
     #[cfg(feature = "transparent-inputs")]
     pub fn add_transparent_input(
         &mut self,
@@ -525,6 +525,21 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
         self.transparent_builder.add_input(pubkey, utxo, coin)
     }
 
+    /// Adds a transparent P2SH coin to be spent in this transaction.
+    ///
+    /// This is only for use with [`Self::build_for_pczt`]. It is unsupported with
+    /// [`Self::build`], which will return an error.
+    #[cfg(feature = "transparent-inputs")]
+    pub fn add_transparent_p2sh_input(
+        &mut self,
+        redeem_script: script::FromChain,
+        utxo: transparent::bundle::OutPoint,
+        coin: TxOut,
+    ) -> Result<(), transparent::builder::Error> {
+        self.transparent_builder
+            .add_p2sh_input(redeem_script, utxo, coin)
+    }
+
     /// Adds a transparent address to send funds to.
     pub fn add_transparent_output(
         &mut self,
@@ -532,6 +547,13 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
         value: Zatoshis,
     ) -> Result<(), transparent::builder::Error> {
         self.transparent_builder.add_output(to, value)
+    }
+
+    /// Adds a transparent "null data" (OP_RETURN) output with the given data payload.
+    pub fn add_transparent_null_data_output<FE>(&mut self, data: &[u8]) -> Result<(), Error<FE>> {
+        self.transparent_builder
+            .add_null_data_output(data)
+            .map_err(Error::TransparentBuild)
     }
 
     /// Returns the sum of the transparent, Sapling, Orchard, zip233_amount and TZE value balances.
@@ -555,7 +577,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
                 any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
                 feature = "zip-233"
             ))]
-            -self.zip233_amount,
+            -ZatBalance::from(self.zip233_amount),
             #[cfg(zcash_unstable = "zfuture")]
             self.tze_builder.value_balance()?,
         ];
@@ -1103,7 +1125,7 @@ mod tests {
     use super::{Builder, Error};
     use crate::transaction::builder::BuildConfig;
 
-    use ::sapling::{zip32::ExtendedSpendingKey, Node, Rseed};
+    use ::sapling::{Node, Rseed, zip32::ExtendedSpendingKey};
     use ::transparent::{address::TransparentAddress, builder::TransparentSigningSet};
     use zcash_protocol::{
         consensus::{NetworkUpgrade, Parameters, TEST_NETWORK},
@@ -1117,7 +1139,7 @@ mod tests {
 
     #[cfg(feature = "transparent-inputs")]
     use {
-        crate::transaction::{builder::DEFAULT_TX_EXPIRY_DELTA, OutPoint, TxOut},
+        crate::transaction::{OutPoint, TxOut, builder::DEFAULT_TX_EXPIRY_DELTA},
         ::transparent::keys::{AccountPrivKey, IncomingViewingKey},
         zip32::AccountId,
     };
@@ -1165,16 +1187,16 @@ mod tests {
             .derive_external_secret_key(NonHardenedChildIndex::ZERO)
             .unwrap();
         let pubkey = transparent_signing_set.add_key(sk);
-        let prev_coin = TxOut {
-            value: Zatoshis::const_from_u64(50000),
-            script_pubkey: tsk
-                .to_account_pubkey()
+        let prev_coin = TxOut::new(
+            Zatoshis::const_from_u64(50000),
+            tsk.to_account_pubkey()
                 .derive_external_ivk()
                 .unwrap()
                 .derive_address(NonHardenedChildIndex::ZERO)
                 .unwrap()
-                .script(),
-        };
+                .script()
+                .into(),
+        );
         builder
             .add_transparent_input(pubkey, OutPoint::fake(), prev_coin)
             .unwrap();

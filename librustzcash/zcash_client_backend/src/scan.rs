@@ -5,13 +5,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::mem;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use memuse::DynamicUsage;
 use zcash_note_encryption::{
-    batch, BatchDomain, Domain, ShieldedOutput, COMPACT_NOTE_SIZE, ENC_CIPHERTEXT_SIZE,
+    BatchDomain, COMPACT_NOTE_SIZE, Domain, ENC_CIPHERTEXT_SIZE, ShieldedOutput, batch,
 };
 use zcash_primitives::{block::BlockHash, transaction::TxId};
 
@@ -257,6 +257,7 @@ impl<Item: Task + DynamicUsage> Tasks<Item> for WithUsage {
 
 /// A task that will clean up its own heap usage from the overall running usage once it is
 /// complete.
+#[allow(dead_code)]
 pub(crate) struct WithUsageTask<Item> {
     /// The item being run.
     item: Item,
@@ -477,11 +478,11 @@ where
             self.pending_results.dynamic_usage_bounds(),
         );
         (
-            bounds.0 .0 + running_usage + bounds.1 .0,
+            bounds.0.0 + running_usage + bounds.1.0,
             bounds
                 .0
-                 .1
-                .zip(bounds.1 .1)
+                .1
+                .zip(bounds.1.1)
                 .map(|(a, b)| a + running_usage + b),
         )
     }

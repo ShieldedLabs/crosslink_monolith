@@ -10,6 +10,24 @@ workspace.
 
 ## [Unreleased]
 
+### Changed
+- MSRV is now 1.85.1.
+
+## [0.26.1] - 2025-10-18
+
+### Fixed
+- Adjusted doc features to fix builds on docs.rs after nightly Rust update.
+
+## [0.26.0] - 2025-10-02
+
+### Changed
+- Migrated to `zcash_primitives 0.26`
+
+## [0.25.0] - 2025-09-25
+
+### Changed
+- Migrated to `zcash_primitives 0.25`.
+
 ## [0.24.0] - 2025-07-31
 
 ### Changed

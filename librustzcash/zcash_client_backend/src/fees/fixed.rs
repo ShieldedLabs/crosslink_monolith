@@ -4,18 +4,18 @@ use core::marker::PhantomData;
 
 use zcash_primitives::transaction::fees::{fixed::FeeRule as FixedFeeRule, transparent};
 use zcash_protocol::{
-    consensus::{self, BlockHeight},
+    ShieldedProtocol, consensus,
     memo::MemoBytes,
     value::{BalanceError, Zatoshis},
-    ShieldedProtocol,
 };
 
-use crate::data_api::InputSource;
+use crate::data_api::{InputSource, wallet::TargetHeight};
 
 use super::{
-    common::{single_pool_output_balance, SinglePoolBalanceConfig},
-    sapling as sapling_fees, ChangeError, ChangeStrategy, DustOutputPolicy, EphemeralBalance,
-    SplitPolicy, TransactionBalance,
+    ChangeError, ChangeStrategy, DustOutputPolicy, EphemeralBalance, SplitPolicy,
+    TransactionBalance,
+    common::{SinglePoolBalanceConfig, single_pool_output_balance},
+    sapling as sapling_fees,
 };
 
 #[cfg(feature = "orchard")]
@@ -69,6 +69,7 @@ impl<I: InputSource> ChangeStrategy for SingleOutputChangeStrategy<I> {
         &self,
         _meta_source: &Self::MetaSource,
         _account: <Self::MetaSource as InputSource>::AccountId,
+        _target_height: TargetHeight,
         _exclude: &[<Self::MetaSource as crate::data_api::InputSource>::NoteRef],
     ) -> Result<Self::AccountMetaT, <Self::MetaSource as crate::data_api::InputSource>::Error> {
         Ok(())
@@ -77,12 +78,12 @@ impl<I: InputSource> ChangeStrategy for SingleOutputChangeStrategy<I> {
     fn compute_balance<P: consensus::Parameters, NoteRefT: Clone>(
         &self,
         params: &P,
-        target_height: BlockHeight,
+        target_height: TargetHeight,
         transparent_inputs: &[impl transparent::InputView],
         transparent_outputs: &[impl transparent::OutputView],
         sapling: &impl sapling_fees::BundleView<NoteRefT>,
         #[cfg(feature = "orchard")] orchard: &impl orchard_fees::BundleView<NoteRefT>,
-        ephemeral_balance: Option<&EphemeralBalance>,
+        ephemeral_balance: Option<EphemeralBalance>,
         _wallet_meta: &Self::AccountMetaT,
     ) -> Result<TransactionBalance, ChangeError<Self::Error, NoteRefT>> {
         let split_policy = SplitPolicy::single_output();
@@ -119,17 +120,17 @@ mod tests {
         fixed::FeeRule as FixedFeeRule, zip317::MINIMUM_FEE,
     };
     use zcash_protocol::{
+        ShieldedProtocol,
         consensus::{Network, NetworkUpgrade, Parameters},
         value::Zatoshis,
-        ShieldedProtocol,
     };
 
     use super::SingleOutputChangeStrategy;
     use crate::{
         data_api::{testing::MockWalletDb, wallet::input_selection::SaplingPayment},
         fees::{
-            tests::{TestSaplingInput, TestTransparentInput},
             ChangeError, ChangeStrategy, ChangeValue, DustOutputPolicy,
+            tests::{TestSaplingInput, TestTransparentInput},
         },
     };
 
@@ -151,7 +152,8 @@ mod tests {
             &Network::TestNetwork,
             Network::TestNetwork
                 .activation_height(NetworkUpgrade::Nu5)
-                .unwrap(),
+                .unwrap()
+                .into(),
             &[] as &[TestTransparentInput],
             &[] as &[TxOut],
             &(
@@ -191,7 +193,8 @@ mod tests {
             &Network::TestNetwork,
             Network::TestNetwork
                 .activation_height(NetworkUpgrade::Nu5)
-                .unwrap(),
+                .unwrap()
+                .into(),
             &[] as &[TestTransparentInput],
             &[] as &[TxOut],
             &(

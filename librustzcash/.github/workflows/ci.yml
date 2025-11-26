@@ -1,5 +1,7 @@
 name: CI
 
+permissions: {}
+
 on:
   pull_request:
   push:
@@ -10,6 +12,9 @@ jobs:
   required-test:
     name: Test ${{ matrix.state }} on ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      statuses: write
     strategy:
       matrix:
         target:
@@ -19,6 +24,7 @@ jobs:
           - Sapling-only
           - Orchard
           - all-pools
+          - all-features
           - NU7
 
         include:
@@ -26,13 +32,15 @@ jobs:
             os: ubuntu-latest-8cores
 
           - state: transparent
-            extra_flags: transparent-inputs
+            transparent-pool: true
           - state: Orchard
-            extra_flags: orchard
+            orchard-pool: true
           - state: all-pools
-            extra_flags: orchard transparent-inputs
+            all-pools: true
+          - state: all-features
+            all-features: true
           - state: NU7
-            extra_flags: orchard transparent-inputs
+            all-features: true
             rustflags: '--cfg zcash_unstable="nu7"'
 
     env:
@@ -40,13 +48,16 @@ jobs:
       RUSTDOCFLAGS: ${{ matrix.rustflags }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - id: prepare
         uses: ./.github/actions/prepare
         with:
-          all-pools: false
+          transparent-pool: ${{ matrix.transparent-pool || false }}
+          orchard-pool: ${{ matrix.orchard-pool || false }}
+          all-pools: ${{ matrix.all-pools || false }}
+          all-features: ${{ matrix.all-features || false }}
           extra-features: ${{ matrix.extra_flags || '' }}
       - uses: actions/cache@v4
         with:
@@ -79,6 +90,7 @@ jobs:
           - Sapling-only
           - Orchard
           - all-pools
+          - all-features
           - NU7
 
         include:
@@ -88,16 +100,20 @@ jobs:
             os: windows-latest-8cores
 
           - state: transparent
-            extra_flags: transparent-inputs
+            transparent-pool: true
           - state: Orchard
-            extra_flags: orchard
+            orchard-pool: true
           - state: all-pools
-            extra_flags: orchard transparent-inputs
+            all-pools: true
+          - state: all-features
+            all-features: true
           - state: NU7
-            extra_flags: orchard transparent-inputs
+            all-features: true
             rustflags: '--cfg zcash_unstable="nu7"'
 
         exclude:
+          - target: macOS
+            state: all-features
           - target: macOS
             state: NU7
 
@@ -106,13 +122,16 @@ jobs:
       RUSTDOCFLAGS: ${{ matrix.rustflags }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - id: prepare
         uses: ./.github/actions/prepare
         with:
-          all-pools: false
+          transparent-pool: ${{ matrix.transparent-pool || false }}
+          orchard-pool: ${{ matrix.orchard-pool || false }}
+          all-pools: ${{ matrix.all-pools || false }}
+          all-features: ${{ matrix.all-features || false }}
           extra-features: ${{ matrix.extra_flags || '' }}
       - uses: actions/cache@v4
         with:
@@ -139,11 +158,11 @@ jobs:
       matrix:
         target:
           - Linux
-        state:
+        state: # all-pools intentionally omitted
           - transparent
           - Sapling-only
           - Orchard
-          - all-pools
+          - all-features
           - NU7
 
         include:
@@ -151,13 +170,13 @@ jobs:
             os: ubuntu-latest-8cores
 
           - state: transparent
-            extra_flags: transparent-inputs
+            transparent-pool: true
           - state: Orchard
-            extra_flags: orchard
-          - state: all-pools
-            extra_flags: orchard transparent-inputs
+            orchard-pool: true
+          - state: all-features
+            all-features: true
           - state: NU7
-            extra_flags: orchard transparent-inputs
+            all-features: true
             rustflags: '--cfg zcash_unstable="nu7"'
 
     env:
@@ -165,13 +184,16 @@ jobs:
       RUSTDOCFLAGS: ${{ matrix.rustflags }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - id: prepare
         uses: ./.github/actions/prepare
         with:
+          transparent-pool: ${{ matrix.transparent-pool || false }}
+          orchard-pool: ${{ matrix.orchard-pool || false }}
           all-pools: false
+          all-features: ${{ matrix.all-features || false }}
           extra-features: ${{ matrix.extra_flags || '' }}
       - uses: actions/cache@v4
         with:
@@ -188,7 +210,6 @@ jobs:
           --workspace
           ${{ steps.prepare.outputs.feature-flags }}
           --features expensive-tests
-          -- --ignored
       - name: Verify working directory is clean
         run: git diff --exit-code
 
@@ -204,6 +225,7 @@ jobs:
           - Windows
         state:
           - ZFuture
+          - ZFuture-allfeatures
 
         include:
           - target: Linux
@@ -215,18 +237,22 @@ jobs:
 
           - state: ZFuture
             rustflags: '--cfg zcash_unstable="zfuture"'
+          - state: ZFuture-allfeatures
+            all-features: true
+            rustflags: '--cfg zcash_unstable="zfuture"'
 
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
       RUSTDOCFLAGS: ${{ matrix.rustflags }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - id: prepare
         uses: ./.github/actions/prepare
         with:
+          all-features: ${{ matrix.all-features || false }}
           extra-features: ${{ matrix.extra_flags || '' }}
       - uses: actions/cache@v4
         with:
@@ -254,7 +280,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macOS-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - id: prepare
@@ -292,12 +318,19 @@ jobs:
     strategy:
       matrix:
         target:
-          - wasm32-wasi
+          - wasm32-wasip1
+        include:
+          - target: wasm32-wasip1
+            build_deps: >
+              gcc-multilib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
           path: crates
+      - name: Install linux build dependencies
+        run: sudo apt update && sudo apt install ${{ matrix.build_deps }}
+        if: matrix.build_deps != ''
       # We use a synthetic crate to ensure no dev-dependencies are enabled, which can
       # be incompatible with some of these targets.
       - name: Copy Rust toolchain into the root for use in synthetic crate setup
@@ -332,11 +365,18 @@ jobs:
       matrix:
         target:
           - thumbv7em-none-eabihf
+        include:
+          - target: thumbv7em-none-eabihf
+            build_deps: >
+              gcc-arm-none-eabi
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
           path: crates
+      - name: Install linux build dependencies
+        run: sudo apt update && sudo apt install ${{ matrix.build_deps }}
+        if: matrix.build_deps != ''
       # We use a synthetic crate to ensure no dev-dependencies are enabled, which can
       # be incompatible with some of these targets.
       - name: Copy Rust toolchain into the root for use in synthetic crate setup
@@ -375,7 +415,7 @@ jobs:
     name: Bitrot check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       # Build benchmarks to prevent bitrot
@@ -385,33 +425,39 @@ jobs:
   clippy:
     name: Clippy (MSRV)
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - id: prepare
-        uses: ./.github/actions/prepare
+      # We can't currently use only the common feature set (to exclude checking of
+      # unstable in-progress code) because this action doesn't support spaces within CLI
+      # arguments. Once it does, switch back to `prepare` instead of `--all-features`.
       - name: Run clippy
-        uses: actions-rs/clippy-check@v1
+        uses: auguwu/clippy-action@94a9ff2f6920180b89e5c03d121d0af04a9d3e03 # 1.4.0
         with:
-          name: Clippy (MSRV)
           token: ${{ secrets.GITHUB_TOKEN }}
-          args: >
-            ${{ steps.prepare.outputs.feature-flags }}
+          working-directory: ${{ inputs.target }}
+          check-args: >
+            --all-features
             --all-targets
-            --
+          args: >
             -D warnings
 
   clippy-beta:
     name: Clippy (beta)
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - id: prepare
-        uses: ./.github/actions/prepare
+      # We can't currently use only the common feature set (to exclude checking of
+      # unstable in-progress code) because this action doesn't support spaces within CLI
+      # arguments. Once it does, switch back to `prepare` instead of `--all-features`.
       - uses: dtolnay/rust-toolchain@beta
         id: toolchain
         with:
@@ -421,14 +467,14 @@ jobs:
         env:
           TOOLCHAIN: ${{steps.toolchain.outputs.name}}
       - name: Run Clippy (beta)
-        uses: actions-rs/clippy-check@v1
+        uses: auguwu/clippy-action@94a9ff2f6920180b89e5c03d121d0af04a9d3e03 # 1.4.0
         with:
-          name: Clippy (beta)
           token: ${{ secrets.GITHUB_TOKEN }}
-          args: >
-            ${{ steps.prepare.outputs.feature-flags }}
+          working-directory: ${{ inputs.target }}
+          check-args: >
+            --all-features
             --all-targets
-            --
+          args: >
             -W clippy::all
 
   codecov:
@@ -439,7 +485,7 @@ jobs:
       options: --security-opt seccomp=unconfined
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - id: prepare
@@ -462,33 +508,43 @@ jobs:
           --timeout 600
           --out xml
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5.3.1
+        uses: codecov/codecov-action@5a1091511ad55cbe89839c7260b706298ca349f7 # v5.5.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # This is run with nightly and `RUSTDOCFLAGS` to emulate the documentation renders on
+  # docs.rs and in `.github/workflows/book.yml` as closely as possible.
   doc-links:
     name: Intra-doc links
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - id: prepare
         uses: ./.github/actions/prepare
+      - uses: dtolnay/rust-toolchain@nightly
+        id: toolchain
+      - run: rustup override set "${TOOLCHAIN}"
+        env:
+          TOOLCHAIN: ${{steps.toolchain.outputs.name}}
       - run: cargo fetch
       # Requires #![deny(rustdoc::broken_intra_doc_links)] in crates.
       - name: Check intra-doc links
         run: >
           cargo doc
-          --all
+          --no-deps
+          --workspace
           ${{ steps.prepare.outputs.feature-flags }}
           --document-private-items
+        env:
+          RUSTDOCFLAGS: -Z unstable-options --enable-index-page --cfg docsrs
 
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: Check formatting
@@ -498,13 +554,13 @@ jobs:
     name: protobuf consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - id: prepare
         uses: ./.github/actions/prepare
       - name: Install protoc
-        uses: supplypike/setup-bin@v4
+        uses: supplypike/setup-bin@1fafb085795af4a3f183502f3a9dffa8f7b83217 # v5.0.0
         with:
           uri: 'https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip'
           name: 'protoc'
@@ -515,6 +571,8 @@ jobs:
           cargo check
           --workspace
           ${{ steps.prepare.outputs.feature-flags }}
+      - name: run cargo-fmt to handle the case that regeneration sometimes produces unformatted output
+        run: cargo fmt
       - name: Verify working directory is clean
         run: git diff --exit-code
 
@@ -522,7 +580,7 @@ jobs:
     name: UUID validity
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - name: Extract UUIDs

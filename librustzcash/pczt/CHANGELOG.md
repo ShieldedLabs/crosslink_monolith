@@ -10,10 +10,18 @@ workspace.
 
 ## [Unreleased]
 
-## [0.4.0] - PLANNED
+## [0.5.0] - 2025-11-05
+
 ### Changed
-- Migrated to `zcash_protocol 0.6`, `zcash_transparent 0.4`, `zcash_primitives 0.24`,
-  `zcash_proofs 0.24`
+- MSRV is now 1.85.1.
+- Migrated to `zcash_protocol 0.7`, `zcash_transparent 0.6`, `zcash_primitives 0.26`,
+  `zcash_proofs 0.26`
+
+## [0.4.0] - 2025-09-25
+
+### Changed
+- Migrated to `zcash_protocol 0.6`, `zcash_transparent 0.5`, `zcash_primitives 0.25`,
+  `zcash_proofs 0.25`
 
 ## [0.3.0] - 2025-05-30
 

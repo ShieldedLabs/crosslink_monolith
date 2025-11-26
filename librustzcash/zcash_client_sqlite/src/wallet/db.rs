@@ -69,7 +69,7 @@ use crate::wallet::scanning::priority_code;
 /// - `zcash_legacy_address_index`: This column is only potentially populated for wallets imported
 ///   from a `zcashd` `wallet.dat` file, for "standalone" Sapling addresses (each of which
 ///   corresponds to an independent account) derived after the introduction of mnemonic seed
-///   derivation in the `4.7.0` `zcashd` release. This column will only be non-null in
+///   derivation in the `4.7.0` `zcashd` release. This column will only be non-negative in
 ///   the case that the `hd_account_index` column has the value `0x7FFFFFFF`, in accordance with
 ///   how post-v4.7.0 Sapling addresses were produced by the `z_getnewaddress` RPC method.
 ///   This relationship is not currently enforced by a CHECK constraint; such a constraint should
@@ -94,7 +94,7 @@ CREATE TABLE "accounts" (
     birthday_orchard_tree_size INTEGER,
     recover_until_height INTEGER,
     has_spend_key INTEGER NOT NULL DEFAULT 1,
-    zcashd_legacy_address_index INTEGER,
+    zcashd_legacy_address_index INTEGER NOT NULL DEFAULT -1,
     CHECK (
       (
         account_kind = 0
@@ -115,8 +115,7 @@ pub(super) const INDEX_ACCOUNTS_UFVK: &str =
     r#"CREATE UNIQUE INDEX accounts_ufvk ON accounts (ufvk)"#;
 pub(super) const INDEX_ACCOUNTS_UIVK: &str =
     r#"CREATE UNIQUE INDEX accounts_uivk ON accounts (uivk)"#;
-pub(super) const INDEX_HD_ACCOUNT: &str =
-    r#"CREATE UNIQUE INDEX hd_account ON accounts (hd_seed_fingerprint, hd_account_index)"#;
+pub(super) const INDEX_HD_ACCOUNT: &str = r#"CREATE UNIQUE INDEX hd_account ON accounts (hd_seed_fingerprint, hd_account_index, zcashd_legacy_address_index)"#;
 
 /// Stores addresses that have been generated from accounts in the wallet.
 ///
@@ -124,7 +123,9 @@ pub(super) const INDEX_HD_ACCOUNT: &str =
 ///
 /// - `account_id`: the account whose IVK was used to derive this address.
 /// - `diversifier_index_be`: the diversifier index at which this address was derived.
-/// - `key_scope`: the key scope for which this address was derived.
+///   This may be null for imported standalone addresses.
+/// - `key_scope`: the BIP 44 change-level index at which this address was derived, or `-1`
+///   for imported transparent pubkeys.
 /// - `address`: The Unified, Sapling, or transparent address. For Unified and Sapling addresses,
 ///   only external-key scoped addresses should be stored in this table; for purely transparent
 ///   addresses, this may be an internal-scope (change) address, so that we can provide
@@ -161,24 +162,45 @@ pub(super) const INDEX_HD_ACCOUNT: &str =
 /// - `transparent_receiver_next_check_time`: The Unix epoch time at which a client should next
 ///   check to determine whether any new UTXOs have been received by the cached transparent receiver
 ///   address. At present, this will ordinarily be populated only for ZIP 320 ephemeral addresses.
+//  - `imported_transparent_receiver_pubkey`: The 33-byte pubkey corresponding to the
+//    `cached_transparent_receiver_address` value, for imported transparent addresses that were not
+//    obtained via derivation from an HD seed associated with the account. In cases that
+//    `cached_transparent_receiver_address` is non-null, either this column or
+//    `transparent_child_index` must also be non-null.
 ///
 /// [`ReceiverFlags`]: crate::wallet::encoding::ReceiverFlags
 pub(super) const TABLE_ADDRESSES: &str = r#"
 CREATE TABLE "addresses" (
     id INTEGER NOT NULL PRIMARY KEY,
-    account_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL
+        REFERENCES accounts(id) ON DELETE CASCADE,
     key_scope INTEGER NOT NULL,
-    diversifier_index_be BLOB NOT NULL,
+    diversifier_index_be BLOB,
     address TEXT NOT NULL,
     transparent_child_index INTEGER,
     cached_transparent_receiver_address TEXT,
     exposed_at_height INTEGER,
     receiver_flags INTEGER NOT NULL,
     transparent_receiver_next_check_time INTEGER,
-    FOREIGN KEY (account_id) REFERENCES accounts(id),
-    CONSTRAINT diversification UNIQUE (account_id, key_scope, diversifier_index_be),
-    CONSTRAINT transparent_index_consistency CHECK (
-        (transparent_child_index IS NOT NULL) == (cached_transparent_receiver_address IS NOT NULL)
+    imported_transparent_receiver_pubkey BLOB,
+    UNIQUE (account_id, key_scope, diversifier_index_be),
+    UNIQUE (imported_transparent_receiver_pubkey),
+    CONSTRAINT ck_addr_transparent_index_consistency CHECK (
+        (transparent_child_index IS NULL OR diversifier_index_be < x'0000000F00000000000000')
+        AND (
+            (
+                cached_transparent_receiver_address IS NULL
+                AND transparent_child_index IS NULL
+                AND imported_transparent_receiver_pubkey IS NULL
+            )
+            OR (
+                cached_transparent_receiver_address IS NOT NULL
+                AND (transparent_child_index IS NULL) == (imported_transparent_receiver_pubkey IS NOT NULL)
+            )
+        )
+    ),
+    CONSTRAINT ck_addr_foreign_or_diversified CHECK (
+        (diversifier_index_be IS NULL) == (key_scope = -1)
     )
 )"#;
 pub(super) const INDEX_ADDRESSES_ACCOUNTS: &str = r#"
@@ -188,6 +210,10 @@ CREATE INDEX idx_addresses_accounts ON addresses (
 pub(super) const INDEX_ADDRESSES_INDICES: &str = r#"
 CREATE INDEX idx_addresses_indices ON addresses (
     diversifier_index_be ASC
+)"#;
+pub(super) const INDEX_ADDRESSES_PUBKEYS: &str = r#"
+CREATE INDEX idx_addresses_pubkeys ON addresses (
+    imported_transparent_receiver_pubkey ASC
 )"#;
 pub(super) const INDEX_ADDRESSES_T_INDICES: &str = r#"
 CREATE INDEX idx_addresses_t_indices ON addresses (
@@ -212,10 +238,14 @@ CREATE TABLE blocks (
 
 /// Stores the wallet's transactions.
 ///
-/// Any transactions that the wallet observes as "belonging to" one of the accounts in
+/// Any transactions that the wallet observes as being associated with one of the accounts in
 /// [`TABLE_ACCOUNTS`] may be tracked in this table. As a result, this table may contain
 /// data that is not recoverable from the chain (for example, transactions created by the
 /// wallet that expired before being mined).
+///
+/// When an account is deleted, all transactions that are associated with that account in some way
+/// that are not associated with any *other* account in the wallet must be first be deleted before
+/// the account deletion operation is allowed to proceed.
 ///
 /// ### Columns
 /// - `created`: The time at which the transaction was created as a string in the format
@@ -240,6 +270,14 @@ CREATE TABLE blocks (
 ///   will only be set for transactions created using this wallet specifically, and not any
 ///   other wallet that uses the same seed (including previous installations of the same
 ///   wallet application.)
+/// - `min_observed_height`: the mempool height at the time that the wallet observed the
+///   transaction, or the mined height of the transaction, whichever is less.
+/// - `confirmed_unmined_at_height`: the maximum block height at which the wallet has observed
+///   positive proof that the transaction has not been mined in a block. Must be NULL if
+///   `mined_height` is not null.
+/// - `trust_status`: A flag indicating whether the transaction should be considered "trusted".
+///   When set to `1`, outputs of this transaction will be considered spendable with `trusted`
+///   confirmations instead of `untrusted` confirmations.
 pub(super) const TABLE_TRANSACTIONS: &str = r#"
 CREATE TABLE "transactions" (
     id_tx INTEGER PRIMARY KEY,
@@ -252,8 +290,19 @@ CREATE TABLE "transactions" (
     raw BLOB,
     fee INTEGER,
     target_height INTEGER,
+    min_observed_height INTEGER NOT NULL,
+    confirmed_unmined_at_height INTEGER,
+    trust_status INTEGER,
     FOREIGN KEY (block) REFERENCES blocks(height),
-    CONSTRAINT height_consistency CHECK (block IS NULL OR mined_height = block)
+    CONSTRAINT height_consistency CHECK (
+        block IS NULL OR mined_height = block
+    ),
+    CONSTRAINT min_observed_consistency CHECK (
+        mined_height IS NULL OR min_observed_height <= mined_height
+    ),
+    CONSTRAINT confirmed_unmined_consistency CHECK (
+        confirmed_unmined_at_height IS NULL OR mined_height IS NULL
+    )
 )"#;
 
 /// Stores the Sapling notes received by the wallet.
@@ -261,7 +310,7 @@ CREATE TABLE "transactions" (
 /// Note spentness is tracked in [`TABLE_SAPLING_RECEIVED_NOTE_SPENDS`].
 ///
 /// ### Columns
-/// - `tx`: a foreign key reference to the transaction that contained this output
+/// - `transaction_id`: a foreign key reference to the transaction that contained this output
 /// - `output_index`: the index of this Sapling output in the transaction
 /// - `account_id`: a foreign key reference to the account whose ivk decrypted this output
 /// - `diversifier`: the diversifier used to construct the note
@@ -281,9 +330,11 @@ CREATE TABLE "transactions" (
 pub(super) const TABLE_SAPLING_RECEIVED_NOTES: &str = r#"
 CREATE TABLE "sapling_received_notes" (
     id INTEGER PRIMARY KEY,
-    tx INTEGER NOT NULL,
+    transaction_id INTEGER NOT NULL
+        REFERENCES transactions(id_tx) ON DELETE CASCADE,
     output_index INTEGER NOT NULL,
-    account_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL
+        REFERENCES accounts(id) ON DELETE CASCADE,
     diversifier BLOB NOT NULL,
     value INTEGER NOT NULL,
     rcm BLOB NOT NULL,
@@ -292,18 +343,21 @@ CREATE TABLE "sapling_received_notes" (
     memo BLOB,
     commitment_tree_position INTEGER,
     recipient_key_scope INTEGER,
-    address_id INTEGER REFERENCES addresses(id),
-    FOREIGN KEY (tx) REFERENCES transactions(id_tx),
-    FOREIGN KEY (account_id) REFERENCES accounts(id),
-    CONSTRAINT tx_output UNIQUE (tx, output_index)
+    address_id INTEGER
+        REFERENCES addresses(id) ON DELETE CASCADE,
+    UNIQUE (transaction_id, output_index)
 )"#;
 pub(super) const INDEX_SAPLING_RECEIVED_NOTES_ACCOUNT: &str = r#"
-CREATE INDEX "sapling_received_notes_account" ON "sapling_received_notes" (
-    "account_id" ASC
+CREATE INDEX idx_sapling_received_notes_account ON sapling_received_notes (
+    account_id ASC
+)"#;
+pub(super) const INDEX_SAPLING_RECEIVED_NOTES_ADDRESS: &str = r#"
+CREATE INDEX idx_sapling_received_notes_address ON sapling_received_notes (
+    address_id ASC
 )"#;
 pub(super) const INDEX_SAPLING_RECEIVED_NOTES_TX: &str = r#"
-CREATE INDEX "sapling_received_notes_tx" ON "sapling_received_notes" (
-    "tx" ASC
+CREATE INDEX idx_sapling_received_notes_tx ON sapling_received_notes (
+    transaction_id ASC
 )"#;
 
 /// A junction table between received Sapling notes and the transactions that spend them.
@@ -315,25 +369,29 @@ CREATE INDEX "sapling_received_notes_tx" ON "sapling_received_notes" (
 /// by joining this table with [`TABLE_TRANSACTIONS`] and then filtering out transactions
 /// where either `transactions.block` is non-null, or `transactions.expiry_height` is not
 /// greater than the wallet's view of the chain tip.
-pub(super) const TABLE_SAPLING_RECEIVED_NOTE_SPENDS: &str = "
-CREATE TABLE sapling_received_note_spends (
-    sapling_received_note_id INTEGER NOT NULL,
-    transaction_id INTEGER NOT NULL,
-    FOREIGN KEY (sapling_received_note_id)
-        REFERENCES sapling_received_notes(id)
-        ON DELETE CASCADE,
-    FOREIGN KEY (transaction_id)
-        -- We do not delete transactions, so this does not cascade
-        REFERENCES transactions(id_tx),
+pub(super) const TABLE_SAPLING_RECEIVED_NOTE_SPENDS: &str = r#"
+CREATE TABLE "sapling_received_note_spends" (
+    sapling_received_note_id INTEGER NOT NULL
+        REFERENCES sapling_received_notes(id) ON DELETE CASCADE,
+    transaction_id INTEGER NOT NULL
+        REFERENCES transactions(id_tx) ON DELETE CASCADE,
     UNIQUE (sapling_received_note_id, transaction_id)
-)";
+)"#;
+pub(super) const INDEX_SAPLING_RNS_NOTE: &str = r#"
+CREATE INDEX idx_sapling_received_note_spends_note_id ON sapling_received_note_spends (
+    sapling_received_note_id ASC
+)"#;
+pub(super) const INDEX_SAPLING_RNS_TX: &str = r#"
+CREATE INDEX idx_sapling_received_note_spends_transaction_id ON sapling_received_note_spends (
+    transaction_id ASC
+)"#;
 
 /// Stores the Orchard notes received by the wallet.
 ///
 /// Note spentness is tracked in [`TABLE_ORCHARD_RECEIVED_NOTE_SPENDS`].
 ///
 /// ### Columns
-/// - `tx`: a foreign key reference to the transaction that contained this output
+/// - `transaction_id`: a foreign key reference to the transaction that contained this output
 /// - `action_index`: the index of the Orchard action that produced this note in the transaction
 /// - `account_id`: a foreign key reference to the account whose ivk decrypted this output
 /// - `diversifier`: the diversifier used to construct the note
@@ -351,12 +409,14 @@ CREATE TABLE sapling_received_note_spends (
 /// - `address_id`: a foreign key to the address that this note was sent to; null in the
 ///   case that the note was sent to an internally-scoped address (we never store addresses
 ///   containing internal Orchard receivers in the `addresses` table).
-pub(super) const TABLE_ORCHARD_RECEIVED_NOTES: &str = "
-CREATE TABLE orchard_received_notes (
+pub(super) const TABLE_ORCHARD_RECEIVED_NOTES: &str = r#"
+CREATE TABLE "orchard_received_notes" (
     id INTEGER PRIMARY KEY,
-    tx INTEGER NOT NULL,
+    transaction_id INTEGER NOT NULL
+        REFERENCES transactions(id_tx) ON DELETE CASCADE,
     action_index INTEGER NOT NULL,
-    account_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL
+        REFERENCES accounts(id) ON DELETE CASCADE,
     diversifier BLOB NOT NULL,
     value INTEGER NOT NULL,
     rho BLOB NOT NULL,
@@ -366,36 +426,43 @@ CREATE TABLE orchard_received_notes (
     memo BLOB,
     commitment_tree_position INTEGER,
     recipient_key_scope INTEGER,
-    address_id INTEGER REFERENCES addresses(id),
-    FOREIGN KEY (tx) REFERENCES transactions(id_tx),
-    FOREIGN KEY (account_id) REFERENCES accounts(id),
-    CONSTRAINT tx_output UNIQUE (tx, action_index)
-)";
+    address_id INTEGER
+        REFERENCES addresses(id) ON DELETE CASCADE,
+    UNIQUE (transaction_id, action_index)
+)"#;
 pub(super) const INDEX_ORCHARD_RECEIVED_NOTES_ACCOUNT: &str = r#"
-CREATE INDEX orchard_received_notes_account ON orchard_received_notes (
+CREATE INDEX idx_orchard_received_notes_account ON orchard_received_notes (
     account_id ASC
 )"#;
+pub(super) const INDEX_ORCHARD_RECEIVED_NOTES_ADDRESS: &str = r#"
+CREATE INDEX idx_orchard_received_notes_address ON orchard_received_notes (
+    address_id ASC
+)"#;
 pub(super) const INDEX_ORCHARD_RECEIVED_NOTES_TX: &str = r#"
-CREATE INDEX orchard_received_notes_tx ON orchard_received_notes (
-    tx ASC
+CREATE INDEX idx_orchard_received_notes_tx ON orchard_received_notes (
+    transaction_id ASC
 )"#;
 
 /// A junction table between received Orchard notes and the transactions that spend them.
 ///
 /// Thie plays the same role for Orchard notes as does [`TABLE_SAPLING_RECEIVED_NOTE_SPENDS`] for
 /// Sapling notes; see its documentation for details.
-pub(super) const TABLE_ORCHARD_RECEIVED_NOTE_SPENDS: &str = "
-CREATE TABLE orchard_received_note_spends (
-    orchard_received_note_id INTEGER NOT NULL,
-    transaction_id INTEGER NOT NULL,
-    FOREIGN KEY (orchard_received_note_id)
-        REFERENCES orchard_received_notes(id)
-        ON DELETE CASCADE,
-    FOREIGN KEY (transaction_id)
-        -- We do not delete transactions, so this does not cascade
-        REFERENCES transactions(id_tx),
+pub(super) const TABLE_ORCHARD_RECEIVED_NOTE_SPENDS: &str = r#"
+CREATE TABLE "orchard_received_note_spends" (
+    orchard_received_note_id INTEGER NOT NULL
+        REFERENCES orchard_received_notes(id) ON DELETE CASCADE,
+    transaction_id INTEGER NOT NULL
+        REFERENCES transactions(id_tx) ON DELETE CASCADE,
     UNIQUE (orchard_received_note_id, transaction_id)
-)";
+)"#;
+pub(super) const INDEX_ORCHARD_RNS_NOTE: &str = r#"
+CREATE INDEX idx_orchard_received_note_spends_note_id ON orchard_received_note_spends (
+    orchard_received_note_id ASC
+)"#;
+pub(super) const INDEX_ORCHARD_RNS_TX: &str = r#"
+CREATE INDEX idx_orchard_received_note_spends_transaction_id ON orchard_received_note_spends (
+    transaction_id ASC
+)"#;
 
 /// Stores the transparent outputs received by the wallet.
 ///
@@ -430,21 +497,31 @@ CREATE TABLE orchard_received_note_spends (
 pub(super) const TABLE_TRANSPARENT_RECEIVED_OUTPUTS: &str = r#"
 CREATE TABLE "transparent_received_outputs" (
     id INTEGER PRIMARY KEY,
-    transaction_id INTEGER NOT NULL,
+    transaction_id INTEGER NOT NULL
+        REFERENCES transactions(id_tx) ON DELETE CASCADE,
     output_index INTEGER NOT NULL,
-    account_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL
+        REFERENCES accounts(id) ON DELETE CASCADE,
     address TEXT NOT NULL,
     script BLOB NOT NULL,
     value_zat INTEGER NOT NULL,
     max_observed_unspent_height INTEGER,
-    address_id INTEGER NOT NULL REFERENCES addresses(id),
-    FOREIGN KEY (transaction_id) REFERENCES transactions(id_tx),
-    FOREIGN KEY (account_id) REFERENCES accounts(id),
-    CONSTRAINT transparent_output_unique UNIQUE (transaction_id, output_index)
+    address_id INTEGER NOT NULL
+        REFERENCES addresses(id) ON DELETE CASCADE,
+    UNIQUE (transaction_id, output_index)
 )"#;
-pub(super) const INDEX_TRANSPARENT_RECEIVED_OUTPUTS_ACCOUNT_ID: &str = r#"
-CREATE INDEX idx_transparent_received_outputs_account_id
-ON "transparent_received_outputs" (account_id)"#;
+pub(super) const INDEX_TRANSPARENT_RECEIVED_OUTPUTS_ACCOUNT: &str = r#"
+CREATE INDEX idx_transparent_received_outputs_account ON transparent_received_outputs (
+    account_id
+)"#;
+pub(super) const INDEX_TRANSPARENT_RECEIVED_OUTPUTS_ADDRESS: &str = r#"
+CREATE INDEX idx_transparent_received_outputs_address ON transparent_received_outputs (
+    address_id
+)"#;
+pub(super) const INDEX_TRANSPARENT_RECEIVED_OUTPUTS_TX: &str = r#"
+CREATE INDEX idx_transparent_received_outputs_tx ON transparent_received_outputs (
+    transaction_id
+)"#;
 
 /// A junction table between received transparent outputs and the transactions that spend them.
 ///
@@ -457,15 +534,20 @@ ON "transparent_received_outputs" (account_id)"#;
 /// in [`zcash_client_backend`].
 pub(super) const TABLE_TRANSPARENT_RECEIVED_OUTPUT_SPENDS: &str = r#"
 CREATE TABLE "transparent_received_output_spends" (
-    transparent_received_output_id INTEGER NOT NULL,
-    transaction_id INTEGER NOT NULL,
-    FOREIGN KEY (transparent_received_output_id)
-        REFERENCES transparent_received_outputs(id)
-        ON DELETE CASCADE,
-    FOREIGN KEY (transaction_id)
-        -- We do not delete transactions, so this does not cascade
-        REFERENCES transactions(id_tx),
+    transparent_received_output_id INTEGER NOT NULL
+        REFERENCES transparent_received_outputs(id) ON DELETE CASCADE,
+    transaction_id INTEGER NOT NULL
+        REFERENCES transactions(id_tx) ON DELETE CASCADE,
     UNIQUE (transparent_received_output_id, transaction_id)
+)"#;
+
+pub(super) const INDEX_TRANSPARENT_ROS_OUTPUT: &str = r#"
+CREATE INDEX idx_transparent_received_output_spends_output_id ON transparent_received_output_spends (
+    transparent_received_output_id ASC
+)"#;
+pub(super) const INDEX_TRANSPARENT_ROS_TX: &str = r#"
+CREATE INDEX idx_transparent_received_output_spends_transaction_id ON transparent_received_output_spends (
+    transaction_id ASC
 )"#;
 
 /// A cache of the relationship between a transaction and the prevout data of its
@@ -477,17 +559,19 @@ CREATE TABLE "transparent_received_output_spends" (
 /// the spend can also be recorded as part of the process of adding the output to
 /// [`TABLE_TRANSPARENT_RECEIVED_OUTPUTS`].
 pub(super) const TABLE_TRANSPARENT_SPEND_MAP: &str = r#"
-CREATE TABLE transparent_spend_map (
-    spending_transaction_id INTEGER NOT NULL,
+CREATE TABLE "transparent_spend_map" (
+    spending_transaction_id INTEGER NOT NULL
+        REFERENCES transactions(id_tx) ON DELETE CASCADE,
     prevout_txid BLOB NOT NULL,
     prevout_output_index INTEGER NOT NULL,
-    FOREIGN KEY (spending_transaction_id) REFERENCES transactions(id_tx)
     -- NOTE: We can't create a unique constraint on just (prevout_txid, prevout_output_index)
     -- because the same output may be attempted to be spent in multiple transactions, even
     -- though only one will ever be mined.
-    CONSTRAINT transparent_spend_map_unique UNIQUE (
-        spending_transaction_id, prevout_txid, prevout_output_index
-    )
+    UNIQUE (spending_transaction_id, prevout_txid, prevout_output_index)
+)"#;
+pub(super) const INDEX_TRANSPARENT_SPEND_MAP_TX: &str = r#"
+CREATE INDEX idx_transparent_spend_map_transaction_id ON transparent_spend_map (
+    spending_transaction_id ASC
 )"#;
 
 /// Stores the outputs of transactions created by the wallet.
@@ -498,7 +582,7 @@ CREATE TABLE transparent_spend_map (
 /// want to cache pool-specific data.
 ///
 /// ### Columns
-/// - `(tx, output_pool, output_index)` collectively identify a transaction output.
+/// - `(transaction_id, output_pool, output_index)` collectively identify a transaction output.
 /// - `from_account_id`: the ID of the account that created the transaction.
 ///   - On recover-from-seed or when scanning by UFVK, this will be either the account
 ///     that decrypted the output, or one of the accounts that funded the transaction.
@@ -519,27 +603,31 @@ CREATE TABLE transparent_spend_map (
 pub(super) const TABLE_SENT_NOTES: &str = r#"
 CREATE TABLE "sent_notes" (
     id INTEGER PRIMARY KEY,
-    tx INTEGER NOT NULL,
+    transaction_id INTEGER NOT NULL
+        REFERENCES transactions(id_tx) ON DELETE CASCADE,
     output_pool INTEGER NOT NULL,
     output_index INTEGER NOT NULL,
-    from_account_id INTEGER NOT NULL,
+    from_account_id INTEGER NOT NULL
+        REFERENCES accounts(id) ON DELETE CASCADE,
     to_address TEXT,
-    to_account_id INTEGER,
+    to_account_id INTEGER
+        REFERENCES accounts(id) ON DELETE SET NULL,
     value INTEGER NOT NULL,
     memo BLOB,
-    FOREIGN KEY (tx) REFERENCES transactions(id_tx),
-    FOREIGN KEY (from_account_id) REFERENCES accounts(id),
-    FOREIGN KEY (to_account_id) REFERENCES accounts(id),
-    CONSTRAINT tx_output UNIQUE (tx, output_pool, output_index),
-    CONSTRAINT note_recipient CHECK (
-        (to_address IS NOT NULL) OR (to_account_id IS NOT NULL)
-    )
+    UNIQUE (transaction_id, output_pool, output_index)
 )"#;
-pub(super) const INDEX_SENT_NOTES_FROM_ACCOUNT: &str =
-    r#"CREATE INDEX sent_notes_from_account ON "sent_notes" (from_account_id)"#;
-pub(super) const INDEX_SENT_NOTES_TO_ACCOUNT: &str =
-    r#"CREATE INDEX sent_notes_to_account ON "sent_notes" (to_account_id)"#;
-pub(super) const INDEX_SENT_NOTES_TX: &str = r#"CREATE INDEX sent_notes_tx ON "sent_notes" (tx)"#;
+pub(super) const INDEX_SENT_NOTES_FROM_ACCOUNT: &str = r#"
+CREATE INDEX idx_sent_notes_from_account ON sent_notes (
+    from_account_id
+)"#;
+pub(super) const INDEX_SENT_NOTES_TO_ACCOUNT: &str = r#"
+CREATE INDEX idx_sent_notes_to_account ON sent_notes (
+    to_account_id
+)"#;
+pub(super) const INDEX_SENT_NOTES_TX: &str = r#"
+CREATE INDEX idx_sent_notes_transaction_id ON sent_notes (
+    transaction_id
+)"#;
 
 /// Stores the set of transaction ids for which the backend required additional data.
 ///
@@ -552,16 +640,16 @@ pub(super) const INDEX_SENT_NOTES_TX: &str = r#"CREATE INDEX sent_notes_tx ON "s
 ///   about transparent inputs to a transaction, this is a reference to that transaction record.
 ///   NULL for transactions where the request for enhancement data is based on discovery due
 ///   to blockchain scanning.
-/// - `request_expiry`: The block height at which this transaction data request will be considered
-///   expired. This is used to ensure that permanently-unsatisfiable transaction data requests
-///   do not stay in the queue forever.
 pub(super) const TABLE_TX_RETRIEVAL_QUEUE: &str = r#"
-CREATE TABLE tx_retrieval_queue (
+CREATE TABLE "tx_retrieval_queue" (
     txid BLOB NOT NULL UNIQUE,
     query_type INTEGER NOT NULL,
-    dependent_transaction_id INTEGER,
-    request_expiry INTEGER,
-    FOREIGN KEY (dependent_transaction_id) REFERENCES transactions(id_tx)
+    dependent_transaction_id INTEGER
+        REFERENCES transactions(id_tx) ON DELETE CASCADE
+)"#;
+pub(super) const INDEX_TX_RETIREVAL_QUEUE_DEPENDENT_TX: &str = r#"
+CREATE INDEX idx_tx_retrieval_queue_dependent_tx ON tx_retrieval_queue (
+    dependent_transaction_id
 )"#;
 
 /// Stores the set of transaction outputs received by the wallet for which spend information
@@ -573,12 +661,16 @@ CREATE TABLE tx_retrieval_queue (
 /// spent soon after it is received in a purely transparent transaction, which the wallet
 /// currently has no means of detecting otherwise.
 pub(super) const TABLE_TRANSPARENT_SPEND_SEARCH_QUEUE: &str = r#"
-CREATE TABLE transparent_spend_search_queue (
+CREATE TABLE "transparent_spend_search_queue" (
     address TEXT NOT NULL,
-    transaction_id INTEGER NOT NULL,
+    transaction_id INTEGER NOT NULL
+        REFERENCES transactions(id_tx) ON DELETE CASCADE,
     output_index INTEGER NOT NULL,
-    FOREIGN KEY (transaction_id) REFERENCES transactions(id_tx),
-    CONSTRAINT value_received_height UNIQUE (transaction_id, output_index)
+    UNIQUE (transaction_id, output_index)
+)"#;
+pub(super) const INDEX_TRANSPARENT_SPEND_SEARCH_TX: &str = r#"
+CREATE INDEX idx_tssq_transaction_id ON transparent_spend_search_queue (
+    transaction_id
 )"#;
 
 //
@@ -786,7 +878,7 @@ pub(super) const VIEW_RECEIVED_OUTPUTS: &str = "
 CREATE VIEW v_received_outputs AS
     SELECT
         sapling_received_notes.id AS id_within_pool_table,
-        sapling_received_notes.tx AS transaction_id,
+        sapling_received_notes.transaction_id,
         2 AS pool,
         sapling_received_notes.output_index,
         account_id,
@@ -797,12 +889,12 @@ CREATE VIEW v_received_outputs AS
         sapling_received_notes.address_id
     FROM sapling_received_notes
     LEFT JOIN sent_notes
-    ON (sent_notes.tx, sent_notes.output_pool, sent_notes.output_index) =
-       (sapling_received_notes.tx, 2, sapling_received_notes.output_index)
+    ON (sent_notes.transaction_id, sent_notes.output_pool, sent_notes.output_index) =
+       (sapling_received_notes.transaction_id, 2, sapling_received_notes.output_index)
 UNION
     SELECT
         orchard_received_notes.id AS id_within_pool_table,
-        orchard_received_notes.tx AS transaction_id,
+        orchard_received_notes.transaction_id,
         3 AS pool,
         orchard_received_notes.action_index AS output_index,
         account_id,
@@ -813,8 +905,8 @@ UNION
         orchard_received_notes.address_id
     FROM orchard_received_notes
     LEFT JOIN sent_notes
-    ON (sent_notes.tx, sent_notes.output_pool, sent_notes.output_index) =
-       (orchard_received_notes.tx, 3, orchard_received_notes.action_index)
+    ON (sent_notes.transaction_id, sent_notes.output_pool, sent_notes.output_index) =
+       (orchard_received_notes.transaction_id, 3, orchard_received_notes.action_index)
 UNION
     SELECT
         u.id AS id_within_pool_table,
@@ -829,28 +921,34 @@ UNION
         u.address_id
     FROM transparent_received_outputs u
     LEFT JOIN sent_notes
-    ON (sent_notes.tx, sent_notes.output_pool, sent_notes.output_index) =
+    ON (sent_notes.transaction_id, sent_notes.output_pool, sent_notes.output_index) =
        (u.transaction_id, 0, u.output_index)";
 
 pub(super) const VIEW_RECEIVED_OUTPUT_SPENDS: &str = "
 CREATE VIEW v_received_output_spends AS
 SELECT
     2 AS pool,
-    sapling_received_note_id AS received_output_id,
-    transaction_id
-FROM sapling_received_note_spends
+    s.sapling_received_note_id AS received_output_id,
+    s.transaction_id,
+    rn.account_id
+FROM sapling_received_note_spends s
+JOIN sapling_received_notes rn ON rn.id = s.sapling_received_note_id
 UNION
 SELECT
     3 AS pool,
-    orchard_received_note_id AS received_output_id,
-    transaction_id
-FROM orchard_received_note_spends
+    s.orchard_received_note_id AS received_output_id,
+    s.transaction_id,
+    rn.account_id
+FROM orchard_received_note_spends s
+JOIN orchard_received_notes rn ON rn.id = s.orchard_received_note_id
 UNION
 SELECT
     0 AS pool,
-    transparent_received_output_id AS received_output_id,
-    transaction_id
-FROM transparent_received_output_spends";
+    s.transparent_received_output_id AS received_output_id,
+    s.transaction_id,
+    rn.account_id
+FROM transparent_received_output_spends s
+JOIN transparent_received_outputs rn ON rn.id = s.transparent_received_output_id";
 
 pub(super) const VIEW_TRANSACTIONS: &str = "
 CREATE VIEW v_transactions AS
@@ -858,8 +956,7 @@ WITH
 notes AS (
     -- Outputs received in this transaction
     SELECT ro.account_id              AS account_id,
-           transactions.mined_height  AS mined_height,
-           transactions.txid          AS txid,
+           ro.transaction_id          AS transaction_id,
            ro.pool                    AS pool,
            id_within_pool_table,
            ro.value                   AS value,
@@ -886,13 +983,10 @@ notes AS (
              ELSE 0
            END AS does_not_match_shielding
     FROM v_received_outputs ro
-    JOIN transactions
-         ON transactions.id_tx = ro.transaction_id
     UNION
     -- Outputs spent in this transaction
     SELECT ro.account_id              AS account_id,
-           transactions.mined_height  AS mined_height,
-           transactions.txid          AS txid,
+           ros.transaction_id         AS transaction_id,
            ro.pool                    AS pool,
            id_within_pool_table,
            -ro.value                  AS value,
@@ -912,14 +1006,12 @@ notes AS (
     JOIN v_received_output_spends ros
          ON ros.pool = ro.pool
          AND ros.received_output_id = ro.id_within_pool_table
-    JOIN transactions
-         ON transactions.id_tx = ros.transaction_id
 ),
 -- Obtain a count of the notes that the wallet created in each transaction,
 -- not counting change notes.
 sent_note_counts AS (
     SELECT sent_notes.from_account_id     AS account_id,
-           transactions.txid              AS txid,
+           sent_notes.transaction_id      AS transaction_id,
            COUNT(DISTINCT sent_notes.id)  AS sent_notes,
            SUM(
              CASE
@@ -929,19 +1021,16 @@ sent_note_counts AS (
              END
            ) AS memo_count
     FROM sent_notes
-    JOIN transactions
-         ON transactions.id_tx = sent_notes.tx
-    LEFT JOIN v_received_outputs ro
-         ON sent_notes.id = ro.sent_note_id
+    LEFT JOIN v_received_outputs ro ON sent_notes.id = ro.sent_note_id
     WHERE COALESCE(ro.is_change, 0) = 0
-    GROUP BY account_id, txid
+    GROUP BY account_id, sent_notes.transaction_id
 ),
 blocks_max_height AS (
     SELECT MAX(blocks.height) AS max_height FROM blocks
 )
 SELECT accounts.uuid                AS account_uuid,
-       notes.mined_height           AS mined_height,
-       notes.txid                   AS txid,
+       transactions.mined_height    AS mined_height,
+       transactions.txid            AS txid,
        transactions.tx_index        AS tx_index,
        transactions.expiry_height   AS expiry_height,
        transactions.raw             AS raw,
@@ -955,7 +1044,7 @@ SELECT accounts.uuid                AS account_uuid,
        SUM(notes.memo_present) + MAX(COALESCE(sent_note_counts.memo_count, 0)) AS memo_count,
        blocks.time                       AS block_time,
        (
-            blocks.height IS NULL
+            transactions.mined_height IS NULL
             AND transactions.expiry_height BETWEEN 1 AND blocks_max_height.max_height
        ) AS expired_unmined,
        SUM(notes.spent_note_count) AS spent_note_count,
@@ -969,17 +1058,17 @@ SELECT accounts.uuid                AS account_uuid,
             AND (SUM(notes.received_count) + SUM(notes.change_note_count)) > 0
             -- We do not know about any external outputs of the transaction.
             AND MAX(COALESCE(sent_note_counts.sent_notes, 0)) = 0
-       ) AS is_shielding
+       ) AS is_shielding,
+       transactions.trust_status
 FROM notes
-LEFT JOIN accounts ON accounts.id = notes.account_id
-LEFT JOIN transactions
-     ON notes.txid = transactions.txid
-JOIN blocks_max_height
-LEFT JOIN blocks ON blocks.height = notes.mined_height
+JOIN accounts ON accounts.id = notes.account_id
+JOIN transactions ON transactions.id_tx = notes.transaction_id
+LEFT JOIN blocks_max_height
+LEFT JOIN blocks ON blocks.height = transactions.mined_height
 LEFT JOIN sent_note_counts
      ON sent_note_counts.account_id = notes.account_id
-     AND sent_note_counts.txid = notes.txid
-GROUP BY notes.account_id, notes.txid";
+     AND sent_note_counts.transaction_id = notes.transaction_id
+GROUP BY notes.account_id, notes.transaction_id";
 
 /// Selects all outputs received by the wallet, plus any outputs sent from the wallet to
 /// external recipients.
@@ -991,9 +1080,36 @@ GROUP BY notes.account_id, notes.txid";
 ///   both outputs received as a consequence of wallet-internal transfers
 ///   and as change.
 ///
-/// The `to_address` column will only contain an address when the recipient is
-/// external. In all other cases, the recipient account id indicates the account
-/// that controls the output.
+/// # Columns
+/// - `txid`: The id of the transaction in which the output was sent or received.
+/// - `output_pool`: The value pool for the transaction; valid values for this are:
+///   - 0: Transparent
+///   - 2: Sapling
+///   - 3: Orchard
+/// - `output_index`: The index of the output within the transaction bundle associated with
+///   the `output_pool` value; that is, within `vout` for transparent, the vector of
+///   Sapling `OutputDescription` values, or the vector of Orchard actions.
+/// - `from_account_uuid`: The UUID of the wallet account that created the output, if the wallet
+///   spent notes in creating the transaction. Note that if multiple accounts in the wallet
+///   contributed funds in creating the associated transaction, redundant rows will exist in the
+///   output of this view, one for each such account.
+/// - `to_account_uuid`: The UUID of the wallet account that received the output, if any; for
+///   outgoing transaction outputs this will be `NULL`.
+/// - `address`: The address to which the output was sent; for received outputs, this is the
+///   address at which the output was received, or `NULL` for wallet-internal outputs.
+/// - `diversifier_index_be`: The big-endian representation of the diversifier index (or, for
+///   transparent addresses, the BIP 44 change-level index of the derivation path) of the receiving
+///   address. This will be `NULL` for outgoing transaction outputs.
+/// - `value`: The value of the output, in zatoshis.
+/// - `is_change`: `0` for outgoing outputs and outputs received at external-facing addresses, `1`
+///   for outputs received at wallet-internal addresses. This represents a best-effort judgement
+///   for whether or not the output should be considered change, and may not be correct for
+///   cross-account internal transactions, shielding transactions, or outputs explicitly sent from
+///   the wallet to itself. The determination of what counts as change is somewhat subjective and
+///   the value of this column should be used with caution.
+/// - `memo`: The binary content of the memo associated with the output, if the output is a
+///   shielded output and the memo was received by the wallet, sent by the wallet or was able to be
+///   decrypted with the wallet's outgoing viewing key.
 pub(super) const VIEW_TX_OUTPUTS: &str = "
 CREATE VIEW v_tx_outputs AS
 WITH unioned AS (
@@ -1003,13 +1119,15 @@ WITH unioned AS (
            ro.output_index              AS output_index,
            from_account.uuid            AS from_account_uuid,
            to_account.uuid              AS to_account_uuid,
-           NULL                         AS to_address,
+           a.address                    AS to_address,
+           a.diversifier_index_be       AS diversifier_index_be,
            ro.value                     AS value,
            ro.is_change                 AS is_change,
            ro.memo                      AS memo
     FROM v_received_outputs ro
     JOIN transactions
         ON transactions.id_tx = ro.transaction_id
+    LEFT JOIN addresses a ON a.id = ro.address_id
     -- join to the sent_notes table to obtain `from_account_id`
     LEFT JOIN sent_notes ON sent_notes.id = ro.sent_note_id
     -- join on the accounts table to obtain account UUIDs
@@ -1023,12 +1141,13 @@ WITH unioned AS (
            from_account.uuid            AS from_account_uuid,
            NULL                         AS to_account_uuid,
            sent_notes.to_address        AS to_address,
+           NULL                         AS diversifier_index_be,
            sent_notes.value             AS value,
            0                            AS is_change,
            sent_notes.memo              AS memo
     FROM sent_notes
     JOIN transactions
-        ON transactions.id_tx = sent_notes.tx
+        ON transactions.id_tx = sent_notes.transaction_id
     LEFT JOIN v_received_outputs ro ON ro.sent_note_id = sent_notes.id
     -- join on the accounts table to obtain account UUIDs
     LEFT JOIN accounts from_account ON from_account.id = sent_notes.from_account_id
@@ -1187,17 +1306,17 @@ GROUP BY
 
 pub(super) const VIEW_ADDRESS_USES: &str = "
 CREATE VIEW v_address_uses AS
-    SELECT orn.address_id, orn.account_id, orn.tx AS transaction_id, t.mined_height,
+    SELECT orn.address_id, orn.account_id, orn.transaction_id, t.mined_height,
            a.key_scope, a.diversifier_index_be, a.transparent_child_index
     FROM orchard_received_notes orn
     JOIN addresses a ON a.id = orn.address_id
-    JOIN transactions t ON t.id_tx = orn.tx
+    JOIN transactions t ON t.id_tx = orn.transaction_id
 UNION
-    SELECT srn.address_id, srn.account_id, srn.tx AS transaction_id, t.mined_height,
+    SELECT srn.address_id, srn.account_id, srn.transaction_id, t.mined_height,
            a.key_scope, a.diversifier_index_be, a.transparent_child_index
     FROM sapling_received_notes srn
     JOIN addresses a ON a.id = srn.address_id
-    JOIN transactions t ON t.id_tx = srn.tx
+    JOIN transactions t ON t.id_tx = srn.transaction_id
 UNION
     SELECT tro.address_id, tro.account_id, tro.transaction_id, t.mined_height,
            a.key_scope, a.diversifier_index_be, a.transparent_child_index

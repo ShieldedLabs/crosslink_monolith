@@ -10,10 +10,52 @@ workspace.
 
 ## [Unreleased]
 
+### Changed
+- MSRV is now 1.85.1.
+
+### Removed
+- Removed deprecated modules:
+    - `zcash_primitives::consensus`
+    - `zcash_primitives::constants`
+    - `zcash_primitives::memo`
+    - `zcash_primitives::zip32`
+    - `zcash_primitives::legacy`
+
+## [0.26.1] - 2025-10-18
+
+### Fixed
+- Adjusted doc features to fix builds on docs.rs after nightly Rust update.
+
+## [0.26.0] - 2025-10-02
+
+### Added
+- `zcash_primitives::transaction::builder::Builder::add_transparent_p2sh_input`
+  (only for use in combination with `Builder::build_for_pczt`).
+
+### Changed
+- Migrated to `zcash_protocol 0.7`, `zcash_address 0.10`, `zcash_transparent 0.6`
+- `zcash_primitives::transaction::fees::zip317`:
+  - `FeeError::NonP2pkhInputs` has been renamed to `UnknownP2shInputs`.
+
+## [0.25.0] - 2025-09-25
+
+### Added
+- `zcash_primitives::transaction::builder::Builder::add_transparent_null_data_output`
+
+### Changed
+- Migrated to `zcash_transparent 0.5`.
+
+## [0.24.1] - 2025-09-09
 
 ### Added
 - `zcash_primitives::transaction::tests::data` has been exposed under the
   `test-dependencies` feature to provide access to test vectors.
+
+### Changed
+- This release provides pre-release support for some planned Network Upgrade 7
+  features under the `zcash_unstable=nu7` configuration flag. This
+  configuration flag guards SemVer-breaking changes that will appear in a
+  future `zcash_primitives` release.
 
 ## [0.24.0] - 2025-07-31
 

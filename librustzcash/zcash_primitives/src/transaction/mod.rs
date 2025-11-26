@@ -34,7 +34,7 @@ use self::{
         orchard as orchard_serialization, sapling as sapling_serialization,
         sprout::{self, JsDescription},
     },
-    txid::{to_txid, BlockTxCommitmentDigester, TxIdDigester},
+    txid::{BlockTxCommitmentDigester, TxIdDigester, to_txid},
     util::sha256d::{HashReader, HashWriter},
 };
 
@@ -490,7 +490,7 @@ impl<A: Authorization> TransactionData<A> {
                         any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
                         feature = "zip-233"
                     ))]
-                    -self.zip233_amount,
+                    -ZatBalance::from(self.zip233_amount),
                 ];
 
                 let overall_balance = value_balances
@@ -1049,6 +1049,13 @@ impl Transaction {
     }
 
     pub fn write_v4<W: Write>(&self, mut writer: W) -> io::Result<()> {
+        if self.orchard_bundle.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Orchard components cannot be present when serializing to the V4 transaction format.",
+            ));
+        }
+
         self.version.write(&mut writer)?;
 
         self.write_transparent(&mut writer)?;
@@ -1077,13 +1084,6 @@ impl Transaction {
             if let Some(bundle) = self.sapling_bundle.as_ref() {
                 writer.write_all(&<[u8; 64]>::from(bundle.authorization().binding_sig))?;
             }
-        }
-
-        if self.orchard_bundle.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Orchard components cannot be present when serializing to the V4 transaction format."
-            ));
         }
 
         Ok(())

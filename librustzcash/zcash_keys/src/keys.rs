@@ -1,4 +1,6 @@
 //! Helper functions for managing light client key material.
+#[cfg(feature = "transparent-inputs")]
+use ::transparent::keys::TransparentKeyScope;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::{self, Display};
@@ -477,7 +479,7 @@ impl UnifiedSpendingKey {
     ///
     /// See [`ExternalIvk::default_address`] for more information.
     ///
-    /// [`ExternalIvk::default_address`]: transparent::keys::ExternalIvk::default_address
+    /// [`ExternalIvk::default_address`]: ::transparent::keys::ExternalIvk::default_address
     #[cfg(all(
         feature = "transparent-inputs",
         any(test, feature = "test-dependencies")
@@ -498,6 +500,12 @@ pub enum AddressGenerationError {
     /// child address indices.
     #[cfg(feature = "transparent-inputs")]
     InvalidTransparentChildIndex(DiversifierIndex),
+    /// The requested key scope is not supported for address derivation.
+    #[cfg(feature = "transparent-inputs")]
+    UnsupportedTransparentKeyScope(TransparentKeyScope),
+    /// An error occurred in [`bip32`] derivation of a transparent address.
+    #[cfg(feature = "transparent-inputs")]
+    Bip32DerivationError(bip32::Error),
     /// The diversifier index could not be mapped to a valid Sapling diversifier.
     #[cfg(feature = "sapling")]
     InvalidSaplingDiversifierIndex(DiversifierIndex),
@@ -523,6 +531,14 @@ impl fmt::Display for AddressGenerationError {
                     f,
                     "Child index {i:?} does not generate a valid transparent receiver"
                 )
+            }
+            #[cfg(feature = "transparent-inputs")]
+            AddressGenerationError::UnsupportedTransparentKeyScope(i) => {
+                write!(f, "Key scope {i:?} is not supported for key derivation")
+            }
+            #[cfg(feature = "transparent-inputs")]
+            AddressGenerationError::Bip32DerivationError(e) => {
+                write!(f, "{e}")
             }
             #[cfg(feature = "sapling")]
             AddressGenerationError::InvalidSaplingDiversifierIndex(i) => {
@@ -550,7 +566,10 @@ impl fmt::Display for AddressGenerationError {
                 )
             }
             AddressGenerationError::ShieldedReceiverRequired => {
-                write!(f, "A Unified Address requires at least one shielded (Sapling or Orchard) receiver.")
+                write!(
+                    f,
+                    "A Unified Address requires at least one shielded (Sapling or Orchard) receiver."
+                )
             }
         }
     }
@@ -558,6 +577,13 @@ impl fmt::Display for AddressGenerationError {
 
 #[cfg(feature = "std")]
 impl std::error::Error for AddressGenerationError {}
+
+#[cfg(feature = "transparent-inputs")]
+impl From<bip32::Error> for AddressGenerationError {
+    fn from(value: bip32::Error) -> Self {
+        AddressGenerationError::Bip32DerivationError(value)
+    }
+}
 
 /// An enumeration of the ways in which a receiver may be requested to be present in a generated
 /// [`UnifiedAddress`].
@@ -1040,7 +1066,7 @@ impl UnifiedFullViewingKey {
     ///
     /// See [`ExternalIvk::default_address`] for more information.
     ///
-    /// [`ExternalIvk::default_address`]: transparent::keys::ExternalIvk::default_address
+    /// [`ExternalIvk::default_address`]: ::transparent::keys::ExternalIvk::default_address
     #[cfg(all(
         feature = "transparent-inputs",
         any(test, feature = "test-dependencies")
@@ -1500,7 +1526,7 @@ impl UnifiedIncomingViewingKey {
     ///
     /// See [`ExternalIvk::default_address`] for more information.
     ///
-    /// [`ExternalIvk::default_address`]: transparent::keys::ExternalIvk::default_address
+    /// [`ExternalIvk::default_address`]: ::transparent::keys::ExternalIvk::default_address
     #[cfg(all(
         feature = "transparent-inputs",
         any(test, feature = "test-dependencies")
@@ -1566,7 +1592,7 @@ mod tests {
     };
 
     #[cfg(feature = "unstable")]
-    use super::{testing::arb_unified_spending_key, Era, UnifiedSpendingKey};
+    use super::{Era, UnifiedSpendingKey, testing::arb_unified_spending_key};
 
     #[cfg(all(feature = "orchard", feature = "unstable"))]
     use subtle::ConstantTimeEq;
