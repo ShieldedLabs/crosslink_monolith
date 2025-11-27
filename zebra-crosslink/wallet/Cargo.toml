@@ -24,7 +24,7 @@ rand_distr = { version = "0.4", default-features = false }
 rand_chacha = "0.3.1"
 
 prost = "0.13"
-tonic = { version = "0.13", default-features = false, features = ["transport", "channel", "tls-ring", "tls-webpki-roots", "prost"] }
+tonic = { workspace = true, features = ["transport", "channel", "tls-ring", "tls-webpki-roots"] }
 tonic-build = { version = "0.13", default-features = false }
 rustls = { version = "0.23.31", default-features = false, features = ["ring"] }
 tokio = { workspace = true, features = ["time", "rt-multi-thread", "macros", "tracing", "signal"] }

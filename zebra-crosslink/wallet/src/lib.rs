@@ -201,16 +201,16 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let mut txs_seen_block_height = 0;
     let mut already_sent = false;
-    // loop {
-    //     the_future_is_now(async {
-    //         let mut client = CompactTxStreamerClient::new({
-    //             loop {
-    //                 if let Ok(channel) = Channel::from_static("http://localhost:18233").connect().await {
-    //                     break channel;
-    //                 }
-    //                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    //             }
-    //         });
+    loop {
+        the_future_is_now(async {
+            let mut client = CompactTxStreamerClient::new({
+                loop {
+                    if let Ok(channel) = Channel::from_static("http://localhost:18233").connect().await {
+                        break channel;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            });
     //         let latest_block = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
     //         let miner_utxos = match client.get_address_utxos(GetAddressUtxosArg {
     //             addresses: vec![miner_t_addr_str.to_owned()],
@@ -361,9 +361,9 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     //         println!("user {} has {} UTXOs with {} zats = {}.{} cTAZ", user_t_addr_str, user_utxos.len(), user_sum, zec_full, zec_part);
 
     //         wallet_state.lock().unwrap().balance = user_sum;
-    //         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    //     });
-    // }
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        });
+    }
 
     /*
     let uivk = UnifiedIncomingViewingKey::decode(&MAIN_NETWORK, "uivk1u7ty6ntudngulxlxedkad44w7g6nydknyrdsaw0jkacy0z8k8qk37t4v39jpz2qe3y98q4vs0s05f4u2vfj5e9t6tk9w5r0a3p4smfendjhhm5au324yvd84vsqe664snjfzv9st8z4s8faza5ytzvte5s9zruwy8vf0ze0mhq7ldfl2js8u58k5l9rjlz89w987a9akhgvug3zaz55d5h0d6ndyt4udl2ncwnm30pl456frnkj").unwrap();
