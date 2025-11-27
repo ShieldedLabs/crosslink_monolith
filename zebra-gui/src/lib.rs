@@ -325,7 +325,7 @@ impl DrawCtx {
                 glyph_bitmap_run_count += 1;
                 acc_x += px_advance as isize;
 
-                if *self.glyph_bitmap_run_allocator_position + glyph_bitmap_run_count >= GLYPH_RUN_MAX { eprintln!("WARNING, overflowing GLYPH_RUN_MAX."); return; }
+                if *self.glyph_bitmap_run_allocator_position + glyph_bitmap_run_count >= GLYPH_RUN_MAX { println!("WARNING, overflowing GLYPH_RUN_MAX."); return; }
             }
 
             *self.glyph_bitmap_run_allocator_position += glyph_bitmap_run_count;
@@ -334,7 +334,7 @@ impl DrawCtx {
             let actual_height = if tracker.fudge_to_px_height == usize::MAX { tracker.target_px_height } else { tracker.fudge_to_px_height };
             for y in 0..actual_height {
                 let screen_y = y as isize + text_y;
-                if screen_y >= 0 && screen_y < self.window_height {
+                if screen_y >= 0 && screen_y < self.window_height && *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                     *self.draw_command_buffer.add(*self.draw_command_count) = DrawCommand::TextRow {
                         y: screen_y as u16,
                         glyph_row_shift: tracker.glyph_row_shift as u8,
@@ -437,7 +437,7 @@ impl DrawCtx {
             let actual_height = if tracker.fudge_to_px_height == usize::MAX { tracker.target_px_height } else { tracker.fudge_to_px_height };
             for y in 0..actual_height {
                 let screen_y = y as isize + text_y;
-                if screen_y >= 0 && screen_y < self.window_height {
+                if screen_y >= 0 && screen_y < self.window_height && *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                     *self.draw_command_buffer.add(*self.draw_command_count) = DrawCommand::TextRow {
                         y: screen_y as u16,
                         glyph_row_shift: tracker.glyph_row_shift as u8,
@@ -455,14 +455,16 @@ impl DrawCtx {
 
     pub fn set_scissor(&self, x1: isize, y1: isize, x2: isize, y2: isize) {
         unsafe {
-            let put = self.draw_command_buffer.add(*self.draw_command_count);
-            *self.draw_command_count += 1;
-            *put = DrawCommand::Scissor {
-                x1: x1.max(0),
-                x2: x2.min(self.window_width),
-                y1: y1.max(0),
-                y2: y2.min(self.window_height),
-            };
+            if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
+                let put = self.draw_command_buffer.add(*self.draw_command_count);
+                *self.draw_command_count += 1;
+                *put = DrawCommand::Scissor {
+                    x1: x1.max(0),
+                    x2: x2.min(self.window_width),
+                    y1: y1.max(0),
+                    y2: y2.min(self.window_height),
+                };
+            }
         }
     }
     pub fn clear_scissor(&self) {
@@ -471,35 +473,39 @@ impl DrawCtx {
 
     pub fn rectangle(&self, x1: f32, y1: f32, x2: f32, y2: f32, color: u32) {
         unsafe {
-            let put = self.draw_command_buffer.add(*self.draw_command_count);
-            *self.draw_command_count += 1;
-            *put = DrawCommand::ColoredRectangle {
-                x: x1.max(0.0),
-                x2: x2.min(self.window_width as f32),
-                y: y1.max(0.0) as f32,
-                y2: y2.min(self.window_height as f32),
-                radius_tl: 0,
-                radius_tr: 0,
-                radius_bl: 0,
-                radius_br: 0,
-                color
-            };
+            if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
+                let put = self.draw_command_buffer.add(*self.draw_command_count);
+                *self.draw_command_count += 1;
+                *put = DrawCommand::ColoredRectangle {
+                    x: x1.max(0.0),
+                    x2: x2.min(self.window_width as f32),
+                    y: y1.max(0.0) as f32,
+                    y2: y2.min(self.window_height as f32),
+                    radius_tl: 0,
+                    radius_tr: 0,
+                    radius_bl: 0,
+                    radius_br: 0,
+                    color
+                };
+            }
         }
     }
 
     // (x1, y1) and (x2, y2) can be in any order
     pub fn line(&self, mut x1: f32, mut y1: f32, mut x2: f32, mut y2: f32, thickness: f32, color: u32) {
         unsafe {
-            let put = self.draw_command_buffer.add(*self.draw_command_count);
-            *self.draw_command_count += 1;
-            let thickness = if thickness < 0.0 || thickness.is_normal() == false { 0.0 } else { thickness };
+            if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
+                let put = self.draw_command_buffer.add(*self.draw_command_count);
+                *self.draw_command_count += 1;
+                let thickness = if thickness < 0.0 || thickness.is_normal() == false { 0.0 } else { thickness };
 
-            if (x2 - x1).abs() >= (y2 - y1).abs() {
-                if x2 < x1 { swap(&mut x1, &mut x2); swap(&mut y1, &mut y2); }
-                *put = DrawCommand::PixelLineXDef { x1, x2, y1, y2, color: color, thickness: thickness };
-            } else {
-                if y2 < y1 { swap(&mut y1, &mut y2); swap(&mut x1, &mut x2); }
-                *put = DrawCommand::PixelLineYDef { x1, x2, y1, y2, color: color, thickness: thickness };
+                if (x2 - x1).abs() >= (y2 - y1).abs() {
+                    if x2 < x1 { swap(&mut x1, &mut x2); swap(&mut y1, &mut y2); }
+                    *put = DrawCommand::PixelLineXDef { x1, x2, y1, y2, color: color, thickness: thickness };
+                } else {
+                    if y2 < y1 { swap(&mut y1, &mut y2); swap(&mut x1, &mut x2); }
+                    *put = DrawCommand::PixelLineYDef { x1, x2, y1, y2, color: color, thickness: thickness };
+                }
             }
         }
     }
@@ -531,54 +537,60 @@ impl DrawCtx {
 
     pub fn rounded_rectangle(&self, x1: isize, y1: isize, x2: isize, y2: isize, radius_tl: isize, radius_tr: isize, radius_bl: isize, radius_br: isize, color: u32) {
         unsafe {
-            let put = self.draw_command_buffer.add(*self.draw_command_count);
-            *self.draw_command_count += 1;
-            *put = DrawCommand::ColoredRectangle {
-                x: x1.max(0) as f32,
-                x2: x2.min(self.window_width) as f32,
-                y: y1.max(0) as f32,
-                y2: y2.min(self.window_height) as f32,
-                radius_tl,
-                radius_tr,
-                radius_bl,
-                radius_br,
-                color
-            };
+            if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
+                let put = self.draw_command_buffer.add(*self.draw_command_count);
+                *self.draw_command_count += 1;
+                *put = DrawCommand::ColoredRectangle {
+                    x: x1.max(0) as f32,
+                    x2: x2.min(self.window_width) as f32,
+                    y: y1.max(0) as f32,
+                    y2: y2.min(self.window_height) as f32,
+                    radius_tl,
+                    radius_tr,
+                    radius_bl,
+                    radius_br,
+                    color
+                };
+            }
         }
     }
 
     pub fn circle(&self, x: f32, y: f32, radius: f32, color: u32) {
         unsafe {
-            let put = self.draw_command_buffer.add(*self.draw_command_count);
-            *self.draw_command_count += 1;
-            *put = DrawCommand::ColoredRectangle {
-                x: x - radius,
-                x2: x + radius,
-                y: y - radius,
-                y2: y + radius,
-                radius_tl: radius as isize,
-                radius_tr: radius as isize,
-                radius_bl: radius as isize,
-                radius_br: radius as isize,
-                color
-            };
+            if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
+                let put = self.draw_command_buffer.add(*self.draw_command_count);
+                *self.draw_command_count += 1;
+                *put = DrawCommand::ColoredRectangle {
+                    x: x - radius,
+                    x2: x + radius,
+                    y: y - radius,
+                    y2: y + radius,
+                    radius_tl: radius as isize,
+                    radius_tr: radius as isize,
+                    radius_bl: radius as isize,
+                    radius_br: radius as isize,
+                    color
+                };
+            }
         }
     }
     pub fn circle_square(&self, x: f32, y: f32, radius: f32, round_pixels: f32, color: u32) {
         unsafe {
-            let put = self.draw_command_buffer.add(*self.draw_command_count);
-            *self.draw_command_count += 1;
-            *put = DrawCommand::ColoredRectangle {
-                x: x - radius,
-                x2: x + radius,
-                y: y - radius,
-                y2: y + radius,
-                radius_tl: round_pixels as isize,
-                radius_tr: round_pixels as isize,
-                radius_bl: round_pixels as isize,
-                radius_br: round_pixels as isize,
-                color
-            };
+            if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
+                let put = self.draw_command_buffer.add(*self.draw_command_count);
+                *self.draw_command_count += 1;
+                *put = DrawCommand::ColoredRectangle {
+                    x: x - radius,
+                    x2: x + radius,
+                    y: y - radius,
+                    y2: y + radius,
+                    radius_tl: round_pixels as isize,
+                    radius_tr: round_pixels as isize,
+                    radius_bl: round_pixels as isize,
+                    radius_br: round_pixels as isize,
+                    color
+                };
+            }
         }
     }
 }
@@ -848,7 +860,7 @@ pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
 pub static SOUND_UI_WOOSH: &[u8] = include_bytes!("../assets/ui_woosh.ogg");
 pub static SOUND_UI_HOVER: &[u8] = include_bytes!("../assets/ui_hover.ogg");
 
-const DRAW_CALL_MAX: usize = 16384;
+const DRAW_CALL_MAX: usize = 131072;
 const GLYPH_RUN_MAX: usize = 16384;
 
 pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
@@ -1233,6 +1245,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                             {
                                                 let put = draw_ctx.draw_command_buffer.add(*draw_ctx.draw_command_count);
                                                 *draw_ctx.draw_command_count += 1;
+                                                assert!(*draw_ctx.draw_command_count <= DRAW_CALL_MAX);
                                                 *put = DrawCommand::ClearScreenToColor { color: 0x090909 };
                                             }
 
@@ -1255,7 +1268,8 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                             input_ctx.zoom_delta = 0.0;
 
                                             assert!(*draw_ctx.glyph_bitmap_run_allocator_position < GLYPH_RUN_MAX);
-                                            assert!(*draw_ctx.draw_command_count < DRAW_CALL_MAX);
+                                            assert!(*draw_ctx.draw_command_count <= DRAW_CALL_MAX);
+                                            if *draw_ctx.draw_command_count == DRAW_CALL_MAX { println!("WARNING, we are at max capacity for draw commands."); }
                                             prev_frame_time_single_threaded_us = begin_frame_instant.elapsed().as_micros() as usize;
 
 
@@ -1708,7 +1722,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                             }
 
                                             if gui_ctx.debug {
-                                                let begin_draw_commands = *draw_ctx.draw_command_count;
+                                                *draw_ctx.draw_command_count = 0;
                                                 draw_ctx.mono_text_line(8.0, 8.0, 13.0,
                                                     &format!(
                                                         "Rate: {} hz | (us) deadline: {} internal:{:>5} total:{:>5} max(5s):{:>5}",
@@ -1720,8 +1734,6 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                     ),
                                                     if prev_frame_time_total_us < target_frame_time_us { 0xff_00ff00 } else { 0xff_ff5500 },
                                                 );
-                                                let end_draw_commands = *draw_ctx.draw_command_count;
-                                                *draw_ctx.draw_command_count = begin_draw_commands;
 
                                                 // Force a non measured render buffer reset if the real code is not active to save CPU.
                                                 if need_buffer_flip == false
@@ -1733,8 +1745,8 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                     }
                                                 }
 
-                                                // draw those commands *manually* that are in the unallocated space of the buffer
-                                                for cmd_i in begin_draw_commands..end_draw_commands {
+                                                // draw those commands *manually*
+                                                for cmd_i in 0..*draw_ctx.draw_command_count {
                                                     match *draw_ctx.draw_command_buffer.add(cmd_i) {
                                                         DrawCommand::TextRow { y, glyph_row_shift, color, font_tracker_id, font_row_index, glyph_bitmap_run, glyph_bitmap_run_len } => {
                                                             let font_tracker = &*draw_ctx.font_tracker_buffer.add(font_tracker_id as usize);
