@@ -415,6 +415,8 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
         return None;
     }
 
+    let finality_candidate_height = BlockHeight(finality_candidate_height.0.min(if let Some(v) = latest_final_block { v.0.0+10 } else { u32::MAX }));
+
     let resp = (call.state)(StateRequest::BlockHeader(finality_candidate_height.into())).await;
 
     let candidate_hash = if let Ok(StateResponse::BlockHeader { hash, .. }) = resp {
@@ -432,7 +434,7 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
     })
     .await;
 
-    let headers: Vec<BlockHeader> = if let Ok(StateResponse::BlockHeaders(hdrs)) = resp {
+    let mut headers: Vec<BlockHeader> = if let Ok(StateResponse::BlockHeaders(hdrs)) = resp {
         // TODO: do we want these in chain order or "walk-back order"
         hdrs.into_iter()
             .map(|ch| Arc::unwrap_or_clone(ch.header))
@@ -441,6 +443,7 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
         // Error or unexpected response type:
         panic!("TODO: improve error handling.");
     };
+    headers.truncate(params.bc_confirmation_depth_sigma as usize);
 
     let mut internal = tfl_handle.internal.lock().await;
 

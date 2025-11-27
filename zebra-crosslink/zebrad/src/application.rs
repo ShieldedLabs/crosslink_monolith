@@ -244,6 +244,8 @@ impl Application for ZebradApp {
 
                     c.crosslink.malachite_peers =
                         vec!["70.34.201.202:8234".to_owned(), "45.76.30.90:8234".to_owned()];
+
+                    c.consensus.checkpoint_sync = false;
                 }
                 Arc::new(c)
             })

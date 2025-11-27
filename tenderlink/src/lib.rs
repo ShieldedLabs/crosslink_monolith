@@ -2054,7 +2054,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     }
                     else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                     {
-                        for round_i in current_height_start_i..bft_state.rounds_data.len()
+                        for round_i in (current_height_start_i..bft_state.rounds_data.len()).rev()
                         {
                             let round_data = &bft_state.rounds_data[round_i];
                             send_round_data_to_peer(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
