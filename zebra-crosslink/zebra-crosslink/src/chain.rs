@@ -119,10 +119,8 @@ impl ZcashDeserialize for BftBlock {
 
 impl BftBlock {
     /// Refer to the [BcBlockHeader] that is the finalization candidate for this block
-    ///
-    /// **UNVERIFIED:** The finalization_candidate of a final [BftBlock] is finalized.
     pub fn finalization_candidate(&self) -> &BcBlockHeader {
-        &self.headers.last().expect("Vec should never be empty")
+        &self.headers.first().expect("Vec should never be empty")
     }
 
     /// Attempt to construct a [BftBlock] from headers while performing immediate validations; see [BftBlock] type docs

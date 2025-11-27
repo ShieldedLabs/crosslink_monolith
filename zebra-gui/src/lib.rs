@@ -1527,8 +1527,21 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                                             hasher.write_u32(thickness.to_bits());
                                                                             hasher.write_u32(color);
                                                                             if should_draw == false { continue; }
+
+                                                                            let dx = (x2 - x1) / (y2 - y1);
                                                                             for iy in iy1..iy2 {
-                                                                                for ix in ix1..ix2 {
+                                                                                let fx = x1 as f32 + dx * (iy - y1 as isize) as f32;
+                                                                                let h = (thickness / 2.0 + 1.0) / f32::sin(f32::atan(1.0/dx.abs()));
+                                                                                let cull_ix1;
+                                                                                let cull_ix2;
+                                                                                if h.is_normal() {
+                                                                                    cull_ix1 = (fx - h).floor() as isize;
+                                                                                    cull_ix2 = (fx + h).ceil() as isize;
+                                                                                } else {
+                                                                                    cull_ix1 = 0;
+                                                                                    cull_ix2 = 9999999999;
+                                                                                }
+                                                                                for ix in ix1.max(cull_ix1)..ix2.min(cull_ix2) {
                                                                                     let pixel = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
                                                                                     let coverage = (1.0 - sd_segment((ix as f32, iy as f32), (x1, y1), (x2, y2), thickness / 2.0)).clamp(0.0, 1.0);
                                                                                     let this_color = blend_u32(*(pixel as *mut u32), color, (coverage * 255.0) as u32);
@@ -1593,8 +1606,21 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                                             hasher.write_u32(thickness.to_bits());
                                                                             hasher.write_u32(color);
                                                                             if should_draw == false { continue; }
+
+                                                                            let dx = (x2 - x1) / (y2 - y1);
                                                                             for iy in iy1..iy2 {
-                                                                                for ix in ix1..ix2 {
+                                                                                let fx = x1 as f32 + dx * (iy - y1 as isize) as f32;
+                                                                                let h = (thickness / 2.0 + 1.0) / f32::sin(f32::atan(1.0/dx.abs()));
+                                                                                let cull_ix1;
+                                                                                let cull_ix2;
+                                                                                if h.is_normal() {
+                                                                                    cull_ix1 = (fx - h).floor() as isize;
+                                                                                    cull_ix2 = (fx + h).ceil() as isize;
+                                                                                } else {
+                                                                                    cull_ix1 = 0;
+                                                                                    cull_ix2 = 9999999999;
+                                                                                }
+                                                                                for ix in ix1.max(cull_ix1)..ix2.min(cull_ix2) {
                                                                                     let pixel = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
                                                                                     let coverage = (1.0 - sd_segment((ix as f32, iy as f32), (x1, y1), (x2, y2), thickness / 2.0)).clamp(0.0, 1.0);
                                                                                     let this_color = blend_u32(*(pixel as *mut u32), color, (coverage * 255.0) as u32);
