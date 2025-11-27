@@ -2,7 +2,7 @@ mod block_source;
 mod error;
 mod input_source;
 pub mod proto;
-mod types;
+pub mod types;
 mod wallet_commitment_trees;
 mod wallet_read;
 mod wallet_write;

@@ -21,8 +21,11 @@ use zcash_primitives::transaction::builder::{BuildConfig, Builder as TxBuilder};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::Zatoshis;
-use zcash_transparent::builder::{TransparentBuilder, TransparentSigningSet, Unauthorized};
-use zcash_transparent::bundle::OutPoint;
+use zcash_transparent::{
+    keys::{ NonHardenedChildIndex },
+    builder::{TransparentBuilder, TransparentSigningSet, Unauthorized},
+    bundle::OutPoint,
+};
 use zebra_chain::block::{Hash as BlockHash, Height};
 use zebra_chain::parameters::NetworkUpgrade;
 use zebra_chain::{serialization::ZcashSerialize};
@@ -44,9 +47,20 @@ use zcash_client_backend::{
     address::{
         UnifiedAddress,
     },
+    data_api::{
+        self,
+        chain::ChainState,
+        Account as APIAccount,
+        AccountBirthday,
+        AccountPurpose,
+        WalletRead,
+        WalletWrite,
+        Zip32Derivation,
+    },
     encoding::AddressCodec,
     keys::{
         UnifiedAddressRequest,
+        UnifiedFullViewingKey,
         UnifiedIncomingViewingKey,
         UnifiedSpendingKey,
     },
@@ -63,6 +77,10 @@ use zcash_client_backend::{
             compact_tx_streamer_client::CompactTxStreamerClient
         }
     },
+};
+use zcash_client_memory::{
+    types::account::{Account as MemAccount},
+    MemoryWalletDb,
 };
 use zcash_protocol::{
     consensus::{
@@ -146,58 +164,72 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let network = &TEST_NETWORK;
 
-    // miner/faucet wallet setup
-    let (miner_t_addr, miner_pubkey, miner_privkey) = {
+    fn wallet_from_seed_phrase<P: Parameters>(params: P, phrase: &str) -> (MemoryWalletDb<P>, MemAccount, UnifiedSpendingKey) {
         use secrecy::ExposeSecret;
 
-        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let mnemonic = bip39::Mnemonic::parse(phrase).unwrap();
         let bip39_passphrase = ""; // optional
         let seed64 = mnemonic.to_seed(bip39_passphrase);
         let seed = secrecy::SecretVec::new(seed64[..32].to_vec());
-
-        // 2. Derive Unified Spending Key (USK) from seed
+        let seed_fp = zip32::fingerprint::SeedFingerprint::from_seed(seed.expose_secret()).unwrap();
         let account_id = zip32::AccountId::try_from(0).unwrap();
-        let usk = UnifiedSpendingKey::from_seed(network, seed.expose_secret(), account_id).unwrap();
-        let (t_addr, child_index) = usk.transparent()
-            .to_account_pubkey()
-            .derive_external_ivk()
-            .unwrap()
-            .default_address();
 
+        let usk = UnifiedSpendingKey::from_seed(&params, seed.expose_secret(), account_id).unwrap();
+        let ufvk = usk.to_unified_full_viewing_key();
+        let birthday = &AccountBirthday::from_parts(
+            ChainState::empty(BlockHeight::from_u32(0), zcash_primitives::block::BlockHash([0; 32])),
+            None,
+        );
+        let derivation = Some(Zip32Derivation::new(seed_fp, account_id));
+        let purpose = AccountPurpose::Spending{ derivation };
+
+        let mut wallet = MemoryWalletDb::new(params, 0); // TODO: max_checkpoints=?
+        let account = wallet.import_account_ufvk("main_account", &ufvk, birthday, purpose, None).unwrap();
+        (wallet, account, usk)
+    }
+
+    fn transparent_keys_from_usk(usk: &UnifiedSpendingKey) -> Option<(secp256k1::PublicKey, secp256k1::SecretKey)> {
         let transparent = usk.transparent();
         let account_pubkey = transparent.to_account_pubkey();
-        let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).unwrap();
-        let address_privkey = transparent.derive_external_secret_key(child_index).unwrap();
-        (TransparentAddress::from_pubkey(&address_pubkey), address_pubkey, address_privkey)
-    };
+        let child_index = NonHardenedChildIndex::const_from_index(0);
+        let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).ok()?;
+        let address_privkey = transparent.derive_external_secret_key(child_index).ok()?;
+        Some((address_pubkey, address_privkey))
+    }
+
+    fn transparent_addr_from_account(account: &MemAccount) -> Option<TransparentAddress> {
+        let account_pubkey = account.ufvk()?.transparent()?;
+        let child_index = NonHardenedChildIndex::const_from_index(0);
+        let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).ok()?;
+        Some(TransparentAddress::from_pubkey(&address_pubkey))
+    }
+
+    let (mut miner_wallet, miner_account, miner_usk) = wallet_from_seed_phrase(network,
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    );
+    let miner_t_addr = transparent_addr_from_account(&miner_account).unwrap();
     let miner_t_addr_str = miner_t_addr.encode(network);
     println!("Faucet miner t-address: {}", miner_t_addr_str);
+    let (miner_pubkey, miner_privkey) = transparent_keys_from_usk(&miner_usk).unwrap();
 
-    // user wallet setup
-    let user_t_addr = {
-        use secrecy::ExposeSecret;
+    let (mut user_wallet, user_account, user_usk) = wallet_from_seed_phrase(network,
+        "blur kit item praise brick misery muffin symptom cheese street tired evolve"
+    );
 
-        let phrase = "blur kit item praise brick misery muffin symptom cheese street tired evolve";
-        let mnemonic = bip39::Mnemonic::parse(phrase).unwrap();
-        let bip39_passphrase = ""; // optional
-        let seed64 = mnemonic.to_seed(bip39_passphrase);
-        let seed = secrecy::SecretVec::new(seed64[..32].to_vec());
-
-        // 2. Derive Unified Spending Key (USK) from seed
-        let account_id = zip32::AccountId::try_from(0).unwrap();
-        let usk = UnifiedSpendingKey::from_seed(network, seed.expose_secret(), account_id).unwrap();
-        let (t_addr, child_index) = usk.transparent()
-            .to_account_pubkey()
-            .derive_external_ivk()
-            .unwrap()
-            .default_address();
-        let account_pubkey = usk.transparent().to_account_pubkey();
-        let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).unwrap();
-        TransparentAddress::from_pubkey(&address_pubkey)
-    };
+    let user_t_addr = transparent_addr_from_account(&user_account).unwrap();
     let user_t_addr_str = user_t_addr.encode(network);
-    println!("User t-address: {}", user_t_addr_str);
+
+    let user_t_recs = user_wallet.get_transparent_receivers(user_account.id(), false, false).unwrap();
+    let user_t_addr1 = user_t_recs.keys().collect::<Vec<_>>()[0];
+    // NOTE: the default isn't the same as below, but I think this is because it forces a diversifier index
+    println!("User wallet: {}/{:?}", user_t_addr_str, user_t_addr1.encode(network));
+
+
+    // let lax_confirmations = ConfirmationsPolicy {
+    //     trusted: 1,
+    //     untrusted: 1,
+    //     allow_zero_conf_shielding: true,
+    // };
 
     let mut txs_seen_block_height = 0;
     let mut already_sent = false;

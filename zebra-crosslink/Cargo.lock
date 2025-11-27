@@ -8250,6 +8250,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "sapling-crypto",
+ "secp256k1",
  "secrecy",
  "tokio",
  "tokio-rustls",
@@ -9286,6 +9287,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bech32",
+ "bip32",
  "bls12_381",
  "bs58",
  "byteorder",
@@ -9306,6 +9308,7 @@ dependencies = [
  "rand_core 0.6.4",
  "rayon",
  "sapling-crypto",
+ "secp256k1",
  "secrecy",
  "shardtree",
  "subtle",
@@ -9333,6 +9336,7 @@ name = "zcash_client_memory"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bip32",
  "bs58",
  "byteorder",
  "bytes",
@@ -9345,6 +9349,7 @@ dependencies = [
  "prost-build 0.14.1",
  "rayon",
  "sapling-crypto",
+ "secp256k1",
  "secrecy",
  "serde",
  "shardtree",
@@ -9371,6 +9376,7 @@ dependencies = [
 name = "zcash_client_sqlite"
 version = "0.19.0"
 dependencies = [
+ "bip32",
  "bitflags 2.9.4",
  "bs58",
  "byteorder",
@@ -9391,6 +9397,7 @@ dependencies = [
  "sapling-crypto",
  "schemerz",
  "schemerz-rusqlite",
+ "secp256k1",
  "secrecy",
  "shardtree",
  "static_assertions",
