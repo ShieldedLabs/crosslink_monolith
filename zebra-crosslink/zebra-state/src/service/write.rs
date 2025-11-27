@@ -374,7 +374,7 @@ impl WriteBlockWorkerTask {
 
                         let _ = rsp_tx.send(Ok(hash));
                     } else if finalized_state.db.contains_hash(hash) {
-                        // already de-facto finalized as below reorg height
+                        warn!("Crosslink finalization: already de-facto finalized as below reorg height");
                         let _ = rsp_tx.send(Ok(hash));
                     } else {
                         let _ = rsp_tx.send(Err("Couldn't find finalized block".into()));

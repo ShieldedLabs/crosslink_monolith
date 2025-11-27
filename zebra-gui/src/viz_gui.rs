@@ -427,7 +427,9 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, dr
             let parent_hash = viz_state.on_screen_bcs.get(&hash).unwrap().block.parent_hash;
             if let Some(parent) = viz_state.on_screen_bcs.get_mut(&parent_hash) {
                 if parent.block.is_best_chain {
-                    recurse_layout_children_then_self(index, &off_chain, &mut working_map, &mut width_map, &viz_state.on_screen_bcs, 0);
+                    recurse_layout_children_then_self(index, &off_chain, &mut working_map, &mut width_map, &viz_state.on_screen_bcs, 1);
+                    let (this_height, this_hash) = off_chain[index];
+                    *working_map.get_mut(&this_hash).unwrap() -= 1;
                 }
             }
         }
