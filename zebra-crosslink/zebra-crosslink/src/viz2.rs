@@ -156,6 +156,7 @@ pub async fn service_viz_requests(
                             parent_hash: Hash32::from_bytes(b.previous_block_hash().0),
                             this_height: i as u64,
                             points_at_bc_block: Hash32::from_bytes(b.finalization_candidate().hash().0),
+                            proving_blocks: b.headers.iter().skip(1).map(|x| Hash32::from_bytes(x.hash().0)).collect(),
                         }
                     ).collect();
                     let _ = response_queue.try_send(response);

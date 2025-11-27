@@ -104,12 +104,13 @@ impl Default for OnScreenBc {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BftBlock {
     pub this_hash: Hash32,
     pub parent_hash: Hash32,
     pub this_height: u64,
     pub points_at_bc_block: Hash32,
+    pub proving_blocks: Vec<Hash32>,
 }
 impl Default for BftBlock {
     fn default() -> Self {
@@ -118,6 +119,7 @@ impl Default for BftBlock {
             parent_hash: Hash32::from_u64(0),
             this_height: 0,
             points_at_bc_block: Hash32::from_u64(0),
+            proving_blocks: Vec::with_capacity(0),
         }
     }
 }
@@ -237,19 +239,35 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         for bc in &message.bc_blocks {
             if let Some(r) = viz_state.on_screen_bcs.get_mut(&bc.this_hash) {
                 anything_happened |= r.block != *bc;
+                let was_implicated = r.block.is_implicated_by_bft;
                 r.block = *bc;
+                r.block.is_implicated_by_bft = was_implicated;
             } else {
                 anything_happened |= true;
                 viz_state.on_screen_bcs.insert(bc.this_hash, OnScreenBc { block: *bc, alpha: 0.0, y: spawn_y, ..Default::default() });
             }
         }
-        for bft in &message.bft_blocks {
+        for bft in message.bft_blocks {
+            if let Some(bc) = viz_state.on_screen_bcs.get_mut(&bft.points_at_bc_block) {
+                bc.block.is_implicated_by_bft = true;
+
+                let mut prev = bft.points_at_bc_block;
+                for hash in &bft.proving_blocks {
+                    if let Some(bc) = viz_state.on_screen_bcs.get_mut(hash) { bc.block.is_implicated_by_bft = true; }
+                    else {
+                        let parent = viz_state.on_screen_bcs.get(&prev).unwrap();
+                        let block = OnScreenBc { block: BcBlock { this_hash: *hash, parent_hash: parent.block.this_hash, this_height: parent.block.this_height + 1, is_best_chain: false, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
+                        viz_state.on_screen_bcs.insert(block.block.this_hash, block);
+                    }
+                    prev = *hash;
+                }
+            }
             if let Some(r) = viz_state.on_screen_bfts.get_mut(&bft.this_hash) {
-                anything_happened |= r.block != *bft;
-                r.block = *bft;
+                anything_happened |= r.block != bft;
+                r.block = bft;
             } else {
                 anything_happened |= true;
-                viz_state.on_screen_bfts.insert(bft.this_hash, OnScreenBft { block: *bft, alpha: 0.0, y: spawn_y, ..Default::default() });
+                viz_state.on_screen_bfts.insert(bft.this_hash, OnScreenBft { block: bft, alpha: 0.0, y: spawn_y, ..Default::default() });
             }
         }
     }
@@ -359,11 +377,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, dr
         on_screen_bc.t_finalized_alpha = if on_screen_bc.block.is_finalized { 1.0 } else { 0.0 };
         on_screen_bc.t_implicated_by_bft_alpha = if on_screen_bc.block.is_implicated_by_bft { 1.0 } else { 0.0 };
         on_screen_bc.t_x = -5.0;
-        on_screen_bc.t_y = if let Some(parent_bc) = viz_state.on_screen_bcs.get(&on_screen_bc.block.parent_hash) {
-            parent_bc.y - 10.0
-        } else {
-            on_screen_bc.t_y
-        }
+        on_screen_bc.t_y = -10.0 * on_screen_bc.block.this_height as f32;
     }
     for on_screen_bft in magic(&mut viz_state.on_screen_bfts).values_mut() {
         if on_screen_bft.block.this_hash == hovered_block {

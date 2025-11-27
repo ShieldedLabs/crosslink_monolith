@@ -324,6 +324,8 @@ impl DrawCtx {
                 *glyph_bitmap_run_start.add(glyph_bitmap_run_count) = (tracker.glyph_to_bitmap_index[g_info.glyph_id as usize], acc_x as i16);
                 glyph_bitmap_run_count += 1;
                 acc_x += px_advance as isize;
+
+                if *self.glyph_bitmap_run_allocator_position + glyph_bitmap_run_count >= GLYPH_RUN_MAX { eprintln!("WARNING, overflowing GLYPH_RUN_MAX."); return; }
             }
 
             *self.glyph_bitmap_run_allocator_position += glyph_bitmap_run_count;
@@ -425,6 +427,8 @@ impl DrawCtx {
                 *glyph_bitmap_run_start.add(glyph_bitmap_run_count) = (tracker.glyph_to_bitmap_index[g_info.glyph_id as usize], acc_x as i16);
                 glyph_bitmap_run_count += 1;
                 acc_x += px_advance as isize;
+
+                if *self.glyph_bitmap_run_allocator_position + glyph_bitmap_run_count >= GLYPH_RUN_MAX { eprintln!("WARNING, overflowing GLYPH_RUN_MAX."); return; }
             }
 
             *self.glyph_bitmap_run_allocator_position += glyph_bitmap_run_count;
