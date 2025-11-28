@@ -18,7 +18,10 @@ use shardtree::{
     store::{ShardStore, memory::MemoryShardStore},
 };
 #[cfg(feature = "transparent-inputs")]
-use zcash_client_backend::wallet::TransparentAddressMetadata;
+use zcash_client_backend::wallet::{
+    TransparentAddressMetadata,
+    TransparentAddressSource,
+};
 use zcash_client_backend::{
     data_api::{
         Account as _, AccountBirthday, AccountSource, InputSource, Ratio, SAPLING_SHARD_HEIGHT,
@@ -1088,6 +1091,10 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             }
         };
 
+        // NOTE: ideally this would be inside Entry::Vacant below, but that's not allowed for
+        // lifetime reasons
+        let receivers = self.get_transparent_receivers(*receiving_account, false, false);
+
         // insert into transparent_received_outputs table. Update if it exists
         #[allow(clippy::diverging_sub_expression)] // FIXME
         match self
@@ -1101,11 +1108,23 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                 entry.get_mut().txout = output.txout().clone();
             }
             Entry::Vacant(entry) => {
+                // todo!("look up the key scope for the address"),
+                // Get balances map, which includes scopes for all known addresses
+                let receivers = receivers?;
+                let Some(metadata) = receivers.get(address) else {
+                    return Err(Error::AccountUnknown(*receiving_account));
+                };
+                let key_scope = match metadata.source() {
+                    TransparentAddressSource::Derived{scope, ..} => *scope,
+                    #[cfg(feature = "transparent-key-import")]
+                    TransparentAddressSource::Standalone => return Err(Error::AccountUnknown(*receiving_account)),
+                };
+
                 entry.insert(ReceivedTransparentOutput::new(
                     txid,
                     *receiving_account,
                     *address,
-                    todo!("look up the key scope for the address"),
+                    key_scope,
                     output.txout().clone(),
                     max_observed_unspent.unwrap_or(BlockHeight::from(0)),
                 ));
