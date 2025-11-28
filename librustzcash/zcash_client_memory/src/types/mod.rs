@@ -1,4 +1,4 @@
-pub(crate) mod account;
+pub mod account;
 pub(crate) mod block;
 pub(crate) mod data_requests;
 pub(crate) mod memory_wallet;
