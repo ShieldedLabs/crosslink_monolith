@@ -50,6 +50,7 @@ use zcash_client_backend::{
     data_api::{
         self,
         chain::{
+            scan_cached_blocks,
             BlockCache,
             ChainState,
         },
@@ -68,7 +69,10 @@ use zcash_client_backend::{
         UnifiedSpendingKey,
     },
     proto::{
-        compact_formats::CompactTx,
+        compact_formats::{
+            CompactBlock,
+            CompactTx,
+        },
         service::{
             BlockId,
             BlockRange,
@@ -276,10 +280,10 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             };
 
             let block_range = BlockRange{
-                start: Some(BlockId{ height: txs_seen_block_height, hash: Vec::new() }),
+                start: Some(BlockId{ height: txs_seen_block_height+1, hash: Vec::new() }),
                 end: Some(BlockId{ height: u32::MAX as u64, hash: Vec::new() }),
             };
-            let new_blocks = match client.get_block_range(block_range.clone()).await {
+            let new_blocks: Option<Vec<CompactBlock>> = match client.get_block_range(block_range.clone()).await {
                 Err(err) => {
                     println!("******* GET BLOCK RANGE ERROR: {:?}", err);
                     None
@@ -306,16 +310,54 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             if let Some(new_blocks) = new_blocks {
                 if new_blocks.len() > 0 {
+                    let tip = new_blocks.last().unwrap();
+                    let tip_height = BlockHeight::from_u32(tip.height.try_into().unwrap());
+                    let start_height = BlockHeight::from_u32(new_blocks[0].height.try_into().unwrap());
+
                     // get transparent transactions for same range
                     let range = BlockRange{
                         start: block_range.start,
                         end: Some(BlockId{
-                            height: new_blocks.last().unwrap().height,
+                            height: tip.height, // TODO: +1 for range?
                             hash: Vec::new(),
                         })
                     };
 
-                    block_cache.insert(new_blocks);
+                    if let Err(err) = user_wallet.update_chain_tip(tip_height) {
+                        println!("update chain tip error: {err}");
+                    }
+                    let new_blocks_n = new_blocks.len();
+                    if let Err(err) = block_cache.insert(new_blocks).await {
+                        println!("block cache insert error: {err}");
+                    };
+
+                    let chain_state = if txs_seen_block_height == 0 {
+                        Some(ChainState::empty(BlockHeight::from_u32(0), zcash_primitives::block::BlockHash([0; 32])))
+                    } else {
+                        // TODO: it feels like we should be able to compute this locally
+                        match client.get_tree_state(BlockId{height:txs_seen_block_height, hash:Vec::new()}).await {
+                            Err(err) => {
+                                println!("******* GET TREE STATE ERROR: {:?}", err);
+                                None
+                            },
+                            Ok(result) => {
+                                let tree_state = result.into_inner();
+                                match tree_state.to_chain_state() {
+                                    Err(err) => {
+                                        println!("******* TREE STATE TO CHAIN STATE ERROR: {:?}", err);
+                                        None
+                                    }
+                                    Ok(chain_state) => Some(chain_state)
+                                }
+                            }
+                        }
+                    };
+                    if let Some(chain_state) = chain_state {
+                        let scan_res = scan_cached_blocks(network, &block_cache, &mut user_wallet, start_height, &chain_state, new_blocks_n);
+                        println!("scan: {scan_res:?}");
+                    }
+
+
 
                     let t_addrs = vec![user_t_addr_str.clone()];
                     for t_addr in &t_addrs {
@@ -356,6 +398,10 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             }
                         }
                     }
+
+
+                    // DONE
+                    txs_seen_block_height = tip_height.into();
                 }
             }
 
