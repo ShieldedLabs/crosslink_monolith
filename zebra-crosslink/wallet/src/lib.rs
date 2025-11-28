@@ -54,6 +54,7 @@ use zcash_client_backend::{
             BlockCache,
             ChainState,
         },
+        wallet,
         Account as APIAccount,
         AccountBirthday,
         AccountPurpose,
@@ -234,12 +235,6 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     println!("User wallet: {}/{:?}", user_t_addr_str, user_t_addr1.encode(network));
 
 
-//     let lax_confirmations = ConfirmationsPolicy {
-//         trusted: 1,
-//         untrusted: 1,
-//         allow_zero_conf_shielding: true,
-    // };
-
     let mut block_cache = MemBlockCache::new();
 
     let mut txs_seen_block_height = 0;
@@ -311,18 +306,11 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             if let Some(new_blocks) = new_blocks {
                 if new_blocks.len() > 0 {
                     let tip = new_blocks.last().unwrap();
-                    let tip_height = BlockHeight::from_u32(tip.height.try_into().unwrap());
+                    let tip_h = tip.height;
+                    let tip_height = BlockHeight::from_u32(tip_h.try_into().unwrap());
                     let start_height = BlockHeight::from_u32(new_blocks[0].height.try_into().unwrap());
 
-                    // get transparent transactions for same range
-                    let range = BlockRange{
-                        start: block_range.start,
-                        end: Some(BlockId{
-                            height: tip.height, // TODO: +1 for range?
-                            hash: Vec::new(),
-                        })
-                    };
-
+                    // Update wallet with chain state & shielded transactions
                     if let Err(err) = user_wallet.update_chain_tip(tip_height) {
                         println!("update chain tip error: {err}");
                     }
@@ -354,13 +342,26 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     };
                     if let Some(chain_state) = chain_state {
                         let scan_res = scan_cached_blocks(network, &block_cache, &mut user_wallet, start_height, &chain_state, new_blocks_n);
-                        println!("scan: {scan_res:?}");
+                        println!("user  scan: {scan_res:?}");
+                        let scan_res = scan_cached_blocks(network, &block_cache, &mut miner_wallet, start_height, &chain_state, new_blocks_n);
+                        println!("miner scan: {scan_res:?}");
                     }
 
 
+                    // Update wallet with transparent transactions for same range
+                    let range = BlockRange{
+                        start: block_range.start,
+                        end: Some(BlockId{
+                            height: tip_h, // TODO: +1 for range?
+                            hash: Vec::new(),
+                        })
+                    };
 
-                    let t_addrs = vec![user_t_addr_str.clone()];
-                    for t_addr in &t_addrs {
+                    let t_addr_wallets = vec![
+                        (user_t_addr_str.clone(), &mut user_wallet),
+                        (miner_t_addr_str.clone(), &mut miner_wallet),
+                    ];
+                    for (t_addr, wallet) in t_addr_wallets {
                         let filter = TransparentAddressBlockFilter{ address: t_addr.to_owned(), range: Some(range.clone()) };
                         let txs = match client.get_taddress_txids(filter).await {
                             Err(err) => {
@@ -391,17 +392,31 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             println!("txs for {t_addr}:");
                             for raw_tx in txs {
                                 let zebra_tx = zebra_chain::transaction::Transaction::zcash_deserialize(raw_tx.data.as_slice());
-                                let branch_id = BranchId::for_height(network, BlockHeight::from_u32(raw_tx.height.try_into().unwrap()));
+                                let tx_height = BlockHeight::from_u32(raw_tx.height.try_into().unwrap());
+                                let branch_id = BranchId::for_height(network, tx_height);
                                 let tx = Transaction::read(raw_tx.data.as_slice(), branch_id);
                                 println!("  zebra: {zebra_tx:?}");
                                 println!("  librz: {tx:?}");
+                                let tx = match tx {
+                                    Ok(tx) => tx,
+                                    Err(err) => {
+                                        println!("transaction read error: {err}");
+                                        continue;
+                                    }
+                                };
+
+                                if let Err(err) = wallet::decrypt_and_store_transaction(network, wallet, &tx, Some(tx_height)) {
+                                    println!("transparent tx decrypt error: {err}");
+                                }
                             }
                         }
+
+                        println!("{} {:?}", t_addr, wallet.get_wallet_summary(wallet::ConfirmationsPolicy::MIN));
                     }
 
 
                     // DONE
-                    txs_seen_block_height = tip_height.into();
+                    txs_seen_block_height = tip_h.into();
                 }
             }
 
