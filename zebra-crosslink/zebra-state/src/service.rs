@@ -28,6 +28,7 @@ use futures::future::FutureExt;
 use tokio::sync::{oneshot, watch};
 use tower::{util::BoxService, Service, ServiceExt};
 use tracing::{instrument, Instrument, Span};
+use derivative::Derivative;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use tower::buffer::Buffer;
@@ -40,6 +41,7 @@ use zebra_chain::{
 };
 
 use zebra_chain::{block::Height, serialization::ZcashSerialize};
+use zebra_chain::block::FatPointerToBftBlock;
 
 use crate::{
     constants::{
@@ -101,7 +103,8 @@ use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, 
 ///
 /// To quickly get the latest block, use [`LatestChainTip`] or [`ChainTipChange`].
 /// They can read the latest block directly, without queueing any requests.
-#[derive(Debug)]
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub(crate) struct StateService {
     // Configuration
     //
@@ -174,7 +177,12 @@ pub(crate) struct StateService {
     /// Set to `f64::NAN` if `finalized_state_queued_blocks` is empty, because grafana shows NaNs
     /// as a break in the graph.
     max_finalized_queue_height: f64,
+
+    #[derivative(Debug = "ignore")]
+    closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
 }
+
+pub type ClosureToCallIntoCrosslinkFromState = Arc<dyn Fn(FatPointerToBftBlock, FatPointerToBftBlock) -> bool + Send + Sync>;
 
 /// A read-only service for accessing Zebra's cached blockchain state.
 ///
@@ -301,6 +309,7 @@ impl StateService {
         network: &Network,
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
+        closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
     ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
         let timer = CodeTimer::start();
         let finalized_state = FinalizedState::new(
@@ -364,6 +373,7 @@ impl StateService {
             last_prune: Instant::now(),
             read_service: read_service.clone(),
             max_finalized_queue_height: f64::NAN,
+            closure_to_call_crosslink,
         };
         timer.finish(module_path!(), line!(), "initializing state service");
 
@@ -595,6 +605,20 @@ impl StateService {
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verrified.block, "queueing block for contextual verification");
         let parent_hash = semantically_verrified.block.header.previous_block_hash;
+        let parent_block_header = self.read_service.non_finalized_state_receiver.with_watch_data(
+            |non_finalized_state| {
+                read::block_header(
+                    non_finalized_state.best_chain(),
+                    &self.read_service.db,
+                    crate::HashOrHeight::Hash(parent_hash),
+                )
+            },
+        );
+        let parent_block_header = if parent_block_header.is_some() { parent_block_header } else { self.read_service.db.block_header(crate::HashOrHeight::Hash(parent_hash)) };
+        let parent_block_fat_pointer = parent_block_header.map(|h| h.fat_pointer_to_bft_block.clone());
+
+        let this_header_fat_pointer = semantically_verrified.block.header.fat_pointer_to_bft_block.clone();
+        let semantically_verrified_height = semantically_verrified.height;
 
         if self
             .non_finalized_block_write_sent_hashes
@@ -645,6 +669,17 @@ impl StateService {
                 .queue((semantically_verrified, rsp_tx));
             rsp_rx
         };
+
+        // CROSSLINK
+        if parent_block_fat_pointer.is_none() || false == (self.closure_to_call_crosslink)(parent_block_fat_pointer.unwrap(), this_header_fat_pointer) {
+            let (rsp_tx, rsp_rx) = oneshot::channel();
+            let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
+                ValidateContextError::CrosslinkNotReady {
+                    block_height: semantically_verrified_height,
+                },
+            )));
+            return rsp_rx;
+        }
 
         // We've finished sending checkpoint verified blocks when:
         // - we've sent the verified block for the last checkpoint, and
@@ -2243,6 +2278,7 @@ pub fn init(
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
+    closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
 ) -> (
     BoxService<Request, Response, BoxError>,
     ReadStateService,
@@ -2255,6 +2291,7 @@ pub fn init(
             network,
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
+            closure_to_call_crosslink,
         );
 
     (
@@ -2319,6 +2356,7 @@ pub fn spawn_init(
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
+    closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
 ) -> tokio::task::JoinHandle<(
     BoxService<Request, Response, BoxError>,
     ReadStateService,
@@ -2332,6 +2370,7 @@ pub fn spawn_init(
             &network,
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
+            closure_to_call_crosslink,
         )
     })
 }

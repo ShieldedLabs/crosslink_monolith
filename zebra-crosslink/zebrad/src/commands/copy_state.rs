@@ -145,7 +145,7 @@ impl CopyStateCmd {
             _target_read_only_state_service,
             _target_latest_chain_tip,
             _target_chain_tip_change,
-        ) = new_zs::spawn_init(target_config.clone(), network, Height::MAX, 0).await?;
+        ) = new_zs::spawn_init(target_config.clone(), network, Height::MAX, 0, std::sync::Arc::new(move |fat_pointer_a, fat_pointer_b| { true })).await?;
 
         let elapsed = target_start_time.elapsed();
         info!(?elapsed, "finished initializing target state service");

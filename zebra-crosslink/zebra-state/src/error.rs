@@ -294,6 +294,10 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     AlreadyFinalized { block_height: block::Height },
 
+    #[error("block height {block_height:?} was not able to be confirmed as having the same or newer bft pointer as its parent")]
+    #[non_exhaustive]
+    CrosslinkNotReady { block_height: block::Height },
+
     #[error("block hash {block_hash} was replaced by a newer commit request")]
     #[non_exhaustive]
     ReplacedByNewerRequest { block_hash: block::Hash },

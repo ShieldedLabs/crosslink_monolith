@@ -62,6 +62,7 @@ pub use service::{
     spawn_init, spawn_init_read_only,
     watch_receiver::WatchReceiver,
     OutputLocation, TransactionIndex, TransactionLocation,
+    ClosureToCallIntoCrosslinkFromState,
 };
 
 // Allow use in the scanner and external tests

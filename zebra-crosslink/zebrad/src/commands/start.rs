@@ -163,6 +163,9 @@ impl StartCmd {
 
         info!("opening database, this may take a few minutes");
 
+        let actual_closure: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>> = Arc::new(std::sync::Mutex::new(None));
+        let actual_closure2 = Arc::clone(&actual_closure);
+
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
             zebra_state::spawn_init(
                 config.state.clone(),
@@ -170,6 +173,14 @@ impl StartCmd {
                 max_checkpoint_height,
                 config.sync.checkpoint_verify_concurrency_limit
                     * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
+                Arc::new(move |fat_pointer_a, fat_pointer_b| {
+                    if let Some(closure) = actual_closure.lock().unwrap().as_mut() {
+                        (closure)(fat_pointer_a, fat_pointer_b)
+                    } else {
+                        tracing::error!("State -> Crosslink closure not yet initialized.");
+                        false
+                    }
+                }),
             )
             .await?;
 
@@ -385,6 +396,7 @@ impl StartCmd {
                     })
                 }),
                 config.crosslink.clone(),
+                actual_closure2,
             )
         };
         let tfl_service = BoxService::new(tfl);

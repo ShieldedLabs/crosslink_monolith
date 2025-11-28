@@ -117,6 +117,7 @@ pub fn spawn_new_tfl_service(
     mempool_service_call: MempoolServiceProcedure,
     force_feed_pow_call: ForceFeedPoWBlockProcedure,
     config: crate::config::Config,
+    closure_from_state_to_here_mutex: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>>,
 ) -> (TFLServiceHandle, JoinHandle<Result<(), String>>) {
     let (validators_at_current_height, validators_keys_to_names) = {
         let mut array = Vec::with_capacity(config.malachite_peers.len());
@@ -199,9 +200,11 @@ pub fn spawn_new_tfl_service(
     };
 
     *handle_mtx.lock().unwrap() = Some(handle1.clone());
+    
+    let handle3 = handle1.clone();
+    *closure_from_state_to_here_mutex.lock().unwrap() = Some(Arc::new(move |fpa, fpb| crate::call_from_state_to_crosslink_to_ask_about_fat_pointers(&handle3, fpa, fpb)));
 
     let handle2 = handle1.clone();
-
     (
         handle1,
         tokio::spawn(async move { crate::tfl_service_main_loop(handle2).await }),

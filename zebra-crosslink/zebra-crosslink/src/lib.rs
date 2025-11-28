@@ -185,6 +185,29 @@ pub(crate) struct TFLServiceInternal {
     current_bc_final: Option<(BlockHeight, BlockHash)>,
 }
 
+fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: zebra_chain::block::FatPointerToBftBlock, child_fat_pointer: zebra_chain::block::FatPointerToBftBlock) -> bool {
+    let mut internal = internal_handle.internal.blocking_lock();
+    let parent_height = if parent_fat_pointer == zebra_chain::block::FatPointerToBftBlock::null() {
+        0
+    } else {
+        if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash().0 == parent_fat_pointer.points_at_block_hash()) {
+            h
+        } else {
+            return false;
+        }
+    };
+    let child_height = if child_fat_pointer == zebra_chain::block::FatPointerToBftBlock::null() {
+        0
+    } else {
+        if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash().0 == child_fat_pointer.points_at_block_hash()) {
+            h
+        } else {
+            return false;
+        }
+    };
+    child_height >= parent_height
+}
+
 // TODO: Result?
 async fn block_height_from_hash(call: &TFLServiceCalls, hash: BlockHash) -> Option<BlockHeight> {
     if let Ok(StateResponse::KnownBlock(Some(known_block))) =
@@ -585,6 +608,7 @@ async fn new_decided_bft_block_from_malachite(
     internal.fat_pointer_to_tip = fat_pointer.clone();
     internal.latest_final_block = Some((new_final_height, new_final_hash));
 
+    drop(internal); // Note(Sam): IT IS VERY IMPORTANT THAT WE DROP THE LOCK BECAUSE ZEBRA_STATE MAY CALL US BACK
     match (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(new_final_hash)).await {
         Ok(zebra_state::Response::CrosslinkFinalized(hash)) => {
             info!("Successfully crosslink-finalized {}", hash);
@@ -598,6 +622,7 @@ async fn new_decided_bft_block_from_malachite(
             error!(?err);
         }
     }
+    let mut internal = tfl_handle.internal.lock().await;
 
     {
         let new_bc_final = internal.latest_final_block;
