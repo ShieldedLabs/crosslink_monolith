@@ -16,7 +16,7 @@ use zcash_primitives::transaction::components::TxOut;
 use zcash_primitives::transaction::fees::zip317::{self, MINIMUM_FEE};
 use zcash_primitives::transaction::sighash::{SignableInput, signature_hash};
 use zcash_primitives::transaction::txid::TxIdDigester;
-use zcash_primitives::transaction::{TransactionData, TxVersion};
+use zcash_primitives::transaction::{Transaction, TransactionData, TxVersion};
 use zcash_primitives::transaction::builder::{BuildConfig, Builder as TxBuilder};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
@@ -28,8 +28,8 @@ use zcash_transparent::{
 };
 use zebra_chain::block::{Hash as BlockHash, Height};
 use zebra_chain::parameters::NetworkUpgrade;
-use zebra_chain::{serialization::ZcashSerialize};
-use zebra_chain::transaction::{LockTime, Transaction};
+use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
+use zebra_chain::transaction::{LockTime};
 use zebra_chain::transparent::{self, Input, MIN_TRANSPARENT_COINBASE_MATURITY, Utxo};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -49,7 +49,10 @@ use zcash_client_backend::{
     },
     data_api::{
         self,
-        chain::ChainState,
+        chain::{
+            BlockCache,
+            ChainState,
+        },
         Account as APIAccount,
         AccountBirthday,
         AccountPurpose,
@@ -74,12 +77,14 @@ use zcash_client_backend::{
             GetAddressUtxosArg,
             Empty,
             LightdInfo,
+            TransparentAddressBlockFilter,
             compact_tx_streamer_client::CompactTxStreamerClient
         }
     },
 };
 use zcash_client_memory::{
     types::account::{Account as MemAccount},
+    MemBlockCache,
     MemoryWalletDb,
 };
 use zcash_protocol::{
@@ -225,11 +230,13 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     println!("User wallet: {}/{:?}", user_t_addr_str, user_t_addr1.encode(network));
 
 
-    // let lax_confirmations = ConfirmationsPolicy {
-    //     trusted: 1,
-    //     untrusted: 1,
-    //     allow_zero_conf_shielding: true,
+//     let lax_confirmations = ConfirmationsPolicy {
+//         trusted: 1,
+//         untrusted: 1,
+//         allow_zero_conf_shielding: true,
     // };
+
+    let mut block_cache = MemBlockCache::new();
 
     let mut txs_seen_block_height = 0;
     let mut already_sent = false;
@@ -272,7 +279,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 start: Some(BlockId{ height: txs_seen_block_height, hash: Vec::new() }),
                 end: Some(BlockId{ height: u32::MAX as u64, hash: Vec::new() }),
             };
-            let new_blocks = match client.get_block_range(block_range).await {
+            let new_blocks = match client.get_block_range(block_range.clone()).await {
                 Err(err) => {
                     println!("******* GET BLOCK RANGE ERROR: {:?}", err);
                     None
@@ -288,14 +295,69 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                  if err.code() == tonic::Code::OutOfRange {
                                      break Some(blocks);
                                  } else {
-                                    println!("Get block range message error: {err:?}");
-                                    break None;
+                                     println!("Get block range message error: {err:?}");
+                                     break None;
                                  }
-                            }
+                             }
                         }
                     }
                 }
             };
+
+            if let Some(new_blocks) = new_blocks {
+                if new_blocks.len() > 0 {
+                    // get transparent transactions for same range
+                    let range = BlockRange{
+                        start: block_range.start,
+                        end: Some(BlockId{
+                            height: new_blocks.last().unwrap().height,
+                            hash: Vec::new(),
+                        })
+                    };
+
+                    block_cache.insert(new_blocks);
+
+                    let t_addrs = vec![user_t_addr_str.clone()];
+                    for t_addr in &t_addrs {
+                        let filter = TransparentAddressBlockFilter{ address: t_addr.to_owned(), range: Some(range.clone()) };
+                        let txs = match client.get_taddress_txids(filter).await {
+                            Err(err) => {
+                                println!("******* GET T-TRANSACTIONS ERROR: {:?}", err);
+                                None
+                            }
+                            Ok(tx_stream) => {
+                                let mut tx_stream = tx_stream.into_inner();
+                                let mut txs = Vec::new();
+                                loop {
+                                    match tx_stream.message().await {
+                                        Ok(Some(tx)) => txs.push(tx),
+                                        Ok(None) => break Some(txs),
+                                        Err(err) => {
+                                            if err.code() == tonic::Code::OutOfRange {
+                                                break Some(txs);
+                                            } else {
+                                                println!("Get txs message error: {err:?}");
+                                                break None;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        };
+
+                        if let Some(txs) = txs {
+                            println!("txs for {t_addr}:");
+                            for raw_tx in txs {
+                                let zebra_tx = zebra_chain::transaction::Transaction::zcash_deserialize(raw_tx.data.as_slice());
+                                let branch_id = BranchId::for_height(network, BlockHeight::from_u32(raw_tx.height.try_into().unwrap()));
+                                let tx = Transaction::read(raw_tx.data.as_slice(), branch_id);
+                                println!("  zebra: {zebra_tx:?}");
+                                println!("  librz: {tx:?}");
+                            }
+                        }
+                    }
+                }
+            }
 
             if !already_sent && miner_utxos.len() != 0 && miner_utxos[0].height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64) < latest_block.height {
                 let mut signing_set = TransparentSigningSet::new();
@@ -342,17 +404,6 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 println!("******* res: {:?}", res);
 
                 already_sent = true;
-            }
-
-            if let Some(new_blocks) = new_blocks {
-                for (i, block) in new_blocks.iter().enumerate() {
-                    let Ok(hash_bytes) = <[u8;32]>::try_from(&block.hash[..]) else { continue; };
-                    println!("{i:02}: block {} has {} transactions", BlockHash::from(hash_bytes), block.vtx.len());
-                    // txs_seen_block_height = txs_seen_block_height.max(block.height);
-                    for tx in &block.vtx {
-                        println!("tx: {tx:?}");
-                    }
-                }
             }
 
             // let latest = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
