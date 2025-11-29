@@ -407,43 +407,78 @@ fn ui_left_pane(ui: &mut Context,
 
     if ui.modal != Modal::None && let _ = elem().decl(Decl {
         child_gap,
+        id: id("Modal Container"),
         padding: (padding.0 * 2.0).dup4(),
         radius: (radius.0, 0.0, radius.2, 0.0),
         floating: true,
-        colour: (0, 0, 0, 0x80),
+        colour: (0, 0, 0, 0xC0),
         align: Align::Center,
         width:  grow!(),
         height: grow!(),
         ..Decl::default()
     }) {
 
-        let pane_w = ((ui.draw().window_width  as f32) * ui.scale * PANE_PERCENT);
-        let pane_h = ((ui.draw().window_height as f32) * ui.scale);
-        let modal_w = pane_w * 0.8;
-        let modal_h = pane_h * 0.8;
-
         if let _ = elem().decl(Decl {
             child_gap, radius,
+            id: id("Modal Contents"),
             padding: (padding.0 * 2.0).dup4(),
             colour: MODAL_COL,
-            width:  grow!(ui.scale(128.0)), // width:  fixed!(modal_w.max(ui.scale(256.0))),
-            height: grow!(ui.scale(128.0)), // height: fixed!(modal_h.max(ui.scale(256.0))),
+            width:  grow!(ui.scale(192.0), ui.scale(384.0)),
+            height: grow!(ui.scale(192.0), ui.scale(384.0)),
+            align: Align::Top,
+            direction: TopToBottom,
             ..Decl::default()
         }) {
             let text_h = ui.scale16(24.0);
+            let title_bar = |ui: &mut Context, clicked_id: &mut Id, title, title_bar_id| {
+                if let _ = elem().decl(Decl {
+                    id: title_bar_id,
+                    child_gap,
+                    width:  grow!(),
+                    height: fit!(),
+                    align: Align::Center,
+                    direction: LeftToRight,
+                    ..Decl::default()
+                }) {
+                    if let _ = elem().decl(Decl { width: grow!(), align: Align::Left, ..Decl::default() }) {}
+                    if let _ = elem().decl(Decl { width: grow!(), align: Align::Center, ..Decl::default() }) {
+                        ui.text(title, clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                    }
+                    if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Align::Right, ..Decl::default() }) {
+                        let id = id("Close This Modal");
+                        let (clicked, colour) = ui.button_act_on_release(clicked_id, id);
+                        if clicked || ui.input().key_pressed(KeyCode::Escape) {
+                            ui.modal = Modal::None;
+                        }
+
+                        let radius = ui.scale(20.0);
+
+                        // Button circle
+                        if let _ = elem().decl(Decl {
+                            id, colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
+                            width:  fixed!(radius * 2.0),
+                            height: fixed!(radius * 2.0),
+                            ..Decl::default()
+                        }) {
+                            let temp_letter_symbol_h = ui.scale16(32.0);
+                            ui.text("x", clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                        }
+                    }
+                }
+            };
             match ui.modal {
                 Modal::None => {}
                 Modal::Send => {
-                    ui.text("Send", clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                    title_bar(ui, clicked_id, "Send",    id("Send Title Bar"));
                 }
                 Modal::Receive => {
-                    ui.text("Receive", clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                    title_bar(ui, clicked_id, "Receive", id("Receive Title Bar"));
                 }
                 Modal::Stake => {
-                    ui.text("Stake", clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                    title_bar(ui, clicked_id, "Stake",   id("Stake Title Bar"));
                 }
                 Modal::Unstake => {
-                    ui.text("Unstake", clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                    title_bar(ui, clicked_id, "Unstake", id("Unstake Title Bar"));
                 }
             }
         }
