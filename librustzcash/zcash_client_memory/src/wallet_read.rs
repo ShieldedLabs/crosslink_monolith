@@ -739,6 +739,24 @@ impl<P: consensus::Parameters> WalletRead for MemoryWalletDb<P> {
     fn utxo_query_height(&self, _account: Self::AccountId) -> Result<BlockHeight, Self::Error> {
         todo!()
     }
+
+    // NOTE(azmr): this is to fill an API gap for a specific purpose and is probably not complete
+    #[cfg(feature = "transparent-inputs")]
+    fn get_transparent_address_metadata(
+        &self,
+        account: Self::AccountId,
+        address: &TransparentAddress,
+    ) -> Result<Option<TransparentAddressMetadata>, Self::Error> {
+        Ok(
+            if let Some(result) = self.get_transparent_receivers(account, false, false)?.get(address) {
+                Some(result.clone())
+            } else {
+                self.get_ephemeral_transparent_receivers(account, u32::MAX, false)?
+                    .get(address)
+                    .cloned()
+            },
+        )
+    }
 }
 
 /// Copied from zcash_client_sqlite::wallet::seed_matches_derived_account
