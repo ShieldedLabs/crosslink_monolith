@@ -262,7 +262,7 @@ impl Context {
     fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
     fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
 
-    fn button(&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) {
+    fn button_ex(&mut self, clicked_id: &mut Id, id: Id, act_on_press: bool) -> (bool, (u8, u8, u8, u8)) {
         let mouse_held     = self.input().mouse_held(winit::event::MouseButton::Left);
         let mouse_pressed  = self.input().mouse_pressed(winit::event::MouseButton::Left);
         let mouse_released = self.input().mouse_released(winit::event::MouseButton::Left);
@@ -276,11 +276,14 @@ impl Context {
         }
 
         if hover {
-            self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
+            // self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
         }
 
-        const act_on_press: bool = true;
-        let activated = (*clicked_id == id) && (if act_on_press { pressed } else { released });
+        let activated = (*clicked_id == id) && if act_on_press {
+            pressed
+        } else {
+            released
+        };
 
         let colour = if down || pressed {
             if clicked_id.id == id.id {
@@ -295,6 +298,13 @@ impl Context {
         };
 
         (activated, colour)
+    }
+
+    fn button(&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) {
+        return self.button_ex(clicked_id, id, true);
+    }
+    fn button_act_on_release(&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) {
+        return self.button_ex(clicked_id, id, false);
     }
 
     fn text(&self, label: &str, config: clay::text::TextElementConfig) {
@@ -349,8 +359,7 @@ fn ui_left_pane(ui: &mut Context,
                 radius:  (f32, f32, f32, f32),
                 clicked_id: &mut Id,
                 tab_id: &mut Id,
-                balance_str: &str,
-                is_rendering: bool) {
+                balance_str: &str) {
 
     let mut tab_id_wallet = Id::default();
     let mut tab_id_finalizers = Id::default();
@@ -441,7 +450,6 @@ fn ui_left_pane(ui: &mut Context,
 
                 if button("Send")    { println!("Send!");    }
                 if button("Receive") { println!("Receive!"); }
-                if button("Faucet")  { println!("Faucet!");  }
                 if button("Stake")   { println!("Stake!");   }
                 if button("Unstake") { println!("Unstake!"); }
 
@@ -470,9 +478,7 @@ fn ui_right_pane(ui: &mut Context,
                  padding: (f32, f32, f32, f32),
                  radius:  (f32, f32, f32, f32),
                  clicked_id: &mut Id,
-                 tab_id: &mut Id,
-                 balance_str: &str,
-                 is_rendering: bool) {
+                 tab_id: &mut Id) {
     let mut tab_id_faucet = Id::default();
     let mut tab_id_roster = Id::default();
     let mut tab_id_settings = Id::default();
@@ -500,6 +506,72 @@ fn ui_right_pane(ui: &mut Context,
         height: grow!(),
         ..Decl::default()
     }) {
+
+        // spacer
+        if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+
+        if *tab_id == tab_id_faucet {
+
+            // big text container
+            // if let _ = elem().decl(Decl {
+            //     width: percent!(1.0),
+            //     height: fit!(),
+            //     padding,
+            //     align: Align::Center,
+            //     ..Decl::default()
+            // }) {
+            //     let big_text_h = ui.scale16(32.0);
+            //     ui.text(&balance_str, clay::text::TextConfig::new().font_size(big_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+            // }
+
+            let child_gap = child_gap as f32;
+            let padding = child_gap.dup4();
+
+            // buttons container
+            if let _ = elem().decl(Decl {
+                id: id("Buttons Container"),
+                padding, child_gap, align: Align::Center,
+                width: percent!(1.0),
+                height: fit!(),
+                ..Decl::default()
+            }) {
+
+                let mut button_ex = |label, act_on_press| {
+                    let id = Id::id(label);
+                    let (clicked, colour) = ui.button_ex(clicked_id, id, act_on_press);
+                    if let _ = elem().decl(Decl {
+                        id, child_gap, align: Align::Center,
+                        direction: TopToBottom,
+                        width: fit!(),
+                        height: fit!(),
+                        ..Decl::default()
+                    }) {
+
+                        let radius = ui.scale(24.0);
+
+                        // Button 
+                        if let _ = elem().decl(Decl {
+                            colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
+                            width:  fit!(ui.scale(192.0)),
+                            height: fit!(radius * 2.0),
+                            ..Decl::default()
+                        }) {
+                            let button_text_h = ui.scale16(20.0);
+                            ui.text(label, clay::text::TextConfig::new().font_size(button_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                        }
+                    }
+                    clicked
+                };
+
+                if button_ex("Receive cTAZ", false) {
+                    println!("Receive cTAZ from faucet!");
+                }
+
+            }
+
+        } else if *tab_id == tab_id_roster {
+        } else if *tab_id == tab_id_settings {
+        }
     }
 }
 
@@ -564,6 +636,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
     });
 
     let mut clicked_id = ui.clicked_id;
+    let mut focused_id = ui.focused_id;
     let mut pane_tab_l = ui.pane_tab_l; // @Todo: how to not have to do this in rust?
     let mut pane_tab_r = ui.pane_tab_r; // @Todo: how to not have to do this in rust?
 
@@ -591,7 +664,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             height: grow!(),
             ..Decl::default()
         }) {
-            ui_left_pane(ui, wallet_state.clone(), _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l, &balance_str, is_rendering);
+            ui_left_pane(ui, wallet_state.clone(), _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l, &balance_str);
         }
 
         if let _ = elem().decl(Decl {
@@ -610,7 +683,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             height: grow!(),
             ..Decl::default()
         }) {
-            ui_right_pane(ui, wallet_state.clone(), _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_r, &balance_str, is_rendering);
+            ui_right_pane(ui, wallet_state.clone(), _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_r);
         }
     }
 
@@ -709,6 +782,7 @@ pub struct Context {
     pub dpi_scale: f32,
 
     pub clicked_id: Id,
+    pub focused_id: Id,
 
     pub pane_tab_l: Id,
     pub pane_tab_r: Id,
