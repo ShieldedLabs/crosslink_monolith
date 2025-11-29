@@ -55,6 +55,11 @@ use zcash_client_backend::{
             scan_cached_blocks,
             BlockCache,
             ChainState,
+            error::Error as ChainError,
+        },
+        scanning::{
+            ScanPriority,
+            ScanRange,
         },
         wallet,
         Account as APIAccount,
@@ -388,6 +393,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let mut txs_seen_block_height = 0;
     let mut already_sent = false;
+    let mut tip_h: u32 = 0;
     loop {
         the_future_is_now(async {
             let mut client = CompactTxStreamerClient::new({
@@ -423,91 +429,152 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 Ok(res) => res.into_inner().address_utxos,
             };
 
-            let block_range = BlockRange{
-                start: Some(BlockId{ height: txs_seen_block_height+1, hash: Vec::new() }),
-                end: Some(BlockId{ height: u32::MAX as u64, hash: Vec::new() }),
-            };
-            let mut new_blocks: Vec<CompactBlock> = Vec::new();
-            match client.get_block_range(block_range.clone()).await {
-                Err(err) => println!("******* GET BLOCK RANGE ERROR: {:?}", err),
-                Ok(res) => {
-                    let mut grpc_stream = res.into_inner();
-                    loop {
-                         match grpc_stream.message().await {
-                             Ok(Some(block)) => new_blocks.push(block),
-                             Ok(None) => break,
-                             Err(err) => {
-                                 if err.code() == tonic::Code::OutOfRange {
-                                     break;
-                                 } else {
-                                     println!("Get block range message error: {err:?}");
-                                     break;
-                                 }
-                             }
-                        }
-                    }
+            match client.get_lightd_info(Empty{}).await {
+                Err(err) => {
+                    println!("******* GET UTXOS ERROR: {:?}", err);
                 }
-            };
+                Ok(info) => {
+                    tip_h = info.into_inner().block_height.try_into().unwrap();
+                }
+            }
+            // let tip_h = match block_cache.get_tip_height(None) {
+            //     Ok(Some(tip_h)) => tip_h,
+            //     Ok(None) => 0.into(),
+            //     Err(err) => {
+            //         println!("******* CACHE TIP ERROR: {:?}", err);
+            //         return;
+            //     },
+            // };
 
-            if new_blocks.len() > 0 {
-                let tip = new_blocks.last().unwrap();
-                let tip_h = tip.height;
+            fn block_range_from_scan_range(scan_range: &ScanRange) -> BlockRange {
+                let r = scan_range.block_range();
+                BlockRange{
+                    start: Some(BlockId{ height: <u64>::from(r.start), hash: Vec::new() }),
+                    end: Some(BlockId{ height: <u64>::from(r.end /*-1*/) as u64, hash: Vec::new() }),
+                }
+            }
+
+            let t_addr_wallets = vec![
+                (user_t_addr.clone(), &mut user_wallet, user_usk.clone(), user_account.id()),
+                (miner_t_addr.clone(), &mut miner_wallet, miner_usk.clone(), user_account.id()),
+            ];
+            for (t_addr, wallet, usk, account_id) in t_addr_wallets {
+                let t_addr_str = t_addr.encode(network);
                 let tip_height = BlockHeight::from_u32(tip_h.try_into().unwrap());
-                let start_height = BlockHeight::from_u32(new_blocks[0].height.try_into().unwrap());
-
-                // Update wallet with chain state & shielded transactions
-                if let Err(err) = user_wallet.update_chain_tip(tip_height) {
+                if let Err(err) = wallet.update_chain_tip(tip_height) {
                     println!("update chain tip error: {err}");
                 }
-                let new_blocks_n = new_blocks.len();
-                if let Err(err) = block_cache.insert(new_blocks).await {
-                    println!("block cache insert error: {err}");
-                };
 
-                let chain_state = if txs_seen_block_height == 0 {
-                    Some(ChainState::empty(BlockHeight::from_u32(0), zcash_primitives::block::BlockHash([0; 32])))
-                } else {
-                    // TODO: it feels like we should be able to compute this locally
-                    match client.get_tree_state(BlockId{height:txs_seen_block_height, hash:Vec::new()}).await {
+                let mut got_transparent = false;
+                loop {
+                    // NOTE: may have changed between loops
+                    let scan_ranges = match wallet.suggest_scan_ranges() {
+                        Ok(ranges) => ranges,
                         Err(err) => {
-                            println!("******* GET TREE STATE ERROR: {:?}", err);
-                            None
-                        },
-                        Ok(result) => {
-                            let tree_state = result.into_inner();
-                            match tree_state.to_chain_state() {
-                                Err(err) => {
-                                    println!("******* TREE STATE TO CHAIN STATE ERROR: {:?}", err);
-                                    None
+                            println!("******* SCAN RANGE ERROR: {:?}", err);
+                            break;
+                        }
+                    };
+                    let Some(scan_range) = scan_ranges.first() else {
+                        break;
+                    };
+                    // if scan_range.priority() != ScanPriority::Verify {
+                    //     break;
+                    // }
+
+                    let prev_state_h = scan_range.block_range().start.saturating_sub(1).into();
+                    let chain_state = if prev_state_h == 0 {
+                        ChainState::empty(BlockHeight::from_u32(0), zcash_primitives::block::BlockHash([0; 32]))
+                    } else {
+                        // TODO: it feels like we should be able to compute this locally
+                        match client.get_tree_state(BlockId{height:prev_state_h, hash:Vec::new()}).await {
+                            Err(err) => {
+                                println!("******* GET TREE STATE ERROR: {:?}", err);
+                                continue;
+                            },
+                            Ok(result) => {
+                                let tree_state = result.into_inner();
+                                match tree_state.to_chain_state() {
+                                    Err(err) => {
+                                        println!("******* TREE STATE TO CHAIN STATE ERROR: {:?}", err);
+                                        continue;
+                                    }
+                                    Ok(chain_state) => chain_state
                                 }
-                                Ok(chain_state) => Some(chain_state)
                             }
                         }
-                    }
-                };
-                if let Some(chain_state) = chain_state {
-                    let scan_res = scan_cached_blocks(network, &block_cache, &mut user_wallet, start_height, &chain_state, new_blocks_n);
-                    println!("user  scan: {scan_res:?}");
-                    let scan_res = scan_cached_blocks(network, &block_cache, &mut miner_wallet, start_height, &chain_state, new_blocks_n);
-                    println!("miner scan: {scan_res:?}");
-                }
+                    };
+
+                    let range = block_range_from_scan_range(&scan_range);
+                    let mut new_blocks: Vec<CompactBlock> = Vec::new();
+                    match client.get_block_range(range.clone()).await {
+                        Err(err) => println!("******* GET BLOCK RANGE ERROR: {:?}", err),
+                        Ok(res) => {
+                            let mut grpc_stream = res.into_inner();
+                            loop {
+                                match grpc_stream.message().await {
+                                    Ok(Some(block)) => {
+                                        println!("got block: {block:?}");
+                                        new_blocks.push(block)
+                                    },
+                                    Ok(None) => break,
+                                    Err(err) => {
+                                        if err.code() == tonic::Code::OutOfRange {
+                                            break;
+                                        } else {
+                                            println!("Get block range message error: {err:?}");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    if let Err(err) = block_cache.insert(new_blocks).await {
+                        println!("block cache insert error: {err}");
+                    };
+
+                    let block_range = scan_range.block_range();
+                    let scan_res = scan_cached_blocks(network, &block_cache, wallet, block_range.start, &chain_state, scan_range.len());
+                    println!("scan: {scan_res:?}");
+                    match scan_res {
+                        Ok(_) => {
+                            // At this point, the cache and scanned data are locally consistent (though
+                            // not necessarily consistent with the latest chain tip - this would be
+                            // discovered the next time this codepath is executed after new blocks are
+                            // received) so we can break out of the loop.
+                        }
+
+                        Err(ChainError::Scan(err)) if err.is_continuity_error() => {
+                            // must be at least one block before the height at which the error occurred
+                            let rewind_height = err.at_height().saturating_sub(10);
+                            if let Err(err) = wallet.truncate_to_height(rewind_height) {
+                                println!("******* TRUNCATE ERROR: {:?}", err);
+                                break;
+                            }
+                            block_cache.delete(ScanRange::from_parts(
+                                    rewind_height .. (tip_h+1).into(),
+                                    ScanPriority::Scanned,
+                            ));
+                            continue;
+                        }
+
+                        Err(err) => {
+                            println!("******* SCAN ERROR: {:?}", err);
+                            break;
+                        }
+                    };
 
 
-                // Update wallet with transparent transactions for same range
-                let range = BlockRange{
-                    start: block_range.start,
-                    end: Some(BlockId{
-                        height: tip_h, // TODO: +1 for range?
-                        hash: Vec::new(),
-                    })
-                };
+                    // Update wallet with transparent transactions for same range
+                    // TODO: off-by-1?
+                    let range = BlockRange{
+                        start: Some(BlockId{ height: block_range.start.into(), hash: Vec::new() }),
+                        end: Some(BlockId{ height: block_range.end.into(), hash: Vec::new() }),
+                    };
 
-                let t_addr_wallets = vec![
-                    (user_t_addr_str.clone(), &mut user_wallet),
-                    (miner_t_addr_str.clone(), &mut miner_wallet),
-                ];
-                for (t_addr, wallet) in t_addr_wallets {
-                    let filter = TransparentAddressBlockFilter{ address: t_addr.to_owned(), range: Some(range.clone()) };
+                    let filter = TransparentAddressBlockFilter{ address: t_addr_str.to_owned(), range: Some(range.clone()) };
                     let mut txs = Vec::new();
                     match client.get_taddress_txids(filter).await {
                         Err(err) => println!("******* GET T-TRANSACTIONS ERROR: {:?}", err),
@@ -532,13 +599,14 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     };
 
                     if txs.len() > 0 {
-                        println!("txs for {t_addr}:");
+                        // println!("txs for {t_addr}:");
+                        got_transparent = true;
                     }
                     for raw_tx in &txs {
                         let tx_height = BlockHeight::from_u32(raw_tx.height.try_into().unwrap());
                         let branch_id = BranchId::for_height(network, tx_height);
                         let tx = Transaction::read(raw_tx.data.as_slice(), branch_id);
-                        println!("  {tx:?}");
+                        // println!("  {tx:?}");
                         let tx = match tx {
                             Ok(tx) => tx,
                             Err(err) => {
@@ -561,7 +629,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 println!("Couldn't get transparent address from pubkey {:?}", txout.script_pubkey);
                                 continue;
                             };
-                            if recipient.encode(network) == t_addr {
+                            if recipient.encode(network) == t_addr_str {
                                 let outpoint = OutPoint::new(tx.txid().into(), index as u32);
                                 let height = BlockHeight::from_u32(raw_tx.height as u32);
                                 let Some(wto) = zcash_client_backend::wallet::WalletTransparentOutput::from_parts(
@@ -573,54 +641,78 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                     println!("put_received_transparent_utxo error: {err}");
                                     continue;
                                 };
-                                println!("Received transparent UTXO at height {}", height);
+                                // println!("Received transparent UTXO at height {}", height);
                             }
                         }
 
                         // TODO: do we need to explicitly handle vin here or does that get covered
                         // by sending?
                     }
+                }
 
-                    println!("{} {:#?}", t_addr, wallet.get_wallet_summary(wallet::ConfirmationsPolicy::MIN));
+                println!("{} {:#?}", t_addr_str, wallet.get_wallet_summary(wallet::ConfirmationsPolicy::MIN));
 
-                    // immediately shield newly-received transparent transactions
-                    if txs.len() > 0 {
-                        let min_zats_for_shielding = Zatoshis::const_from_u64(10_000);
-                        match wallet::propose_shielding::<_, _, _, _, Infallible>(
-                            wallet,
-                            network,
-                            &wallet::input_selection::GreedyInputSelector::new(),
-                            &change_strategy,
-                            min_zats_for_shielding,
-                            &[miner_t_addr],
-                            miner_account.id(),
-                            wallet::ConfirmationsPolicy::MIN,
-                        ) {
-                            Err(err) => println!("propose_shielding error: {err:?}"),
-                            Ok(proposal) => {
-                                let prover = LocalTxProver::bundled();
-                                match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
-                                    wallet, network,
-                                    &prover,
-                                    &prover,
-                                    &wallet::SpendingKeys::from_unified_spending_key(miner_usk.clone()),
-                                    zcash_client_backend::wallet::OvkPolicy::Sender,
-                                    &proposal)
-                                {
-                                    Err(err) => println!("shielding create_proposed_transactions error: {err:?}"),
-                                    Ok(txid) => println!("created shielding transaction {txid:?}"),
+                // immediately shield newly-received transparent transactions
+                if got_transparent {
+                    let min_zats_for_shielding = Zatoshis::const_from_u64(10_000);
+                    match wallet::propose_shielding::<_, _, _, _, Infallible>(
+                        wallet,
+                        network,
+                        &wallet::input_selection::GreedyInputSelector::new(),
+                        &change_strategy,
+                        min_zats_for_shielding,
+                        &[t_addr],
+                        account_id,
+                        wallet::ConfirmationsPolicy::MIN,
+                    ) {
+                        Err(err) => println!("propose_shielding error: {err:?}"),
+                        Ok(proposal) => {
+                            let prover = LocalTxProver::bundled();
+                            match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                                wallet, network,
+                                &prover,
+                                &prover,
+                                &wallet::SpendingKeys::from_unified_spending_key(usk.clone()),
+                                zcash_client_backend::wallet::OvkPolicy::Sender,
+                                &proposal)
+                            {
+                                Err(err) => println!("shielding create_proposed_transactions error: {err:?}"),
+                                Ok(txids) => for txid in txids {
+                                    println!("created shielding transaction {txid:?}");
+
+                                    let tx = match wallet.get_transaction(txid) {
+                                        Err(err) => {
+                                            println!("failed to get tx {txid:?} immediately after making it: {err:?}");
+                                            continue;
+                                        }
+                                        Ok(Some(tx)) => tx,
+                                        Ok(None) => {
+                                            println!("failed to get tx {txid:?} immediately after making it: (None)");
+                                            continue;
+                                        }
+                                    };
+
+                                    let mut data = Vec::new();
+                                    if let Err(err) = tx.write(&mut data) {
+                                        println!("Serialization error for tx {:?}: {:?}", txid, err);
+                                        continue;
+                                    }
+
+                                    let raw_tx = RawTransaction { data, height: 0 };
+
+                                    match client.send_transaction(raw_tx).await {
+                                        Ok(res) => println!("sent transaction: {res:?}"),
+                                        Err(err) => println!("failed to send transaction: {err:?}"),
+                                    }
                                 }
                             }
                         }
                     }
                 }
-
-                // DONE
-                txs_seen_block_height = tip_h.into();
-
-                let history = get_transaction_history(&user_wallet);
-                wallet_state.lock().unwrap().txs = history.iter().map(|h| WalletTx(h.clone())).collect(); // @temp: shouldn't be a separate type
             }
+
+            let history = get_transaction_history(&user_wallet);
+            wallet_state.lock().unwrap().txs = history.iter().map(|h| WalletTx(h.clone())).collect(); // @temp: shouldn't be a separate type
 
             if !already_sent && txs_seen_block_height >= 5 {
             // if !already_sent && miner_utxos.len() != 0 && miner_utxos[0].height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64) < latest_block.height {
@@ -743,6 +835,9 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             println!("user {} has {} UTXOs with {} zats = {}.{} cTAZ", user_t_addr_str, user_utxos.len(), user_sum, zec_full, zec_part);
 
             wallet_state.lock().unwrap().balance = user_sum;
+        });
+
+        the_future_is_now(async {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         });
     }
