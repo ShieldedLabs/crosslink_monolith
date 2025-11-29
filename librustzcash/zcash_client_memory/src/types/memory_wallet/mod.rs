@@ -58,53 +58,53 @@ use crate::types::*;
 #[derive(Debug)]
 pub struct MemoryWalletDb<P: consensus::Parameters> {
     /// Zcash network parameters for wallet
-    pub(crate) params: P,
+    pub params: P,
     /// The accounts in the wallet
-    pub(crate) accounts: Accounts,
+    pub accounts: Accounts,
     /// The wallet that have been scanned and cached that contain relevant wallet data
-    pub(crate) blocks: BTreeMap<BlockHeight, MemoryWalletBlock>,
+    pub blocks: BTreeMap<BlockHeight, MemoryWalletBlock>,
     /// Scanned transactions relevant to accounts in this wallet
-    pub(crate) tx_table: TransactionTable,
+    pub tx_table: TransactionTable,
     /// Notes that an account has received
-    pub(crate) received_notes: ReceivedNoteTable,
+    pub received_notes: ReceivedNoteTable,
     /// Notes that have been spent
-    pub(crate) received_note_spends: ReceievedNoteSpends,
+    pub received_note_spends: ReceievedNoteSpends,
     /// Nullifiers for notes that have been spent
-    pub(crate) nullifiers: NullifierMap,
+    pub nullifiers: NullifierMap,
     /// Stores the outputs of transactions created by the wallet.
-    pub(crate) sent_notes: SentNoteTable,
+    pub sent_notes: SentNoteTable,
     /// Maps transaction ids to their block height and index
-    pub(crate) tx_locator: TxLocatorMap,
+    pub tx_locator: TxLocatorMap,
     /// Sapling commitment tree
-    pub(crate) sapling_tree: ShardTree<
+    pub sapling_tree: ShardTree<
         MemoryShardStore<sapling::Node, BlockHeight>,
         { SAPLING_SHARD_HEIGHT * 2 },
         SAPLING_SHARD_HEIGHT,
     >,
     /// Stores the block height corresponding to the last note commitment in a shard
-    pub(crate) sapling_tree_shard_end_heights: BTreeMap<Address, BlockHeight>,
+    pub sapling_tree_shard_end_heights: BTreeMap<Address, BlockHeight>,
     /// Orchard commitment tree
     #[cfg(feature = "orchard")]
-    pub(crate) orchard_tree: ShardTree<
+    pub orchard_tree: ShardTree<
         MemoryShardStore<orchard::tree::MerkleHashOrchard, BlockHeight>,
         { ORCHARD_SHARD_HEIGHT * 2 },
         ORCHARD_SHARD_HEIGHT,
     >,
     #[cfg(feature = "orchard")]
     /// Stores the block height corresponding to the last note commitment in a shard
-    pub(crate) orchard_tree_shard_end_heights: BTreeMap<Address, BlockHeight>,
+    pub orchard_tree_shard_end_heights: BTreeMap<Address, BlockHeight>,
 
     /// Transparent outputs received by the wallet
-    pub(crate) transparent_received_outputs: TransparentReceivedOutputs,
+    pub transparent_received_outputs: TransparentReceivedOutputs,
     /// Transparent outputs received by the wallet that have been spent
-    pub(crate) transparent_received_output_spends: TransparentReceivedOutputSpends,
+    pub transparent_received_output_spends: TransparentReceivedOutputSpends,
     /// Map between transparent outpoints and their spend transactions
-    pub(crate) transparent_spend_map: TransparentSpendCache,
+    pub transparent_spend_map: TransparentSpendCache,
 
     /// Pending requests to the external data provider to enhance transaction data
-    pub(crate) transaction_data_request_queue: TransactionDataRequestQueue,
+    pub transaction_data_request_queue: TransactionDataRequestQueue,
     /// Queue of block ranges that should be scanned along with their priority
-    pub(crate) scan_queue: ScanQueue,
+    pub scan_queue: ScanQueue,
 }
 
 impl<P: consensus::Parameters + PartialEq> PartialEq for MemoryWalletDb<P> {

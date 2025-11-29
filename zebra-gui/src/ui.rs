@@ -20,6 +20,22 @@ pub fn magic<'a, 'b, T>(mut_ref: &'a mut T) -> &'b mut T {
 pub struct SomeDataToKeepAround {
     pub messages:          Vec<String>,
     pub can_send_messages: bool,
+    pub per_frame_strs:    Vec<String>,
+}
+
+
+#[macro_export]
+macro_rules! frame_strf {
+    ($data:expr, $($arg:tt)*) => {
+        $data.frame_str(&format_args!($($arg)*).to_string())
+    };
+}
+
+impl SomeDataToKeepAround {
+    fn frame_str(&mut self, str: &str) -> &String {
+        self.per_frame_strs.push(str.to_string().clone());
+        return self.per_frame_strs.last().unwrap();
+    }
 }
 
 fn dbg_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
@@ -210,7 +226,6 @@ fn decl(item: Decl) {
             Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
         }
     }
-    
 
     let mut decl = Clay_ElementDeclaration_ZERO;
     decl.backgroundColor = clay::Clay_Color {
@@ -353,13 +368,12 @@ impl<T: Copy> Dup4 for T { fn dup4(self) -> (Self, Self, Self, Self) { (self, se
 
 fn ui_left_pane(ui: &mut Context,
                 wallet_state: Arc<Mutex<wallet::WalletState>>,
-                _data: &mut SomeDataToKeepAround,
+                data: &mut SomeDataToKeepAround,
                 child_gap: f32,
                 padding: (f32, f32, f32, f32),
                 radius:  (f32, f32, f32, f32),
                 clicked_id: &mut Id,
-                tab_id: &mut Id,
-                balance_str: &str) {
+                tab_id: &mut Id) {
 
     let mut tab_id_wallet = Id::default();
     let mut tab_id_finalizers = Id::default();
@@ -375,7 +389,7 @@ fn ui_left_pane(ui: &mut Context,
     }) {
         tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, clicked_id, "Wallet");
         tab_id_finalizers = ui.tab(radius, padding, tab_id, clicked_id, "Finalizers");
-        tab_id_history    = ui.tab(radius, padding, tab_id, clicked_id, "History");
+        tab_id_history    = ui.tab(radius, padding, tab_id, clicked_id, "History"); // @todo frame_strf!(data, "History ({})", &wallet_state.lock().unwrap().txs.len())
     }
 
     // Main contents
@@ -403,6 +417,10 @@ fn ui_left_pane(ui: &mut Context,
                 align: Align::Center,
                 ..Decl::default()
             }) {
+                let balance = wallet_state.lock().unwrap().balance;
+                let zec_full = balance / 100_000_000;
+                let zec_part = balance % 100_000_000;
+                let balance_str = frame_strf!(data, "{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
                 ui.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
             }
 
@@ -460,12 +478,33 @@ fn ui_left_pane(ui: &mut Context,
             if let _ = elem().decl(Decl {
                 id: id("Balance"),
                 padding,
+                child_gap,
                 width: percent!(1.0),
                 height: fit!(),
+                direction: TopToBottom,
                 align: Align::Center,
                 ..Decl::default()
             }) {
-                ui.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                let txs = &wallet_state.lock().unwrap().txs;
+
+                let tx_count_text_h = ui.scale16(24.0);
+                ui.text(frame_strf!(data, "Transactions ({})", txs.len()), clay::text::TextConfig::new().font_size(tx_count_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+
+                let transaction_text_h = ui.scale16(12.0);
+
+                for tx in txs {
+                    if let _ = elem().decl(Decl{
+                        padding,
+                        child_gap,
+                        height: grow!(),
+                        width: fit!(),
+                        direction: LeftToRight,
+                        align: Align::Top,
+                        ..Decl::default()
+                    }) {
+                        ui.text(frame_strf!(data, "{:?}", tx.0.txid), clay::text::TextConfig::new().font_size(transaction_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                    }
+                }
             }
         }
     }
@@ -473,7 +512,7 @@ fn ui_left_pane(ui: &mut Context,
 
 fn ui_right_pane(ui: &mut Context,
                  wallet_state: Arc<Mutex<wallet::WalletState>>,
-                 _data: &mut SomeDataToKeepAround,
+                 data: &mut SomeDataToKeepAround,
                  child_gap: f32,
                  padding: (f32, f32, f32, f32),
                  radius:  (f32, f32, f32, f32),
@@ -549,7 +588,7 @@ fn ui_right_pane(ui: &mut Context,
 
                         let radius = ui.scale(24.0);
 
-                        // Button 
+                        // Button
                         if let _ = elem().decl(Decl {
                             colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
                             width:  fit!(ui.scale(192.0)),
@@ -576,13 +615,10 @@ fn ui_right_pane(ui: &mut Context,
 }
 
 
-fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
+fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
+    data.per_frame_strs.clear();
+
     let mut result = false;
-    let mut balance_str = String::new();
-    let balance = wallet_state.lock().unwrap().balance;
-    let zec_full = balance / 100_000_000;
-    let zec_part = balance % 100_000_000;
-    balance_str = format!("{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
 
     const MIN_ZOOM: f32 = 0.5;
     const MAX_ZOOM: f32 = 2.0;
@@ -664,7 +700,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             height: grow!(),
             ..Decl::default()
         }) {
-            ui_left_pane(ui, wallet_state.clone(), _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l, &balance_str);
+            ui_left_pane(ui, wallet_state.clone(), data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l);
         }
 
         if let _ = elem().decl(Decl {
@@ -683,7 +719,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             height: grow!(),
             ..Decl::default()
         }) {
-            ui_right_pane(ui, wallet_state.clone(), _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_r);
+            ui_right_pane(ui, wallet_state.clone(), data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_r);
         }
     }
 
@@ -742,7 +778,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
         }
     }
 
-    result |= dbg_ui(ui, _data, is_rendering);
+    result |= dbg_ui(ui, data, is_rendering);
 
     result
 }

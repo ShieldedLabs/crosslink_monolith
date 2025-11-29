@@ -84,21 +84,21 @@ impl Deref for TransparentReceivedOutputSpends {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceivedTransparentOutput {
     // Reference to the transaction in which this TXO was created
-    pub(crate) transaction_id: TxId,
+    pub transaction_id: TxId,
     // The account that controls spend authority for this TXO
-    pub(crate) account_id: AccountId,
+    pub account_id: AccountId,
     // The address to which this TXO was sent
-    pub(crate) address: TransparentAddress,
+    pub address: TransparentAddress,
     // The key scope at which the address was derived
-    pub(crate) key_scope: TransparentKeyScope,
+    pub key_scope: TransparentKeyScope,
     // script, value_zat
-    pub(crate) txout: TxOut,
+    pub txout: TxOut,
     /// The maximum block height at which this TXO was either
     /// observed to be a member of the UTXO set at the start of the block, or observed
     /// to be an output of a transaction mined in the block. This is intended to be used to
     /// determine when the TXO is no longer a part of the UTXO set, in the case that the
     /// transaction that spends it is not detected by the wallet.
-    pub(crate) max_observed_unspent_height: Option<BlockHeight>,
+    pub max_observed_unspent_height: Option<BlockHeight>,
 }
 
 impl ReceivedTransparentOutput {

@@ -1,12 +1,11 @@
 mod received;
-mod sent;
+pub mod sent;
 
-pub(crate) use received::{
+pub use received::{
     ReceievedNoteSpends, ReceivedNote, ReceivedNoteTable, to_spendable_notes,
 };
-#[cfg(test)]
-pub(crate) use sent::SentNoteId;
-pub(crate) use sent::{SentNote, SentNoteTable};
+
+pub use sent::{SentNote, SentNoteTable};
 
 mod serialization {
     use crate::error::Error;

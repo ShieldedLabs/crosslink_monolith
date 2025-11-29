@@ -1,7 +1,7 @@
 //! Internal wallet
 #![allow(warnings)]
 
-use std::convert::Infallible;
+use std::convert::{Infallible, identity};
 use orchard::keys::SpendAuthorizingKey;
 use orchard::note_encryption::{CompactAction};
 use rand_chacha::rand_core::SeedableRng;
@@ -12,6 +12,7 @@ use tonic::client::GrpcService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use zcash_client_backend::fees::{self, StandardFeeRule };
 use zcash_client_backend::proto::service::RawTransaction;
+use zcash_client_memory::types::account::AccountId;
 use zcash_note_encryption::try_compact_note_decryption;
 use zcash_primitives::transaction::components::TxOut;
 use zcash_primitives::transaction::fees::zip317::{self, MINIMUM_FEE};
@@ -21,7 +22,7 @@ use zcash_primitives::transaction::{Transaction, TransactionData, TxVersion};
 use zcash_primitives::transaction::builder::{BuildConfig, Builder as TxBuilder};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
-use zcash_protocol::value::Zatoshis;
+use zcash_protocol::value::{ZatBalance, Zatoshis};
 use zcash_transparent::{
     keys::{ NonHardenedChildIndex },
     builder::{TransparentBuilder, TransparentSigningSet, Unauthorized},
@@ -145,9 +146,7 @@ async fn wait_for_zainod() {
     }
 }
 
-pub struct WalletTx {
-
-}
+pub struct WalletTx(pub TransactionSummary<AccountId>);
 
 pub struct WalletState {
     pub balance: i64, // in zats
@@ -215,6 +214,136 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).ok()?;
         Some(TransparentAddress::from_pubkey(&address_pubkey))
         // Some(account.default_address().ok()??.0)
+    }
+
+    fn get_transaction_history<P: zcash_protocol::consensus::Parameters>(wallet: &MemoryWalletDb<P>) -> Vec<TransactionSummary<AccountId>> {
+        let mut history = wallet
+            .tx_table
+            .iter()
+            .map(|(txid, tx)| {
+                let spent_notes = wallet
+                    .received_note_spends
+                    .iter()
+                    .filter(|(_, spend_txid)| *spend_txid == txid)
+                    .collect::<Vec<_>>();
+
+                let memos = spent_notes
+                    .iter()
+                    .map(|sn| wallet.get_memo(*sn.0).ok()?)
+                    .collect::<Vec<_>>();
+
+                let spent_utxos = wallet
+                    .transparent_received_output_spends
+                    .iter()
+                    .filter(|(_, spend_txid)| *spend_txid == txid)
+                    .collect::<Vec<_>>();
+
+                let sent_notes = wallet
+                    .sent_notes
+                    .iter()
+                    .filter(|(note_id, _)| note_id.txid() == txid)
+                    .filter(|(note_id, _)| {
+                        // use a join on the received notes table to detect which are change
+                        wallet.received_notes.iter().any(|received_note| {
+                            zcash_client_memory::types::sent::SentNoteId::from(received_note.note_id) == **note_id
+                                && !received_note.is_change
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                let received_txo = wallet
+                    .transparent_received_outputs
+                    .iter()
+                    .filter(|(outpoint, _received_output)| outpoint.txid() == txid)
+                    .collect::<Vec<_>>();
+
+                let sent_txo_value: u64 = received_txo
+                    .iter()
+                    .map(|(_, o)| u64::from(o.txout.value()))
+                    .sum();
+
+                // notes received by the transaction
+                let received_notes = wallet
+                    .received_notes
+                    .iter()
+                    .filter(|received_note| received_note.txid() == *txid)
+                    .collect::<Vec<_>>();
+
+                let receiving_account_id = received_notes.first().map(|note| note.account_id());
+                let sending_account_id = sent_notes.first().map(|(_, note)| note.from_account_id);
+                let receiving_transparent_account_id = received_txo
+                    .first()
+                    .map(|(_, received)| received.account_id);
+                let sent_txo_account_id = spent_utxos.first().and_then(|(outpoint, _)| {
+                    // any spent txo was first a received txo
+                    wallet.transparent_received_outputs
+                        .get(outpoint)
+                        .map(|txo| txo.account_id)
+                });
+
+                let account_id = vec![
+                    receiving_account_id,
+                    sending_account_id,
+                    receiving_transparent_account_id,
+                    sent_txo_account_id,
+                ]
+                .into_iter()
+                .find_map(identity)
+                .ok_or(zcash_client_memory::Error::Other(
+                    format!("Account id could not be found for tx: {}", txid).to_string(),
+                ))?;
+
+                let balance_gained: u64 = received_notes
+                    .iter()
+                    .map(|note| note.note.value().into_u64())
+                    .sum::<u64>()
+                    + sent_txo_value;
+
+                let balance_lost: u64 = wallet // includes change
+                    .sent_notes
+                    .iter()
+                    .filter(|(note_id, _)| note_id.txid() == txid)
+                    .map(|(_, sent_note)| sent_note.value.into_u64())
+                    .sum::<u64>()
+                    + tx.fee().map(u64::from).unwrap_or(0);
+
+                let is_shielding = {
+                    //All of the wallet-spent and wallet-received notes are consistent with a shielding transaction.
+                    // e.g. only transparent outputs are spend and only shielded notes are received
+                    spent_notes.is_empty() && !spent_utxos.is_empty()
+                        // The transaction contains at least one wallet-received note.
+                        && !received_notes.is_empty()
+                        // We do not know about any external outputs of the transaction.
+                        && sent_notes.is_empty()
+                };
+
+                let has_change = received_notes.iter().any(|note| note.is_change);
+
+                Ok(
+                    TransactionSummary::from_parts(
+                        account_id,                                                             // account_id
+                        *txid,              // txid
+                        tx.expiry_height(), // expiry_height
+                        tx.mined_height(),  // mined_height
+                        ZatBalance::from_i64((balance_gained as i64) - (balance_lost as i64))?, // account_value_delta
+                        Zatoshis::from_u64(balance_lost)?,
+                        Zatoshis::from_u64(balance_gained)?,
+                        tx.fee(),                              // fee_paid
+                        spent_notes.len() + spent_utxos.len(), // spent_note_count
+                        has_change,                            // has_change
+                        sent_notes.len(),                      // sent_note_count (excluding change)
+                        received_notes.iter().filter(|note| !note.is_change).count(), // received_note_count (excluding change)
+                        memos.iter().filter(|m| m.is_some()).count(),
+                        false,        // Unimplemented: expired_unmined
+                        is_shielding, // is_shielding
+                    ),
+                )
+            })
+            .collect::<Result<Vec<_>, zcash_client_memory::Error>>()
+            .expect("COULD NOT GET TRANSACTION HISTORY");
+        history.sort_by(|a, b|
+            b.mined_height.cmp(&a.mined_height).then(b.txid.cmp(&a.txid)));
+        return history;
     }
 
     // NOTE(azmr): I don't yet understand why the wallet requires miner index = 0 but user index = 1.
@@ -488,12 +617,15 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 // DONE
                 txs_seen_block_height = tip_h.into();
+
+                let history = get_transaction_history(&user_wallet);
+                wallet_state.lock().unwrap().txs = history.iter().map(|h| WalletTx(h.clone())).collect(); // @temp: shouldn't be a separate type
             }
 
             if !already_sent && txs_seen_block_height >= 5 {
             // if !already_sent && miner_utxos.len() != 0 && miner_utxos[0].height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64) < latest_block.height {
                 let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
-                if false {
+                if true {
                     let mut signing_set = TransparentSigningSet::new();
                     signing_set.add_key(miner_privkey);
 
@@ -760,3 +892,65 @@ impl ServerCertVerifier for DerVerifier {
     }
 }
 */
+
+#[derive(Debug, Copy, Clone)]
+pub struct TransactionSummary<AccountId> {
+    pub account_id: AccountId,
+    pub txid: zcash_protocol::TxId,
+    pub expiry_height: Option<BlockHeight>,
+    pub mined_height: Option<BlockHeight>,
+    pub account_value_delta: ZatBalance,
+    pub total_spent: Zatoshis,
+    pub total_received: Zatoshis,
+    pub fee_paid: Option<Zatoshis>,
+    pub spent_note_count: usize,
+    pub has_change: bool,
+    pub sent_note_count: usize,
+    pub received_note_count: usize,
+    pub memo_count: usize,
+    pub expired_unmined: bool,
+    pub is_shielding: bool,
+}
+
+impl<AccountId> TransactionSummary<AccountId> {
+    /// Constructs a `TransactionSummary` from its parts.
+    ///
+    /// See the documentation for each getter method below to determine how each method
+    /// argument should be prepared.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        account_id: AccountId,
+        txid: zcash_protocol::TxId,
+        expiry_height: Option<BlockHeight>,
+        mined_height: Option<BlockHeight>,
+        account_value_delta: ZatBalance,
+        total_spent: Zatoshis,
+        total_received: Zatoshis,
+        fee_paid: Option<Zatoshis>,
+        spent_note_count: usize,
+        has_change: bool,
+        sent_note_count: usize,
+        received_note_count: usize,
+        memo_count: usize,
+        expired_unmined: bool,
+        is_shielding: bool,
+    ) -> Self {
+        Self {
+            account_id,
+            txid,
+            expiry_height,
+            mined_height,
+            account_value_delta,
+            total_spent,
+            total_received,
+            fee_paid,
+            spent_note_count,
+            has_change,
+            sent_note_count,
+            received_note_count,
+            memo_count,
+            expired_unmined,
+            is_shielding,
+        }
+    }
+}
