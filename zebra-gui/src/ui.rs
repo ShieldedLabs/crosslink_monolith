@@ -5,7 +5,7 @@ use std::{hash::Hash};
 use winit::{event::MouseButton, keyboard::KeyCode};
 use clay_layout as clay;
 use clay::{Clay, Declaration};
-use clay::render_commands::RenderCommandConfig::{Rectangle, Text};
+use clay::render_commands::RenderCommandConfig::{Rectangle, Text, ScissorStart, ScissorEnd};
 use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 //use clay::*; // @Temporary
 
@@ -114,6 +114,7 @@ struct Decl {
     colour: (u8, u8, u8, u8),
     radius: (f32, f32, f32, f32),
     padding: (f32, f32, f32, f32),
+    clip: bool,
     child_gap: f32,
     align: Align,
     width:  Sizing,
@@ -220,7 +221,7 @@ fn decl(item: Decl) {
         a: item.colour.3 as f32
     };
     decl.id = item.id.clay().id;
-    // decl.clip = Clay_ClipElementConfig { true, true, Clay_Vector2 { x: 0.0, y: 0.0 } };
+    decl.clip = clay::Clay_ClipElementConfig { horizontal: item.clip, vertical: item.clip, childOffset: clay::Clay_Vector2 { x: 0.0, y: 0.0 } };
     decl.layout.sizing.width  = clay::Clay_SizingAxis::from(sizing(item.width));
     decl.layout.sizing.height = clay::Clay_SizingAxis::from(sizing(item.height));
     decl.layout.padding = clay::Clay_Padding::from(clay::Clay_Padding {
@@ -662,6 +663,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             direction: TopToBottom,
             width: pane_pct,
             height: grow!(),
+            clip: true,
             ..Decl::default()
         }) {
             ui_left_pane(ui, wallet_state.clone(), _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l, &balance_str);
@@ -681,6 +683,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             direction: TopToBottom,
             width: pane_pct,
             height: grow!(),
+            clip: true,
             ..Decl::default()
         }) {
             ui_right_pane(ui, wallet_state.clone(), _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_r);
@@ -725,6 +728,12 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                 }
                 Text(config) => {
                     ui.draw().text_line(x1 as f32, y1 as f32, config.font_size as f32, config.text, clay_color_to_u32(config.color));
+                }
+                ScissorStart() => {
+                    ui.draw().set_scissor(x1, y1, x2, y2);
+                }
+                ScissorEnd() => {
+                    ui.draw().clear_scissor();
                 }
                 misc => { todo!("Unsupported clay render command: {:?}", misc) }
             }
