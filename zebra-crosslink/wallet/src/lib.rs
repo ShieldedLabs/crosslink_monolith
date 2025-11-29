@@ -1,6 +1,7 @@
 //! Internal wallet
 #![allow(warnings)]
 
+use std::convert::Infallible;
 use orchard::keys::SpendAuthorizingKey;
 use orchard::note_encryption::{CompactAction};
 use rand_chacha::rand_core::SeedableRng;
@@ -9,7 +10,7 @@ use sapling_crypto::zip32::ExtendedSpendingKey;
 use tokio_rustls::rustls;
 use tonic::client::GrpcService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
-use zcash_client_backend::fees::StandardFeeRule;
+use zcash_client_backend::fees::{self, StandardFeeRule };
 use zcash_client_backend::proto::service::RawTransaction;
 use zcash_note_encryption::try_compact_note_decryption;
 use zcash_primitives::transaction::components::TxOut;
@@ -246,7 +247,14 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     // NOTE: the default isn't the same as below, but I think this is because it forces a diversifier index
     println!("User wallet: {}/{:?}", user_t_addr_str, user_t_addr1.encode(network));
 
-
+    const FEE_RULE: StandardFeeRule = StandardFeeRule::Zip317;
+    const FALLBACK_CHANGE_POOL: zcash_protocol::ShieldedProtocol = zcash_protocol::ShieldedProtocol::Orchard;
+    let change_strategy = fees::standard::SingleOutputChangeStrategy::new(
+        FEE_RULE,
+        None,
+        FALLBACK_CHANGE_POOL,
+        fees::DustOutputPolicy::default(),
+    );
     let mut block_cache = MemBlockCache::new();
 
     let mut txs_seen_block_height = 0;
@@ -397,7 +405,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     if txs.len() > 0 {
                         println!("txs for {t_addr}:");
                     }
-                    for raw_tx in txs {
+                    for raw_tx in &txs {
                         let tx_height = BlockHeight::from_u32(raw_tx.height.try_into().unwrap());
                         let branch_id = BranchId::for_height(network, tx_height);
                         let tx = Transaction::read(raw_tx.data.as_slice(), branch_id);
@@ -445,16 +453,47 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
 
                     println!("{} {:#?}", t_addr, wallet.get_wallet_summary(wallet::ConfirmationsPolicy::MIN));
-                }
 
+                    // immediately shield newly-received transparent transactions
+                    if txs.len() > 0 {
+                        let min_zats_for_shielding = Zatoshis::const_from_u64(10_000);
+                        match wallet::propose_shielding::<_, _, _, _, Infallible>(
+                            wallet,
+                            network,
+                            &wallet::input_selection::GreedyInputSelector::new(),
+                            &change_strategy,
+                            min_zats_for_shielding,
+                            &[miner_t_addr],
+                            miner_account.id(),
+                            wallet::ConfirmationsPolicy::MIN,
+                        ) {
+                            Err(err) => println!("propose_shielding error: {err:?}"),
+                            Ok(proposal) => {
+                                let prover = LocalTxProver::bundled();
+                                match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                                    wallet, network,
+                                    &prover,
+                                    &prover,
+                                    &wallet::SpendingKeys::from_unified_spending_key(miner_usk.clone()),
+                                    zcash_client_backend::wallet::OvkPolicy::Sender,
+                                    &proposal)
+                                {
+                                    Err(err) => println!("shielding create_proposed_transactions error: {err:?}"),
+                                    Ok(txid) => println!("created shielding transaction {txid:?}"),
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // DONE
                 txs_seen_block_height = tip_h.into();
             }
 
-            if !already_sent && miner_utxos.len() != 0 && miner_utxos[0].height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64) < latest_block.height {
+            if !already_sent && txs_seen_block_height >= 5 {
+            // if !already_sent && miner_utxos.len() != 0 && miner_utxos[0].height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64) < latest_block.height {
                 let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
-                if true {
+                if false {
                     let mut signing_set = TransparentSigningSet::new();
                     signing_set.add_key(miner_privkey);
 
@@ -500,7 +539,6 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 } else {
                     // NOTE: we can't send transparent->transparent through the high-level API, we
                     // have to propose_shielding first, then send in a later block
-                    use std::convert::Infallible;
                     match wallet::propose_standard_transfer_to_address::<_, _, Infallible>(
                         &mut miner_wallet,
                         network,
@@ -511,7 +549,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         zats,
                         None,
                         None,
-                        zcash_protocol::ShieldedProtocol::Orchard)
+                        FALLBACK_CHANGE_POOL)
                     {
                         Err(err) => println!("propose_transfer error: {err:?}"),
                         Ok(proposal) => {
@@ -525,13 +563,14 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 &proposal)
                             {
                                 Err(err) => println!("create_proposed_transactions error: {err:?}"),
-                                Ok(txid) => println!("created transaction {txid:?}"),
+                                Ok(txid) => {
+                                    println!("created transaction {txid:?}");
+                                    already_sent = true;
+                                },
                             }
                         }
                     }
                 }
-
-                already_sent = true;
             }
 
             // let latest = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
