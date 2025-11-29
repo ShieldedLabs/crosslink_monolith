@@ -300,7 +300,7 @@ impl Context {
         }
 
         if hover {
-            // self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
+            self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
         }
 
         let activated = (*clicked_id == id) && if act_on_press {
@@ -833,6 +833,7 @@ pub struct Context {
     pub clay:  *mut   Clay,
 
     pub cursor: winit::window::Cursor,
+    pub prev_cursor: winit::window::Cursor,
 
     pub debug: bool,
     pub pixel_inspector_primed: bool,
