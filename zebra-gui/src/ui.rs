@@ -249,7 +249,7 @@ const INACTIVE_TAB_COL: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
 const ACTIVE_TAB_COL:   (u8, u8, u8, u8) = PANE_COL;
 const BUTTON_COL:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff);
 const BUTTON_HOVER_COL: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
-const BUTTON_DOWN_COL:  (u8, u8, u8, u8) = (0x1e, 0x1e, 0x1e, 0xff);
+const BUTTON_DOWN_COL:  (u8, u8, u8, u8) = (0x1c, 0x1c, 0x1c, 0xff);
 
 
 impl Context {
@@ -263,16 +263,22 @@ impl Context {
     fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
 
     fn button(&self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) {
-        let mouse_held    = self.input().mouse_held(winit::event::MouseButton::Left);
-        let mouse_clicked = self.input().mouse_pressed(winit::event::MouseButton::Left);
+        let mouse_held     = self.input().mouse_held(winit::event::MouseButton::Left);
+        let mouse_pressed  = self.input().mouse_pressed(winit::event::MouseButton::Left);
+        let mouse_released = self.input().mouse_released(winit::event::MouseButton::Left);
 
-        let hover = unsafe { clay::Clay_PointerOver(id.clay().id) };
-        let (down, click) = (hover && mouse_held, hover && mouse_clicked);
-        if click {
+        let hover    = unsafe { clay::Clay_PointerOver(id.clay().id) };
+        let down     = hover && mouse_held;
+        let pressed  = hover && mouse_pressed;
+        let released = hover && mouse_released;
+        if pressed {
             *clicked_id = id;
         }
 
-        let colour = if down || click {
+        const act_on_press: bool = true;
+        let activated = (*clicked_id == id) && (if act_on_press { pressed } else { released });
+
+        let colour = if down || pressed {
             if clicked_id.id == id.id {
                 BUTTON_DOWN_COL
             } else {
@@ -284,7 +290,7 @@ impl Context {
             BUTTON_COL
         };
 
-        (click, colour)
+        (activated, colour)
     }
 
     fn text(&self, label: &str, config: clay::text::TextElementConfig) {
