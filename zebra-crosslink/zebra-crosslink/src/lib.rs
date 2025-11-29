@@ -564,8 +564,9 @@ async fn new_decided_bft_block_from_malachite(
         panic!();
     }
 
+    drop(internal);
     assert_eq!(
-        validate_bft_block_from_malachite_already_locked(&tfl_handle, &mut internal, new_block)
+        validate_bft_block_from_malachite(&tfl_handle, new_block)
             .await,
         tenderlink::TMStatus::Pass
     );
@@ -574,6 +575,8 @@ async fn new_decided_bft_block_from_malachite(
     let new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
     // assert_eq!(new_final_height.0, new_block.finalization_candidate_height);
     let insert_i = new_block.height as usize - 1;
+
+    internal = tfl_handle.internal.lock().await;
 
     // HACK: ensure there are enough blocks to overwrite this at the correct index
     for i in internal.bft_blocks.len()..=insert_i {
@@ -622,8 +625,8 @@ async fn new_decided_bft_block_from_malachite(
             error!(?err);
         }
     }
-    let mut internal = tfl_handle.internal.lock().await;
-
+    
+    internal = tfl_handle.internal.lock().await;
     {
         let new_bc_final = internal.latest_final_block;
 
@@ -635,6 +638,7 @@ async fn new_decided_bft_block_from_malachite(
                 new_final_height_hash.1
             };
 
+            drop(internal);
             let (new_final_height_hashes, new_final_blocks) = tfl_block_sequence(
                 &call,
                 start_hash,
@@ -643,6 +647,7 @@ async fn new_decided_bft_block_from_malachite(
                 true,
             )
             .await;
+            internal = tfl_handle.internal.lock().await;
 
             let mut quiet = true;
             if let (Some(Some(first_block)), Some(Some(last_block))) =
@@ -817,13 +822,6 @@ async fn validate_bft_block_from_malachite(
     new_block: &BftBlock,
 ) -> tenderlink::TMStatus {
     let mut internal = tfl_handle.internal.lock().await;
-    validate_bft_block_from_malachite_already_locked(tfl_handle, &mut internal, new_block).await
-}
-async fn validate_bft_block_from_malachite_already_locked(
-    tfl_handle: &TFLServiceHandle,
-    internal: &mut TFLServiceInternal,
-    new_block: &BftBlock,
-) -> tenderlink::TMStatus {
     let call = tfl_handle.call.clone();
     let params = &PROTOTYPE_PARAMETERS;
 
@@ -837,6 +835,7 @@ async fn validate_bft_block_from_malachite_already_locked(
         );
         return tenderlink::TMStatus::Fail;
     }
+    drop(internal);
 
     let new_final_hash = new_block.headers.first().expect("at least 1 header").hash();
     let new_final_pow_height =

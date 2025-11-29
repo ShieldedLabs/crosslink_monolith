@@ -477,10 +477,10 @@ impl DrawCtx {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
                 *self.draw_command_count += 1;
                 *put = DrawCommand::RoundedRectangle {
-                    x: x1.max(0.0),
-                    x2: x2.min(self.window_width as f32),
-                    y: y1.max(0.0) as f32,
-                    y2: y2.min(self.window_height as f32),
+                    x: x1,
+                    x2: x2,
+                    y: y1,
+                    y2: y2,
                     radius_tl: 0,
                     radius_tr: 0,
                     radius_bl: 0,
@@ -541,10 +541,10 @@ impl DrawCtx {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
                 *self.draw_command_count += 1;
                 *put = DrawCommand::RoundedRectangle {
-                    x: x1.max(0) as f32,
-                    x2: x2.min(self.window_width) as f32,
-                    y: y1.max(0) as f32,
-                    y2: y2.min(self.window_height) as f32,
+                    x: x1 as f32,
+                    x2: x2 as f32,
+                    y: y1 as f32,
+                    y2: y2 as f32,
                     radius_tl,
                     radius_tr,
                     radius_bl,
