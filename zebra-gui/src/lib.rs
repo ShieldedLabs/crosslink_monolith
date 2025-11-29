@@ -476,7 +476,7 @@ impl DrawCtx {
             if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
                 *self.draw_command_count += 1;
-                *put = DrawCommand::ColoredRectangle {
+                *put = DrawCommand::RoundedRectangle {
                     x: x1.max(0.0),
                     x2: x2.min(self.window_width as f32),
                     y: y1.max(0.0) as f32,
@@ -540,7 +540,7 @@ impl DrawCtx {
             if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
                 *self.draw_command_count += 1;
-                *put = DrawCommand::ColoredRectangle {
+                *put = DrawCommand::RoundedRectangle {
                     x: x1.max(0) as f32,
                     x2: x2.min(self.window_width) as f32,
                     y: y1.max(0) as f32,
@@ -560,7 +560,7 @@ impl DrawCtx {
             if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
                 *self.draw_command_count += 1;
-                *put = DrawCommand::ColoredRectangle {
+                *put = DrawCommand::RoundedRectangle {
                     x: x - radius,
                     x2: x + radius,
                     y: y - radius,
@@ -579,7 +579,7 @@ impl DrawCtx {
             if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
                 *self.draw_command_count += 1;
-                *put = DrawCommand::ColoredRectangle {
+                *put = DrawCommand::RoundedRectangle {
                     x: x - radius,
                     x2: x + radius,
                     y: y - radius,
@@ -740,7 +740,7 @@ enum DrawCommand {
     ClearScreenToColor {
         color: u32,
     },
-    ColoredRectangle {
+    RoundedRectangle {
         x: f32,
         x2: f32,
         y: f32,
@@ -1262,7 +1262,10 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                 }
                                             }
 
-                                            window.set_cursor(gui_ctx.cursor.clone());
+                                            if (gui_ctx.prev_cursor != gui_ctx.cursor) {
+                                                gui_ctx.prev_cursor  = gui_ctx.cursor.clone();
+                                                window.set_cursor(gui_ctx.cursor.clone());
+                                            }
 
                                             input_ctx.mouse_moved = false;
                                             input_ctx.last_mouse_pos = input_ctx.this_mouse_pos;
@@ -1359,7 +1362,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                                         scissor_x2 = x2;
                                                                         scissor_y2 = y2;
                                                                     }
-                                                                    DrawCommand::ColoredRectangle {
+                                                                    DrawCommand::RoundedRectangle {
                                                                         x: ofx,
                                                                         x2: ofx2,
                                                                         y: ofy,
@@ -1442,7 +1445,10 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                                                 }
                                                                                 let pixel_alpha = color_alpha * cover_alpha;
 
-                                                                                *(cursor_pixels as *mut u32) = blend_u32(*(cursor_pixels as *mut u32), color,  (pixel_alpha * 255.0).round() as u32);
+                                                                                if (_x as isize) >= scissor_x1 && (_x as isize) < scissor_x2 &&
+                                                                                   (_y as isize) >= scissor_y1 && (_y as isize) < scissor_y2 {  // @Scissor
+                                                                                    *(cursor_pixels as *mut u32) = blend_u32(*(cursor_pixels as *mut u32), color,  (pixel_alpha * 255.0).round() as u32);
+                                                                                }
                                                                                 cursor_pixels = cursor_pixels.byte_add(4);
                                                                             }
                                                                             row_pixels = row_pixels.byte_add(4 << pixel_row_shift);
@@ -1450,6 +1456,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                                     },
                                                                     DrawCommand::TextRow { y, glyph_row_shift, color, font_tracker_id, font_row_index, glyph_bitmap_run, glyph_bitmap_run_len } => {
                                                                         if (y as u32) < tile_pixel_y || (y as u32) >= tile_pixel_y2 { continue; }
+                                                                        if (y as isize) < scissor_y1 || (y as isize) >= scissor_y2 { continue; } // @Scissor
 
                                                                         let font_tracker = &*(*ctx.draw_ctx).font_tracker_buffer.add(font_tracker_id as usize);
                                                                         let bitmap_widths = font_tracker.cached_bitmap_widths.as_ptr();
@@ -1483,10 +1490,12 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                                             }
                                                                             let len = x2 - x1;
                                                                             if len <= 0 { continue; }
-                                                                            for _ in 0..len {
+                                                                            for _x in x1..x2 {
                                                                                 let blend = *copy_data as u32;
                                                                                 copy_data = copy_data.byte_add(1);
-                                                                                *(put_data as *mut u32) = blend_u32(*(put_data as *mut u32), color, blend);
+                                                                                if (_x as isize) >= scissor_x1 && (_x as isize) < scissor_x2 { // @Scissor
+                                                                                    *(put_data as *mut u32) = blend_u32(*(put_data as *mut u32), color, blend);
+                                                                                }
                                                                                 put_data = put_data.byte_add(4);
                                                                             }
                                                                         }

@@ -5,7 +5,7 @@ use std::{hash::Hash};
 use winit::{event::MouseButton, keyboard::KeyCode};
 use clay_layout as clay;
 use clay::{Clay, Declaration};
-use clay::render_commands::RenderCommandConfig::{Rectangle, Text};
+use clay::render_commands::RenderCommandConfig::{Rectangle, Text, ScissorStart, ScissorEnd};
 use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 //use clay::*; // @Temporary
 
@@ -20,6 +20,22 @@ pub fn magic<'a, 'b, T>(mut_ref: &'a mut T) -> &'b mut T {
 pub struct SomeDataToKeepAround {
     pub messages:          Vec<String>,
     pub can_send_messages: bool,
+    pub per_frame_strs:    Vec<String>,
+}
+
+
+#[macro_export]
+macro_rules! frame_strf {
+    ($data:expr, $($arg:tt)*) => {
+        $data.frame_str(&format_args!($($arg)*).to_string())
+    };
+}
+
+impl SomeDataToKeepAround {
+    fn frame_str(&mut self, str: &str) -> &String {
+        self.per_frame_strs.push(str.to_string().clone());
+        return self.per_frame_strs.last().unwrap();
+    }
 }
 
 fn dbg_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
@@ -114,6 +130,7 @@ struct Decl {
     colour: (u8, u8, u8, u8),
     radius: (f32, f32, f32, f32),
     padding: (f32, f32, f32, f32),
+    clip: bool,
     child_gap: f32,
     align: Align,
     width:  Sizing,
@@ -149,10 +166,10 @@ impl Id {
 
 fn id(label: &str) -> Id { Id::id(label) }
 
-struct CloseElement {}
-fn elem() -> CloseElement { unsafe { clay::Clay__OpenElement(); } CloseElement {} }
-impl Drop for CloseElement { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
-impl CloseElement { fn decl(&self, item: Decl) -> &Self { decl(item); self } }
+struct Element {}
+fn elem() -> Element { unsafe { clay::Clay__OpenElement(); } Element {} }
+impl Drop for Element { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
+impl Element { fn decl(&self, item: Decl) -> &Self { decl(item); self } }
 
 const Clay_ElementId_ZERO: clay::Clay_ElementId = clay::Clay_ElementId { id: 0, offset: 0, baseId: 0, stringId: clay::Clay_String { isStaticallyAllocated: false, length: 0, chars: std::ptr::null() } };
 const Clay_SizingMinMax_ZERO: clay::Clay_SizingMinMax = clay::Clay_SizingMinMax { min: 0f32, max: f32::MAX };
@@ -210,7 +227,6 @@ fn decl(item: Decl) {
             Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
         }
     }
-    
 
     let mut decl = Clay_ElementDeclaration_ZERO;
     decl.backgroundColor = clay::Clay_Color {
@@ -220,7 +236,7 @@ fn decl(item: Decl) {
         a: item.colour.3 as f32
     };
     decl.id = item.id.clay().id;
-    // decl.clip = Clay_ClipElementConfig { true, true, Clay_Vector2 { x: 0.0, y: 0.0 } };
+    decl.clip = clay::Clay_ClipElementConfig { horizontal: item.clip, vertical: item.clip, childOffset: clay::Clay_Vector2 { x: 0.0, y: 0.0 } };
     decl.layout.sizing.width  = clay::Clay_SizingAxis::from(sizing(item.width));
     decl.layout.sizing.height = clay::Clay_SizingAxis::from(sizing(item.height));
     decl.layout.padding = clay::Clay_Padding::from(clay::Clay_Padding {
@@ -251,6 +267,14 @@ const BUTTON_COL:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff);
 const BUTTON_HOVER_COL: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
 const BUTTON_DOWN_COL:  (u8, u8, u8, u8) = (0x1c, 0x1c, 0x1c, 0xff);
 
+#[derive(Debug, Default, Copy, Clone)]
+pub enum Modal {
+    #[default] None,
+    Send,
+    Receive,
+    Stake,
+    Unstake,
+}
 
 impl Context {
     pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, ..Default::default() } }
@@ -276,7 +300,7 @@ impl Context {
         }
 
         if hover {
-            // self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
+            self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
         }
 
         let activated = (*clicked_id == id) && if act_on_press {
@@ -311,17 +335,16 @@ impl Context {
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
 
-    fn tab(&mut self,
-           radius: (f32, f32, f32, f32),
-           padding: (f32, f32, f32, f32),
-           tab_id: &mut Id,
-           clicked_id: &mut Id,
-           label: &str) -> Id {
+    fn tab_ex(&mut self,
+              radius: (f32, f32, f32, f32),
+              padding: (f32, f32, f32, f32),
+              tab_id: &mut Id,
+              clicked_id: &mut Id,
+              id: Id,
+              label: &str) -> Id {
         let tab_text_h = self.scale16(18.0);
 
         let radius = (radius.0, radius.1, 0.0, 0.0);
-
-        let id = Id::id(label);
 
         let (clicked, _) = self.button(clicked_id, id);
         if clicked || *tab_id == Id::default() {
@@ -342,6 +365,16 @@ impl Context {
 
         id
     }
+
+    fn tab(&mut self,
+           radius: (f32, f32, f32, f32),
+           padding: (f32, f32, f32, f32),
+           tab_id: &mut Id,
+           clicked_id: &mut Id,
+           label: &str) -> Id {
+        let id = Id::id(label);
+        self.tab_ex(radius, padding, tab_id, clicked_id, id, label)
+    }
 }
 
 trait         Dup2: Copy { fn dup2(self) -> (Self, Self); }
@@ -353,13 +386,12 @@ impl<T: Copy> Dup4 for T { fn dup4(self) -> (Self, Self, Self, Self) { (self, se
 
 fn ui_left_pane(ui: &mut Context,
                 wallet_state: Arc<Mutex<wallet::WalletState>>,
-                _data: &mut SomeDataToKeepAround,
+                data: &mut SomeDataToKeepAround,
                 child_gap: f32,
                 padding: (f32, f32, f32, f32),
                 radius:  (f32, f32, f32, f32),
                 clicked_id: &mut Id,
-                tab_id: &mut Id,
-                balance_str: &str) {
+                tab_id: &mut Id) {
 
     let mut tab_id_wallet = Id::default();
     let mut tab_id_finalizers = Id::default();
@@ -374,8 +406,8 @@ fn ui_left_pane(ui: &mut Context,
         ..Decl::default()
     }) {
         tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, clicked_id, "Wallet");
-        tab_id_finalizers = ui.tab(radius, padding, tab_id, clicked_id, "Finalizers");
-        tab_id_history    = ui.tab(radius, padding, tab_id, clicked_id, "History");
+        // tab_id_finalizers = ui.tab(radius, padding, tab_id, clicked_id, "Finalizers");
+        tab_id_history    = ui.tab_ex(radius, padding, tab_id, clicked_id, Id::id("History"), frame_strf!(data, "History ({})", &wallet_state.lock().unwrap().txs.len()));
     }
 
     // Main contents
@@ -403,6 +435,10 @@ fn ui_left_pane(ui: &mut Context,
                 align: Align::Center,
                 ..Decl::default()
             }) {
+                let balance = wallet_state.lock().unwrap().balance;
+                let zec_full = balance / 100_000_000;
+                let zec_part = balance % 100_000_000;
+                let balance_str = frame_strf!(data, "{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
                 ui.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
             }
 
@@ -418,7 +454,7 @@ fn ui_left_pane(ui: &mut Context,
                 ..Decl::default()
             }) {
 
-                let mut button = |label| {
+                let mut button = |ui: &mut Context, label| {
                     let id = Id::id(label);
                     let (clicked, colour) = ui.button(clicked_id, id);
                     if let _ = elem().decl(Decl {
@@ -448,10 +484,10 @@ fn ui_left_pane(ui: &mut Context,
                     clicked
                 };
 
-                if button("Send")    { println!("Send!");    }
-                if button("Receive") { println!("Receive!"); }
-                if button("Stake")   { println!("Stake!");   }
-                if button("Unstake") { println!("Unstake!"); }
+                if button(ui, "Send")    { ui.modal = Modal::Send;    }
+                if button(ui, "Receive") { ui.modal = Modal::Receive; }
+                if button(ui, "Stake")   { ui.modal = Modal::Stake;   }
+                if button(ui, "Unstake") { ui.modal = Modal::Unstake; }
 
             }
 
@@ -460,12 +496,33 @@ fn ui_left_pane(ui: &mut Context,
             if let _ = elem().decl(Decl {
                 id: id("Balance"),
                 padding,
+                child_gap,
                 width: percent!(1.0),
                 height: fit!(),
+                direction: TopToBottom,
                 align: Align::Center,
                 ..Decl::default()
             }) {
-                ui.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                let txs = &wallet_state.lock().unwrap().txs;
+
+                let tx_count_text_h = ui.scale16(24.0);
+                ui.text(frame_strf!(data, "Transactions ({})", txs.len()), clay::text::TextConfig::new().font_size(tx_count_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+
+                let transaction_text_h = ui.scale16(12.0);
+
+                for tx in txs {
+                    if let _ = elem().decl(Decl{
+                        padding,
+                        child_gap,
+                        height: grow!(),
+                        width: fit!(),
+                        direction: LeftToRight,
+                        align: Align::Top,
+                        ..Decl::default()
+                    }) {
+                        ui.text(frame_strf!(data, "{:?}", tx.0.txid), clay::text::TextConfig::new().font_size(transaction_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                    }
+                }
             }
         }
     }
@@ -473,7 +530,7 @@ fn ui_left_pane(ui: &mut Context,
 
 fn ui_right_pane(ui: &mut Context,
                  wallet_state: Arc<Mutex<wallet::WalletState>>,
-                 _data: &mut SomeDataToKeepAround,
+                 data: &mut SomeDataToKeepAround,
                  child_gap: f32,
                  padding: (f32, f32, f32, f32),
                  radius:  (f32, f32, f32, f32),
@@ -492,7 +549,7 @@ fn ui_right_pane(ui: &mut Context,
         ..Decl::default()
     }) {
         tab_id_faucet   = ui.tab(radius, padding, tab_id, clicked_id, "Faucet");
-        tab_id_roster   = ui.tab(radius, padding, tab_id, clicked_id, "Roster");
+        // tab_id_roster   = ui.tab(radius, padding, tab_id, clicked_id, "Roster");
         tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, clicked_id, "Settings");
     }
 
@@ -549,7 +606,7 @@ fn ui_right_pane(ui: &mut Context,
 
                         let radius = ui.scale(24.0);
 
-                        // Button 
+                        // Button
                         if let _ = elem().decl(Decl {
                             colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
                             width:  fit!(ui.scale(192.0)),
@@ -565,8 +622,8 @@ fn ui_right_pane(ui: &mut Context,
 
                 if button_ex("Receive cTAZ", false) {
                     println!("Receive cTAZ from faucet!");
+                    wallet_state.lock().unwrap().request_from_faucet();
                 }
-
             }
 
         } else if *tab_id == tab_id_roster {
@@ -576,13 +633,10 @@ fn ui_right_pane(ui: &mut Context,
 }
 
 
-fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
+fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
+    data.per_frame_strs.clear();
+
     let mut result = false;
-    let mut balance_str = String::new();
-    let balance = wallet_state.lock().unwrap().balance;
-    let zec_full = balance / 100_000_000;
-    let zec_part = balance % 100_000_000;
-    balance_str = format!("{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
 
     const MIN_ZOOM: f32 = 0.5;
     const MAX_ZOOM: f32 = 2.0;
@@ -662,9 +716,10 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             direction: TopToBottom,
             width: pane_pct,
             height: grow!(),
+            clip: true,
             ..Decl::default()
         }) {
-            ui_left_pane(ui, wallet_state.clone(), _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l, &balance_str);
+            ui_left_pane(ui, wallet_state.clone(), data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l);
         }
 
         if let _ = elem().decl(Decl {
@@ -681,9 +736,10 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             direction: TopToBottom,
             width: pane_pct,
             height: grow!(),
+            clip: true,
             ..Decl::default()
         }) {
-            ui_right_pane(ui, wallet_state.clone(), _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_r);
+            ui_right_pane(ui, wallet_state.clone(), data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_r);
         }
     }
 
@@ -726,6 +782,12 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
                 Text(config) => {
                     ui.draw().text_line(x1 as f32, y1 as f32, config.font_size as f32, config.text, clay_color_to_u32(config.color));
                 }
+                ScissorStart() => {
+                    ui.draw().set_scissor(x1, y1, x2, y2);
+                }
+                ScissorEnd() => {
+                    ui.draw().clear_scissor();
+                }
                 misc => { todo!("Unsupported clay render command: {:?}", misc) }
             }
 
@@ -742,7 +804,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
         }
     }
 
-    result |= dbg_ui(ui, _data, is_rendering);
+    result |= dbg_ui(ui, data, is_rendering);
 
     result
 }
@@ -771,6 +833,7 @@ pub struct Context {
     pub clay:  *mut   Clay,
 
     pub cursor: winit::window::Cursor,
+    pub prev_cursor: winit::window::Cursor,
 
     pub debug: bool,
     pub pixel_inspector_primed: bool,
@@ -786,6 +849,8 @@ pub struct Context {
 
     pub pane_tab_l: Id,
     pub pane_tab_r: Id,
+
+    pub modal: Modal,
 }
 
 #[derive(Debug, Default, Copy, Clone)]

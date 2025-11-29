@@ -12,6 +12,6 @@ pub(crate) use account::*;
 pub(crate) use block::*;
 pub(crate) use data_requests::*;
 pub use memory_wallet::*;
-pub(crate) use notes::*;
+pub use notes::*;
 pub(crate) use nullifier::*;
 pub(crate) use transaction::*;

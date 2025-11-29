@@ -383,7 +383,7 @@ impl From<zcash_client_backend::data_api::testing::transparent::GapLimits> for G
 /// system from the clock. A `WalletDb` encapsulates the full set of capabilities that are required
 /// in order to implement the [`WalletRead`], [`WalletWrite`] and [`WalletCommitmentTrees`] traits.
 pub struct WalletDb<C, P, CL, R> {
-    conn: C,
+    pub conn: C,
     params: P,
     clock: CL,
     rng: R,
