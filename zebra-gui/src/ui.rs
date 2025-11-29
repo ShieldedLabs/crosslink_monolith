@@ -500,7 +500,7 @@ fn ui_left_pane(ui: &mut Context,
             let contents_hovered = ui.hovered(contents_id);
 
             let text_h = ui.scale16(24.0);
-            let title_bar = |ui: &mut Context, clicked_id: &mut Id, title, title_bar_id, closeable| {
+            let title_bar = |ui: &mut Context, clicked_id: &mut Id, closeable, title, title_bar_id| {
                 if let _ = elem().decl(Decl {
                     id: title_bar_id,
                     child_gap,
@@ -514,20 +514,18 @@ fn ui_left_pane(ui: &mut Context,
                     if let _ = elem().decl(Decl { width: grow!(), align: Align::Center, ..Decl::default() }) {
                         ui.text(title, clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
                     }
-                    if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Align::Right, ..Decl::default() }) {
+                    if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Align::Right, ..Decl::default() }) && closeable {
                         let id = id("Close This Modal");
 
-                        if closeable {
-                            let (clicked, colour) = ui.button_act_on_release(clicked_id, id);
-                            if clicked || ui.input().key_pressed(KeyCode::Escape) {
-                                ui.modal = Modal::None;
-                            }
+                        let (clicked, colour) = ui.button_act_on_release(clicked_id, id);
+                        if clicked || ui.input().key_pressed(KeyCode::Escape) {
+                            ui.modal = Modal::None;
+                        }
 
-                            // Click background to exit -- the code could be placed farther outside but it is here so it can be gated by `closeable`
-                            if ui.hovered(container_id) && !ui.hovered(contents_id) && ui.input().mouse_pressed(winit::event::MouseButton::Left) {
-                                ui.modal = Modal::None;
-                                clicked_id = id;
-                            }
+                        // Click background to exit -- the code could be placed farther outside but it is here so it can be gated by `closeable`
+                        if ui.hovered(container_id) && !ui.hovered(contents_id) && ui.input().mouse_pressed(winit::event::MouseButton::Left) {
+                            ui.modal = Modal::None;
+                            *clicked_id = id;
                         }
 
                         let radius = ui.scale(20.0);
@@ -548,16 +546,16 @@ fn ui_left_pane(ui: &mut Context,
             match ui.modal {
                 Modal::None => {}
                 Modal::Send => {
-                    title_bar(ui, clicked_id, "Send",    id("Send Title Bar"));
+                    title_bar(ui, clicked_id, true, "Send",    id("Send Title Bar"));
                 }
                 Modal::Receive => {
-                    title_bar(ui, clicked_id, "Receive", id("Receive Title Bar"));
+                    title_bar(ui, clicked_id, true, "Receive", id("Receive Title Bar"));
                 }
                 Modal::Stake => {
-                    title_bar(ui, clicked_id, "Stake",   id("Stake Title Bar"));
+                    title_bar(ui, clicked_id, true, "Stake",   id("Stake Title Bar"));
                 }
                 Modal::Unstake => {
-                    title_bar(ui, clicked_id, "Unstake", id("Unstake Title Bar"));
+                    title_bar(ui, clicked_id, true, "Unstake", id("Unstake Title Bar"));
                 }
             }
         }
