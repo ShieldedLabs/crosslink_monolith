@@ -1,6 +1,7 @@
 //! Internal wallet
 #![allow(warnings)]
 
+use std::collections::VecDeque;
 use std::convert::{Infallible, identity};
 use orchard::keys::SpendAuthorizingKey;
 use orchard::note_encryption::{CompactAction};
@@ -151,20 +152,34 @@ async fn wait_for_zainod() {
     }
 }
 
+enum WalletAction {
+    RequestFromFaucet,
+}
+
 pub struct WalletTx(pub TransactionSummary<AccountId>);
 
+#[derive(Default)]
 pub struct WalletState {
     pub balance: i64, // in zats
     pub txs: Vec<WalletTx>,
-}
+    pub waiting_for_faucet: bool,
 
+    actions_in_flight: VecDeque<WalletAction>,
+}
 
 impl WalletState {
     pub fn new() -> Self {
         WalletState {
-            balance: 0,
-            txs: Vec::new(),
+            ..Default::default()
         }
+    }
+
+    pub fn request_from_faucet(&mut self) {
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::RequestFromFaucet => true, _ => false }).count() != 0 {
+            return;
+        }
+
+        self.actions_in_flight.push_back(WalletAction::RequestFromFaucet);
     }
 }
 
@@ -390,6 +405,8 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         fees::DustOutputPolicy::default(),
     );
     let mut block_cache = MemBlockCache::new();
+
+    let mut total_user_txs = 0;
 
     let mut txs_seen_block_height = 0;
     let mut already_sent = false;
@@ -709,89 +726,52 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
                     }
                 }
+
+                // DONE
+                txs_seen_block_height = tip_h as i32;
             }
 
             let history = get_transaction_history(&user_wallet);
             wallet_state.lock().unwrap().txs = history.iter().map(|h| WalletTx(h.clone())).collect(); // @temp: shouldn't be a separate type
 
+            if history.len() != total_user_txs {
+                total_user_txs = history.len();
+                wallet_state.lock().unwrap().waiting_for_faucet = false;
+            }
+
             if !already_sent && txs_seen_block_height >= 5 {
             // if !already_sent && miner_utxos.len() != 0 && miner_utxos[0].height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64) < latest_block.height {
                 let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
-                if true {
-                    let mut signing_set = TransparentSigningSet::new();
-                    signing_set.add_key(miner_privkey);
-
-                    let prover = LocalTxProver::bundled();
-                    let extsk: &[ExtendedSpendingKey] = &[];
-                    let sak: &[SpendAuthorizingKey] = &[];
-
-                    let script = zcash_transparent::address::Script(zcash_script::script::Code(miner_utxos[0].script.clone()));
-
-                    let outpoint = OutPoint::new(miner_utxos[0].txid[..32].try_into().unwrap(), miner_utxos[0].index as u32);
-
-                    let mut txb = TxBuilder::new(
-                        network,
-                        BlockHeight::from_u32(latest_block.height as u32),
-                        BuildConfig::Standard {
-                            sapling_anchor: None,
-                            orchard_anchor: None,
-                        },
-                    );
-
-                    txb.add_transparent_input(miner_pubkey, outpoint, TxOut::new((zats + MINIMUM_FEE).unwrap(), script)).unwrap();
-                    txb.add_transparent_output(&user_t_addr, zats).unwrap();
-
-                    use rand_chacha::ChaCha20Rng;
-                    let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
-                    let tx_res = txb.build(
-                        &signing_set,
-                        extsk,
-                        sak,
-                        rng,
-                        &prover,
-                        &prover,
-                        &zip317::FeeRule::standard(),
-                    ).unwrap();
-
-                    let tx = tx_res.transaction();
-                    let mut tx_bytes = vec![];
-                    tx.write(&mut tx_bytes).unwrap();
-
-                    let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
-                    println!("******* res: {:?}", res);
-
-                } else {
-                    // NOTE: we can't send transparent->transparent through the high-level API, we
-                    // have to propose_shielding first, then send in a later block
-                    match wallet::propose_standard_transfer_to_address::<_, _, Infallible>(
-                        &mut miner_wallet,
-                        network,
-                        zcash_client_backend::fees::StandardFeeRule::Zip317,
-                        miner_account.id(),
-                        wallet::ConfirmationsPolicy::MIN,
-                        &zcash_client_backend::address::Address::Transparent(user_t_addr),
-                        zats,
-                        None,
-                        None,
-                        FALLBACK_CHANGE_POOL)
-                    {
-                        Err(err) => println!("propose_transfer error: {err:?}"),
-                        Ok(proposal) => {
-                            let prover = LocalTxProver::bundled();
-                            match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
-                                &mut miner_wallet, network,
-                                &prover,
-                                &prover,
-                                &wallet::SpendingKeys::from_unified_spending_key(miner_usk.clone()),
-                                zcash_client_backend::wallet::OvkPolicy::Sender,
-                                &proposal)
-                            {
-                                Err(err) => println!("create_proposed_transactions error: {err:?}"),
-                                Ok(txid) => {
-                                    println!("created transaction {txid:?}");
-                                    already_sent = true;
-                                },
-                            }
+                // NOTE: we can't send transparent->transparent through the high-level API, we
+                // have to propose_shielding first, then send in a later block
+                match wallet::propose_standard_transfer_to_address::<_, _, Infallible>(
+                    &mut miner_wallet,
+                    network,
+                    zcash_client_backend::fees::StandardFeeRule::Zip317,
+                    miner_account.id(),
+                    wallet::ConfirmationsPolicy::MIN,
+                    &zcash_client_backend::address::Address::Transparent(user_t_addr),
+                    zats,
+                    None,
+                    None,
+                    FALLBACK_CHANGE_POOL)
+                {
+                    Err(err) => println!("propose_transfer error: {err:?}"),
+                    Ok(proposal) => {
+                        let prover = LocalTxProver::bundled();
+                        match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                            &mut miner_wallet, network,
+                            &prover,
+                            &prover,
+                            &wallet::SpendingKeys::from_unified_spending_key(miner_usk.clone()),
+                            zcash_client_backend::wallet::OvkPolicy::Sender,
+                            &proposal)
+                        {
+                            Err(err) => println!("create_proposed_transactions error: {err:?}"),
+                            Ok(txid) => {
+                                println!("created transaction {txid:?}");
+                                already_sent = true;
+                            },
                         }
                     }
                 }
@@ -830,14 +810,78 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 user_sum += utxo.value_zat;
             }
 
+            wallet_state.lock().unwrap().balance = user_sum;
+
             let zec_full = user_sum / 100_000_000;
             let zec_part = user_sum % 100_000_000;
             println!("user {} has {} UTXOs with {} zats = {}.{} cTAZ", user_t_addr_str, user_utxos.len(), user_sum, zec_full, zec_part);
 
-            wallet_state.lock().unwrap().balance = user_sum;
-        });
+            println!("*** PENDING WALLET GUI ACTIONS: {}", wallet_state.lock().unwrap().actions_in_flight.len());
+            if let Ok(wallet_state) = &mut wallet_state.try_lock() {
+                while let Some(action) = wallet_state.actions_in_flight.front() {
+                    match action {
+                        WalletAction::RequestFromFaucet => {
+                            println!("***** WALLET GUI REQUESTED FUNDS FROM THE FAUCET (txs_seen_block_height: {})", txs_seen_block_height);
+                            if txs_seen_block_height >= 5 {
+                                let action = wallet_state.actions_in_flight.pop_front().unwrap();
+                                wallet_state.waiting_for_faucet = true;
 
-        the_future_is_now(async {
+                                let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
+
+                                let mut signing_set = TransparentSigningSet::new();
+                                signing_set.add_key(miner_privkey);
+
+                                let prover = LocalTxProver::bundled();
+                                let extsk: &[ExtendedSpendingKey] = &[];
+                                let sak: &[SpendAuthorizingKey] = &[];
+
+                                let script = zcash_transparent::address::Script(zcash_script::script::Code(miner_utxos[0].script.clone()));
+
+                                let outpoint = OutPoint::new(miner_utxos[0].txid[..32].try_into().unwrap(), miner_utxos[0].index as u32);
+
+                                let mut txb = TxBuilder::new(
+                                    network,
+                                    BlockHeight::from_u32(latest_block.height as u32),
+                                    BuildConfig::Standard {
+                                        sapling_anchor: None,
+                                        orchard_anchor: None,
+                                    },
+                                );
+
+                                txb.add_transparent_input(miner_pubkey, outpoint, TxOut::new((zats + MINIMUM_FEE).unwrap(), script)).unwrap();
+                                txb.add_transparent_output(&user_t_addr, zats).unwrap();
+
+                                use rand_chacha::ChaCha20Rng;
+                                let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+                                let tx_res = txb.build(
+                                    &signing_set,
+                                    extsk,
+                                    sak,
+                                    rng,
+                                    &prover,
+                                    &prover,
+                                    &zip317::FeeRule::standard(),
+                                ).unwrap();
+
+                                let tx = tx_res.transaction();
+                                let mut tx_bytes = vec![];
+                                tx.write(&mut tx_bytes).unwrap();
+
+                                let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
+                                println!("******* res: {:?}", res);
+                            }
+                            else {
+                                break;
+                            }
+                        },
+
+                        _ => {
+                            wallet_state.actions_in_flight.pop_front();
+                        }
+                    }
+                }
+            }
+
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         });
     }
