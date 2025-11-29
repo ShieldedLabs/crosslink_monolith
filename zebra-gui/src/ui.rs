@@ -149,10 +149,10 @@ impl Id {
 
 fn id(label: &str) -> Id { Id::id(label) }
 
-struct CloseElement {}
-fn elem() -> CloseElement { unsafe { clay::Clay__OpenElement(); } CloseElement {} }
-impl Drop for CloseElement { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
-impl CloseElement { fn decl(&self, item: Decl) -> &Self { decl(item); self } }
+struct Element {}
+fn elem() -> Element { unsafe { clay::Clay__OpenElement(); } Element {} }
+impl Drop for Element { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
+impl Element { fn decl(&self, item: Decl) -> &Self { decl(item); self } }
 
 const Clay_ElementId_ZERO: clay::Clay_ElementId = clay::Clay_ElementId { id: 0, offset: 0, baseId: 0, stringId: clay::Clay_String { isStaticallyAllocated: false, length: 0, chars: std::ptr::null() } };
 const Clay_SizingMinMax_ZERO: clay::Clay_SizingMinMax = clay::Clay_SizingMinMax { min: 0f32, max: f32::MAX };
