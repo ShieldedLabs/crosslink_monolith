@@ -327,17 +327,16 @@ impl Context {
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
 
-    fn tab(&mut self,
-           radius: (f32, f32, f32, f32),
-           padding: (f32, f32, f32, f32),
-           tab_id: &mut Id,
-           clicked_id: &mut Id,
-           label: &str) -> Id {
+    fn tab_ex(&mut self,
+              radius: (f32, f32, f32, f32),
+              padding: (f32, f32, f32, f32),
+              tab_id: &mut Id,
+              clicked_id: &mut Id,
+              id: Id,
+              label: &str) -> Id {
         let tab_text_h = self.scale16(18.0);
 
         let radius = (radius.0, radius.1, 0.0, 0.0);
-
-        let id = Id::id(label);
 
         let (clicked, _) = self.button(clicked_id, id);
         if clicked || *tab_id == Id::default() {
@@ -357,6 +356,16 @@ impl Context {
         }
 
         id
+    }
+
+    fn tab(&mut self,
+           radius: (f32, f32, f32, f32),
+           padding: (f32, f32, f32, f32),
+           tab_id: &mut Id,
+           clicked_id: &mut Id,
+           label: &str) -> Id {
+        let id = Id::id(label);
+        self.tab_ex(radius, padding, tab_id, clicked_id, id, label)
     }
 }
 
@@ -390,7 +399,7 @@ fn ui_left_pane(ui: &mut Context,
     }) {
         tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, clicked_id, "Wallet");
         tab_id_finalizers = ui.tab(radius, padding, tab_id, clicked_id, "Finalizers");
-        tab_id_history    = ui.tab(radius, padding, tab_id, clicked_id, "History"); // @todo frame_strf!(data, "History ({})", &wallet_state.lock().unwrap().txs.len())
+        tab_id_history    = ui.tab_ex(radius, padding, tab_id, clicked_id, Id::id("History"), frame_strf!(data, "History ({})", &wallet_state.lock().unwrap().txs.len()));
     }
 
     // Main contents
