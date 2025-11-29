@@ -607,11 +607,13 @@ impl StateService {
         let parent_hash = semantically_verrified.block.header.previous_block_hash;
         let parent_block_header = self.read_service.non_finalized_state_receiver.with_watch_data(
             |non_finalized_state| {
-                read::block_header(
-                    non_finalized_state.best_chain(),
-                    &self.read_service.db,
-                    crate::HashOrHeight::Hash(parent_hash),
-                )
+                let mut ret = None;
+                for chain in non_finalized_state.chain_iter() {
+                    if ret.is_none() {
+                        ret = chain.block(crate::HashOrHeight::Hash(parent_hash)).map(|b| b.block.header.clone());
+                    }
+                }
+                ret
             },
         );
         let parent_block_header = if parent_block_header.is_some() { parent_block_header } else { self.read_service.db.block_header(crate::HashOrHeight::Hash(parent_hash)) };
