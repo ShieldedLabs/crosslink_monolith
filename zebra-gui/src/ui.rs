@@ -622,8 +622,8 @@ fn ui_right_pane(ui: &mut Context,
 
                 if button_ex("Receive cTAZ", false) {
                     println!("Receive cTAZ from faucet!");
+                    wallet_state.lock().unwrap().request_from_faucet();
                 }
-
             }
 
         } else if *tab_id == tab_id_roster {
