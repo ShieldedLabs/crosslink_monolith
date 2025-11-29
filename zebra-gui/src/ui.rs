@@ -262,7 +262,7 @@ impl Context {
     fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
     fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
 
-    fn button(&self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) {
+    fn button(&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) {
         let mouse_held     = self.input().mouse_held(winit::event::MouseButton::Left);
         let mouse_pressed  = self.input().mouse_pressed(winit::event::MouseButton::Left);
         let mouse_released = self.input().mouse_released(winit::event::MouseButton::Left);
@@ -273,6 +273,10 @@ impl Context {
         let released = hover && mouse_released;
         if pressed {
             *clicked_id = id;
+        }
+
+        if hover {
+            self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
         }
 
         const act_on_press: bool = true;
@@ -297,7 +301,7 @@ impl Context {
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
 
-    fn tab(&self,
+    fn tab(&mut self,
            radius: (f32, f32, f32, f32),
            padding: (f32, f32, f32, f32),
            tab_id: &mut Id,
@@ -338,7 +342,7 @@ trait         Dup4: Copy { fn dup4(self) -> (Self, Self, Self, Self); }
 impl<T: Copy> Dup4 for T { fn dup4(self) -> (Self, Self, Self, Self) { (self, self, self, self) } }
 
 fn ui_left_pane(ui: &mut Context,
-                wallet_state: &Arc<Mutex<wallet::WalletState>>,
+                wallet_state: Arc<Mutex<wallet::WalletState>>,
                 _data: &mut SomeDataToKeepAround,
                 child_gap: f32,
                 padding: (f32, f32, f32, f32),
@@ -460,7 +464,7 @@ fn ui_left_pane(ui: &mut Context,
 }
 
 fn ui_right_pane(ui: &mut Context,
-                 wallet_state: &Arc<Mutex<wallet::WalletState>>,
+                 wallet_state: Arc<Mutex<wallet::WalletState>>,
                  _data: &mut SomeDataToKeepAround,
                  child_gap: f32,
                  padding: (f32, f32, f32, f32),
@@ -536,6 +540,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
     }
     ui.scale = ui.zoom * ui.dpi_scale;
 
+    ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Default);
+
     let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_height as f32);
     let mouse_pos = (ui.input().mouse_pos().0 as f32, ui.input().mouse_pos().1 as f32);
 
@@ -585,7 +591,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             height: grow!(),
             ..Decl::default()
         }) {
-            ui_left_pane(ui, &wallet_state, _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l, &balance_str, is_rendering);
+            ui_left_pane(ui, wallet_state.clone(), _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l, &balance_str, is_rendering);
         }
 
         if let _ = elem().decl(Decl {
@@ -604,7 +610,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, _data
             height: grow!(),
             ..Decl::default()
         }) {
-            ui_right_pane(ui, &wallet_state, _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_r, &balance_str, is_rendering);
+            ui_right_pane(ui, wallet_state.clone(), _data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_r, &balance_str, is_rendering);
         }
     }
 
@@ -690,6 +696,8 @@ pub struct Context {
     pub input: *const InputCtx,
     pub draw:  *const DrawCtx,
     pub clay:  *mut   Clay,
+
+    pub cursor: winit::window::Cursor,
 
     pub debug: bool,
     pub pixel_inspector_primed: bool,

@@ -1262,6 +1262,8 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                 }
                                             }
 
+                                            window.set_cursor(gui_ctx.cursor.clone());
+
                                             input_ctx.mouse_moved = false;
                                             input_ctx.last_mouse_pos = input_ctx.this_mouse_pos;
                                             input_ctx.scroll_delta = (0.0, 0.0);
