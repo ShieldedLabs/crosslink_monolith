@@ -165,10 +165,9 @@ fn id(label: &str) -> Id {
     }
 }
 
-struct Element {}
-fn elem() -> Element { unsafe { clay::Clay__OpenElement(); } Element {} }
+#[derive(Default)] struct Element { decl: Decl }
+fn elem() -> Element { unsafe { clay::Clay__OpenElement(); } Element::default() }
 impl Drop for Element { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
-impl Element { fn decl(&self, item: Decl) -> &Self { decl(item); self } }
 
 const Clay_ElementId_ZERO: clay::Clay_ElementId = clay::Clay_ElementId { id: 0, offset: 0, baseId: 0, stringId: clay::Clay_String { isStaticallyAllocated: false, length: 0, chars: std::ptr::null() } };
 const Clay_SizingMinMax_ZERO: clay::Clay_SizingMinMax = clay::Clay_SizingMinMax { min: 0f32, max: f32::MAX };
@@ -217,53 +216,58 @@ const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Clay_E
     userData: std::ptr::null_mut(),
 };
 
-fn decl(item: Decl) {
-    fn sizing(sizing: Sizing) -> clay::layout::Sizing {
-        match sizing {
-            Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
-            Sizing::Grow(min, max) => { clay::layout::Sizing::Grow(min, max) }
-            Sizing::Fixed(x)       => { clay::layout::Sizing::Fixed(x) }
-            Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
+impl Element {
+    fn decl(&mut self, item: Decl) -> &mut Self {
+        fn sizing(sizing: Sizing) -> clay::layout::Sizing {
+            match sizing {
+                Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
+                Sizing::Grow(min, max) => { clay::layout::Sizing::Grow(min, max) }
+                Sizing::Fixed(x)       => { clay::layout::Sizing::Fixed(x) }
+                Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
+            }
         }
-    }
 
-    let mut decl = Clay_ElementDeclaration_ZERO;
-    decl.backgroundColor = clay::Clay_Color {
-        r: item.colour.0 as f32,
-        g: item.colour.1 as f32,
-        b: item.colour.2 as f32,
-        a: item.colour.3 as f32
-    };
-    decl.id = item.id.clay().id;
-    decl.clip = clay::Clay_ClipElementConfig { horizontal: item.clip, vertical: item.clip, childOffset: clay::Clay_Vector2 { x: 0.0, y: 0.0 } };
-    if item.floating {
-        decl.floating.attachTo = clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_PARENT;
-        // decl.floating.clipTo = clay::Clay_FloatingClipToElement_CLAY_CLIP_TO_NONE;
-        decl.floating.clipTo = clay::Clay_FloatingClipToElement_CLAY_CLIP_TO_ATTACHED_PARENT;
-        decl.floating.attachPoints = clay::Clay_FloatingAttachPoints {
-            element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
-            parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
+        let mut decl = Clay_ElementDeclaration_ZERO;
+        decl.backgroundColor = clay::Clay_Color {
+            r: item.colour.0 as f32,
+            g: item.colour.1 as f32,
+            b: item.colour.2 as f32,
+            a: item.colour.3 as f32
         };
-    }
-    decl.layout.sizing.width  = clay::Clay_SizingAxis::from(sizing(item.width));
-    decl.layout.sizing.height = clay::Clay_SizingAxis::from(sizing(item.height));
-    decl.layout.padding = clay::Clay_Padding::from(clay::Clay_Padding {
-        left:   item.padding.0 as u16,
-        right:  item.padding.1 as u16,
-        top:    item.padding.2 as u16,
-        bottom: item.padding.3 as u16,
-    });
-    decl.layout.childGap = item.child_gap as u16;
-    decl.layout.childAlignment = clay::Clay_ChildAlignment { x: item.align.x as _, y: item.align.y as _ };
-    decl.layout.layoutDirection = item.direction as _;
-    decl.cornerRadius = clay::Clay_CornerRadius {
-        topLeft:     item.radius.0,
-        topRight:    item.radius.1,
-        bottomLeft:  item.radius.2,
-        bottomRight: item.radius.3
-    };
+        decl.id = item.id.clay().id;
+        decl.clip = clay::Clay_ClipElementConfig { horizontal: item.clip, vertical: item.clip, childOffset: clay::Clay_Vector2 { x: 0.0, y: 0.0 } };
+        if item.floating {
+            decl.floating.attachTo = clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_PARENT;
+            // decl.floating.clipTo = clay::Clay_FloatingClipToElement_CLAY_CLIP_TO_NONE;
+            decl.floating.clipTo = clay::Clay_FloatingClipToElement_CLAY_CLIP_TO_ATTACHED_PARENT;
+            decl.floating.attachPoints = clay::Clay_FloatingAttachPoints {
+                element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
+                parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
+            };
+        }
+        decl.layout.sizing.width  = clay::Clay_SizingAxis::from(sizing(item.width));
+        decl.layout.sizing.height = clay::Clay_SizingAxis::from(sizing(item.height));
+        decl.layout.padding = clay::Clay_Padding::from(clay::Clay_Padding {
+            left:   item.padding.0 as u16,
+            right:  item.padding.1 as u16,
+            top:    item.padding.2 as u16,
+            bottom: item.padding.3 as u16,
+        });
+        decl.layout.childGap = item.child_gap as u16;
+        decl.layout.childAlignment = clay::Clay_ChildAlignment { x: item.align.x as _, y: item.align.y as _ };
+        decl.layout.layoutDirection = item.direction as _;
+        decl.cornerRadius = clay::Clay_CornerRadius {
+            topLeft:     item.radius.0,
+            topRight:    item.radius.1,
+            bottomLeft:  item.radius.2,
+            bottomRight: item.radius.3
+        };
 
-    unsafe { clay::Clay__ConfigureOpenElement(decl); }
+        unsafe { clay::Clay__ConfigureOpenElement(decl); }
+
+        self.decl = item;
+        self
+    }
 }
 
 const PANE_PERCENT: f32 = (0.25 + 0.333) / 2.0;
@@ -288,6 +292,63 @@ pub enum Modal {
     Unstake,
 }
 
+pub fn rgba_to_hsva(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8, u8) {
+    let rf = r as f32 / 255.0;
+    let gf = g as f32 / 255.0;
+    let bf = b as f32 / 255.0;
+
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let delta = max - min;
+
+    // Compute Hue (0–1)
+    let h = if delta == 0.0 {
+        0.0
+    } else if max == rf {
+        ((gf - bf) / delta).rem_euclid(6.0)
+    } else if max == gf {
+        (bf - rf) / delta + 2.0
+    } else {
+        (rf - gf) / delta + 4.0
+    } / 6.0;
+
+    // Compute Saturation and Value (0–1)
+    let s = if max == 0.0 { 0.0 } else { delta / max };
+    let v = max;
+
+    // Convert to u8 range
+    let h8 = (h * 255.0).round().clamp(0.0, 255.0) as u8;
+    let s8 = (s * 255.0).round().clamp(0.0, 255.0) as u8;
+    let v8 = (v * 255.0).round().clamp(0.0, 255.0) as u8;
+
+    (h8, s8, v8, a)
+}
+
+pub fn hsva_to_rgba(h: u8, s: u8, v: u8, a: u8) -> (u8, u8, u8, u8) {
+    let hf = (h as f32 / 255.0) * 6.0;  // 0..6
+    let sf = s as f32 / 255.0;          // 0..1
+    let vf = v as f32 / 255.0;          // 0..1
+
+    let c = vf * sf;
+    let x = c * (1.0 - ((hf % 2.0) - 1.0).abs());
+    let m = vf - c;
+
+    let (rf, gf, bf) = match hf as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x), // covers sector 5
+    };
+
+    let r = ((rf + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    let g = ((gf + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    let b = ((bf + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+
+    (r, g, b, a)
+}
+
 impl Context {
     pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, ..Default::default() } }
     fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw     } }
@@ -298,12 +359,14 @@ impl Context {
     fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
     fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
 
+    fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
+
     fn button_ex(&mut self, clicked_id: &mut Id, id: Id, act_on_press: bool) -> (bool, (u8, u8, u8, u8)) {
         let mouse_held     = self.input().mouse_held(winit::event::MouseButton::Left);
         let mouse_pressed  = self.input().mouse_pressed(winit::event::MouseButton::Left);
         let mouse_released = self.input().mouse_released(winit::event::MouseButton::Left);
 
-        let hover    = unsafe { clay::Clay_PointerOver(id.clay().id) };
+        let hover    = self.hovered(id);
         let down     = hover && mouse_held;
         let pressed  = hover && mouse_pressed;
         let released = hover && mouse_released;
@@ -405,7 +468,7 @@ fn ui_left_pane(ui: &mut Context,
                 clicked_id: &mut Id,
                 tab_id: &mut Id) {
 
-    if ui.modal != Modal::None && let _ = elem().decl(Decl {
+    if ui.modal != Modal::None && let _elem = elem().decl(Decl {
         child_gap,
         id: id("Modal Container"),
         padding: (padding.0 * 2.0).dup4(),
@@ -418,7 +481,10 @@ fn ui_left_pane(ui: &mut Context,
         ..Decl::default()
     }) {
 
-        if let _ = elem().decl(Decl {
+        let container_id = _elem.decl.id;
+        let container_hovered = ui.hovered(container_id);
+
+        if let _elem = elem().decl(Decl {
             child_gap, radius,
             id: id("Modal Contents"),
             padding: (padding.0 * 2.0).dup4(),
@@ -429,8 +495,12 @@ fn ui_left_pane(ui: &mut Context,
             direction: TopToBottom,
             ..Decl::default()
         }) {
+
+            let contents_id = _elem.decl.id;
+            let contents_hovered = ui.hovered(contents_id);
+
             let text_h = ui.scale16(24.0);
-            let title_bar = |ui: &mut Context, clicked_id: &mut Id, title, title_bar_id| {
+            let title_bar = |ui: &mut Context, clicked_id: &mut Id, title, title_bar_id, closeable| {
                 if let _ = elem().decl(Decl {
                     id: title_bar_id,
                     child_gap,
@@ -446,9 +516,18 @@ fn ui_left_pane(ui: &mut Context,
                     }
                     if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Align::Right, ..Decl::default() }) {
                         let id = id("Close This Modal");
-                        let (clicked, colour) = ui.button_act_on_release(clicked_id, id);
-                        if clicked || ui.input().key_pressed(KeyCode::Escape) {
-                            ui.modal = Modal::None;
+
+                        if closeable {
+                            let (clicked, colour) = ui.button_act_on_release(clicked_id, id);
+                            if clicked || ui.input().key_pressed(KeyCode::Escape) {
+                                ui.modal = Modal::None;
+                            }
+
+                            // Click background to exit -- the code could be placed farther outside but it is here so it can be gated by `closeable`
+                            if ui.hovered(container_id) && !ui.hovered(contents_id) && ui.input().mouse_pressed(winit::event::MouseButton::Left) {
+                                ui.modal = Modal::None;
+                                clicked_id = id;
+                            }
                         }
 
                         let radius = ui.scale(20.0);

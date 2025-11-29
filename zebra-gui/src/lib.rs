@@ -1910,6 +1910,53 @@ mod tests {
     #[test]
     fn it_works() {
     }
+
+    fn approx_eq(a: u8, b: u8) -> bool {
+        let da = a as i16;
+        let db = b as i16;
+        (da - db).abs() <= 3
+    }
+
+    #[test]
+    fn test_round_trip_sampled() {
+        for r in (0..=255).step_by(17) {
+            for g in (0..=255).step_by(17) {
+                for b in (0..=255).step_by(17) {
+                    let a = 255;
+
+                    let (h, s, v, a2) = rgba_to_hsva(r, g, b, a);
+                    let (rr, gg, bb, aa) = hsva_to_rgba(h, s, v, a2);
+
+                    assert!(approx_eq(r, rr), "r={} rr={}", r, rr);
+                    assert!(approx_eq(g, gg), "g={} gg={}", g, gg);
+                    assert!(approx_eq(b, bb), "b={} bb={}", b, bb);
+                    assert_eq!(a, aa);
+                }
+            }
+        }
+    }
+
+    // Uncomment to brute-force all 16,777,216 colors
+    /*
+    #[test]
+    fn test_round_trip_full() {
+        for r in 0..=255 {
+            for g in 0..=255 {
+                for b in 0..=255 {
+                    let a = 255;
+
+                    let (h, s, v, a2) = rgba_to_hsva(r, g, b, a);
+                    let (rr, gg, bb, aa) = hsva_to_rgba(h, s, v, a2);
+
+                    assert!(approx_eq(r, rr), "r={} rr={}", r, rr);
+                    assert!(approx_eq(g, gg), "g={} gg={}", g, gg);
+                    assert!(approx_eq(b, bb), "b={} bb={}", b, bb);
+                    assert_eq!(a, aa);
+                }
+            }
+        }
+    }
+    */
 }
 
 /// Returns f1 is b is true.
