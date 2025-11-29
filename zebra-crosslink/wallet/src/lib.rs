@@ -1,6 +1,7 @@
 //! Internal wallet
 #![allow(warnings)]
 
+use std::convert::Infallible;
 use orchard::keys::SpendAuthorizingKey;
 use orchard::note_encryption::{CompactAction};
 use rand_chacha::rand_core::SeedableRng;
@@ -9,7 +10,7 @@ use sapling_crypto::zip32::ExtendedSpendingKey;
 use tokio_rustls::rustls;
 use tonic::client::GrpcService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
-use zcash_client_backend::fees::StandardFeeRule;
+use zcash_client_backend::fees::{self, StandardFeeRule };
 use zcash_client_backend::proto::service::RawTransaction;
 use zcash_note_encryption::try_compact_note_decryption;
 use zcash_primitives::transaction::components::TxOut;
@@ -198,10 +199,10 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         (wallet, account, usk)
     }
 
-    fn transparent_keys_from_usk(usk: &UnifiedSpendingKey) -> Option<(secp256k1::PublicKey, secp256k1::SecretKey)> {
+    fn transparent_keys_from_usk(usk: &UnifiedSpendingKey, index: u32) -> Option<(secp256k1::PublicKey, secp256k1::SecretKey)> {
         let transparent = usk.transparent();
         let account_pubkey = transparent.to_account_pubkey();
-        let child_index = NonHardenedChildIndex::const_from_index(0);
+        let child_index = NonHardenedChildIndex::const_from_index(index);
         let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).ok()?;
         let address_privkey = transparent.derive_external_secret_key(child_index).ok()?;
         Some((address_pubkey, address_privkey))
@@ -216,13 +217,22 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // Some(account.default_address().ok()??.0)
     }
 
+    // NOTE(azmr): I don't yet understand why the wallet requires miner index = 0 but user index = 1.
+    // They seem to be generated distinctly, but maybe they share some account management state.
+
     let (mut miner_wallet, miner_account, miner_usk) = wallet_from_seed_phrase(network,
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
     );
     let miner_t_addr = transparent_addr_from_account(&miner_account, 0).unwrap();
     let miner_t_addr_str = miner_t_addr.encode(network);
     println!("Faucet miner t-address: {}", miner_t_addr_str);
-    let (miner_pubkey, miner_privkey) = transparent_keys_from_usk(&miner_usk).unwrap();
+    let (miner_pubkey, miner_privkey) = transparent_keys_from_usk(&miner_usk, 0).unwrap();
+
+    let miner_t_recs = miner_wallet.get_transparent_receivers(miner_account.id(), false, false).unwrap();
+    let miner_t_addrs = miner_t_recs.keys().collect::<Vec<_>>()[0];
+    println!("miner_t_addrs: {miner_t_addrs:?}");
+    println!("miner_t_get: {:?}", miner_t_recs.get(&miner_t_addr));
+    // debug_assert_eq!(miner_t_addr, *miner_t_addr1);
 
     let (mut user_wallet, user_account, user_usk) = wallet_from_seed_phrase(network,
         "blur kit item praise brick misery muffin symptom cheese street tired evolve"
@@ -233,10 +243,18 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let user_t_recs = user_wallet.get_transparent_receivers(user_account.id(), false, false).unwrap();
     let user_t_addr1 = user_t_recs.keys().collect::<Vec<_>>()[0];
+    debug_assert_eq!(user_t_addr, *user_t_addr1);
     // NOTE: the default isn't the same as below, but I think this is because it forces a diversifier index
     println!("User wallet: {}/{:?}", user_t_addr_str, user_t_addr1.encode(network));
 
-
+    const FEE_RULE: StandardFeeRule = StandardFeeRule::Zip317;
+    const FALLBACK_CHANGE_POOL: zcash_protocol::ShieldedProtocol = zcash_protocol::ShieldedProtocol::Orchard;
+    let change_strategy = fees::standard::SingleOutputChangeStrategy::new(
+        FEE_RULE,
+        None,
+        FALLBACK_CHANGE_POOL,
+        fees::DustOutputPolicy::default(),
+    );
     let mut block_cache = MemBlockCache::new();
 
     let mut txs_seen_block_height = 0;
@@ -357,7 +375,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 let t_addr_wallets = vec![
                     (user_t_addr_str.clone(), &mut user_wallet),
-                    // (miner_t_addr_str.clone(), &mut miner_wallet),
+                    (miner_t_addr_str.clone(), &mut miner_wallet),
                 ];
                 for (t_addr, wallet) in t_addr_wallets {
                     let filter = TransparentAddressBlockFilter{ address: t_addr.to_owned(), range: Some(range.clone()) };
@@ -387,7 +405,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     if txs.len() > 0 {
                         println!("txs for {t_addr}:");
                     }
-                    for raw_tx in txs {
+                    for raw_tx in &txs {
                         let tx_height = BlockHeight::from_u32(raw_tx.height.try_into().unwrap());
                         let branch_id = BranchId::for_height(network, tx_height);
                         let tx = Transaction::read(raw_tx.data.as_slice(), branch_id);
@@ -435,58 +453,124 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
 
                     println!("{} {:#?}", t_addr, wallet.get_wallet_summary(wallet::ConfirmationsPolicy::MIN));
-                }
 
+                    // immediately shield newly-received transparent transactions
+                    if txs.len() > 0 {
+                        let min_zats_for_shielding = Zatoshis::const_from_u64(10_000);
+                        match wallet::propose_shielding::<_, _, _, _, Infallible>(
+                            wallet,
+                            network,
+                            &wallet::input_selection::GreedyInputSelector::new(),
+                            &change_strategy,
+                            min_zats_for_shielding,
+                            &[miner_t_addr],
+                            miner_account.id(),
+                            wallet::ConfirmationsPolicy::MIN,
+                        ) {
+                            Err(err) => println!("propose_shielding error: {err:?}"),
+                            Ok(proposal) => {
+                                let prover = LocalTxProver::bundled();
+                                match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                                    wallet, network,
+                                    &prover,
+                                    &prover,
+                                    &wallet::SpendingKeys::from_unified_spending_key(miner_usk.clone()),
+                                    zcash_client_backend::wallet::OvkPolicy::Sender,
+                                    &proposal)
+                                {
+                                    Err(err) => println!("shielding create_proposed_transactions error: {err:?}"),
+                                    Ok(txid) => println!("created shielding transaction {txid:?}"),
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // DONE
                 txs_seen_block_height = tip_h.into();
             }
 
-            if !already_sent && miner_utxos.len() != 0 && miner_utxos[0].height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64) < latest_block.height {
-                let mut signing_set = TransparentSigningSet::new();
-                signing_set.add_key(miner_privkey);
-
-                let prover = LocalTxProver::bundled();
-                let extsk: &[ExtendedSpendingKey] = &[];
-                let sak: &[SpendAuthorizingKey] = &[];
-
+            if !already_sent && txs_seen_block_height >= 5 {
+            // if !already_sent && miner_utxos.len() != 0 && miner_utxos[0].height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64) < latest_block.height {
                 let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
-                let script = zcash_transparent::address::Script(zcash_script::script::Code(miner_utxos[0].script.clone()));
+                if false {
+                    let mut signing_set = TransparentSigningSet::new();
+                    signing_set.add_key(miner_privkey);
 
-                let outpoint = OutPoint::new(miner_utxos[0].txid[..32].try_into().unwrap(), miner_utxos[0].index as u32);
+                    let prover = LocalTxProver::bundled();
+                    let extsk: &[ExtendedSpendingKey] = &[];
+                    let sak: &[SpendAuthorizingKey] = &[];
 
-                let mut txb = TxBuilder::new(
-                    network,
-                    BlockHeight::from_u32(latest_block.height as u32),
-                    BuildConfig::Standard {
-                        sapling_anchor: None,
-                        orchard_anchor: None,
-                    },
-                );
+                    let script = zcash_transparent::address::Script(zcash_script::script::Code(miner_utxos[0].script.clone()));
 
-                txb.add_transparent_input(miner_pubkey, outpoint, TxOut::new((zats + MINIMUM_FEE).unwrap(), script)).unwrap();
-                txb.add_transparent_output(&user_t_addr, zats).unwrap();
+                    let outpoint = OutPoint::new(miner_utxos[0].txid[..32].try_into().unwrap(), miner_utxos[0].index as u32);
 
-                use rand_chacha::ChaCha20Rng;
-                let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
-                let tx_res = txb.build(
-                    &signing_set,
-                    extsk,
-                    sak,
-                    rng,
-                    &prover,
-                    &prover,
-                    &zip317::FeeRule::standard(),
-                ).unwrap();
+                    let mut txb = TxBuilder::new(
+                        network,
+                        BlockHeight::from_u32(latest_block.height as u32),
+                        BuildConfig::Standard {
+                            sapling_anchor: None,
+                            orchard_anchor: None,
+                        },
+                    );
 
-                let tx = tx_res.transaction();
-                let mut tx_bytes = vec![];
-                tx.write(&mut tx_bytes).unwrap();
+                    txb.add_transparent_input(miner_pubkey, outpoint, TxOut::new((zats + MINIMUM_FEE).unwrap(), script)).unwrap();
+                    txb.add_transparent_output(&user_t_addr, zats).unwrap();
 
-                let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
-                println!("******* res: {:?}", res);
+                    use rand_chacha::ChaCha20Rng;
+                    let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+                    let tx_res = txb.build(
+                        &signing_set,
+                        extsk,
+                        sak,
+                        rng,
+                        &prover,
+                        &prover,
+                        &zip317::FeeRule::standard(),
+                    ).unwrap();
 
-                already_sent = true;
+                    let tx = tx_res.transaction();
+                    let mut tx_bytes = vec![];
+                    tx.write(&mut tx_bytes).unwrap();
+
+                    let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
+                    println!("******* res: {:?}", res);
+
+                } else {
+                    // NOTE: we can't send transparent->transparent through the high-level API, we
+                    // have to propose_shielding first, then send in a later block
+                    match wallet::propose_standard_transfer_to_address::<_, _, Infallible>(
+                        &mut miner_wallet,
+                        network,
+                        zcash_client_backend::fees::StandardFeeRule::Zip317,
+                        miner_account.id(),
+                        wallet::ConfirmationsPolicy::MIN,
+                        &zcash_client_backend::address::Address::Transparent(user_t_addr),
+                        zats,
+                        None,
+                        None,
+                        FALLBACK_CHANGE_POOL)
+                    {
+                        Err(err) => println!("propose_transfer error: {err:?}"),
+                        Ok(proposal) => {
+                            let prover = LocalTxProver::bundled();
+                            match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                                &mut miner_wallet, network,
+                                &prover,
+                                &prover,
+                                &wallet::SpendingKeys::from_unified_spending_key(miner_usk.clone()),
+                                zcash_client_backend::wallet::OvkPolicy::Sender,
+                                &proposal)
+                            {
+                                Err(err) => println!("create_proposed_transactions error: {err:?}"),
+                                Ok(txid) => {
+                                    println!("created transaction {txid:?}");
+                                    already_sent = true;
+                                },
+                            }
+                        }
+                    }
+                }
             }
 
             // let latest = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
