@@ -876,7 +876,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
         height: grow!(),
         ..Decl::default()
     }) {
-        let pane_pct = Sizing::Percent(ui.scale * PANE_PERCENT);
+        let pane_pct = Sizing::Percent(ui.zoom * PANE_PERCENT);
 
         if let _ = elem().decl(Decl {
             id: id("Left Pane"),
