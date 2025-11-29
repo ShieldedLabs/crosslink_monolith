@@ -26,7 +26,7 @@ use crate::{Nullifier, error::Error};
 
 /// Keeps track of notes that are spent in which transaction
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ReceievedNoteSpends(pub(crate) BTreeMap<NoteId, TxId>);
+pub struct ReceievedNoteSpends(pub BTreeMap<NoteId, TxId>);
 
 impl ReceievedNoteSpends {
     pub fn new() -> Self {
@@ -51,23 +51,23 @@ impl Deref for ReceievedNoteSpends {
 /// A note that has been received by the wallet
 /// TODO: Instead of Vec, perhaps we should identify by some unique ID
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ReceivedNoteTable(pub(crate) Vec<ReceivedNote>);
+pub struct ReceivedNoteTable(pub Vec<ReceivedNote>);
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ReceivedNote {
+pub struct ReceivedNote {
     // Uniquely identifies this note
-    pub(crate) note_id: NoteId,
-    pub(crate) txid: TxId,
+    pub note_id: NoteId,
+    pub txid: TxId,
     // output_index: sapling, action_index: orchard
-    pub(crate) output_index: u32,
-    pub(crate) account_id: AccountId,
+    pub output_index: u32,
+    pub account_id: AccountId,
     //sapling: (diversifier, value, rcm) orchard: (diversifier, value, rho, rseed)
-    pub(crate) note: Note,
-    pub(crate) nf: Option<Nullifier>,
-    pub(crate) is_change: bool,
-    pub(crate) memo: Memo,
-    pub(crate) commitment_tree_position: Option<Position>,
-    pub(crate) recipient_key_scope: Option<Scope>,
+    pub note: Note,
+    pub nf: Option<Nullifier>,
+    pub is_change: bool,
+    pub memo: Memo,
+    pub commitment_tree_position: Option<Position>,
+    pub recipient_key_scope: Option<Scope>,
 }
 impl ReceivedNote {
     pub fn pool(&self) -> PoolType {
@@ -291,7 +291,7 @@ impl DerefMut for ReceivedNoteTable {
     }
 }
 
-pub(crate) fn to_spendable_notes(
+pub fn to_spendable_notes(
     sapling_received_notes: &[&ReceivedNote],
     #[cfg(feature = "orchard")] orchard_received_notes: &[&ReceivedNote],
 ) -> Result<ReceivedNotes<NoteId>, Error> {

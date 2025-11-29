@@ -15,7 +15,7 @@ use crate::error::Error;
 
 /// Maps a block height and transaction index to a transaction ID.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TxLocatorMap(pub(crate) BTreeMap<(BlockHeight, u32), TxId>);
+pub struct TxLocatorMap(pub BTreeMap<(BlockHeight, u32), TxId>);
 
 impl Deref for TxLocatorMap {
     type Target = BTreeMap<(BlockHeight, u32), TxId>;
@@ -27,21 +27,21 @@ impl Deref for TxLocatorMap {
 
 /// A table of received notes. Corresponds to sapling_received_notes and orchard_received_notes tables.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct TransactionEntry {
+pub struct TransactionEntry {
     // created: String,
     /// mined_height is rolled into into a txn status
-    tx_status: TransactionStatus,
-    block: Option<BlockHeight>,
-    tx_index: Option<u32>,
-    expiry_height: Option<BlockHeight>,
-    raw: Option<Vec<u8>>,
-    fee: Option<Zatoshis>,
+    pub tx_status: TransactionStatus,
+    pub block: Option<BlockHeight>,
+    pub tx_index: Option<u32>,
+    pub expiry_height: Option<BlockHeight>,
+    pub raw: Option<Vec<u8>>,
+    pub fee: Option<Zatoshis>,
     /// - `target_height`: stores the target height for which the transaction was constructed, if
     ///   known. This will ordinarily be null for transactions discovered via chain scanning; it
     ///   will only be set for transactions created using this wallet specifically, and not any
     ///   other wallet that uses the same seed (including previous installations of the same
     ///   wallet application.)
-    _target_height: Option<TargetHeight>,
+    pub _target_height: Option<TargetHeight>,
 }
 impl TransactionEntry {
     pub fn new_from_tx_meta(tx_meta: WalletTx<AccountId>, height: BlockHeight) -> Self {
@@ -55,31 +55,30 @@ impl TransactionEntry {
             _target_height: None,
         }
     }
-    pub(crate) fn expiry_height(&self) -> Option<BlockHeight> {
+    pub fn expiry_height(&self) -> Option<BlockHeight> {
         self.expiry_height
     }
-    pub(crate) fn status(&self) -> TransactionStatus {
+    pub fn status(&self) -> TransactionStatus {
         self.tx_status
     }
 
-    pub(crate) fn mined_height(&self) -> Option<BlockHeight> {
+    pub fn mined_height(&self) -> Option<BlockHeight> {
         match self.tx_status {
             TransactionStatus::Mined(height) => Some(height),
             _ => None,
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn fee(&self) -> Option<Zatoshis> {
+    pub fn fee(&self) -> Option<Zatoshis> {
         self.fee
     }
 
-    pub(crate) fn raw(&self) -> Option<&[u8]> {
+    pub fn raw(&self) -> Option<&[u8]> {
         self.raw.as_deref()
     }
 
     #[cfg(feature = "transparent-inputs")]
-    pub(crate) fn is_mined_or_unexpired_at(&self, height: BlockHeight) -> bool {
+    pub fn is_mined_or_unexpired_at(&self, height: BlockHeight) -> bool {
         match self.tx_status {
             TransactionStatus::Mined(tx_height) => tx_height <= height,
             TransactionStatus::NotInMainChain => self
@@ -91,23 +90,23 @@ impl TransactionEntry {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct TransactionTable(pub(crate) BTreeMap<TxId, TransactionEntry>);
+pub struct TransactionTable(pub BTreeMap<TxId, TransactionEntry>);
 
 impl TransactionTable {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self(BTreeMap::new())
     }
 
     /// Returns transaction status for a given transaction ID. None if the transaction is not known.
-    pub(crate) fn tx_status(&self, txid: &TxId) -> Option<TransactionStatus> {
+    pub fn tx_status(&self, txid: &TxId) -> Option<TransactionStatus> {
         self.0.get(txid).map(|entry| entry.tx_status)
     }
 
-    pub(crate) fn get_transaction(&self, txid: &TxId) -> Option<&TransactionEntry> {
+    pub fn get_transaction(&self, txid: &TxId) -> Option<&TransactionEntry> {
         self.0.get(txid)
     }
 
-    pub(crate) fn get_by_height_and_index(
+    pub fn get_by_height_and_index(
         &self,
         height: BlockHeight,
         index: u32,
@@ -119,7 +118,7 @@ impl TransactionTable {
 
     /// Inserts information about a MINED transaction that was observed to
     /// contain a note related to this wallet
-    pub(crate) fn put_tx_meta(&mut self, tx_meta: WalletTx<AccountId>, height: BlockHeight) {
+    pub fn put_tx_meta(&mut self, tx_meta: WalletTx<AccountId>, height: BlockHeight) {
         match self.0.entry(tx_meta.txid()) {
             Entry::Occupied(mut entry) => {
                 entry.get_mut().tx_index = Some(tx_meta.block_index() as u32);
@@ -134,7 +133,7 @@ impl TransactionTable {
     #[cfg(feature = "transparent-inputs")]
     /// Insert partial transaction data ontained from a received transparent output
     /// Will update an existing transaction if it already exists with new date (e.g. will replace Nones with newer Some value)
-    pub(crate) fn put_tx_partial(
+    pub fn put_tx_partial(
         &mut self,
         txid: &TxId,
         block: &Option<BlockHeight>,
@@ -165,7 +164,7 @@ impl TransactionTable {
     }
 
     /// Inserts full transaction data
-    pub(crate) fn put_tx_data(
+    pub fn put_tx_data(
         &mut self,
         tx: &Transaction,
         fee: Option<Zatoshis>,
@@ -196,7 +195,7 @@ impl TransactionTable {
         }
     }
 
-    pub(crate) fn set_transaction_status(
+    pub fn set_transaction_status(
         &mut self,
         txid: &TxId,
         status: TransactionStatus,
@@ -209,7 +208,7 @@ impl TransactionTable {
         }
     }
 
-    pub(crate) fn unmine_transactions_greater_than(&mut self, height: BlockHeight) {
+    pub fn unmine_transactions_greater_than(&mut self, height: BlockHeight) {
         self.0.iter_mut().for_each(|(_, entry)| {
             if let TransactionStatus::Mined(tx_height) = entry.tx_status {
                 if tx_height > height {
@@ -223,15 +222,15 @@ impl TransactionTable {
 }
 
 impl TransactionTable {
-    pub(crate) fn get(&self, txid: &TxId) -> Option<&TransactionEntry> {
+    pub fn get(&self, txid: &TxId) -> Option<&TransactionEntry> {
         self.0.get(txid)
     }
 
-    pub(crate) fn _get_mut(&mut self, txid: &TxId) -> Option<&mut TransactionEntry> {
+    pub fn _get_mut(&mut self, txid: &TxId) -> Option<&mut TransactionEntry> {
         self.0.get_mut(txid)
     }
 
-    pub(crate) fn _remove(&mut self, txid: &TxId) -> Option<TransactionEntry> {
+    pub fn _remove(&mut self, txid: &TxId) -> Option<TransactionEntry> {
         self.0.remove(txid)
     }
 }
@@ -245,17 +244,17 @@ impl Deref for TransactionTable {
 }
 
 impl TxLocatorMap {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self(BTreeMap::new())
     }
-    pub(crate) fn _insert(&mut self, height: BlockHeight, index: u32, txid: TxId) {
+    pub fn _insert(&mut self, height: BlockHeight, index: u32, txid: TxId) {
         self.0.insert((height, index), txid);
     }
 
-    pub(crate) fn get(&self, height: BlockHeight, index: u32) -> Option<&TxId> {
+    pub fn get(&self, height: BlockHeight, index: u32) -> Option<&TxId> {
         self.0.get(&(height, index))
     }
-    pub(crate) fn entry(&mut self, k: (BlockHeight, u32)) -> Entry<'_, (BlockHeight, u32), TxId> {
+    pub fn entry(&mut self, k: (BlockHeight, u32)) -> Entry<'_, (BlockHeight, u32), TxId> {
         self.0.entry(k)
     }
 }
