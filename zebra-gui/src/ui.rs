@@ -267,6 +267,14 @@ const BUTTON_COL:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff);
 const BUTTON_HOVER_COL: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
 const BUTTON_DOWN_COL:  (u8, u8, u8, u8) = (0x1c, 0x1c, 0x1c, 0xff);
 
+#[derive(Debug, Default, Copy, Clone)]
+pub enum Modal {
+    #[default] None,
+    Send,
+    Receive,
+    Stake,
+    Unstake,
+}
 
 impl Context {
     pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, ..Default::default() } }
@@ -292,7 +300,7 @@ impl Context {
         }
 
         if hover {
-            // self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
+            self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
         }
 
         let activated = (*clicked_id == id) && if act_on_press {
@@ -398,7 +406,7 @@ fn ui_left_pane(ui: &mut Context,
         ..Decl::default()
     }) {
         tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, clicked_id, "Wallet");
-        tab_id_finalizers = ui.tab(radius, padding, tab_id, clicked_id, "Finalizers");
+        // tab_id_finalizers = ui.tab(radius, padding, tab_id, clicked_id, "Finalizers");
         tab_id_history    = ui.tab_ex(radius, padding, tab_id, clicked_id, Id::id("History"), frame_strf!(data, "History ({})", &wallet_state.lock().unwrap().txs.len()));
     }
 
@@ -446,7 +454,7 @@ fn ui_left_pane(ui: &mut Context,
                 ..Decl::default()
             }) {
 
-                let mut button = |label| {
+                let mut button = |ui: &mut Context, label| {
                     let id = Id::id(label);
                     let (clicked, colour) = ui.button(clicked_id, id);
                     if let _ = elem().decl(Decl {
@@ -476,10 +484,10 @@ fn ui_left_pane(ui: &mut Context,
                     clicked
                 };
 
-                if button("Send")    { println!("Send!");    }
-                if button("Receive") { println!("Receive!"); }
-                if button("Stake")   { println!("Stake!");   }
-                if button("Unstake") { println!("Unstake!"); }
+                if button(ui, "Send")    { ui.modal = Modal::Send;    }
+                if button(ui, "Receive") { ui.modal = Modal::Receive; }
+                if button(ui, "Stake")   { ui.modal = Modal::Stake;   }
+                if button(ui, "Unstake") { ui.modal = Modal::Unstake; }
 
             }
 
@@ -541,7 +549,7 @@ fn ui_right_pane(ui: &mut Context,
         ..Decl::default()
     }) {
         tab_id_faucet   = ui.tab(radius, padding, tab_id, clicked_id, "Faucet");
-        tab_id_roster   = ui.tab(radius, padding, tab_id, clicked_id, "Roster");
+        // tab_id_roster   = ui.tab(radius, padding, tab_id, clicked_id, "Roster");
         tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, clicked_id, "Settings");
     }
 
@@ -825,6 +833,7 @@ pub struct Context {
     pub clay:  *mut   Clay,
 
     pub cursor: winit::window::Cursor,
+    pub prev_cursor: winit::window::Cursor,
 
     pub debug: bool,
     pub pixel_inspector_primed: bool,
@@ -840,6 +849,8 @@ pub struct Context {
 
     pub pane_tab_l: Id,
     pub pane_tab_r: Id,
+
+    pub modal: Modal,
 }
 
 #[derive(Debug, Default, Copy, Clone)]
