@@ -4,6 +4,9 @@
 mod ui;
 use ui::*;
 
+mod fontello_icons;
+use fontello_icons::*;
+
 use std::sync::{Arc, Mutex};
 use wallet;
 
@@ -826,6 +829,7 @@ fn okay_but_is_it_wayland(elwt: &winit::event_loop::ActiveEventLoop) -> bool {
 
 // pub static SOURCE_SERIF: &[u8] = include_bytes!("../assets/source_serif_4.ttf");
 pub static INTER: &[u8] = include_bytes!("../assets/Inter-VariableFont_opsz,wght.ttf");
+pub static ICONS: &[u8] = include_bytes!("../assets/fontello.ttf");
 pub static DEJA_VU_SANS_MONO: &[u8] = include_bytes!("../assets/deja_vu_sans_mono.ttf");
 pub static FONT_PIXEL_3X3_MONO: &[u8] = include_bytes!("../assets/3x3-Mono.ttf");
 pub static FONT_PIXEL_TINY5: &[u8] = include_bytes!("../assets/Tiny5-Regular.ttf");
