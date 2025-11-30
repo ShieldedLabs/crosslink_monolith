@@ -120,6 +120,7 @@ async fn wait_for_zainod() {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum WalletAction {
     RequestFromFaucet,
 }
@@ -207,12 +208,14 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         Some((address_pubkey, address_privkey))
     }
 
-    fn transparent_addr_from_account(account: &zcash_client_sqlite::wallet::Account, index: u32) -> Option<TransparentAddress> {
+    fn addrs_from_account(account: &zcash_client_sqlite::wallet::Account, index: u32) -> Option<(TransparentAddress, UnifiedAddress)> {
         // NOTE: the wallet auto-increments the child index so this isn't recognized
-        let account_pubkey = account.ufvk()?.transparent()?;
+        let ufvk = account.ufvk()?;
+        let (ua, di_) = ufvk.find_address(orchard::keys::DiversifierIndex::new(), UnifiedAddressRequest::ORCHARD).ok()?;
+        let account_pubkey = ufvk.transparent()?;
         let child_index = NonHardenedChildIndex::const_from_index(index);
         let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).ok()?;
-        Some(TransparentAddress::from_pubkey(&address_pubkey))
+        Some((TransparentAddress::from_pubkey(&address_pubkey), ua))
         // Some(account.default_address().ok()??.0)
     }
 
@@ -271,7 +274,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let (miner_wallet, miner_account, miner_usk) = wallet_from_seed_phrase(network,
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
         );
-        let miner_t_addr = transparent_addr_from_account(&miner_account, 0).unwrap();
+        let (miner_t_addr, miner_ua) = addrs_from_account(&miner_account, 0).unwrap();
         let miner_t_addr_str = miner_t_addr.encode(network);
         let (miner_pubkey, miner_privkey) = transparent_keys_from_usk(&miner_usk, 0).unwrap();
         let miner_t_recs = miner_wallet
@@ -287,12 +290,13 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         user_pubkey,
         user_privkey,
         user_t_address,
+        user_ua,
     ) = {
         let (user_wallet, user_account, user_usk) = wallet_from_seed_phrase(
             network,
             "blur kit item praise brick misery muffin symptom cheese street tired evolve",
         );
-        let user_t_addr = transparent_addr_from_account(&user_account, 0).unwrap();
+        let (user_t_addr, user_ua) = addrs_from_account(&user_account, 0).unwrap();
         let user_t_addr_str = user_t_addr.encode(network);
         let (user_pubkey, user_privkey) = transparent_keys_from_usk(&user_usk, 0).unwrap();
         let user_t_recs = user_wallet
@@ -303,7 +307,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // NOTE: the default isn't the same as below, but I think this is because it forces a diversifier index
         // println!("User wallet: {}/{:?}", user_t_addr_str, user_t_addr1.encode(network));
 
-        (user_wallet,  user_account, user_usk, user_pubkey, user_privkey, user_t_addr)
+        (user_wallet,  user_account, user_usk, user_pubkey, user_privkey, user_t_addr, user_ua)
     };
 
     println!("*************************");
@@ -387,7 +391,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 // let from_addrs = tbalances
                 //     .into_keys();
 
-                let Some(addr) = transparent_addr_from_account(&account, 0) else {
+                let Some((t_addr, _ua)) = addrs_from_account(&account, 0) else {
                     println!("Failed to get transparent address from account!");
                     return;
                 };
@@ -407,7 +411,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     &wallet::input_selection::GreedyInputSelector::new(),
                     &change_strategy,
                     min_zats_for_shielding,
-                    &[addr],
+                    &[t_addr],
                     account.id(),
                     wallet::ConfirmationsPolicy::MIN,
                 ) {
@@ -523,14 +527,29 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             })(&user_wallet, &miner_wallet).await;
 
             // Process gui wallet actions
-            let Ok(wallet_state) = &mut wallet_state.try_lock() else { continue; };
-            println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len());
 
             // @todo(judah): I'm thinking the weird frame hitch we get in the UI is caused by this loop,
             // since it's probably waiting for the wallet_state mutex to unlock.
-            while let Some(action) = wallet_state.actions_in_flight.front() {
-                match action {
-                    WalletAction::RequestFromFaucet => {
+            let mut retries_this_round = 6;
+            loop {
+                let action: WalletAction = {
+                    let mut wallet_lock = wallet_state.try_lock();
+                    let Ok(wallet_state) = &mut wallet_lock else {
+                        if retries_this_round > 0 {
+                            retries_this_round -= 1;
+                            println!("wallet lock retry ({retries_this_round} attempts remaining)");
+                            tokio::time::sleep(tokio::time::Duration::from_millis(9)).await;
+                            continue;
+                        } else {
+                            break;
+                        }
+                    };
+                    println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len());
+                    let Some(action) = wallet_state.actions_in_flight.front() else { break; };
+                    *action
+                };
+                let ok: bool = match action {
+                    WalletAction::RequestFromFaucet => if true {
                         let Ok(miner_utxos) = client.get_address_utxos(GetAddressUtxosArg{
                             addresses: [miner_t_address.encode(network).to_string()].to_vec(),
                             start_height: 0,
@@ -545,8 +564,6 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             println!("Miner had no UTXOs to use");
                             break;
                         }
-
-                        let action = wallet_state.actions_in_flight.pop_front().unwrap();
 
                         let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
 
@@ -600,14 +617,88 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             }
                             Err(err) => {
                                 println!("Failed to send faucet transaction: {}", err);
-                                wallet_state.waiting_for_faucet = false;
+                                wallet_state.lock().unwrap().waiting_for_faucet = false;
                             },
                         }
-                    },
+                        true
+                    } else {
+                        let zats = (Zatoshis::from_nonnegative_i64(500_000_000).unwrap() - MINIMUM_FEE).unwrap();
+                        // NOTE: we can't send transparent->transparent through the high-level API, we
+                        // have to propose_shielding first, then send in a later block
+                        const FALLBACK_CHANGE_POOL: zcash_protocol::ShieldedProtocol = zcash_protocol::ShieldedProtocol::Orchard;
+                        match wallet::propose_standard_transfer_to_address::<_, _, Infallible>(
+                            &mut miner_wallet,
+                            network,
+                            zcash_client_backend::fees::StandardFeeRule::Zip317,
+                            miner_account.id(),
+                            wallet::ConfirmationsPolicy::MIN,
+                            // &zcash_client_backend::address::Address::Transparent(user_t_addr),
+                            &zcash_client_backend::address::Address::Unified(user_ua.clone()),
+                            zats,
+                            None,
+                            None,
+                            FALLBACK_CHANGE_POOL)
+                        {
+                            Err(err) => {
+                                println!("propose_transfer error: {err:?}");
+                                wallet_state.lock().unwrap().waiting_for_faucet = false;
+                            },
+                            Ok(proposal) => {
+                                let prover = LocalTxProver::bundled();
+                                match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                                    &mut miner_wallet, network,
+                                    &prover,
+                                    &prover,
+                                    &wallet::SpendingKeys::from_unified_spending_key(miner_usk.clone()),
+                                    zcash_client_backend::wallet::OvkPolicy::Sender,
+                                    &proposal)
+                                {
+                                    Err(err) => println!("create_proposed_transactions error: {err:?}"),
+                                    Ok(txids) => for txid in txids {
+                                        let tx = match miner_wallet.get_transaction(txid) {
+                                            Err(err) => {
+                                                println!("failed to get tx {txid:?} immediately after making it: {err:?}");
+                                                wallet_state.lock().unwrap().waiting_for_faucet = false;
+                                                continue;
+                                            }
+                                            Ok(Some(tx)) => tx,
+                                            Ok(None) => {
+                                                println!("failed to get tx {txid:?} immediately after making it: (None)");
+                                                wallet_state.lock().unwrap().waiting_for_faucet = false;
+                                                continue;
+                                            }
+                                        };
 
-                    _ => {
-                        wallet_state.actions_in_flight.pop_front();
+                                        let mut data = Vec::new();
+                                        if let Err(err) = tx.write(&mut data) {
+                                            println!("Serialization error for tx {:?}: {:?}", txid, err);
+                                            wallet_state.lock().unwrap().waiting_for_faucet = false;
+                                            continue;
+                                        }
+
+                                        let raw_tx = RawTransaction { data, height: 0 };
+
+                                        match client.send_transaction(raw_tx).await {
+                                            Ok(res) => println!("sent transaction: {res:?}"),
+                                            Err(err) => {
+                                                println!("failed to send transaction: {err:?}");
+                                                wallet_state.lock().unwrap().waiting_for_faucet = false;
+                                            }
+                                        }
+
+                                        println!("created transaction {txid:?}");
+                                        // already_sent = true;
+                                    },
+                                }
+                            }
+                        }
+                        true
                     }
+
+                    _ => { true }
+                };
+                if ok {
+                    wallet_state.lock().unwrap().actions_in_flight.pop_front();
                 }
             }
 
