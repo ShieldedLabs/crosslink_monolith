@@ -132,9 +132,11 @@ pub struct WalletState {
     pub balance: i64, // in zats
     pub txs: Vec<WalletTx>,
     pub waiting_for_faucet: bool,
+    pub miner_seen_height: u32,
     pub miner_unshielded_funds: u64,
     pub miner_shielded_pending_funds: u64,
     pub miner_shielded_spendable_funds: u64,
+    pub faucet_funds_available: u64,
 
     actions_in_flight: VecDeque<WalletAction>,
 }
@@ -330,6 +332,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         loop {
             // Sync wallet DBs
             for (wallet, t_address) in [(&mut miner_wallet, miner_t_address), (&mut user_wallet, user_t_address)] {
+                // TODO: outside loop?
                 let Ok(info) = client.get_lightd_info(Empty {}).await else {
                     println!("Failed to get lightd info");
                     continue;
@@ -511,12 +514,58 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     None
                 };
 
+                let tip_h: Option<u32> = if let Ok(Some(val)) = miner_wallet.chain_height() {
+                    Some(val.into())
+                } else {
+                    None
+                };
+
+                let faucet_available = if let Some(tip_h) = tip_h {
+                    // Calculate the funds available for faucet;
+                    // This would be better done incrementally on initial scan, accounting for reorgs etc
+                    let h = tip_h.saturating_sub(MIN_TRANSPARENT_COINBASE_MATURITY + 2); // account for coinbase maturing & shielding tx
+
+                    if let Ok(history) = get_transaction_history(miner_wallet) {
+                        let mut coinbase_total = 0;
+                        let mut faucet_spent = 0;
+                        let mut staking_spent = 0;
+                        for tx in history {
+                            println!("{tx:?}");
+                            if tx.is_shielding {
+                                coinbase_total += tx.total_received.into_u64();
+                            } else if tx.total_spent.into_u64() > 0 {
+                                if tx.memo_count > 0 {
+                                    faucet_spent += tx.total_spent.into_u64();
+                                } else {
+                                    staking_spent += tx.total_spent.into_u64();
+                                }
+                            }
+                        }
+
+                        println!("coinbase_total: {coinbase_total}");
+                        println!("faucet_total: {}", coinbase_total/2);
+                        println!("faucet_spent: {faucet_spent}");
+                        println!("staking_spent: {staking_spent}");
+                        Some(coinbase_total/2 - faucet_spent)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 {
                     let mut wallet_lock = wallet_state.lock().unwrap();
                     wallet_lock.balance = wallet_balance as i64;
                     if let Some(txs) = txs {
                         wallet_lock.waiting_for_faucet = false; // TODO:???
                         wallet_lock.txs = txs; // @temp: doesn't need to be its own type
+                    }
+                    if let Some(tip_h) = tip_h {
+                        wallet_lock.miner_seen_height = tip_h;
+                    }
+                    if let Some(faucet_available) = faucet_available {
+                        wallet_lock.faucet_funds_available = faucet_available;
                     }
                     if let Some(vals) = miner_vals {
                         wallet_lock.miner_unshielded_funds = vals.0;
@@ -549,7 +598,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     *action
                 };
                 let ok: bool = match action {
-                    WalletAction::RequestFromFaucet => if true {
+                    WalletAction::RequestFromFaucet => if false {
                         let Ok(miner_utxos) = client.get_address_utxos(GetAddressUtxosArg{
                             addresses: [miner_t_address.encode(network).to_string()].to_vec(),
                             start_height: 0,
@@ -635,7 +684,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             // &zcash_client_backend::address::Address::Transparent(user_t_addr),
                             &zcash_client_backend::address::Address::Unified(user_ua.clone()),
                             zats,
-                            None,
+                            Some(zcash_protocol::memo::MemoBytes::from_bytes("Happy spending, with love from your favourite faucet".as_bytes()).unwrap()),
                             None,
                             FALLBACK_CHANGE_POOL)
                         {
