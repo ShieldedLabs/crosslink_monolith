@@ -146,6 +146,7 @@ impl WalletState {
             return;
         }
 
+        self.waiting_for_faucet = true;
         self.actions_in_flight.push_back(WalletAction::RequestFromFaucet);
     }
 }
@@ -300,6 +301,8 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let mut block_cache = MemBlockCache::new();
     the_future_is_now(async {
+        // @todo(judah): investigate why requests get randomly dropped in a strange way:
+        // transport error, service not ready, etc.
         let mut client = loop {
             if let Ok(channel) = Channel::from_static("http://localhost:18233").connect().await {
                 break CompactTxStreamerClient::new(channel);
@@ -482,6 +485,9 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // Process gui wallet actions
             let Ok(wallet_state) = &mut wallet_state.try_lock() else { continue; };
             println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len());
+
+            // @todo(judah): I'm thinking the weird frame hitch we get in the UI is caused by this loop,
+            // since it's probably waiting for the wallet_state mutex to unlock.
             while let Some(action) = wallet_state.actions_in_flight.front() {
                 match action {
                     WalletAction::RequestFromFaucet => {
@@ -547,8 +553,6 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         let tx = tx_res.transaction();
                         let mut tx_bytes = vec![];
                         tx.write(&mut tx_bytes).unwrap();
-
-                        wallet_state.waiting_for_faucet = true;
 
                         match client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await {
                             Ok(_) => {

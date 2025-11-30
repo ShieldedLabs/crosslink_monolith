@@ -762,35 +762,47 @@ fn ui_right_pane(ui: &mut Context,
                 ..Decl::default()
             }) {
 
-                let mut button_ex = |label, act_on_press| {
+                let mut button_ex = |label, act_on_press, disabled: bool| {
                     let id = id(label);
-                    let (clicked, colour) = ui.button_ex(clicked_id, id, act_on_press);
+                    let (clicked, mut colour) = ui.button_ex(clicked_id, id, act_on_press);
                     if let _ = elem().decl(Decl {
-                        id, child_gap, align: Align::Center,
+                        id,
+                        child_gap,
+                        align: Align::Center,
                         direction: TopToBottom,
                         width: fit!(),
                         height: fit!(),
                         ..Decl::default()
                     }) {
-
                         let radius = ui.scale(24.0);
+
+                        // @TEMP: real disabling
+                        if disabled {
+                            colour.3 = 100;
+                        }
 
                         // Button
                         if let _ = elem().decl(Decl {
-                            colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
+                            colour,
+                            padding,
+                            child_gap,
+                            radius: radius.dup4(),
+                            align: Align::Center,
                             width:  fit!(ui.scale(192.0)),
                             height: fit!(radius * 2.0),
                             ..Decl::default()
                         }) {
                             let button_text_h = ui.scale16(20.0);
-                            ui.text(label, clay::text::TextConfig::new().font_size(button_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                            let text_color = if disabled { clay::Color::u_rgba(INACTIVE_TAB_COL.0, INACTIVE_TAB_COL.1, INACTIVE_TAB_COL.2, INACTIVE_TAB_COL.3) } else { WHITE_CLAY }; // @TEMP: real disabling
+                            ui.text(label, clay::text::TextConfig::new().font_size(button_text_h).color(text_color).alignment(clay::text::TextAlignment::Center).end());
                         }
                     }
-                    clicked
+
+                    clicked && !disabled // @TEMP: real disabling
                 };
 
-                if button_ex("Receive cTAZ", false) {
-                    println!("Receive cTAZ from faucet!");
+                // @TEMP: real disabling
+                if button_ex("Receive cTAZ", false, wallet_state.lock().unwrap().waiting_for_faucet) {
                     wallet_state.lock().unwrap().request_from_faucet();
                 }
             }
