@@ -167,13 +167,13 @@ const Decl: Decl = Decl {
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 struct TextDecl {
-    font_kind: FontKind,
+    font: FontKind,
     h: f32,
     colour: (u8, u8, u8, u8),
     align: AlignX,
 }
 const TextDecl: TextDecl = TextDecl {
-    font_kind: FontKind::Normal,
+    font: FontKind::Normal,
     h: 0.0,
     colour: WHITE,
     align: AlignX::Left,
@@ -459,7 +459,7 @@ impl Context {
 
     fn text(&self, label: &str, decl: TextDecl) {
         let config = clay::text::TextConfig::new()
-            .font_id(decl.font_kind as u16)
+            .font_id(decl.font as u16)
             .font_size(decl.h as u16)
             .color(clay_colour(decl.colour))
             .alignment(match decl.align {
@@ -960,11 +960,32 @@ fn ui_right_pane(ui: &mut Context,
                         w.faucet_funds_available,
                     )
                 };
-                ui.text(frame_strf!(data, "Miner funds: {}", h), TextDecl { h: title_h, align: AlignX::Left, ..TextDecl });
-                ui.text(frame_strf!(data, "Unshielded: {} cTAZ", str_from_ctaz(un)), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
-                ui.text(frame_strf!(data, "Shielded (pending): {} cTAZ", str_from_ctaz(sh_p)), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
-                ui.text(frame_strf!(data, "Shielded (spendable): {} cTAZ", str_from_ctaz(sh_s)), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
-                ui.text(frame_strf!(data, "Faucet available: {} cTAZ", str_from_ctaz(fc)), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
+
+                let row   = Decl { width: percent!(1.0), child_gap, height: fit!(), ..Decl };
+
+                let left  = Decl { width: grow!(), height: fit!(), align: Left,  ..Decl };
+                let right = Decl { width: grow!(), height: fit!(), align: Right, ..Decl };
+
+                let left_text  = TextDecl { h: text_h,  align: AlignX::Left,  ..TextDecl  };
+                let right_text = TextDecl { font: Mono, align: AlignX::Right, ..left_text };
+
+                ui.text(frame_strf!(data, "Miner funds at height {}:", h), TextDecl { h: title_h, ..left_text });
+                if let _ = elem().decl(row) {
+                    if let _ = elem().decl(left)  { ui.text("Unshielded:", left_text); }
+                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(un)), right_text); }
+                }
+                if let _ = elem().decl(row) {
+                    if let _ = elem().decl(left)  { ui.text("Shielded (pending):", left_text); }
+                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_p)), right_text); }
+                }
+                if let _ = elem().decl(row) {
+                    if let _ = elem().decl(left)  { ui.text("Shielded (spendable):", left_text); }
+                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_s)), right_text); }
+                }
+                if let _ = elem().decl(row) {
+                    if let _ = elem().decl(left)  { ui.text("Faucet available:", left_text); }
+                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(fc)), right_text); }
+                }
                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
             };
