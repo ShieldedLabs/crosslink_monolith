@@ -18,6 +18,7 @@ use crate::transaction::{
         FeeRule,
         transparent::{InputView, OutputView},
     },
+    StakingAction,
 };
 
 #[cfg(feature = "std")]
@@ -311,6 +312,7 @@ pub struct Builder<'a, P, U: sapling::builder::ProverProgress> {
     transparent_builder: TransparentBuilder,
     sapling_builder: Option<sapling::builder::Builder>,
     orchard_builder: Option<orchard::builder::Builder>,
+    staking_action: Option<StakingAction>,
     #[cfg(zcash_unstable = "zfuture")]
     tze_builder: TzeBuilder<'a, TransactionData<Unauthorized>>,
     #[cfg(not(zcash_unstable = "zfuture"))]
@@ -399,6 +401,7 @@ impl<'a, P: consensus::Parameters> Builder<'a, P, ()> {
             transparent_builder: TransparentBuilder::empty(),
             sapling_builder,
             orchard_builder,
+            staking_action: None,
             #[cfg(zcash_unstable = "zfuture")]
             tze_builder: TzeBuilder::empty(),
             #[cfg(not(zcash_unstable = "zfuture"))]
@@ -431,6 +434,7 @@ impl<'a, P: consensus::Parameters> Builder<'a, P, ()> {
             transparent_builder: self.transparent_builder,
             sapling_builder: self.sapling_builder,
             orchard_builder: self.orchard_builder,
+            staking_action: self.staking_action,
             tze_builder: self.tze_builder,
             _progress_notifier,
         }
@@ -547,6 +551,16 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
         value: Zatoshis,
     ) -> Result<(), transparent::builder::Error> {
         self.transparent_builder.add_output(to, value)
+    }
+
+    /// Adds a transparent address to send funds to.
+    pub fn put_staking_action(
+        &mut self,
+        //to: &TransparentAddress,
+        staking_action: StakingAction,
+    ) -> Result<(), transparent::builder::Error> {
+        self.staking_action = Some(staking_action);
+        Ok(())
     }
 
     /// Adds a transparent "null data" (OP_RETURN) output with the given data payload.
@@ -765,11 +779,13 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
         let consensus_branch_id = BranchId::for_height(&self.params, self.target_height);
 
         // determine transaction version
-        let version = TxVersion::suggested_for_branch(consensus_branch_id);
+        let mut version = TxVersion::suggested_for_branch(consensus_branch_id);
 
         //
         // Consistency checks
         //
+
+        let fee = if self.staking_action.is_none() { fee } else { version = TxVersion::VCrosslink; Zatoshis::const_from_u64(0) };
 
         // After fees are accounted for, the value balance of the transaction must be zero.
         let balance_after_fees = (self.value_balance()? - fee).ok_or(BalanceError::Underflow)?;
@@ -847,7 +863,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
             sprout_bundle: None,
             sapling_bundle,
             orchard_bundle,
-            staking_action: None, // TODO: real data?
+            staking_action: self.staking_action,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle,
         };
@@ -929,7 +945,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
             sprout_bundle: unauthed_tx.sprout_bundle,
             sapling_bundle,
             orchard_bundle,
-            staking_action: None, // TODO: real data?
+            staking_action: unauthed_tx.staking_action,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle,
         };

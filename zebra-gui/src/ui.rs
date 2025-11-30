@@ -20,9 +20,7 @@ pub fn magic<'a, 'b, T>(mut_ref: &'a mut T) -> &'b mut T {
 }
 
 #[derive(Debug, Default)]
-pub struct SomeDataToKeepAround {
-    pub messages:          Vec<String>,
-    pub can_send_messages: bool,
+pub struct UiData {
     pub per_frame_strs:    Vec<String>,
 }
 
@@ -34,14 +32,14 @@ macro_rules! frame_strf {
     };
 }
 
-impl SomeDataToKeepAround {
+impl UiData {
     fn frame_str(&mut self, str: &str) -> &String {
         self.per_frame_strs.push(str.to_string().clone());
         return self.per_frame_strs.last().unwrap();
     }
 }
 
-fn dbg_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
+fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
     if ui.input().key_pressed(KeyCode::Tab) {
         ui.debug = !ui.debug;
     }
@@ -395,6 +393,15 @@ pub fn hsva_to_rgba(h: u8, s: u8, v: u8, a: u8) -> (u8, u8, u8, u8) {
     (r, g, b, a)
 }
 
+trait HSVA_RGBA {
+    #[inline(always)] fn hsva(self) -> Self;
+    #[inline(always)] fn rgba(self) -> Self;
+}
+impl HSVA_RGBA for (u8, u8, u8, u8) {
+    #[inline(always)] fn hsva(self) -> Self { rgba_to_hsva(self.0, self.1, self.2, self.3) }
+    #[inline(always)] fn rgba(self) -> Self { hsva_to_rgba(self.0, self.1, self.2, self.3) }
+}
+
 impl Context {
     pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, ..Default::default() } }
     fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw     } }
@@ -532,7 +539,8 @@ impl<A: Mul, B: Mul, C: Mul, D: Mul> Mul for (A, B, C, D) { #[inline(always)] fn
 
 fn ui_left_pane(ui: &mut Context,
                 wallet_state: Arc<Mutex<wallet::WalletState>>,
-                data: &mut SomeDataToKeepAround,
+                data: &mut UiData,
+                viz: &mut VizState,
                 child_gap: f32,
                 padding: (f32, f32, f32, f32),
                 radius:  (f32, f32, f32, f32),
@@ -772,16 +780,9 @@ fn ui_left_pane(ui: &mut Context,
                 }
 
                 if clicked {
-                    // if let Some(send_to_viz) = *RESPONSES_FROM_ZEBRA.lock().unwrap() {
-                    //     send_to_viz.try_send(ResponseFromZebra {
-                    //         AllBlocks {
-                    //             bc_tip_height: u64,
-                    //             bft_tip_height: u64,
-                    //             bc_blocks: Vec<BcBlock>,
-                    //             bft_blocks: Vec<BftBlock>,
-                    //         }
-                    //     });
-                    // }
+                    viz.camera_x = 0.0;
+                    viz.camera_y = 0.0;
+                    viz.zoom = 0.0;
                 }
             }
 
@@ -827,7 +828,7 @@ fn ui_left_pane(ui: &mut Context,
 
 fn ui_right_pane(ui: &mut Context,
                  wallet_state: Arc<Mutex<wallet::WalletState>>,
-                 data: &mut SomeDataToKeepAround,
+                 data: &mut UiData,
                  child_gap: f32,
                  padding: (f32, f32, f32, f32),
                  radius:  (f32, f32, f32, f32),
@@ -933,6 +934,9 @@ fn ui_right_pane(ui: &mut Context,
                 if button_ex("Receive cTAZ", false, wallet_state.lock().unwrap().waiting_for_faucet) {
                     wallet_state.lock().unwrap().request_from_faucet();
                 }
+                if button_ex("Test Stake Action cTAZ", false, wallet_state.lock().unwrap().waiting_for_test_stake_action) {
+                    wallet_state.lock().unwrap().perform_test_stake_action();
+                }
             }
 
             if let _ = elem().decl(Decl {
@@ -968,7 +972,7 @@ fn ui_right_pane(ui: &mut Context,
 }
 
 
-fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data: &mut SomeDataToKeepAround, is_rendering: bool) -> bool {
+fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
     data.per_frame_strs.clear();
 
     let mut result = false;
@@ -1052,7 +1056,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
             clip: true,
             ..Decl
         }) {
-            ui_left_pane(ui, wallet_state.clone(), data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l);
+            ui_left_pane(ui, wallet_state.clone(), data, viz, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l);
         }
 
         if let _ = elem().decl(Decl {
@@ -1137,12 +1141,12 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
         }
     }
 
-    result |= dbg_ui(ui, data, is_rendering);
+    result |= dbg_ui(ui, is_rendering);
 
     result
 }
 
-pub fn demo_of_rendering_stuff_with_context_that_allocates_in_the_background(ui: &mut Context, data: &mut SomeDataToKeepAround, wallet_state: Arc<Mutex<wallet::WalletState>>) -> bool {
+pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet_state: Arc<Mutex<wallet::WalletState>>) -> bool {
     let dummy_input = InputCtx {
         this_mouse_pos: ui.input().this_mouse_pos,
         last_mouse_pos: ui.input().last_mouse_pos,
@@ -1153,8 +1157,8 @@ pub fn demo_of_rendering_stuff_with_context_that_allocates_in_the_background(ui:
 
         ..Default::default()
     };
-    let real_input = ui.input; let result =           run_ui(ui, wallet_state.clone(), data, false);
-    ui.input = &dummy_input;   let result = result || run_ui(ui, wallet_state.clone(), data, true);
+    let real_input = ui.input; let result =           run_ui(ui, wallet_state.clone(), data, viz, false);
+    ui.input = &dummy_input;   let result = result || run_ui(ui, wallet_state.clone(), data, viz, true);
     ui.input =   real_input;
     return result;
 }

@@ -159,18 +159,18 @@ const COLOR_BC: u32 = 0x00A8CC;
 const COLOR_BFT: u32 = 0xFF9843;
 
 pub struct VizState {
-    camera_x: f32,
-    camera_y: f32,
-    zoom: f32,
-    on_screen_bcs: HashMap<Hash32, OnScreenBc>,
-    on_screen_bfts: HashMap<Hash32, OnScreenBft>,
-    send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
-    receive_from_zebra: std::sync::mpsc::Receiver<ResponseFromZebra>,
+    pub camera_x: f32,
+    pub camera_y: f32,
+    pub zoom: f32,
+    pub on_screen_bcs: HashMap<Hash32, OnScreenBc>,
+    pub on_screen_bfts: HashMap<Hash32, OnScreenBft>,
+    pub send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
+    pub receive_from_zebra: std::sync::mpsc::Receiver<ResponseFromZebra>,
 
-    bc_tip_height: u64,
-    bft_tip_height: u64,
+    pub bc_tip_height: u64,
+    pub bft_tip_height: u64,
 
-    last_frame_hovered_hash: Hash32,
+    pub last_frame_hovered_hash: Hash32,
 }
 pub fn viz_gui_init() -> VizState {
     let (me_send, zebra_receive) = std::sync::mpsc::sync_channel(128);
