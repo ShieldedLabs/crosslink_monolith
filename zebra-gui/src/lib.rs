@@ -978,7 +978,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
     let mut gui_clay = clay_layout::Clay::new((1280., 720.).into());
 
     let mut gui_ctx = ui::Context::new();
-    let mut some_data_to_keep_around = ui::UiData::default();
+    let mut ui_data = ui::UiData::default();
 
     gui_ctx.clay = &mut gui_clay;
 
@@ -1256,7 +1256,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                             viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &draw_ctx, dt as f32, &input_ctx);
 
                                             {
-                                                let should_quit = demo_of_rendering_stuff_with_context_that_allocates_in_the_background(&mut gui_ctx, &mut some_data_to_keep_around, wallet_state.clone());
+                                                let should_quit = ui_update(&mut gui_ctx, &mut ui_data, &mut viz_state, wallet_state.clone());
                                                 if should_quit {
                                                     elwt.exit();
                                                 }
