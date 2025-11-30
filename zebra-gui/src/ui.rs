@@ -461,6 +461,26 @@ impl<T: Copy> Dup3 for T { fn dup3(self) -> (Self, Self, Self) { (self, self, se
 trait         Dup4: Copy { fn dup4(self) -> (Self, Self, Self, Self); }
 impl<T: Copy> Dup4 for T { fn dup4(self) -> (Self, Self, Self, Self) { (self, self, self, self) } }
 
+// Implementation of `tuple.mul(scalar)`. Helper "AsF32" trait to get it working.
+// This would literally be a two-liner, if Rust generics had C++-style SFINAE.
+trait AsF32         { #[inline(always)] fn to_f32(self) -> f32;                #[inline(always)] fn from_f32(x: f32) -> Self; }
+impl  AsF32 for u8  { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for u16 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for u32 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for u64 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for i8  { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for i16 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for i32 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for i64 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for f32 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for f64 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+
+trait                                Mul                  { #[inline(always)] fn mul(self, f: f32) -> Self; }
+impl<T: AsF32>                       Mul for T            { #[inline(always)] fn mul(self, f: f32) -> Self { T::from_f32(self.to_f32() * f) } }
+impl<A: Mul, B: Mul>                 Mul for (A, B)       { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f)) } }
+impl<A: Mul, B: Mul, C: Mul>         Mul for (A, B, C)    { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f)) } }
+impl<A: Mul, B: Mul, C: Mul, D: Mul> Mul for (A, B, C, D) { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f), self.3.mul(f)) } }
+
 fn ui_left_pane(ui: &mut Context,
                 wallet_state: Arc<Mutex<wallet::WalletState>>,
                 data: &mut SomeDataToKeepAround,
