@@ -65,7 +65,7 @@ fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
 
     if is_rendering {
         if ui.pixel_inspector_primed {
-            ui.draw().mono_text_line(0.0, 0.0, 16.0, "Pixel Inspector is Primed! Click to select pixel.", 0xff_00ff00);
+            ui.draw().text_line(FontKind::Mono, 0.0, 0.0, 16.0, "Pixel Inspector is Primed! Click to select pixel.", 0xff_00ff00);
         }
         if let Some((x, y)) = unsafe { *ui.draw().debug_pixel_inspector } {
             let x = x as isize; let y = y as isize;
@@ -75,7 +75,7 @@ fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
             if y < ui.draw().window_height/2 { draw_y = ui.draw().window_height - 256 };
             let color = unsafe { *ui.draw().debug_pixel_inspector_last_color };
             ui.draw().rectangle(draw_x as f32, draw_y as f32, draw_x as f32 + 256.0, draw_y as f32 + 256.0, 0xff_000000 | color);
-            ui.draw().mono_text_line(draw_x as f32, draw_y as f32, 12.0, &format!("({},{}) = {:X}", x, y, color), 0xff_000000 | (color ^ u32::MAX));
+            ui.draw().text_line(FontKind::Mono, draw_x as f32, draw_y as f32, 12.0, &format!("({},{}) = {:X}", x, y, color), 0xff_000000 | (color ^ u32::MAX));
         }
     }
 
@@ -167,11 +167,13 @@ const Decl: Decl = Decl {
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 struct TextDecl {
+    font_kind: FontKind,
     h: f32,
     colour: (u8, u8, u8, u8),
     align: AlignX,
 }
 const TextDecl: TextDecl = TextDecl {
+    font_kind: FontKind::Normal,
     h: 0.0,
     colour: WHITE,
     align: AlignX::Left,
@@ -457,6 +459,7 @@ impl Context {
 
     fn text(&self, label: &str, decl: TextDecl) {
         let config = clay::text::TextConfig::new()
+            .font_id(decl.font_kind as u16)
             .font_size(decl.h as u16)
             .color(clay_colour(decl.colour))
             .alignment(match decl.align {
@@ -1023,8 +1026,9 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
     clay.set_layout_dimensions((window_w as f32, window_h as f32).into());
     clay.pointer_state(mouse_pos.into(), mouse_held);
     clay.set_measure_text_function_user_data(ui.draw(), |string, text_config, draw| {
+        let font_kind = match text_config.font_id { 0 => FontKind::Normal, 1 => FontKind::Mono, 2 => FontKind::Icons, _ => todo!() };
         let h = text_config.font_size as f32;
-        let w = draw.measure_text_line(h, string);
+        let w = draw.measure_text_line(font_kind, h, string);
         clay::math::Dimensions::new(w, h)
     });
 
@@ -1117,7 +1121,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
                                                 clay_color_to_u32(config.color));
                 }
                 RenderCommandConfig::Text(config) => {
-                    ui.draw().text_line(x1 as f32, y1 as f32, config.font_size as f32, config.text, clay_color_to_u32(config.color));
+                    let font_kind = match config.font_id { 0 => FontKind::Normal, 1 => FontKind::Mono, 2 => FontKind::Icons, _ => todo!() };
+                    ui.draw().text_line(font_kind, x1 as f32, y1 as f32, config.font_size as f32, config.text, clay_color_to_u32(config.color));
                 }
                 ScissorStart() => {
                     ui.draw().set_scissor(x1, y1, x2, y2);
