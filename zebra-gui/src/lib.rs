@@ -477,10 +477,10 @@ impl DrawCtx {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
                 *self.draw_command_count += 1;
                 *put = DrawCommand::RoundedRectangle {
-                    x: x1.max(0.0),
-                    x2: x2.min(self.window_width as f32),
-                    y: y1.max(0.0) as f32,
-                    y2: y2.min(self.window_height as f32),
+                    x: x1,
+                    x2: x2,
+                    y: y1,
+                    y2: y2,
                     radius_tl: 0,
                     radius_tr: 0,
                     radius_bl: 0,
@@ -541,10 +541,10 @@ impl DrawCtx {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
                 *self.draw_command_count += 1;
                 *put = DrawCommand::RoundedRectangle {
-                    x: x1.max(0) as f32,
-                    x2: x2.min(self.window_width) as f32,
-                    y: y1.max(0) as f32,
-                    y2: y2.min(self.window_height) as f32,
+                    x: x1 as f32,
+                    x2: x2 as f32,
+                    y: y1 as f32,
+                    y2: y2 as f32,
                     radius_tl,
                     radius_tr,
                     radius_bl,
@@ -1910,6 +1910,53 @@ mod tests {
     #[test]
     fn it_works() {
     }
+
+    fn approx_eq(a: u8, b: u8) -> bool {
+        let da = a as i16;
+        let db = b as i16;
+        (da - db).abs() <= 3
+    }
+
+    #[test]
+    fn test_round_trip_sampled() {
+        for r in (0..=255).step_by(17) {
+            for g in (0..=255).step_by(17) {
+                for b in (0..=255).step_by(17) {
+                    let a = 255;
+
+                    let (h, s, v, a2) = rgba_to_hsva(r, g, b, a);
+                    let (rr, gg, bb, aa) = hsva_to_rgba(h, s, v, a2);
+
+                    assert!(approx_eq(r, rr), "r={} rr={}", r, rr);
+                    assert!(approx_eq(g, gg), "g={} gg={}", g, gg);
+                    assert!(approx_eq(b, bb), "b={} bb={}", b, bb);
+                    assert_eq!(a, aa);
+                }
+            }
+        }
+    }
+
+    // Uncomment to brute-force all 16,777,216 colors
+    /*
+    #[test]
+    fn test_round_trip_full() {
+        for r in 0..=255 {
+            for g in 0..=255 {
+                for b in 0..=255 {
+                    let a = 255;
+
+                    let (h, s, v, a2) = rgba_to_hsva(r, g, b, a);
+                    let (rr, gg, bb, aa) = hsva_to_rgba(h, s, v, a2);
+
+                    assert!(approx_eq(r, rr), "r={} rr={}", r, rr);
+                    assert!(approx_eq(g, gg), "g={} gg={}", g, gg);
+                    assert!(approx_eq(b, bb), "b={} bb={}", b, bb);
+                    assert_eq!(a, aa);
+                }
+            }
+        }
+    }
+    */
 }
 
 /// Returns f1 is b is true.

@@ -127,6 +127,7 @@ use Direction::*;
 struct Decl {
     id: Id,
     direction: Direction,
+    floating: bool,
     colour: (u8, u8, u8, u8),
     radius: (f32, f32, f32, f32),
     padding: (f32, f32, f32, f32),
@@ -152,24 +153,21 @@ impl Id {
             }
         }
     }
-    fn id(label: &str) -> Self {
-        let id = unsafe { clay::Clay__HashString(label.into(), 0, clay::Clay__GetParentElementId()) };
-        Self {
-            id: id.id,
-            offset: id.offset,
-            base_id: id.baseId,
-            len: id.stringId.length as usize,
-            chars: id.stringId.chars as *const u8
-        }
+}
+fn id(label: &str) -> Id {
+    let id = unsafe { clay::Clay__HashString(label.into(), 0, clay::Clay__GetParentElementId()) };
+    Id {
+        id: id.id,
+        offset: id.offset,
+        base_id: id.baseId,
+        len: id.stringId.length as usize,
+        chars: id.stringId.chars as *const u8
     }
 }
 
-fn id(label: &str) -> Id { Id::id(label) }
-
-struct Element {}
-fn elem() -> Element { unsafe { clay::Clay__OpenElement(); } Element {} }
+#[derive(Default)] struct Element { decl: Decl }
+fn elem() -> Element { unsafe { clay::Clay__OpenElement(); } Element::default() }
 impl Drop for Element { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
-impl Element { fn decl(&self, item: Decl) -> &Self { decl(item); self } }
 
 const Clay_ElementId_ZERO: clay::Clay_ElementId = clay::Clay_ElementId { id: 0, offset: 0, baseId: 0, stringId: clay::Clay_String { isStaticallyAllocated: false, length: 0, chars: std::ptr::null() } };
 const Clay_SizingMinMax_ZERO: clay::Clay_SizingMinMax = clay::Clay_SizingMinMax { min: 0f32, max: f32::MAX };
@@ -218,45 +216,61 @@ const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Clay_E
     userData: std::ptr::null_mut(),
 };
 
-fn decl(item: Decl) {
-    fn sizing(sizing: Sizing) -> clay::layout::Sizing {
-        match sizing {
-            Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
-            Sizing::Grow(min, max) => { clay::layout::Sizing::Grow(min, max) }
-            Sizing::Fixed(x)       => { clay::layout::Sizing::Fixed(x) }
-            Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
+impl Element {
+    fn decl(&mut self, item: Decl) -> &mut Self {
+        fn sizing(sizing: Sizing) -> clay::layout::Sizing {
+            match sizing {
+                Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
+                Sizing::Grow(min, max) => { clay::layout::Sizing::Grow(min, max) }
+                Sizing::Fixed(x)       => { clay::layout::Sizing::Fixed(x) }
+                Sizing::Percent(p)     => { clay::layout::Sizing::Percent(p) }
+            }
         }
+
+        let mut decl = Clay_ElementDeclaration_ZERO;
+        decl.backgroundColor = clay::Clay_Color {
+            r: item.colour.0 as f32,
+            g: item.colour.1 as f32,
+            b: item.colour.2 as f32,
+            a: item.colour.3 as f32
+        };
+        decl.id = item.id.clay().id;
+        decl.clip = clay::Clay_ClipElementConfig { horizontal: item.clip, vertical: item.clip, childOffset: clay::Clay_Vector2 { x: 0.0, y: 0.0 } };
+        if item.floating {
+            decl.floating.attachTo = clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_PARENT;
+            // decl.floating.clipTo = clay::Clay_FloatingClipToElement_CLAY_CLIP_TO_NONE;
+            decl.floating.clipTo = clay::Clay_FloatingClipToElement_CLAY_CLIP_TO_ATTACHED_PARENT;
+            decl.floating.attachPoints = clay::Clay_FloatingAttachPoints {
+                element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
+                parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
+            };
+        }
+        decl.layout.sizing.width  = clay::Clay_SizingAxis::from(sizing(item.width));
+        decl.layout.sizing.height = clay::Clay_SizingAxis::from(sizing(item.height));
+        decl.layout.padding = clay::Clay_Padding::from(clay::Clay_Padding {
+            left:   item.padding.0 as u16,
+            right:  item.padding.1 as u16,
+            top:    item.padding.2 as u16,
+            bottom: item.padding.3 as u16,
+        });
+        decl.layout.childGap = item.child_gap as u16;
+        decl.layout.childAlignment = clay::Clay_ChildAlignment { x: item.align.x as _, y: item.align.y as _ };
+        decl.layout.layoutDirection = item.direction as _;
+        decl.cornerRadius = clay::Clay_CornerRadius {
+            topLeft:     item.radius.0,
+            topRight:    item.radius.1,
+            bottomLeft:  item.radius.2,
+            bottomRight: item.radius.3
+        };
+
+        unsafe { clay::Clay__ConfigureOpenElement(decl); }
+
+        self.decl = item;
+        self
     }
-
-    let mut decl = Clay_ElementDeclaration_ZERO;
-    decl.backgroundColor = clay::Clay_Color {
-        r: item.colour.0 as f32,
-        g: item.colour.1 as f32,
-        b: item.colour.2 as f32,
-        a: item.colour.3 as f32
-    };
-    decl.id = item.id.clay().id;
-    decl.clip = clay::Clay_ClipElementConfig { horizontal: item.clip, vertical: item.clip, childOffset: clay::Clay_Vector2 { x: 0.0, y: 0.0 } };
-    decl.layout.sizing.width  = clay::Clay_SizingAxis::from(sizing(item.width));
-    decl.layout.sizing.height = clay::Clay_SizingAxis::from(sizing(item.height));
-    decl.layout.padding = clay::Clay_Padding::from(clay::Clay_Padding {
-        left:   item.padding.0 as u16,
-        right:  item.padding.1 as u16,
-        top:    item.padding.2 as u16,
-        bottom: item.padding.3 as u16,
-    });
-    decl.layout.childGap = item.child_gap as u16;
-    decl.layout.childAlignment = clay::Clay_ChildAlignment { x: item.align.x as _, y: item.align.y as _ };
-    decl.layout.layoutDirection = item.direction as _;
-    decl.cornerRadius = clay::Clay_CornerRadius {
-        topLeft:     item.radius.0,
-        topRight:    item.radius.1,
-        bottomLeft:  item.radius.2,
-        bottomRight: item.radius.3
-    };
-
-    unsafe { clay::Clay__ConfigureOpenElement(decl); }
 }
+
+const PANE_PERCENT: f32 = (0.25 + 0.333) / 2.0;
 
 const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
 const WHITE_CLAY:       clay::Color = clay::Color::rgba(WHITE.0 as f32, WHITE.1 as f32, WHITE.2 as f32, WHITE.3 as f32);
@@ -267,13 +281,72 @@ const BUTTON_COL:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff);
 const BUTTON_HOVER_COL: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
 const BUTTON_DOWN_COL:  (u8, u8, u8, u8) = (0x1c, 0x1c, 0x1c, 0xff);
 
-#[derive(Debug, Default, Copy, Clone)]
+const MODAL_COL: (u8, u8, u8, u8) = (0x1e, 0x1e, 0x1e, 0xff);
+
+#[derive(Debug, Default, Copy, Clone, PartialEq)]
 pub enum Modal {
     #[default] None,
     Send,
     Receive,
     Stake,
     Unstake,
+}
+
+pub fn rgba_to_hsva(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8, u8) {
+    let rf = r as f32 / 255.0;
+    let gf = g as f32 / 255.0;
+    let bf = b as f32 / 255.0;
+
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let delta = max - min;
+
+    // Compute Hue (0–1)
+    let h = if delta == 0.0 {
+        0.0
+    } else if max == rf {
+        ((gf - bf) / delta).rem_euclid(6.0)
+    } else if max == gf {
+        (bf - rf) / delta + 2.0
+    } else {
+        (rf - gf) / delta + 4.0
+    } / 6.0;
+
+    // Compute Saturation and Value (0–1)
+    let s = if max == 0.0 { 0.0 } else { delta / max };
+    let v = max;
+
+    // Convert to u8 range
+    let h8 = (h * 255.0).round().clamp(0.0, 255.0) as u8;
+    let s8 = (s * 255.0).round().clamp(0.0, 255.0) as u8;
+    let v8 = (v * 255.0).round().clamp(0.0, 255.0) as u8;
+
+    (h8, s8, v8, a)
+}
+
+pub fn hsva_to_rgba(h: u8, s: u8, v: u8, a: u8) -> (u8, u8, u8, u8) {
+    let hf = (h as f32 / 255.0) * 6.0;  // 0..6
+    let sf = s as f32 / 255.0;          // 0..1
+    let vf = v as f32 / 255.0;          // 0..1
+
+    let c = vf * sf;
+    let x = c * (1.0 - ((hf % 2.0) - 1.0).abs());
+    let m = vf - c;
+
+    let (rf, gf, bf) = match hf as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x), // covers sector 5
+    };
+
+    let r = ((rf + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    let g = ((gf + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    let b = ((bf + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+
+    (r, g, b, a)
 }
 
 impl Context {
@@ -286,12 +359,14 @@ impl Context {
     fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
     fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
 
+    fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
+
     fn button_ex(&mut self, clicked_id: &mut Id, id: Id, act_on_press: bool) -> (bool, (u8, u8, u8, u8)) {
         let mouse_held     = self.input().mouse_held(winit::event::MouseButton::Left);
         let mouse_pressed  = self.input().mouse_pressed(winit::event::MouseButton::Left);
         let mouse_released = self.input().mouse_released(winit::event::MouseButton::Left);
 
-        let hover    = unsafe { clay::Clay_PointerOver(id.clay().id) };
+        let hover    = self.hovered(id);
         let down     = hover && mouse_held;
         let pressed  = hover && mouse_pressed;
         let released = hover && mouse_released;
@@ -372,7 +447,7 @@ impl Context {
            tab_id: &mut Id,
            clicked_id: &mut Id,
            label: &str) -> Id {
-        let id = Id::id(label);
+        let id = id(label);
         self.tab_ex(radius, padding, tab_id, clicked_id, id, label)
     }
 }
@@ -393,6 +468,100 @@ fn ui_left_pane(ui: &mut Context,
                 clicked_id: &mut Id,
                 tab_id: &mut Id) {
 
+    if ui.modal != Modal::None && let _elem = elem().decl(Decl {
+        child_gap,
+        id: id("Modal Container"),
+        padding: (padding.0 * 2.0).dup4(),
+        radius: (radius.0, 0.0, radius.2, 0.0),
+        floating: true,
+        colour: (0, 0, 0, 0xC0),
+        align: Align::Center,
+        width:  grow!(),
+        height: grow!(),
+        ..Decl::default()
+    }) {
+
+        let container_id = _elem.decl.id;
+        let container_hovered = ui.hovered(container_id);
+
+        if let _elem = elem().decl(Decl {
+            child_gap, radius,
+            id: id("Modal Contents"),
+            padding: (padding.0 * 2.0).dup4(),
+            colour: MODAL_COL,
+            width:  grow!(ui.scale(192.0), ui.scale(384.0)),
+            height: grow!(ui.scale(192.0), ui.scale(384.0)),
+            align: Align::Top,
+            direction: TopToBottom,
+            ..Decl::default()
+        }) {
+
+            let contents_id = _elem.decl.id;
+            let contents_hovered = ui.hovered(contents_id);
+
+            let text_h = ui.scale16(24.0);
+            let title_bar = |ui: &mut Context, clicked_id: &mut Id, closeable, title, title_bar_id| {
+                if let _ = elem().decl(Decl {
+                    id: title_bar_id,
+                    child_gap,
+                    width:  grow!(),
+                    height: fit!(),
+                    align: Align::Center,
+                    direction: LeftToRight,
+                    ..Decl::default()
+                }) {
+                    if let _ = elem().decl(Decl { width: grow!(), align: Align::Left, ..Decl::default() }) {}
+                    if let _ = elem().decl(Decl { width: grow!(), align: Align::Center, ..Decl::default() }) {
+                        ui.text(title, clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                    }
+                    if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Align::Right, ..Decl::default() }) && closeable {
+                        let id = id("Close This Modal");
+
+                        let (clicked, colour) = ui.button_act_on_release(clicked_id, id);
+                        if clicked || ui.input().key_pressed(KeyCode::Escape) {
+                            ui.modal = Modal::None;
+                        }
+
+                        // Click background to exit -- the code could be placed farther outside but it is here so it can be gated by `closeable`
+                        if ui.hovered(container_id) && !ui.hovered(contents_id) && ui.input().mouse_pressed(winit::event::MouseButton::Left) {
+                            ui.modal = Modal::None;
+                            *clicked_id = id;
+                        }
+
+                        let radius = ui.scale(20.0);
+
+                        // Button circle
+                        if let _ = elem().decl(Decl {
+                            id, colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
+                            width:  fixed!(radius * 2.0),
+                            height: fixed!(radius * 2.0),
+                            ..Decl::default()
+                        }) {
+                            let temp_letter_symbol_h = ui.scale16(32.0);
+                            ui.text("x", clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                        }
+                    }
+                }
+            };
+            match ui.modal {
+                Modal::None => {}
+                Modal::Send => {
+                    title_bar(ui, clicked_id, true, "Send",    id("Send Title Bar"));
+                }
+                Modal::Receive => {
+                    title_bar(ui, clicked_id, true, "Receive", id("Receive Title Bar"));
+                }
+                Modal::Stake => {
+                    title_bar(ui, clicked_id, true, "Stake",   id("Stake Title Bar"));
+                }
+                Modal::Unstake => {
+                    title_bar(ui, clicked_id, true, "Unstake", id("Unstake Title Bar"));
+                }
+            }
+        }
+    }
+
+
     let mut tab_id_wallet = Id::default();
     let mut tab_id_finalizers = Id::default();
     let mut tab_id_history = Id::default();
@@ -407,7 +576,7 @@ fn ui_left_pane(ui: &mut Context,
     }) {
         tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, clicked_id, "Wallet");
         // tab_id_finalizers = ui.tab(radius, padding, tab_id, clicked_id, "Finalizers");
-        tab_id_history    = ui.tab_ex(radius, padding, tab_id, clicked_id, Id::id("History"), frame_strf!(data, "History ({})", &wallet_state.lock().unwrap().txs.len()));
+        tab_id_history    = ui.tab_ex(radius, padding, tab_id, clicked_id, id("History"), frame_strf!(data, "History ({})", &wallet_state.lock().unwrap().txs.len()));
     }
 
     // Main contents
@@ -455,7 +624,7 @@ fn ui_left_pane(ui: &mut Context,
             }) {
 
                 let mut button = |ui: &mut Context, label| {
-                    let id = Id::id(label);
+                    let id = id(label);
                     let (clicked, colour) = ui.button(clicked_id, id);
                     if let _ = elem().decl(Decl {
                         id, child_gap, align: Align::Center,
@@ -594,7 +763,7 @@ fn ui_right_pane(ui: &mut Context,
             }) {
 
                 let mut button_ex = |label, act_on_press| {
-                    let id = Id::id(label);
+                    let id = id(label);
                     let (clicked, colour) = ui.button_ex(clicked_id, id, act_on_press);
                     if let _ = elem().decl(Decl {
                         id, child_gap, align: Align::Center,
@@ -671,13 +840,13 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
     let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_height as f32);
     let mouse_pos = (ui.input().mouse_pos().0 as f32, ui.input().mouse_pos().1 as f32);
 
-    let child_gap = ui.scale(8.0);
+    let child_gap = ui.scale(12.0);
     let padding = child_gap.dup4();
 
     let mouse_held    = ui.input().mouse_held(winit::event::MouseButton::Left);
     let mouse_clicked = ui.input().mouse_pressed(winit::event::MouseButton::Left);
 
-    let radius = ui.scale(8.0).dup4();
+    let radius = ui.scale(12.0).dup4();
 
     // Begin the layout
     let clay = magic(ui).clay();
@@ -705,11 +874,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
         height: grow!(),
         ..Decl::default()
     }) {
-        let pane_pct = {
-            let pct = 0.25;
-            // clay::layout::Sizing::Percent((pct * ui.scale).min(pct))
-            Sizing::Percent(pct * ui.scale)
-        };
+        let pane_pct = Sizing::Percent(ui.zoom * PANE_PERCENT);
 
         if let _ = elem().decl(Decl {
             id: id("Left Pane"),
