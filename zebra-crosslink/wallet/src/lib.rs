@@ -147,11 +147,12 @@ impl WalletState {
     }
 
     pub fn request_from_faucet(&mut self) {
+        self.waiting_for_faucet = true;
+
         if self.actions_in_flight.iter().filter(|a| match a { WalletAction::RequestFromFaucet => true, _ => false }).count() != 0 {
             return;
         }
 
-        self.waiting_for_faucet = true;
         self.actions_in_flight.push_back(WalletAction::RequestFromFaucet);
     }
 }
