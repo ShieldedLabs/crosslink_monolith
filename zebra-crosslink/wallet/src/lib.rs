@@ -611,8 +611,10 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         for tx in history {
                             println!("{tx:?}");
                             if tx.is_shielding {
-                                if let Some(height) = tx.mined_height && height + (MIN_TRANSPARENT_COINBASE_MATURITY + 2) < tip_h {
-                                    coinbase_total += tx.total_received.into_u64();
+                                if let Some(height) = tx.mined_height {
+                                    if height + (MIN_TRANSPARENT_COINBASE_MATURITY + 2) < BlockHeight::from_u32(tip_h) {
+                                        coinbase_total += tx.total_received.into_u64();
+                                    }
                                 }
                             } else if tx.total_spent.into_u64() > 0 {
                                 if tx.memo_count > 0 {
