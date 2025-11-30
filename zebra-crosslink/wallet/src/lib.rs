@@ -62,6 +62,7 @@ use zcash_client_backend::{
         self,
         chain::{error::Error as ChainError, scan_cached_blocks, ChainState},
         scanning::{ScanPriority, ScanRange},
+        Balance,
         wallet, Account as APIAccount, AccountBirthday, AccountPurpose, WalletRead, WalletWrite,
         Zip32Derivation,
     },
@@ -130,6 +131,9 @@ pub struct WalletState {
     pub balance: i64, // in zats
     pub txs: Vec<WalletTx>,
     pub waiting_for_faucet: bool,
+    pub miner_unshielded_funds: u64,
+    pub miner_shielded_pending_funds: u64,
+    pub miner_shielded_spendable_funds: u64,
 
     actions_in_flight: VecDeque<WalletAction>,
 }
@@ -149,6 +153,14 @@ impl WalletState {
         self.waiting_for_faucet = true;
         self.actions_in_flight.push_back(WalletAction::RequestFromFaucet);
     }
+}
+
+pub fn str_from_ctaz(val: u64) -> String {
+    let full = val / 100_000_000;
+    let part = val % 100_000_000;
+    let part_str = format!("{part}00");
+    let trim_part = part_str.trim_end_matches("0");
+    format!("{full}.{}", &part_str[..trim_part.len().max(3)])
 }
 
 pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
@@ -340,7 +352,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                 }
 
-                let Ok(summary) = wallet.get_wallet_summary(ConfirmationsPolicy::default()) else { continue; };
+                let Ok(summary) = wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else { continue; };
                 let Some(summary) = summary else { continue; };
 
                 let balances = summary.account_balances();
@@ -351,7 +363,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             // Shield miner's transparent ZATOSHIz
             (async | wallet: &mut WalletDb<_, _, _, _>, account: &zcash_client_sqlite::wallet::Account, usk: &UnifiedSpendingKey | {
-                let summary = match wallet.get_wallet_summary(ConfirmationsPolicy::default()) {
+                let summary = match wallet.get_wallet_summary(ConfirmationsPolicy::MIN) {
                     Ok(summary) => summary,
                     Err(err) => {
                         println!("Failed to get wallet summary: {}", err);
@@ -371,7 +383,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 //         return; // nothing to do yet
                 //     }
                 // };
-                // let Ok(tbaances) = wallet.get_transparent_balances(miner_account.id(), target_height, ConfirmationsPolicy::default()) else { return; };
+                // let Ok(tbaances) = wallet.get_transparent_balances(miner_account.id(), target_height, ConfirmationsPolicy::MIN) else { return; };
                 // let from_addrs = tbalances
                 //     .into_keys();
 
@@ -453,34 +465,62 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             })(&mut miner_wallet, &miner_account, &miner_usk).await;
 
             // Update gui wallet state
-            (async | wallet: &mut WalletDb<_, _, _, _> | {
-                let summary = match wallet.get_wallet_summary(ConfirmationsPolicy::default()) {
-                    Ok(summary) => summary,
+            (async |user_wallet: &WalletDb<_, _, _, _>, miner_wallet: &WalletDb<_, _, _, _>| {
+                let user_summary = match user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) {
+                    Ok(Some(summary)) => summary,
+                    Ok(None) => return,
                     Err(err) => {
                         println!("Failed to get wallet summary: {}", err);
                         return;
                     }
                 };
 
-                let Some(summary) = summary else { return; };
-
-                let balances = summary.account_balances();
+                let balances = user_summary.account_balances();
                 let mut wallet_balance = 0;
                 for (_, b) in balances {
                     wallet_balance += b.total().into_u64();
                 }
 
-                let zec_full = wallet_balance / 100_000_000;
-                let zec_part = wallet_balance % 100_000_000;
-                println!("WALLET HAS {} ({}.{})) cTAZ",wallet_balance, zec_full, zec_part);
+                use core::ops::Add;
+                let miner_vals = match miner_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) {
+                    Ok(Some(summary)) => {
+                        let bals = summary.account_balances();
 
-                wallet_state.lock().unwrap().balance = wallet_balance as i64;
+                        let mut vals = (0,0,0);
+                        for bal in bals {
+                            let Ok(sh) = (*bal.1.orchard_balance() + *bal.1.sapling_balance()) else { continue; };
+                            vals.0 += <u64>::from(bal.1.unshielded_balance().spendable_value());
+                            vals.1 += <u64>::from(sh.change_pending_confirmation()) + <u64>::from(sh.value_pending_spendability());
+                            vals.2 += <u64>::from(sh.spendable_value());
+                        }
+                        Some(vals)
+                    },
+                    _ => None
+                };
 
-                if let Ok(history) = get_transaction_history(wallet) {
-                    wallet_state.lock().unwrap().waiting_for_faucet = false;
-                    wallet_state.lock().unwrap().txs = history.iter().map(|h| WalletTx(h.clone())).collect(); // @temp: doesn't need to be its own type
+
+                println!("WALLET HAS {} ({})) cTAZ", wallet_balance, str_from_ctaz(wallet_balance));
+
+                let txs = if let Ok(history) = get_transaction_history(user_wallet) {
+                    Some(history.iter().map(|h| WalletTx(h.clone())).collect())
+                } else {
+                    None
+                };
+
+                {
+                    let mut wallet_lock = wallet_state.lock().unwrap();
+                    wallet_lock.balance = wallet_balance as i64;
+                    if let Some(txs) = txs {
+                        wallet_lock.waiting_for_faucet = false; // TODO:???
+                        wallet_lock.txs = txs; // @temp: doesn't need to be its own type
+                    }
+                    if let Some(vals) = miner_vals {
+                        wallet_lock.miner_unshielded_funds = vals.0;
+                        wallet_lock.miner_shielded_pending_funds = vals.1;
+                        wallet_lock.miner_shielded_spendable_funds = vals.2;
+                    }
                 }
-            })(&mut user_wallet).await;
+            })(&user_wallet, &miner_wallet).await;
 
             // Process gui wallet actions
             let Ok(wallet_state) = &mut wallet_state.try_lock() else { continue; };
@@ -862,7 +902,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     let Ok(balances) = miner_wallet.get_transparent_balances(
                         id.into(),
                         target_height,
-                        ConfirmationsPolicy::default(),
+                        ConfirmationsPolicy::MIN,
                     ) else {
                         continue;
                     };

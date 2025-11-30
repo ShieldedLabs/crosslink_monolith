@@ -9,6 +9,8 @@ use clay::render_commands::RenderCommandConfig::{Rectangle, Text, ScissorStart, 
 use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 //use clay::*; // @Temporary
 
+use wallet::str_from_ctaz;
+
 use super::*;
 
 pub fn magic<'a, 'b, T>(mut_ref: &'a mut T) -> &'b mut T {
@@ -604,10 +606,7 @@ fn ui_left_pane(ui: &mut Context,
                 align: Align::Center,
                 ..Decl::default()
             }) {
-                let balance = wallet_state.lock().unwrap().balance;
-                let zec_full = balance / 100_000_000;
-                let zec_part = balance % 100_000_000;
-                let balance_str = frame_strf!(data, "{}.{} cTAZ", zec_full, &format!("{:03}", zec_part)[..3]);
+                let balance_str = frame_strf!(data, "{} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().balance.try_into().unwrap()));
                 ui.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
             }
 
@@ -685,11 +684,14 @@ fn ui_left_pane(ui: &mut Context,
                         child_gap,
                         height: grow!(),
                         width: fit!(),
-                        direction: LeftToRight,
+                        direction: TopToBottom,
                         align: Align::Top,
                         ..Decl::default()
                     }) {
-                        ui.text(frame_strf!(data, "{:?}", tx.0.txid), clay::text::TextConfig::new().font_size(transaction_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                        // manually split id text
+                        let string = format!("{:?}", tx.0.txid);
+                        ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), clay::text::TextConfig::new().font_size(transaction_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                        ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), clay::text::TextConfig::new().font_size(transaction_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
                     }
                 }
             }
@@ -807,6 +809,19 @@ fn ui_right_pane(ui: &mut Context,
                 }
             }
 
+            if let _ = elem().decl(Decl {
+                padding, child_gap, align: Align::TopLeft,
+                width: grow!(), height: fit!(),
+                direction: TopToBottom,
+                ..Decl::default()
+            }) {
+                let title_h = ui.scale16(28.0);
+                let text_h = ui.scale16(22.0);
+                ui.text(frame_strf!(data, "Miner funds:"), clay::text::TextConfig::new().font_size(title_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                ui.text(frame_strf!(data, "Unshielded: {} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().miner_unshielded_funds)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                ui.text(frame_strf!(data, "Shielded (pending): {} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().miner_shielded_pending_funds)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                ui.text(frame_strf!(data, "Shielded (spendable): {} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().miner_shielded_spendable_funds)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+            };
         } else if *tab_id == tab_id_roster {
         } else if *tab_id == tab_id_settings {
         }
