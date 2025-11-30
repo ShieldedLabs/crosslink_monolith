@@ -1,122 +1,86 @@
 //! Internal wallet
 #![allow(warnings)]
 
-use std::collections::VecDeque;
-use std::convert::{Infallible, identity};
 use orchard::keys::SpendAuthorizingKey;
-use orchard::note_encryption::{CompactAction};
+use orchard::note_encryption::CompactAction;
 use rand_chacha::rand_core::SeedableRng;
 use rand_core::OsRng;
 use sapling_crypto::zip32::ExtendedSpendingKey;
+use std::collections::VecDeque;
+use std::convert::{identity, Infallible};
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use tokio_rustls::rustls;
 use tonic::client::GrpcService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
-use zcash_client_backend::fees::{self, StandardFeeRule };
-use zcash_client_backend::proto::service::RawTransaction;
-use zcash_client_sqlite::{AccountUuid, WalletDb};
+use tonic::IntoRequest;
+use zcash_client_backend::data_api::chain::{BlockCache, CommitmentTreeRoot};
+use zcash_client_backend::data_api::wallet::{ConfirmationsPolicy, TargetHeight, create_proposed_transactions, propose_shielding, shield_transparent_funds};
+use zcash_client_backend::fees::{self, StandardFeeRule};
+use zcash_client_backend::proto::service::{GetSubtreeRootsArg, RawTransaction, TreeState};
+use zcash_client_backend::wallet::WalletTransparentOutput;
+use zcash_client_memory::MemBlockCache;
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::util::SystemClock;
+use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_note_encryption::try_compact_note_decryption;
+use zcash_primitives::transaction::builder::{BuildConfig, Builder as TxBuilder};
 use zcash_primitives::transaction::components::TxOut;
 use zcash_primitives::transaction::fees::zip317::{self, MINIMUM_FEE};
-use zcash_primitives::transaction::sighash::{SignableInput, signature_hash};
+use zcash_primitives::transaction::sighash::{signature_hash, SignableInput};
 use zcash_primitives::transaction::txid::TxIdDigester;
 use zcash_primitives::transaction::{Transaction, TransactionData, TxVersion};
-use zcash_primitives::transaction::builder::{BuildConfig, Builder as TxBuilder};
 use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::TxId;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::{ZatBalance, Zatoshis};
+use zcash_protocol::TxId;
 use zcash_transparent::{
-    keys::{ NonHardenedChildIndex },
     builder::{TransparentBuilder, TransparentSigningSet, Unauthorized},
     bundle::OutPoint,
+    keys::NonHardenedChildIndex,
 };
-use zebra_chain::block::{Hash as BlockHash, Height};
+use zebra_chain::block::{Hash as BlockHash, Height, ZCASH_BLOCK_VERSION};
 use zebra_chain::parameters::NetworkUpgrade;
+use zebra_chain::sapling;
 use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
-use zebra_chain::transaction::{LockTime};
-use zebra_chain::transparent::{self, Input, MIN_TRANSPARENT_COINBASE_MATURITY, Utxo};
-use std::future::Future;
-use std::sync::{Arc, Mutex};
+use zebra_chain::sprout::commitment;
+use zebra_chain::transaction::LockTime;
+use zebra_chain::transparent::{self, Input, Utxo, MIN_TRANSPARENT_COINBASE_MATURITY};
 
-use rustls::CertificateError;
 use rustls::client::danger::ServerCertVerified;
 use rustls::client::danger::ServerCertVerifier;
-use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::crypto::ring;
-use rustls::crypto::CryptoProvider;
 use rustls::crypto::verify_tls12_signature;
 use rustls::crypto::verify_tls13_signature;
+use rustls::crypto::CryptoProvider;
+use rustls::crypto::WebPkiSupportedAlgorithms;
+use rustls::CertificateError;
 use tokio::runtime::Builder;
 use zcash_client_backend::{
-    address::{
-        UnifiedAddress,
-    },
+    address::UnifiedAddress,
     data_api::{
         self,
-        chain::{
-            scan_cached_blocks,
-            BlockCache,
-            ChainState,
-            error::Error as ChainError,
-        },
-        scanning::{
-            ScanPriority,
-            ScanRange,
-        },
-        wallet,
-        Account as APIAccount,
-        AccountBirthday,
-        AccountPurpose,
-        WalletRead,
-        WalletWrite,
+        chain::{error::Error as ChainError, scan_cached_blocks, ChainState},
+        scanning::{ScanPriority, ScanRange},
+        wallet, Account as APIAccount, AccountBirthday, AccountPurpose, WalletRead, WalletWrite,
         Zip32Derivation,
     },
     encoding::AddressCodec,
     keys::{
-        UnifiedAddressRequest,
-        UnifiedFullViewingKey,
-        UnifiedIncomingViewingKey,
-        UnifiedSpendingKey,
+        UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedIncomingViewingKey, UnifiedSpendingKey,
     },
     proto::{
-        compact_formats::{
-            CompactBlock,
-            CompactTx,
-        },
+        compact_formats::{CompactBlock, CompactTx},
         service::{
-            BlockId,
-            BlockRange,
-            ChainSpec,
-            Duration,
-            GetAddressUtxosArg,
-            Empty,
-            LightdInfo,
-            TransparentAddressBlockFilter,
-            compact_tx_streamer_client::CompactTxStreamerClient
-        }
+            compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
+            Duration, Empty, GetAddressUtxosArg, LightdInfo, TransparentAddressBlockFilter,
+        },
     },
 };
-use zcash_client_memory::{
-    types::account::{Account as MemAccount},
-    MemBlockCache,
-    MemoryWalletDb,
-};
-use zcash_protocol::{
-    consensus::{
-        MAIN_NETWORK,
-        TEST_NETWORK,
-        NetworkType,
-        Parameters,
-    },
-};
+use zcash_protocol::consensus::{NetworkType, Parameters, MAIN_NETWORK, TEST_NETWORK};
 use zcash_transparent::{
     address::TransparentAddress,
-    keys::{
-        IncomingViewingKey,
-        TransparentKeyScope,
-    },
+    keys::{IncomingViewingKey, TransparentKeyScope},
 };
 
 fn the_future_is_now<F: Future>(future: F) -> F::Output {
@@ -187,17 +151,11 @@ impl WalletState {
 }
 
 pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
-    the_future_is_now(async {
-        println!("waiting for zaino to be ready...");
-        wait_for_zainod().await;
-    });
-
-    let cdb = zcash_client_sqlite::BlockDb::for_path(":memory:").unwrap();
-    zcash_client_sqlite::chain::init::init_cache_database(&cdb).unwrap();
-
-    let network = &TEST_NETWORK;
-
-    fn wallet_from_seed_phrase<P: Parameters + 'static>(params: P, phrase: &str) -> (zcash_client_sqlite::WalletDb<rusqlite::Connection, P, SystemClock, OsRng>, zcash_client_sqlite::wallet::Account, UnifiedSpendingKey) {
+    fn wallet_from_seed_phrase<P: Parameters + 'static>(params: P, phrase: &str) -> (
+        zcash_client_sqlite::WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
+        zcash_client_sqlite::wallet::Account,
+        UnifiedSpendingKey,
+    ) {
         use secrecy::ExposeSecret;
 
         let mnemonic = bip39::Mnemonic::parse(phrase).unwrap();
@@ -213,14 +171,17 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             None,
         );
 
-        let mut wallet = zcash_client_sqlite::WalletDb::for_path(":memory:", params, SystemClock, OsRng).expect("hahahahahahahah ");
+        let mut wallet = zcash_client_sqlite::WalletDb::for_path(":memory:", params, SystemClock, OsRng).unwrap();
         zcash_client_sqlite::wallet::init::init_wallet_db(
             &mut wallet,
             Some(secrecy::Secret::new(seed.expose_secret().clone())),
-        ).expect("AWESROME");
+        ).unwrap();
 
-        let (account_uuid, _) = wallet.create_account("main_account", &seed, birthday, None).expect("ha lol");
-        let account = wallet.get_account(account_uuid).expect("ha lol").unwrap();
+        let (account_uuid, _) = wallet
+            .create_account("main_account", &seed, birthday, None)
+            .unwrap();
+        let account = wallet.get_account(account_uuid).unwrap().unwrap();
+
         (wallet, account, usk)
     }
 
@@ -279,555 +240,699 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         return Ok(results);
     }
 
-    // NOTE(azmr): I don't yet understand why the wallet requires miner index = 0 but user index = 1.
-    // They seem to be generated distinctly, but maybe they share some account management state.
+    the_future_is_now(async {
+        println!("waiting for zaino to be ready...");
+        wait_for_zainod().await;
+    });
 
-    let (mut miner_wallet, miner_account, miner_usk) = wallet_from_seed_phrase(network,
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
-    );
-    let miner_t_addr = transparent_addr_from_account(&miner_account, 0).unwrap();
-    let miner_t_addr_str = miner_t_addr.encode(network);
-    println!("Faucet miner t-address: {}", miner_t_addr_str);
-    let (miner_pubkey, miner_privkey) = transparent_keys_from_usk(&miner_usk, 0).unwrap();
+    let network = &TEST_NETWORK;
 
-    let miner_t_recs = miner_wallet.get_transparent_receivers(miner_account.id(), false, false).unwrap();
-    let miner_t_addrs = miner_t_recs.keys().collect::<Vec<_>>()[0];
-    println!("miner_t_addrs: {miner_t_addrs:?}");
-    println!("miner_t_get: {:?}", miner_t_recs.get(&miner_t_addr));
-    // debug_assert_eq!(miner_t_addr, *miner_t_addr1);
+    let (
+        mut miner_wallet,
+        miner_account,
+        miner_usk,
+        miner_pubkey,
+        miner_privkey,
+        miner_t_address,
+    ) = {
+        let (miner_wallet, miner_account, miner_usk) = wallet_from_seed_phrase(network,
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        );
+        let miner_t_addr = transparent_addr_from_account(&miner_account, 0).unwrap();
+        let miner_t_addr_str = miner_t_addr.encode(network);
+        let (miner_pubkey, miner_privkey) = transparent_keys_from_usk(&miner_usk, 0).unwrap();
+        let miner_t_recs = miner_wallet
+            .get_transparent_receivers(miner_account.id(), false, false)
+            .unwrap();
+        (miner_wallet, miner_account, miner_usk, miner_pubkey, miner_privkey, miner_t_addr)
+    };
 
-    let (mut user_wallet, user_account, user_usk) = wallet_from_seed_phrase(network,
-        "blur kit item praise brick misery muffin symptom cheese street tired evolve"
-    );
+    let (
+        mut user_wallet,
+        user_account,
+        user_usk,
+        user_pubkey,
+        user_privkey,
+        user_t_address,
+    ) = {
+        let (user_wallet, user_account, user_usk) = wallet_from_seed_phrase(
+            network,
+            "blur kit item praise brick misery muffin symptom cheese street tired evolve",
+        );
+        let user_t_addr = transparent_addr_from_account(&user_account, 0).unwrap();
+        let user_t_addr_str = user_t_addr.encode(network);
+        let (user_pubkey, user_privkey) = transparent_keys_from_usk(&user_usk, 0).unwrap();
+        let user_t_recs = user_wallet
+            .get_transparent_receivers(user_account.id(), false, false)
+            .unwrap();
 
-    let user_t_addr = transparent_addr_from_account(&user_account, 0).unwrap();
-    let user_t_addr_str = user_t_addr.encode(network);
+        // let user_t_addr1 = user_t_recs.into_iter().filter(|(addr, _)| addr == &user_t_addr).next().unwrap().0;
+        // NOTE: the default isn't the same as below, but I think this is because it forces a diversifier index
+        // println!("User wallet: {}/{:?}", user_t_addr_str, user_t_addr1.encode(network));
 
-    let user_t_recs = user_wallet.get_transparent_receivers(user_account.id(), false, false).unwrap();
-    println!("RECS: {:?}", user_t_recs);
-    let user_t_addr1 = user_t_recs.into_iter().filter(|(addr, _)| addr == &user_t_addr).next().unwrap().0;
-    // let user_t_addr1 = user_t_recs.keys().collect::<Vec<_>>()[0];
-    debug_assert_eq!(user_t_addr, user_t_addr1);
-    // NOTE: the default isn't the same as below, but I think this is because it forces a diversifier index
-    println!("User wallet: {}/{:?}", user_t_addr_str, user_t_addr1.encode(network));
+        (user_wallet,  user_account, user_usk, user_pubkey, user_privkey, user_t_addr)
+    };
 
-    const FEE_RULE: StandardFeeRule = StandardFeeRule::Zip317;
-    const FALLBACK_CHANGE_POOL: zcash_protocol::ShieldedProtocol = zcash_protocol::ShieldedProtocol::Orchard;
-    let change_strategy = fees::standard::SingleOutputChangeStrategy::new(
-        FEE_RULE,
-        None,
-        FALLBACK_CHANGE_POOL,
-        fees::DustOutputPolicy::default(),
-    );
+    println!("*************************");
+    println!("MINER WALLET ADDRESS: {}", miner_t_address.encode(network));
+    println!("USER WALLET ADDRESS:  {}", user_t_address.encode(network));
+    println!("*************************");
+
     let mut block_cache = MemBlockCache::new();
-    // let mut genesys_block_hash: Option<zcash_primitives::block::BlockHash> = None;
-
-    let mut total_user_txs = 0;
-
-    let mut txs_seen_block_height = 0;
-    let mut already_sent = false;
-    let mut tip_h: u32 = 0;
-    loop {
-        the_future_is_now(async {
-            let mut client = CompactTxStreamerClient::new({
-                loop {
-                    if let Ok(channel) = Channel::from_static("http://localhost:18233").connect().await {
-                        break channel;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-            });
-
-            // if genesys_block_hash.is_none() {
-            //     let latest_block = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
-            //     genesys_block_hash = Some(zcash_primitives::block::BlockHash(latest_block.hash.try_into().unwrap()));
-            // }
-
-            let latest_block = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
-            let miner_utxos = match client.get_address_utxos(GetAddressUtxosArg {
-                addresses: vec![miner_t_addr_str.to_owned()],
-                start_height: 0,
-                max_entries: 0
-            }).await {
-                Err(err) => {
-                    println!("******* GET UTXOS ERROR: {:?}", err);
-                    vec![]
-                },
-                Ok(res) => res.into_inner().address_utxos,
-            };
-
-            let user_utxos = match client.get_address_utxos(GetAddressUtxosArg {
-                addresses: vec![user_t_addr_str.to_owned()],
-                start_height: 0,
-                max_entries: 0
-            }).await {
-                Err(err) => {
-                    println!("******* GET UTXOS ERROR: {:?}", err);
-                    vec![]
-                },
-                Ok(res) => res.into_inner().address_utxos,
-            };
-
-            match client.get_lightd_info(Empty{}).await {
-                Err(err) => {
-                    println!("******* GET UTXOS ERROR: {:?}", err);
-                }
-                Ok(info) => {
-                    tip_h = info.into_inner().block_height.try_into().unwrap();
-                }
-            }
-            // let tip_h = match block_cache.get_tip_height(None) {
-            //     Ok(Some(tip_h)) => tip_h,
-            //     Ok(None) => 0.into(),
-            //     Err(err) => {
-            //         println!("******* CACHE TIP ERROR: {:?}", err);
-            //         return;
-            //     },
-            // };
-
-            fn block_range_from_scan_range(scan_range: &ScanRange) -> BlockRange {
-                let r = scan_range.block_range();
-                BlockRange{
-                    start: Some(BlockId{ height: <u64>::from(r.start), hash: Vec::new() }),
-                    end: Some(BlockId{ height: <u64>::from(r.end /*-1*/) as u64, hash: Vec::new() }),
-                }
+    the_future_is_now(async {
+        let mut client = loop {
+            if let Ok(channel) = Channel::from_static("http://localhost:18233").connect().await {
+                break CompactTxStreamerClient::new(channel);
             }
 
-            let t_addr_wallets = vec![
-                (user_t_addr.clone(), &mut user_wallet, user_usk.clone(), user_account.id()),
-                (miner_t_addr.clone(), &mut miner_wallet, miner_usk.clone(), user_account.id()),
-            ];
-            for (t_addr, wallet, usk, account_id) in t_addr_wallets {
-                let t_addr_str = t_addr.encode(network);
-                let tip_height = BlockHeight::from_u32(tip_h.try_into().unwrap());
-                if let Err(err) = wallet.update_chain_tip(tip_height) {
-                    println!("update chain tip error: {err}");
-                }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        };
 
-                let mut got_transparent = false;
-                loop {
-                    // NOTE: may have changed between loops
-                    let scan_ranges = match wallet.suggest_scan_ranges() {
-                        Ok(ranges) => ranges,
-                        Err(err) => {
-                            println!("******* SCAN RANGE ERROR: {:?}", err);
-                            break;
+        loop {
+            // Sync wallet DBs
+            for (wallet, t_address) in [(&mut miner_wallet, miner_t_address), (&mut user_wallet, user_t_address)] {
+                let Ok(info) = client.get_lightd_info(Empty {}).await else {
+                    println!("Failed to get lightd info");
+                    continue;
+                };
+
+                let network_tip_height = info.into_inner().block_height;
+
+                if 'needs_to_sync: /* what a funny language */ {
+                    if let Ok(chain_height) = wallet.chain_height() {
+                        if let Some(chain_height) = chain_height {
+                            network_tip_height != u64::from(chain_height)
+                        } else {
+                            network_tip_height > 1
                         }
-                    };
-                    let Some(scan_range) = scan_ranges.first() else {
-                        break;
-                    };
-                    // if scan_range.priority() != ScanPriority::Verify {
-                    //     break;
-                    // }
-
-                    let prev_state_h = scan_range.block_range().start.saturating_sub(1).into();
-                    let chain_state = if prev_state_h == 0 {
-                        ChainState::empty(BlockHeight::from_u32(0), zcash_primitives::block::BlockHash([0; 32]))
-                        // ChainState::empty(
-                        //     BlockHeight::from_u32(0),
-                        //     genesys_block_hash.expect("we should've set the genesis block hash before this"),
-                        // )
                     } else {
-                        // TODO: it feels like we should be able to compute this locally
-                        match client.get_tree_state(BlockId{height:prev_state_h, hash:Vec::new()}).await {
-                            Err(err) => {
-                                println!("******* GET TREE STATE ERROR: {:?}", err);
-                                continue;
-                            },
-                            Ok(result) => {
-                                let tree_state = result.into_inner();
-                                match tree_state.to_chain_state() {
-                                    Err(err) => {
-                                        println!("******* TREE STATE TO CHAIN STATE ERROR: {:?}", err);
-                                        continue;
-                                    }
-                                    Ok(chain_state) => chain_state
-                                }
-                            }
-                        }
-                    };
-
-                    let range = block_range_from_scan_range(&scan_range);
-                    let mut new_blocks: Vec<CompactBlock> = Vec::new();
-                    match client.get_block_range(range.clone()).await {
-                        Err(err) => println!("******* GET BLOCK RANGE ERROR: {:?}", err),
-                        Ok(res) => {
-                            let mut grpc_stream = res.into_inner();
-                            loop {
-                                match grpc_stream.message().await {
-                                    Ok(Some(block)) => {
-                                        println!("got block: {block:?}");
-                                        new_blocks.push(block)
-                                    },
-                                    Ok(None) => break,
-                                    Err(err) => {
-                                        if err.code() == tonic::Code::OutOfRange {
-                                            break;
-                                        } else {
-                                            println!("Get block range message error: {err:?}");
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    };
-
-                    if let Err(err) = block_cache.insert(new_blocks).await {
-                        println!("block cache insert error: {err}");
-                    };
-
-                    let block_range = scan_range.block_range();
-                    let scan_res = scan_cached_blocks(network, &block_cache, wallet, block_range.start, &chain_state, scan_range.len());
-                    println!("scan: {scan_res:?}");
-                    match scan_res {
-                        Ok(_) => {
-                            // At this point, the cache and scanned data are locally consistent (though
-                            // not necessarily consistent with the latest chain tip - this would be
-                            // discovered the next time this codepath is executed after new blocks are
-                            // received) so we can break out of the loop.
-                        }
-
-                        Err(ChainError::Scan(err)) if err.is_continuity_error() => {
-                            // must be at least one block before the height at which the error occurred
-                            let rewind_height = err.at_height().saturating_sub(10);
-                            if let Err(err) = wallet.truncate_to_height(rewind_height) {
-                                println!("******* TRUNCATE ERROR: {:?}", err);
-                                break;
-                            }
-                            block_cache.delete(ScanRange::from_parts(
-                                    rewind_height .. (tip_h+1).into(),
-                                    ScanPriority::Scanned,
-                            ));
-                            continue;
-                        }
-
-                        Err(err) => {
-                            println!("******* SCAN ERROR: {:?}", err);
-                            break;
-                        }
-                    };
-
-
-                    // Update wallet with transparent transactions for same range
-                    // TODO: off-by-1?
-                    let range = BlockRange{
-                        start: Some(BlockId{ height: block_range.start.into(), hash: Vec::new() }),
-                        end: Some(BlockId{ height: block_range.end.into(), hash: Vec::new() }),
-                    };
-
-                    let filter = TransparentAddressBlockFilter{ address: t_addr_str.to_owned(), range: Some(range.clone()) };
-                    let mut txs = Vec::new();
-                    match client.get_taddress_txids(filter).await {
-                        Err(err) => println!("******* GET T-TRANSACTIONS ERROR: {:?}", err),
-                        Ok(tx_stream) => {
-                            let mut tx_stream = tx_stream.into_inner();
-                            loop {
-                                match tx_stream.message().await {
-                                    Ok(Some(tx)) => txs.push(tx),
-                                    Ok(None) => break,
-                                    Err(err) => {
-                                        if err.code() == tonic::Code::OutOfRange {
-                                            break;
-                                        } else {
-                                            println!("Get txs message error: {err:?}");
-                                            // txs.truncate(0);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    };
-
-                    if txs.len() > 0 {
-                        // println!("txs for {t_addr}:");
-                        got_transparent = true;
-                    }
-                    for raw_tx in &txs {
-                        let tx_height = BlockHeight::from_u32(raw_tx.height.try_into().unwrap());
-                        let branch_id = BranchId::for_height(network, tx_height);
-                        let tx = Transaction::read(raw_tx.data.as_slice(), branch_id);
-                        // println!("  {tx:?}");
-                        let tx = match tx {
-                            Ok(tx) => tx,
-                            Err(err) => {
-                                println!("transaction read error: {err}");
-                                continue;
-                            }
-                        };
-
-                        let Some(bundle) = tx.transparent_bundle() else {
-                            continue;
-                        };
-
-                        // if let Err(err) = wallet::decrypt_and_store_transaction(network, wallet, &tx, Some(tx_height)) {
-                        //     println!("transparent tx decrypt error: {err}");
-                        // }
-
-                        // Process outputs for received UTXOs
-                        for (index, txout) in bundle.vout.iter().enumerate() {
-                            let Some(recipient) = txout.recipient_address() else {
-                                println!("Couldn't get transparent address from pubkey {:?}", txout.script_pubkey);
-                                continue;
-                            };
-                            if recipient.encode(network) == t_addr_str {
-                                let outpoint = OutPoint::new(tx.txid().into(), index as u32);
-                                let height = BlockHeight::from_u32(raw_tx.height as u32);
-                                let Some(wto) = zcash_client_backend::wallet::WalletTransparentOutput::from_parts(
-                                    outpoint,
-                                    txout.clone(),
-                                    Some(height),
-                                ) else { continue };
-                                if let Err(err) = wallet.put_received_transparent_utxo(&wto) {
-                                    println!("put_received_transparent_utxo error: {err}");
-                                    continue;
-                                };
-                                // println!("Received transparent UTXO at height {}", height);
-                            }
-                        }
-
-                        // TODO: do we need to explicitly handle vin here or does that get covered
-                        // by sending?
+                        true
                     }
                 }
-
-                println!("{} {:#?}", t_addr_str, wallet.get_wallet_summary(wallet::ConfirmationsPolicy::MIN));
-
-                // immediately shield newly-received transparent transactions
-                if got_transparent {
-                    let min_zats_for_shielding = Zatoshis::const_from_u64(10_000);
-                    match wallet::propose_shielding::<_, _, _, _, Infallible>(
-                        wallet,
-                        network,
-                        &wallet::input_selection::GreedyInputSelector::new(),
-                        &change_strategy,
-                        min_zats_for_shielding,
-                        &[t_addr],
-                        account_id,
-                        wallet::ConfirmationsPolicy::MIN,
-                    ) {
-                        Err(err) => println!("propose_shielding error: {err:?}"),
-                        Ok(proposal) => {
-                            let prover = LocalTxProver::bundled();
-                            match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
-                                wallet, network,
-                                &prover,
-                                &prover,
-                                &wallet::SpendingKeys::from_unified_spending_key(usk.clone()),
-                                zcash_client_backend::wallet::OvkPolicy::Sender,
-                                &proposal)
-                            {
-                                Err(err) => println!("shielding create_proposed_transactions error: {err:?}"),
-                                Ok(txids) => for txid in txids {
-                                    println!("created shielding transaction {txid:?}");
-
-                                    let tx = match wallet.get_transaction(txid) {
-                                        Err(err) => {
-                                            println!("failed to get tx {txid:?} immediately after making it: {err:?}");
-                                            continue;
-                                        }
-                                        Ok(Some(tx)) => tx,
-                                        Ok(None) => {
-                                            println!("failed to get tx {txid:?} immediately after making it: (None)");
-                                            continue;
-                                        }
-                                    };
-
-                                    let mut data = Vec::new();
-                                    if let Err(err) = tx.write(&mut data) {
-                                        println!("Serialization error for tx {:?}: {:?}", txid, err);
-                                        continue;
-                                    }
-
-                                    let raw_tx = RawTransaction { data, height: 0 };
-
-                                    match client.send_transaction(raw_tx).await {
-                                        Ok(res) => println!("sent transaction: {res:?}"),
-                                        Err(err) => println!("failed to send transaction: {err:?}"),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            txs_seen_block_height = tip_h as i32;
-
-            {
-                let history = get_transaction_history(&miner_wallet).unwrap();
-                println!("********************* miner history: {:?}", history);
-            }
-
-            let history = get_transaction_history(&user_wallet).unwrap();
-            wallet_state.lock().unwrap().txs = history.iter().map(|h| WalletTx(h.clone())).collect(); // @temp: shouldn't be a separate type
-
-            if history.len() != total_user_txs {
-                total_user_txs = history.len();
-                wallet_state.lock().unwrap().waiting_for_faucet = false;
-            }
-
-            if !already_sent && txs_seen_block_height >= 5 {
-            // if !already_sent && miner_utxos.len() != 0 && miner_utxos[0].height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64) < latest_block.height {
-                let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
-                // NOTE: we can't send transparent->transparent through the high-level API, we
-                // have to propose_shielding first, then send in a later block
-                match wallet::propose_standard_transfer_to_address::<_, _, Infallible>(
-                    &mut miner_wallet,
-                    network,
-                    zcash_client_backend::fees::StandardFeeRule::Zip317,
-                    miner_account.id(),
-                    wallet::ConfirmationsPolicy::MIN,
-                    &zcash_client_backend::address::Address::Transparent(user_t_addr),
-                    zats,
-                    None,
-                    None,
-                    FALLBACK_CHANGE_POOL)
                 {
-                    Err(err) => println!("propose_transfer error: {err:?}"),
+                    const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u32 = 64;
+                    if let Err(err) = zcash_client_backend::sync::run(&mut client, network, &mut block_cache, wallet, MAX_BLOCKS_TO_DOWNLOAD_AT_TIME).await {
+                        println!("Failed to sync wallet: {}", err);
+                        continue;
+                    }
+                }
+
+                let Ok(summary) = wallet.get_wallet_summary(ConfirmationsPolicy::default()) else { continue; };
+                let Some(summary) = summary else { continue; };
+
+                let balances = summary.account_balances();
+                println!("******* WALLET {:?} *******", t_address.encode(network));
+                println!("BALANCES {:?}", balances);
+                println!("SUMMARY  {:?}", summary);
+            }
+
+            // Shield miner's transparent ZATOSHIz
+            (async | wallet: &mut WalletDb<_, _, _, _>, account: &zcash_client_sqlite::wallet::Account, usk: &UnifiedSpendingKey | {
+                let summary = match wallet.get_wallet_summary(ConfirmationsPolicy::default()) {
+                    Ok(summary) => summary,
+                    Err(err) => {
+                        println!("Failed to get wallet summary: {}", err);
+                        return;
+                    }
+                };
+
+                let Some(summary) = summary else { return; };
+
+                // let Ok(chain_height) = wallet.chain_height() else {
+                //     println!("Failed to get chain height");
+                //     return;
+                // };
+                // let target_height: TargetHeight = match chain_height {
+                //     Some(height) => (height + 1).into(),
+                //     None => {
+                //         return; // nothing to do yet
+                //     }
+                // };
+                // let Ok(tbaances) = wallet.get_transparent_balances(miner_account.id(), target_height, ConfirmationsPolicy::default()) else { return; };
+                // let from_addrs = tbalances
+                //     .into_keys();
+
+                let Some(addr) = transparent_addr_from_account(&account, 0) else {
+                    println!("Failed to get transparent address from account!");
+                    return;
+                };
+
+                const FEE_RULE: StandardFeeRule = StandardFeeRule::Zip317;
+                const FALLBACK_CHANGE_POOL: zcash_protocol::ShieldedProtocol = zcash_protocol::ShieldedProtocol::Orchard;
+                let change_strategy = fees::standard::SingleOutputChangeStrategy::new(
+                    FEE_RULE,
+                    None,
+                    FALLBACK_CHANGE_POOL,
+                    fees::DustOutputPolicy::default(),
+                );
+                let min_zats_for_shielding = Zatoshis::const_from_u64(10_000);
+                match wallet::propose_shielding::<_, _, _, _, Infallible>(
+                    wallet,
+                    network,
+                    &wallet::input_selection::GreedyInputSelector::new(),
+                    &change_strategy,
+                    min_zats_for_shielding,
+                    &[addr],
+                    account.id(),
+                    wallet::ConfirmationsPolicy::MIN,
+                ) {
                     Ok(proposal) => {
                         let prover = LocalTxProver::bundled();
-                        match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
-                            &mut miner_wallet, network,
+                        let txids = match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                            wallet,
+                            network,
                             &prover,
                             &prover,
-                            &wallet::SpendingKeys::from_unified_spending_key(miner_usk.clone()),
+                            &wallet::SpendingKeys::from_unified_spending_key(usk.clone()),
                             zcash_client_backend::wallet::OvkPolicy::Sender,
                             &proposal)
                         {
-                            Err(err) => println!("create_proposed_transactions error: {err:?}"),
-                            Ok(txids) => for txid in txids {
-                                let tx = match miner_wallet.get_transaction(txid) {
-                                    Err(err) => {
-                                        println!("failed to get tx {txid:?} immediately after making it: {err:?}");
-                                        return;
-                                    }
-                                    Ok(Some(tx)) => tx,
-                                    Ok(None) => {
-                                        println!("failed to get tx {txid:?} immediately after making it: (None)");
-                                        return;
-                                    }
-                                };
+                            Ok(txids) => txids,
+                            Err(err) => {
+                                println!("Failed to create transactions: {:?}", err);
+                                return;
+                            },
+                        };
 
-                                let mut data = Vec::new();
-                                if let Err(err) = tx.write(&mut data) {
-                                    println!("Serialization error for tx {:?}: {:?}", txid, err);
+                        for txid in txids {
+                            let tx = match wallet.get_transaction(txid) {
+                                Ok(Some(tx)) => tx,
+                                Ok(None) => {
+                                    println!("failed to get tx {txid:?} immediately after making it: (None)");
                                     return;
                                 }
-
-                                let raw_tx = RawTransaction { data, height: 0 };
-
-                                match client.send_transaction(raw_tx).await {
-                                    Ok(res) => println!("sent transaction: {res:?}"),
-                                    Err(err) => println!("failed to send transaction: {err:?}"),
+                                Err(err) => {
+                                    println!("failed to get tx {txid:?} immediately after making it: {err:?}");
+                                    return;
                                 }
+                            };
 
-                                println!("created transaction {txid:?}");
-                                already_sent = true;
+                            let mut data = Vec::new();
+                            if let Err(err) = tx.write(&mut data) {
+                                println!("Serialization error for tx {:?}: {:?}", txid, err);
+                                return;
+                            }
+
+                            let raw_tx = RawTransaction { data, height: 0 };
+                            match client.send_transaction(raw_tx).await {
+                                Ok(res) => println!("sent transaction: {res:?}"),
+                                Err(err) => println!("failed to send transaction: {err:?}"),
+                            }
+
+                            println!("created transaction {txid:?}");
+                        }
+                    }
+                    Err(err) => {
+                        println!("Failed to propose shielding: {:?}", err);
+                        return;
+                    }
+                }
+            })(&mut miner_wallet, &miner_account, &miner_usk).await;
+
+            // Update gui wallet state
+            (async | wallet: &mut WalletDb<_, _, _, _> | {
+                let summary = match wallet.get_wallet_summary(ConfirmationsPolicy::default()) {
+                    Ok(summary) => summary,
+                    Err(err) => {
+                        println!("Failed to get wallet summary: {}", err);
+                        return;
+                    }
+                };
+
+                let Some(summary) = summary else { return; };
+
+                let balances = summary.account_balances();
+                let mut wallet_balance = 0;
+                for (_, b) in balances {
+                    wallet_balance += b.total().into_u64();
+                }
+
+                let zec_full = wallet_balance / 100_000_000;
+                let zec_part = wallet_balance % 100_000_000;
+                println!("WALLET HAS {} ({}.{})) cTAZ",wallet_balance, zec_full, zec_part);
+
+                wallet_state.lock().unwrap().balance = wallet_balance as i64;
+
+                if let Ok(history) = get_transaction_history(wallet) {
+                    wallet_state.lock().unwrap().waiting_for_faucet = false;
+                    wallet_state.lock().unwrap().txs = history.iter().map(|h| WalletTx(h.clone())).collect(); // @temp: doesn't need to be its own type
+                }
+            })(&mut user_wallet).await;
+
+            // Process gui wallet actions
+            let Ok(wallet_state) = &mut wallet_state.try_lock() else { continue; };
+            println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len());
+            while let Some(action) = wallet_state.actions_in_flight.front() {
+                match action {
+                    WalletAction::RequestFromFaucet => {
+                        let Ok(miner_utxos) = client.get_address_utxos(GetAddressUtxosArg{
+                            addresses: [miner_t_address.encode(network).to_string()].to_vec(),
+                            start_height: 0,
+                            max_entries: 0,
+                        }).await else {
+                            println!("Miner had no UTXOs to use");
+                            break;
+                        };
+
+                        let miner_utxos = miner_utxos.into_inner().address_utxos;
+                        if miner_utxos.is_empty() {
+                            println!("Miner had no UTXOs to use");
+                            break;
+                        }
+
+                        let action = wallet_state.actions_in_flight.pop_front().unwrap();
+
+                        let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
+
+                        let mut signing_set = TransparentSigningSet::new();
+                        signing_set.add_key(miner_privkey);
+
+                        let prover = LocalTxProver::bundled();
+                        let extsk: &[ExtendedSpendingKey] = &[];
+                        let sak: &[SpendAuthorizingKey] = &[];
+
+                        let script = zcash_transparent::address::Script(zcash_script::script::Code(miner_utxos[0].script.clone()));
+
+                        let outpoint = OutPoint::new(miner_utxos[0].txid[..32].try_into().unwrap(), miner_utxos[0].index as u32);
+
+                        let Some(target_height) = miner_wallet.chain_height().expect("Failed to get chain height") else {
+                            println!("Failed to get miner's chain height");
+                            break;
+                        };
+
+                        let mut txb = TxBuilder::new(
+                            network,
+                            target_height + 1,
+                            BuildConfig::Standard {
+                                sapling_anchor: None,
+                                orchard_anchor: None,
+                            },
+                        );
+
+                        txb.add_transparent_input(miner_pubkey, outpoint, TxOut::new((zats + MINIMUM_FEE).unwrap(), script)).unwrap();
+                        txb.add_transparent_output(&user_t_address, zats).unwrap();
+
+                        use rand_chacha::ChaCha20Rng;
+                        let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+                        let tx_res = txb.build(
+                            &signing_set,
+                            extsk,
+                            sak,
+                            rng,
+                            &prover,
+                            &prover,
+                            &zip317::FeeRule::standard(),
+                        ).unwrap();
+
+                        let tx = tx_res.transaction();
+                        let mut tx_bytes = vec![];
+                        tx.write(&mut tx_bytes).unwrap();
+
+                        wallet_state.waiting_for_faucet = true;
+
+                        match client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await {
+                            Ok(_) => {
+                                println!("Faucet transaction sent successfully");
+                            }
+                            Err(err) => {
+                                println!("Failed to send faucet transaction: {}", err);
+                                wallet_state.waiting_for_faucet = false;
                             },
                         }
+                    },
+
+                    _ => {
+                        wallet_state.actions_in_flight.pop_front();
                     }
                 }
             }
 
-            // let latest = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
-            // let consensus_branch_id = BranchId::for_height(network, BlockHeight::from_u32(latest.height as u32));
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        };
+    });
 
-            // let mut tbundle = TransparentBuilder::empty().build();
-            // // tbundle.add_output(&user_t_addr, Zatoshis::const_from_u64(500)).unwrap();
-            // // let tbundle = tbundle.build().unwrap();
+    // SOMEWHAT BROKEN MANUAL SYNC CODE
+    /*
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-            // let unauthed_tx: TransactionData::<zcash_protocol::transaction::Unauthorized> = TransactionData::from_parts(
-            //     TxVersion::VCrosslink,
-            //     consensus_branch_id,
-            //     0,
-            //     BlockHeight::from_u32(0),
-            //     tbundle,
-            //     None, None, None, None);
+        // GET THE CURRENT STATE OF THE WORLD
+        let (sync_failed, network_tip_height, tree_state) = 'sync_state: {
+            let tree_state = if local_tip_height == 0 {
+                TreeState::default()
+            } else {
+                match client.get_tree_state(BlockId {height: local_tip_height, ..Default::default()}).await {
+                    Ok(info) => info.into_inner(),
+                    Err(err) => {
+                        println!("Failed to get tree state: {:?}", err);
+                        break 'sync_state (true, 0, TreeState::default());
+                    }
+                }
+            };
 
-            // let txid_parts = unauthed_tx.digest(TxIdDigester);
+            let Ok(info) = client.get_lightd_info(Empty {}).await else {
+                println!("Failed to get lightd info");
+                break 'sync_state (true, 0, TreeState::default());
+            };
 
-            // let transparent_bundle = unauthed_tx
-            //     .transparent_bundle()
-            //     .map(|tb| tb.clone().apply_signatures(|thing| {
-            //         let sig_hash = signature_hash(&unauthed_tx, &SignableInput::Shielded, &txid_parts);
-            //         let sig_hash: [u8; 32] = sig_hash.as_ref().clone();
-            //         sig_hash
-            //     }, &TransparentSigningSet::default()).unwrap());
+            let network_tip_height = info.into_inner().block_height;
 
-            // let mut tx_bytes = vec![];
-            // tx_bytes.write(&mut tx_bytes).unwrap();
+            match client.get_block_range(BlockRange {
+                start: Some(BlockId { height: local_tip_height,   ..Default::default() }),
+                end:   Some(BlockId { height: network_tip_height, ..Default::default() }),
+            }).await {
+                Ok(blocks) => {
+                    let mut new_blocks: Vec<CompactBlock> = Vec::new();
+                    let mut block_stream = blocks.into_inner();
+                    loop {
+                        match block_stream.message().await {
+                            Ok(Some(block)) => {
+                                local_tip_height = block.height;
+                                new_blocks.push(block)
+                            }
+                            Ok(None) => break,
+                            Err(err) => {
+                                if err.code() == tonic::Code::OutOfRange {
+                                    break;
+                                } else {
+                                    println!("Failed to get block: {:?}", err);
+                                    break;
+                                }
+                            }
+                        }
+                    }
 
-            let mut user_sum = 0;
-            for utxo in &user_utxos {
-                user_sum += utxo.value_zat;
+                    if let Err(err) = block_cache.insert(new_blocks).await {
+                        println!("Failed to update block cache: {:?}", err);
+                        break 'sync_state (true, 0, TreeState::default());
+                    }
+                }
+                Err(err) => {
+                    println!("Failed to get block range: {:?}", err);
+                    break 'sync_state (true, 0, TreeState::default());
+                }
             }
 
-            wallet_state.lock().unwrap().balance = user_sum;
+            (false, network_tip_height, tree_state)
+        };
 
-            let zec_full = user_sum / 100_000_000;
-            let zec_part = user_sum % 100_000_000;
-            println!("user {} has {} UTXOs with {} zats = {}.{} cTAZ", user_t_addr_str, user_utxos.len(), user_sum, zec_full, zec_part);
+        if sync_failed {
+            continue;
+        }
 
-            println!("*** PENDING WALLET GUI ACTIONS: {}", wallet_state.lock().unwrap().actions_in_flight.len());
+        let (reorg_required) = 'process_blocks: {
+            let mut reorg_required = false;
+            for wallet in [&mut miner_wallet, &mut user_wallet] {
+                // use zcash_client_backend::data_api::WalletCommitmentTrees;
+
+                if let Err(err) = wallet.update_chain_tip(BlockHeight::from_u32(local_tip_height as u32)) {
+                    println!("Failed to update chain tip: {:?}", err);
+                }
+
+                let mut scan_ranges = match wallet.suggest_scan_ranges() {
+                    Err(err) => {
+                        println!("Failed to get scan ranges: {:?}", err);
+                        continue;
+                    }
+                    Ok(scan_ranges) => scan_ranges,
+                };
+
+                while let Some(scan_range) = scan_ranges.first() {
+                    match scan_range.priority() {
+                        ScanPriority::Verify => {
+                            let previous_height = scan_range.block_range().start.saturating_sub(1);
+                            let chain_state = match client.get_tree_state(BlockId { height: previous_height.into(), ..Default::default() }).await {
+                                Ok(tree_state) => {
+                                    tree_state.into_inner().to_chain_state().unwrap()
+                                }
+                                Err(err) => {
+                                    println!("Failed to get tree state: {:?}", err);
+                                    continue;
+                                }
+                            };
+
+                            match scan_cached_blocks(
+                                &network,
+                                &block_cache,
+                                wallet,
+                                scan_range.block_range().start,
+                                &chain_state,
+                                scan_range.len(),
+                            ) {
+                                Ok(_) => {
+                                    break;
+                                }
+                                Err(ChainError::Scan(err)) => {
+                                    let rewind_height = err.at_height().saturating_sub(1);
+                                    if let Err(err) = wallet.truncate_to_height(rewind_height) {
+                                        assert!(false,"Failed to truncate wallet db: {:?}", err);
+                                    }
+
+                                    let deletion_range = ScanRange::from_parts(
+                                        (rewind_height..BlockHeight::from_u32(network_tip_height as u32)).into(),
+                                        ScanPriority::Scanned,
+                                    );
+                                    if let Err(err) = block_cache.delete(deletion_range).await {
+                                        assert!(false,"Failed to truncate block db: {:?}", err);
+                                    }
+
+                                    local_tip_height = rewind_height.into();
+                                    break 'process_blocks true;
+                                }
+                                Err(err) => {
+                                assert!(false,"Failed to truncate wallet db: {:?}", err);
+                                }
+                            }
+                        }
+
+                        _ => {}
+                    }
+
+                    scan_ranges = wallet.suggest_scan_ranges().expect("failed to get new scan ranges");
+                }
+            }
+
+            break 'process_blocks (false);
+        };
+
+        if reorg_required {
+            continue;
+        }
+
+        'process_wallet_txs: {
+            let Ok(chain_state) = tree_state.to_chain_state() else {
+                break 'process_wallet_txs;
+            };
+
+            for (wallet, t_address) in [
+                (&mut miner_wallet, miner_t_address),
+                (&mut user_wallet, user_t_address),
+            ] {
+                let scan_ranges = match wallet.suggest_scan_ranges() {
+                    Err(err) => {
+                        assert!(false,"Failed to get scan ranges: {:?}", err);
+                        break 'process_wallet_txs;
+                    }
+                    Ok(scan_ranges) => scan_ranges,
+                };
+
+                for range in &scan_ranges {
+                    let scan_result = scan_cached_blocks(
+                        &network,
+                        &block_cache,
+                        wallet,
+                        range.block_range().start,
+                        &chain_state,
+                        range.len(),
+                    );
+                }
+
+                let lowest_start = &scan_ranges
+                    .iter()
+                    .min_by(|a, b| a.block_range().start.cmp(&b.block_range().start));
+                let highest_end = &scan_ranges
+                    .iter()
+                    .max_by(|a, b| a.block_range().end.cmp(&b.block_range().end));
+                match (lowest_start, highest_end) {
+                    (Some(lo), Some(hi)) => {
+                        let range = BlockRange {
+                            start: Some(BlockId {
+                                height: lo.block_range().start.into(),
+                                ..Default::default()
+                            }),
+                            end: Some(BlockId {
+                                height: hi.block_range().end.into(),
+                                ..Default::default()
+                            }),
+                        };
+
+                        println!("TADDRESS SEARCH RANGE: {:?}", range);
+
+                        match client
+                            .get_taddress_transactions(TransparentAddressBlockFilter {
+                                address: t_address.encode(network),
+                                range: Some(range.clone()),
+                            })
+                            .await
+                        {
+                            Ok(tx_stream) => {
+                                let mut tx_stream = tx_stream.into_inner();
+                                loop {
+                                    match tx_stream.message().await {
+                                        Ok(Some(raw_tx)) => {
+                                            let tx_height = BlockHeight::from_u32(
+                                                raw_tx.height.try_into().unwrap(),
+                                            );
+                                            let branch_id =
+                                                BranchId::for_height(network, tx_height);
+                                            let tx = Transaction::read(
+                                                raw_tx.data.as_slice(),
+                                                branch_id,
+                                            )
+                                            .expect("failed to read transaction");
+
+                                            if let Err(err) =
+                                                wallet::decrypt_and_store_transaction(
+                                                    network, wallet, &tx, None,
+                                                )
+                                            {
+                                                println!("Error decrypting and storing transaction: {}", err);
+                                            }
+
+                                            // let Some(bundle) = tx.transparent_bundle() else {
+                                            //     continue;
+                                            // };
+
+                                            // if let Err(err) = wallet::decrypt_and_store_transaction(network, wallet, &tx, Some(tx_height)) {
+                                            //     println!("transparent tx decrypt error: {err}");
+                                            // }
+
+                                            // Process outputs for received UTXOs
+                                            // for (index, txout) in bundle.vout.iter().enumerate() {
+                                            //     let Some(recipient) = txout.recipient_address() else {
+                                            //         println!("Couldn't get transparent address from pubkey {:?}", txout.script_pubkey);
+                                            //         continue;
+                                            //     };
+                                            //     if recipient.encode(network) == t_addr_str {
+                                            //         let outpoint = OutPoint::new(tx.txid().into(), index as u32);
+                                            //         let height = BlockHeight::from_u32(raw_tx.height as u32);
+                                            //         let Some(wto) = zcash_client_backend::wallet::WalletTransparentOutput::from_parts(
+                                            //             outpoint,
+                                            //             txout.clone(),
+                                            //             Some(height),
+                                            //         ) else { continue };
+                                            //         if let Err(err) = wallet.put_received_transparent_utxo(&wto) {
+                                            //             println!("put_received_transparent_utxo error: {err}");
+                                            //             continue;
+                                            //         };
+                                            //         // println!("Received transparent UTXO at height {}", height);
+                                            //     }
+                                            // }
+                                        }
+                                        Ok(None) => {
+                                            break;
+                                        }
+                                        Err(err) => {
+                                            assert!(false,"Failed to fetch transactions for address {} in range {:?}: {}", t_address.encode(network), &range, err);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                assert!(false,"Failed to fetch transactions for address {} in range {:?}: {}", t_address.encode(network), &range, err);
+                            }
+                        }
+                    }
+
+                    _ => {}
+                }
+            }
+
+            let mut wallet_balance = 0;
+
+            let target_height =
+                wallet::TargetHeight::from(BlockHeight::from_u32(local_tip_height as u32));
+            if let Ok(ids) = miner_wallet.get_account_ids() {
+                for id in ids {
+                    let Ok(balances) = miner_wallet.get_transparent_balances(
+                        id.into(),
+                        target_height,
+                        ConfirmationsPolicy::default(),
+                    ) else {
+                        continue;
+                    };
+                    for b in balances {
+                        wallet_balance += b.1 .1.total().into_u64();
+                    }
+                }
+            }
+
+            let zec_full = wallet_balance / 100_000_000;
+            let zec_part = wallet_balance % 100_000_000;
+            println!(
+                "MINER HAS {} ({}.{})) cTAZ",
+                wallet_balance, zec_full, zec_part
+            );
+
+            wallet_state.lock().unwrap().balance = wallet_balance as i64;
+        };
+
+        'process_wallet_actions: {
+            /*
             if let Ok(wallet_state) = &mut wallet_state.try_lock() {
                 while let Some(action) = wallet_state.actions_in_flight.front() {
                     match action {
                         WalletAction::RequestFromFaucet => {
+                            /*
                             println!("***** WALLET GUI REQUESTED FUNDS FROM THE FAUCET (txs_seen_block_height: {})", txs_seen_block_height);
-                            if txs_seen_block_height >= 5 {
-                                let action = wallet_state.actions_in_flight.pop_front().unwrap();
-                                wallet_state.waiting_for_faucet = true;
+                            let action = wallet_state.actions_in_flight.pop_front().unwrap();
+                            wallet_state.waiting_for_faucet = true;
 
-                                let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
+                            let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
 
-                                let mut signing_set = TransparentSigningSet::new();
-                                signing_set.add_key(miner_privkey);
+                            let mut signing_set = TransparentSigningSet::new();
+                            signing_set.add_key(miner_privkey);
 
-                                let prover = LocalTxProver::bundled();
-                                let extsk: &[ExtendedSpendingKey] = &[];
-                                let sak: &[SpendAuthorizingKey] = &[];
+                            let prover = LocalTxProver::bundled();
+                            let extsk: &[ExtendedSpendingKey] = &[];
+                            let sak: &[SpendAuthorizingKey] = &[];
 
-                                let script = zcash_transparent::address::Script(zcash_script::script::Code(miner_utxos[0].script.clone()));
+                            let script = zcash_transparent::address::Script(zcash_script::script::Code(miner_utxos[0].script.clone()));
 
-                                let outpoint = OutPoint::new(miner_utxos[0].txid[..32].try_into().unwrap(), miner_utxos[0].index as u32);
+                            let outpoint = OutPoint::new(miner_utxos[0].txid[..32].try_into().unwrap(), miner_utxos[0].index as u32);
 
-                                let mut txb = TxBuilder::new(
-                                    network,
-                                    BlockHeight::from_u32(latest_block.height as u32),
-                                    BuildConfig::Standard {
-                                        sapling_anchor: None,
-                                        orchard_anchor: None,
-                                    },
-                                );
+                            let mut txb = TxBuilder::new(
+                                network,
+                                BlockHeight::from_u32(latest_block.height as u32),
+                                BuildConfig::Standard {
+                                    sapling_anchor: None,
+                                    orchard_anchor: None,
+                                },
+                            );
 
-                                txb.add_transparent_input(miner_pubkey, outpoint, TxOut::new((zats + MINIMUM_FEE).unwrap(), script)).unwrap();
-                                txb.add_transparent_output(&user_t_addr, zats).unwrap();
+                            txb.add_transparent_input(miner_pubkey, outpoint, TxOut::new((zats + MINIMUM_FEE).unwrap(), script)).unwrap();
+                            txb.add_transparent_output(&user_t_addr, zats).unwrap();
 
-                                use rand_chacha::ChaCha20Rng;
-                                let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
-                                let tx_res = txb.build(
-                                    &signing_set,
-                                    extsk,
-                                    sak,
-                                    rng,
-                                    &prover,
-                                    &prover,
-                                    &zip317::FeeRule::standard(),
-                                ).unwrap();
+                            use rand_chacha::ChaCha20Rng;
+                            let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+                            let tx_res = txb.build(
+                                &signing_set,
+                                extsk,
+                                sak,
+                                rng,
+                                &prover,
+                                &prover,
+                                &zip317::FeeRule::standard(),
+                            ).unwrap();
 
-                                let tx = tx_res.transaction();
-                                let mut tx_bytes = vec![];
-                                tx.write(&mut tx_bytes).unwrap();
+                            let tx = tx_res.transaction();
+                            let mut tx_bytes = vec![];
+                            tx.write(&mut tx_bytes).unwrap();
 
-                                let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
-                                println!("******* res: {:?}", res);
-                            }
-                            else {
-                                break;
-                            }
+                            let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
+                            println!("******* res: {:?}", res);
+                            */
                         },
 
                         _ => {
@@ -836,10 +941,429 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                 }
             }
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        });
+            */
+        };
     }
+    */
+
+    // ORIGINAL CODE FOR ANDREW'S COPYING/PASTING PLEASURE
+    /*
+    the_future_is_now(async {
+        let latest_block = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
+        let miner_utxos = match client.get_address_utxos(GetAddressUtxosArg {
+            addresses: vec![miner_t_addr_str.to_owned()],
+            start_height: 0,
+            max_entries: 0
+        }).await {
+            Err(err) => {
+                println!("******* GET UTXOS ERROR: {:?}", err);
+                vec![]
+            },
+            Ok(res) => res.into_inner().address_utxos,
+        };
+
+        let user_utxos = match client.get_address_utxos(GetAddressUtxosArg {
+            addresses: vec![user_t_addr_str.to_owned()],
+            start_height: 0,
+            max_entries: 0
+        }).await {
+            Err(err) => {
+                println!("******* GET UTXOS ERROR: {:?}", err);
+                vec![]
+            },
+            Ok(res) => res.into_inner().address_utxos,
+        };
+
+        // match client.get_lightd_info(Empty{}).await {
+        //     Err(err) => {
+        //         println!("******* GET UTXOS ERROR: {:?}", err);
+        //     }
+        //     Ok(info) => {
+        //         tip_h = info.into_inner().block_height.try_into().unwrap();
+        //     }
+        // }
+        // let tip_h = match block_cache.get_tip_height(None) {
+        //     Ok(Some(tip_h)) => tip_h,
+        //     Ok(None) => 0.into(),
+        //     Err(err) => {
+        //         println!("******* CACHE TIP ERROR: {:?}", err);
+        //         return;
+        //     },
+        // };
+
+        fn block_range_from_scan_range(scan_range: &ScanRange) -> BlockRange {
+            let r = scan_range.block_range();
+            BlockRange{
+                start: Some(BlockId{ height: <u64>::from(r.start), hash: Vec::new() }),
+                end: Some(BlockId{ height: <u64>::from(r.end /*-1*/) as u64, hash: Vec::new() }),
+            }
+        }
+
+        let t_addr_wallets = vec![
+            (user_t_addr.clone(), &mut user_wallet, user_usk.clone(), user_account.id()),
+            (miner_t_addr.clone(), &mut miner_wallet, miner_usk.clone(), user_account.id()),
+        ];
+        for (t_addr, wallet, usk, account_id) in t_addr_wallets {
+            let t_addr_str = t_addr.encode(network);
+            let tip_height = BlockHeight::from_u32(tip_h.try_into().unwrap());
+            if let Err(err) = wallet.update_chain_tip(tip_height) {
+                println!("update chain tip error: {err}");
+            }
+
+            let mut got_transparent = false;
+            loop {
+                // NOTE: may have changed between loops
+                let scan_ranges = match wallet.suggest_scan_ranges() {
+                    Ok(ranges) => ranges,
+                    Err(err) => {
+                        println!("******* SCAN RANGE ERROR: {:?}", err);
+                        break;
+                    }
+                };
+                let Some(scan_range) = scan_ranges.first() else {
+                    break;
+                };
+                // if scan_range.priority() != ScanPriority::Verify {
+                //     break;
+                // }
+
+                let prev_state_h = scan_range.block_range().start.saturating_sub(1).into();
+                let chain_state = if prev_state_h == 0 {
+                    ChainState::empty(BlockHeight::from_u32(0), zcash_primitives::block::BlockHash([0; 32]))
+                    // ChainState::empty(
+                    //     BlockHeight::from_u32(0),
+                    //     genesys_block_hash.expect("we should've set the genesis block hash before this"),
+                    // )
+                } else {
+                    // TODO: it feels like we should be able to compute this locally
+                    match client.get_tree_state(BlockId{height:prev_state_h, hash:Vec::new()}).await {
+                        Err(err) => {
+                            println!("******* GET TREE STATE ERROR: {:?}", err);
+                            continue;
+                        },
+                        Ok(result) => {
+                            let tree_state = result.into_inner();
+                            match tree_state.to_chain_state() {
+                                Err(err) => {
+                                    println!("******* TREE STATE TO CHAIN STATE ERROR: {:?}", err);
+                                    continue;
+                                }
+                                Ok(chain_state) => chain_state
+                            }
+                        }
+                    }
+                };
+
+                let range = block_range_from_scan_range(&scan_range);
+                let mut new_blocks: Vec<CompactBlock> = Vec::new();
+                match client.get_block_range(range.clone()).await {
+                    Err(err) => println!("******* GET BLOCK RANGE ERROR: {:?}", err),
+                    Ok(res) => {
+                    }
+                };
+
+                if let Err(err) = block_cache.insert(new_blocks).await {
+                    println!("block cache insert error: {err}");
+                };
+
+                let block_range = scan_range.block_range();
+                let scan_res = scan_cached_blocks(network, &block_cache, wallet, block_range.start, &chain_state, scan_range.len());
+                println!("scan: {scan_res:?}");
+                match scan_res {
+                    Ok(_) => {
+                        // At this point, the cache and scanned data are locally consistent (though
+                        // not necessarily consistent with the latest chain tip - this would be
+                        // discovered the next time this codepath is executed after new blocks are
+                        // received) so we can break out of the loop.
+                    }
+
+                    Err(ChainError::Scan(err)) if err.is_continuity_error() => {
+                        // must be at least one block before the height at which the error occurred
+                        let rewind_height = err.at_height().saturating_sub(10);
+                        if let Err(err) = wallet.truncate_to_height(rewind_height) {
+                            println!("******* TRUNCATE ERROR: {:?}", err);
+                            break;
+                        }
+                        block_cache.delete(ScanRange::from_parts(
+                                rewind_height .. (tip_h+1).into(),
+                                ScanPriority::Scanned,
+                        ));
+                        continue;
+                    }
+
+                    Err(err) => {
+                        println!("******* SCAN ERROR: {:?}", err);
+                        break;
+                    }
+                };
+
+
+                // Update wallet with transparent transactions for same range
+                // TODO: off-by-1?
+                let range = BlockRange{
+                    start: Some(BlockId{ height: block_range.start.into(), hash: Vec::new() }),
+                    end: Some(BlockId{ height: block_range.end.into(), hash: Vec::new() }),
+                };
+
+                let filter = TransparentAddressBlockFilter{ address: t_addr_str.to_owned(), range: Some(range.clone()) };
+                let mut txs = Vec::new();
+                match client.get_taddress_txids(filter).await {
+                    Err(err) => println!("******* GET T-TRANSACTIONS ERROR: {:?}", err),
+                    Ok(tx_stream) => {
+                        let mut tx_stream = tx_stream.into_inner();
+                        loop {
+                            match tx_stream.message().await {
+                                Ok(Some(tx)) => txs.push(tx),
+                                Ok(None) => break,
+                                Err(err) => {
+                                    if err.code() == tonic::Code::OutOfRange {
+                                        break;
+                                    } else {
+                                        println!("Get txs message error: {err:?}");
+                                        // txs.truncate(0);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+
+                if txs.len() > 0 {
+                    // println!("txs for {t_addr}:");
+                    got_transparent = true;
+                }
+                for raw_tx in &txs {
+                    let tx_height = BlockHeight::from_u32(raw_tx.height.try_into().unwrap());
+                    let branch_id = BranchId::for_height(network, tx_height);
+                    let tx = Transaction::read(raw_tx.data.as_slice(), branch_id);
+                    // println!("  {tx:?}");
+                    let tx = match tx {
+                        Ok(tx) => tx,
+                        Err(err) => {
+                            println!("transaction read error: {err}");
+                            continue;
+                        }
+                    };
+
+                    let Some(bundle) = tx.transparent_bundle() else {
+                        continue;
+                    };
+
+                    // if let Err(err) = wallet::decrypt_and_store_transaction(network, wallet, &tx, Some(tx_height)) {
+                    //     println!("transparent tx decrypt error: {err}");
+                    // }
+
+                    // Process outputs for received UTXOs
+                    for (index, txout) in bundle.vout.iter().enumerate() {
+                        let Some(recipient) = txout.recipient_address() else {
+                            println!("Couldn't get transparent address from pubkey {:?}", txout.script_pubkey);
+                            continue;
+                        };
+                        if recipient.encode(network) == t_addr_str {
+                            let outpoint = OutPoint::new(tx.txid().into(), index as u32);
+                            let height = BlockHeight::from_u32(raw_tx.height as u32);
+                            let Some(wto) = zcash_client_backend::wallet::WalletTransparentOutput::from_parts(
+                                outpoint,
+                                txout.clone(),
+                                Some(height),
+                            ) else { continue };
+                            if let Err(err) = wallet.put_received_transparent_utxo(&wto) {
+                                println!("put_received_transparent_utxo error: {err}");
+                                continue;
+                            };
+                            // println!("Received transparent UTXO at height {}", height);
+                        }
+                    }
+
+                    // TODO: do we need to explicitly handle vin here or does that get covered
+                    // by sending?
+                }
+            }
+
+            println!("{} {:#?}", t_addr_str, wallet.get_wallet_summary(wallet::ConfirmationsPolicy::MIN));
+
+            // immediately shield newly-received transparent transactions
+            if got_transparent {
+                let min_zats_for_shielding = Zatoshis::const_from_u64(10_000);
+                match wallet::propose_shielding::<_, _, _, _, Infallible>(
+                    wallet,
+                    network,
+                    &wallet::input_selection::GreedyInputSelector::new(),
+                    &change_strategy,
+                    min_zats_for_shielding,
+                    &[t_addr],
+                    account_id,
+                    wallet::ConfirmationsPolicy::MIN,
+                ) {
+                    Err(err) => println!("propose_shielding error: {err:?}"),
+                    Ok(proposal) => {
+                        let prover = LocalTxProver::bundled();
+                        match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                            wallet, network,
+                            &prover,
+                            &prover,
+                            &wallet::SpendingKeys::from_unified_spending_key(usk.clone()),
+                            zcash_client_backend::wallet::OvkPolicy::Sender,
+                            &proposal)
+                        {
+                            Err(err) => println!("shielding create_proposed_transactions error: {err:?}"),
+                            Ok(txids) => for txid in txids {
+                                println!("created shielding transaction {txid:?}");
+
+                                let tx = match wallet.get_transaction(txid) {
+                                    Err(err) => {
+                                        println!("failed to get tx {txid:?} immediately after making it: {err:?}");
+                                        continue;
+                                    }
+                                    Ok(Some(tx)) => tx,
+                                    Ok(None) => {
+                                        println!("failed to get tx {txid:?} immediately after making it: (None)");
+                                        continue;
+                                    }
+                                };
+
+                                let mut data = Vec::new();
+                                if let Err(err) = tx.write(&mut data) {
+                                    println!("Serialization error for tx {:?}: {:?}", txid, err);
+                                    continue;
+                                }
+
+                                let raw_tx = RawTransaction { data, height: 0 };
+
+                                match client.send_transaction(raw_tx).await {
+                                    Ok(res) => println!("sent transaction: {res:?}"),
+                                    Err(err) => println!("failed to send transaction: {err:?}"),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        txs_seen_block_height = tip_h as i32;
+
+        {
+            let history = get_transaction_history(&miner_wallet).unwrap();
+            println!("********************* miner history: {:?}", history);
+        }
+
+        let history = get_transaction_history(&user_wallet).unwrap();
+        wallet_state.lock().unwrap().txs = history.iter().map(|h| WalletTx(h.clone())).collect(); // @temp: shouldn't be a separate type
+
+        if history.len() != total_user_txs {
+            total_user_txs = history.len();
+            wallet_state.lock().unwrap().waiting_for_faucet = false;
+        }
+
+        if !already_sent && txs_seen_block_height >= 5 {
+        // if !already_sent && miner_utxos.len() != 0 && miner_utxos[0].height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64) < latest_block.height {
+            let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
+            // NOTE: we can't send transparent->transparent through the high-level API, we
+            // have to propose_shielding first, then send in a later block
+            match wallet::propose_standard_transfer_to_address::<_, _, Infallible>(
+                &mut miner_wallet,
+                network,
+                zcash_client_backend::fees::StandardFeeRule::Zip317,
+                miner_account.id(),
+                wallet::ConfirmationsPolicy::MIN,
+                &zcash_client_backend::address::Address::Transparent(user_t_addr),
+                zats,
+                None,
+                None,
+                FALLBACK_CHANGE_POOL)
+            {
+                Err(err) => println!("propose_transfer error: {err:?}"),
+                Ok(proposal) => {
+                    let prover = LocalTxProver::bundled();
+                    match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                        &mut miner_wallet, network,
+                        &prover,
+                        &prover,
+                        &wallet::SpendingKeys::from_unified_spending_key(miner_usk.clone()),
+                        zcash_client_backend::wallet::OvkPolicy::Sender,
+                        &proposal)
+                    {
+                        Err(err) => println!("create_proposed_transactions error: {err:?}"),
+                        Ok(txids) => for txid in txids {
+                            let tx = match miner_wallet.get_transaction(txid) {
+                                Err(err) => {
+                                    println!("failed to get tx {txid:?} immediately after making it: {err:?}");
+                                    return;
+                                }
+                                Ok(Some(tx)) => tx,
+                                Ok(None) => {
+                                    println!("failed to get tx {txid:?} immediately after making it: (None)");
+                                    return;
+                                }
+                            };
+
+                            let mut data = Vec::new();
+                            if let Err(err) = tx.write(&mut data) {
+                                println!("Serialization error for tx {:?}: {:?}", txid, err);
+                                return;
+                            }
+
+                            let raw_tx = RawTransaction { data, height: 0 };
+
+                            match client.send_transaction(raw_tx).await {
+                                Ok(res) => println!("sent transaction: {res:?}"),
+                                Err(err) => println!("failed to send transaction: {err:?}"),
+                            }
+
+                            println!("created transaction {txid:?}");
+                            already_sent = true;
+                        },
+                    }
+                }
+            }
+        }
+
+        // let latest = client.get_latest_block(ChainSpec{}).await.unwrap().into_inner();
+        // let consensus_branch_id = BranchId::for_height(network, BlockHeight::from_u32(latest.height as u32));
+
+        // let mut tbundle = TransparentBuilder::empty().build();
+        // // tbundle.add_output(&user_t_addr, Zatoshis::const_from_u64(500)).unwrap();
+        // // let tbundle = tbundle.build().unwrap();
+
+        // let unauthed_tx: TransactionData::<zcash_protocol::transaction::Unauthorized> = TransactionData::from_parts(
+        //     TxVersion::VCrosslink,
+        //     consensus_branch_id,
+        //     0,
+        //     BlockHeight::from_u32(0),
+        //     tbundle,
+        //     None, None, None, None);
+
+        // let txid_parts = unauthed_tx.digest(TxIdDigester);
+
+        // let transparent_bundle = unauthed_tx
+        //     .transparent_bundle()
+        //     .map(|tb| tb.clone().apply_signatures(|thing| {
+        //         let sig_hash = signature_hash(&unauthed_tx, &SignableInput::Shielded, &txid_parts);
+        //         let sig_hash: [u8; 32] = sig_hash.as_ref().clone();
+        //         sig_hash
+        //     }, &TransparentSigningSet::default()).unwrap());
+
+        // let mut tx_bytes = vec![];
+        // tx_bytes.write(&mut tx_bytes).unwrap();
+
+        let mut user_sum = 0;
+        for utxo in &user_utxos {
+            user_sum += utxo.value_zat;
+        }
+
+        wallet_state.lock().unwrap().balance = user_sum;
+
+        let zec_full = user_sum / 100_000_000;
+        let zec_part = user_sum % 100_000_000;
+        println!("user {} has {} UTXOs with {} zats = {}.{} cTAZ", user_t_addr_str, user_utxos.len(), user_sum, zec_full, zec_part);
+
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    });
+    */
 
     /*
     let uivk = UnifiedIncomingViewingKey::decode(&MAIN_NETWORK, "uivk1u7ty6ntudngulxlxedkad44w7g6nydknyrdsaw0jkacy0z8k8qk37t4v39jpz2qe3y98q4vs0s05f4u2vfj5e9t6tk9w5r0a3p4smfendjhhm5au324yvd84vsqe664snjfzv9st8z4s8faza5ytzvte5s9zruwy8vf0ze0mhq7ldfl2js8u58k5l9rjlz89w987a9akhgvug3zaz55d5h0d6ndyt4udl2ncwnm30pl456frnkj").unwrap();

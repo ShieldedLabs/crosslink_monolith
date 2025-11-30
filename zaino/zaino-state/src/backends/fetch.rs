@@ -1375,21 +1375,24 @@ impl LightWalletIndexer for FetchServiceSubscriber {
     /// The block can be specified by either height or hash.
     async fn get_tree_state(&self, request: BlockId) -> Result<TreeState, Self::Error> {
         let chain_info = self.get_blockchain_info().await?;
-        let hash_or_height = if request.height != 0 {
-            match u32::try_from(request.height) {
-                Ok(height) => {
-                    if height > chain_info.blocks().0 {
-                        return Err(FetchServiceError::TonicStatusError(tonic::Status::out_of_range(
-                            format!(
-                                "Error: Height out of range [{}]. Height requested is greater than the best chain tip [{}].",
-                                height, chain_info.blocks().0,
-                            ))
-                        ));
-                    } else {
-                        height.to_string()
-                    }
+        let hash_or_height = match u32::try_from(request.height) {
+            Ok(height) => {
+                if height > chain_info.blocks().0 {
+                    return Err(FetchServiceError::TonicStatusError(tonic::Status::out_of_range(
+                        format!(
+                            "Error: Height out of range [{}]. Height requested is greater than the best chain tip [{}].",
+                            height, chain_info.blocks().0,
+                        ))
+                    ));
+                } else {
+                    height.to_string()
                 }
-                Err(_) => {
+            }
+            Err(_) => {
+                if request.hash.len() != 0 {
+                    hex::encode(request.hash)
+                }
+                else {
                     return Err(FetchServiceError::TonicStatusError(
                         tonic::Status::invalid_argument(
                             "Error: Height out of range. Failed to convert to u32.",
@@ -1397,8 +1400,6 @@ impl LightWalletIndexer for FetchServiceSubscriber {
                     ));
                 }
             }
-        } else {
-            hex::encode(request.hash)
         };
         match self.z_get_treestate(hash_or_height).await {
             Ok(state) => {
