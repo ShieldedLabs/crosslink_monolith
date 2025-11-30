@@ -161,11 +161,12 @@ impl WalletState {
         self.actions_in_flight.push_back(WalletAction::RequestFromFaucet);
     }
     pub fn perform_test_stake_action(&mut self) {
+        self.waiting_for_test_stake_action = true;
+
         if self.actions_in_flight.iter().filter(|a| match a { WalletAction::TestStakeAction => true, _ => false }).count() != 0 {
             return;
         }
 
-        self.waiting_for_test_stake_action = true;
         self.actions_in_flight.push_back(WalletAction::TestStakeAction);
     }
 }
