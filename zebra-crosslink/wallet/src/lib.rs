@@ -263,6 +263,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     row.get("memo_count")?,
                     row.get("expired_unmined")?,
                     row.get("is_shielding")?,
+                    [0; 512],
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -270,7 +271,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         return Ok(results);
     }
 
-    async fn get_received_memos<P: zcash_protocol::consensus::Parameters>(client: &mut CompactTxStreamerClient<Channel>, wallet: &zcash_client_sqlite::WalletDb<rusqlite::Connection, P, SystemClock, OsRng>, params: P) -> Vec<String> {
+    async fn get_received_memos<P: zcash_protocol::consensus::Parameters>(client: &mut CompactTxStreamerClient<Channel>, wallet: &zcash_client_sqlite::WalletDb<rusqlite::Connection, P, SystemClock, OsRng>, params: P) -> Vec<(TxId, String)> {
 
         fn try_get_orchard_memos(tx: &TransactionData<zcash_primitives::transaction::Authorized>, ivk: &orchard::keys::PreparedIncomingViewingKey) -> Vec<String> {
             let mut memos = Vec::new();
@@ -322,7 +323,11 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 let possible_orchard_ivk = if let Some(orchard_ivk) = uivk.orchard() { Some(orchard_ivk.prepare()) } else { None };
 
                 if let Some(orchard_ivk) = possible_orchard_ivk {
-                    let m = try_get_orchard_memos(txdata, &orchard_ivk);
+                    let m: Vec<(TxId, String)> = try_get_orchard_memos(txdata, &orchard_ivk)
+                        .iter()
+                        .map(|memo| (*txid, memo.clone()))
+                        .collect();
+
                     memos.extend_from_slice(&m[..]);
                 }
             }
@@ -443,7 +448,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 println!("MEMOS");
                 let memos = get_received_memos(&mut client, wallet, network).await;
                 for memo in memos {
-                    println!("\t{}", memo);
+                    println!("\tTx {:?}: {}", memo.0, memo.1);
                 }
             }
 
@@ -587,8 +592,19 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 println!("WALLET HAS {} ({})) cTAZ", wallet_balance, str_from_ctaz(wallet_balance));
 
-                let txs = if let Ok(history) = get_transaction_history(user_wallet) {
-                    Some(history.iter().map(|h| WalletTx(h.clone())).collect())
+                let txs = if let Ok(mut history) = get_transaction_history(user_wallet) {
+                    let memos = get_received_memos(&mut client, user_wallet, network).await;
+                    let txs: Vec<WalletTx> = history.iter().map(|tx| {
+                        let mut tx = WalletTx(tx.clone());
+                        if let Some(memo) = memos.iter().find(|m| m.0 == tx.0.txid) {
+                            let bytes = memo.1.as_bytes();
+                            tx.0.memo[0..bytes.len()].copy_from_slice(bytes);
+                        }
+
+                        tx
+                    }).collect();
+
+                    Some(txs)
                 } else {
                     None
                 };
@@ -612,7 +628,8 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             println!("{tx:?}");
                             if tx.is_shielding {
                                 if let Some(height) = tx.mined_height {
-                                    if height + (MIN_TRANSPARENT_COINBASE_MATURITY + 2) < BlockHeight::from_u32(tip_h) {
+                                    let height: u64 = height.try_into().unwrap();
+                                    if height + (MIN_TRANSPARENT_COINBASE_MATURITY as u64 + 2 as u64) < tip_h as u64 {
                                         coinbase_total += tx.total_received.into_u64();
                                     }
                                 }
@@ -1930,6 +1947,7 @@ pub struct TransactionSummary<AccountId> {
     pub memo_count: usize,
     pub expired_unmined: bool,
     pub is_shielding: bool,
+    pub memo: [u8; 512],
 }
 
 impl<AccountId> TransactionSummary<AccountId> {
@@ -1954,6 +1972,7 @@ impl<AccountId> TransactionSummary<AccountId> {
         memo_count: usize,
         expired_unmined: bool,
         is_shielding: bool,
+        memo: [u8; 512],
     ) -> Self {
         Self {
             account_id,
@@ -1971,6 +1990,7 @@ impl<AccountId> TransactionSummary<AccountId> {
             memo_count,
             expired_unmined,
             is_shielding,
+            memo,
         }
     }
 }
