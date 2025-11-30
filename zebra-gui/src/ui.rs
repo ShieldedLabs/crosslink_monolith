@@ -5,7 +5,8 @@ use std::{hash::Hash};
 use winit::{event::MouseButton, keyboard::KeyCode};
 use clay_layout as clay;
 use clay::{Clay, Declaration};
-use clay::render_commands::RenderCommandConfig::{Rectangle, Text, ScissorStart, ScissorEnd};
+use clay::render_commands::RenderCommandConfig;
+use clay::render_commands::RenderCommandConfig::{Rectangle, ScissorStart, ScissorEnd};
 use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 //use clay::*; // @Temporary
 
@@ -83,11 +84,11 @@ fn dbg_ui(ui: &mut Context, _data: &mut SomeDataToKeepAround, is_rendering: bool
     return false;
 }
 
-#[derive(Debug, Default, Copy, Clone)] enum Direction { #[default] LeftToRight, TopToBottom }
-#[derive(Debug, Default, Copy, Clone)] enum AlignX    { #[default] Left, Right, Center }
-#[derive(Debug, Default, Copy, Clone)] enum AlignY    { #[default] Top, Bottom, Center }
-#[derive(Debug, Default, Copy, Clone)] struct Align   { x: AlignX, y: AlignY }
-#[derive(Debug,          Copy, Clone)] enum Sizing    { Fit(f32, f32), Grow(f32, f32), Fixed(f32), Percent(f32) }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] enum Direction { #[default] LeftToRight, TopToBottom }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] enum AlignX    { #[default] Left, Right, Center }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] enum AlignY    { #[default] Top, Bottom, Center }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] struct Align   { x: AlignX, y: AlignY }
+#[derive(Debug,          Copy, Clone, PartialEq)] enum Sizing    { Fit(f32, f32), Grow(f32, f32), Fixed(f32), Percent(f32) }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] struct Id { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
 impl Default for Sizing { fn default() -> Self { Self::Fit(0.0, f32::MAX) } }
 impl Align {
@@ -136,7 +137,7 @@ const BottomRight: Align = Align::BottomRight;
 use Direction::*;
 
 
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone, PartialEq)]
 struct Decl {
     id: Id,
     direction: Direction,
@@ -165,6 +166,20 @@ const Decl: Decl = Decl {
     width:     Sizing::Fit(0.0, f32::MAX),
     height:    Sizing::Fit(0.0, f32::MAX),
 };
+
+#[derive(Debug, Default, Copy, Clone, PartialEq)]
+struct TextDecl {
+    h: f32,
+    colour: (u8, u8, u8, u8),
+    align: AlignX,
+}
+const TextDecl: TextDecl = TextDecl {
+    h: 0.0,
+    colour: WHITE,
+    align: AlignX::Left,
+};
+
+
 
 impl Id {
     fn clay(&self) -> clay::id::Id {
@@ -301,7 +316,6 @@ impl Element {
 const PANE_PERCENT: f32 = (0.25 + 0.333) / 2.0;
 
 const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
-const WHITE_CLAY:       clay::Color = clay::Color::rgba(WHITE.0 as f32, WHITE.1 as f32, WHITE.2 as f32, WHITE.3 as f32);
 const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
 const INACTIVE_TAB_COL: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
 const ACTIVE_TAB_COL:   (u8, u8, u8, u8) = PANE_COL;
@@ -312,6 +326,8 @@ const BUTTON_DOWN_COL:  (u8, u8, u8, u8) = (0x1c, 0x1c, 0x1c, 0xff);
 const MODAL_COL: (u8, u8, u8, u8) = (0x1e, 0x1e, 0x1e, 0xff); // @FigmaScreenshot
 
 const TRANSACTION_HISTORY_CONTAINER_COL: (u8, u8, u8, u8) = (0x22, 0x22, 0x24, 0xff); // @FigmaScreenshot
+
+const fn clay_colour(colour: (u8, u8, u8, u8)) -> clay::Color { clay::Color::rgba(colour.0 as f32, colour.1 as f32, colour.2 as f32, colour.3 as f32) }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 pub enum Modal {
@@ -429,14 +445,19 @@ impl Context {
         (activated, colour)
     }
 
-    fn button(&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) {
-        return self.button_ex(clicked_id, id, true);
-    }
-    fn button_act_on_release(&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) {
-        return self.button_ex(clicked_id, id, false);
-    }
+    fn button               (&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) { return self.button_ex(clicked_id, id, true); }
+    fn button_act_on_release(&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) { return self.button_ex(clicked_id, id, false); }
 
-    fn text(&self, label: &str, config: clay::text::TextElementConfig) {
+    fn text(&self, label: &str, decl: TextDecl) {
+        let config = clay::text::TextConfig::new()
+            .font_size(decl.h as u16)
+            .color(clay_colour(decl.colour))
+            .alignment(match decl.align {
+                AlignX::Left   => clay::text::TextAlignment::Left,
+                AlignX::Right  => clay::text::TextAlignment::Right,
+                AlignX::Center => clay::text::TextAlignment::Center,
+            })
+            .end();
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
 
@@ -447,7 +468,7 @@ impl Context {
               clicked_id: &mut Id,
               id: Id,
               label: &str) -> Id {
-        let tab_text_h = self.scale16(18.0);
+        let tab_text_h = self.scale(18.0);
 
         let radius = (radius.0, radius.1, 0.0, 0.0);
 
@@ -463,9 +484,9 @@ impl Context {
             width: grow!(),
             height: grow!(),
             align: Align::Center,
-            ..Decl::default()
+            ..Decl
         }) {
-            self.text(label, clay::text::TextConfig::new().font_size(tab_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+            self.text(label, TextDecl { h: tab_text_h, align: AlignX::Center, ..TextDecl });
         }
 
         id
@@ -528,7 +549,7 @@ fn ui_left_pane(ui: &mut Context,
         align: Align::Center,
         width:  grow!(),
         height: grow!(),
-        ..Decl::default()
+        ..Decl
     }) {
 
         let container_id = _elem.decl.id;
@@ -543,13 +564,13 @@ fn ui_left_pane(ui: &mut Context,
             height: grow!(ui.scale(192.0), ui.scale(384.0)),
             align: Align::Top,
             direction: TopToBottom,
-            ..Decl::default()
+            ..Decl
         }) {
 
             let contents_id = _elem.decl.id;
             let contents_hovered = ui.hovered(contents_id);
 
-            let text_h = ui.scale16(24.0);
+            let text_h = ui.scale(24.0);
             let title_bar = |ui: &mut Context, clicked_id: &mut Id, closeable, title, title_bar_id| {
                 if let _ = elem().decl(Decl {
                     id: title_bar_id,
@@ -558,13 +579,13 @@ fn ui_left_pane(ui: &mut Context,
                     height: fit!(),
                     align: Align::Center,
                     direction: LeftToRight,
-                    ..Decl::default()
+                    ..Decl
                 }) {
-                    if let _ = elem().decl(Decl { width: grow!(), align: Align::Left, ..Decl::default() }) {}
-                    if let _ = elem().decl(Decl { width: grow!(), align: Align::Center, ..Decl::default() }) {
-                        ui.text(title, clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                    if let _ = elem().decl(Decl { width: grow!(), align: Align::Left, ..Decl }) {}
+                    if let _ = elem().decl(Decl { width: grow!(), align: Align::Center, ..Decl }) {
+                        ui.text(title, TextDecl { h: text_h, align: AlignX::Center, ..TextDecl });
                     }
-                    if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Align::Right, ..Decl::default() }) && closeable {
+                    if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Align::Right, ..Decl }) && closeable {
                         let id = id("Close This Modal");
 
                         let (clicked, colour) = ui.button_act_on_release(clicked_id, id);
@@ -585,10 +606,10 @@ fn ui_left_pane(ui: &mut Context,
                             id, colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
                             width:  fixed!(radius * 2.0),
                             height: fixed!(radius * 2.0),
-                            ..Decl::default()
+                            ..Decl
                         }) {
-                            let temp_letter_symbol_h = ui.scale16(32.0);
-                            ui.text("x", clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                            let temp_letter_symbol_h = ui.scale(32.0);
+                            ui.text("x", TextDecl { h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
                         }
                     }
                 }
@@ -622,7 +643,7 @@ fn ui_left_pane(ui: &mut Context,
         width: percent!(1.0),
         height: fit!(),
         align: Align::Center,
-        ..Decl::default()
+        ..Decl
     }) {
         tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, clicked_id, "Wallet");
         // tab_id_finalizers = ui.tab(radius, padding, tab_id, clicked_id, "Finalizers");
@@ -641,7 +662,7 @@ fn ui_left_pane(ui: &mut Context,
         height: grow!(),
         ..Decl
     }) {
-        let balance_text_h = ui.scale16(48.0);
+        let balance_text_h = ui.scale(48.0);
 
         // spacer
         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
@@ -654,10 +675,10 @@ fn ui_left_pane(ui: &mut Context,
                 height: fit!(),
                 padding,
                 align: Align::Center,
-                ..Decl::default()
+                ..Decl
             }) {
                 let balance_str = frame_strf!(data, "{} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().balance.try_into().unwrap()));
-                ui.text(&balance_str, clay::text::TextConfig::new().font_size(balance_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                ui.text(&balance_str, TextDecl { h: balance_text_h, align: AlignX::Center, ..TextDecl });
             }
 
             let child_gap = child_gap as f32;
@@ -669,7 +690,7 @@ fn ui_left_pane(ui: &mut Context,
                 padding, child_gap, align: Align::Center,
                 width: grow!(),
                 height: fit!(),
-                ..Decl::default()
+                ..Decl
             }) {
 
                 let mut button = |ui: &mut Context, label| {
@@ -680,7 +701,7 @@ fn ui_left_pane(ui: &mut Context,
                         direction: TopToBottom,
                         width: fit!(),
                         height: fit!(),
-                        ..Decl::default()
+                        ..Decl
                     }) {
 
                         let radius = ui.scale(24.0);
@@ -690,14 +711,14 @@ fn ui_left_pane(ui: &mut Context,
                             colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
                             width:  fixed!(radius * 2.0),
                             height: fixed!(radius * 2.0),
-                            ..Decl::default()
+                            ..Decl
                         }) {
-                            let temp_letter_symbol_h = ui.scale16(32.0);
-                            ui.text(&label[..1], clay::text::TextConfig::new().font_size(temp_letter_symbol_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                            let temp_letter_symbol_h = ui.scale(32.0);
+                            ui.text(&label[..1], TextDecl { h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
                         }
 
-                        let button_text_h = ui.scale16(16.0);
-                        ui.text(label, clay::text::TextConfig::new().font_size(button_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                        let button_text_h = ui.scale(16.0);
+                        ui.text(label, TextDecl { h: button_text_h, align: AlignX::Center, ..TextDecl });
                     }
                     clicked
                 };
@@ -718,15 +739,15 @@ fn ui_left_pane(ui: &mut Context,
                 align: Center,
                 ..Decl
             }) {
-                let h = ui.scale16(24.0);
-                ui.text("There are no transactions yet.", clay::text::TextConfig::new().font_size(h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                let h = ui.scale(24.0);
+                ui.text("There are no transactions yet.", TextDecl { h: h, align: AlignX::Center, ..TextDecl });
             }
 
             // "Reset View" button
             if let _ = elem().decl(Decl {
                 align: Align::BottomRight,
                 width: grow!(),
-                ..Decl::default()
+                ..Decl
             }) {
                 let label = "Reset View";
                 let id = id(label);
@@ -743,11 +764,11 @@ fn ui_left_pane(ui: &mut Context,
                     align: Align::Center,
                     width:  fit!(ui.scale(128.0)),
                     height: fit!(radius * 2.0),
-                    ..Decl::default()
+                    ..Decl
                 }) {
-                    let button_text_h = ui.scale16(16.0);
-                    let text_color = WHITE_CLAY;
-                    ui.text(label, clay::text::TextConfig::new().font_size(button_text_h).color(text_color).alignment(clay::text::TextAlignment::Center).end());
+                    let button_text_h = ui.scale(16.0);
+                    let colour = WHITE;
+                    ui.text(label, TextDecl { h: button_text_h, colour, align: AlignX::Center, ..TextDecl });
                 }
 
                 if clicked {
@@ -774,14 +795,14 @@ fn ui_left_pane(ui: &mut Context,
                 height: fit!(),
                 direction: TopToBottom,
                 align: Align::Center,
-                ..Decl::default()
+                ..Decl
             }) {
                 let txs = &wallet_state.lock().unwrap().txs;
 
-                let tx_count_text_h = ui.scale16(24.0);
-                ui.text(frame_strf!(data, "Transactions ({})", txs.len()), clay::text::TextConfig::new().font_size(tx_count_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+                let tx_count_text_h = ui.scale(24.0);
+                ui.text(frame_strf!(data, "Transactions ({})", txs.len()), TextDecl { h: tx_count_text_h, align: AlignX::Center, ..TextDecl });
 
-                let transaction_text_h = ui.scale16(12.0);
+                let transaction_text_h = ui.scale(12.0);
 
                 for tx in txs {
                     if let _ = elem().decl(Decl{
@@ -791,12 +812,12 @@ fn ui_left_pane(ui: &mut Context,
                         width: fit!(),
                         direction: TopToBottom,
                         align: Align::Top,
-                        ..Decl::default()
+                        ..Decl
                     }) {
                         // manually split id text
                         let string = format!("{:?}", tx.0.txid);
-                        ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), clay::text::TextConfig::new().font_size(transaction_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
-                        ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), clay::text::TextConfig::new().font_size(transaction_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                        ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), TextDecl { h: transaction_text_h, align: AlignX::Left, ..TextDecl });
+                        ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), TextDecl { h: transaction_text_h, align: AlignX::Left, ..TextDecl });
                     }
                 }
             }
@@ -822,7 +843,7 @@ fn ui_right_pane(ui: &mut Context,
         width: percent!(1.0),
         height: fit!(),
         align: Align::Center,
-        ..Decl::default()
+        ..Decl
     }) {
         tab_id_faucet   = ui.tab(radius, padding, tab_id, clicked_id, "Faucet");
         // tab_id_roster   = ui.tab(radius, padding, tab_id, clicked_id, "Roster");
@@ -837,7 +858,7 @@ fn ui_right_pane(ui: &mut Context,
         direction: TopToBottom,
         width: percent!(1.0),
         height: grow!(),
-        ..Decl::default()
+        ..Decl
     }) {
 
         // spacer
@@ -851,10 +872,10 @@ fn ui_right_pane(ui: &mut Context,
             //     height: fit!(),
             //     padding,
             //     align: Align::Center,
-            //     ..Decl::default()
+            //     ..Decl
             // }) {
-            //     let big_text_h = ui.scale16(32.0);
-            //     ui.text(&balance_str, clay::text::TextConfig::new().font_size(big_text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+            //     let big_text_h = ui.scale(32.0);
+            //     ui.text(&balance_str, TextDecl { h: big_text_h, align: AlignX::Center, ..TextDecl });
             // }
 
             let child_gap = child_gap as f32;
@@ -866,7 +887,7 @@ fn ui_right_pane(ui: &mut Context,
                 padding, child_gap, align: Align::Center,
                 width: percent!(1.0),
                 height: fit!(),
-                ..Decl::default()
+                ..Decl
             }) {
 
                 let mut button_ex = |label, act_on_press, disabled: bool| {
@@ -879,7 +900,7 @@ fn ui_right_pane(ui: &mut Context,
                         direction: TopToBottom,
                         width: fit!(),
                         height: fit!(),
-                        ..Decl::default()
+                        ..Decl
                     }) {
                         let radius = ui.scale(24.0);
 
@@ -897,11 +918,11 @@ fn ui_right_pane(ui: &mut Context,
                             align: Align::Center,
                             width:  fit!(ui.scale(192.0)),
                             height: fit!(radius * 2.0),
-                            ..Decl::default()
+                            ..Decl
                         }) {
-                            let button_text_h = ui.scale16(20.0);
-                            let text_color = if disabled { clay::Color::u_rgba(INACTIVE_TAB_COL.0, INACTIVE_TAB_COL.1, INACTIVE_TAB_COL.2, INACTIVE_TAB_COL.3) } else { WHITE_CLAY }; // @TEMP: real disabling
-                            ui.text(label, clay::text::TextConfig::new().font_size(button_text_h).color(text_color).alignment(clay::text::TextAlignment::Center).end());
+                            let h = ui.scale(20.0);
+                            let colour = if disabled { INACTIVE_TAB_COL } else { WHITE };
+                            ui.text(label, TextDecl { h, colour, align: AlignX::Center, ..TextDecl });
                         }
                     }
 
@@ -921,10 +942,10 @@ fn ui_right_pane(ui: &mut Context,
                 padding: ui.scale(16.0).dup4(), child_gap, align: Align::TopLeft,
                 width: grow!(), height: fit!(),
                 direction: TopToBottom,
-                ..Decl::default()
+                ..Decl
             }) {
-                let title_h = ui.scale16(28.0);
-                let text_h = ui.scale16(22.0);
+                let title_h = ui.scale(28.0);
+                let text_h = ui.scale(22.0);
                 let (h, un, sh_p, sh_s, fc) = {
                     let w = wallet_state.lock().unwrap();
                     (
@@ -935,11 +956,11 @@ fn ui_right_pane(ui: &mut Context,
                         w.faucet_funds_available,
                     )
                 };
-                ui.text(frame_strf!(data, "Miner funds: {}", h), clay::text::TextConfig::new().font_size(title_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
-                ui.text(frame_strf!(data, "Unshielded: {} cTAZ", str_from_ctaz(un)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
-                ui.text(frame_strf!(data, "Shielded (pending): {} cTAZ", str_from_ctaz(sh_p)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
-                ui.text(frame_strf!(data, "Shielded (spendable): {} cTAZ", str_from_ctaz(sh_s)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
-                ui.text(frame_strf!(data, "Faucet available: {} cTAZ", str_from_ctaz(fc)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                ui.text(frame_strf!(data, "Miner funds: {}", h), TextDecl { h: title_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "Unshielded: {} cTAZ", str_from_ctaz(un)), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "Shielded (pending): {} cTAZ", str_from_ctaz(sh_p)), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "Shielded (spendable): {} cTAZ", str_from_ctaz(sh_s)), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "Faucet available: {} cTAZ", str_from_ctaz(fc)), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
             };
@@ -1022,7 +1043,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
         padding: (0.0, 0.0, padding.2, padding.3), child_gap,
         width: grow!(),
         height: grow!(),
-        ..Decl::default()
+        ..Decl
     }) {
         let pane_pct = Sizing::Percent(ui.zoom * PANE_PERCENT);
 
@@ -1032,7 +1053,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
             width: pane_pct,
             height: grow!(),
             clip: true,
-            ..Decl::default()
+            ..Decl
         }) {
             ui_left_pane(ui, wallet_state.clone(), data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l);
         }
@@ -1042,7 +1063,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
             radius, padding, child_gap,
             width: grow!(),
             height: grow!(),
-            ..Decl::default()
+            ..Decl
         }) {
         }
 
@@ -1052,7 +1073,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
             width: pane_pct,
             height: grow!(),
             clip: true,
-            ..Decl::default()
+            ..Decl
         }) {
             ui_right_pane(ui, wallet_state.clone(), data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_r);
         }
@@ -1094,7 +1115,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
                                                 radius_br,
                                                 clay_color_to_u32(config.color));
                 }
-                Text(config) => {
+                RenderCommandConfig::Text(config) => {
                     ui.draw().text_line(x1 as f32, y1 as f32, config.font_size as f32, config.text, clay_color_to_u32(config.color));
                 }
                 ScissorStart() => {
