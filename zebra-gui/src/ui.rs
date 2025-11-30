@@ -807,6 +807,9 @@ fn ui_right_pane(ui: &mut Context,
                 if button_ex("Receive cTAZ", false, wallet_state.lock().unwrap().waiting_for_faucet) {
                     wallet_state.lock().unwrap().request_from_faucet();
                 }
+                if button_ex("Test Stake Action cTAZ", false, wallet_state.lock().unwrap().waiting_for_test_stake_action) {
+                    wallet_state.lock().unwrap().perform_test_stake_action();
+                }
             }
 
             if let _ = elem().decl(Decl {

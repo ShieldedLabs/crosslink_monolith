@@ -83,6 +83,7 @@ use zcash_transparent::{
     address::TransparentAddress,
     keys::{IncomingViewingKey, TransparentKeyScope},
 };
+use zcash_primitives::transaction::StakingAction;
 
 fn the_future_is_now<F: Future>(future: F) -> F::Output {
     Builder::new_current_thread()
@@ -123,6 +124,7 @@ async fn wait_for_zainod() {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum WalletAction {
     RequestFromFaucet,
+    TestStakeAction,
 }
 
 pub struct WalletTx(pub TransactionSummary<AccountUuid>);
@@ -132,6 +134,7 @@ pub struct WalletState {
     pub balance: i64, // in zats
     pub txs: Vec<WalletTx>,
     pub waiting_for_faucet: bool,
+    pub waiting_for_test_stake_action: bool,
     pub miner_unshielded_funds: u64,
     pub miner_shielded_pending_funds: u64,
     pub miner_shielded_spendable_funds: u64,
@@ -153,6 +156,14 @@ impl WalletState {
 
         self.waiting_for_faucet = true;
         self.actions_in_flight.push_back(WalletAction::RequestFromFaucet);
+    }
+    pub fn perform_test_stake_action(&mut self) {
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::TestStakeAction => true, _ => false }).count() != 0 {
+            return;
+        }
+
+        self.waiting_for_test_stake_action = true;
+        self.actions_in_flight.push_back(WalletAction::TestStakeAction);
     }
 }
 
@@ -691,6 +702,59 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                     },
                                 }
                             }
+                        }
+                        true
+                    }
+
+                    WalletAction::TestStakeAction => {
+                        let mut signing_set = TransparentSigningSet::new();
+                        signing_set.add_key(miner_privkey);
+
+                        let prover = LocalTxProver::bundled();
+                        let extsk: &[ExtendedSpendingKey] = &[];
+                        let sak: &[SpendAuthorizingKey] = &[];
+
+                        let Some(target_height) = miner_wallet.chain_height().expect("Failed to get chain height") else {
+                            println!("Failed to get miner's chain height");
+                            break;
+                        };
+
+                        let mut txb = TxBuilder::new(
+                            network,
+                            target_height + 1,
+                            BuildConfig::Standard {
+                                sapling_anchor: None,
+                                orchard_anchor: None,
+                            },
+                        );
+
+                        //txb.add_transparent_output(&user_t_address, zats).unwrap();
+                        txb.put_staking_action(StakingAction::parse_from_cmd("ADD|7372433|james").unwrap().unwrap()).unwrap();
+
+                        use rand_chacha::ChaCha20Rng;
+                        let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+                        let tx_res = txb.build(
+                            &signing_set,
+                            extsk,
+                            sak,
+                            rng,
+                            &prover,
+                            &prover,
+                            &zip317::FeeRule::standard(),
+                        ).unwrap();
+
+                        let tx = tx_res.transaction();
+                        let mut tx_bytes = vec![];
+                        tx.write(&mut tx_bytes).unwrap();
+
+                        match client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await {
+                            Ok(_) => {
+                                println!("Test stake transaction sent successfully");
+                            }
+                            Err(err) => {
+                                println!("Failed to send test stake transaction: {}", err);
+                                wallet_state.lock().unwrap().waiting_for_test_stake_action = false;
+                            },
                         }
                         true
                     }
