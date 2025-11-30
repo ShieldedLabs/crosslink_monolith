@@ -101,6 +101,17 @@ impl Align {
     const Bottom:      Self = Self { y: AlignY::Bottom, x: AlignX::Center };
     const BottomRight: Self = Self { y: AlignY::Bottom, x: AlignX::Right };
 }
+// why can we not `use` these? namaste
+const TopLeft:     Align = Align::TopLeft;
+const Top:         Align = Align::Top;
+const TopRight:    Align = Align::TopRight;
+const Left:        Align = Align::Left;
+const Center:      Align = Align::Center;
+const Right:       Align = Align::Right;
+const BottomLeft:  Align = Align::BottomLeft;
+const Bottom:      Align = Align::Bottom;
+const BottomRight: Align = Align::BottomRight;
+
 #[macro_export] macro_rules! fit {
     ($min:expr, $max:expr) => { Sizing::Fit($min, $max) };
     ($min:expr)            => { fit!($min, f32::MAX) };
@@ -139,6 +150,21 @@ struct Decl {
     width:  Sizing,
     height: Sizing,
 }
+// Ease-of-use constant for the builder pattern thing, so you can write Decl{..Decl} to get a default Decl.
+// I can't do #[derive_const(Default)] because that's only on Rust nightly. And it would probably be complex anyway.
+const Decl: Decl = Decl {
+    id:        Id { id: 0, offset: 0, base_id: 0, len: 0, chars: std::ptr::null() },
+    direction: Direction::LeftToRight,
+    floating:  false,
+    colour:    (0,   0,   0,   0),
+    radius:    (0.0, 0.0, 0.0, 0.0),
+    padding:   (0.0, 0.0, 0.0, 0.0),
+    clip:      false,
+    child_gap: 0.0,
+    align:     Align::TopLeft,
+    width:     Sizing::Fit(0.0, f32::MAX),
+    height:    Sizing::Fit(0.0, f32::MAX),
+};
 
 impl Id {
     fn clay(&self) -> clay::id::Id {
@@ -276,14 +302,16 @@ const PANE_PERCENT: f32 = (0.25 + 0.333) / 2.0;
 
 const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
 const WHITE_CLAY:       clay::Color = clay::Color::rgba(WHITE.0 as f32, WHITE.1 as f32, WHITE.2 as f32, WHITE.3 as f32);
-const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff);
+const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
 const INACTIVE_TAB_COL: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
 const ACTIVE_TAB_COL:   (u8, u8, u8, u8) = PANE_COL;
-const BUTTON_COL:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff);
+const BUTTON_COL:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff); // @FigmaScreenshot
 const BUTTON_HOVER_COL: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
 const BUTTON_DOWN_COL:  (u8, u8, u8, u8) = (0x1c, 0x1c, 0x1c, 0xff);
 
-const MODAL_COL: (u8, u8, u8, u8) = (0x1e, 0x1e, 0x1e, 0xff);
+const MODAL_COL: (u8, u8, u8, u8) = (0x1e, 0x1e, 0x1e, 0xff); // @FigmaScreenshot
+
+const TRANSACTION_HISTORY_CONTAINER_COL: (u8, u8, u8, u8) = (0x22, 0x22, 0x24, 0xff); // @FigmaScreenshot
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 pub enum Modal {
@@ -461,6 +489,26 @@ impl<T: Copy> Dup3 for T { fn dup3(self) -> (Self, Self, Self) { (self, self, se
 trait         Dup4: Copy { fn dup4(self) -> (Self, Self, Self, Self); }
 impl<T: Copy> Dup4 for T { fn dup4(self) -> (Self, Self, Self, Self) { (self, self, self, self) } }
 
+// Implementation of `tuple.mul(scalar)`. Helper "AsF32" trait to get it working.
+// This would literally be a two-liner, if Rust generics had C++-style SFINAE.
+trait AsF32         { #[inline(always)] fn to_f32(self) -> f32;                #[inline(always)] fn from_f32(x: f32) -> Self; }
+impl  AsF32 for u8  { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for u16 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for u32 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for u64 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for i8  { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for i16 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for i32 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for i64 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for f32 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl  AsF32 for f64 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+
+trait                                Mul                  { #[inline(always)] fn mul(self, f: f32) -> Self; }
+impl<T: AsF32>                       Mul for T            { #[inline(always)] fn mul(self, f: f32) -> Self { T::from_f32(self.to_f32() * f) } }
+impl<A: Mul, B: Mul>                 Mul for (A, B)       { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f)) } }
+impl<A: Mul, B: Mul, C: Mul>         Mul for (A, B, C)    { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f)) } }
+impl<A: Mul, B: Mul, C: Mul, D: Mul> Mul for (A, B, C, D) { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f), self.3.mul(f)) } }
+
 fn ui_left_pane(ui: &mut Context,
                 wallet_state: Arc<Mutex<wallet::WalletState>>,
                 data: &mut SomeDataToKeepAround,
@@ -473,7 +521,7 @@ fn ui_left_pane(ui: &mut Context,
     if ui.modal != Modal::None && let _elem = elem().decl(Decl {
         child_gap,
         id: id("Modal Container"),
-        padding: (padding.0 * 2.0).dup4(),
+        padding: padding.mul(2.0),
         radius: (radius.0, 0.0, radius.2, 0.0),
         floating: true,
         colour: (0, 0, 0, 0xC0),
@@ -489,7 +537,7 @@ fn ui_left_pane(ui: &mut Context,
         if let _elem = elem().decl(Decl {
             child_gap, radius,
             id: id("Modal Contents"),
-            padding: (padding.0 * 2.0).dup4(),
+            padding: padding.mul(2.0),
             colour: MODAL_COL,
             width:  grow!(ui.scale(192.0), ui.scale(384.0)),
             height: grow!(ui.scale(192.0), ui.scale(384.0)),
@@ -585,11 +633,13 @@ fn ui_left_pane(ui: &mut Context,
     if let _ = elem().decl(Decl {
         id: id("Main Contents"),
         colour: PANE_COL,
+        padding, child_gap,
         radius: (0.0, 0.0, radius.2, 0.0),
         direction: TopToBottom,
+        align: Align::Top,
         width: percent!(1.0),
         height: grow!(),
-        ..Decl::default()
+        ..Decl
     }) {
         let balance_text_h = ui.scale16(48.0);
 
@@ -600,7 +650,7 @@ fn ui_left_pane(ui: &mut Context,
 
             // balance container
             if let _ = elem().decl(Decl {
-                width: percent!(1.0),
+                width: grow!(),
                 height: fit!(),
                 padding,
                 align: Align::Center,
@@ -617,7 +667,7 @@ fn ui_left_pane(ui: &mut Context,
             if let _ = elem().decl(Decl {
                 id: id("Buttons Container"),
                 padding, child_gap, align: Align::Center,
-                width: percent!(1.0),
+                width: grow!(),
                 height: fit!(),
                 ..Decl::default()
             }) {
@@ -657,6 +707,61 @@ fn ui_left_pane(ui: &mut Context,
                 if button(ui, "Stake")   { ui.modal = Modal::Stake;   }
                 if button(ui, "Unstake") { ui.modal = Modal::Unstake; }
 
+            }
+
+            if let _ = elem().decl(Decl {
+                colour: TRANSACTION_HISTORY_CONTAINER_COL,
+                child_gap, padding,
+                radius: radius.mul(2.0),
+                width:  grow!(radius.0 * 2.0),
+                height: grow!(radius.0 * 2.0),
+                align: Center,
+                ..Decl
+            }) {
+                let h = ui.scale16(24.0);
+                ui.text("There are no transactions yet.", clay::text::TextConfig::new().font_size(h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Center).end());
+            }
+
+            // "Reset View" button
+            if let _ = elem().decl(Decl {
+                align: Align::BottomRight,
+                width: grow!(),
+                ..Decl::default()
+            }) {
+                let label = "Reset View";
+                let id = id(label);
+                let (clicked, colour) = ui.button_ex(clicked_id, id, true);
+                let radius = ui.scale(20.0);
+
+                // Button
+                if let _ = elem().decl(Decl {
+                    id,
+                    colour,
+                    padding,
+                    child_gap,
+                    radius: radius.dup4(),
+                    align: Align::Center,
+                    width:  fit!(ui.scale(128.0)),
+                    height: fit!(radius * 2.0),
+                    ..Decl::default()
+                }) {
+                    let button_text_h = ui.scale16(16.0);
+                    let text_color = WHITE_CLAY;
+                    ui.text(label, clay::text::TextConfig::new().font_size(button_text_h).color(text_color).alignment(clay::text::TextAlignment::Center).end());
+                }
+
+                if clicked {
+                    // if let Some(send_to_viz) = *RESPONSES_FROM_ZEBRA.lock().unwrap() {
+                    //     send_to_viz.try_send(ResponseFromZebra {
+                    //         AllBlocks {
+                    //             bc_tip_height: u64,
+                    //             bft_tip_height: u64,
+                    //             bc_blocks: Vec<BcBlock>,
+                    //             bft_blocks: Vec<BftBlock>,
+                    //         }
+                    //     });
+                    // }
+                }
             }
 
         } else if *tab_id == tab_id_finalizers {
@@ -813,17 +918,30 @@ fn ui_right_pane(ui: &mut Context,
             }
 
             if let _ = elem().decl(Decl {
-                padding, child_gap, align: Align::TopLeft,
+                padding: ui.scale(16.0).dup4(), child_gap, align: Align::TopLeft,
                 width: grow!(), height: fit!(),
                 direction: TopToBottom,
                 ..Decl::default()
             }) {
                 let title_h = ui.scale16(28.0);
                 let text_h = ui.scale16(22.0);
-                ui.text(frame_strf!(data, "Miner funds:"), clay::text::TextConfig::new().font_size(title_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
-                ui.text(frame_strf!(data, "Unshielded: {} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().miner_unshielded_funds)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
-                ui.text(frame_strf!(data, "Shielded (pending): {} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().miner_shielded_pending_funds)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
-                ui.text(frame_strf!(data, "Shielded (spendable): {} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().miner_shielded_spendable_funds)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                let (h, un, sh_p, sh_s, fc) = {
+                    let w = wallet_state.lock().unwrap();
+                    (
+                        w.miner_seen_height,
+                        w.miner_unshielded_funds,
+                        w.miner_shielded_pending_funds,
+                        w.miner_shielded_spendable_funds,
+                        w.faucet_funds_available,
+                    )
+                };
+                ui.text(frame_strf!(data, "Miner funds: {}", h), clay::text::TextConfig::new().font_size(title_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                ui.text(frame_strf!(data, "Unshielded: {} cTAZ", str_from_ctaz(un)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                ui.text(frame_strf!(data, "Shielded (pending): {} cTAZ", str_from_ctaz(sh_p)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                ui.text(frame_strf!(data, "Shielded (spendable): {} cTAZ", str_from_ctaz(sh_s)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                ui.text(frame_strf!(data, "Faucet available: {} cTAZ", str_from_ctaz(fc)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+
             };
         } else if *tab_id == tab_id_roster {
         } else if *tab_id == tab_id_settings {
@@ -896,6 +1014,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
     let mut c = clay.begin::<(), ()>();
 
     unsafe { clay::Clay_SetCurrentContext(c.clay.context); }
+
+    // c.set_debug_mode(true);
 
     if let _ = elem().decl(Decl {
         id: id("Main"),

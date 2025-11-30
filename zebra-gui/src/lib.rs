@@ -315,7 +315,7 @@ impl DrawCtx {
 
                 let px_advance = (((g_pos.x_advance as f32 / tracker.units_per_em) * tracker.ppem).ceil() as usize).min(1usize << tracker.glyph_row_shift);
 
-                // TODO: Scissor
+                // TODO: Scissor?
                 if (acc_x + px_advance as isize) <= 0 { acc_x += px_advance as isize; continue; }
                 if acc_x > self.window_width { break; }
 
@@ -418,7 +418,7 @@ impl DrawCtx {
 
                 let px_advance = (((g_pos.x_advance as f32 / tracker.units_per_em) * tracker.ppem).ceil() as usize).min(1usize << tracker.glyph_row_shift);
 
-                // TODO: Scissor
+                // TODO: Scissor?
                 if (acc_x + px_advance as isize) <= 0 { acc_x += px_advance as isize; continue; }
                 if acc_x > self.window_width { break; }
 
