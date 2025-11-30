@@ -922,10 +922,23 @@ fn ui_right_pane(ui: &mut Context,
             }) {
                 let title_h = ui.scale16(28.0);
                 let text_h = ui.scale16(22.0);
-                ui.text(frame_strf!(data, "Miner funds:"), clay::text::TextConfig::new().font_size(title_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
-                ui.text(frame_strf!(data, "Unshielded: {} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().miner_unshielded_funds)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
-                ui.text(frame_strf!(data, "Shielded (pending): {} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().miner_shielded_pending_funds)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
-                ui.text(frame_strf!(data, "Shielded (spendable): {} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().miner_shielded_spendable_funds)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                let (h, un, sh_p, sh_s, fc) = {
+                    let w = wallet_state.lock().unwrap();
+                    (
+                        w.miner_seen_height,
+                        w.miner_unshielded_funds,
+                        w.miner_shielded_pending_funds,
+                        w.miner_shielded_spendable_funds,
+                        w.faucet_funds_available,
+                    )
+                };
+                ui.text(frame_strf!(data, "Miner funds: {}", h), clay::text::TextConfig::new().font_size(title_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                ui.text(frame_strf!(data, "Unshielded: {} cTAZ", str_from_ctaz(un)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                ui.text(frame_strf!(data, "Shielded (pending): {} cTAZ", str_from_ctaz(sh_p)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                ui.text(frame_strf!(data, "Shielded (spendable): {} cTAZ", str_from_ctaz(sh_s)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                ui.text(frame_strf!(data, "Faucet available: {} cTAZ", str_from_ctaz(fc)), clay::text::TextConfig::new().font_size(text_h).color(WHITE_CLAY).alignment(clay::text::TextAlignment::Left).end());
+                if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+
             };
         } else if *tab_id == tab_id_roster {
         } else if *tab_id == tab_id_settings {
