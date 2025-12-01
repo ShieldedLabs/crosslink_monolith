@@ -12,9 +12,10 @@ pub struct ChainMetadata {
 /// A compact representation of the shielded data in a Zcash block.
 ///
 /// CompactBlock is a packaging of ONLY the data from a block that's needed to:
-///    1. Detect a payment to your Shielded address
-///    2. Detect a spend of your Shielded notes
-///    3. Update your witnesses to generate new spend proofs.
+///
+/// 1. Detect a payment to your Shielded address
+/// 1. Detect a spend of your Shielded notes
+/// 1. Update your witnesses to generate new spend proofs.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompactBlock {
     /// the version of this wire format, for storage
@@ -63,7 +64,7 @@ pub struct CompactTx {
     /// stateless server and a transaction with transparent inputs, this will be
     /// unset because the calculation requires reference to prior transactions.
     /// If there are no transparent inputs, the fee will be calculable as:
-    ///     valueBalanceSapling + valueBalanceOrchard + sum(vPubNew) - sum(vPubOld) - sum(tOut)
+    /// valueBalanceSapling + valueBalanceOrchard + sum(vPubNew) - sum(vPubOld) - sum(tOut)
     #[prost(uint32, tag = "3")]
     pub fee: u32,
     #[prost(message, repeated, tag = "4")]

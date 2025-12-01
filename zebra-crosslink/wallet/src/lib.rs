@@ -89,6 +89,8 @@ use zcash_primitives::transaction::StakingActionKind;
 
 pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
+pub static TENDERLINK_PUBLIC_KEY: Mutex<[u8; 32]> = Mutex::new([0_u8; 32]);
+
 fn the_future_is_now<F: Future>(future: F) -> F::Output {
     Builder::new_current_thread()
         .enable_time()
