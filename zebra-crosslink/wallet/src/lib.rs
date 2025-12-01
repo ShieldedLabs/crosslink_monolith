@@ -141,6 +141,36 @@ pub enum WalletTxKind {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WalletTx(pub TransactionSummary<AccountUuid>, pub WalletTxKind);
 
+impl WalletTx {
+    pub fn with_fake_data(kind: WalletTxKind, sent: u64, received: u64, shielding: bool, memo: &str) -> Self {
+        let mut memo_as_bytes = [0u8; 512];
+        &memo_as_bytes[0..memo.len()].copy_from_slice(memo.as_bytes());
+
+        Self(
+            TransactionSummary{
+                account_id: AccountUuid::default(),
+                txid: TxId::from_bytes([0; 32]),
+                expiry_height: None,
+                mined_height: Some(BlockHeight::from_u32(10)),
+                account_value_delta: ZatBalance::from_i64((sent.saturating_sub(received)) as i64).unwrap(),
+                total_spent: Zatoshis::from_u64(sent).unwrap(),
+                total_received: Zatoshis::from_u64(received).unwrap(),
+                fee_paid: None,
+                spent_note_count: if kind == WalletTxKind::Send { 1 } else { 0 },
+                has_change: false,
+                sent_note_count: if kind == WalletTxKind::Send { 1 } else { 0 },
+                received_note_count: if kind == WalletTxKind::Receive { 1 } else { 0 },
+                memo_count: if memo_as_bytes.len() != 0 { 1 } else { 0 },
+                expired_unmined: false,
+                is_shielding: true,
+                memo: memo_as_bytes,
+            },
+            kind,
+        )
+    }
+
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct WalletState {
     pub balance: i64, // in zats

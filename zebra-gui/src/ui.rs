@@ -212,6 +212,17 @@ pub fn id(label: &str) -> Id {
     }
 }
 
+pub fn id_index(label: &str, index: u32) -> Id {
+    let id = unsafe { clay::Clay__HashString(label.into(), index, clay::Clay__GetParentElementId()) };
+    Id {
+        id: id.id,
+        offset: id.offset,
+        base_id: id.baseId,
+        len: id.stringId.length as usize,
+        chars: id.stringId.chars as *const u8
+    }
+}
+
 #[derive(Default)] pub struct Element { decl: Decl }
 pub fn elem() -> Element { unsafe { clay::Clay__OpenElement(); } Element::default() }
 impl Drop for Element { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
@@ -839,22 +850,7 @@ pub fn ui_left_pane(ui: &mut Context,
                 if button(ui, ICON_QRCODE,   "Receive") { ui.modal = Modal::Receive; }
                 if button(ui, ICON_PLUS,     "Stake")   { ui.modal = Modal::Stake;   }
                 if button(ui, ICON_MINUS_1,  "Unstake") { ui.modal = Modal::Unstake; }
-
             }
-
-            if let _ = elem().decl(Decl {
-                colour: TRANSACTION_HISTORY_CONTAINER_COL,
-                child_gap, padding,
-                radius: radius.mul(2.0),
-                width:  grow!(radius.0 * 2.0),
-                height: grow!(radius.0 * 2.0),
-                align: Center,
-                ..Decl
-            }) {
-                let h = ui.scale(24.0);
-                ui.text("There are no transactions yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
-            }
-
         } else if *tab_id == tab_id_finalizers {
         } else if *tab_id == tab_id_history {
             if let _ = elem().decl(Decl {
@@ -869,25 +865,145 @@ pub fn ui_left_pane(ui: &mut Context,
             }) {
                 let txs = &wallet_state.lock().unwrap().txs;
 
-                let tx_count_text_h = ui.scale(24.0);
-                ui.text(frame_strf!(data, "Transactions ({})", txs.len()), TextDecl { h: tx_count_text_h, align: AlignX::Center, ..TextDecl });
+                if let _ = elem().decl(Decl {
+                    colour: TRANSACTION_HISTORY_CONTAINER_COL,
+                    child_gap, padding,
+                    radius: radius.mul(2.0),
+                    width:  grow!(radius.0 * 2.0),
+                    height: grow!(radius.0 * 2.0),
+                    align: Center,
+                    ..Decl
+                }) {
+                    if txs.len() == 0 {
+                        let h = ui.scale(24.0);
+                        ui.text("There are no transactions yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
+                    }
+                    else {
+                        let kind_text_h = ui.scale(18.0);
+                        let transaction_text_h = ui.scale(16.0);
 
-                let transaction_text_h = ui.scale(12.0);
+                        for (index, tx) in txs.iter().enumerate() {
+                            if let _ = elem().decl(Decl{
+                                id: id_index("Transaction", index as u32),
+                                padding,
+                                child_gap,
+                                height: fixed!(ui.scale(64.0)),
+                                width: percent!(1.0),
+                                direction: LeftToRight,
+                                align: Center,
+                                ..Decl
+                            }) {
+                                // left icon
+                                if let _ = elem().decl(Decl{
+                                    padding,
+                                    child_gap,
+                                    height: percent!(1.0),
+                                    width: fit!(),
+                                    direction: TopToBottom,
+                                    align: Left,
+                                    ..Decl
+                                }) {
+                                    let icon = match tx.1 {
+                                        wallet::WalletTxKind::Send    => ICON_UP_SMALL,
+                                        wallet::WalletTxKind::Receive => ICON_DOWN_SMALL,
+                                        wallet::WalletTxKind::Shield  => ICON_SHIELD,
+                                        _ => todo!(),
+                                    };
+                                    let temp_letter_symbol_h = ui.scale(24.0);
+                                    ui.text(icon, TextDecl { font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
+                                }
 
-                for tx in txs {
-                    if let _ = elem().decl(Decl{
-                        padding,
-                        child_gap,
-                        height: grow!(),
-                        width: fit!(),
-                        direction: TopToBottom,
-                        align: Top,
-                        ..Decl
-                    }) {
-                        // manually split id text
-                        let string = format!("{:?} {:?}", tx.0.txid, tx.1);
-                        ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), TextDecl { h: transaction_text_h, align: AlignX::Left, ..TextDecl });
-                        ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), TextDecl { h: transaction_text_h, align: AlignX::Left, ..TextDecl });
+                                // info
+                                if let _ = elem().decl(Decl{
+                                    height: fit!(),
+                                    width: grow!(),
+                                    direction: TopToBottom,
+                                    align: Left,
+                                    ..Decl
+                                }) {
+                                    let label = match tx.1 {
+                                        wallet::WalletTxKind::Send    => "Sent",
+                                        wallet::WalletTxKind::Receive => "Received",
+                                        wallet::WalletTxKind::Shield  => "Shielded",
+                                        _ => todo!(),
+                                    };
+
+                                    let txid = tx.0.txid.to_string();
+                                    let label_str = if let Some(mined_height) = tx.0.mined_height {
+                                        frame_strf!(data, "{} @ {}", label, mined_height)
+                                    } else {
+                                        frame_strf!(data, "{}", label)
+                                    };
+
+                                    ui.text(label_str, TextDecl { h: kind_text_h, align: AlignX::Left, ..TextDecl });
+
+                                    // spacer
+                                    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
+
+                                    ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { h: transaction_text_h, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, align: AlignX::Left, ..TextDecl });
+
+                                    // spacer
+                                    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
+
+                                    if tx.0.memo_count != 0 {
+                                        let mut memo_str = String::from_utf8(tx.0.memo.as_slice().to_vec()).unwrap().trim_end_matches(|c| c == '\0').to_string();
+                                        if memo_str.len() > 32 {
+                                            memo_str = format!("{}...", memo_str[..32].to_string());
+                                        }
+
+                                        ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
+                                    }
+                                }
+
+                                // right info
+                                if let _ = elem().decl(Decl{
+                                    padding,
+                                    child_gap,
+                                    height: percent!(1.0),
+                                    width: fit!(),
+                                    direction: TopToBottom,
+                                    align: Right,
+                                    ..Decl
+                                }) {
+                                    // @todo colors
+                                    let color = match tx.1 {
+                                        wallet::WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
+                                        wallet::WalletTxKind::Receive => (0x5a, 0xb5, 0x52, 0xff),
+                                        wallet::WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
+                                        _ => WHITE,
+
+                                    };
+
+                                    match tx.1 {
+                                        wallet::WalletTxKind::Send => {
+                                            ui.text(frame_strf!(data, "-{} cTAZ", str_from_ctaz(tx.0.total_spent.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: color, ..TextDecl });
+                                        },
+                                        wallet::WalletTxKind::Receive => {
+                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.0.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: color, ..TextDecl });
+                                        },
+                                        wallet::WalletTxKind::Shield => {
+                                            let shield_amount: i64 = tx.0.account_value_delta.into();
+                                            let full = shield_amount / 100_000_000;
+                                            let part = shield_amount % 100_000_000;
+                                            let part_str = format!("{part}00");
+                                            let trim_part = part_str.trim_end_matches("0");
+
+                                            let prefix = if shield_amount < 0 { "-" } else { "" };
+                                            ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..trim_part.len().max(3)]), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: color, ..TextDecl });
+                                        },
+                                        _ => todo!(),
+                                    }
+                                }
+
+                                // @TODO: REMOVE ME ONCE IDs ARE FIXED!!!!!!
+                                break;
+
+                                // manually split id text
+                                // let string = format!("{:?} {:?}", tx.0.txid, tx.1);
+                                // ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), TextDecl { h: transaction_text_h, align: AlignX::Left, ..TextDecl });
+                                // ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), TextDecl { h: transaction_text_h, align: AlignX::Left, ..TextDecl });
+                            }
+                        }
                     }
                 }
             }
