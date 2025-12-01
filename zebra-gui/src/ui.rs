@@ -65,7 +65,7 @@ fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
 
     if is_rendering {
         if ui.pixel_inspector_primed {
-            ui.draw().mono_text_line(0.0, 0.0, 16.0, "Pixel Inspector is Primed! Click to select pixel.", 0xff_00ff00);
+            ui.draw().text_line(FontKind::Mono, 0.0, 0.0, 16.0, "Pixel Inspector is Primed! Click to select pixel.", 0xff_00ff00);
         }
         if let Some((x, y)) = unsafe { *ui.draw().debug_pixel_inspector } {
             let x = x as isize; let y = y as isize;
@@ -75,7 +75,7 @@ fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
             if y < ui.draw().window_height/2 { draw_y = ui.draw().window_height - 256 };
             let color = unsafe { *ui.draw().debug_pixel_inspector_last_color };
             ui.draw().rectangle(draw_x as f32, draw_y as f32, draw_x as f32 + 256.0, draw_y as f32 + 256.0, 0xff_000000 | color);
-            ui.draw().mono_text_line(draw_x as f32, draw_y as f32, 12.0, &format!("({},{}) = {:X}", x, y, color), 0xff_000000 | (color ^ u32::MAX));
+            ui.draw().text_line(FontKind::Mono, draw_x as f32, draw_y as f32, 12.0, &format!("({},{}) = {:X}", x, y, color), 0xff_000000 | (color ^ u32::MAX));
         }
     }
 
@@ -160,18 +160,20 @@ const Decl: Decl = Decl {
     padding:   (0.0, 0.0, 0.0, 0.0),
     clip:      false,
     child_gap: 0.0,
-    align:     Align::TopLeft,
+    align:     TopLeft,
     width:     Sizing::Fit(0.0, f32::MAX),
     height:    Sizing::Fit(0.0, f32::MAX),
 };
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 struct TextDecl {
+    font: FontKind,
     h: f32,
     colour: (u8, u8, u8, u8),
     align: AlignX,
 }
 const TextDecl: TextDecl = TextDecl {
+    font: FontKind::Normal,
     h: 0.0,
     colour: WHITE,
     align: AlignX::Left,
@@ -457,6 +459,7 @@ impl Context {
 
     fn text(&self, label: &str, decl: TextDecl) {
         let config = clay::text::TextConfig::new()
+            .font_id(decl.font as u16)
             .font_size(decl.h as u16)
             .color(clay_colour(decl.colour))
             .alignment(match decl.align {
@@ -490,7 +493,7 @@ impl Context {
             colour: if *tab_id == id { ACTIVE_TAB_COL } else { INACTIVE_TAB_COL },
             width: grow!(),
             height: grow!(),
-            align: Align::Center,
+            align: Center,
             ..Decl
         }) {
             self.text(label, TextDecl { h: tab_text_h, align: AlignX::Center, ..TextDecl });
@@ -554,7 +557,7 @@ fn ui_left_pane(ui: &mut Context,
         radius: (radius.0, 0.0, radius.2, 0.0),
         floating: true,
         colour: (0, 0, 0, 0xC0),
-        align: Align::Center,
+        align: Center,
         width:  grow!(),
         height: grow!(),
         ..Decl
@@ -570,7 +573,7 @@ fn ui_left_pane(ui: &mut Context,
             colour: MODAL_COL,
             width:  grow!(ui.scale(192.0), ui.scale(384.0)),
             height: grow!(ui.scale(192.0), ui.scale(384.0)),
-            align: Align::Top,
+            align: Top,
             direction: TopToBottom,
             ..Decl
         }) {
@@ -585,15 +588,15 @@ fn ui_left_pane(ui: &mut Context,
                     child_gap,
                     width:  grow!(),
                     height: fit!(),
-                    align: Align::Center,
+                    align: Center,
                     direction: LeftToRight,
                     ..Decl
                 }) {
-                    if let _ = elem().decl(Decl { width: grow!(), align: Align::Left, ..Decl }) {}
-                    if let _ = elem().decl(Decl { width: grow!(), align: Align::Center, ..Decl }) {
+                    if let _ = elem().decl(Decl { width: grow!(), align: Left, ..Decl }) {}
+                    if let _ = elem().decl(Decl { width: grow!(), align: Center, ..Decl }) {
                         ui.text(title, TextDecl { h: text_h, align: AlignX::Center, ..TextDecl });
                     }
-                    if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Align::Right, ..Decl }) && closeable {
+                    if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Right, ..Decl }) && closeable {
                         let id = id("Close This Modal");
 
                         let (clicked, colour) = ui.button_act_on_release(clicked_id, id);
@@ -611,7 +614,7 @@ fn ui_left_pane(ui: &mut Context,
 
                         // Button circle
                         if let _ = elem().decl(Decl {
-                            id, colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
+                            id, colour, radius: radius.dup4(), padding, child_gap, align: Center,
                             width:  fixed!(radius * 2.0),
                             height: fixed!(radius * 2.0),
                             ..Decl
@@ -693,7 +696,7 @@ fn ui_left_pane(ui: &mut Context,
         child_gap,
         width: percent!(1.0),
         height: fit!(),
-        align: Align::Center,
+        align: Center,
         ..Decl
     }) {
         tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, clicked_id, "Wallet");
@@ -708,7 +711,7 @@ fn ui_left_pane(ui: &mut Context,
         padding, child_gap,
         radius: (0.0, 0.0, radius.2, 0.0),
         direction: TopToBottom,
-        align: Align::Top,
+        align: Top,
         width: percent!(1.0),
         height: grow!(),
         ..Decl
@@ -725,7 +728,7 @@ fn ui_left_pane(ui: &mut Context,
                 width: grow!(),
                 height: fit!(),
                 padding,
-                align: Align::Center,
+                align: Center,
                 ..Decl
             }) {
                 let balance_str = frame_strf!(data, "{} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().balance.try_into().unwrap()));
@@ -738,17 +741,17 @@ fn ui_left_pane(ui: &mut Context,
             // buttons container
             if let _ = elem().decl(Decl {
                 id: id("Buttons Container"),
-                padding, child_gap, align: Align::Center,
+                padding, child_gap, align: Center,
                 width: grow!(),
                 height: fit!(),
                 ..Decl
             }) {
 
-                let mut button = |ui: &mut Context, label| {
+                let mut button = |ui: &mut Context, icon: &'static str, label: &'static str| {
                     let id = id(label);
                     let (clicked, colour) = ui.button(clicked_id, id);
                     if let _ = elem().decl(Decl {
-                        id, child_gap, align: Align::Center,
+                        id, child_gap, align: Center,
                         direction: TopToBottom,
                         width: fit!(),
                         height: fit!(),
@@ -759,13 +762,13 @@ fn ui_left_pane(ui: &mut Context,
 
                         // Button circle
                         if let _ = elem().decl(Decl {
-                            colour, radius: radius.dup4(), padding, child_gap, align: Align::Center,
+                            colour, radius: radius.dup4(), padding, child_gap, align: Center,
                             width:  fixed!(radius * 2.0),
                             height: fixed!(radius * 2.0),
                             ..Decl
                         }) {
                             let temp_letter_symbol_h = ui.scale(32.0);
-                            ui.text(&label[..1], TextDecl { h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
+                            ui.text(ICON_CANCEL, TextDecl { font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
                         }
 
                         let button_text_h = ui.scale(16.0);
@@ -774,10 +777,10 @@ fn ui_left_pane(ui: &mut Context,
                     clicked
                 };
 
-                if button(ui, "Send")    { ui.modal = Modal::Send;    }
-                if button(ui, "Receive") { ui.modal = Modal::Receive; }
-                if button(ui, "Stake")   { ui.modal = Modal::Stake;   }
-                if button(ui, "Unstake") { ui.modal = Modal::Unstake; }
+                if button(ui, ICON_PAPER_PLANE, "Send")    { ui.modal = Modal::Send;    }
+                if button(ui, ICON_QRCODE,      "Receive") { ui.modal = Modal::Receive; }
+                if button(ui, ICON_PLUS,        "Stake")   { ui.modal = Modal::Stake;   }
+                if button(ui, ICON_MINUS_1,     "Unstake") { ui.modal = Modal::Unstake; }
 
             }
 
@@ -794,41 +797,6 @@ fn ui_left_pane(ui: &mut Context,
                 ui.text("There are no transactions yet.", TextDecl { h: h, align: AlignX::Center, ..TextDecl });
             }
 
-            // "Reset View" button
-            if let _ = elem().decl(Decl {
-                align: Align::BottomRight,
-                width: grow!(),
-                ..Decl
-            }) {
-                let label = "Reset View";
-                let id = id(label);
-                let (clicked, colour) = ui.button_ex(clicked_id, id, true);
-                let radius = ui.scale(20.0);
-
-                // Button
-                if let _ = elem().decl(Decl {
-                    id,
-                    colour,
-                    padding,
-                    child_gap,
-                    radius: radius.dup4(),
-                    align: Align::Center,
-                    width:  fit!(ui.scale(128.0)),
-                    height: fit!(radius * 2.0),
-                    ..Decl
-                }) {
-                    let button_text_h = ui.scale(16.0);
-                    let colour = WHITE;
-                    ui.text(label, TextDecl { h: button_text_h, colour, align: AlignX::Center, ..TextDecl });
-                }
-
-                if clicked {
-                    viz.camera_x = 0.0;
-                    viz.camera_y = 0.0;
-                    viz.zoom = 0.0;
-                }
-            }
-
         } else if *tab_id == tab_id_finalizers {
         } else if *tab_id == tab_id_history {
             if let _ = elem().decl(Decl {
@@ -838,7 +806,7 @@ fn ui_left_pane(ui: &mut Context,
                 width: percent!(1.0),
                 height: fit!(),
                 direction: TopToBottom,
-                align: Align::Center,
+                align: Center,
                 ..Decl
             }) {
                 let txs = &wallet_state.lock().unwrap().txs;
@@ -855,7 +823,7 @@ fn ui_left_pane(ui: &mut Context,
                         height: grow!(),
                         width: fit!(),
                         direction: TopToBottom,
-                        align: Align::Top,
+                        align: Top,
                         ..Decl
                     }) {
                         // manually split id text
@@ -886,7 +854,7 @@ fn ui_right_pane(ui: &mut Context,
         child_gap,
         width: percent!(1.0),
         height: fit!(),
-        align: Align::Center,
+        align: Center,
         ..Decl
     }) {
         tab_id_faucet   = ui.tab(radius, padding, tab_id, clicked_id, "Faucet");
@@ -915,7 +883,7 @@ fn ui_right_pane(ui: &mut Context,
             //     width: percent!(1.0),
             //     height: fit!(),
             //     padding,
-            //     align: Align::Center,
+            //     align: Center,
             //     ..Decl
             // }) {
             //     let big_text_h = ui.scale(32.0);
@@ -928,7 +896,7 @@ fn ui_right_pane(ui: &mut Context,
             // buttons container
             if let _ = elem().decl(Decl {
                 id: id("Buttons Container"),
-                padding, child_gap, align: Align::Center,
+                padding, child_gap, align: Center,
                 width: percent!(1.0),
                 height: fit!(),
                 ..Decl
@@ -940,7 +908,7 @@ fn ui_right_pane(ui: &mut Context,
                     if let _ = elem().decl(Decl {
                         id,
                         child_gap,
-                        align: Align::Center,
+                        align: Center,
                         direction: TopToBottom,
                         width: fit!(),
                         height: fit!(),
@@ -959,7 +927,7 @@ fn ui_right_pane(ui: &mut Context,
                             padding,
                             child_gap,
                             radius: radius.dup4(),
-                            align: Align::Center,
+                            align: Center,
                             width:  fit!(ui.scale(192.0)),
                             height: fit!(radius * 2.0),
                             ..Decl
@@ -983,7 +951,7 @@ fn ui_right_pane(ui: &mut Context,
             }
 
             if let _ = elem().decl(Decl {
-                padding: ui.scale(16.0).dup4(), child_gap, align: Align::TopLeft,
+                padding: ui.scale(16.0).dup4(), child_gap, align: TopLeft,
                 width: grow!(), height: fit!(),
                 direction: TopToBottom,
                 ..Decl
@@ -1000,11 +968,32 @@ fn ui_right_pane(ui: &mut Context,
                         w.faucet_funds_available,
                     )
                 };
-                ui.text(frame_strf!(data, "Miner funds: {}", h), TextDecl { h: title_h, align: AlignX::Left, ..TextDecl });
-                ui.text(frame_strf!(data, "Unshielded: {} cTAZ", str_from_ctaz(un)), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
-                ui.text(frame_strf!(data, "Shielded (pending): {} cTAZ", str_from_ctaz(sh_p)), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
-                ui.text(frame_strf!(data, "Shielded (spendable): {} cTAZ", str_from_ctaz(sh_s)), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
-                ui.text(frame_strf!(data, "Faucet available: {} cTAZ", str_from_ctaz(fc)), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
+
+                let row   = Decl { width: percent!(1.0), child_gap, height: fit!(), ..Decl };
+
+                let left  = Decl { width: grow!(), height: fit!(), align: Left,  ..Decl };
+                let right = Decl { width: grow!(), height: fit!(), align: Right, ..Decl };
+
+                let left_text  = TextDecl { h: text_h,  align: AlignX::Left,  ..TextDecl  };
+                let right_text = TextDecl { font: Mono, align: AlignX::Right, ..left_text };
+
+                ui.text(frame_strf!(data, "Miner funds at height {}:", h), TextDecl { h: title_h, ..left_text });
+                if let _ = elem().decl(row) {
+                    if let _ = elem().decl(left)  { ui.text("Unshielded:", left_text); }
+                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(un)), right_text); }
+                }
+                if let _ = elem().decl(row) {
+                    if let _ = elem().decl(left)  { ui.text("Shielded (pending):", left_text); }
+                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_p)), right_text); }
+                }
+                if let _ = elem().decl(row) {
+                    if let _ = elem().decl(left)  { ui.text("Shielded (spendable):", left_text); }
+                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_s)), right_text); }
+                }
+                if let _ = elem().decl(row) {
+                    if let _ = elem().decl(left)  { ui.text("Faucet available:", left_text); }
+                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(fc)), right_text); }
+                }
                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
             };
@@ -1066,8 +1055,9 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
     clay.set_layout_dimensions((window_w as f32, window_h as f32).into());
     clay.pointer_state(mouse_pos.into(), mouse_held);
     clay.set_measure_text_function_user_data(ui.draw(), |string, text_config, draw| {
+        let font_kind = match text_config.font_id { 0 => FontKind::Normal, 1 => FontKind::Mono, 2 => FontKind::Icons, _ => todo!() };
         let h = text_config.font_size as f32;
-        let w = draw.measure_text_line(h, string);
+        let w = draw.measure_text_line(font_kind, h, string);
         clay::math::Dimensions::new(w, h)
     });
 
@@ -1089,6 +1079,12 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
         height: grow!(),
         ..Decl
     }) {
+
+        let clicked_id = &mut clicked_id;
+        let focused_id = &mut focused_id;
+        let pane_tab_l = &mut pane_tab_l;
+        let pane_tab_r = &mut pane_tab_r;
+
         let pane_pct = Sizing::Percent(ui.zoom * PANE_PERCENT);
 
         if let _ = elem().decl(Decl {
@@ -1099,16 +1095,54 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
             clip: true,
             ..Decl
         }) {
-            ui_left_pane(ui, wallet_state.clone(), data, viz, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_l);
+            ui_left_pane(ui, wallet_state.clone(), data, viz, child_gap, padding, radius, clicked_id, pane_tab_l);
         }
 
         if let _ = elem().decl(Decl {
             id: id("Central Gap"),
             radius, padding, child_gap,
+            direction: TopToBottom,
             width: grow!(),
             height: grow!(),
             ..Decl
         }) {
+
+            if let _ = elem().decl(Decl { align: Top, width: grow!(), ..Decl }) {
+                ui.text(frame_strf!(data, "TODO: Put BFT height here!"), TextDecl { h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+            }
+
+            if let _ = elem().decl(Decl { height: grow!(), ..Decl }) {}
+
+            // "Reset View" button
+            if let _ = elem().decl(Decl { align: Bottom, width: grow!(), ..Decl }) {
+                let label = "Reset View";
+                let id = id(label);
+                let (clicked, colour) = ui.button_ex(clicked_id, id, true);
+                let radius = ui.scale(20.0);
+
+                // Button
+                if let _ = elem().decl(Decl {
+                    id,
+                    colour,
+                    padding,
+                    child_gap,
+                    radius: radius.dup4(),
+                    align: Center,
+                    width:  fit!(ui.scale(128.0)),
+                    height: fit!(radius * 2.0),
+                    ..Decl
+                }) {
+                    let button_text_h = ui.scale(16.0);
+                    let colour = WHITE;
+                    ui.text(label, TextDecl { h: button_text_h, colour, align: AlignX::Center, ..TextDecl });
+                }
+
+                if clicked {
+                    viz.camera_x = 0.0;
+                    viz.camera_y = 0.0;
+                    viz.zoom = 0.0;
+                }
+            }
         }
 
         if let _ = elem().decl(Decl {
@@ -1119,10 +1153,13 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
             clip: true,
             ..Decl
         }) {
-            ui_right_pane(ui, wallet_state.clone(), data, child_gap, padding, radius, &mut clicked_id, &mut pane_tab_r);
+            ui_right_pane(ui, wallet_state.clone(), data, child_gap, padding, radius, clicked_id, pane_tab_r);
         }
     }
 
+    if !ui.input().mouse_held(winit::event::MouseButton::Left) {
+        clicked_id = Id::default();
+    }
     ui.clicked_id = clicked_id;
     ui.pane_tab_l = pane_tab_l;
     ui.pane_tab_r = pane_tab_r;
@@ -1160,7 +1197,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
                                                 clay_color_to_u32(config.color));
                 }
                 RenderCommandConfig::Text(config) => {
-                    ui.draw().text_line(x1 as f32, y1 as f32, config.font_size as f32, config.text, clay_color_to_u32(config.color));
+                    let font_kind = match config.font_id { 0 => FontKind::Normal, 1 => FontKind::Mono, 2 => FontKind::Icons, _ => todo!() };
+                    ui.draw().text_line(font_kind, x1 as f32, y1 as f32, config.font_size as f32, config.text, clay_color_to_u32(config.color));
                 }
                 ScissorStart() => {
                     ui.draw().set_scissor(x1, y1, x2, y2);

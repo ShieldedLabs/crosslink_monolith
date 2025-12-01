@@ -1435,6 +1435,43 @@ impl<'de> serde::Deserialize<'de> for Script {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct TFLStakerZats(#[serde(with = "hex")] pub [u8; 32], pub u64);
+// #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+// pub struct TFLStakerZec {
+//     #[serde(with = "hex")]
+//     pub addr: [u8; 32],
+//     pub stake: u64,
+// }
+// #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+// pub struct GetRoster {
+//     // #[serde(with = "hex")]
+//     pub stakers: Vec<TFLStakerZec>,
+// }
+/// Error type for the `getaddressutxos` RPC request.
+#[derive(Debug, thiserror::Error)]
+pub enum GetRosterError {
+    /// Invalid encoding
+    #[error("Invalid encoding: {0}")]
+    InvalidEncoding(String),
+}
+
+impl ResponseToError for Vec<TFLStakerZats> {
+    type RpcError = Infallible;
+}
+
+// impl From<GetBytes> for Vec<u8> {
+//     fn from(v: GetBytes) -> Vec<u8> {
+//         v.data
+//     }
+// }
+
+// impl From<Vec<u8>> for GetBytes {
+//     fn from(data: Vec<u8>) -> GetBytes {
+//         GetBytes { data }
+//     }
+// }
+
 /// This is used for the output parameter of [`crate::jsonrpsee::connector::JsonRpSeeConnector::get_address_utxos`].
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct GetUtxosResponse {

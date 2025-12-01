@@ -8,6 +8,7 @@ use zaino_proto::proto::{
     compact_formats::CompactBlock,
     service::{
         compact_tx_streamer_server::CompactTxStreamer, Address, AddressList, Balance, BlockId,
+        Bytes,
         BlockRange, ChainSpec, Duration, Empty, Exclude, GetAddressUtxosArg,
         GetAddressUtxosReplyList, GetSubtreeRootsArg, LightdInfo, PingResponse, RawTransaction,
         SendResponse, TransparentAddressBlockFilter, TreeState, TxFilter,
@@ -176,6 +177,8 @@ where
         Returns max [GetAddressUtxosArg.max_entries] utxos, or unrestricted if [GetAddressUtxosArg.max_entries] = 0. \
         Utxos are returned in a stream."
         get_address_utxos_stream(GetAddressUtxosArg) -> Self::GetAddressUtxosStreamStream as streaming,
+        "Get BFT roster"
+        get_roster(Empty) -> Bytes as empty,
         "Return information about this lightwalletd instance and the blockchain"
         get_lightd_info(Empty) -> LightdInfo as empty,
         "GetLatestTreeState returns the note commitment tree state corresponding to the chain tip."

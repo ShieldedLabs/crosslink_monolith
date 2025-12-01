@@ -41,7 +41,7 @@ use zaino_fetch::{
 use zaino_proto::proto::{
     compact_formats::CompactBlock,
     service::{
-        AddressList, Balance, BlockId, BlockRange, Exclude, GetAddressUtxosArg,
+        AddressList, Balance, BlockId, BlockRange, Bytes, Exclude, GetAddressUtxosArg,
         GetAddressUtxosReply, GetAddressUtxosReplyList, LightdInfo, PingResponse, RawTransaction,
         SendResponse, TransparentAddressBlockFilter, TreeState, TxFilter,
     },
@@ -1668,6 +1668,9 @@ impl ZcashIndexer for StateServiceSubscriber {
         }
     }
 
+    async fn get_raw_roster(&self) -> Result<Bytes, Self::Error> {
+        todo!("");
+    }
     async fn get_raw_transaction(
         &self,
         txid_hex: String,
@@ -2496,6 +2499,10 @@ impl LightWalletIndexer for StateServiceSubscriber {
             }
         });
         Ok(UtxoReplyStream::new(channel_rx))
+    }
+
+    async fn get_roster(&self) -> Result<Bytes, Self::Error> {
+        todo!("expecting fetch");
     }
 
     /// Return information about this lightwalletd instance and the blockchain

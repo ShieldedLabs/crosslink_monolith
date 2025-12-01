@@ -33,6 +33,7 @@ use crate::jsonrpsee::{
         mining_info::GetMiningInfoWire,
         peer_info::GetPeerInfo,
         GetBalanceError, GetBalanceResponse, GetBlockCountResponse, GetBlockError, GetBlockHash,
+        TFLStakerZats,
         GetBlockResponse, GetBlockchainInfoResponse, GetInfoResponse, GetMempoolInfoResponse,
         GetSubtreesError, GetSubtreesResponse, GetTransactionResponse, GetTreestateError,
         GetTreestateResponse, GetUtxosError, GetUtxosResponse, SendTransactionError,
@@ -737,6 +738,15 @@ impl JsonRpSeeConnector {
         };
 
         self.send_request("getrawtransaction", params).await
+    }
+
+    /// BFT Roster
+    pub async fn get_roster(&self) -> Result<Vec<TFLStakerZats>, RpcRequestError<Infallible>> {
+        // dummy params
+        let params = vec![
+            serde_json::to_value(0).map_err(RpcRequestError::JsonRpc)?,
+        ];
+        self.send_request("get_tfl_roster_zats", params).await
     }
 
     /// Returns the transaction ids made by the provided transparent addresses.

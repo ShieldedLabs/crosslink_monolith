@@ -253,6 +253,11 @@ pub struct GetAddressUtxosReplyList {
     #[prost(message, repeated, tag = "1")]
     pub address_utxos: ::prost::alloc::vec::Vec<GetAddressUtxosReply>,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Bytes {
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ShieldedProtocol {
@@ -545,6 +550,32 @@ pub mod compact_tx_streamer_client {
                     GrpcMethod::new(
                         "cash.z.wallet.sdk.rpc.CompactTxStreamer",
                         "GetTransaction",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_roster(
+            &mut self,
+            request: impl tonic::IntoRequest<super::Empty>,
+        ) -> std::result::Result<tonic::Response<super::Bytes>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetRoster",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                        "GetRoster",
                     ),
                 );
             self.inner.unary(req, path, codec).await

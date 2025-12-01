@@ -192,6 +192,7 @@ service CompactTxStreamer {
 
     // Return the requested full (not compact) transaction (as from zcashd)
     rpc GetTransaction(TxFilter) returns (RawTransaction) {}
+    rpc GetRoster(Empty) returns (RawTransaction) {}
     // Submit the given transaction to the Zcash network
     rpc SendTransaction(RawTransaction) returns (SendResponse) {}
 
