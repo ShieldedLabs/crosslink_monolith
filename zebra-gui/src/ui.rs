@@ -1378,22 +1378,97 @@ pub fn ui_right_pane(ui: &mut Context,
             }
 
             let roster = wallet_state.lock().unwrap().roster.clone();
-            for (index, member) in roster.iter().enumerate() {
-                let bytes = member.pub_key;
-                let chunks = {
-                    let mut chunks = [0u64; 4];
-                    for i in 0..4 {
-                        let start = i * 8;
-                        let end = start + 8;
-                        let mut buf = [0u8; 8];
-                        buf.copy_from_slice(&bytes[start..end]);
-                        chunks[i] = u64::from_le_bytes(buf);
+
+            if let _ = elem().decl(Decl {
+                id: id("Roster Container"),
+                padding, child_gap, align: Center,
+                direction: TopToBottom,
+                width: percent!(1.0),
+                height: fit!(),
+                ..Decl
+            }) {
+                for (index, member) in roster.iter().enumerate() {
+                    let bytes = member.pub_key;
+                    let chunks = {
+                        let mut chunks = [0u64; 4];
+                        for i in 0..4 {
+                            let start = i * 8;
+                            let end = start + 8;
+                            let mut buf = [0u8; 8];
+                            buf.copy_from_slice(&bytes[start..end]);
+                            chunks[i] = u64::from_le_bytes(buf);
+                        }
+
+                        chunks
+                    };
+
+                    if let _ = elem().decl(Decl {
+                        id: id_index("Roster Member", index as u32),
+                        padding,
+                        child_gap,
+                        height: fixed!(ui.scale(64.0)),
+                        width: percent!(1.0),
+                        direction: LeftToRight,
+                        align: Left,
+                        ..Decl
+                    }) {
+                        let row   = Decl { width: percent!(1.0), child_gap, height: fit!(), ..Decl };
+                        let left  = Decl { width: grow!(), height: fit!(), align: Left,  ..Decl };
+                        let right = Decl { width: grow!(), height: fit!(), align: Right, ..Decl };
+
+                        let left_text  = TextDecl { h: ui.scale(24.0),  align: AlignX::Left,  ..TextDecl  };
+                        let right_text = TextDecl { font: Mono, align: AlignX::Right, ..left_text };
+
+                        let mut button = |ui: &mut Context, icon: &'static str, id| {
+                            let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, true);
+                            if let _ = elem().decl(Decl {
+                                id, child_gap, align: Center,
+                                direction: TopToBottom,
+                                width: fit!(),
+                                height: fit!(),
+                                ..Decl
+                            }) {
+
+                                let radius = ui.scale(24.0);
+
+                                // Button circle
+                                if let _ = elem().decl(Decl {
+                                    colour, radius: radius.dup4(), padding, child_gap, align: Center,
+                                    width:  fixed!(radius * 2.0),
+                                    height: fixed!(radius * 2.0),
+                                    ..Decl
+                                }) {
+                                    let temp_letter_symbol_h = ui.scale(28.0);
+                                    ui.text(icon, TextDecl { colour: text_colour, font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
+                                }
+                            }
+                            clicked
+                        };
+
+                        if let _ = elem().decl(row) {
+                            if let _ = elem().decl(left)  {
+                                if button(ui, ICON_DOC_INV, id_index("Button", index as u32)) {
+                                    let address_str = String::from_utf8_lossy(member.pub_key.as_slice());
+                                    ui.input().send_to_clipboard(&address_str);
+                                }
+
+                                ui.text(frame_strf!(data, "{}:", display_str(&chunks)), left_text);
+                            }
+
+                            if let _ = elem().decl(right) {
+                                let full = member.stake / 100_000_000;
+                                let part = member.stake % 100_000_000;
+                                let part_str = format!("{part}00");
+                                let trim_part = part_str.trim_end_matches("0");
+
+                                ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), right_text);
+                            }
+                        }
+
+                        // spacer
+                        if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
                     }
-
-                    chunks
-                };
-
-                ui.text(frame_strf!(data, "{} {}", display_str(&chunks), member.stake), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                }
             }
         }
         // } else if *tab_id == tab_id_settings {
