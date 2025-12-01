@@ -420,7 +420,7 @@ impl Context {
 
     pub fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
 
-    pub fn button_ex(&mut self, clicked_id: &mut Id, id: Id, act_on_press: bool) -> (bool, (u8, u8, u8, u8)) {
+    pub fn button_ex(&mut self, id: Id, act_on_press: bool) -> (bool, (u8, u8, u8, u8)) {
         let mouse_held     = self.input().mouse_held(winit::event::MouseButton::Left);
         let mouse_pressed  = self.input().mouse_pressed(winit::event::MouseButton::Left);
         let mouse_released = self.input().mouse_released(winit::event::MouseButton::Left);
@@ -430,21 +430,21 @@ impl Context {
         let pressed  = hover && mouse_pressed;
         let released = hover && mouse_released;
         if pressed {
-            *clicked_id = id;
+            self.clicked_id = id;
         }
 
         if hover {
             // self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
         }
 
-        let activated = (*clicked_id == id) && if act_on_press {
+        let activated = (self.clicked_id == id) && if act_on_press {
             pressed
         } else {
             released
         };
 
         let colour = if down || pressed {
-            if clicked_id.id == id.id {
+            if self.clicked_id.id == id.id {
                 BUTTON_DOWN_COL
             } else {
                 BUTTON_COL
@@ -458,8 +458,7 @@ impl Context {
         (activated, colour)
     }
 
-    pub fn button               (&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) { return self.button_ex(clicked_id, id, true); }
-    pub fn button_act_on_release(&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) { return self.button_ex(clicked_id, id, false); }
+    pub fn button(&mut self, id: Id) -> (bool, (u8, u8, u8, u8)) { return self.button_ex(id, true); }
 
     pub fn text(&self, label: &str, decl: TextDecl) {
         let config = clay::text::TextConfig::new()
@@ -484,14 +483,13 @@ impl Context {
               radius: (f32, f32, f32, f32),
               padding: (f32, f32, f32, f32),
               tab_id: &mut Id,
-              clicked_id: &mut Id,
               id: Id,
               label: &str) -> Id {
         let tab_text_h = self.scale(18.0);
 
         let radius = (radius.0, radius.1, 0.0, 0.0);
 
-        let (clicked, _) = self.button(clicked_id, id);
+        let (clicked, _) = self.button(id);
         if clicked || *tab_id == Id::default() {
             *tab_id = id;
         }
@@ -515,10 +513,9 @@ impl Context {
            radius: (f32, f32, f32, f32),
            padding: (f32, f32, f32, f32),
            tab_id: &mut Id,
-           clicked_id: &mut Id,
            label: &str) -> Id {
         let id = id(label);
-        self.tab_ex(radius, padding, tab_id, clicked_id, id, label)
+        self.tab_ex(radius, padding, tab_id, id, label)
     }
 }
 
@@ -556,7 +553,6 @@ pub fn ui_left_pane(ui: &mut Context,
                 child_gap: f32,
                 padding: (f32, f32, f32, f32),
                 radius:  (f32, f32, f32, f32),
-                clicked_id: &mut Id,
                 tab_id: &mut Id) {
 
     if ui.modal != Modal::None && let _elem = elem().decl(Decl {
@@ -595,7 +591,7 @@ pub fn ui_left_pane(ui: &mut Context,
             if container_hovered { ui.capture = true; }
 
             let text_h = ui.scale(24.0);
-            let title_bar = |ui: &mut Context, clicked_id: &mut Id, closeable, title, title_bar_id| {
+            let title_bar = |ui: &mut Context, closeable, title, title_bar_id| {
                 if let _ = elem().decl(Decl {
                     id: title_bar_id,
                     child_gap,
@@ -612,7 +608,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Right, ..Decl }) && closeable {
                         let id = id("Close This Modal");
 
-                        let (clicked, colour) = ui.button_ex(clicked_id, id, false);
+                        let (clicked, colour) = ui.button_ex(id, false);
                         if clicked || ui.input().key_pressed(KeyCode::Escape) {
                             ui.modal = Modal::None;
                         }
@@ -620,7 +616,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         // Click background to exit -- the code could be placed farther outside but it is here so it can be gated by `closeable`
                         if ui.hovered(container_id) && !ui.hovered(contents_id) && ui.input().mouse_pressed(winit::event::MouseButton::Left) {
                             ui.modal = Modal::None;
-                            *clicked_id = id;
+                            ui.clicked_id = id;
                         }
 
                         let radius = ui.scale(20.0);
@@ -641,17 +637,17 @@ pub fn ui_left_pane(ui: &mut Context,
             match ui.modal {
                 Modal::None => {}
                 Modal::Send => {
-                    title_bar(ui, clicked_id, true, "Send",    id("Send Title Bar"));
+                    title_bar(ui, true, "Send",    id("Send Title Bar"));
                 }
                 Modal::Receive => {
-                    title_bar(ui, clicked_id, true, "Receive", id("Receive Title Bar"));
+                    title_bar(ui, true, "Receive", id("Receive Title Bar"));
                 }
                 Modal::Stake => {
-                    title_bar(ui, clicked_id, true, "Stake",   id("Stake Title Bar"));
+                    title_bar(ui, true, "Stake",   id("Stake Title Bar"));
 
                     let mut button_ex = |ui: &mut Context, label, act_on_press, disabled: bool| {
                         let id = id(label);
-                        let (clicked, mut colour) = ui.button_ex(clicked_id, id, act_on_press);
+                        let (clicked, mut colour) = ui.button_ex(id, act_on_press);
                         if let _ = elem().decl(Decl {
                             id,
                             child_gap,
@@ -718,7 +714,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
                 }
                 Modal::Unstake => {
-                    title_bar(ui, clicked_id, true, "Unstake", id("Unstake Title Bar"));
+                    title_bar(ui, true, "Unstake", id("Unstake Title Bar"));
                 }
             }
         }
@@ -737,9 +733,9 @@ pub fn ui_left_pane(ui: &mut Context,
         align: Center,
         ..Decl
     }) {
-        tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, clicked_id, "Wallet");
-        // tab_id_finalizers = ui.tab(radius, padding, tab_id, clicked_id, "Finalizers");
-        tab_id_history    = ui.tab_ex(radius, padding, tab_id, clicked_id, id("History"), frame_strf!(data, "History ({})", &wallet_state.lock().unwrap().txs.len()));
+        tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Wallet");
+        // tab_id_finalizers = ui.tab(radius, padding, tab_id, "Finalizers");
+        tab_id_history    = ui.tab_ex(radius, padding, tab_id, id("History"), frame_strf!(data, "History ({})", &wallet_state.lock().unwrap().txs.len()));
     }
 
     // Main contents
@@ -811,7 +807,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                 let mut button = |ui: &mut Context, icon: &'static str, label: &'static str| {
                     let id = id(label);
-                    let (clicked, colour) = ui.button(clicked_id, id);
+                    let (clicked, colour) = ui.button(id);
                     if let _ = elem().decl(Decl {
                         id, child_gap, align: Center,
                         direction: TopToBottom,
@@ -906,7 +902,6 @@ pub fn ui_right_pane(ui: &mut Context,
                  child_gap: f32,
                  padding: (f32, f32, f32, f32),
                  radius:  (f32, f32, f32, f32),
-                 clicked_id: &mut Id,
                  tab_id: &mut Id) {
     let mut tab_id_faucet = Id::default();
     let mut tab_id_roster = Id::default();
@@ -920,10 +915,10 @@ pub fn ui_right_pane(ui: &mut Context,
         align: Center,
         ..Decl
     }) {
-        // tab_id_faucet = ui.tab(radius, padding, tab_id, clicked_id, "Faucet");
-        tab_id_faucet  = ui.tab_ex(radius, padding, tab_id, clicked_id, id("Faucet"), frame_strf!(data, "Faucet ({})", &wallet_state.lock().unwrap().miner_seen_height));
-        // tab_id_roster   = ui.tab(radius, padding, tab_id, clicked_id, "Roster");
-        // tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, clicked_id, "Settings");
+        // tab_id_faucet = ui.tab(radius, padding, tab_id, "Faucet");
+        tab_id_faucet  = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet ({})", &wallet_state.lock().unwrap().miner_seen_height));
+        // tab_id_roster   = ui.tab(radius, padding, tab_id, "Roster");
+        // tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, "Settings");
     }
 
     // Main contents
@@ -968,7 +963,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
                 let mut button_ex = |label, act_on_press, disabled: bool| {
                     let id = id(label);
-                    let (clicked, mut colour) = ui.button_ex(clicked_id, id, act_on_press);
+                    let (clicked, mut colour) = ui.button_ex(id, act_on_press);
                     if let _ = elem().decl(Decl {
                         id,
                         child_gap,
@@ -1156,12 +1151,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
         clay::math::Dimensions::new(w, h)
     });
 
-    let mut clicked_id = ui.clicked_id;
-    let mut focused_id = ui.focused_id;
     let mut pane_tab_l = ui.pane_tab_l; // @Todo: how to not have to do this in rust?
     let mut pane_tab_r = ui.pane_tab_r; // @Todo: how to not have to do this in rust?
-
-
     let mut c = clay.begin::<(), ()>();
 
     unsafe { clay::Clay_SetCurrentContext(c.clay.context); }
@@ -1177,11 +1168,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
         ..Decl
     }) {
 
-        let clicked_id = &mut clicked_id;
-        let focused_id = &mut focused_id;
         let pane_tab_l = &mut pane_tab_l;
         let pane_tab_r = &mut pane_tab_r;
-
         let pane_pct = Sizing::Percent(ui.zoom * PANE_PERCENT);
 
         if let _elem = elem().decl(Decl {
@@ -1197,7 +1185,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
                 ui.capture = true;
             }
 
-            ui_left_pane(ui, wallet_state.clone(), data, viz, child_gap, padding, radius, clicked_id, pane_tab_l);
+            ui_left_pane(ui, wallet_state.clone(), data, viz, child_gap, padding, radius, pane_tab_l);
         }
 
         if let _elem = elem().decl(Decl {
@@ -1222,7 +1210,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             if let _ = elem().decl(Decl { align: Bottom, width: grow!(), ..Decl }) {
                 let label = "Reset View";
                 let id = id(label);
-                let (clicked, colour) = ui.button_ex(clicked_id, id, true);
+                let (clicked, colour) = ui.button_ex(id, true);
                 let radius = ui.scale(20.0);
 
                 if ui.hovered(id) {
@@ -1267,17 +1255,16 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
                 ui.capture = true;
             }
 
-            ui_right_pane(ui, wallet_state.clone(), viz, data, child_gap, padding, radius, clicked_id, pane_tab_r);
+            ui_right_pane(ui, wallet_state.clone(), viz, data, child_gap, padding, radius, pane_tab_r);
         }
     }
 
     if !ui.input().mouse_held(winit::event::MouseButton::Left) {
-        clicked_id = Id::default();
+        ui.clicked_id = Id::default();
     }
     if ui.clicked_id != Id::default() {
         ui.capture = true;
     }
-    ui.clicked_id = clicked_id;
     ui.pane_tab_l = pane_tab_l;
     ui.pane_tab_r = pane_tab_r;
 
