@@ -122,16 +122,17 @@ async fn wait_for_zainod() {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 enum WalletAction {
     RequestFromFaucet,
     TestStakeAction,
     StakeToMiner,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WalletTx(pub TransactionSummary<AccountUuid>);
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 pub struct WalletState {
     pub balance: i64, // in zats
     pub txs: Vec<WalletTx>,
@@ -146,7 +147,9 @@ pub struct WalletState {
     pub miner_shielded_spendable_funds: u64,
     pub faucet_funds_available: u64,
 
-    actions_in_flight: VecDeque<WalletAction>,
+    pub roster: Vec<RosterMember>,
+
+    pub actions_in_flight: VecDeque<WalletAction>,
 }
 
 impl WalletState {
@@ -193,6 +196,12 @@ pub fn str_from_ctaz(val: u64) -> String {
     let part_str = format!("{part}00");
     let trim_part = part_str.trim_end_matches("0");
     format!("{full}.{}", &part_str[..trim_part.len().max(3)])
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct RosterMember {
+    pub pub_key: [u8; 32],
+    pub stake: u64,
 }
 
 pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
@@ -490,11 +499,6 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     println!("*************************");
 
     // TODO: use tenderlink types & printing routines
-    #[derive(Debug)]
-    struct RosterMember {
-        pub pub_key: [u8; 32],
-        pub stake: u64,
-    }
     let mut roster: Vec<RosterMember> = Vec::new();
     let mut block_cache = MemBlockCache::new();
     the_future_is_now(async {
@@ -537,6 +541,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 if ok {
                     roster = new_roster;
                 }
+                wallet_state.lock().unwrap().roster = roster.clone();
             }
             println!("*********** ROSTER: {roster:?}");
 
@@ -2089,7 +2094,7 @@ impl ServerCertVerifier for DerVerifier {
 }
 */
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TransactionSummary<AccountId> {
     pub account_id: AccountId,
     pub txid: zcash_protocol::TxId,

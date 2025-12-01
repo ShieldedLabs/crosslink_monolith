@@ -434,7 +434,7 @@ impl Context {
         }
 
         if hover {
-            self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
+            // self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
         }
 
         let activated = (*clicked_id == id) && if act_on_press {
