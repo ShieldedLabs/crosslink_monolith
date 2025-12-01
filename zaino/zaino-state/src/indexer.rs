@@ -16,7 +16,7 @@ use zaino_fetch::jsonrpsee::response::{
 use zaino_proto::proto::{
     compact_formats::CompactBlock,
     service::{
-        AddressList, Balance, BlockId, BlockRange, Duration, Exclude, GetAddressUtxosArg,
+        AddressList, Balance, BlockId, BlockRange, Bytes, Duration, Exclude, GetAddressUtxosArg,
         GetAddressUtxosReplyList, GetSubtreeRootsArg, LightdInfo, PingResponse, RawTransaction,
         SendResponse, ShieldedProtocol, SubtreeRoot, TransparentAddressBlockFilter, TreeState,
         TxFilter,
@@ -442,6 +442,10 @@ pub trait ZcashIndexer: Send + Sync + 'static {
         verbose: Option<u8>,
     ) -> Result<GetRawTransaction, Self::Error>;
 
+    async fn get_raw_roster(
+        &self,
+    ) -> Result<Bytes, Self::Error>;
+
     /// Returns the transaction ids made by the provided transparent addresses.
     ///
     /// zcashd reference: [`getaddresstxids`](https://zcash.github.io/rpc/getaddresstxids.html)
@@ -509,6 +513,9 @@ pub trait ZcashIndexer: Send + Sync + 'static {
 
     /// Helper function to get the chain height
     async fn chain_height(&self) -> Result<Height, Self::Error>;
+
+    // /// Helper function to get the roster
+    // async fn get_roster(&self) -> Result<RawTransaction, Self::Error>;
 
     /// Helper function, to get the list of taddresses that have sends or reciepts
     /// within a given block range
@@ -596,6 +603,7 @@ pub trait LightWalletIndexer: Send + Sync + Clone + ZcashIndexer + 'static {
 
     /// Return the requested full (not compact) transaction (as from zcashd)
     async fn get_transaction(&self, request: TxFilter) -> Result<RawTransaction, Self::Error>;
+    async fn get_roster(&self) -> Result<Bytes, Self::Error>;
 
     /// Submit the given transaction to the Zcash network
     async fn send_transaction(&self, request: RawTransaction) -> Result<SendResponse, Self::Error>;
@@ -821,6 +829,9 @@ pub trait LightWalletIndexer: Send + Sync + Clone + ZcashIndexer + 'static {
         &self,
         request: GetAddressUtxosArg,
     ) -> Result<UtxoReplyStream, Self::Error>;
+
+    // /// Return information about this lightwalletd instance and the blockchain
+    // async fn get_roster(&self) -> Result<RawTransaction, Self::Error>;
 
     /// Return information about this lightwalletd instance and the blockchain
     async fn get_lightd_info(&self) -> Result<LightdInfo, Self::Error>;
