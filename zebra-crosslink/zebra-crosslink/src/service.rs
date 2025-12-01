@@ -113,6 +113,7 @@ impl fmt::Debug for TFLServiceCalls {
 /// [`TFLServiceHandle`] is a shallow handle that can be cloned and passed between threads.
 pub fn spawn_new_tfl_service(
     is_regtest: bool,
+    global_seed: [u8; 32],
     state_service_call: StateServiceProcedure,
     mempool_service_call: MempoolServiceProcedure,
     force_feed_pow_call: ForceFeedPoWBlockProcedure,
@@ -200,7 +201,7 @@ pub fn spawn_new_tfl_service(
     };
 
     *handle_mtx.lock().unwrap() = Some(handle1.clone());
-    
+
     let handle3 = handle1.clone();
     *closure_from_state_to_here_mutex.lock().unwrap() = Some(Arc::new(move |fpa, fpb| crate::call_from_state_to_crosslink_to_ask_about_fat_pointers(&handle3, fpa, fpb)));
 
