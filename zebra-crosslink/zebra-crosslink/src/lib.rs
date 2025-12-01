@@ -625,7 +625,7 @@ async fn new_decided_bft_block_from_malachite(
             error!(?err);
         }
     }
-    
+
     internal = tfl_handle.internal.lock().await;
     {
         let new_bc_final = internal.latest_final_block;
@@ -665,7 +665,8 @@ async fn new_decided_bft_block_from_malachite(
                 tfl_dump_blocks(&new_final_height_hashes[..], &new_final_blocks[..]);
             }
 
-            let pos_total_reward: u64 = 6000; // arbitrary scale
+            // @Workshop
+            let pos_total_reward: u64 = (650_000_000 - 10_000) / 2; // half of block reward - fee TODO: account for dev fund etc, remove fee
 
             // walk all blocks in newly-finalized sequence; handle rewards & broadcast them
             for i in 0..new_final_height_hashes.len() {
