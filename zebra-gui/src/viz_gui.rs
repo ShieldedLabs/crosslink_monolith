@@ -339,7 +339,7 @@ const ZOOM_FACTOR : f32 = 1.2;
 const SCREEN_UNIT_CONST : f32 = 10.0;
 
 pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui: &mut ui::Context, draw_ctx: &DrawCtx, dt: f32, input_ctx: &InputCtx) {
-    {
+    if !ui.capture {
         let dxm = (input_ctx.mouse_pos().0.clamp(0, draw_ctx.window_width) - draw_ctx.window_width/2) as f32;
         let dym = (input_ctx.mouse_pos().1.clamp(0, draw_ctx.window_height) - draw_ctx.window_height/2) as f32;
         let old_screen_unit = SCREEN_UNIT_CONST * ZOOM_FACTOR.powf(viz_state.zoom);
