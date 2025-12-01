@@ -83,6 +83,7 @@ pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum Floating  { #[default] None, Parent, Root(f32, f32) }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum AlignX    { #[default] Left, Right, Center }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum AlignY    { #[default] Top, Bottom, Center }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub struct Align   { x: AlignX, y: AlignY }
@@ -140,7 +141,7 @@ pub const Id: Id = Id { id: 0, offset: 0, base_id: 0, len: 0, chars: std::ptr::n
 pub struct Decl {
     id: Id,
     direction: Direction,
-    floating: bool,
+    floating: Floating,
     colour: (u8, u8, u8, u8),
     radius: (f32, f32, f32, f32),
     padding: (f32, f32, f32, f32),
@@ -155,7 +156,7 @@ pub struct Decl {
 pub const Decl: Decl = Decl {
     id:        Id,
     direction: Direction::LeftToRight,
-    floating:  false,
+    floating:  Floating::None,
     colour:    (0,   0,   0,   0),
     radius:    (0.0, 0.0, 0.0, 0.0),
     padding:   (0.0, 0.0, 0.0, 0.0),
@@ -294,14 +295,25 @@ impl Element {
         };
         decl.id = item.id.clay().id;
         decl.clip = clay::Clay_ClipElementConfig { horizontal: item.clip, vertical: item.clip, childOffset: clay::Clay_Vector2 { x: 0.0, y: 0.0 } };
-        if item.floating {
-            decl.floating.attachTo = clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_PARENT;
-            // decl.floating.clipTo = clay::Clay_FloatingClipToElement_CLAY_CLIP_TO_NONE;
-            decl.floating.clipTo = clay::Clay_FloatingClipToElement_CLAY_CLIP_TO_ATTACHED_PARENT;
-            decl.floating.attachPoints = clay::Clay_FloatingAttachPoints {
-                element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
-                parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
-            };
+        match item.floating {
+            Floating::Parent => {
+                decl.floating.attachTo = clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_PARENT;
+                decl.floating.clipTo = clay::Clay_FloatingClipToElement_CLAY_CLIP_TO_ATTACHED_PARENT;
+                decl.floating.attachPoints = clay::Clay_FloatingAttachPoints {
+                    element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
+                    parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
+                };
+            },
+            Floating::Root(x, y) => {
+                decl.floating.attachTo = clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_ROOT;
+                decl.floating.offset.x = x;
+                decl.floating.offset.y = y;
+                decl.floating.attachPoints = clay::Clay_FloatingAttachPoints {
+                    element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
+                    parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
+                };
+            },
+            _ => {},
         }
         decl.layout.sizing.width  = clay::Clay_SizingAxis::from(sizing(item.width));
         decl.layout.sizing.height = clay::Clay_SizingAxis::from(sizing(item.height));
@@ -496,11 +508,11 @@ impl Context {
                 AlignX::Right  => clay::text::TextAlignment::Right,
                 AlignX::Center => clay::text::TextAlignment::Center,
             })
-            // .wrap_mode(if decl.break_word {
-            //     clay::text::TextElementConfigWrapMode::BreakWord
-            // } else {
-            //     clay::text::TextElementConfigWrapMode::Words
-            // })
+            .wrap_mode(if decl.break_word {
+                clay::text::TextElementConfigWrapMode::BreakWord
+            } else {
+                clay::text::TextElementConfigWrapMode::Words
+            })
             .end();
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
@@ -586,7 +598,7 @@ pub fn ui_left_pane(ui: &mut Context,
         id: id("Modal Container"),
         padding: padding.mul(2.0),
         radius: (radius.0, 0.0, radius.2, 0.0),
-        floating: true,
+        floating: Floating::Parent,
         colour: (0, 0, 0, 0xC0),
         align: Center,
         width:  grow!(),
@@ -1166,6 +1178,20 @@ pub fn ui_right_pane(ui: &mut Context,
 
     // spacer
     if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
+
+        let mouse_pos = ui.input().mouse_pos();
+        if let _ = elem().decl(Decl {
+            id: id("Block Inspector Contents"),
+            colour: PANE_COL,
+            width: fixed!(ui.scale(128.0)),
+            height: fixed!(ui.scale(128.0)),
+            floating: Floating::Root(mouse_pos.0 as f32, mouse_pos.1 as f32),
+            ..Decl
+        }) {
+        }
+    // if viz.inspecting_block_hash != Hash32::from_u64(0) {
+    // }
+
 
     // // Block Inspector Contents
     // if let _ = elem().decl(Decl {
