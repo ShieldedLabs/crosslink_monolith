@@ -1234,6 +1234,10 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle) -> Result<(), 
         let tfl_handle3 = internal_handle.clone();
         let tfl_handle4 = internal_handle.clone();
 
+        use ed25519_zebra::VerificationKeyBytes;
+        let tender_pub = VerificationKeyBytes::from(&my_private_key);
+        *wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap() = tender_pub.into();
+
         tokio::spawn(tenderlink::entry_point(
             my_private_key,
             static_keypair_maybe,

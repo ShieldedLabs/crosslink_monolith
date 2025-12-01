@@ -1395,6 +1395,51 @@ pub fn ui_right_pane(ui: &mut Context,
 
                 ui.text(frame_strf!(data, "{} {}", display_str(&chunks), member.stake), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
             }
+
+
+            let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
+                let id = id(label);
+                let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled);
+                if let _ = elem().decl(Decl {
+                    id,
+                    child_gap,
+                    align: Center,
+                    direction: TopToBottom,
+                    width: fit!(),
+                    height: fit!(),
+                    ..Decl
+                }) {
+                    let radius = ui.scale(24.0);
+
+                    // Button
+                    if let _ = elem().decl(Decl {
+                        colour,
+                        padding,
+                        child_gap,
+                        radius: radius.dup4(),
+                        align: Center,
+                        width:  fit!(ui.scale(192.0)),
+                        height: fit!(radius * 2.0),
+                        ..Decl
+                    }) {
+                        let h = ui.scale(20.0);
+                        ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
+                    }
+                }
+
+                clicked
+            };
+
+
+            let mut recv_address = String::new();
+            for b in wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().iter().rev() {
+                recv_address.push_str(&format!("{:02x}", b));
+            }
+            ui.text("Your Finalizer Address", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+            ui.text(frame_strf!(data, "[{}]", &recv_address), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+            if button_ex(ui, "Copy Finalizer Address", true, true) {
+                ui.input().send_to_clipboard(&recv_address);
+            }
         }
         // } else if *tab_id == tab_id_settings {
     }
