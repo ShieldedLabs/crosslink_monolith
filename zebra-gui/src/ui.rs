@@ -739,6 +739,16 @@ pub fn ui_left_pane(ui: &mut Context,
         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
         if *tab_id == tab_id_wallet {
+            let (
+                balance,
+                pending_balance,
+            ) = {
+                let wallet_state = wallet_state.lock().unwrap();
+                (
+                    wallet_state.balance,
+                    wallet_state.pending_balance,
+                )
+            };
 
             // balance container
             if let _ = elem().decl(Decl {
@@ -747,7 +757,7 @@ pub fn ui_left_pane(ui: &mut Context,
                 align: Center,
                 ..Decl
             }) {
-                let balance_str = frame_strf!(data, "{} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().balance.try_into().unwrap()));
+                let balance_str = frame_strf!(data, "{} cTAZ", str_from_ctaz(balance.try_into().unwrap()));
                 ui.text(&balance_str, TextDecl { h: balance_text_h, align: AlignX::Center, ..TextDecl });
             }
 
@@ -758,7 +768,7 @@ pub fn ui_left_pane(ui: &mut Context,
                 align: Center,
                 ..Decl
             }) {
-                let balance_str = frame_strf!(data, "{} cTAZ Pending", str_from_ctaz(wallet_state.lock().unwrap().pending_balance.try_into().unwrap()));
+                let balance_str = frame_strf!(data, "{} cTAZ Pending", str_from_ctaz(pending_balance.try_into().unwrap()));
                 ui.text(&balance_str, TextDecl { h: accent_text_h, align: AlignX::Center, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
             }
 
@@ -857,7 +867,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         ..Decl
                     }) {
                         // manually split id text
-                        let string = format!("{:?}", tx.0.txid);
+                        let string = format!("{:?} {:?}", tx.0.txid, tx.1);
                         ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), TextDecl { h: transaction_text_h, align: AlignX::Left, ..TextDecl });
                         ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), TextDecl { h: transaction_text_h, align: AlignX::Left, ..TextDecl });
                     }
@@ -1173,10 +1183,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
         }) {
 
             if let _ = elem().decl(Decl { align: Top, width: grow!(), ..Decl }) {
-                ui.text(frame_strf!(data, "BFT Height: 0"), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                ui.text(frame_strf!(data, "BFT Height: {}", viz.bft_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
             }
             if let _ = elem().decl(Decl { align: Top, width: grow!(), ..Decl }) {
-                ui.text(frame_strf!(data, "PoW Height: 0"), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                ui.text(frame_strf!(data, "PoW Height: {}", viz.bc_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
             }
 
             if let _ = elem().decl(Decl { height: grow!(), ..Decl }) {}

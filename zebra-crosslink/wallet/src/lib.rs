@@ -129,11 +129,19 @@ enum WalletAction {
     StakeToMiner,
 }
 
-pub struct WalletTx(pub TransactionSummary<AccountUuid>);
+#[derive(Debug)]
+pub enum WalletTxKind {
+    Send,
+    Receive,
+    Shield,
+}
+
+pub struct WalletTx(pub TransactionSummary<AccountUuid>, pub WalletTxKind);
 
 #[derive(Default)]
 pub struct WalletState {
     pub balance: i64, // in zats
+    pub pending_balance: i64, // in zats
     pub txs: Vec<WalletTx>,
 
     pub waiting_for_faucet: bool,
@@ -699,9 +707,11 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 };
 
                 let balances = user_summary.account_balances();
-                let mut wallet_balance = 0;
+                let mut spendable_balance = 0;
+                let mut pending_balance   = 0;
                 for (_, b) in balances {
-                    wallet_balance += b.spendable_value().into_u64();
+                    spendable_balance += b.spendable_value().into_u64();
+                    pending_balance   += b.value_pending_spendability().into_u64();
                 }
 
                 use core::ops::Add;
@@ -722,12 +732,21 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 };
 
 
-                println!("WALLET HAS {} ({})) cTAZ", wallet_balance, str_from_ctaz(wallet_balance));
+                println!("WALLET HAS {} ({})) cTAZ", spendable_balance, str_from_ctaz(spendable_balance));
 
                 let txs = if let Ok(mut history) = get_transaction_history(user_wallet) {
                     let memos = get_received_memos(&mut client, user_wallet, network).await;
                     let txs: Vec<WalletTx> = history.iter().map(|tx| {
-                        let mut tx = WalletTx(tx.clone());
+                        let mut kind: WalletTxKind;
+                        if tx.is_shielding {
+                            kind = WalletTxKind::Shield;
+                        } else if tx.received_note_count > 0 {
+                            kind = WalletTxKind::Receive;
+                        } else {
+                            kind = WalletTxKind::Receive;
+                        }
+
+                        let mut tx = WalletTx(tx.clone(), kind);
                         if let Some(memo) = memos.iter().find(|m| m.0 == tx.0.txid) {
                             let bytes = memo.1.as_bytes();
                             tx.0.memo[0..bytes.len()].copy_from_slice(bytes);
@@ -790,7 +809,9 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 {
                     let mut wallet_lock = wallet_state.lock().unwrap();
-                    wallet_lock.balance = wallet_balance as i64;
+                    wallet_lock.balance         = spendable_balance as i64;
+                    wallet_lock.pending_balance = pending_balance   as i64;
+
                     if let Some(txs) = txs {
                         wallet_lock.waiting_for_faucet = false; // TODO:???
                         wallet_lock.txs = txs; // @temp: doesn't need to be its own type
