@@ -155,6 +155,33 @@ impl StartCmd {
             config
         };
 
+        // workshop-specific key seed
+        let global_seed = loop {
+            use std::{fs::File, io::Read, io::Write};
+            use rand::{Rng, RngCore, SeedableRng};
+
+            let mut key_path = config.state.cache_dir.clone();
+            let _ = std::fs::create_dir_all(key_path.clone());
+
+            key_path.push("secret.seed");
+            let mut seed = [0u8; 32];
+            println!("getting key seed from {:?}", key_path);
+            if let Ok(mut f) = File::open(key_path.clone()) {
+                match f.read_exact(&mut seed) {
+                    Ok(()) => break seed,
+                    Err(err) => warn!("couldn't read seed at {key_path:?}; creating a new one"),
+                }
+            }
+
+            // all else failed, create/replace file from scratch
+            seed = rand::thread_rng().gen();
+            let mut f = File::create(key_path).expect("couldn't create seed file; add one manually");
+            f.write(&seed).expect("couldn't write to seed file; add one manually");
+
+            break seed;
+        };
+
+
         info!("initializing node state");
         let (_, max_checkpoint_height) = zebra_consensus::router::init_checkpoint_list(
             config.consensus.clone(),
