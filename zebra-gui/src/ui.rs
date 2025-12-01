@@ -645,7 +645,7 @@ pub fn ui_left_pane(ui: &mut Context,
                 Modal::Stake => {
                     title_bar(ui, clicked_id, true, "Stake",   id("Stake Title Bar"));
 
-                    let mut button_ex = |label, act_on_press, disabled: bool| {
+                    let mut button_ex = |ui: &mut Context, label, act_on_press, disabled: bool| {
                         let id = id(label);
                         let (clicked, mut colour) = ui.button_ex(clicked_id, id, act_on_press);
                         if let _ = elem().decl(Decl {
@@ -684,8 +684,31 @@ pub fn ui_left_pane(ui: &mut Context,
                         clicked && !disabled // @TEMP: real disabling
                     };
 
-                    if button_ex("Stake 1 ZEC", false, wallet_state.lock().unwrap().waiting_for_stake_to_miner) {
-                        wallet_state.lock().unwrap().stake_to_miner();
+                    const ONE_ZEC: u64 = 100_000_000;
+                    let waiting_for_stake_to_miner = wallet_state.lock().unwrap().waiting_for_stake_to_miner;
+
+                    if let _ = elem().decl(Decl {
+                        child_gap, radius,
+                        id: id("Staking Buttons"),
+                        colour: MODAL_COL,
+                        width:  grow!(),
+                        height: grow!(),
+                        align: Center,
+                        direction: TopToBottom,
+                        ..Decl
+                    }) {
+                        // @todo(judah): disable buttons below current spendable balance
+                        ui.text("Select Staking Amount", TextDecl { h: text_h, align: AlignX::Center, ..TextDecl });
+
+                        if button_ex(ui, "10 ZEC", false, waiting_for_stake_to_miner) {
+                            wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC * 10);
+                        }
+                        if button_ex(ui, "50 ZEC", false, waiting_for_stake_to_miner) {
+                            wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC * 50);
+                        }
+                        if button_ex(ui, "100 ZEC", false, waiting_for_stake_to_miner) {
+                            wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC * 100);
+                        }
                     }
                 }
                 Modal::Unstake => {
@@ -980,9 +1003,6 @@ pub fn ui_right_pane(ui: &mut Context,
                 if button_ex("Receive cTAZ", false, wallet_state.lock().unwrap().waiting_for_faucet) {
                     wallet_state.lock().unwrap().request_from_faucet();
                 }
-                if button_ex("Test Stake Action cTAZ", false, wallet_state.lock().unwrap().waiting_for_test_stake_action) {
-                    wallet_state.lock().unwrap().perform_test_stake_action();
-                }
             }
 
             if let _ = elem().decl(Decl {
@@ -1053,7 +1073,7 @@ pub fn ui_right_pane(ui: &mut Context,
     //         ui.text(frame_strf!(data, "Click on a Block to Inspect its JSON!"), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
     //     } else {
     //         ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
-    // 
+    //
     //         // let json = if let Some(raw) = viz.inspect_block_json_text.as_ref() {
     //         //     match serde_json::from_str::<serde_json::Value>(raw) {
     //         //         Ok(value) => match serde_json::to_string_pretty(&value) {

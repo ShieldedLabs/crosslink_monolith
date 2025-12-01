@@ -663,7 +663,7 @@ impl Hash32 {
         for b in &bytes[0..4] {
             str.push_str(&format!("{:02x}", b));
         }
-        str.push_str(":");
+        str.push_str("..");
         for b in &bytes[bytes.len() - 4..] {
             str.push_str(&format!("{:02x}", b));
         }

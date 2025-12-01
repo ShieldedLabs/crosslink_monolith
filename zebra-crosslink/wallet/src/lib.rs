@@ -126,7 +126,7 @@ async fn wait_for_zainod() {
 enum WalletAction {
     RequestFromFaucet,
     TestStakeAction,
-    StakeToMiner,
+    StakeToMiner(Zatoshis),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -134,6 +134,8 @@ pub enum WalletTxKind {
     Send,
     Receive,
     Shield,
+    Stake,
+    Unstake,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -144,9 +146,9 @@ pub struct WalletState {
     pub balance: i64, // in zats
     pub pending_balance: i64, // in zats
     pub txs: Vec<WalletTx>,
+    pub roster: Vec<RosterMember>,
 
     pub waiting_for_faucet: bool,
-    pub waiting_for_test_stake_action: bool,
     pub waiting_for_stake_to_miner: bool,
 
     pub miner_seen_height: u32,
@@ -154,8 +156,6 @@ pub struct WalletState {
     pub miner_shielded_pending_funds: u64,
     pub miner_shielded_spendable_funds: u64,
     pub faucet_funds_available: u64,
-
-    pub roster: Vec<RosterMember>,
 
     pub actions_in_flight: VecDeque<WalletAction>,
 }
@@ -177,24 +177,14 @@ impl WalletState {
         self.actions_in_flight.push_back(WalletAction::RequestFromFaucet);
     }
 
-    pub fn perform_test_stake_action(&mut self) {
-        self.waiting_for_test_stake_action = true;
-
-        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::TestStakeAction => true, _ => false }).count() != 0 {
-            return;
-        }
-
-        self.actions_in_flight.push_back(WalletAction::TestStakeAction);
-    }
-
-    pub fn stake_to_miner(&mut self) {
+    pub fn stake_to_miner(&mut self, amount: u64) {
         self.waiting_for_stake_to_miner = true;
 
-        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::StakeToMiner => true, _ => false }).count() != 0 {
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::StakeToMiner(_) => true, _ => false }).count() != 0 {
             return;
         }
 
-        self.actions_in_flight.push_back(WalletAction::StakeToMiner);
+        self.actions_in_flight.push_back(WalletAction::StakeToMiner(Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_miner")));
     }
 }
 
@@ -1084,60 +1074,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         true
                     }
 
-                    WalletAction::TestStakeAction => {
-                        let mut signing_set = TransparentSigningSet::new();
-                        signing_set.add_key(miner_privkey);
-
-                        let prover = LocalTxProver::bundled();
-                        let extsk: &[ExtendedSpendingKey] = &[];
-                        let sak: &[SpendAuthorizingKey] = &[];
-
-                        let Some(target_height) = miner_wallet.chain_height().expect("Failed to get chain height") else {
-                            println!("Failed to get miner's chain height");
-                            break;
-                        };
-
-                        let mut txb = TxBuilder::new(
-                            network,
-                            target_height + 1,
-                            BuildConfig::Standard {
-                                sapling_anchor: None,
-                                orchard_anchor: None,
-                            },
-                        );
-
-                        //txb.add_transparent_output(&user_t_address, zats).unwrap();
-                        txb.put_staking_action(StakingAction::parse_from_cmd("ADD|7372433|james").unwrap().unwrap()).unwrap();
-
-                        use rand_chacha::ChaCha20Rng;
-                        let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
-                        let tx_res = txb.build(
-                            &signing_set,
-                            extsk,
-                            sak,
-                            rng,
-                            &prover,
-                            &prover,
-                            &zip317::FeeRule::standard(),
-                        ).unwrap();
-
-                        let tx = tx_res.transaction();
-                        let mut tx_bytes = vec![];
-                        tx.write(&mut tx_bytes).unwrap();
-
-                        match client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await {
-                            Ok(_) => {
-                                println!("Test stake transaction sent successfully");
-                            }
-                            Err(err) => {
-                                println!("Failed to send test stake transaction: {}", err);
-                                wallet_state.lock().unwrap().waiting_for_test_stake_action = false;
-                            },
-                        }
-                        true
-                    }
-
-                    WalletAction::StakeToMiner => {
+                    WalletAction::StakeToMiner(amount) => {
                         let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
                             println!("Failed to get wallet summary");
                             break;
@@ -1149,14 +1086,88 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             spendable += b.spendable_value().into_u64();
                         }
 
-                        if spendable < 100_000_000 {
+                        // @todo(judah): better check?
+                        let amount_with_fee = (amount - MINIMUM_FEE).unwrap();
+                        if spendable < amount.into_u64() {
                             println!("Not enough spendable zats to stake, will try again later...");
                             break;
                         }
 
-                        println!("********** STAKING SOME ZEC TO THE MINER");
-                        let zats = (Zatoshis::from_nonnegative_i64(100_000_000).unwrap() - MINIMUM_FEE).unwrap();
-                        let ok = send_zats(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, zats, network).await;
+                        println!("********** STAKING ZEC {:?} ({:?}) TO THE MINER", amount, amount_with_fee);
+                        let ok = send_zats(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network).await;
+                        if !ok {
+                            println!("Failed to send ZEC to miner");
+                            break;
+                        }
+
+                        println!("********** SUBMITING STAKING TRANSACTION");
+                        let ok = {
+                            let mut signing_set = TransparentSigningSet::new();
+                            signing_set.add_key(miner_privkey);
+
+                            let prover = LocalTxProver::bundled();
+                            let extsk: &[ExtendedSpendingKey] = &[];
+                            let sak: &[SpendAuthorizingKey] = &[];
+
+                            let Ok(Some(target_height)) = miner_wallet.chain_height() else {
+                                println!("Failed to get miner's chain height");
+                                break;
+                            };
+
+                            let mut txb = TxBuilder::new(
+                                network,
+                                target_height + 1,
+                                BuildConfig::Standard {
+                                    sapling_anchor: None,
+                                    orchard_anchor: None,
+                                },
+                            );
+
+                            // @todo: who's the target for this, the miner?
+                            let Ok(Some(action)) = StakingAction::parse_from_cmd(&format!("ADD|{}|james", amount_with_fee.into_u64())) else {
+                                println!("Failed to create staking action");
+                                break;
+                            };
+
+                            match txb.put_staking_action(action) {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    println!("Failed to put staking action: {}", e);
+                                    break;
+                                }
+                            }
+
+                            use rand_chacha::ChaCha20Rng;
+                            let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+                            let Ok(tx_res) = txb.build(
+                                &signing_set,
+                                extsk,
+                                sak,
+                                rng,
+                                &prover,
+                                &prover,
+                                &zip317::FeeRule::standard(),
+                            ) else {
+                                println!("Failed to build staking transaction");
+                                break;
+                            };
+
+                            let tx = tx_res.transaction();
+                            let mut tx_bytes = vec![];
+                            tx.write(&mut tx_bytes).unwrap();
+
+                            match client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await {
+                                Ok(_) => {
+                                    println!("Test stake transaction sent successfully");
+                                    true
+                                }
+                                Err(err) => {
+                                    println!("Failed to send test stake transaction: {}", err);
+                                    false
+                                },
+                            }
+                        };
+
                         if ok {
                             wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
                         }
