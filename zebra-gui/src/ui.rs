@@ -823,8 +823,8 @@ pub fn ui_left_pane(ui: &mut Context,
                             height: fixed!(radius * 2.0),
                             ..Decl
                         }) {
-                            let temp_letter_symbol_h = ui.scale(32.0);
-                            ui.text(ICON_CANCEL, TextDecl { font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
+                            let temp_letter_symbol_h = ui.scale(28.0);
+                            ui.text(icon, TextDecl { font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
                         }
 
                         let button_text_h = ui.scale(16.0);
@@ -833,10 +833,10 @@ pub fn ui_left_pane(ui: &mut Context,
                     clicked
                 };
 
-                if button(ui, ICON_PAPER_PLANE, "Send")    { ui.modal = Modal::Send;    }
-                if button(ui, ICON_QRCODE,      "Receive") { ui.modal = Modal::Receive; }
-                if button(ui, ICON_PLUS,        "Stake")   { ui.modal = Modal::Stake;   }
-                if button(ui, ICON_MINUS_1,     "Unstake") { ui.modal = Modal::Unstake; }
+                if button(ui, ICON_DATABASE, "Send")    { ui.modal = Modal::Send;    }
+                if button(ui, ICON_QRCODE,   "Receive") { ui.modal = Modal::Receive; }
+                if button(ui, ICON_PLUS,     "Stake")   { ui.modal = Modal::Stake;   }
+                if button(ui, ICON_MINUS_1,  "Unstake") { ui.modal = Modal::Unstake; }
 
             }
 
