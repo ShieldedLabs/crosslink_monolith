@@ -134,6 +134,7 @@ pub const BottomRight: Align = Align::BottomRight;
 
 use Direction::*;
 
+pub const Id: Id = Id { id: 0, offset: 0, base_id: 0, len: 0, chars: std::ptr::null() };
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 pub struct Decl {
@@ -152,7 +153,7 @@ pub struct Decl {
 // Ease-of-use constant for the builder pattern thing, so you can write Decl{..Decl} to get a default Decl.
 // I can't do #[derive_const(Default)] because that's only on Rust nightly. And it would probably be complex anyway.
 pub const Decl: Decl = Decl {
-    id:        Id { id: 0, offset: 0, base_id: 0, len: 0, chars: std::ptr::null() },
+    id:        Id,
     direction: Direction::LeftToRight,
     floating:  false,
     colour:    (0,   0,   0,   0),
@@ -182,6 +183,7 @@ pub const TextDecl: TextDecl = TextDecl {
 
 
 impl Id {
+    pub const VIZ_GUI: Self = Self { id: 1, ..Id };
     fn clay(&self) -> clay::id::Id {
         clay::id::Id {
             id: clay::Clay_ElementId {
@@ -1075,6 +1077,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
 
     ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Default);
 
+    ui.capture = false;
+
     let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_height as f32);
     let mouse_pos = (ui.input().mouse_pos().0 as f32, ui.input().mouse_pos().1 as f32);
 
@@ -1123,7 +1127,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
 
         let pane_pct = Sizing::Percent(ui.zoom * PANE_PERCENT);
 
-        if let _ = elem().decl(Decl {
+        if let _elem = elem().decl(Decl {
             id: id("Left Pane"),
             direction: TopToBottom,
             width: pane_pct,
@@ -1131,10 +1135,15 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             clip: true,
             ..Decl
         }) {
+            let id = _elem.decl.id;
+            if ui.hovered(id) {
+                ui.capture = true;
+            }
+
             ui_left_pane(ui, wallet_state.clone(), data, viz, child_gap, padding, radius, clicked_id, pane_tab_l);
         }
 
-        if let _ = elem().decl(Decl {
+        if let _elem = elem().decl(Decl {
             id: id("Central Gap"),
             radius, padding, child_gap,
             direction: TopToBottom,
@@ -1155,6 +1164,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
                 let id = id(label);
                 let (clicked, colour) = ui.button_ex(clicked_id, id, true);
                 let radius = ui.scale(20.0);
+
+                if ui.hovered(id) {
+                    ui.capture = true;
+                }
 
                 // Button
                 if let _ = elem().decl(Decl {
@@ -1181,7 +1194,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             }
         }
 
-        if let _ = elem().decl(Decl {
+        if let _elem = elem().decl(Decl {
             id: id("Right Pane"),
             direction: TopToBottom,
             width: pane_pct,
@@ -1189,6 +1202,11 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             clip: true,
             ..Decl
         }) {
+            let id = _elem.decl.id;
+            if ui.hovered(id) {
+                ui.capture = true;
+            }
+
             ui_right_pane(ui, wallet_state.clone(), viz, data, child_gap, padding, radius, clicked_id, pane_tab_r);
         }
     }
@@ -1297,6 +1315,8 @@ pub struct Context {
     pub scale:     f32,
     pub zoom:      f32,
     pub dpi_scale: f32,
+
+    pub capture: bool,
 
     pub clicked_id: Id,
     pub focused_id: Id,

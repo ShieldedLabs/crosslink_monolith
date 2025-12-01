@@ -319,7 +319,7 @@ fn e_lerp(from: f32, to: f32, dt: f32) -> f32 {
 const ZOOM_FACTOR : f32 = 1.2;
 const SCREEN_UNIT_CONST : f32 = 10.0;
 
-pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui: &ui::Context, draw_ctx: &DrawCtx, dt: f32, input_ctx: &InputCtx) {
+pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui: &mut ui::Context, draw_ctx: &DrawCtx, dt: f32, input_ctx: &InputCtx) {
     {
         let dxm = (input_ctx.mouse_pos().0.clamp(0, draw_ctx.window_width) - draw_ctx.window_width/2) as f32;
         let dym = (input_ctx.mouse_pos().1.clamp(0, draw_ctx.window_height) - draw_ctx.window_height/2) as f32;
@@ -335,7 +335,10 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     // origin
     let screen_unit = SCREEN_UNIT_CONST * zoom;
 
-    if ui.clicked_id == ui::Id::default() && input_ctx.mouse_held(MouseButton::Left) {
+    if !ui.capture && ui.clicked_id == ui::Id::default() && input_ctx.mouse_pressed(MouseButton::Left) {
+        ui.clicked_id = ui::Id::VIZ_GUI;
+    }
+    if ui.clicked_id == ui::Id::VIZ_GUI && input_ctx.mouse_held(MouseButton::Left) {
         viz_state.camera_x -= input_ctx.mouse_delta().0 as f32 / screen_unit;
         viz_state.camera_y -= input_ctx.mouse_delta().1 as f32 / screen_unit;
     }

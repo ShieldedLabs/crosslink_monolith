@@ -1175,7 +1175,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                             gui_ctx.draw  = &draw_ctx;
                                             gui_ctx.dpi_scale = window.scale_factor() as f32;
 
-                                            viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &gui_ctx, &draw_ctx, dt as f32, &input_ctx);
+                                            viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut gui_ctx, &draw_ctx, dt as f32, &input_ctx);
 
                                             {
                                                 let should_quit = ui_update(&mut gui_ctx, &mut ui_data, &mut viz_state, wallet_state.clone());
