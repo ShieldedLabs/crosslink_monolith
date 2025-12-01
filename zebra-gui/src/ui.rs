@@ -351,10 +351,11 @@ impl Element {
     }
 }
 
-pub const PANE_PERCENT: f32 = (0.25 + 0.333) / 2.0;
+pub const PANE_PERCENT: f32 = 0.27; // @PreventPanesColliding
 
 pub const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
-pub const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
+// pub const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
+pub const PANE_COL:         (u8, u8, u8, u8) = (0x13, 0x13, 0x13, 0xff); // @FigmaScreenshot
 pub const INACTIVE_TAB_COL: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
 pub const ACTIVE_TAB_COL:   (u8, u8, u8, u8) = PANE_COL;
 
@@ -888,7 +889,27 @@ pub fn ui_left_pane(ui: &mut Context,
             {
                 let txs = &wallet_state.lock().unwrap().txs;
 
+                if txs.len() == 0 {
+                    ui.history_scroll = 0.0;
+                }
+
+                let id = id("History Scroll Container");
+                if ui.hovered(id) {
+                    ui.history_scroll -= ui.input().zoom_delta     as f32 * 32.0;
+                    ui.history_scroll -= ui.input().scroll_delta.0 as f32 * 32.0;
+                }
+                if ui.history_scroll < 0.0 {
+                    ui.history_scroll = 0.0;
+                }
+                let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
+                if scroll_container_data.found {
+                    let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
+                    if ui.history_scroll > max {
+                        ui.history_scroll = max;
+                    }
+                };
                 if let _ = elem().decl(Decl {
+                    id,
                     colour: TRANSACTION_HISTORY_CONTAINER_COL,
                     child_gap: child_gap * 0.5, padding,
                     radius: padding.0.dup4(),
@@ -896,15 +917,10 @@ pub fn ui_left_pane(ui: &mut Context,
                     // height: grow!(radius.0 * 2.0),
                     height: percent!(1.0),
                     direction: TopToBottom,
-                    clip: Scroll(0.0, ui.history_scroll),
+                    clip: Scroll(0.0, -ui.history_scroll * ui.scale),
                     align: Top,
                     ..Decl
                 }) {
-                    ui.history_scroll += ui.scale(ui.input().zoom_delta     as f32 * 32.0);
-                    ui.history_scroll += ui.scale(ui.input().scroll_delta.0 as f32 * 32.0);
-                    if ui.history_scroll > 0.0 {
-                        ui.history_scroll = 0.0;
-                    }
                     if txs.len() == 0 {
                         let h = ui.scale(24.0);
                         if let _ = elem().decl(Decl {
@@ -1208,8 +1224,8 @@ pub fn ui_right_pane(ui: &mut Context,
         // } else if *tab_id == tab_id_settings {
     }
 
-    // spacer
-    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
+    // // spacer
+    // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
     if viz.inspecting_block_hash != Hash32::from_u64(0) {
         let ctx_menu_pos = (viz.inspecting_block_screen_x, viz.inspecting_block_screen_y);
@@ -1265,7 +1281,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
     let mut result = false;
 
     const MIN_ZOOM: f32 = 0.5;
-    const MAX_ZOOM: f32 = 2.0;
+    const MAX_ZOOM: f32 = 1.65; // @PreventPanesColliding
 
     if ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight) {
         if ui.input().key_pressed(KeyCode::Equal) {

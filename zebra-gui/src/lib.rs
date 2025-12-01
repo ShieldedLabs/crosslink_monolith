@@ -1168,7 +1168,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 let put = draw_ctx.draw_command_buffer.add(*draw_ctx.draw_command_count);
                                                 *draw_ctx.draw_command_count += 1;
                                                 assert!(*draw_ctx.draw_command_count <= DRAW_CALL_MAX);
-                                                *put = DrawCommand::ClearScreenToColor { color: 0x090909 };
+                                                *put = DrawCommand::ClearScreenToColor { color: 0x080808 };
                                             }
 
                                             gui_ctx.input = &input_ctx;
