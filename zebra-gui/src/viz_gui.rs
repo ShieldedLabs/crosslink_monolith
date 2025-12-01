@@ -214,7 +214,7 @@ pub fn viz_gui_init() -> VizState {
         inspecting_block_screen_x: 0.0,
         inspecting_block_screen_y: 0.0,
     };
-    if false {
+    if true {
         let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
         let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(2), parent_hash: Hash32::from_u64(1), this_height: 1, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };

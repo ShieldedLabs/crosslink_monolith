@@ -710,6 +710,11 @@ pub fn ui_left_pane(ui: &mut Context,
                         clicked
                     };
 
+                    if (wallet_state.lock().unwrap().balance as u64) < ONE_cTAZ / 100 {
+                        let colour = (0xff, 0xaf, 0x0e, 0xff);
+                        ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
+                    }
+
                     const ONE_cTAZ: u64 = 100_000_000;
                     let waiting_for_stake_to_miner = wallet_state.lock().unwrap().waiting_for_stake_to_miner;
 
@@ -723,9 +728,13 @@ pub fn ui_left_pane(ui: &mut Context,
                         direction: TopToBottom,
                         ..Decl
                     }) {
-                        // @todo(judah): disable buttons below current spendable balance
-
                         let balance = wallet_state.lock().unwrap().balance;
+
+                        // if (balance as u64) < ONE_cTAZ / 100 {
+                        //     let colour = (0xff, 0xaf, 0x0e, 0xff);
+                        //     ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
+                        // }
+
                         let can = !waiting_for_stake_to_miner;
                         if button_ex(ui, "+0.01 cTAZ", can && (balance as u64) >= ONE_cTAZ / 100) { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ / 100); }
                         if button_ex(ui,  "+0.1 cTAZ", can && (balance as u64) >= ONE_cTAZ / 10)  { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ / 10);  }
@@ -864,36 +873,48 @@ pub fn ui_left_pane(ui: &mut Context,
             }
         } else if *tab_id == tab_id_finalizers {
         } else if *tab_id == tab_id_history {
-            if let _ = elem().decl(Decl {
-                id: id("Balance"),
-                padding,
-                child_gap,
-                width: percent!(1.0),
-                height: fit!(),
-                direction: TopToBottom,
-                align: Center,
-                ..Decl
-            }) {
+            {
                 let txs = &wallet_state.lock().unwrap().txs;
 
                 if let _ = elem().decl(Decl {
                     colour: TRANSACTION_HISTORY_CONTAINER_COL,
-                    child_gap, padding,
+                    child_gap: child_gap * 0.5, padding,
                     radius: radius.mul(2.0),
                     width:  grow!(radius.0 * 2.0),
                     height: grow!(radius.0 * 2.0),
-                    align: Center,
+                    direction: TopToBottom,
+                    align: Top,
                     ..Decl
                 }) {
                     if txs.len() == 0 {
                         let h = ui.scale(24.0);
-                        ui.text("There are no transactions yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
+                        if let _ = elem().decl(Decl {
+                            direction: TopToBottom,
+                            width:  percent!(1.0),
+                            height: percent!(1.0),
+                            child_gap,
+                            align:  Center,
+                            ..Decl
+                        }) {
+                            ui.text(ICON_DROPBOX_1, TextDecl { font: Icons, colour: WHITE.mul(0.6), h: ui.scale(64.0), align: AlignX::Center, ..TextDecl });
+                            ui.text("There are no transactions yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
+                        }
                     }
                     else {
                         let kind_text_h = ui.scale(18.0);
                         let transaction_text_h = ui.scale(16.0);
 
                         for (index, tx) in txs.iter().enumerate() {
+                            if index > 0 { // separator
+                                let colour = {
+                                    let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
+                                    col = col.hsva();
+                                    col.2 = col.2.mul(1.5).min(255);
+                                    col.rgba()
+                                };
+
+                                let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
+                            }
                             if let _ = elem().decl(Decl{
                                 id: id_index("Transaction", index as u32),
                                 padding,
@@ -906,12 +927,11 @@ pub fn ui_left_pane(ui: &mut Context,
                             }) {
                                 // left icon
                                 if let _ = elem().decl(Decl{
-                                    padding,
-                                    child_gap,
-                                    height: percent!(1.0),
-                                    width: fit!(),
+                                    id: id_index("Left Icon", index as u32),
+                                    height: fit!(),
+                                    width: fixed!(ui.scale(32.0)),
                                     direction: TopToBottom,
-                                    align: Left,
+                                    align: Center,
                                     ..Decl
                                 }) {
                                     let icon = match tx.1 {
@@ -920,12 +940,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                         wallet::WalletTxKind::Shield  => ICON_SHIELD,
                                         _ => todo!(),
                                     };
-                                    let temp_letter_symbol_h = ui.scale(24.0);
-                                    ui.text(icon, TextDecl { font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
+                                    ui.text(icon, TextDecl { font: Icons, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
                                 }
 
                                 // info
                                 if let _ = elem().decl(Decl{
+                                    id: id_index("Centre Info", index as u32),
                                     height: fit!(),
                                     width: grow!(),
                                     direction: TopToBottom,
@@ -968,9 +988,8 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                 // right info
                                 if let _ = elem().decl(Decl{
-                                    padding,
-                                    child_gap,
-                                    height: percent!(1.0),
+                                    id: id_index("Right Info", index as u32),
+                                    height: fit!(),
                                     width: fit!(),
                                     direction: TopToBottom,
                                     align: Right,
@@ -987,10 +1006,10 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                     match tx.1 {
                                         wallet::WalletTxKind::Send => {
-                                            ui.text(frame_strf!(data, "-{} cTAZ", str_from_ctaz(tx.0.total_spent.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: color, ..TextDecl });
+                                            ui.text(frame_strf!(data, "-{} cTAZ", str_from_ctaz(tx.0.total_spent.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                         },
                                         wallet::WalletTxKind::Receive => {
-                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.0.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: color, ..TextDecl });
+                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.0.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                         },
                                         wallet::WalletTxKind::Shield => {
                                             let shield_amount: i64 = tx.0.account_value_delta.into();
@@ -1000,19 +1019,16 @@ pub fn ui_left_pane(ui: &mut Context,
                                             let trim_part = part_str.trim_end_matches("0");
 
                                             let prefix = if shield_amount < 0 { "-" } else { "" };
-                                            ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..trim_part.len().max(3)]), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: color, ..TextDecl });
+                                            ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..trim_part.len().max(3)]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                         },
                                         _ => todo!(),
                                     }
                                 }
 
-                                // @TODO: REMOVE ME ONCE IDs ARE FIXED!!!!!!
-                                break;
-
                                 // manually split id text
                                 // let string = format!("{:?} {:?}", tx.0.txid, tx.1);
-                                // ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), TextDecl { h: transaction_text_h, align: AlignX::Left, ..TextDecl });
-                                // ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), TextDecl { h: transaction_text_h, align: AlignX::Left, ..TextDecl });
+                                // ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), TextDecl { h: transaction_text_h, align: AlignX::Right, ..TextDecl });
+                                // ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), TextDecl { h: transaction_text_h, align: AlignX::Right, ..TextDecl });
                             }
                         }
                     }
