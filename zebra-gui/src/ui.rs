@@ -862,7 +862,7 @@ fn ui_right_pane(ui: &mut Context,
                  tab_id: &mut Id) {
     let mut tab_id_faucet = Id::default();
     let mut tab_id_roster = Id::default();
-    let mut tab_id_settings = Id::default();
+    // let mut tab_id_settings = Id::default();
 
     if let _ = elem().decl(Decl {
         id: id("Tab Bar"),
@@ -874,7 +874,7 @@ fn ui_right_pane(ui: &mut Context,
     }) {
         tab_id_faucet   = ui.tab(radius, padding, tab_id, clicked_id, "Faucet");
         // tab_id_roster   = ui.tab(radius, padding, tab_id, clicked_id, "Roster");
-        tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, clicked_id, "Settings");
+        // tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, clicked_id, "Settings");
     }
 
     // Main contents
@@ -1013,8 +1013,8 @@ fn ui_right_pane(ui: &mut Context,
 
             };
         } else if *tab_id == tab_id_roster {
-        } else if *tab_id == tab_id_settings {
         }
+        // } else if *tab_id == tab_id_settings {
     }
 
     // spacer
