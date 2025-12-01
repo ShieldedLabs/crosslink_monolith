@@ -37,7 +37,7 @@ use zaino_fetch::{
 use zaino_proto::proto::{
     compact_formats::CompactBlock,
     service::{
-        AddressList, Balance, BlockId, BlockRange, Duration, Exclude, GetAddressUtxosArg,
+        AddressList, Balance, BlockId, BlockRange, Bytes, Duration, Exclude, GetAddressUtxosArg,
         GetAddressUtxosReply, GetAddressUtxosReplyList, LightdInfo, PingResponse, RawTransaction,
         SendResponse, TransparentAddressBlockFilter, TreeState, TxFilter,
     },
@@ -597,6 +597,17 @@ impl ZcashIndexer for FetchServiceSubscriber {
             .into())
     }
 
+    async fn get_raw_roster(&self) -> Result<Bytes, Self::Error> {
+        use std::io::Write;
+        let roster = self.fetcher.get_roster().await?;
+        let mut data: Vec<u8> = Vec::new();
+        for m in roster {
+            data.write_all(&m.0).unwrap();
+            data.write_all(&m.1.to_le_bytes()).unwrap();
+        }
+        Ok(Bytes{ data })
+    }
+
     async fn chain_height(&self) -> Result<Height, Self::Error> {
         Ok(self.block_cache.get_chain_height().await?)
     }
@@ -1010,6 +1021,10 @@ impl LightWalletIndexer for FetchServiceSubscriber {
                 tonic::Status::invalid_argument("Error: Transaction hash incorrect"),
             ))
         }
+    }
+
+    async fn get_roster(&self) -> Result<Bytes, Self::Error> {
+        Ok(self.get_raw_roster().await?)
     }
 
     /// Submit the given transaction to the Zcash network

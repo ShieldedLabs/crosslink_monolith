@@ -395,6 +395,13 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     println!("USER WALLET ADDRESS:  {}", user_t_address.encode(network));
     println!("*************************");
 
+    // TODO: use tenderlink types & printing routines
+    #[derive(Debug)]
+    struct RosterMember {
+        pub pub_key: [u8; 32],
+        pub stake: u64,
+    }
+    let mut roster: Vec<RosterMember> = Vec::new();
     let mut block_cache = MemBlockCache::new();
     the_future_is_now(async {
         // @todo(judah): investigate why requests get randomly dropped in a strange way:
@@ -408,6 +415,37 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         };
 
         loop {
+            if let Ok(res) = client.get_roster(Empty{}).await {
+                use std::io::{ Cursor,Read };
+                let roster_bytes = res.into_inner().data;
+
+                let mut ok = roster_bytes.len() > 0;
+                let mut cur = Cursor::new(&roster_bytes);
+
+                let mut new_roster = Vec::new();
+                let mut num_buf = [0u8; 8];
+                while cur.position() < roster_bytes.len() as u64 {
+                    let mut m = RosterMember{ pub_key: [0;32], stake:0 };
+                    if let Err(err) = cur.read_exact(&mut m.pub_key) {
+                        println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
+                        ok = false;
+                        break;
+                    }
+                    if let Err(err) = cur.read_exact(&mut num_buf) {
+                        println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
+                        ok = false;
+                        break;
+                    }
+                    m.stake = u64::from_le_bytes(num_buf);
+                    new_roster.push(m);
+                }
+
+                if ok {
+                    roster = new_roster;
+                }
+            }
+            println!("*********** ROSTER: {roster:?}");
+
             // Sync wallet DBs
             for (wallet, t_address) in [(&mut miner_wallet, miner_t_address), (&mut user_wallet, user_t_address)] {
                 // TODO: outside loop?
