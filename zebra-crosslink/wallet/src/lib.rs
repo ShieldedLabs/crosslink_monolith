@@ -871,7 +871,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         wallet_lock.miner_seen_height = tip_h;
                     }
                     if let Some(faucet_available) = faucet_available {
-                        automatically_send_to_the_user = faucet_available > 500_000_000;
+                        // automatically_send_to_the_user = faucet_available > 500_000_000;
                         wallet_lock.faucet_funds_available = faucet_available;
                     }
                     if let Some(vals) = miner_vals {
