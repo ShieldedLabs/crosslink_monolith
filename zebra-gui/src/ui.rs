@@ -21,7 +21,9 @@ pub fn magic<'a, 'b, T>(mut_ref: &'a mut T) -> &'b mut T {
 
 #[derive(Debug, Default)]
 pub struct UiData {
-    pub per_frame_strs:    Vec<String>,
+    pub per_frame_strs: Vec<String>,
+
+    pub send_address: String,
 }
 
 
@@ -684,43 +686,98 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
                 }
             };
+
+            let mut button_ex = |ui: &mut Context, label, enabled: bool| {
+                let id = id(label);
+                let colour = {
+                    let mut hsva = BUTTON_GREY.hsva();
+                    hsva.2 = ((hsva.2 as f32) * 1.25).min(255.0) as u8;
+                    hsva.rgba()
+                };
+                let (clicked, colour, text_colour) = ui.button_ex(false, colour, id, enabled);
+                let radius = ui.scale(24.0);
+                if let _ = elem().decl(Decl {
+                    id,
+                    colour,
+                    child_gap,
+                    radius: radius.dup4(),
+                    align: Align::Center,
+                    direction: TopToBottom,
+                    width:  fit!(ui.scale(192.0)),
+                    height: fit!(radius * 2.0),
+                    ..Decl
+                }) {
+                    let h = ui.scale(20.0);
+                    ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
+                }
+
+                clicked
+            };
+
             match ui.modal {
                 Modal::None => {}
                 Modal::Send => {
                     title_bar(ui, true, "Send",    id("Send Title Bar"));
+
+                    if let _ = elem().decl(Decl {
+                        child_gap, radius,
+                        id: id("Send Container"),
+                        colour: MODAL_COL,
+                        width:  grow!(),
+                        height: grow!(),
+                        align: Center,
+                        direction: TopToBottom,
+                        ..Decl
+                    }) {
+                        // spacer
+                        if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
+
+                        let mut send_address = "00000000..00000000";
+                        if data.send_address.len() != 0 {
+                            send_address = &data.send_address;
+                            if send_address.len() > 20 {
+                                send_address = &send_address[..20];
+                            }
+                        }
+
+                        ui.text(frame_strf!(data, "[{}]", send_address), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                        if button_ex(ui, "Paste Address", true) {
+                            data.send_address = ui.input().get_from_clipboard().trim().to_string();
+                        }
+
+                        // spacer
+                        if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
+
+                        if (wallet_state.lock().unwrap().balance as u64) < ONE_cTAZ / 100 {
+                            let colour = (0xff, 0xaf, 0x0e, 0xff);
+                            ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
+                        }
+
+                        const ONE_cTAZ: u64 = 100_000_000;
+
+                        if let _ = elem().decl(Decl {
+                            child_gap, radius,
+                            id: id("Send Buttons"),
+                            colour: MODAL_COL,
+                            width:  grow!(),
+                            height: grow!(),
+                            align: Center,
+                            direction: TopToBottom,
+                            ..Decl
+                        }) {
+                            let balance = wallet_state.lock().unwrap().balance;
+
+                            let can = data.send_address.len() != 0;
+                            if button_ex(ui,   "1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ);       }
+                            if button_ex(ui,   "10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ * 10);  }
+                        }
+                    }
                 }
                 Modal::Receive => {
                     title_bar(ui, true, "Receive", id("Receive Title Bar"));
                 }
                 Modal::Stake => {
                     title_bar(ui, true, "Stake",   id("Stake Title Bar"));
-
-                    let mut button_ex = |ui: &mut Context, label, enabled: bool| {
-                        let id = id(label);
-                        let colour = {
-                            let mut hsva = BUTTON_GREY.hsva();
-                            hsva.2 = ((hsva.2 as f32) * 1.25).min(255.0) as u8;
-                            hsva.rgba()
-                        };
-                        let (clicked, colour, text_colour) = ui.button_ex(false, colour, id, enabled);
-                        let radius = ui.scale(24.0);
-                        if let _ = elem().decl(Decl {
-                            id,
-                            colour,
-                            child_gap,
-                            radius: radius.dup4(),
-                            align: Align::Center,
-                            direction: TopToBottom,
-                            width:  fit!(ui.scale(192.0)),
-                            height: fit!(radius * 2.0),
-                            ..Decl
-                        }) {
-                            let h = ui.scale(20.0);
-                            ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
-                        }
-
-                        clicked
-                    };
 
                     if (wallet_state.lock().unwrap().balance as u64) < ONE_cTAZ / 100 {
                         let colour = (0xff, 0xaf, 0x0e, 0xff);
@@ -1011,8 +1068,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     // spacer
                                     if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                                    if tx.0.memo_count != 0 {
-                                        let mut memo_str = String::from_utf8(tx.0.memo.as_slice().to_vec()).unwrap().trim_end_matches(|c| c == '\0').to_string();
+                                    let mut memo_str = String::from_utf8(tx.0.memo.as_slice().to_vec()).unwrap().trim_end_matches(|c| c == '\0').to_string();
+                                    if memo_str.len() != 0 {
                                         if memo_str.len() > 32 {
                                             memo_str = format!("{}...", memo_str[..32].to_string());
                                         }

@@ -125,11 +125,12 @@ async fn wait_for_zainod() {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum WalletAction {
     RequestFromFaucet,
     TestStakeAction,
     StakeToMiner(Zatoshis, [u8; 32]),
+    SendToAddress(String, Zatoshis),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -218,6 +219,17 @@ impl WalletState {
         }
 
         self.actions_in_flight.push_back(WalletAction::StakeToMiner(Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_miner"), target_finalizer));
+    }
+
+    pub fn send_to_address(&mut self, address: String, amount: u64) {
+        if self.actions_in_flight.iter().filter(|a| match a {
+            WalletAction::SendToAddress(addr, amt) if amt.into_u64() == amount && *addr == address => true,
+            _ => false
+        }).count() != 0 {
+            return;
+        }
+
+        self.actions_in_flight.push_back(WalletAction::SendToAddress(address.clone(), Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_miner")));
     }
 }
 
@@ -968,7 +980,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     };
                     println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len());
                     let Some(action) = wallet_state.actions_in_flight.front() else { break; };
-                    *action
+                    action.clone()
                 };
                 let ok: bool = match action {
                     WalletAction::RequestFromFaucet => if false {

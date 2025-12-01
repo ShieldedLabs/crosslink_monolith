@@ -621,6 +621,26 @@ impl InputCtx {
 
         return (self.mouse_released & button) != 0;
     }
+
+    fn get_from_clipboard(&self) -> String {
+        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+            return String::new();
+        };
+        let Ok(text) = clipboard.get_text() else {
+            return String::new();
+        };
+        return text;
+    }
+
+    fn send_to_clipboard(&self, text: &str) -> bool {
+        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+            return false;
+        };
+        let Err(_) = clipboard.set_text(text) else {
+            return false;
+        };
+        return true;
+    }
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum FontKind { #[default] Normal, Mono, Icons }
