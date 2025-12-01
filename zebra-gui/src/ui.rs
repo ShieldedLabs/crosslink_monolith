@@ -84,6 +84,7 @@ pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum Floating  { #[default] None, Parent, Root(f32, f32) }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum ClipMode  { #[default] None, Clip, Scroll(f32, f32) }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum AlignX    { #[default] Left, Right, Center }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum AlignY    { #[default] Top, Bottom, Center }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub struct Align   { x: AlignX, y: AlignY }
@@ -133,6 +134,7 @@ pub const BottomRight: Align = Align::BottomRight;
     }};
 }
 
+use ClipMode::{Clip, Scroll};
 use Direction::*;
 
 pub const Id: Id = Id { id: 0, offset: 0, base_id: 0, len: 0, chars: std::ptr::null() };
@@ -145,7 +147,7 @@ pub struct Decl {
     colour: (u8, u8, u8, u8),
     radius: (f32, f32, f32, f32),
     padding: (f32, f32, f32, f32),
-    clip: bool,
+    clip: ClipMode,
     child_gap: f32,
     align: Align,
     width:  Sizing,
@@ -160,7 +162,7 @@ pub const Decl: Decl = Decl {
     colour:    (0,   0,   0,   0),
     radius:    (0.0, 0.0, 0.0, 0.0),
     padding:   (0.0, 0.0, 0.0, 0.0),
-    clip:      false,
+    clip:      ClipMode::None,
     child_gap: 0.0,
     align:     TopLeft,
     width:     Sizing::Fit(0.0, f32::MAX),
@@ -294,7 +296,16 @@ impl Element {
             a: item.colour.3 as f32
         };
         decl.id = item.id.clay().id;
-        decl.clip = clay::Clay_ClipElementConfig { horizontal: item.clip, vertical: item.clip, childOffset: clay::Clay_Vector2 { x: 0.0, y: 0.0 } };
+        let clipping = match item.clip { ClipMode::None => false, _ => true };
+        decl.clip = clay::Clay_ClipElementConfig {
+            horizontal: clipping,
+            vertical: clipping,
+            childOffset: match item.clip {
+                ClipMode::None => clay::Clay_Vector2 { x: 0.0, y: 0.0 },
+                ClipMode::Clip => clay::Clay_Vector2 { x: 0.0, y: 0.0 },
+                ClipMode::Scroll(x, y) => clay::Clay_Vector2 { x, y },
+            }
+        };
         match item.floating {
             Floating::Parent => {
                 decl.floating.attachTo = clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_PARENT;
@@ -782,10 +793,10 @@ pub fn ui_left_pane(ui: &mut Context,
         let balance_text_h = ui.scale(48.0);
         let accent_text_h  = ui.scale(16.0);
 
-        // spacer
-        if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
-
         if *tab_id == tab_id_wallet {
+            // spacer
+            if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
+
             let (
                 balance,
                 pending_balance,
@@ -880,12 +891,18 @@ pub fn ui_left_pane(ui: &mut Context,
                     colour: TRANSACTION_HISTORY_CONTAINER_COL,
                     child_gap: child_gap * 0.5, padding,
                     radius: radius.mul(2.0),
-                    width:  grow!(radius.0 * 2.0),
+                    width:  percent!(1.0),
                     height: grow!(radius.0 * 2.0),
                     direction: TopToBottom,
+                    clip: Scroll(0.0, ui.history_scroll),
                     align: Top,
                     ..Decl
                 }) {
+                    ui.history_scroll += ui.scale(ui.input().zoom_delta     as f32 * 32.0);
+                    ui.history_scroll += ui.scale(ui.input().scroll_delta.0 as f32 * 32.0);
+                    if ui.history_scroll > 0.0 {
+                        ui.history_scroll = 0.0;
+                    }
                     if txs.len() == 0 {
                         let h = ui.scale(24.0);
                         if let _ = elem().decl(Decl {
@@ -1321,7 +1338,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             direction: TopToBottom,
             width: pane_pct,
             height: grow!(),
-            clip: true,
+            clip: Clip,
             ..Decl
         }) {
             let id = _elem.decl.id;
@@ -1395,7 +1412,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             direction: TopToBottom,
             width: pane_pct,
             height: grow!(),
-            clip: true,
+            clip: Clip,
             ..Decl
         }) {
             let id = _elem.decl.id;
@@ -1523,6 +1540,8 @@ pub struct Context {
     pub pane_tab_r: Id,
 
     pub modal: Modal,
+
+    pub history_scroll: f32,
 }
 
 #[derive(Debug, Default, Copy, Clone)]
