@@ -41,7 +41,7 @@ impl ResponseFromZebra {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)] // , Serialize, Deserialize)]
 pub struct BcBlock {
     pub this_hash: Hash32,
     pub parent_hash: Hash32,
@@ -108,7 +108,8 @@ impl Default for OnScreenBc {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+// use serde::{Serialize, Deserialize};
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)] // , Serialize, Deserialize)]
 pub struct BftBlock {
     pub this_hash: Hash32,
     pub parent_hash: Hash32,
@@ -618,7 +619,7 @@ fn split_vector(x: f32, y: f32) -> (f32, f32, f32) {
     (x/len, y/len, len)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)] // , Serialize, Deserialize)]
 pub struct Hash32 {
     le_chunks: [u64; 4],
 }

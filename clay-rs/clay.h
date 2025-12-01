@@ -359,7 +359,7 @@ typedef CLAY_PACKED_ENUM {
     // Disable text wrapping entirely.
     CLAY_TEXT_WRAP_NONE,
     // Break on all characters.
-    CLAY_TEXT_WRAP_ALL
+    CLAY_TEXT_WRAP_BREAK_WORD
 } Clay_TextElementConfigWrapMode;
 
 // Controls how wrapped lines of text are horizontally aligned within the outer text bounding box.
@@ -1553,9 +1553,6 @@ Clay__MeasuredWord *Clay__AddMeasuredWord(Clay__MeasuredWord word, Clay__Measure
 }
 
 Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_TextElementConfig *config) {
-
-    unsigned char in_that_mode_where_we_hack_in_char_line_wrap = config->wrapMode == CLAY_TEXT_WRAP_ALL;
-
     Clay_Context* context = Clay_GetCurrentContext();
     #ifndef CLAY_WASM
     if (!Clay__MeasureText) {
@@ -1648,12 +1645,12 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
             return &Clay__MeasureTextCacheItem_DEFAULT;
         }
         char current = text->chars[end];
-        if (current == ' ' || current == '\n' || in_that_mode_where_we_hack_in_char_line_wrap) {
+        if (current == ' ' || current == '\n' || config->wrapMode == CLAY_TEXT_WRAP_BREAK_WORD) {
             int32_t length = end - start;
             Clay_Dimensions dimensions = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) { .length = length, .chars = &text->chars[start], .baseChars = text->chars }, config, context->measureTextUserData);
             measured->minWidth = CLAY__MAX(dimensions.width, measured->minWidth);
             measuredHeight = CLAY__MAX(measuredHeight, dimensions.height);
-            if (in_that_mode_where_we_hack_in_char_line_wrap) {
+            if (config->wrapMode == CLAY_TEXT_WRAP_BREAK_WORD) {
                 previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = start, .length = length, .width = dimensions.width, .next = -1 }, previousWord);
                 lineWidth += dimensions.width;
                 start = end;
@@ -2276,7 +2273,7 @@ void Clay__SizeContainersAlongAxis(bool xAxis) {
 
                 if (childSizing.type != CLAY__SIZING_TYPE_PERCENT
                     && childSizing.type != CLAY__SIZING_TYPE_FIXED
-                    && (!Clay__ElementHasConfig(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT) || (Clay__FindElementConfigWithType(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig->wrapMode == CLAY_TEXT_WRAP_WORDS || Clay__FindElementConfigWithType(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig->wrapMode == CLAY_TEXT_WRAP_ALL)) // todo too many loops
+                    && (!Clay__ElementHasConfig(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT) || (Clay__FindElementConfigWithType(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig->wrapMode == CLAY_TEXT_WRAP_WORDS || Clay__FindElementConfigWithType(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig->wrapMode == CLAY_TEXT_WRAP_BREAK_WORD)) // todo too many loops
 //                    && (xAxis || !Clay__ElementHasConfig(childElement, CLAY__ELEMENT_CONFIG_TYPE_ASPECT))
                 ) {
                     Clay__int32_tArray_Add(&resizableContainerBuffer, childElementIndex);
@@ -3598,8 +3595,8 @@ void Clay__RenderDebugView(void) {
                                     wrapMode = CLAY_STRING("NONE");
                                 } else if (textConfig->wrapMode == CLAY_TEXT_WRAP_NEWLINES) {
                                     wrapMode = CLAY_STRING("NEWLINES");
-                                } else if (textConfig->wrapMode == CLAY_TEXT_WRAP_ALL) {
-                                    wrapMode = CLAY_STRING("ALL");
+                                } else if (textConfig->wrapMode == CLAY_TEXT_WRAP_BREAK_WORD) {
+                                    wrapMode = CLAY_STRING("BREAK_WORD");
                                 }
                                 CLAY_TEXT(wrapMode, infoTextConfig);
                                 // .textAlignment

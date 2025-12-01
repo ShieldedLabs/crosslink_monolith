@@ -172,12 +172,14 @@ pub struct TextDecl {
     h: f32,
     colour: (u8, u8, u8, u8),
     align: AlignX,
+    break_word: bool,
 }
 pub const TextDecl: TextDecl = TextDecl {
     font: FontKind::Normal,
     h: 0.0,
     colour: WHITE,
     align: AlignX::Left,
+    break_word: false,
 };
 
 
@@ -469,20 +471,11 @@ impl Context {
                 AlignX::Right  => clay::text::TextAlignment::Right,
                 AlignX::Center => clay::text::TextAlignment::Center,
             })
-            .end();
-        unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
-    }
-    pub fn text_no_wrap(&self, label: &str, decl: TextDecl) {
-        let config = clay::text::TextConfig::new()
-            .font_id(decl.font as u16)
-            .font_size(decl.h as u16)
-            .color(clay_colour(decl.colour))
-            .alignment(match decl.align {
-                AlignX::Left   => clay::text::TextAlignment::Left,
-                AlignX::Right  => clay::text::TextAlignment::Right,
-                AlignX::Center => clay::text::TextAlignment::Center,
-            })
-            .wrap_mode(clay::text::TextElementConfigWrapMode::All)
+            // .wrap_mode(if decl.break_word {
+            //     clay::text::TextElementConfigWrapMode::BreakWord
+            // } else {
+            //     clay::text::TextElementConfigWrapMode::Words
+            // })
             .end();
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
@@ -1022,28 +1015,36 @@ pub fn ui_right_pane(ui: &mut Context,
     // spacer
     if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
-    // Block Inspector Contents
-    if let _ = elem().decl(Decl {
-        id: id("Block Inspector Contents"),
-        colour: PANE_COL,
-        radius: (0.0, radius.1, 0.0, radius.3),
-        direction: TopToBottom,
-        width: percent!(1.0),
-        height: grow!(),
-        ..Decl
-    }) {
-        let text_h = ui.scale(22.0);
-        if viz.inspecting_block_hash == Hash32::from_u64(0) {
-            ui.text(frame_strf!(data, "Click on a Block to Inspect its JSON!"), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
-        } else {
-            ui.text_no_wrap(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
-            if let Some(s) = viz.inspect_block_json_text.as_ref() {
-                ui.text_no_wrap(s, TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
-            } else {
-                ui.text_no_wrap("Loading...", TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
-            }
-        }
-    }
+    // // Block Inspector Contents
+    // if let _ = elem().decl(Decl {
+    //     id: id("Block Inspector Contents"),
+    //     colour: PANE_COL,
+    //     radius: (0.0, radius.1, 0.0, radius.3),
+    //     direction: TopToBottom,
+    //     width: percent!(1.0),
+    //     height: grow!(),
+    //     ..Decl
+    // }) {
+    //     let text_h = ui.scale(22.0);
+    //     if viz.inspecting_block_hash == Hash32::from_u64(0) {
+    //         ui.text(frame_strf!(data, "Click on a Block to Inspect its JSON!"), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
+    //     } else {
+    //         ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
+    // 
+    //         // let json = if let Some(raw) = viz.inspect_block_json_text.as_ref() {
+    //         //     match serde_json::from_str::<serde_json::Value>(raw) {
+    //         //         Ok(value) => match serde_json::to_string_pretty(&value) {
+    //         //             Ok(prettified) => prettified.to_string(),
+    //         //             Err(error) => { eprintln!("In JSON:\n{}\nPrettify error: {:?}", raw, error); todo!(); raw.to_string(); }
+    //         //         },
+    //         //         Err(error) => { eprintln!("In JSON:\n{}\nPrettify error: {:?}", raw, error); todo!(); raw.to_string(); }
+    //         //     }
+    //         // } else {
+    //         //     "Loading...".to_string()
+    //         // };
+    //         // ui.text(frame_strf!(data, "{}", json), TextDecl { font: Mono, break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
+    //     }
+    // }
 }
 
 

@@ -677,7 +677,7 @@ pub const Clay_TextElementConfigWrapMode_CLAY_TEXT_WRAP_WORDS: Clay_TextElementC
 pub const Clay_TextElementConfigWrapMode_CLAY_TEXT_WRAP_NEWLINES: Clay_TextElementConfigWrapMode =
     1;
 pub const Clay_TextElementConfigWrapMode_CLAY_TEXT_WRAP_NONE: Clay_TextElementConfigWrapMode = 2;
-pub const Clay_TextElementConfigWrapMode_CLAY_TEXT_WRAP_ALL: Clay_TextElementConfigWrapMode = 3;
+pub const Clay_TextElementConfigWrapMode_CLAY_TEXT_WRAP_BREAK_WORD: Clay_TextElementConfigWrapMode = 3;
 pub type Clay_TextElementConfigWrapMode = ::core::ffi::c_uchar;
 pub const Clay_TextAlignment_CLAY_TEXT_ALIGN_LEFT: Clay_TextAlignment = 0;
 pub const Clay_TextAlignment_CLAY_TEXT_ALIGN_CENTER: Clay_TextAlignment = 1;
