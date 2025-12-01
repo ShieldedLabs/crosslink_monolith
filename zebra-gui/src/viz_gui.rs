@@ -171,6 +171,9 @@ pub struct VizState {
     pub bft_tip_height: u64,
 
     pub last_frame_hovered_hash: Hash32,
+
+    pub inspecting_block_hash: Hash32,
+    pub inspect_block_json_text: Option<String>,
 }
 pub fn viz_gui_init() -> VizState {
     let (me_send, zebra_receive) = std::sync::mpsc::sync_channel(128);
@@ -191,6 +194,9 @@ pub fn viz_gui_init() -> VizState {
         bft_tip_height: 0,
 
         last_frame_hovered_hash: Hash32::from_u64(0),
+
+        inspecting_block_hash: Hash32::from_u64(0),
+        inspect_block_json_text: None,
     };
     if false {
         let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
@@ -376,6 +382,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, dr
 
             on_screen_bc.t_bft_arrow_alpha = if on_screen_bc.block.is_best_chain { 1.0 } else { 0.1 };
         }
+        if on_screen_bc.block.this_hash == viz_state.inspecting_block_hash { on_screen_bc.t_darkness += 0.2; }
         on_screen_bc.t_finalized_alpha = if on_screen_bc.block.is_finalized { 1.0 } else { 0.0 };
         on_screen_bc.t_implicated_by_bft_alpha = if on_screen_bc.block.is_implicated_by_bft { 1.0 } else { 0.0 };
         on_screen_bc.t_x = -5.0;
@@ -394,6 +401,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, dr
             on_screen_bft.t_roundness = 1.0;
             on_screen_bft.t_darkness = 0.0;
         }
+        if on_screen_bft.block.this_hash == viz_state.inspecting_block_hash { on_screen_bft.t_darkness += 0.2; }
         on_screen_bft.t_x = 5.0;
         on_screen_bft.t_y = if let Some(on_screen_bc) = viz_state.on_screen_bcs.get(&on_screen_bft.block.points_at_bc_block) {
             on_screen_bc.y - 10.0 / 2.0
@@ -580,6 +588,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, dr
         viz_state.last_frame_hovered_hash = hovered_block;
         if hovered_block != Hash32::from_u64(0)
         { play_sound(SOUND_UI_HOVER, 0.5, 1.0); }
+    }
+
+    if input_ctx.mouse_pressed(MouseButton::Left) {
+        viz_state.inspecting_block_hash = hovered_block;
+        viz_state.inspect_block_json_text = None;
     }
 }
 

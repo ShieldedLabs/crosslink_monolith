@@ -358,6 +358,8 @@ typedef CLAY_PACKED_ENUM {
     CLAY_TEXT_WRAP_NEWLINES,
     // Disable text wrapping entirely.
     CLAY_TEXT_WRAP_NONE,
+    // Break on all characters.
+    CLAY_TEXT_WRAP_ALL
 } Clay_TextElementConfigWrapMode;
 
 // Controls how wrapped lines of text are horizontally aligned within the outer text bounding box.
@@ -1551,6 +1553,9 @@ Clay__MeasuredWord *Clay__AddMeasuredWord(Clay__MeasuredWord word, Clay__Measure
 }
 
 Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_TextElementConfig *config) {
+
+    unsigned char in_that_mode_where_we_hack_in_char_line_wrap = config->wrapMode == CLAY_TEXT_WRAP_ALL;
+
     Clay_Context* context = Clay_GetCurrentContext();
     #ifndef CLAY_WASM
     if (!Clay__MeasureText) {
@@ -1643,27 +1648,35 @@ Clay__MeasureTextCacheItem *Clay__MeasureTextCached(Clay_String *text, Clay_Text
             return &Clay__MeasureTextCacheItem_DEFAULT;
         }
         char current = text->chars[end];
-        if (current == ' ' || current == '\n') {
+        if (current == ' ' || current == '\n' || in_that_mode_where_we_hack_in_char_line_wrap) {
             int32_t length = end - start;
             Clay_Dimensions dimensions = Clay__MeasureText(CLAY__INIT(Clay_StringSlice) { .length = length, .chars = &text->chars[start], .baseChars = text->chars }, config, context->measureTextUserData);
             measured->minWidth = CLAY__MAX(dimensions.width, measured->minWidth);
             measuredHeight = CLAY__MAX(measuredHeight, dimensions.height);
-            if (current == ' ') {
-                dimensions.width += spaceWidth;
-                previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = start, .length = length + 1, .width = dimensions.width, .next = -1 }, previousWord);
+            if (in_that_mode_where_we_hack_in_char_line_wrap) {
+                previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = start, .length = length, .width = dimensions.width, .next = -1 }, previousWord);
                 lineWidth += dimensions.width;
+                start = end;
             }
-            if (current == '\n') {
-                if (length > 0) {
-                    previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = start, .length = length, .width = dimensions.width, .next = -1 }, previousWord);
+            else {
+                if (current == ' ') {
+                    dimensions.width += spaceWidth;
+                    previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = start, .length = length + 1, .width = dimensions.width, .next = -1 }, previousWord);
+                    lineWidth += dimensions.width;
+                    start = end + 1;
                 }
-                previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = end + 1, .length = 0, .width = 0, .next = -1 }, previousWord);
-                lineWidth += dimensions.width;
-                measuredWidth = CLAY__MAX(lineWidth, measuredWidth);
-                measured->containsNewlines = true;
-                lineWidth = 0;
+                if (current == '\n') {
+                    if (length > 0) {
+                        previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = start, .length = length, .width = dimensions.width, .next = -1 }, previousWord);
+                    }
+                    previousWord = Clay__AddMeasuredWord(CLAY__INIT(Clay__MeasuredWord) { .startOffset = end + 1, .length = 0, .width = 0, .next = -1 }, previousWord);
+                    lineWidth += dimensions.width;
+                    measuredWidth = CLAY__MAX(lineWidth, measuredWidth);
+                    measured->containsNewlines = true;
+                    lineWidth = 0;
+                    start = end + 1;
+                }
             }
-            start = end + 1;
         }
         end++;
     }
@@ -2263,7 +2276,7 @@ void Clay__SizeContainersAlongAxis(bool xAxis) {
 
                 if (childSizing.type != CLAY__SIZING_TYPE_PERCENT
                     && childSizing.type != CLAY__SIZING_TYPE_FIXED
-                    && (!Clay__ElementHasConfig(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT) || (Clay__FindElementConfigWithType(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig->wrapMode == CLAY_TEXT_WRAP_WORDS)) // todo too many loops
+                    && (!Clay__ElementHasConfig(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT) || (Clay__FindElementConfigWithType(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig->wrapMode == CLAY_TEXT_WRAP_WORDS || Clay__FindElementConfigWithType(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig->wrapMode == CLAY_TEXT_WRAP_ALL)) // todo too many loops
 //                    && (xAxis || !Clay__ElementHasConfig(childElement, CLAY__ELEMENT_CONFIG_TYPE_ASPECT))
                 ) {
                     Clay__int32_tArray_Add(&resizableContainerBuffer, childElementIndex);
@@ -3585,6 +3598,8 @@ void Clay__RenderDebugView(void) {
                                     wrapMode = CLAY_STRING("NONE");
                                 } else if (textConfig->wrapMode == CLAY_TEXT_WRAP_NEWLINES) {
                                     wrapMode = CLAY_STRING("NEWLINES");
+                                } else if (textConfig->wrapMode == CLAY_TEXT_WRAP_ALL) {
+                                    wrapMode = CLAY_STRING("ALL");
                                 }
                                 CLAY_TEXT(wrapMode, infoTextConfig);
                                 // .textAlignment

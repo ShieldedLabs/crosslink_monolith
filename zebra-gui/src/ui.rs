@@ -470,6 +470,20 @@ impl Context {
             .end();
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
+    fn text_no_wrap(&self, label: &str, decl: TextDecl) {
+        let config = clay::text::TextConfig::new()
+            .font_id(decl.font as u16)
+            .font_size(decl.h as u16)
+            .color(clay_colour(decl.colour))
+            .alignment(match decl.align {
+                AlignX::Left   => clay::text::TextAlignment::Left,
+                AlignX::Right  => clay::text::TextAlignment::Right,
+                AlignX::Center => clay::text::TextAlignment::Center,
+            })
+            .wrap_mode(clay::text::TextElementConfigWrapMode::All)
+            .end();
+        unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
+    }
 
     fn tab_ex(&mut self,
               radius: (f32, f32, f32, f32),
@@ -635,6 +649,49 @@ fn ui_left_pane(ui: &mut Context,
                 }
                 Modal::Stake => {
                     title_bar(ui, clicked_id, true, "Stake",   id("Stake Title Bar"));
+
+                    let mut button_ex = |label, act_on_press, disabled: bool| {
+                        let id = id(label);
+                        let (clicked, mut colour) = ui.button_ex(clicked_id, id, act_on_press);
+                        if let _ = elem().decl(Decl {
+                            id,
+                            child_gap,
+                            align: Align::Center,
+                            direction: TopToBottom,
+                            width: fit!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            let radius = ui.scale(24.0);
+
+                            // @TEMP: real disabling
+                            if disabled {
+                                colour.3 = 100;
+                            }
+
+                            // Button
+                            if let _ = elem().decl(Decl {
+                                colour,
+                                padding,
+                                child_gap,
+                                radius: radius.dup4(),
+                                align: Align::Center,
+                                width:  fit!(ui.scale(192.0)),
+                                height: fit!(radius * 2.0),
+                                ..Decl
+                            }) {
+                                let h = ui.scale(20.0);
+                                let colour = if disabled { INACTIVE_TAB_COL } else { WHITE };
+                                ui.text(label, TextDecl { h, colour, align: AlignX::Center, ..TextDecl });
+                            }
+                        }
+
+                        clicked && !disabled // @TEMP: real disabling
+                    };
+
+                    if button_ex("Stake 1 ZEC", false, wallet_state.lock().unwrap().waiting_for_stake_to_miner) {
+                        wallet_state.lock().unwrap().stake_to_miner();
+                    }
                 }
                 Modal::Unstake => {
                     title_bar(ui, clicked_id, true, "Unstake", id("Unstake Title Bar"));
@@ -796,6 +853,7 @@ fn ui_left_pane(ui: &mut Context,
 
 fn ui_right_pane(ui: &mut Context,
                  wallet_state: Arc<Mutex<wallet::WalletState>>,
+                 viz: &mut VizState,
                  data: &mut UiData,
                  child_gap: f32,
                  padding: (f32, f32, f32, f32),
@@ -958,6 +1016,27 @@ fn ui_right_pane(ui: &mut Context,
         } else if *tab_id == tab_id_settings {
         }
     }
+
+    // spacer
+    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+
+    // Block Inspector Contents
+    if let _ = elem().decl(Decl {
+        id: id("Block Inspector Contents"),
+        colour: PANE_COL,
+        radius: (0.0, radius.1, 0.0, radius.3),
+        direction: TopToBottom,
+        width: percent!(1.0),
+        height: grow!(),
+        ..Decl
+    }) {
+        let text_h = ui.scale(22.0);
+        if viz.inspecting_block_hash == Hash32::from_u64(0) {
+            ui.text(frame_strf!(data, "Click on a Block to Inspect its JSON!"), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
+        } else {
+            ui.text_no_wrap(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
+        }
+    }
 }
 
 
@@ -1110,7 +1189,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
             clip: true,
             ..Decl
         }) {
-            ui_right_pane(ui, wallet_state.clone(), data, child_gap, padding, radius, clicked_id, pane_tab_r);
+            ui_right_pane(ui, wallet_state.clone(), viz, data, child_gap, padding, radius, clicked_id, pane_tab_r);
         }
     }
 
