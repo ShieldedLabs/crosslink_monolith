@@ -649,6 +649,49 @@ fn ui_left_pane(ui: &mut Context,
                 }
                 Modal::Stake => {
                     title_bar(ui, clicked_id, true, "Stake",   id("Stake Title Bar"));
+
+                    let mut button_ex = |label, act_on_press, disabled: bool| {
+                        let id = id(label);
+                        let (clicked, mut colour) = ui.button_ex(clicked_id, id, act_on_press);
+                        if let _ = elem().decl(Decl {
+                            id,
+                            child_gap,
+                            align: Align::Center,
+                            direction: TopToBottom,
+                            width: fit!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            let radius = ui.scale(24.0);
+
+                            // @TEMP: real disabling
+                            if disabled {
+                                colour.3 = 100;
+                            }
+
+                            // Button
+                            if let _ = elem().decl(Decl {
+                                colour,
+                                padding,
+                                child_gap,
+                                radius: radius.dup4(),
+                                align: Align::Center,
+                                width:  fit!(ui.scale(192.0)),
+                                height: fit!(radius * 2.0),
+                                ..Decl
+                            }) {
+                                let h = ui.scale(20.0);
+                                let colour = if disabled { INACTIVE_TAB_COL } else { WHITE };
+                                ui.text(label, TextDecl { h, colour, align: AlignX::Center, ..TextDecl });
+                            }
+                        }
+
+                        clicked && !disabled // @TEMP: real disabling
+                    };
+
+                    if button_ex("Stake 1 ZEC", false, wallet_state.lock().unwrap().waiting_for_stake_to_miner) {
+                        wallet_state.lock().unwrap().stake_to_miner();
+                    }
                 }
                 Modal::Unstake => {
                     title_bar(ui, clicked_id, true, "Unstake", id("Unstake Title Bar"));
@@ -819,7 +862,7 @@ fn ui_right_pane(ui: &mut Context,
                  tab_id: &mut Id) {
     let mut tab_id_faucet = Id::default();
     let mut tab_id_roster = Id::default();
-    let mut tab_id_settings = Id::default();
+    // let mut tab_id_settings = Id::default();
 
     if let _ = elem().decl(Decl {
         id: id("Tab Bar"),
@@ -831,7 +874,7 @@ fn ui_right_pane(ui: &mut Context,
     }) {
         tab_id_faucet   = ui.tab(radius, padding, tab_id, clicked_id, "Faucet");
         // tab_id_roster   = ui.tab(radius, padding, tab_id, clicked_id, "Roster");
-        tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, clicked_id, "Settings");
+        // tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, clicked_id, "Settings");
     }
 
     // Main contents
@@ -970,8 +1013,8 @@ fn ui_right_pane(ui: &mut Context,
 
             };
         } else if *tab_id == tab_id_roster {
-        } else if *tab_id == tab_id_settings {
         }
+        // } else if *tab_id == tab_id_settings {
     }
 
     // spacer

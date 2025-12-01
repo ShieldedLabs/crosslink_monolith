@@ -1,6 +1,7 @@
 //! Internal wallet
 #![allow(warnings)]
 
+use zcash_client_backend::data_api::WalletCommitmentTrees;
 use orchard::keys::SpendAuthorizingKey;
 use orchard::note_encryption::CompactAction;
 use rand_chacha::rand_core::SeedableRng;
@@ -125,6 +126,7 @@ async fn wait_for_zainod() {
 enum WalletAction {
     RequestFromFaucet,
     TestStakeAction,
+    StakeToMiner,
 }
 
 pub struct WalletTx(pub TransactionSummary<AccountUuid>);
@@ -133,8 +135,11 @@ pub struct WalletTx(pub TransactionSummary<AccountUuid>);
 pub struct WalletState {
     pub balance: i64, // in zats
     pub txs: Vec<WalletTx>,
+
     pub waiting_for_faucet: bool,
     pub waiting_for_test_stake_action: bool,
+    pub waiting_for_stake_to_miner: bool,
+
     pub miner_seen_height: u32,
     pub miner_unshielded_funds: u64,
     pub miner_shielded_pending_funds: u64,
@@ -152,13 +157,15 @@ impl WalletState {
     }
 
     pub fn request_from_faucet(&mut self) {
+        self.waiting_for_faucet = true;
+
         if self.actions_in_flight.iter().filter(|a| match a { WalletAction::RequestFromFaucet => true, _ => false }).count() != 0 {
             return;
         }
 
-        self.waiting_for_faucet = true;
         self.actions_in_flight.push_back(WalletAction::RequestFromFaucet);
     }
+
     pub fn perform_test_stake_action(&mut self) {
         self.waiting_for_test_stake_action = true;
 
@@ -167,6 +174,16 @@ impl WalletState {
         }
 
         self.actions_in_flight.push_back(WalletAction::TestStakeAction);
+    }
+
+    pub fn stake_to_miner(&mut self) {
+        self.waiting_for_stake_to_miner = true;
+
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::StakeToMiner => true, _ => false }).count() != 0 {
+            return;
+        }
+
+        self.actions_in_flight.push_back(WalletAction::StakeToMiner);
     }
 }
 
@@ -335,6 +352,83 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         memos
     }
+
+    let send_zats = async | client: &mut CompactTxStreamerClient<_>, dst_wallet: &mut WalletDb<_, _, _, _>, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params | -> bool {
+        // @todo(judah): handle multiple accounts?
+        let Ok(src_ids)  = src_wallet.get_account_ids() else { return false; };
+        let Some(src_id) = src_ids.first() else { return false; };
+        let Ok(Some(src_account)) = src_wallet.get_account(*src_id) else { return false; };
+
+        let Ok(dst_ids)  = dst_wallet.get_account_ids() else { return false; };
+        let Some(dst_id) = dst_ids.first() else { return false; };
+        let Ok(Some(dst_account)) = dst_wallet.get_account(*dst_id) else { return false; };
+        let Some((_, dst_ua)) = addrs_from_account(&dst_account, 0) else { return false; };
+
+        const FALLBACK_CHANGE_POOL: zcash_protocol::ShieldedProtocol = zcash_protocol::ShieldedProtocol::Orchard;
+
+        match wallet::propose_standard_transfer_to_address::<_, _, Infallible>(
+            src_wallet,
+            params,
+            zcash_client_backend::fees::StandardFeeRule::Zip317,
+            src_account.id(),
+            wallet::ConfirmationsPolicy::MIN,
+            &zcash_client_backend::address::Address::Unified(dst_ua.clone()),
+            zats,
+            Some(zcash_protocol::memo::MemoBytes::from_bytes(dst_ua.encode(params).to_string().as_bytes()).unwrap()),
+            None,
+            FALLBACK_CHANGE_POOL)
+        {
+            Err(err) => {
+                println!("propose_transfer error: {err:?}");
+                return false;
+            },
+            Ok(proposal) => {
+                let prover = LocalTxProver::bundled();
+                match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                    src_wallet,
+                    params,
+                    &prover,
+                    &prover,
+                    &wallet::SpendingKeys::from_unified_spending_key(src_usk.clone()),
+                    zcash_client_backend::wallet::OvkPolicy::Sender,
+                    &proposal)
+                {
+                    Err(err) => println!("create_proposed_transactions error: {err:?}"),
+                    Ok(txids) => for txid in txids {
+                        let tx = match src_wallet.get_transaction(txid) {
+                            Err(err) => {
+                                println!("failed to get tx {txid:?} immediately after making it: {err:?}");
+                                continue;
+                            }
+                            Ok(Some(tx)) => tx,
+                            Ok(None) => {
+                                println!("failed to get tx {txid:?} immediately after making it: (None)");
+                                continue;
+                            }
+                        };
+
+                        let mut data = Vec::new();
+                        if let Err(err) = tx.write(&mut data) {
+                            println!("Serialization error for tx {:?}: {:?}", txid, err);
+                            continue;
+                        }
+
+                        let raw_tx = RawTransaction { data, height: 0 };
+                        match client.send_transaction(raw_tx).await {
+                            Ok(res)  => println!("sent transaction: {res:?}"),
+                            Err(err) => {
+                                continue;
+                            }
+                        }
+
+                        println!("created transaction {txid:?}");
+                    }
+                }
+            }
+        }
+
+        return true;
+    };
 
     the_future_is_now(async {
         println!("waiting for zaino to be ready...");
@@ -607,7 +701,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 let balances = user_summary.account_balances();
                 let mut wallet_balance = 0;
                 for (_, b) in balances {
-                    wallet_balance += b.total().into_u64();
+                    wallet_balance += b.spendable_value().into_u64();
                 }
 
                 use core::ops::Add;
@@ -1015,6 +1109,33 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             },
                         }
                         true
+                    }
+
+                    WalletAction::StakeToMiner => {
+                        let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
+                            println!("Failed to get wallet summary");
+                            break;
+                        };
+
+                        let mut spendable = 0;
+                        let balances = wallet_summary.account_balances();
+                        for (_, b) in balances {
+                            spendable += b.spendable_value().into_u64();
+                        }
+
+                        if spendable < 100_000_000 {
+                            println!("Not enough spendable zats to stake, will try again later...");
+                            break;
+                        }
+
+                        println!("********** STAKING SOME ZEC TO THE MINER");
+                        let zats = (Zatoshis::from_nonnegative_i64(100_000_000).unwrap() - MINIMUM_FEE).unwrap();
+                        let ok = send_zats(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, zats, network).await;
+                        if ok {
+                            wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
+                        }
+
+                        ok
                     }
 
                     _ => { true }
