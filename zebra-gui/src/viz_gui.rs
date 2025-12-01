@@ -184,6 +184,9 @@ pub struct VizState {
 
     pub inspecting_block_hash: Hash32,
     pub inspect_block_json_text: Option<String>,
+
+    pub inspecting_block_screen_x: f32,
+    pub inspecting_block_screen_y: f32,
 }
 pub fn viz_gui_init() -> VizState {
     let (me_send, zebra_receive) = std::sync::mpsc::sync_channel(128);
@@ -207,6 +210,9 @@ pub fn viz_gui_init() -> VizState {
 
         inspecting_block_hash: Hash32::from_u64(0),
         inspect_block_json_text: None,
+
+        inspecting_block_screen_x: 0.0,
+        inspecting_block_screen_y: 0.0,
     };
     if false {
         let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
@@ -366,6 +372,8 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     let world_mouse_y = viz_state.camera_y + ((input_ctx.mouse_pos().1.clamp(0, draw_ctx.window_height) - draw_ctx.window_height/2) as f32) / screen_unit;
 
     let mut hovered_block = Hash32::from_u64(0);
+    let mut hovered_block_screen_x = 0.0;
+    let mut hovered_block_screen_y = 0.0;
     for on_screen_bc in viz_state.on_screen_bcs.values() {
         let dx = on_screen_bc.x - world_mouse_x;
         let dy = on_screen_bc.y - world_mouse_y;
@@ -508,6 +516,14 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         let color_accent = (((on_screen_bc.alpha*on_screen_bc.finalized_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_ACCENT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
         let color_bft = (((on_screen_bc.alpha*on_screen_bc.implicated_by_bft_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BFT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
 
+        if hovered_block == on_screen_bc.block.this_hash {
+            hovered_block_screen_x = origin_x + (x*screen_unit);
+            hovered_block_screen_y = origin_y + (y*screen_unit);
+        }
+        if viz_state.inspecting_block_hash == on_screen_bc.block.this_hash {
+            viz_state.inspecting_block_screen_x = origin_x + (x*screen_unit);
+            viz_state.inspecting_block_screen_y = origin_y + (y*screen_unit);
+        }
         draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bc.roundness, color);
         draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit / 2.0, (screen_unit / 2.0)*on_screen_bc.roundness, color_accent);
 
@@ -563,6 +579,15 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         let x = on_screen_bft.x;
         let y = on_screen_bft.y;
         let color = (((on_screen_bft.alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BFT, ((1.0 - on_screen_bft.darkness) * 255.0) as u32);
+
+        if hovered_block == on_screen_bft.block.this_hash {
+            hovered_block_screen_x = origin_x + (x*screen_unit);
+            hovered_block_screen_y = origin_y + (y*screen_unit);
+        }
+        if viz_state.inspecting_block_hash == on_screen_bft.block.this_hash {
+            viz_state.inspecting_block_screen_x = origin_x + (x*screen_unit);
+            viz_state.inspecting_block_screen_y = origin_y + (y*screen_unit);
+        }
         draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bft.roundness, color);
 
         // hash
@@ -611,6 +636,8 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
 
     if input_ctx.mouse_pressed(MouseButton::Left) {
         viz_state.inspecting_block_hash = hovered_block;
+        viz_state.inspecting_block_screen_x = hovered_block_screen_x;
+        viz_state.inspecting_block_screen_y = hovered_block_screen_y;
         viz_state.inspect_block_json_text = None;
     }
 }

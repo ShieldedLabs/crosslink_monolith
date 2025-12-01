@@ -1730,16 +1730,16 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                     for t in 0..thick {
                                                         if y+t >= window_height { continue; }
                                                         let mut put_ptr = final_output_blit_buffer.byte_add((y+t)*window_width*4) as *mut u32;
-                                                        for _ in 0..single_w {
-                                                            *put_ptr = single_color;
+                                                        for x in 0..single_w {
+                                                            *put_ptr = blend_u32(*put_ptr, single_color, 128);
                                                             put_ptr = put_ptr.byte_add(4);
                                                         }
-                                                        for _ in 0..work_w {
-                                                            *put_ptr = work_color;
+                                                        for x in 0..work_w {
+                                                            *put_ptr = blend_u32(*put_ptr, work_color, 128);
                                                             put_ptr = put_ptr.byte_add(4);
                                                         }
-                                                        for _ in 0..full_w {
-                                                            *put_ptr = full_color;
+                                                        for x in 0..full_w {
+                                                            *put_ptr = blend_u32(*put_ptr, full_color, 128);
                                                             put_ptr = put_ptr.byte_add(4);
                                                         }
                                                     }

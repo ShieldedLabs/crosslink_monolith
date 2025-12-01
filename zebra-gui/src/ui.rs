@@ -1176,18 +1176,18 @@ pub fn ui_right_pane(ui: &mut Context,
     // spacer
     if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
-        let mouse_pos = ui.input().mouse_pos();
+    if viz.inspecting_block_hash != Hash32::from_u64(0) {
+        let ctx_menu_pos = (viz.inspecting_block_screen_x, viz.inspecting_block_screen_y);
         if let _ = elem().decl(Decl {
             id: id("Block Inspector Contents"),
             colour: PANE_COL,
             width: fixed!(ui.scale(128.0)),
             height: fixed!(ui.scale(128.0)),
-            floating: Floating::Root(mouse_pos.0 as f32, mouse_pos.1 as f32),
+            floating: Floating::Root(ctx_menu_pos.0 as f32, ctx_menu_pos.1 as f32),
             ..Decl
         }) {
         }
-    // if viz.inspecting_block_hash != Hash32::from_u64(0) {
-    // }
+    }
 
 
     // TODO: bring this all back!
