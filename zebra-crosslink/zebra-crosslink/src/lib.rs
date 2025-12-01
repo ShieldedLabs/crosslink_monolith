@@ -1027,21 +1027,21 @@ fn update_roster_for_cmd(
 
     let (has_add, sub_key_name, is_clear) = match action.kind {
         StakingActionKind::Add => (true, None, false),
-        StakingActionKind::Sub => (
-            false,
-            Some((action.target, &action.insecure_target_name)),
-            false,
-        ),
+        // StakingActionKind::Sub => (
+        //     false,
+        //     Some((action.target, &action.insecure_target_name)),
+        //     false,
+        // ),
         StakingActionKind::Clear => (
             false,
             Some((action.target, &action.insecure_target_name)),
             true,
         ),
-        StakingActionKind::Move => (
-            true,
-            Some((action.source, &action.insecure_source_name)),
-            false,
-        ),
+        // StakingActionKind::Move => (
+        //     true,
+        //     Some((action.source, &action.insecure_source_name)),
+        //     false,
+        // ),
         StakingActionKind::MoveClear => (
             true,
             Some((action.source, &action.insecure_source_name)),
@@ -1102,6 +1102,7 @@ fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> 
         if let zebra_chain::transaction::Transaction::VCrosslink { staking_action, .. } =
             tx.as_ref()
         {
+            info!("Got staking action in txid: {}", tx.unmined_id());
             if let Some(staking_action) = staking_action {
                 cmd_c += update_roster_for_cmd(roster, validators_keys_to_names, &staking_action);
             }

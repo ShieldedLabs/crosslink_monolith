@@ -1341,13 +1341,13 @@ impl CommandBuf {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub enum StakingActionKind {
     Add,
-    Sub,
+    // Sub,
 
     /// "clear" to a given amount <= current voting power, probably 0
     /// This exists alongside SUB because it's awkward to predict in advance the exact
     /// voting power after block rewards have been accounted for.
     Clear,
-    Move,
+    // Move,
     MoveClear,
 }
 impl From<StakingActionKind> for u8 {
@@ -1355,9 +1355,9 @@ impl From<StakingActionKind> for u8 {
         match v {
             // 0 is reserved for None
             StakingActionKind::Add       => 1,
-            StakingActionKind::Sub       => 2,
+            // StakingActionKind::Sub       => 2,
             StakingActionKind::Clear     => 3,
-            StakingActionKind::Move      => 4,
+            // StakingActionKind::Move      => 4,
             StakingActionKind::MoveClear => 5,
         }
     }
@@ -1367,9 +1367,9 @@ impl TryFrom<u8> for StakingActionKind {
     fn try_from(v: u8) -> Result<StakingActionKind, ()> {
         match v {
             1 => Ok(StakingActionKind::Add),
-            2 => Ok(StakingActionKind::Sub),
+            // 2 => Ok(StakingActionKind::Sub),
             3 => Ok(StakingActionKind::Clear),
-            4 => Ok(StakingActionKind::Move),
+            // 4 => Ok(StakingActionKind::Move),
             5 => Ok(StakingActionKind::MoveClear),
             _ => Err(()),
         }
@@ -1398,13 +1398,14 @@ impl StakingAction {
     pub fn to_cmd_string(&self) -> std::string::String {
         let kind_str = match self.kind {
             StakingActionKind::Add       => &"ADD",
-            StakingActionKind::Sub       => &"SUB",
+            // StakingActionKind::Sub       => &"SUB",
             StakingActionKind::Clear     => &"CLR",
-            StakingActionKind::Move      => &"MOV",
+            // StakingActionKind::Move      => &"MOV",
             StakingActionKind::MoveClear => &"MCL",
         };
         let mut str = format!("{kind_str}|{}|{}", self.val, self.insecure_target_name);
-        if self.kind == StakingActionKind::Move || self.kind == StakingActionKind::MoveClear {
+        // if self.kind == StakingActionKind::Move || self.kind == StakingActionKind::MoveClear {
+        if self.kind == StakingActionKind::MoveClear {
             str.push_str(&format!("|{}", self.insecure_source_name));
         }
         str
@@ -1482,17 +1483,17 @@ impl StakingAction {
 
                 let kind = match cmd[..3] {
                     [b'A', b'D', b'D'] => StakingActionKind::Add,
-                    [b'S', b'U', b'B'] => StakingActionKind::Sub,
+                    // [b'S', b'U', b'B'] => StakingActionKind::Sub,
                     [b'C', b'L', b'R'] => StakingActionKind::Clear,
 
-                    [b'M', b'O', b'V'] => {
-                        let Some(pk) = public_key1 else {
-                            return Err(format!("Roster command invalid: can't move from non-present finalizer \"{}\"\nCMD: \"{}\"", insecure_source_name, cmd_str));
-                        };
-                        source = pk.into();
-                        insecure_source_name = std::string::String::from(&cmd_str[addr1_bgn.unwrap_or(cmd_str.len())..]);
-                        StakingActionKind::Move
-                    }
+//                     [b'M', b'O', b'V'] => {
+//                         let Some(pk) = public_key1 else {
+//                             return Err(format!("Roster command invalid: can't move from non-present finalizer \"{}\"\nCMD: \"{}\"", insecure_source_name, cmd_str));
+//                         };
+//                         source = pk.into();
+//                         insecure_source_name = std::string::String::from(&cmd_str[addr1_bgn.unwrap_or(cmd_str.len())..]);
+//                         StakingActionKind::Move
+//                     }
 
                     [b'M', b'C', b'L'] => {
                         let Some(pk) = public_key1 else {
@@ -1594,9 +1595,9 @@ impl std::fmt::Display for StakingAction {
 
         fmter.field("kind", match self.kind {
             StakingActionKind::Add       => &"Add",
-            StakingActionKind::Sub       => &"Sub",
+            // StakingActionKind::Sub       => &"Sub",
             StakingActionKind::Clear     => &"Clear",
-            StakingActionKind::Move      => &"Move",
+            // StakingActionKind::Move      => &"Move",
             StakingActionKind::MoveClear => &"MoveClear",
         });
 
@@ -1605,7 +1606,8 @@ impl std::fmt::Display for StakingAction {
         fmter.field("target", &self.target);
         fmter.field("insecure_target_name", &self.insecure_target_name);
 
-        if self.kind == StakingActionKind::Move || self.kind == StakingActionKind::MoveClear {
+        // if self.kind == StakingActionKind::Move ||
+        if self.kind == StakingActionKind::MoveClear {
             fmter.field("source", &self.source);
             fmter.field("insecure_source_name", &self.insecure_source_name);
         }
