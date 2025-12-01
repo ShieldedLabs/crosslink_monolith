@@ -785,9 +785,9 @@ pub static SOUND_UI_HOVER: &[u8] = include_bytes!("../assets/ui_hover.ogg");
 const DRAW_CALL_MAX: usize = 131072;
 const GLYPH_RUN_MAX: usize = 16384;
 
-pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
+pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fake_data: bool) {
 
-    let mut viz_state = viz_gui_init();
+    let mut viz_state = viz_gui_init(fake_data);
 
     // Create window + event loop.
     let event_loop = winit::event_loop::EventLoop::new().unwrap();

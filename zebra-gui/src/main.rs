@@ -15,5 +15,5 @@ fn main() {
         ];
     }
 
-    visualizer_zcash::main_thread_run_program(wallet_state);
+    visualizer_zcash::main_thread_run_program(wallet_state, true);
 }
