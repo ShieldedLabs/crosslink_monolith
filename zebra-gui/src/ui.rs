@@ -575,6 +575,8 @@ pub fn ui_left_pane(ui: &mut Context,
         let container_id = _elem.decl.id;
         let container_hovered = ui.hovered(container_id);
 
+        if container_hovered { ui.capture = true; }
+
         if let _elem = elem().decl(Decl {
             child_gap, radius,
             id: id("Modal Contents"),
@@ -589,6 +591,8 @@ pub fn ui_left_pane(ui: &mut Context,
 
             let contents_id = _elem.decl.id;
             let contents_hovered = ui.hovered(contents_id);
+
+            if container_hovered { ui.capture = true; }
 
             let text_h = ui.scale(24.0);
             let title_bar = |ui: &mut Context, clicked_id: &mut Id, closeable, title, title_bar_id| {
@@ -608,7 +612,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Right, ..Decl }) && closeable {
                         let id = id("Close This Modal");
 
-                        let (clicked, colour) = ui.button_act_on_release(clicked_id, id);
+                        let (clicked, colour) = ui.button_ex(clicked_id, id, false);
                         if clicked || ui.input().key_pressed(KeyCode::Escape) {
                             ui.modal = Modal::None;
                         }
@@ -698,16 +702,18 @@ pub fn ui_left_pane(ui: &mut Context,
                         ..Decl
                     }) {
                         // @todo(judah): disable buttons below current spendable balance
-                        ui.text("Select Staking Amount", TextDecl { h: text_h, align: AlignX::Center, ..TextDecl });
 
-                        if button_ex(ui, "10 ZEC", false, waiting_for_stake_to_miner) {
+                        if button_ex(ui, "+0.01 cTAZ", false, waiting_for_stake_to_miner) {
+                            wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC / 100);
+                        }
+                        if button_ex(ui, "+0.1 cTAZ", false, waiting_for_stake_to_miner) {
+                            wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC / 10);
+                        }
+                        if button_ex(ui, "+1 cTAZ", false, waiting_for_stake_to_miner) {
+                            wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC);
+                        }
+                        if button_ex(ui, "+10 cTAZ", false, waiting_for_stake_to_miner) {
                             wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC * 10);
-                        }
-                        if button_ex(ui, "50 ZEC", false, waiting_for_stake_to_miner) {
-                            wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC * 50);
-                        }
-                        if button_ex(ui, "100 ZEC", false, waiting_for_stake_to_miner) {
-                            wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC * 100);
                         }
                     }
                 }
@@ -850,7 +856,7 @@ pub fn ui_left_pane(ui: &mut Context,
                 ..Decl
             }) {
                 let h = ui.scale(24.0);
-                ui.text("There are no transactions yet.", TextDecl { h: h, align: AlignX::Center, ..TextDecl });
+                ui.text("There are no transactions yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
             }
 
         } else if *tab_id == tab_id_finalizers {
@@ -1267,6 +1273,9 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
 
     if !ui.input().mouse_held(winit::event::MouseButton::Left) {
         clicked_id = Id::default();
+    }
+    if ui.clicked_id != Id::default() {
+        ui.capture = true;
     }
     ui.clicked_id = clicked_id;
     ui.pane_tab_l = pane_tab_l;
