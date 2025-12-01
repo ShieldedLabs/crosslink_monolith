@@ -1032,7 +1032,6 @@ pub fn ui_right_pane(ui: &mut Context,
                  tab_id: &mut Id) {
     let mut tab_id_faucet = Id::default();
     let mut tab_id_roster = Id::default();
-    // let mut tab_id_settings = Id::default();
 
     if let _ = elem().decl(Decl {
         id: id("Tab Bar"),
@@ -1042,10 +1041,8 @@ pub fn ui_right_pane(ui: &mut Context,
         align: Center,
         ..Decl
     }) {
-        // tab_id_faucet = ui.tab(radius, padding, tab_id, "Faucet");
         tab_id_faucet  = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet ({})", &wallet_state.lock().unwrap().miner_seen_height));
-        // tab_id_roster   = ui.tab(radius, padding, tab_id, "Roster");
-        // tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, "Settings");
+        tab_id_roster   = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, "Guardians");
     }
 
     // Main contents
@@ -1193,6 +1190,7 @@ pub fn ui_right_pane(ui: &mut Context,
     // }
 
 
+    // TODO: bring this all back!
     // // Block Inspector Contents
     // if let _ = elem().decl(Decl {
     //     id: id("Block Inspector Contents"),
