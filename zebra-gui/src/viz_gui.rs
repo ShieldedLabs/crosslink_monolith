@@ -160,12 +160,12 @@ impl Default for OnScreenBft {
     }
 }
 
-const COLOR_BC:  u32 = 0xFF0000;
-const COLOR_BFT: u32 = 0x00FF00;
+const COLOR_BC:  u32 = 0x82ccc0;
+const COLOR_BFT: u32 = 0xdc4c4f;
 
-const COLOR_BC_LINK:    u32 = 0x0000FF;
-const COLOR_BFT_LINK:   u32 = 0xFF00FF;
-const COLOR_CROSS_LINK: u32 = 0x00FFFF;
+const COLOR_BC_LINK:    u32 = 0x32556e;
+const COLOR_BFT_LINK:   u32 = 0x9a2d37;
+const COLOR_CROSS_LINK: u32 = 0x32556e;
 
 pub struct VizState {
     pub camera_x: f32,
@@ -500,7 +500,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
 
     //draw_ctx.circle(origin_x as f32, origin_y as f32, (screen_unit/2.0) as f32, 0xff_0000bb);
 
-    let arrow_width = screen_unit / 12.0;
+    let arrow_and_line_width = screen_unit / 12.0;
 
     for on_screen_bc in viz_state.on_screen_bcs.values() {
         let x = on_screen_bc.x;
@@ -510,7 +510,9 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         let color_bft = (((on_screen_bc.alpha*on_screen_bc.implicated_by_bft_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BFT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
         draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bc.roundness, color);
         draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit / 2.0, (screen_unit / 2.0)*on_screen_bc.roundness, color_white);
-        draw_ctx.circle_square(origin_x + (x*screen_unit) + screen_unit / 3.0, origin_y + (y*screen_unit) - screen_unit / 3.0, screen_unit / 3.0, (screen_unit / 3.0), color_bft);
+
+        // @todo(judah): not sure what this circle is supposed to represent
+        // draw_ctx.circle_square(origin_x + (x*screen_unit) + screen_unit / 3.0, origin_y + (y*screen_unit) - screen_unit / 3.0, screen_unit / 3.0, (screen_unit / 3.0), color_bft);
 
         if on_screen_bc.block.is_best_chain {
             // hash
@@ -538,7 +540,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 origin_y + (y + dy * 2.0) * screen_unit,
                 origin_x + (x + dx * (l - 2.0))*screen_unit,
                 origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                arrow_width, COLOR_BC_LINK | (((on_screen_bc.alpha*255.0) as u32) << 24),
+                arrow_and_line_width, COLOR_BC_LINK | (((on_screen_bc.alpha*255.0) as u32) << 24),
             );
         }
         if let Some(pointing_at_bft) = viz_state.on_screen_bfts.get(&on_screen_bc.block.points_at_bft_block) {
@@ -547,12 +549,12 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             let dx = px-x;
             let dy = py-y;
             let (dx, dy, l) = split_vector(dx, dy);
-            draw_ctx.line(
+            draw_ctx.arrow(
                 origin_x + (x + dx * 2.0) * screen_unit,
                 origin_y + (y + dy * 2.0) * screen_unit,
                 origin_x + (x + dx * (l - 2.0))*screen_unit,
                 origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                arrow_width, COLOR_BFT_LINK | (((on_screen_bc.alpha*on_screen_bc.bft_arrow_alpha*255.0) as u32) << 24),
+                arrow_and_line_width, COLOR_BFT_LINK | (((on_screen_bc.alpha*on_screen_bc.bft_arrow_alpha*255.0) as u32) << 24),
             );
         }
     }
@@ -582,7 +584,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 origin_y + (y + dy * 2.0) * screen_unit,
                 origin_x + (x + dx * (l - 2.0))*screen_unit,
                 origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                arrow_width, COLOR_BFT_LINK | (((on_screen_bft.alpha*255.0) as u32) << 24),
+                arrow_and_line_width, COLOR_BFT_LINK | (((on_screen_bft.alpha*255.0) as u32) << 24),
             );
         }
         if let Some(pointing_at_bc) = viz_state.on_screen_bcs.get(&on_screen_bft.block.points_at_bc_block) {
@@ -596,7 +598,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 origin_y + (y + dy * 2.0) * screen_unit,
                 origin_x + (x + dx * (l - 2.0))*screen_unit,
                 origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                arrow_width, COLOR_CROSS_LINK | (((on_screen_bft.alpha*255.0) as u32) << 24),
+                arrow_and_line_width, COLOR_CROSS_LINK | (((on_screen_bft.alpha*255.0) as u32) << 24),
             );
         }
     }
