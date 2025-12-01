@@ -785,9 +785,9 @@ pub static SOUND_UI_HOVER: &[u8] = include_bytes!("../assets/ui_hover.ogg");
 const DRAW_CALL_MAX: usize = 131072;
 const GLYPH_RUN_MAX: usize = 16384;
 
-pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
+pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fake_data: bool) {
 
-    let mut viz_state = viz_gui_init();
+    let mut viz_state = viz_gui_init(fake_data);
 
     // Create window + event loop.
     let event_loop = winit::event_loop::EventLoop::new().unwrap();
@@ -1168,7 +1168,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>) {
                                                 let put = draw_ctx.draw_command_buffer.add(*draw_ctx.draw_command_count);
                                                 *draw_ctx.draw_command_count += 1;
                                                 assert!(*draw_ctx.draw_command_count <= DRAW_CALL_MAX);
-                                                *put = DrawCommand::ClearScreenToColor { color: 0x090909 };
+                                                *put = DrawCommand::ClearScreenToColor { color: 0x080808 };
                                             }
 
                                             gui_ctx.input = &input_ctx;

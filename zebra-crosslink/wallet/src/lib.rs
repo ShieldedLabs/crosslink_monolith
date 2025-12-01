@@ -86,6 +86,8 @@ use zcash_transparent::{
 };
 use zcash_primitives::transaction::StakingAction;
 
+pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+
 fn the_future_is_now<F: Future>(future: F) -> F::Output {
     Builder::new_current_thread()
         .enable_time()
@@ -473,6 +475,12 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         wait_for_zainod().await;
     });
 
+    let global_seed = loop {
+        if let Some(global_seed) = *GLOBAL_SEED.lock().unwrap() {
+            break global_seed;
+        }
+    };
+
     let network = &TEST_NETWORK;
 
     let (
@@ -504,10 +512,11 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         user_t_address,
         user_ua,
     ) = {
-        let (user_wallet, user_account, user_usk) = wallet_from_seed_phrase(
-            network,
-            "blur kit item praise brick misery muffin symptom cheese street tired evolve",
-        );
+        // roundtrip seed through mnemonic phrase
+        let mnemonic = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &global_seed).unwrap();
+        let phrase = mnemonic.words().map(|s| s.to_string()).collect::<Vec<String>>().join(" ");
+
+        let (user_wallet, user_account, user_usk) = wallet_from_seed_phrase(network, &phrase);
         let (user_t_addr, user_ua) = addrs_from_account(&user_account, 0).unwrap();
         let user_t_addr_str = user_t_addr.encode(network);
         let (user_pubkey, user_privkey) = transparent_keys_from_usk(&user_usk, 0).unwrap();

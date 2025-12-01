@@ -188,7 +188,7 @@ pub struct VizState {
     pub inspecting_block_screen_x: f32,
     pub inspecting_block_screen_y: f32,
 }
-pub fn viz_gui_init() -> VizState {
+pub fn viz_gui_init(fake_data: bool) -> VizState {
     let (me_send, zebra_receive) = std::sync::mpsc::sync_channel(128);
     let (zebra_send, me_receive) = std::sync::mpsc::sync_channel(128);
 
@@ -214,7 +214,7 @@ pub fn viz_gui_init() -> VizState {
         inspecting_block_screen_x: 0.0,
         inspecting_block_screen_y: 0.0,
     };
-    if false {
+    if fake_data {
         let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
         let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(2), parent_hash: Hash32::from_u64(1), this_height: 1, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
@@ -339,7 +339,7 @@ const ZOOM_FACTOR : f32 = 1.2;
 const SCREEN_UNIT_CONST : f32 = 10.0;
 
 pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui: &mut ui::Context, draw_ctx: &DrawCtx, dt: f32, input_ctx: &InputCtx) {
-    {
+    if !ui.capture {
         let dxm = (input_ctx.mouse_pos().0.clamp(0, draw_ctx.window_width) - draw_ctx.window_width/2) as f32;
         let dym = (input_ctx.mouse_pos().1.clamp(0, draw_ctx.window_height) - draw_ctx.window_height/2) as f32;
         let old_screen_unit = SCREEN_UNIT_CONST * ZOOM_FACTOR.powf(viz_state.zoom);
@@ -634,7 +634,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         { play_sound(SOUND_UI_HOVER, 0.5, 1.0); }
     }
 
-    if input_ctx.mouse_pressed(MouseButton::Left) {
+    if !ui.capture && input_ctx.mouse_pressed(MouseButton::Left) {
         viz_state.inspecting_block_hash = hovered_block;
         viz_state.inspecting_block_screen_x = hovered_block_screen_x;
         viz_state.inspecting_block_screen_y = hovered_block_screen_y;

@@ -84,6 +84,7 @@ pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum Floating  { #[default] None, Parent, Root(f32, f32) }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum ClipMode  { #[default] None, Clip, Scroll(f32, f32) }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum AlignX    { #[default] Left, Right, Center }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum AlignY    { #[default] Top, Bottom, Center }
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub struct Align   { x: AlignX, y: AlignY }
@@ -133,6 +134,7 @@ pub const BottomRight: Align = Align::BottomRight;
     }};
 }
 
+use ClipMode::{Clip, Scroll};
 use Direction::*;
 
 pub const Id: Id = Id { id: 0, offset: 0, base_id: 0, len: 0, chars: std::ptr::null() };
@@ -145,7 +147,7 @@ pub struct Decl {
     colour: (u8, u8, u8, u8),
     radius: (f32, f32, f32, f32),
     padding: (f32, f32, f32, f32),
-    clip: bool,
+    clip: ClipMode,
     child_gap: f32,
     align: Align,
     width:  Sizing,
@@ -160,7 +162,7 @@ pub const Decl: Decl = Decl {
     colour:    (0,   0,   0,   0),
     radius:    (0.0, 0.0, 0.0, 0.0),
     padding:   (0.0, 0.0, 0.0, 0.0),
-    clip:      false,
+    clip:      ClipMode::None,
     child_gap: 0.0,
     align:     TopLeft,
     width:     Sizing::Fit(0.0, f32::MAX),
@@ -294,7 +296,16 @@ impl Element {
             a: item.colour.3 as f32
         };
         decl.id = item.id.clay().id;
-        decl.clip = clay::Clay_ClipElementConfig { horizontal: item.clip, vertical: item.clip, childOffset: clay::Clay_Vector2 { x: 0.0, y: 0.0 } };
+        let clipping = match item.clip { ClipMode::None => false, _ => true };
+        decl.clip = clay::Clay_ClipElementConfig {
+            horizontal: clipping,
+            vertical: clipping,
+            childOffset: match item.clip {
+                ClipMode::None => clay::Clay_Vector2 { x: 0.0, y: 0.0 },
+                ClipMode::Clip => clay::Clay_Vector2 { x: 0.0, y: 0.0 },
+                ClipMode::Scroll(x, y) => clay::Clay_Vector2 { x, y },
+            }
+        };
         match item.floating {
             Floating::Parent => {
                 decl.floating.attachTo = clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_PARENT;
@@ -340,10 +351,11 @@ impl Element {
     }
 }
 
-pub const PANE_PERCENT: f32 = (0.25 + 0.333) / 2.0;
+pub const PANE_PERCENT: f32 = 0.27; // @PreventPanesColliding
 
 pub const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
-pub const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
+// pub const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
+pub const PANE_COL:         (u8, u8, u8, u8) = (0x13, 0x13, 0x13, 0xff); // @FigmaScreenshot
 pub const INACTIVE_TAB_COL: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
 pub const ACTIVE_TAB_COL:   (u8, u8, u8, u8) = PANE_COL;
 
@@ -508,11 +520,11 @@ impl Context {
                 AlignX::Right  => clay::text::TextAlignment::Right,
                 AlignX::Center => clay::text::TextAlignment::Center,
             })
-            .wrap_mode(if decl.break_word {
-                clay::text::TextElementConfigWrapMode::BreakWord
-            } else {
-                clay::text::TextElementConfigWrapMode::Words
-            })
+            // .wrap_mode(if decl.break_word {
+            //     clay::text::TextElementConfigWrapMode::BreakWord
+            // } else {
+            //     clay::text::TextElementConfigWrapMode::Words
+            // })
             .end();
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
@@ -710,6 +722,11 @@ pub fn ui_left_pane(ui: &mut Context,
                         clicked
                     };
 
+                    if (wallet_state.lock().unwrap().balance as u64) < ONE_cTAZ / 100 {
+                        let colour = (0xff, 0xaf, 0x0e, 0xff);
+                        ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
+                    }
+
                     const ONE_cTAZ: u64 = 100_000_000;
                     let waiting_for_stake_to_miner = wallet_state.lock().unwrap().waiting_for_stake_to_miner;
 
@@ -723,9 +740,13 @@ pub fn ui_left_pane(ui: &mut Context,
                         direction: TopToBottom,
                         ..Decl
                     }) {
-                        // @todo(judah): disable buttons below current spendable balance
-
                         let balance = wallet_state.lock().unwrap().balance;
+
+                        // if (balance as u64) < ONE_cTAZ / 100 {
+                        //     let colour = (0xff, 0xaf, 0x0e, 0xff);
+                        //     ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
+                        // }
+
                         let can = !waiting_for_stake_to_miner;
                         if button_ex(ui, "+0.01 cTAZ", can && (balance as u64) >= ONE_cTAZ / 100) { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ / 100); }
                         if button_ex(ui,  "+0.1 cTAZ", can && (balance as u64) >= ONE_cTAZ / 10)  { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ / 10);  }
@@ -768,15 +789,16 @@ pub fn ui_left_pane(ui: &mut Context,
         align: Top,
         width: percent!(1.0),
         height: grow!(),
+        clip: Clip,
         ..Decl
     }) {
         let balance_text_h = ui.scale(48.0);
         let accent_text_h  = ui.scale(16.0);
 
-        // spacer
-        if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
-
         if *tab_id == tab_id_wallet {
+            // spacer
+            if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
+
             let (
                 balance,
                 pending_balance,
@@ -864,36 +886,70 @@ pub fn ui_left_pane(ui: &mut Context,
             }
         } else if *tab_id == tab_id_finalizers {
         } else if *tab_id == tab_id_history {
-            if let _ = elem().decl(Decl {
-                id: id("Balance"),
-                padding,
-                child_gap,
-                width: percent!(1.0),
-                height: fit!(),
-                direction: TopToBottom,
-                align: Center,
-                ..Decl
-            }) {
+            {
                 let txs = &wallet_state.lock().unwrap().txs;
 
+                if txs.len() == 0 {
+                    ui.history_scroll = 0.0;
+                }
+
+                let id = id("History Scroll Container");
+                if ui.hovered(id) {
+                    ui.history_scroll -= ui.input().zoom_delta     as f32 * 32.0;
+                    ui.history_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
+                }
+                if ui.history_scroll < 0.0 {
+                    ui.history_scroll = 0.0;
+                }
+                let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
+                if scroll_container_data.found {
+                    let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
+                    if ui.history_scroll > max {
+                        ui.history_scroll = max;
+                    }
+                };
                 if let _ = elem().decl(Decl {
+                    id,
                     colour: TRANSACTION_HISTORY_CONTAINER_COL,
-                    child_gap, padding,
-                    radius: radius.mul(2.0),
-                    width:  grow!(radius.0 * 2.0),
-                    height: grow!(radius.0 * 2.0),
-                    align: Center,
+                    child_gap: child_gap * 0.5, padding,
+                    radius: padding.0.dup4(),
+                    width:  percent!(1.0),
+                    // height: grow!(radius.0 * 2.0),
+                    height: percent!(1.0),
+                    direction: TopToBottom,
+                    clip: Scroll(0.0, -ui.history_scroll * ui.scale),
+                    align: Top,
                     ..Decl
                 }) {
                     if txs.len() == 0 {
                         let h = ui.scale(24.0);
-                        ui.text("There are no transactions yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
+                        if let _ = elem().decl(Decl {
+                            direction: TopToBottom,
+                            width:  percent!(1.0),
+                            height: percent!(1.0),
+                            child_gap,
+                            align:  Center,
+                            ..Decl
+                        }) {
+                            ui.text(ICON_DROPBOX_1, TextDecl { font: Icons, colour: WHITE.mul(0.6), h: ui.scale(64.0), align: AlignX::Center, ..TextDecl });
+                            ui.text("There are no transactions yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
+                        }
                     }
                     else {
                         let kind_text_h = ui.scale(18.0);
                         let transaction_text_h = ui.scale(16.0);
 
                         for (index, tx) in txs.iter().enumerate() {
+                            if index > 0 { // separator
+                                let colour = {
+                                    let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
+                                    col = col.hsva();
+                                    col.2 = col.2.mul(1.5).min(255);
+                                    col.rgba()
+                                };
+
+                                let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
+                            }
                             if let _ = elem().decl(Decl{
                                 id: id_index("Transaction", index as u32),
                                 padding,
@@ -906,12 +962,11 @@ pub fn ui_left_pane(ui: &mut Context,
                             }) {
                                 // left icon
                                 if let _ = elem().decl(Decl{
-                                    padding,
-                                    child_gap,
-                                    height: percent!(1.0),
-                                    width: fit!(),
+                                    id: id_index("Left Icon", index as u32),
+                                    height: fit!(),
+                                    width: fixed!(ui.scale(32.0)),
                                     direction: TopToBottom,
-                                    align: Left,
+                                    align: Center,
                                     ..Decl
                                 }) {
                                     let icon = match tx.1 {
@@ -920,12 +975,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                         wallet::WalletTxKind::Shield  => ICON_SHIELD,
                                         _ => todo!(),
                                     };
-                                    let temp_letter_symbol_h = ui.scale(24.0);
-                                    ui.text(icon, TextDecl { font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
+                                    ui.text(icon, TextDecl { font: Icons, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
                                 }
 
                                 // info
                                 if let _ = elem().decl(Decl{
+                                    id: id_index("Centre Info", index as u32),
                                     height: fit!(),
                                     width: grow!(),
                                     direction: TopToBottom,
@@ -968,9 +1023,8 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                 // right info
                                 if let _ = elem().decl(Decl{
-                                    padding,
-                                    child_gap,
-                                    height: percent!(1.0),
+                                    id: id_index("Right Info", index as u32),
+                                    height: fit!(),
                                     width: fit!(),
                                     direction: TopToBottom,
                                     align: Right,
@@ -987,10 +1041,10 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                     match tx.1 {
                                         wallet::WalletTxKind::Send => {
-                                            ui.text(frame_strf!(data, "-{} cTAZ", str_from_ctaz(tx.0.total_spent.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: color, ..TextDecl });
+                                            ui.text(frame_strf!(data, "-{} cTAZ", str_from_ctaz(tx.0.total_spent.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                         },
                                         wallet::WalletTxKind::Receive => {
-                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.0.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: color, ..TextDecl });
+                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.0.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                         },
                                         wallet::WalletTxKind::Shield => {
                                             let shield_amount: i64 = tx.0.account_value_delta.into();
@@ -1000,19 +1054,16 @@ pub fn ui_left_pane(ui: &mut Context,
                                             let trim_part = part_str.trim_end_matches("0");
 
                                             let prefix = if shield_amount < 0 { "-" } else { "" };
-                                            ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..trim_part.len().max(3)]), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: color, ..TextDecl });
+                                            ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..trim_part.len().max(3)]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                         },
                                         _ => todo!(),
                                     }
                                 }
 
-                                // @TODO: REMOVE ME ONCE IDs ARE FIXED!!!!!!
-                                break;
-
                                 // manually split id text
                                 // let string = format!("{:?} {:?}", tx.0.txid, tx.1);
-                                // ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), TextDecl { h: transaction_text_h, align: AlignX::Left, ..TextDecl });
-                                // ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), TextDecl { h: transaction_text_h, align: AlignX::Left, ..TextDecl });
+                                // ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), TextDecl { h: transaction_text_h, align: AlignX::Right, ..TextDecl });
+                                // ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), TextDecl { h: transaction_text_h, align: AlignX::Right, ..TextDecl });
                             }
                         }
                     }
@@ -1172,55 +1223,6 @@ pub fn ui_right_pane(ui: &mut Context,
         }
         // } else if *tab_id == tab_id_settings {
     }
-
-    // spacer
-    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
-
-    if viz.inspecting_block_hash != Hash32::from_u64(0) {
-        let ctx_menu_pos = (viz.inspecting_block_screen_x, viz.inspecting_block_screen_y);
-        if let _ = elem().decl(Decl {
-            id: id("Block Inspector Contents"),
-            colour: PANE_COL,
-            width: fixed!(ui.scale(128.0)),
-            height: fixed!(ui.scale(128.0)),
-            floating: Floating::Root(ctx_menu_pos.0 as f32, ctx_menu_pos.1 as f32),
-            ..Decl
-        }) {
-        }
-    }
-
-
-    // TODO: bring this all back!
-    // // Block Inspector Contents
-    // if let _ = elem().decl(Decl {
-    //     id: id("Block Inspector Contents"),
-    //     colour: PANE_COL,
-    //     radius: (0.0, radius.1, 0.0, radius.3),
-    //     direction: TopToBottom,
-    //     width: percent!(1.0),
-    //     height: grow!(),
-    //     ..Decl
-    // }) {
-    //     let text_h = ui.scale(22.0);
-    //     if viz.inspecting_block_hash == Hash32::from_u64(0) {
-    //         ui.text(frame_strf!(data, "Click on a Block to Inspect its JSON!"), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
-    //     } else {
-    //         ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
-    //
-    //         // let json = if let Some(raw) = viz.inspect_block_json_text.as_ref() {
-    //         //     match serde_json::from_str::<serde_json::Value>(raw) {
-    //         //         Ok(value) => match serde_json::to_string_pretty(&value) {
-    //         //             Ok(prettified) => prettified.to_string(),
-    //         //             Err(error) => { eprintln!("In JSON:\n{}\nPrettify error: {:?}", raw, error); todo!(); raw.to_string(); }
-    //         //         },
-    //         //         Err(error) => { eprintln!("In JSON:\n{}\nPrettify error: {:?}", raw, error); todo!(); raw.to_string(); }
-    //         //     }
-    //         // } else {
-    //         //     "Loading...".to_string()
-    //         // };
-    //         // ui.text(frame_strf!(data, "{}", json), TextDecl { font: Mono, break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
-    //     }
-    // }
 }
 
 
@@ -1230,7 +1232,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
     let mut result = false;
 
     const MIN_ZOOM: f32 = 0.5;
-    const MAX_ZOOM: f32 = 2.0;
+    const MAX_ZOOM: f32 = 1.65; // @PreventPanesColliding
 
     if ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight) {
         if ui.input().key_pressed(KeyCode::Equal) {
@@ -1305,7 +1307,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             direction: TopToBottom,
             width: pane_pct,
             height: grow!(),
-            clip: true,
+            clip: Clip,
             ..Decl
         }) {
             let id = _elem.decl.id;
@@ -1379,7 +1381,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             direction: TopToBottom,
             width: pane_pct,
             height: grow!(),
-            clip: true,
+            clip: Clip,
             ..Decl
         }) {
             let id = _elem.decl.id;
@@ -1392,6 +1394,48 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             ui.pane_tab_r = pane_tab_r;
         }
     }
+
+    if viz.inspecting_block_hash != Hash32::from_u64(0) {
+        let ctx_menu_pos = (viz.inspecting_block_screen_x, viz.inspecting_block_screen_y);
+        let id = id("Block Inspector Contents");
+        if ui.hovered(id) {
+            ui.capture = true;
+        }
+        let border_colour = { let mut col = PANE_COL.hsva(); col.2 = 0x18; col.rgba() };
+        if let _ = elem().decl(Decl {
+            id,
+            colour: border_colour,
+            child_gap, padding, radius,
+            width:  fit!(),
+            height: fit!(),
+            floating: Floating::Root(ctx_menu_pos.0 as f32, ctx_menu_pos.1 as f32),
+            ..Decl
+        }) {
+            if let _ = elem().decl(Decl {
+                colour: PANE_COL,
+                child_gap, padding, radius,
+                width:  fit!(ui.scale(192.0), ui.draw().window_width as f32 * 0.5),
+                height: fit!(ui.scale(128.0)),
+                direction: TopToBottom,
+                ..Decl
+            }) {
+                let text_h = ui.scale(10.0);
+                // Block Inspector Contents
+                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
+
+                let text = {
+                    if let Some(text) = viz.inspect_block_json_text.as_ref() {
+                        text.to_string()
+                    } else {
+                        "Loading...".to_string()
+                    }
+                };
+                ui.text(frame_strf!(data, "{}", text), TextDecl { font: Mono, break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
+            }
+        }
+    }
+
+
 
     if !ui.input().mouse_held(winit::event::MouseButton::Left) {
         ui.clicked_id = Id::default();
@@ -1507,6 +1551,8 @@ pub struct Context {
     pub pane_tab_r: Id,
 
     pub modal: Modal,
+
+    pub history_scroll: f32,
 }
 
 #[derive(Debug, Default, Copy, Clone)]
