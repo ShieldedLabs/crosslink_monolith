@@ -624,6 +624,7 @@ impl InputCtx {
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum FontKind { #[default] Normal, Mono, Icons }
+use FontKind::{Mono, Icons};
 
 struct FontTracker {
     how_many_times_was_i_used: usize,
