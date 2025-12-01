@@ -788,6 +788,7 @@ pub fn ui_left_pane(ui: &mut Context,
         align: Top,
         width: percent!(1.0),
         height: grow!(),
+        clip: Clip,
         ..Decl
     }) {
         let balance_text_h = ui.scale(48.0);
@@ -890,9 +891,10 @@ pub fn ui_left_pane(ui: &mut Context,
                 if let _ = elem().decl(Decl {
                     colour: TRANSACTION_HISTORY_CONTAINER_COL,
                     child_gap: child_gap * 0.5, padding,
-                    radius: radius.mul(2.0),
+                    radius: padding.0.dup4(),
                     width:  percent!(1.0),
-                    height: grow!(radius.0 * 2.0),
+                    // height: grow!(radius.0 * 2.0),
+                    height: percent!(1.0),
                     direction: TopToBottom,
                     clip: Scroll(0.0, ui.history_scroll),
                     align: Top,
