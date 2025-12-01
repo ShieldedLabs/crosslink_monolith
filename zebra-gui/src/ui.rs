@@ -1387,6 +1387,50 @@ pub fn ui_right_pane(ui: &mut Context,
                 height: fit!(),
                 ..Decl
             }) {
+                let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
+                    let id = id(label);
+                    let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled);
+                    if let _ = elem().decl(Decl {
+                        id,
+                        child_gap,
+                        align: Center,
+                        direction: TopToBottom,
+                        width: fit!(),
+                        height: fit!(),
+                        ..Decl
+                    }) {
+                        let radius = ui.scale(24.0);
+
+                        // Button
+                        if let _ = elem().decl(Decl {
+                            colour,
+                            padding,
+                            child_gap,
+                            radius: radius.dup4(),
+                            align: Center,
+                            width:  fit!(ui.scale(192.0)),
+                            height: fit!(radius * 2.0),
+                            ..Decl
+                        }) {
+                            let h = ui.scale(20.0);
+                            ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
+                        }
+                    }
+
+                    clicked
+                };
+
+
+                let mut recv_address = String::new();
+                for b in wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().iter().rev() {
+                    recv_address.push_str(&format!("{:02x}", b));
+                }
+                ui.text("Your Finalizer Address", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                ui.text(frame_strf!(data, "[{}]", &recv_address), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                if button_ex(ui, "Copy Finalizer Address", true, true) {
+                    ui.input().send_to_clipboard(&recv_address);
+                }
+
                 for (index, member) in roster.iter().enumerate() {
                     let bytes = member.pub_key;
                     let chunks = {
@@ -1438,7 +1482,7 @@ pub fn ui_right_pane(ui: &mut Context,
                                     height: fixed!(radius * 2.0),
                                     ..Decl
                                 }) {
-                                    let temp_letter_symbol_h = ui.scale(28.0);
+                                    let temp_letter_symbol_h = ui.scale(12.0);
                                     ui.text(icon, TextDecl { colour: text_colour, font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
                                 }
                             }
@@ -1448,7 +1492,10 @@ pub fn ui_right_pane(ui: &mut Context,
                         if let _ = elem().decl(row) {
                             if let _ = elem().decl(left)  {
                                 if button(ui, ICON_DOC_INV, id_index("Button", index as u32)) {
-                                    let address_str = String::from_utf8_lossy(member.pub_key.as_slice());
+                                    let mut address_str = String::new();
+                                    for b in member.pub_key.iter().rev() {
+                                        address_str.push_str(&format!("{:02x}", b));
+                                    }
                                     ui.input().send_to_clipboard(&address_str);
                                 }
 
@@ -1469,51 +1516,6 @@ pub fn ui_right_pane(ui: &mut Context,
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
                     }
                 }
-            }
-
-
-            let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
-                let id = id(label);
-                let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled);
-                if let _ = elem().decl(Decl {
-                    id,
-                    child_gap,
-                    align: Center,
-                    direction: TopToBottom,
-                    width: fit!(),
-                    height: fit!(),
-                    ..Decl
-                }) {
-                    let radius = ui.scale(24.0);
-
-                    // Button
-                    if let _ = elem().decl(Decl {
-                        colour,
-                        padding,
-                        child_gap,
-                        radius: radius.dup4(),
-                        align: Center,
-                        width:  fit!(ui.scale(192.0)),
-                        height: fit!(radius * 2.0),
-                        ..Decl
-                    }) {
-                        let h = ui.scale(20.0);
-                        ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
-                    }
-                }
-
-                clicked
-            };
-
-
-            let mut recv_address = String::new();
-            for b in wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().iter().rev() {
-                recv_address.push_str(&format!("{:02x}", b));
-            }
-            ui.text("Your Finalizer Address", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-            ui.text(frame_strf!(data, "[{}]", &recv_address), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-            if button_ex(ui, "Copy Finalizer Address", true, true) {
-                ui.input().send_to_clipboard(&recv_address);
             }
         }
         // } else if *tab_id == tab_id_settings {
