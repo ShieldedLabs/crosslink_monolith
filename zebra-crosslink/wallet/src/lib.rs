@@ -85,6 +85,7 @@ use zcash_transparent::{
     keys::{IncomingViewingKey, TransparentKeyScope},
 };
 use zcash_primitives::transaction::StakingAction;
+use zcash_primitives::transaction::StakingActionKind;
 
 pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
@@ -128,7 +129,7 @@ async fn wait_for_zainod() {
 enum WalletAction {
     RequestFromFaucet,
     TestStakeAction,
-    StakeToMiner(Zatoshis),
+    StakeToMiner(Zatoshis, [u8; 32]),
     SendToAddress(String, Zatoshis),
 }
 
@@ -210,14 +211,14 @@ impl WalletState {
         self.actions_in_flight.push_back(WalletAction::RequestFromFaucet);
     }
 
-    pub fn stake_to_miner(&mut self, amount: u64) {
+    pub fn stake_to_miner(&mut self, amount: u64, target_finalizer: [u8; 32]) {
         self.waiting_for_stake_to_miner = true;
 
-        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::StakeToMiner(_) => true, _ => false }).count() != 0 {
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::StakeToMiner(_,_) => true, _ => false }).count() != 0 {
             return;
         }
 
-        self.actions_in_flight.push_back(WalletAction::StakeToMiner(Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_miner")));
+        self.actions_in_flight.push_back(WalletAction::StakeToMiner(Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_miner"), target_finalizer));
     }
 
     pub fn send_to_address(&mut self, address: String, amount: u64) {
@@ -1129,7 +1130,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         true
                     }
 
-                    WalletAction::StakeToMiner(amount) => {
+                    WalletAction::StakeToMiner(amount, target_finalizer) => {
                         let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
                             println!("Failed to get wallet summary");
                             break;
@@ -1148,8 +1149,17 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             break;
                         }
 
-                        println!("********** STAKING ZEC {:?} ({:?}) TO THE MINER", amount, amount_with_fee);
-                        let ok = send_zats(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network, Some(StakingAction::parse_from_cmd(&format!("ADD|10000{}|james", amount_with_fee.into_u64())).unwrap().unwrap())).await;
+                        println!("********** STAKING ZEC {:?} ({:?}) TO THE MINER but also to {:?}", amount, amount_with_fee, target_finalizer);
+                        let ok = send_zats(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network,
+                            Some(StakingAction {
+                                kind: StakingActionKind::Add,
+                                val: amount_with_fee.into_u64(),
+                                target: target_finalizer,
+                                source: [0_u8; 32],
+                                insecure_target_name: "".to_owned(),
+                                insecure_source_name: "".to_owned(),
+                            })
+                        ).await;
                         if !ok {
                             println!("Failed to send ZEC to miner");
                             break;

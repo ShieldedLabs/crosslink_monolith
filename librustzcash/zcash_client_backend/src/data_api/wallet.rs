@@ -110,6 +110,7 @@ use {
     zcash_protocol::consensus::NetworkConstants,
 };
 use zcash_primitives::transaction::StakingAction;
+use zcash_primitives::transaction::StakingActionKind;
 
 pub mod input_selection;
 use input_selection::{GreedyInputSelector, InputSelector, InputSelectorError};

@@ -24,6 +24,7 @@ pub struct UiData {
     pub per_frame_strs: Vec<String>,
 
     pub send_address: String,
+    pub stake_address: String,
     pub recv_address: String,
 }
 
@@ -797,6 +798,22 @@ pub fn ui_left_pane(ui: &mut Context,
                 Modal::Stake => {
                     title_bar(ui, true, "Stake",   id("Stake Title Bar"));
 
+                    let mut stake_address = "00000000..00000000";
+                    if data.stake_address.len() != 0 {
+                        stake_address = &data.stake_address;
+                        if stake_address.len() > 20 {
+                            stake_address = &stake_address[..20];
+                        }
+                    }
+
+                    ui.text(frame_strf!(data, "[{}]", stake_address), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                    if button_ex(ui, "Paste Address", true) {
+                        data.stake_address = ui.input().get_from_clipboard().trim().to_string();
+                    }
+
+                    // spacer
+                    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
+
                     if (wallet_state.lock().unwrap().balance as u64) < ONE_cTAZ / 100 {
                         let colour = (0xff, 0xaf, 0x0e, 0xff);
                         ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
@@ -822,11 +839,50 @@ pub fn ui_left_pane(ui: &mut Context,
                         //     ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                         // }
 
-                        let can = !waiting_for_stake_to_miner;
-                        if button_ex(ui, "+0.01 cTAZ", can && (balance as u64) >= ONE_cTAZ / 100) { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ / 100); }
-                        if button_ex(ui,  "+0.1 cTAZ", can && (balance as u64) >= ONE_cTAZ / 10)  { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ / 10);  }
-                        if button_ex(ui,    "+1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ);       }
-                        if button_ex(ui,   "+10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ * 10);  }
+                        pub fn addr_from_str_bytes(data: &[u8]) -> Option<[u8; 32]> {
+                            const VALS: [u8; 256] = {
+                                let mut v = [0xff; 256];
+                                v[b'0' as usize] = 0x0;
+                                v[b'1' as usize] = 0x1;
+                                v[b'2' as usize] = 0x2;
+                                v[b'3' as usize] = 0x3;
+                                v[b'4' as usize] = 0x4;
+                                v[b'5' as usize] = 0x5;
+                                v[b'6' as usize] = 0x6;
+                                v[b'7' as usize] = 0x7;
+                                v[b'8' as usize] = 0x8;
+                                v[b'9' as usize] = 0x9;
+                                v[b'a' as usize] = 0xa;
+                                v[b'b' as usize] = 0xb;
+                                v[b'c' as usize] = 0xc;
+                                v[b'd' as usize] = 0xd;
+                                v[b'e' as usize] = 0xe;
+                                v[b'f' as usize] = 0xf;
+                                v
+                            };
+                            let mut buf = [0u8; 32];
+                            for i in 0..32 {
+                                let a = data.get(2*i)?;
+                                let b = data.get(2*i + 1)?;
+                                let a = VALS[*a as usize];
+                                if a == 0xff {
+                                    return None;
+                                }
+                                let b = VALS[*b as usize];
+                                if b == 0xff {
+                                    return None;
+                                }
+                                buf[31-i] = (a << 4) | b
+                            }
+                            Some(buf)
+                        }
+                        let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
+
+                        let can = !waiting_for_stake_to_miner && hex_dest.is_some();
+                        if button_ex(ui, "+0.01 cTAZ", can && (balance as u64) >= ONE_cTAZ / 100) { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ / 100, hex_dest.unwrap()); }
+                        if button_ex(ui,  "+0.1 cTAZ", can && (balance as u64) >= ONE_cTAZ / 10)  { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ / 10, hex_dest.unwrap());  }
+                        if button_ex(ui,    "+1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ, hex_dest.unwrap());       }
+                        if button_ex(ui,   "+10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ * 10, hex_dest.unwrap());  }
                     }
                 }
                 Modal::Unstake => {
