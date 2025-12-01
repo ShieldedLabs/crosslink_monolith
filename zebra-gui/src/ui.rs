@@ -896,7 +896,7 @@ pub fn ui_left_pane(ui: &mut Context,
                 let id = id("History Scroll Container");
                 if ui.hovered(id) {
                     ui.history_scroll -= ui.input().zoom_delta     as f32 * 32.0;
-                    ui.history_scroll -= ui.input().scroll_delta.0 as f32 * 32.0;
+                    ui.history_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
                 }
                 if ui.history_scroll < 0.0 {
                     ui.history_scroll = 0.0;
@@ -1229,9 +1229,14 @@ pub fn ui_right_pane(ui: &mut Context,
 
     if viz.inspecting_block_hash != Hash32::from_u64(0) {
         let ctx_menu_pos = (viz.inspecting_block_screen_x, viz.inspecting_block_screen_y);
+        let id = id("Block Inspector Contents");
+        if ui.hovered(id) {
+            ui.capture = true;
+        }
         if let _ = elem().decl(Decl {
-            id: id("Block Inspector Contents"),
+            id,
             colour: PANE_COL,
+            child_gap, padding, radius,
             width: fixed!(ui.scale(128.0)),
             height: fixed!(ui.scale(128.0)),
             floating: Floating::Root(ctx_menu_pos.0 as f32, ctx_menu_pos.1 as f32),

@@ -634,7 +634,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         { play_sound(SOUND_UI_HOVER, 0.5, 1.0); }
     }
 
-    if input_ctx.mouse_pressed(MouseButton::Left) {
+    if !ui.capture && input_ctx.mouse_pressed(MouseButton::Left) {
         viz_state.inspecting_block_hash = hovered_block;
         viz_state.inspecting_block_screen_x = hovered_block_screen_x;
         viz_state.inspecting_block_screen_y = hovered_block_screen_y;
