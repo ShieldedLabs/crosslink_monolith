@@ -1457,7 +1457,7 @@ pub fn ui_right_pane(ui: &mut Context,
                         ..Decl
                     }) {
                         let row   = Decl { width: percent!(1.0), child_gap, height: fit!(), ..Decl };
-                        let left  = Decl { width: grow!(), height: fit!(), align: Left,  ..Decl };
+                        let left  = Decl { width: grow!(), height: fit!(), child_gap, align: Left,  ..Decl };
                         let right = Decl { width: grow!(), height: fit!(), align: Right, ..Decl };
 
                         let left_text  = TextDecl { h: ui.scale(24.0),  align: AlignX::Left,  ..TextDecl  };
@@ -1482,7 +1482,7 @@ pub fn ui_right_pane(ui: &mut Context,
                                     height: fixed!(radius * 2.0),
                                     ..Decl
                                 }) {
-                                    let temp_letter_symbol_h = ui.scale(12.0);
+                                    let temp_letter_symbol_h = ui.scale(24.0);
                                     ui.text(icon, TextDecl { colour: text_colour, font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
                                 }
                             }
