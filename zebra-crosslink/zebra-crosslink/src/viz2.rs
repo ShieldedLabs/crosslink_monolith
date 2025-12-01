@@ -139,8 +139,13 @@ pub async fn service_viz_requests(
                     response.bft_tip_height = (internal.bft_blocks.len() as u64).saturating_sub(1);
                     for (i, bc) in seq_blocks.iter().enumerate() {
                         if let Some(bc) = bc {
+                            let this_hash = Hash32::from_bytes(bc.header.hash().0);
+                            if request.want_to_inspect_block == this_hash {
+                                response.what_block_it_is = this_hash;
+                                response.json_dump_of_the_block = format!("{:?}", bc);
+                            }
                             response.bc_blocks.push(visualizer_zcash::BcBlock {
-                                this_hash: Hash32::from_bytes(bc.header.hash().0),
+                                this_hash: this_hash,
                                 parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
                                 this_height: lo_height.0 as u64 + i as u64,
                                 is_best_chain: true,
@@ -150,15 +155,20 @@ pub async fn service_viz_requests(
                             });
                         }
                     }
-                    response.bft_blocks = internal.bft_blocks.iter().enumerate().map(|(i, b)|
-                        visualizer_zcash::BftBlock {
-                            this_hash: Hash32::from_bytes(b.blake3_hash().0),
+                    for (i, b) in internal.bft_blocks.iter().enumerate() {
+                        let this_hash = Hash32::from_bytes(b.blake3_hash().0);
+                        if request.want_to_inspect_block == this_hash {
+                            response.what_block_it_is = this_hash;
+                            response.json_dump_of_the_block = format!("{:?}", b);
+                        }
+                        response.bft_blocks.push(visualizer_zcash::BftBlock {
+                            this_hash: this_hash,
                             parent_hash: Hash32::from_bytes(b.previous_block_hash().0),
                             this_height: i as u64,
                             points_at_bc_block: Hash32::from_bytes(b.finalization_candidate().hash().0),
                             proving_blocks: b.headers.iter().skip(1).map(|x| Hash32::from_bytes(x.hash().0)).collect(),
-                        }
-                    ).collect();
+                        });
+                    };
                     let _ = response_queue.try_send(response);
                 } else {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;

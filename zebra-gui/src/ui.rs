@@ -864,7 +864,7 @@ pub fn ui_right_pane(ui: &mut Context,
                  tab_id: &mut Id) {
     let mut tab_id_faucet = Id::default();
     let mut tab_id_roster = Id::default();
-    let mut tab_id_settings = Id::default();
+    // let mut tab_id_settings = Id::default();
 
     if let _ = elem().decl(Decl {
         id: id("Tab Bar"),
@@ -876,7 +876,7 @@ pub fn ui_right_pane(ui: &mut Context,
     }) {
         tab_id_faucet   = ui.tab(radius, padding, tab_id, clicked_id, "Faucet");
         // tab_id_roster   = ui.tab(radius, padding, tab_id, clicked_id, "Roster");
-        tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, clicked_id, "Settings");
+        // tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, clicked_id, "Settings");
     }
 
     // Main contents
@@ -1015,8 +1015,8 @@ pub fn ui_right_pane(ui: &mut Context,
 
             };
         } else if *tab_id == tab_id_roster {
-        } else if *tab_id == tab_id_settings {
         }
+        // } else if *tab_id == tab_id_settings {
     }
 
     // spacer
@@ -1037,6 +1037,11 @@ pub fn ui_right_pane(ui: &mut Context,
             ui.text(frame_strf!(data, "Click on a Block to Inspect its JSON!"), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
         } else {
             ui.text_no_wrap(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
+            if let Some(s) = viz.inspect_block_json_text.as_ref() {
+                ui.text_no_wrap(s, TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
+            } else {
+                ui.text_no_wrap("Loading...", TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
+            }
         }
     }
 }
@@ -1106,9 +1111,11 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
     let mut pane_tab_l = ui.pane_tab_l; // @Todo: how to not have to do this in rust?
     let mut pane_tab_r = ui.pane_tab_r; // @Todo: how to not have to do this in rust?
 
+    
     let mut c = clay.begin::<(), ()>();
-
+    
     unsafe { clay::Clay_SetCurrentContext(c.clay.context); }
+    unsafe { clay::Clay_SetMaxMeasureTextCacheWordCount(262144); }
 
     // c.set_debug_mode(true);
 
