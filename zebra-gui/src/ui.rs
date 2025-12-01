@@ -1151,8 +1151,6 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
         clay::math::Dimensions::new(w, h)
     });
 
-    let mut pane_tab_l = ui.pane_tab_l; // @Todo: how to not have to do this in rust?
-    let mut pane_tab_r = ui.pane_tab_r; // @Todo: how to not have to do this in rust?
     let mut c = clay.begin::<(), ()>();
 
     unsafe { clay::Clay_SetCurrentContext(c.clay.context); }
@@ -1168,8 +1166,6 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
         ..Decl
     }) {
 
-        let pane_tab_l = &mut pane_tab_l;
-        let pane_tab_r = &mut pane_tab_r;
         let pane_pct = Sizing::Percent(ui.zoom * PANE_PERCENT);
 
         if let _elem = elem().decl(Decl {
@@ -1185,7 +1181,9 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
                 ui.capture = true;
             }
 
-            ui_left_pane(ui, wallet_state.clone(), data, viz, child_gap, padding, radius, pane_tab_l);
+            let mut pane_tab_l = ui.pane_tab_l;
+            ui_left_pane(ui, wallet_state.clone(), data, viz, child_gap, padding, radius, &mut pane_tab_l);
+            ui.pane_tab_l = pane_tab_l;
         }
 
         if let _elem = elem().decl(Decl {
@@ -1255,7 +1253,9 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
                 ui.capture = true;
             }
 
-            ui_right_pane(ui, wallet_state.clone(), viz, data, child_gap, padding, radius, pane_tab_r);
+            let mut pane_tab_r = ui.pane_tab_r;
+            ui_right_pane(ui, wallet_state.clone(), viz, data, child_gap, padding, radius, &mut pane_tab_r);
+            ui.pane_tab_r = pane_tab_r;
         }
     }
 
@@ -1265,8 +1265,6 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
     if ui.clicked_id != Id::default() {
         ui.capture = true;
     }
-    ui.pane_tab_l = pane_tab_l;
-    ui.pane_tab_r = pane_tab_r;
 
     // Return the list of render commands of your layout
     let render_commands = c.end();
