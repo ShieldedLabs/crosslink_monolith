@@ -520,11 +520,11 @@ impl Context {
                 AlignX::Right  => clay::text::TextAlignment::Right,
                 AlignX::Center => clay::text::TextAlignment::Center,
             })
-            .wrap_mode(if decl.break_word {
-                clay::text::TextElementConfigWrapMode::BreakWord
-            } else {
-                clay::text::TextElementConfigWrapMode::Words
-            })
+            // .wrap_mode(if decl.break_word {
+            //     clay::text::TextElementConfigWrapMode::BreakWord
+            // } else {
+            //     clay::text::TextElementConfigWrapMode::Words
+            // })
             .end();
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
@@ -1223,60 +1223,6 @@ pub fn ui_right_pane(ui: &mut Context,
         }
         // } else if *tab_id == tab_id_settings {
     }
-
-    // // spacer
-    // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
-
-    if viz.inspecting_block_hash != Hash32::from_u64(0) {
-        let ctx_menu_pos = (viz.inspecting_block_screen_x, viz.inspecting_block_screen_y);
-        let id = id("Block Inspector Contents");
-        if ui.hovered(id) {
-            ui.capture = true;
-        }
-        if let _ = elem().decl(Decl {
-            id,
-            colour: PANE_COL,
-            child_gap, padding, radius,
-            width: fixed!(ui.scale(128.0)),
-            height: fixed!(ui.scale(128.0)),
-            floating: Floating::Root(ctx_menu_pos.0 as f32, ctx_menu_pos.1 as f32),
-            ..Decl
-        }) {
-        }
-    }
-
-
-    // TODO: bring this all back!
-    // // Block Inspector Contents
-    // if let _ = elem().decl(Decl {
-    //     id: id("Block Inspector Contents"),
-    //     colour: PANE_COL,
-    //     radius: (0.0, radius.1, 0.0, radius.3),
-    //     direction: TopToBottom,
-    //     width: percent!(1.0),
-    //     height: grow!(),
-    //     ..Decl
-    // }) {
-    //     let text_h = ui.scale(22.0);
-    //     if viz.inspecting_block_hash == Hash32::from_u64(0) {
-    //         ui.text(frame_strf!(data, "Click on a Block to Inspect its JSON!"), TextDecl { h: text_h, align: AlignX::Left, ..TextDecl });
-    //     } else {
-    //         ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
-    //
-    //         // let json = if let Some(raw) = viz.inspect_block_json_text.as_ref() {
-    //         //     match serde_json::from_str::<serde_json::Value>(raw) {
-    //         //         Ok(value) => match serde_json::to_string_pretty(&value) {
-    //         //             Ok(prettified) => prettified.to_string(),
-    //         //             Err(error) => { eprintln!("In JSON:\n{}\nPrettify error: {:?}", raw, error); todo!(); raw.to_string(); }
-    //         //         },
-    //         //         Err(error) => { eprintln!("In JSON:\n{}\nPrettify error: {:?}", raw, error); todo!(); raw.to_string(); }
-    //         //     }
-    //         // } else {
-    //         //     "Loading...".to_string()
-    //         // };
-    //         // ui.text(frame_strf!(data, "{}", json), TextDecl { font: Mono, break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
-    //     }
-    // }
 }
 
 
@@ -1448,6 +1394,48 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             ui.pane_tab_r = pane_tab_r;
         }
     }
+
+    if viz.inspecting_block_hash != Hash32::from_u64(0) {
+        let ctx_menu_pos = (viz.inspecting_block_screen_x, viz.inspecting_block_screen_y);
+        let id = id("Block Inspector Contents");
+        if ui.hovered(id) {
+            ui.capture = true;
+        }
+        let border_colour = { let mut col = PANE_COL.hsva(); col.2 = 0x18; col.rgba() };
+        if let _ = elem().decl(Decl {
+            id,
+            colour: border_colour,
+            child_gap, padding, radius,
+            width:  fit!(),
+            height: fit!(),
+            floating: Floating::Root(ctx_menu_pos.0 as f32, ctx_menu_pos.1 as f32),
+            ..Decl
+        }) {
+            if let _ = elem().decl(Decl {
+                colour: PANE_COL,
+                child_gap, padding, radius,
+                width:  fit!(ui.scale(192.0), ui.draw().window_width as f32 * 0.5),
+                height: fit!(ui.scale(128.0)),
+                direction: TopToBottom,
+                ..Decl
+            }) {
+                let text_h = ui.scale(10.0);
+                // Block Inspector Contents
+                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
+
+                let text = {
+                    if let Some(text) = viz.inspect_block_json_text.as_ref() {
+                        text.to_string()
+                    } else {
+                        "Loading...".to_string()
+                    }
+                };
+                ui.text(frame_strf!(data, "{}", text), TextDecl { font: Mono, break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
+            }
+        }
+    }
+
+
 
     if !ui.input().mouse_held(winit::event::MouseButton::Left) {
         ui.clicked_id = Id::default();
