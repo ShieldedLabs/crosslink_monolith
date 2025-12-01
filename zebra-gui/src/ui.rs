@@ -334,9 +334,10 @@ pub const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
 pub const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
 pub const INACTIVE_TAB_COL: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
 pub const ACTIVE_TAB_COL:   (u8, u8, u8, u8) = PANE_COL;
-pub const BUTTON_COL:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff); // @FigmaScreenshot
-pub const BUTTON_HOVER_COL: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
-pub const BUTTON_DOWN_COL:  (u8, u8, u8, u8) = (0x1c, 0x1c, 0x1c, 0xff);
+
+pub const BUTTON_GREY:      (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff); // @FigmaScreenshot
+pub const BUTTON_BLUE:      (u8, u8, u8, u8) = (0x1a, 0x36, 0x51, 0xff); // @FigmaScreenshot
+pub const BUTTON_ORANGE:    (u8, u8, u8, u8) = (0x59, 0x41, 0x11, 0xff); // @FigmaScreenshot
 
 pub const MODAL_COL: (u8, u8, u8, u8) = (0x1e, 0x1e, 0x1e, 0xff); // @FigmaScreenshot
 
@@ -431,7 +432,7 @@ impl Context {
 
     pub fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
 
-    pub fn button_ex(&mut self, id: Id, act_on_press: bool) -> (bool, (u8, u8, u8, u8)) {
+    pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
         let mouse_held     = self.input().mouse_held(winit::event::MouseButton::Left);
         let mouse_pressed  = self.input().mouse_pressed(winit::event::MouseButton::Left);
         let mouse_released = self.input().mouse_released(winit::event::MouseButton::Left);
@@ -448,28 +449,42 @@ impl Context {
             // self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
         }
 
-        let activated = (self.clicked_id == id) && if act_on_press {
+        let activated = enabled && (self.clicked_id == id) && if act_on_press {
             pressed
         } else {
             released
         };
 
-        let colour = if down || pressed {
-            if self.clicked_id.id == id.id {
-                BUTTON_DOWN_COL
-            } else {
-                BUTTON_COL
-            }
-        } else if hover {
-            BUTTON_HOVER_COL
-        } else {
-            BUTTON_COL
-        };
+        let mut hsva = colour.hsva();
+        if !enabled {
+            hsva.2 = hsva.2.mul(0.75);
+            hsva.1 = hsva.1.mul(0.75);
+        } else if !down && hover {
+            hsva.2 = ((hsva.2 as f32) * 1.25).min(255.0) as u8;
+        } else if down && self.clicked_id.id == id.id {
+            hsva.2 = hsva.2.mul(0.85);
+        }
+        let colour = hsva.rgba();
 
-        (activated, colour)
+        // let mut text_hsva = hsva; // WHITE.hsva();
+        // // text_hsva.1 = text_hsva.1.mul(0.5);
+        // text_hsva.2 = ((text_hsva.2 as f32) * 3.0).min(255.0) as u8;
+
+        let mut text_hsva = WHITE.hsva();
+
+        text_hsva.0 = hsva.0;
+        text_hsva.1 = hsva.1.mul(0.45);
+        text_hsva.2 = 0xf8;
+
+        if !enabled {
+            text_hsva.2 = text_hsva.2.mul(0.5);
+        }
+        let text_colour = text_hsva.rgba();
+
+        (activated, colour, text_colour)
     }
 
-    pub fn button(&mut self, id: Id) -> (bool, (u8, u8, u8, u8)) { return self.button_ex(id, true); }
+    pub fn button(&mut self, id: Id) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) { return self.button_ex(true, BUTTON_GREY, id, true); }
 
     pub fn text(&self, label: &str, decl: TextDecl) {
         let config = clay::text::TextConfig::new()
@@ -500,7 +515,7 @@ impl Context {
 
         let radius = (radius.0, radius.1, 0.0, 0.0);
 
-        let (clicked, _) = self.button(id);
+        let (clicked, _, _) = self.button(id);
         if clicked || *tab_id == Id::default() {
             *tab_id = id;
         }
@@ -619,7 +634,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Right, ..Decl }) && closeable {
                         let id = id("Close This Modal");
 
-                        let (clicked, colour) = ui.button_ex(id, false);
+                        let (clicked, colour, _) = ui.button_ex(false, BUTTON_GREY, id, true);
                         if clicked || ui.input().key_pressed(KeyCode::Escape) {
                             ui.modal = Modal::None;
                         }
@@ -656,46 +671,34 @@ pub fn ui_left_pane(ui: &mut Context,
                 Modal::Stake => {
                     title_bar(ui, true, "Stake",   id("Stake Title Bar"));
 
-                    let mut button_ex = |ui: &mut Context, label, act_on_press, disabled: bool| {
+                    let mut button_ex = |ui: &mut Context, label, enabled: bool| {
                         let id = id(label);
-                        let (clicked, mut colour) = ui.button_ex(id, act_on_press);
+                        let colour = {
+                            let mut hsva = BUTTON_GREY.hsva();
+                            hsva.2 = ((hsva.2 as f32) * 1.25).min(255.0) as u8;
+                            hsva.rgba()
+                        };
+                        let (clicked, colour, text_colour) = ui.button_ex(false, colour, id, enabled);
+                        let radius = ui.scale(24.0);
                         if let _ = elem().decl(Decl {
                             id,
+                            colour,
                             child_gap,
+                            radius: radius.dup4(),
                             align: Align::Center,
                             direction: TopToBottom,
-                            width: fit!(),
-                            height: fit!(),
+                            width:  fit!(ui.scale(192.0)),
+                            height: fit!(radius * 2.0),
                             ..Decl
                         }) {
-                            let radius = ui.scale(24.0);
-
-                            // @TEMP: real disabling
-                            if disabled {
-                                colour.3 = 100;
-                            }
-
-                            // Button
-                            if let _ = elem().decl(Decl {
-                                colour,
-                                padding,
-                                child_gap,
-                                radius: radius.dup4(),
-                                align: Align::Center,
-                                width:  fit!(ui.scale(192.0)),
-                                height: fit!(radius * 2.0),
-                                ..Decl
-                            }) {
-                                let h = ui.scale(20.0);
-                                let colour = if disabled { INACTIVE_TAB_COL } else { WHITE };
-                                ui.text(label, TextDecl { h, colour, align: AlignX::Center, ..TextDecl });
-                            }
+                            let h = ui.scale(20.0);
+                            ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
                         }
 
-                        clicked && !disabled // @TEMP: real disabling
+                        clicked
                     };
 
-                    const ONE_ZEC: u64 = 100_000_000;
+                    const ONE_cTAZ: u64 = 100_000_000;
                     let waiting_for_stake_to_miner = wallet_state.lock().unwrap().waiting_for_stake_to_miner;
 
                     if let _ = elem().decl(Decl {
@@ -710,18 +713,12 @@ pub fn ui_left_pane(ui: &mut Context,
                     }) {
                         // @todo(judah): disable buttons below current spendable balance
 
-                        if button_ex(ui, "+0.01 cTAZ", false, waiting_for_stake_to_miner) {
-                            wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC / 100);
-                        }
-                        if button_ex(ui, "+0.1 cTAZ", false, waiting_for_stake_to_miner) {
-                            wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC / 10);
-                        }
-                        if button_ex(ui, "+1 cTAZ", false, waiting_for_stake_to_miner) {
-                            wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC);
-                        }
-                        if button_ex(ui, "+10 cTAZ", false, waiting_for_stake_to_miner) {
-                            wallet_state.lock().unwrap().stake_to_miner(ONE_ZEC * 10);
-                        }
+                        let balance = wallet_state.lock().unwrap().balance;
+                        let can = !waiting_for_stake_to_miner;
+                        if button_ex(ui, "+0.01 cTAZ", can && (balance as u64) >= ONE_cTAZ / 100) { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ / 100); }
+                        if button_ex(ui,  "+0.1 cTAZ", can && (balance as u64) >= ONE_cTAZ / 10)  { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ / 10);  }
+                        if button_ex(ui,    "+1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ);       }
+                        if button_ex(ui,   "+10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ * 10);  }
                     }
                 }
                 Modal::Unstake => {
@@ -818,7 +815,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                 let mut button = |ui: &mut Context, icon: &'static str, label: &'static str| {
                     let id = id(label);
-                    let (clicked, colour) = ui.button(id);
+                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, true);
                     if let _ = elem().decl(Decl {
                         id, child_gap, align: Center,
                         direction: TopToBottom,
@@ -837,7 +834,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             ..Decl
                         }) {
                             let temp_letter_symbol_h = ui.scale(28.0);
-                            ui.text(icon, TextDecl { font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
+                            ui.text(icon, TextDecl { colour: text_colour, font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
                         }
 
                         let button_text_h = ui.scale(16.0);
@@ -846,10 +843,12 @@ pub fn ui_left_pane(ui: &mut Context,
                     clicked
                 };
 
-                if button(ui, ICON_DATABASE, "Send")    { ui.modal = Modal::Send;    }
+                if button(ui, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
+                // if button(ui, ICON_DATABASE, "Send")    { ui.modal = Modal::Send;    }
                 if button(ui, ICON_QRCODE,   "Receive") { ui.modal = Modal::Receive; }
-                if button(ui, ICON_PLUS,     "Stake")   { ui.modal = Modal::Stake;   }
-                if button(ui, ICON_MINUS_1,  "Unstake") { ui.modal = Modal::Unstake; }
+                // if button(ui, ICON_PLUS,     "Stake")   { ui.modal = Modal::Stake;   }
+                if button(ui, ICON_DATABASE,     "Stake")   { ui.modal = Modal::Stake;   }
+                // if button(ui, ICON_MINUS_1,  "Unstake") { ui.modal = Modal::Unstake; }
             }
         } else if *tab_id == tab_id_finalizers {
         } else if *tab_id == tab_id_history {
@@ -1077,9 +1076,9 @@ pub fn ui_right_pane(ui: &mut Context,
                 ..Decl
             }) {
 
-                let mut button_ex = |label, act_on_press, disabled: bool| {
+                let mut button_ex = |label, act_on_press, enabled: bool| {
                     let id = id(label);
-                    let (clicked, mut colour) = ui.button_ex(id, act_on_press);
+                    let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled);
                     if let _ = elem().decl(Decl {
                         id,
                         child_gap,
@@ -1090,11 +1089,6 @@ pub fn ui_right_pane(ui: &mut Context,
                         ..Decl
                     }) {
                         let radius = ui.scale(24.0);
-
-                        // @TEMP: real disabling
-                        if disabled {
-                            colour.3 = 100;
-                        }
 
                         // Button
                         if let _ = elem().decl(Decl {
@@ -1108,16 +1102,14 @@ pub fn ui_right_pane(ui: &mut Context,
                             ..Decl
                         }) {
                             let h = ui.scale(20.0);
-                            let colour = if disabled { INACTIVE_TAB_COL } else { WHITE };
-                            ui.text(label, TextDecl { h, colour, align: AlignX::Center, ..TextDecl });
+                            ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
                         }
                     }
 
-                    clicked && !disabled // @TEMP: real disabling
+                    clicked
                 };
 
-                // @TEMP: real disabling
-                if button_ex("Receive cTAZ", false, wallet_state.lock().unwrap().waiting_for_faucet) {
+                if button_ex("Receive cTAZ", false, !wallet_state.lock().unwrap().waiting_for_faucet) {
                     wallet_state.lock().unwrap().request_from_faucet();
                 }
             }
@@ -1323,8 +1315,11 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             // "Reset View" button
             if let _ = elem().decl(Decl { align: Bottom, width: grow!(), ..Decl }) {
                 let label = "Reset View";
+
+                let enabled = viz.camera_x != 0.0 || viz.camera_y != 0.0 || viz.zoom != 0.0;
+
                 let id = id(label);
-                let (clicked, colour) = ui.button_ex(id, true);
+                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, id, enabled);
                 let radius = ui.scale(20.0);
 
                 if ui.hovered(id) {
@@ -1344,8 +1339,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
                     ..Decl
                 }) {
                     let button_text_h = ui.scale(16.0);
-                    let colour = WHITE;
-                    ui.text(label, TextDecl { h: button_text_h, colour, align: AlignX::Center, ..TextDecl });
+                    ui.text(label, TextDecl { h: button_text_h, colour: text_colour, align: AlignX::Center, ..TextDecl });
                 }
 
                 if clicked {
