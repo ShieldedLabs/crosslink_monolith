@@ -1223,8 +1223,8 @@ pub fn ui_right_pane(ui: &mut Context,
         align: Center,
         ..Decl
     }) {
-        tab_id_faucet  = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet ({})", &wallet_state.lock().unwrap().miner_seen_height));
-        tab_id_roster   = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, "Guardians");
+        tab_id_faucet = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet ({})", &wallet_state.lock().unwrap().miner_seen_height));
+        tab_id_roster = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, "Guardians");
     }
 
     // Main contents
@@ -1305,6 +1305,7 @@ pub fn ui_right_pane(ui: &mut Context,
                 }
             }
 
+            // info container
             if let _ = elem().decl(Decl {
                 padding: ui.scale(32.0).dup4(), child_gap, align: TopLeft,
                 width: grow!(), height: fit!(),
@@ -1348,9 +1349,52 @@ pub fn ui_right_pane(ui: &mut Context,
                     if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_p)), right_text); }
                 }
                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
-
             };
         } else if *tab_id == tab_id_roster {
+            fn display_str(chunks: &[u64; 4]) -> String {
+                let mut bytes = {
+                    let mut out = [0u8; 32];
+                    let mut i = 0;
+                    for &chunk in chunks {
+                        let le = chunk.to_le_bytes(); // linear memory bytes for a LE u64
+                        out[i..i + 8].copy_from_slice(&le);
+                        i += 8;
+                    }
+                    out
+                };
+
+                let mut str = String::new();
+                bytes.reverse();
+
+                for b in &bytes[0..4] {
+                    str.push_str(&format!("{:02x}", b));
+                }
+                str.push_str("..");
+                for b in &bytes[bytes.len() - 4..] {
+                    str.push_str(&format!("{:02x}", b));
+                }
+
+                str
+            }
+
+            let roster = wallet_state.lock().unwrap().roster.clone();
+            for (index, member) in roster.iter().enumerate() {
+                let bytes = member.pub_key;
+                let chunks = {
+                    let mut chunks = [0u64; 4];
+                    for i in 0..4 {
+                        let start = i * 8;
+                        let end = start + 8;
+                        let mut buf = [0u8; 8];
+                        buf.copy_from_slice(&bytes[start..end]);
+                        chunks[i] = u64::from_le_bytes(buf);
+                    }
+
+                    chunks
+                };
+
+                ui.text(frame_strf!(data, "{} {}", display_str(&chunks), member.stake), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+            }
         }
         // } else if *tab_id == tab_id_settings {
     }
