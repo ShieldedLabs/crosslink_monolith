@@ -1224,7 +1224,7 @@ pub fn ui_right_pane(ui: &mut Context,
         ..Decl
     }) {
         tab_id_faucet = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet ({})", &wallet_state.lock().unwrap().miner_seen_height));
-        tab_id_roster = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, "Guardians");
+        tab_id_roster = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, "Finalizers");
     }
 
     // Main contents
