@@ -11,12 +11,12 @@ pub static REQUESTS_TO_ZEBRA: Mutex<Option<std::sync::mpsc::Receiver<RequestToZe
 pub static RESPONSES_FROM_ZEBRA: Mutex<Option<std::sync::mpsc::SyncSender<ResponseFromZebra>>> = Mutex::new(None);
 
 pub struct RequestToZebra {
-    rtype: u8,
+    pub want_to_inspect_block: Hash32,
 }
 impl RequestToZebra {
     pub fn _0() -> Self {
         RequestToZebra {
-            rtype: 0,
+            want_to_inspect_block: Hash32::from_u64(0),
         }
     }
 }
@@ -25,6 +25,8 @@ pub struct ResponseFromZebra {
     pub bft_tip_height: u64,
     pub bc_blocks: Vec<BcBlock>,
     pub bft_blocks: Vec<BftBlock>,
+    pub what_block_it_is: Hash32,
+    pub json_dump_of_the_block: String,
 }
 impl ResponseFromZebra {
     pub fn _0() -> Self {
@@ -33,6 +35,8 @@ impl ResponseFromZebra {
             bft_tip_height: 0,
             bc_blocks: Vec::new(),
             bft_blocks: Vec::new(),
+            what_block_it_is: Hash32::from_u64(0),
+            json_dump_of_the_block: "Data not available.".to_owned(),
         }
     }
 }
@@ -238,6 +242,9 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
             bc.block.is_best_chain = false;
         }
 
+        if message.what_block_it_is == viz_state.inspecting_block_hash {
+            viz_state.inspect_block_json_text = Some(message.json_dump_of_the_block);
+        }
 
         let zoom = ZOOM_FACTOR.powf(viz_state.zoom);
         // origin
@@ -281,7 +288,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
     }
 
     if anything_happened == false {
-        let _ = viz_state.send_to_zebra.try_send(RequestToZebra::_0());
+        let _ = viz_state.send_to_zebra.try_send(RequestToZebra { want_to_inspect_block: viz_state.inspecting_block_hash, });
     }
 
     // animations
