@@ -627,13 +627,18 @@ pub fn ui_left_pane(ui: &mut Context,
 
         if container_hovered { ui.capture = true; }
 
+        let mut height = grow!(ui.scale(192.0), ui.scale(384.0));
+        if ui.modal == Modal::Stake {
+            height = fit!();
+        }
+
         if let _elem = elem().decl(Decl {
             child_gap, radius,
             id: id("Modal Contents"),
             padding: padding.mul(2.0),
             colour: MODAL_COL,
             width:  grow!(ui.scale(192.0), ui.scale(384.0)),
-            height: grow!(ui.scale(192.0), ui.scale(384.0)),
+            height: height,
             align: Top,
             direction: TopToBottom,
             ..Decl
@@ -822,16 +827,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     const ONE_cTAZ: u64 = 100_000_000;
                     let waiting_for_stake_to_miner = wallet_state.lock().unwrap().waiting_for_stake_to_miner;
 
-                    if let _ = elem().decl(Decl {
-                        child_gap, radius,
-                        id: id("Staking Buttons"),
-                        colour: MODAL_COL,
-                        width:  grow!(),
-                        height: grow!(),
-                        align: Center,
-                        direction: TopToBottom,
-                        ..Decl
-                    }) {
+                    {
                         let balance = wallet_state.lock().unwrap().balance;
 
                         // if (balance as u64) < ONE_cTAZ / 100 {
@@ -907,7 +903,7 @@ pub fn ui_left_pane(ui: &mut Context,
     }) {
         tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Wallet");
         // tab_id_finalizers = ui.tab(radius, padding, tab_id, "Finalizers");
-        tab_id_history    = ui.tab_ex(radius, padding, tab_id, id("History"), frame_strf!(data, "History ({})", &wallet_state.lock().unwrap().txs.len()));
+        // tab_id_history    = ui.tab_ex(radius, padding, tab_id, id("History"), frame_strf!(data, "History ({})", &wallet_state.lock().unwrap().txs.len()));
     }
 
     // Main contents
@@ -928,7 +924,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
         if *tab_id == tab_id_wallet {
             // spacer
-            if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
+            // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
             let (
                 balance,
@@ -1015,8 +1011,9 @@ pub fn ui_left_pane(ui: &mut Context,
                 if button(ui, ICON_DATABASE,     "Stake")   { ui.modal = Modal::Stake;   }
                 // if button(ui, ICON_MINUS_1,  "Unstake") { ui.modal = Modal::Unstake; }
             }
-        } else if *tab_id == tab_id_finalizers {
-        } else if *tab_id == tab_id_history {
+
+            // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+
             {
                 let txs = &wallet_state.lock().unwrap().txs;
 
@@ -1045,8 +1042,8 @@ pub fn ui_left_pane(ui: &mut Context,
                     child_gap: child_gap * 0.5, padding,
                     radius: padding.0.dup4(),
                     width:  percent!(1.0),
-                    // height: grow!(radius.0 * 2.0),
-                    height: percent!(1.0),
+                    height: grow!(),
+                    // height: percent!(1.0),
                     direction: TopToBottom,
                     clip: Scroll(0.0, -ui.history_scroll * ui.scale),
                     align: Top,
@@ -1200,6 +1197,9 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
                 }
             }
+
+        } else if *tab_id == tab_id_finalizers {
+        } else if *tab_id == tab_id_history {
         }
     }
 }
