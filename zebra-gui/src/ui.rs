@@ -24,6 +24,7 @@ pub struct UiData {
     pub per_frame_strs: Vec<String>,
 
     pub send_address: String,
+    pub recv_address: String,
 }
 
 
@@ -775,6 +776,23 @@ pub fn ui_left_pane(ui: &mut Context,
                 }
                 Modal::Receive => {
                     title_bar(ui, true, "Receive", id("Receive Title Bar"));
+
+                    if let _ = elem().decl(Decl {
+                        child_gap, radius,
+                        id: id("Receive Container"),
+                        colour: MODAL_COL,
+                        width:  grow!(),
+                        height: grow!(),
+                        align: Center,
+                        direction: TopToBottom,
+                        ..Decl
+                    }) {
+                        let recv_address = "00000000..00000000";
+                        ui.text(frame_strf!(data, "[{}]", recv_address), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                        if button_ex(ui, "Copy Address", true) {
+                            ui.input().send_to_clipboard(recv_address);
+                        }
+                    }
                 }
                 Modal::Stake => {
                     title_bar(ui, true, "Stake",   id("Stake Title Bar"));
