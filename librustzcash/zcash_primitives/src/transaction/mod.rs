@@ -1384,8 +1384,8 @@ pub struct StakingAction {
     pub target: [u8; 32],
     pub source: [u8; 32],
     // temporary
-    pub insecure_target_name: std::string::String,
-    pub insecure_source_name: std::string::String,
+    // pub insecure_target_name: std::string::String,
+    // pub insecure_source_name: std::string::String,
 }
 impl StakingAction {
     fn hash_to_state(&self, writer: &mut crate::encoding::StateWrite) -> Option<()> {
@@ -1395,6 +1395,53 @@ impl StakingAction {
         writer.write_all(&self.source).ok()
     }
 
+    // TODO: fold in existing
+    pub fn str_from_addr(addr: [u8; 32]) -> std::string::String {
+        let mut str = std::string::String::with_capacity(64);
+        for i in 0..32 {
+            str.push_str(&format!("{:02x}", addr[31-i]));
+        }
+        str
+    }
+    pub fn addr_from_str_bytes(data: &[u8]) -> Option<[u8; 32]> {
+        const VALS: [u8; 256] = {
+            let mut v = [0xff; 256];
+            v[b'0' as usize] = 0x0;
+            v[b'1' as usize] = 0x1;
+            v[b'2' as usize] = 0x2;
+            v[b'3' as usize] = 0x3;
+            v[b'4' as usize] = 0x4;
+            v[b'5' as usize] = 0x5;
+            v[b'6' as usize] = 0x6;
+            v[b'7' as usize] = 0x7;
+            v[b'8' as usize] = 0x8;
+            v[b'9' as usize] = 0x9;
+            v[b'a' as usize] = 0xa;
+            v[b'b' as usize] = 0xb;
+            v[b'c' as usize] = 0xc;
+            v[b'd' as usize] = 0xd;
+            v[b'e' as usize] = 0xe;
+            v[b'f' as usize] = 0xf;
+            v
+        };
+        let mut buf = [0u8; 32];
+        for i in 0..32 {
+            let a = data.get(2*i)?;
+            let b = data.get(2*i + 1)?;
+            let a = VALS[*a as usize];
+            if a == 0xff {
+                return None;
+            }
+            let b = VALS[*b as usize];
+            if b == 0xff {
+                return None;
+            }
+            buf[31-i] = (a << 4) | b
+        }
+        Some(buf)
+    }
+
+
     pub fn to_cmd_string(&self) -> std::string::String {
         let kind_str = match self.kind {
             StakingActionKind::Add       => &"ADD",
@@ -1403,10 +1450,10 @@ impl StakingAction {
             // StakingActionKind::Move      => &"MOV",
             StakingActionKind::MoveClear => &"MCL",
         };
-        let mut str = format!("{kind_str}|{}|{}", self.val, self.insecure_target_name);
+        let mut str = format!("{kind_str}|{}|{}", self.val, Self::str_from_addr(self.target));
         // if self.kind == StakingActionKind::Move || self.kind == StakingActionKind::MoveClear {
         if self.kind == StakingActionKind::MoveClear {
-            str.push_str(&format!("|{}", self.insecure_source_name));
+            str.push_str(&format!("|{}", Self::str_from_addr(self.source)));
         }
         str
     }
@@ -1466,19 +1513,31 @@ impl StakingAction {
                     addr0_end += 1;
                 }
 
-                let (_, _, pub_key) =
-                    rng_private_public_key_from_address(&cmd[addr0_bgn..addr0_end]);
+                let Some(pub_key) = Self::addr_from_str_bytes(&cmd[addr0_bgn..addr0_end]) else {
+                    return Err(format!(
+                            "Roster command invalid: incorrectly-formed target address \"{}\"\nCMD: \"{}\"",
+                            &cmd_str[addr0_bgn..addr0_end], cmd_str
+                    ));
+                };
+                // let (_, _, pub_key) =
+                //     rng_private_public_key_from_address(&cmd[addr0_bgn..addr0_end]);
 
                 let (addr1_bgn, public_key1) = if addr0_end + 1 < cmd.len() {
                     let addr1_bgn = addr0_end + 1;
-                    let (_, _, public_key1) = rng_private_public_key_from_address(&cmd[addr1_bgn..]);
+                    let Some(public_key1) = Self::addr_from_str_bytes(&cmd[addr1_bgn..]) else {
+                        return Err(format!(
+                                "Roster command invalid: incorrectly-formed source address \"{}\"\nCMD: \"{}\"",
+                                &cmd_str[addr1_bgn..], cmd_str
+                        ));
+                    };
+                    // let (_, _, public_key1) = rng_private_public_key_from_address(&cmd[addr1_bgn..]);
                     (Some(addr1_bgn), Some(public_key1))
                 } else {
                     (None, None)
                 };
 
-                let insecure_target_name = std::string::String::from(&cmd_str[addr0_bgn..addr0_end]);
-                let mut insecure_source_name = std::string::String::new();
+                // let insecure_target_name = std::string::String::from(&cmd_str[addr0_bgn..addr0_end]);
+                // let mut insecure_source_name = std::string::String::new();
                 let mut source = [0u8; 32];
 
                 let kind = match cmd[..3] {
@@ -1497,10 +1556,10 @@ impl StakingAction {
 
                     [b'M', b'C', b'L'] => {
                         let Some(pk) = public_key1 else {
-                            return Err(format!("Roster command invalid: can't clear from non-present finalizer \"{}\"\nCMD: \"{}\"", insecure_source_name, cmd_str));
+                            return Err(format!("Roster command invalid: can't clear from non-present finalizer\nCMD: \"{}\"", cmd_str));
                         };
                         source = pk.into();
-                        insecure_source_name = std::string::String::from(&cmd_str[addr1_bgn.unwrap_or(cmd_str.len())..]);
+                        // insecure_source_name = std::string::String::from(&cmd_str[addr1_bgn.unwrap_or(cmd_str.len())..]);
                         StakingActionKind::MoveClear
                     }
 
@@ -1515,8 +1574,8 @@ impl StakingAction {
                     val,
                     target: pub_key.into(),
                     source,
-                    insecure_target_name,
-                    insecure_source_name,
+                    // insecure_target_name,
+                    // insecure_source_name,
                 }))
             }
         }
@@ -1548,21 +1607,21 @@ impl StakingAction {
         let mut source = [0u8; 32];
         reader.read_exact(&mut source)?;
 
-        // TODO(@Prod): remove all of the following once we no longer have insecure user names
-        use std::string::ToString;
+        // // TODO(@Prod): remove all of the following once we no longer have insecure user names
+        // use std::string::ToString;
 
-        let target_name_len = reader.read_u8()? as usize;
-        let mut target_name_buf = vec![0u8; target_name_len];
-        reader.read_exact(&mut target_name_buf)?;
-        let insecure_target_name = std::string::String::from_utf8_lossy(&target_name_buf).to_string();
+        // let target_name_len = reader.read_u8()? as usize;
+        // let mut target_name_buf = vec![0u8; target_name_len];
+        // reader.read_exact(&mut target_name_buf)?;
+        // let insecure_target_name = std::string::String::from_utf8_lossy(&target_name_buf).to_string();
 
-        let source_name_len = reader.read_u8()? as usize;
-        let mut source_name_buf = vec![0u8; source_name_len];
-        reader.read_exact(&mut source_name_buf)?;
-        let insecure_source_name = std::string::String::from_utf8_lossy(&source_name_buf).to_string();
+        // let source_name_len = reader.read_u8()? as usize;
+        // let mut source_name_buf = vec![0u8; source_name_len];
+        // reader.read_exact(&mut source_name_buf)?;
+        // let insecure_source_name = std::string::String::from_utf8_lossy(&source_name_buf).to_string();
 
         Ok(Some(StakingAction {
-            kind, val, source, target, insecure_target_name, insecure_source_name
+            kind, val, source, target, // insecure_target_name, insecure_source_name
         }))
     }
 
@@ -1575,15 +1634,16 @@ impl StakingAction {
             writer.write_u64_le(staking_action.val)?;
             writer.write_all(&staking_action.target)?;
             writer.write_all(&staking_action.source)?;
+            Ok(())
 
             // TODO(@Prod): remove all of the following once we no longer have insecure user names
-            let target_len = usize::min(u8::MAX as usize, staking_action.insecure_target_name.len());
-            writer.write_u8(target_len as u8)?;
-            writer.write_all(&staking_action.insecure_target_name.as_bytes()[..target_len])?;
+            // let target_len = usize::min(u8::MAX as usize, staking_action.insecure_target_name.len());
+            // writer.write_u8(target_len as u8)?;
+            // writer.write_all(&staking_action.insecure_target_name.as_bytes()[..target_len])?;
 
-            let source_len = usize::min(u8::MAX as usize, staking_action.insecure_source_name.len());
-            writer.write_u8(source_len as u8)?;
-            writer.write_all(&staking_action.insecure_source_name.as_bytes()[..source_len])
+            // let source_len = usize::min(u8::MAX as usize, staking_action.insecure_source_name.len());
+            // writer.write_u8(source_len as u8)
+            // writer.write_all(&staking_action.insecure_source_name.as_bytes()[..source_len])
         } else {
             writer.write_u8(0)
         }
@@ -1604,12 +1664,12 @@ impl std::fmt::Display for StakingAction {
         fmter.field("val", &self.val);
 
         fmter.field("target", &self.target);
-        fmter.field("insecure_target_name", &self.insecure_target_name);
+        // fmter.field("insecure_target_name", &self.insecure_target_name);
 
         // if self.kind == StakingActionKind::Move ||
         if self.kind == StakingActionKind::MoveClear {
             fmter.field("source", &self.source);
-            fmter.field("insecure_source_name", &self.insecure_source_name);
+            // fmter.field("insecure_source_name", &self.insecure_source_name);
         }
 
         fmter.finish()

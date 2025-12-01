@@ -1149,7 +1149,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
 
                         println!("********** STAKING ZEC {:?} ({:?}) TO THE MINER", amount, amount_with_fee);
-                        let ok = send_zats(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network, Some(StakingAction::parse_from_cmd(&format!("ADD|10000{}|james", amount_with_fee.into_u64())).unwrap().unwrap())).await;
+                        let ok = send_zats(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network, Some(StakingAction::parse_from_cmd(&format!("ADD|{}|deadbeefc001babedeadbeefc001babedeadbeefc001babedeadbeefc001babe", amount_with_fee.into_u64())).unwrap().unwrap())).await;
                         if !ok {
                             println!("Failed to send ZEC to miner");
                             break;

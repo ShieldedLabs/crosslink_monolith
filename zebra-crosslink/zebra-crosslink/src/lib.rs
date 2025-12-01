@@ -1025,7 +1025,7 @@ fn update_roster_for_cmd(
     // TODO: what is allowed in terms of multiple staking action in 1 command?
     // Any subtract is serially dependent
 
-    let (has_add, sub_key_name, is_clear) = match action.kind {
+    let (has_add, sub_key, is_clear) = match action.kind {
         StakingActionKind::Add => (true, None, false),
         // StakingActionKind::Sub => (
         //     false,
@@ -1034,7 +1034,7 @@ fn update_roster_for_cmd(
         // ),
         StakingActionKind::Clear => (
             false,
-            Some((action.target, &action.insecure_target_name)),
+            Some(action.target),
             true,
         ),
         // StakingActionKind::Move => (
@@ -1044,29 +1044,29 @@ fn update_roster_for_cmd(
         // ),
         StakingActionKind::MoveClear => (
             true,
-            Some((action.source, &action.insecure_source_name)),
+            Some(action.source),
             true,
         ),
     };
 
     let mut amount = action.val;
-    if let Some((sub_key, sub_name)) = sub_key_name {
+    if let Some(sub_key) = sub_key {
         let sub_key = MalPublicKey2(sub_key.into());
         let Some(member) = roster.iter_mut().find(|cmp| cmp.public_key == sub_key.0) else {
             warn!(
                 "Roster command invalid: can't subtract from non-present finalizer \"{}\"",
-                sub_name
+                StakingAction::str_from_addr(sub_key.0.into())
             );
             return 0;
         };
 
         if member.voting_power < action.val {
             if is_clear {
-                warn!("Roster command invalid: can't clear the finalizer to a higher current value \"{}\"/{}: {} => {}",
-                    sub_name, sub_key, member.voting_power, action.val);
+                warn!("Roster command invalid: can't clear the finalizer to a higher current value {}: {} => {}",
+                    StakingAction::str_from_addr(sub_key.0.into()), member.voting_power, action.val);
             } else {
-                warn!("Roster command invalid: can't subtract more from the finalizer than their current value \"{}\"/{}: {} - {}",
-                    sub_name, sub_key, member.voting_power, action.val);
+                warn!("Roster command invalid: can't subtract more from the finalizer than their current value {}: {} - {}",
+                    StakingAction::str_from_addr(sub_key.0.into()), member.voting_power, action.val);
             }
             return 0;
         }
@@ -1085,7 +1085,7 @@ fn update_roster_for_cmd(
             member.voting_power += amount;
         } else {
             roster.push(MalValidator::new(add_key.0, amount));
-            validators_keys_to_names.insert(add_key.0, action.insecure_target_name.clone());
+            // validators_keys_to_names.insert(add_key.0, action.insecure_target_name.clone());
         }
     }
 
