@@ -632,6 +632,49 @@ fn ui_left_pane(ui: &mut Context,
                 }
                 Modal::Stake => {
                     title_bar(ui, clicked_id, true, "Stake",   id("Stake Title Bar"));
+
+                    let mut button_ex = |label, act_on_press, disabled: bool| {
+                        let id = id(label);
+                        let (clicked, mut colour) = ui.button_ex(clicked_id, id, act_on_press);
+                        if let _ = elem().decl(Decl {
+                            id,
+                            child_gap,
+                            align: Align::Center,
+                            direction: TopToBottom,
+                            width: fit!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            let radius = ui.scale(24.0);
+
+                            // @TEMP: real disabling
+                            if disabled {
+                                colour.3 = 100;
+                            }
+
+                            // Button
+                            if let _ = elem().decl(Decl {
+                                colour,
+                                padding,
+                                child_gap,
+                                radius: radius.dup4(),
+                                align: Align::Center,
+                                width:  fit!(ui.scale(192.0)),
+                                height: fit!(radius * 2.0),
+                                ..Decl
+                            }) {
+                                let h = ui.scale(20.0);
+                                let colour = if disabled { INACTIVE_TAB_COL } else { WHITE };
+                                ui.text(label, TextDecl { h, colour, align: AlignX::Center, ..TextDecl });
+                            }
+                        }
+
+                        clicked && !disabled // @TEMP: real disabling
+                    };
+
+                    if button_ex("Stake 1 ZEC", false, wallet_state.lock().unwrap().waiting_for_stake_to_miner) {
+                        wallet_state.lock().unwrap().stake_to_miner();
+                    }
                 }
                 Modal::Unstake => {
                     title_bar(ui, clicked_id, true, "Unstake", id("Unstake Title Bar"));
