@@ -795,7 +795,9 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
                 return Err(Error::InsufficientFunds(-balance_after_fees));
             }
             Ordering::Greater => {
-                return Err(Error::ChangeRequired(balance_after_fees));
+                if self.staking_action.is_none() {
+                    return Err(Error::ChangeRequired(balance_after_fees));
+                }
             }
             Ordering::Equal => (),
         };

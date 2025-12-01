@@ -404,7 +404,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         memos
     }
 
-    let send_zats = async | client: &mut CompactTxStreamerClient<_>, dst_wallet: &mut WalletDb<_, _, _, _>, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params | -> bool {
+    let send_zats = async | client: &mut CompactTxStreamerClient<_>, dst_wallet: &mut WalletDb<_, _, _, _>, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params, staking_action: Option<StakingAction>| -> bool {
         // @todo(judah): handle multiple accounts?
         let Ok(src_ids)  = src_wallet.get_account_ids() else { return false; };
         let Some(src_id) = src_ids.first() else { return false; };
@@ -442,8 +442,9 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     &prover,
                     &wallet::SpendingKeys::from_unified_spending_key(src_usk.clone()),
                     zcash_client_backend::wallet::OvkPolicy::Sender,
-                    &proposal)
-                {
+                    &proposal,
+                    staking_action,
+                ) {
                     Err(err) => println!("create_proposed_transactions error: {err:?}"),
                     Ok(txids) => for txid in txids {
                         let tx = match src_wallet.get_transaction(txid) {
@@ -697,8 +698,9 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             &prover,
                             &wallet::SpendingKeys::from_unified_spending_key(usk.clone()),
                             zcash_client_backend::wallet::OvkPolicy::Sender,
-                            &proposal)
-                        {
+                            &proposal,
+                            None,
+                        ) {
                             Ok(txids) => txids,
                             Err(err) => {
                                 println!("Failed to create transactions: {:?}", err);
@@ -912,8 +914,9 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 &prover,
                                 &wallet::SpendingKeys::from_unified_spending_key(miner_usk.clone()),
                                 zcash_client_backend::wallet::OvkPolicy::Sender,
-                                &proposal)
-                            {
+                                &proposal,
+                                None,
+                            ) {
                                 Err(err) => println!("create_proposed_transactions error: {err:?}"),
                                 Ok(txids) => for txid in txids {
                                     let tx = match miner_wallet.get_transaction(txid) {
@@ -1081,8 +1084,9 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                     &prover,
                                     &wallet::SpendingKeys::from_unified_spending_key(miner_usk.clone()),
                                     zcash_client_backend::wallet::OvkPolicy::Sender,
-                                    &proposal)
-                                {
+                                    &proposal,
+                                    None,
+                                ) {
                                     Err(err) => println!("create_proposed_transactions error: {err:?}"),
                                     Ok(txids) => for txid in txids {
                                         let tx = match miner_wallet.get_transaction(txid) {
@@ -1145,79 +1149,11 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
 
                         println!("********** STAKING ZEC {:?} ({:?}) TO THE MINER", amount, amount_with_fee);
-                        let ok = send_zats(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network).await;
+                        let ok = send_zats(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network, Some(StakingAction::parse_from_cmd(&format!("ADD|10000{}|james", amount_with_fee.into_u64())).unwrap().unwrap())).await;
                         if !ok {
                             println!("Failed to send ZEC to miner");
                             break;
                         }
-
-                        println!("********** SUBMITING STAKING TRANSACTION");
-                        let ok = {
-                            let mut signing_set = TransparentSigningSet::new();
-                            signing_set.add_key(miner_privkey);
-
-                            let prover = LocalTxProver::bundled();
-                            let extsk: &[ExtendedSpendingKey] = &[];
-                            let sak: &[SpendAuthorizingKey] = &[];
-
-                            let Ok(Some(target_height)) = miner_wallet.chain_height() else {
-                                println!("Failed to get miner's chain height");
-                                break;
-                            };
-
-                            let mut txb = TxBuilder::new(
-                                network,
-                                target_height + 1,
-                                BuildConfig::Standard {
-                                    sapling_anchor: None,
-                                    orchard_anchor: None,
-                                },
-                            );
-
-                            // @todo: who's the target for this, the miner?
-                            let Ok(Some(action)) = StakingAction::parse_from_cmd(&format!("ADD|{}|james", amount_with_fee.into_u64())) else {
-                                println!("Failed to create staking action");
-                                break;
-                            };
-
-                            match txb.put_staking_action(action) {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    println!("Failed to put staking action: {}", e);
-                                    break;
-                                }
-                            }
-
-                            use rand_chacha::ChaCha20Rng;
-                            let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
-                            let Ok(tx_res) = txb.build(
-                                &signing_set,
-                                extsk,
-                                sak,
-                                rng,
-                                &prover,
-                                &prover,
-                                &zip317::FeeRule::standard(),
-                            ) else {
-                                println!("Failed to build staking transaction");
-                                break;
-                            };
-
-                            let tx = tx_res.transaction();
-                            let mut tx_bytes = vec![];
-                            tx.write(&mut tx_bytes).unwrap();
-
-                            match client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await {
-                                Ok(_) => {
-                                    println!("Test stake transaction sent successfully");
-                                    true
-                                }
-                                Err(err) => {
-                                    println!("Failed to send test stake transaction: {}", err);
-                                    false
-                                },
-                            }
-                        };
 
                         if ok {
                             wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;

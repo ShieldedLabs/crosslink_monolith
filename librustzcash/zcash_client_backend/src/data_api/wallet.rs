@@ -109,6 +109,7 @@ use {
     zcash_note_encryption::try_output_recovery_with_pkd_esk,
     zcash_protocol::consensus::NetworkConstants,
 };
+use zcash_primitives::transaction::StakingAction;
 
 pub mod input_selection;
 use input_selection::{GreedyInputSelector, InputSelector, InputSelectorError};
@@ -809,6 +810,7 @@ pub fn create_proposed_transactions<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeEr
     spending_keys: &SpendingKeys,
     ovk_policy: OvkPolicy,
     proposal: &Proposal<FeeRuleT, N>,
+    staking_action: Option<StakingAction>,
 ) -> Result<NonEmpty<TxId>, CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>>
 where
     DbT: WalletWrite + WalletCommitmentTrees,
@@ -827,6 +829,7 @@ where
         .ok_or(Error::KeyNotRecognized)?
         .id();
 
+    let mut staking_action_once = staking_action;
     let mut step_results = Vec::with_capacity(proposal.steps().len());
     for step in proposal.steps() {
         let step_result: StepResult<_> = create_proposed_transaction(
@@ -843,8 +846,10 @@ where
             step,
             #[cfg(feature = "transparent-inputs")]
             &mut unused_transparent_outputs,
+            staking_action_once,
         )?;
         step_results.push((step, step_result));
+        staking_action_once = None;
     }
 
     // Ephemeral outputs must be referenced exactly once.
@@ -973,6 +978,7 @@ struct BuildState<'a, P, AccountId> {
     )>,
     #[cfg(feature = "transparent-inputs")]
     utxos_spent: Vec<OutPoint>,
+    staking_action: Option<StakingAction>,
 }
 
 // `unused_transparent_outputs` maps `StepOutput`s for transparent outputs
@@ -993,6 +999,7 @@ fn build_proposed_transaction<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N>
         StepOutput,
         (TransparentAddress, OutPoint),
     >,
+    staking_action: Option<StakingAction>,
 ) -> Result<
     BuildState<'static, ParamsT, DbT::AccountId>,
     CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>,
@@ -1522,6 +1529,10 @@ where
         }
     }
 
+    if let Some(sa) = &staking_action {
+        builder.put_staking_action(sa.clone());
+    }
+
     Ok(BuildState {
         #[cfg(feature = "transparent-inputs")]
         step_index,
@@ -1534,6 +1545,7 @@ where
         transparent_output_meta,
         #[cfg(feature = "transparent-inputs")]
         utxos_spent,
+        staking_action,
     })
 }
 
@@ -1558,6 +1570,7 @@ fn create_proposed_transaction<DbT, ParamsT, InputsErrT, FeeRuleT, ChangeErrT, N
         StepOutput,
         (TransparentAddress, OutPoint),
     >,
+    staking_action: Option<StakingAction>,
 ) -> Result<
     StepResult<<DbT as WalletRead>::AccountId>,
     CreateErrT<DbT, InputsErrT, FeeRuleT, ChangeErrT, N>,
@@ -1578,6 +1591,7 @@ where
         proposal_step,
         #[cfg(feature = "transparent-inputs")]
         unused_transparent_outputs,
+        staking_action,
     )?;
 
     // Build the transaction with the specified fee rule
@@ -2513,5 +2527,6 @@ where
         spending_keys,
         OvkPolicy::Sender,
         &proposal,
+        None,
     )
 }
