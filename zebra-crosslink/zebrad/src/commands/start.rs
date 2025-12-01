@@ -180,6 +180,7 @@ impl StartCmd {
 
             break seed;
         };
+        *wallet::GLOBAL_SEED.lock().unwrap() = Some(global_seed);
 
 
         info!("initializing node state");
@@ -325,6 +326,7 @@ impl StartCmd {
             let state = state.clone();
             zebra_crosslink::service::spawn_new_tfl_service(
                 is_regtest,
+                global_seed,
                 Arc::new(move |req| {
                     let state = state.clone();
                     Box::pin(async move { state.clone().ready().await?.call(req).await })
