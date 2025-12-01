@@ -7,3 +7,4 @@
 *.DS_Store
 */target
 *.local.toml
+zebra-gui/icon-font/fontello-*/
