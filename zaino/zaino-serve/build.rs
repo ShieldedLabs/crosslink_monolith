@@ -4,21 +4,23 @@ use std::process::Command;
 
 fn main() -> io::Result<()> {
     // Fetch the commit hash
-    let commit_hash = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .expect("Failed to get commit hash")
-        .stdout;
-    let commit_hash = String::from_utf8(commit_hash).expect("Invalid UTF-8 sequence");
+    let commit_hash = {
+        if let Ok(commit_hash) = Command::new("git").args(["rev-parse", "HEAD"]).output() {
+            String::from_utf8(commit_hash.stdout).expect("Invalid UTF-8 sequence")
+        } else {
+            "0000000".to_string()
+        }
+    };
     println!("cargo:rustc-env=GIT_COMMIT={}", commit_hash.trim());
 
     // Fetch the current branch
-    let branch = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .expect("Failed to get branch")
-        .stdout;
-    let branch = String::from_utf8(branch).expect("Invalid UTF-8 sequence");
+    let branch = {
+        if let Ok(branch) = Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]).output() {
+            String::from_utf8(branch.stdout).expect("Invalid UTF-8 sequence")
+        } else {
+            "main".to_string()
+        }
+    };
     println!("cargo:rustc-env=BRANCH={}", branch.trim());
 
     // @Todo: `date` is not guaranteed to exist on Windows. What to do?

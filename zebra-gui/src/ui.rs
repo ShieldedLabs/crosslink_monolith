@@ -33,13 +33,13 @@ macro_rules! frame_strf {
 }
 
 impl UiData {
-    fn frame_str(&mut self, str: &str) -> &String {
+    pub fn frame_str(&mut self, str: &str) -> &String {
         self.per_frame_strs.push(str.to_string().clone());
         return self.per_frame_strs.last().unwrap();
     }
 }
 
-fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
+pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
     if ui.input().key_pressed(KeyCode::Tab) {
         ui.debug = !ui.debug;
     }
@@ -82,34 +82,34 @@ fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
     return false;
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq)] enum Direction { #[default] LeftToRight, TopToBottom }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] enum AlignX    { #[default] Left, Right, Center }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] enum AlignY    { #[default] Top, Bottom, Center }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] struct Align   { x: AlignX, y: AlignY }
-#[derive(Debug,          Copy, Clone, PartialEq)] enum Sizing    { Fit(f32, f32), Grow(f32, f32), Fixed(f32), Percent(f32) }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] struct Id { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum AlignX    { #[default] Left, Right, Center }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum AlignY    { #[default] Top, Bottom, Center }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] pub struct Align   { x: AlignX, y: AlignY }
+#[derive(Debug,          Copy, Clone, PartialEq)] pub enum Sizing    { Fit(f32, f32), Grow(f32, f32), Fixed(f32), Percent(f32) }
+#[derive(Debug, Default, Copy, Clone, PartialEq)] pub struct Id { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
 impl Default for Sizing { fn default() -> Self { Self::Fit(0.0, f32::MAX) } }
 impl Align {
-    const TopLeft:     Self = Self { y: AlignY::Top,    x: AlignX::Left };
-    const Top:         Self = Self { y: AlignY::Top,    x: AlignX::Center };
-    const TopRight:    Self = Self { y: AlignY::Top,    x: AlignX::Right };
-    const Left:        Self = Self { y: AlignY::Center, x: AlignX::Left };
-    const Center:      Self = Self { y: AlignY::Center, x: AlignX::Center };
-    const Right:       Self = Self { y: AlignY::Center, x: AlignX::Right };
-    const BottomLeft:  Self = Self { y: AlignY::Bottom, x: AlignX::Left };
-    const Bottom:      Self = Self { y: AlignY::Bottom, x: AlignX::Center };
-    const BottomRight: Self = Self { y: AlignY::Bottom, x: AlignX::Right };
+    pub const TopLeft:     Self = Self { y: AlignY::Top,    x: AlignX::Left };
+    pub const Top:         Self = Self { y: AlignY::Top,    x: AlignX::Center };
+    pub const TopRight:    Self = Self { y: AlignY::Top,    x: AlignX::Right };
+    pub const Left:        Self = Self { y: AlignY::Center, x: AlignX::Left };
+    pub const Center:      Self = Self { y: AlignY::Center, x: AlignX::Center };
+    pub const Right:       Self = Self { y: AlignY::Center, x: AlignX::Right };
+    pub const BottomLeft:  Self = Self { y: AlignY::Bottom, x: AlignX::Left };
+    pub const Bottom:      Self = Self { y: AlignY::Bottom, x: AlignX::Center };
+    pub const BottomRight: Self = Self { y: AlignY::Bottom, x: AlignX::Right };
 }
 // why can we not `use` these? namaste
-const TopLeft:     Align = Align::TopLeft;
-const Top:         Align = Align::Top;
-const TopRight:    Align = Align::TopRight;
-const Left:        Align = Align::Left;
-const Center:      Align = Align::Center;
-const Right:       Align = Align::Right;
-const BottomLeft:  Align = Align::BottomLeft;
-const Bottom:      Align = Align::Bottom;
-const BottomRight: Align = Align::BottomRight;
+pub const TopLeft:     Align = Align::TopLeft;
+pub const Top:         Align = Align::Top;
+pub const TopRight:    Align = Align::TopRight;
+pub const Left:        Align = Align::Left;
+pub const Center:      Align = Align::Center;
+pub const Right:       Align = Align::Right;
+pub const BottomLeft:  Align = Align::BottomLeft;
+pub const Bottom:      Align = Align::Bottom;
+pub const BottomRight: Align = Align::BottomRight;
 
 #[macro_export] macro_rules! fit {
     ($min:expr, $max:expr) => { Sizing::Fit($min, $max) };
@@ -134,9 +134,10 @@ const BottomRight: Align = Align::BottomRight;
 
 use Direction::*;
 
+pub const Id: Id = Id { id: 0, offset: 0, base_id: 0, len: 0, chars: std::ptr::null() };
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
-struct Decl {
+pub struct Decl {
     id: Id,
     direction: Direction,
     floating: bool,
@@ -151,8 +152,8 @@ struct Decl {
 }
 // Ease-of-use constant for the builder pattern thing, so you can write Decl{..Decl} to get a default Decl.
 // I can't do #[derive_const(Default)] because that's only on Rust nightly. And it would probably be complex anyway.
-const Decl: Decl = Decl {
-    id:        Id { id: 0, offset: 0, base_id: 0, len: 0, chars: std::ptr::null() },
+pub const Decl: Decl = Decl {
+    id:        Id,
     direction: Direction::LeftToRight,
     floating:  false,
     colour:    (0,   0,   0,   0),
@@ -166,13 +167,13 @@ const Decl: Decl = Decl {
 };
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
-struct TextDecl {
+pub struct TextDecl {
     font: FontKind,
     h: f32,
     colour: (u8, u8, u8, u8),
     align: AlignX,
 }
-const TextDecl: TextDecl = TextDecl {
+pub const TextDecl: TextDecl = TextDecl {
     font: FontKind::Normal,
     h: 0.0,
     colour: WHITE,
@@ -182,6 +183,7 @@ const TextDecl: TextDecl = TextDecl {
 
 
 impl Id {
+    pub const VIZ_GUI: Self = Self { id: 1, ..Id };
     fn clay(&self) -> clay::id::Id {
         clay::id::Id {
             id: clay::Clay_ElementId {
@@ -197,7 +199,7 @@ impl Id {
         }
     }
 }
-fn id(label: &str) -> Id {
+pub fn id(label: &str) -> Id {
     let id = unsafe { clay::Clay__HashString(label.into(), 0, clay::Clay__GetParentElementId()) };
     Id {
         id: id.id,
@@ -208,29 +210,29 @@ fn id(label: &str) -> Id {
     }
 }
 
-#[derive(Default)] struct Element { decl: Decl }
-fn elem() -> Element { unsafe { clay::Clay__OpenElement(); } Element::default() }
+#[derive(Default)] pub struct Element { decl: Decl }
+pub fn elem() -> Element { unsafe { clay::Clay__OpenElement(); } Element::default() }
 impl Drop for Element { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
 
-const Clay_ElementId_ZERO: clay::Clay_ElementId = clay::Clay_ElementId { id: 0, offset: 0, baseId: 0, stringId: clay::Clay_String { isStaticallyAllocated: false, length: 0, chars: std::ptr::null() } };
-const Clay_SizingMinMax_ZERO: clay::Clay_SizingMinMax = clay::Clay_SizingMinMax { min: 0f32, max: f32::MAX };
-const Clay_SizingAxis_ZERO: clay::Clay_SizingAxis = clay::Clay_SizingAxis {
+pub const Clay_ElementId_ZERO: clay::Clay_ElementId = clay::Clay_ElementId { id: 0, offset: 0, baseId: 0, stringId: clay::Clay_String { isStaticallyAllocated: false, length: 0, chars: std::ptr::null() } };
+pub const Clay_SizingMinMax_ZERO: clay::Clay_SizingMinMax = clay::Clay_SizingMinMax { min: 0f32, max: f32::MAX };
+pub const Clay_SizingAxis_ZERO: clay::Clay_SizingAxis = clay::Clay_SizingAxis {
     size: clay::Clay_SizingAxis__bindgen_ty_1 { minMax: Clay_SizingMinMax_ZERO },
     type_: clay::Clay__SizingType_CLAY__SIZING_TYPE_FIT
 };
-const Clay_Sizing_ZERO: clay::Clay_Sizing = clay::Clay_Sizing { width: Clay_SizingAxis_ZERO, height: Clay_SizingAxis_ZERO };
-const Clay_Padding_ZERO: clay::Clay_Padding = clay::Clay_Padding { left: 0, right: 0, top: 0, bottom: 0 };
-const Clay_ChildAlignment_ZERO: clay::Clay_ChildAlignment = clay::Clay_ChildAlignment { x: 0 as _, y: 0 as _ };
-const Clay_LayoutConfig_ZERO: clay::Clay_LayoutConfig = clay::Clay_LayoutConfig {
+pub const Clay_Sizing_ZERO: clay::Clay_Sizing = clay::Clay_Sizing { width: Clay_SizingAxis_ZERO, height: Clay_SizingAxis_ZERO };
+pub const Clay_Padding_ZERO: clay::Clay_Padding = clay::Clay_Padding { left: 0, right: 0, top: 0, bottom: 0 };
+pub const Clay_ChildAlignment_ZERO: clay::Clay_ChildAlignment = clay::Clay_ChildAlignment { x: 0 as _, y: 0 as _ };
+pub const Clay_LayoutConfig_ZERO: clay::Clay_LayoutConfig = clay::Clay_LayoutConfig {
     sizing: Clay_Sizing_ZERO,
     padding: Clay_Padding_ZERO,
     childGap: 0,
     childAlignment: Clay_ChildAlignment_ZERO,
     layoutDirection: clay::Clay_LayoutDirection_CLAY_LEFT_TO_RIGHT,
 };
-const Clay_Color_ZERO: clay::Clay_Color = clay::Clay_Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
-const Clay_CornerRadius_ZERO: clay::Clay_CornerRadius = clay::Clay_CornerRadius { topLeft: 0f32, topRight: 0f32, bottomLeft: 0f32, bottomRight: 0f32 };
-const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Clay_ElementDeclaration {
+pub const Clay_Color_ZERO: clay::Clay_Color = clay::Clay_Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+pub const Clay_CornerRadius_ZERO: clay::Clay_CornerRadius = clay::Clay_CornerRadius { topLeft: 0f32, topRight: 0f32, bottomLeft: 0f32, bottomRight: 0f32 };
+pub const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Clay_ElementDeclaration {
     id: Clay_ElementId_ZERO,
     layout: Clay_LayoutConfig_ZERO,
     backgroundColor: Clay_Color_ZERO,
@@ -313,21 +315,21 @@ impl Element {
     }
 }
 
-const PANE_PERCENT: f32 = (0.25 + 0.333) / 2.0;
+pub const PANE_PERCENT: f32 = (0.25 + 0.333) / 2.0;
 
-const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
-const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
-const INACTIVE_TAB_COL: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
-const ACTIVE_TAB_COL:   (u8, u8, u8, u8) = PANE_COL;
-const BUTTON_COL:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff); // @FigmaScreenshot
-const BUTTON_HOVER_COL: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
-const BUTTON_DOWN_COL:  (u8, u8, u8, u8) = (0x1c, 0x1c, 0x1c, 0xff);
+pub const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
+pub const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
+pub const INACTIVE_TAB_COL: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
+pub const ACTIVE_TAB_COL:   (u8, u8, u8, u8) = PANE_COL;
+pub const BUTTON_COL:       (u8, u8, u8, u8) = (0x24, 0x24, 0x24, 0xff); // @FigmaScreenshot
+pub const BUTTON_HOVER_COL: (u8, u8, u8, u8) = (0x30, 0x30, 0x30, 0xff);
+pub const BUTTON_DOWN_COL:  (u8, u8, u8, u8) = (0x1c, 0x1c, 0x1c, 0xff);
 
-const MODAL_COL: (u8, u8, u8, u8) = (0x1e, 0x1e, 0x1e, 0xff); // @FigmaScreenshot
+pub const MODAL_COL: (u8, u8, u8, u8) = (0x1e, 0x1e, 0x1e, 0xff); // @FigmaScreenshot
 
-const TRANSACTION_HISTORY_CONTAINER_COL: (u8, u8, u8, u8) = (0x22, 0x22, 0x24, 0xff); // @FigmaScreenshot
+pub const TRANSACTION_HISTORY_CONTAINER_COL: (u8, u8, u8, u8) = (0x22, 0x22, 0x24, 0xff); // @FigmaScreenshot
 
-const fn clay_colour(colour: (u8, u8, u8, u8)) -> clay::Color { clay::Color::rgba(colour.0 as f32, colour.1 as f32, colour.2 as f32, colour.3 as f32) }
+pub const fn clay_colour(colour: (u8, u8, u8, u8)) -> clay::Color { clay::Color::rgba(colour.0 as f32, colour.1 as f32, colour.2 as f32, colour.3 as f32) }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 pub enum Modal {
@@ -395,7 +397,7 @@ pub fn hsva_to_rgba(h: u8, s: u8, v: u8, a: u8) -> (u8, u8, u8, u8) {
     (r, g, b, a)
 }
 
-trait HSVA_RGBA {
+pub trait HSVA_RGBA {
     #[inline(always)] fn hsva(self) -> Self;
     #[inline(always)] fn rgba(self) -> Self;
 }
@@ -406,17 +408,17 @@ impl HSVA_RGBA for (u8, u8, u8, u8) {
 
 impl Context {
     pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, ..Default::default() } }
-    fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw     } }
-    fn input(&self) -> &InputCtx { unsafe { &*self.input    } }
-    fn clay(&self)  -> &mut Clay { unsafe { &mut *self.clay } }
+    pub fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw     } }
+    pub fn input(&self) -> &InputCtx { unsafe { &*self.input    } }
+    pub fn clay(&self)  -> &mut Clay { unsafe { &mut *self.clay } }
 
-    fn scale(&self, size: f32) -> f32 { (size * self.scale).floor() }
-    fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
-    fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
+    pub fn scale(&self, size: f32) -> f32 { (size * self.scale).floor() }
+    pub fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
+    pub fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
 
-    fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
+    pub fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
 
-    fn button_ex(&mut self, clicked_id: &mut Id, id: Id, act_on_press: bool) -> (bool, (u8, u8, u8, u8)) {
+    pub fn button_ex(&mut self, clicked_id: &mut Id, id: Id, act_on_press: bool) -> (bool, (u8, u8, u8, u8)) {
         let mouse_held     = self.input().mouse_held(winit::event::MouseButton::Left);
         let mouse_pressed  = self.input().mouse_pressed(winit::event::MouseButton::Left);
         let mouse_released = self.input().mouse_released(winit::event::MouseButton::Left);
@@ -454,10 +456,10 @@ impl Context {
         (activated, colour)
     }
 
-    fn button               (&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) { return self.button_ex(clicked_id, id, true); }
-    fn button_act_on_release(&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) { return self.button_ex(clicked_id, id, false); }
+    pub fn button               (&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) { return self.button_ex(clicked_id, id, true); }
+    pub fn button_act_on_release(&mut self, clicked_id: &mut Id, id: Id) -> (bool, (u8, u8, u8, u8)) { return self.button_ex(clicked_id, id, false); }
 
-    fn text(&self, label: &str, decl: TextDecl) {
+    pub fn text(&self, label: &str, decl: TextDecl) {
         let config = clay::text::TextConfig::new()
             .font_id(decl.font as u16)
             .font_size(decl.h as u16)
@@ -470,7 +472,7 @@ impl Context {
             .end();
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
-    fn text_no_wrap(&self, label: &str, decl: TextDecl) {
+    pub fn text_no_wrap(&self, label: &str, decl: TextDecl) {
         let config = clay::text::TextConfig::new()
             .font_id(decl.font as u16)
             .font_size(decl.h as u16)
@@ -485,7 +487,7 @@ impl Context {
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
 
-    fn tab_ex(&mut self,
+    pub fn tab_ex(&mut self,
               radius: (f32, f32, f32, f32),
               padding: (f32, f32, f32, f32),
               tab_id: &mut Id,
@@ -516,7 +518,7 @@ impl Context {
         id
     }
 
-    fn tab(&mut self,
+    pub fn tab(&mut self,
            radius: (f32, f32, f32, f32),
            padding: (f32, f32, f32, f32),
            tab_id: &mut Id,
@@ -527,34 +529,34 @@ impl Context {
     }
 }
 
-trait         Dup2: Copy { fn dup2(self) -> (Self, Self); }
+pub trait     Dup2: Copy { fn dup2(self) -> (Self, Self); }
 impl<T: Copy> Dup2 for T { fn dup2(self) -> (Self, Self) { (self, self) } }
-trait         Dup3: Copy { fn dup3(self) -> (Self, Self, Self); }
+pub trait     Dup3: Copy { fn dup3(self) -> (Self, Self, Self); }
 impl<T: Copy> Dup3 for T { fn dup3(self) -> (Self, Self, Self) { (self, self, self) } }
-trait         Dup4: Copy { fn dup4(self) -> (Self, Self, Self, Self); }
+pub trait     Dup4: Copy { fn dup4(self) -> (Self, Self, Self, Self); }
 impl<T: Copy> Dup4 for T { fn dup4(self) -> (Self, Self, Self, Self) { (self, self, self, self) } }
 
 // Implementation of `tuple.mul(scalar)`. Helper "AsF32" trait to get it working.
 // This would literally be a two-liner, if Rust generics had C++-style SFINAE.
-trait AsF32         { #[inline(always)] fn to_f32(self) -> f32;                #[inline(always)] fn from_f32(x: f32) -> Self; }
-impl  AsF32 for u8  { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
-impl  AsF32 for u16 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
-impl  AsF32 for u32 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
-impl  AsF32 for u64 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
-impl  AsF32 for i8  { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
-impl  AsF32 for i16 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
-impl  AsF32 for i32 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
-impl  AsF32 for i64 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
-impl  AsF32 for f32 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
-impl  AsF32 for f64 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+pub trait AsF32         { #[inline(always)] fn to_f32(self) -> f32;                #[inline(always)] fn from_f32(x: f32) -> Self; }
+impl      AsF32 for u8  { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl      AsF32 for u16 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl      AsF32 for u32 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl      AsF32 for u64 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl      AsF32 for i8  { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl      AsF32 for i16 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl      AsF32 for i32 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl      AsF32 for i64 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl      AsF32 for f32 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
+impl      AsF32 for f64 { #[inline(always)] fn to_f32(self) -> f32 { self as f32 } #[inline(always)] fn from_f32(x: f32) -> Self { x as Self } }
 
-trait                                Mul                  { #[inline(always)] fn mul(self, f: f32) -> Self; }
+pub trait                            Mul                  { #[inline(always)] fn mul(self, f: f32) -> Self; }
 impl<T: AsF32>                       Mul for T            { #[inline(always)] fn mul(self, f: f32) -> Self { T::from_f32(self.to_f32() * f) } }
 impl<A: Mul, B: Mul>                 Mul for (A, B)       { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f)) } }
 impl<A: Mul, B: Mul, C: Mul>         Mul for (A, B, C)    { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f)) } }
 impl<A: Mul, B: Mul, C: Mul, D: Mul> Mul for (A, B, C, D) { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f), self.3.mul(f)) } }
 
-fn ui_left_pane(ui: &mut Context,
+pub fn ui_left_pane(ui: &mut Context,
                 wallet_state: Arc<Mutex<wallet::WalletState>>,
                 data: &mut UiData,
                 viz: &mut VizState,
@@ -851,7 +853,7 @@ fn ui_left_pane(ui: &mut Context,
     }
 }
 
-fn ui_right_pane(ui: &mut Context,
+pub fn ui_right_pane(ui: &mut Context,
                  wallet_state: Arc<Mutex<wallet::WalletState>>,
                  viz: &mut VizState,
                  data: &mut UiData,
@@ -1045,7 +1047,7 @@ fn ui_right_pane(ui: &mut Context,
 }
 
 
-fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
+pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
     data.per_frame_strs.clear();
 
     let mut result = false;
@@ -1079,6 +1081,8 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
     ui.scale = ui.zoom * ui.dpi_scale;
 
     ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Default);
+
+    ui.capture = false;
 
     let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_height as f32);
     let mouse_pos = (ui.input().mouse_pos().0 as f32, ui.input().mouse_pos().1 as f32);
@@ -1130,7 +1134,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
 
         let pane_pct = Sizing::Percent(ui.zoom * PANE_PERCENT);
 
-        if let _ = elem().decl(Decl {
+        if let _elem = elem().decl(Decl {
             id: id("Left Pane"),
             direction: TopToBottom,
             width: pane_pct,
@@ -1138,10 +1142,15 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
             clip: true,
             ..Decl
         }) {
+            let id = _elem.decl.id;
+            if ui.hovered(id) {
+                ui.capture = true;
+            }
+
             ui_left_pane(ui, wallet_state.clone(), data, viz, child_gap, padding, radius, clicked_id, pane_tab_l);
         }
 
-        if let _ = elem().decl(Decl {
+        if let _elem = elem().decl(Decl {
             id: id("Central Gap"),
             radius, padding, child_gap,
             direction: TopToBottom,
@@ -1162,6 +1171,10 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
                 let id = id(label);
                 let (clicked, colour) = ui.button_ex(clicked_id, id, true);
                 let radius = ui.scale(20.0);
+
+                if ui.hovered(id) {
+                    ui.capture = true;
+                }
 
                 // Button
                 if let _ = elem().decl(Decl {
@@ -1188,7 +1201,7 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
             }
         }
 
-        if let _ = elem().decl(Decl {
+        if let _elem = elem().decl(Decl {
             id: id("Right Pane"),
             direction: TopToBottom,
             width: pane_pct,
@@ -1196,6 +1209,11 @@ fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data:
             clip: true,
             ..Decl
         }) {
+            let id = _elem.decl.id;
+            if ui.hovered(id) {
+                ui.capture = true;
+            }
+
             ui_right_pane(ui, wallet_state.clone(), viz, data, child_gap, padding, radius, clicked_id, pane_tab_r);
         }
     }
@@ -1304,6 +1322,8 @@ pub struct Context {
     pub scale:     f32,
     pub zoom:      f32,
     pub dpi_scale: f32,
+
+    pub capture: bool,
 
     pub clicked_id: Id,
     pub focused_id: Id,
