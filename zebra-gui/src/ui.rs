@@ -628,8 +628,8 @@ pub fn ui_left_pane(ui: &mut Context,
                             height: fixed!(radius * 2.0),
                             ..Decl
                         }) {
-                            let temp_letter_symbol_h = ui.scale(32.0);
-                            ui.text("x", TextDecl { h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
+                            let temp_letter_symbol_h = ui.scale(24.0);
+                            ui.text(ICON_CANCEL, TextDecl { font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
                         }
                     }
                 }
@@ -726,9 +726,10 @@ pub fn ui_left_pane(ui: &mut Context,
         ..Decl
     }) {
         let balance_text_h = ui.scale(48.0);
+        let accent_text_h  = ui.scale(16.0);
 
         // spacer
-        if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+        if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
         if *tab_id == tab_id_wallet {
 
@@ -736,13 +737,26 @@ pub fn ui_left_pane(ui: &mut Context,
             if let _ = elem().decl(Decl {
                 width: grow!(),
                 height: fit!(),
-                padding,
                 align: Center,
                 ..Decl
             }) {
                 let balance_str = frame_strf!(data, "{} cTAZ", str_from_ctaz(wallet_state.lock().unwrap().balance.try_into().unwrap()));
                 ui.text(&balance_str, TextDecl { h: balance_text_h, align: AlignX::Center, ..TextDecl });
             }
+
+            // pending container
+            if let _ = elem().decl(Decl {
+                width: grow!(),
+                height: fit!(),
+                align: Center,
+                ..Decl
+            }) {
+                let balance_str = frame_strf!(data, "{} cTAZ Pending", str_from_ctaz(wallet_state.lock().unwrap().pending_balance.try_into().unwrap()));
+                ui.text(&balance_str, TextDecl { h: accent_text_h, align: AlignX::Center, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
+            }
+
+            // spacer
+            // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
             let child_gap = child_gap as f32;
             let padding = child_gap.dup4();
@@ -867,7 +881,8 @@ pub fn ui_right_pane(ui: &mut Context,
         align: Center,
         ..Decl
     }) {
-        tab_id_faucet   = ui.tab(radius, padding, tab_id, clicked_id, "Faucet");
+        // tab_id_faucet = ui.tab(radius, padding, tab_id, clicked_id, "Faucet");
+        tab_id_faucet  = ui.tab_ex(radius, padding, tab_id, clicked_id, id("Faucet"), frame_strf!(data, "Faucet ({})", &wallet_state.lock().unwrap().miner_seen_height));
         // tab_id_roster   = ui.tab(radius, padding, tab_id, clicked_id, "Roster");
         // tab_id_settings = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, clicked_id, "Settings");
     }
@@ -961,17 +976,16 @@ pub fn ui_right_pane(ui: &mut Context,
             }
 
             if let _ = elem().decl(Decl {
-                padding: ui.scale(16.0).dup4(), child_gap, align: TopLeft,
+                padding: ui.scale(32.0).dup4(), child_gap, align: TopLeft,
                 width: grow!(), height: fit!(),
                 direction: TopToBottom,
                 ..Decl
             }) {
                 let title_h = ui.scale(28.0);
                 let text_h = ui.scale(22.0);
-                let (h, un, sh_p, sh_s, fc) = {
+                let (un, sh_p, sh_s, fc) = {
                     let w = wallet_state.lock().unwrap();
                     (
-                        w.miner_seen_height,
                         w.miner_unshielded_funds,
                         w.miner_shielded_pending_funds,
                         w.miner_shielded_spendable_funds,
@@ -987,22 +1001,21 @@ pub fn ui_right_pane(ui: &mut Context,
                 let left_text  = TextDecl { h: text_h,  align: AlignX::Left,  ..TextDecl  };
                 let right_text = TextDecl { font: Mono, align: AlignX::Right, ..left_text };
 
-                ui.text(frame_strf!(data, "Miner funds at height {}:", h), TextDecl { h: title_h, ..left_text });
+                if let _ = elem().decl(row) {
+                    if let _ = elem().decl(left)  { ui.text("Available:", left_text); }
+                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(fc)), right_text); }
+                }
                 if let _ = elem().decl(row) {
                     if let _ = elem().decl(left)  { ui.text("Unshielded:", left_text); }
                     if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(un)), right_text); }
                 }
                 if let _ = elem().decl(row) {
-                    if let _ = elem().decl(left)  { ui.text("Shielded (pending):", left_text); }
-                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_p)), right_text); }
-                }
-                if let _ = elem().decl(row) {
-                    if let _ = elem().decl(left)  { ui.text("Shielded (spendable):", left_text); }
+                    if let _ = elem().decl(left)  { ui.text("Shielded (Spendable):", left_text); }
                     if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_s)), right_text); }
                 }
                 if let _ = elem().decl(row) {
-                    if let _ = elem().decl(left)  { ui.text("Faucet available:", left_text); }
-                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(fc)), right_text); }
+                    if let _ = elem().decl(left)  { ui.text("Shielded (Pending):", left_text); }
+                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_p)), right_text); }
                 }
                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
@@ -1013,7 +1026,7 @@ pub fn ui_right_pane(ui: &mut Context,
     }
 
     // spacer
-    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
     // // Block Inspector Contents
     // if let _ = elem().decl(Decl {
@@ -1112,9 +1125,9 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
     let mut pane_tab_l = ui.pane_tab_l; // @Todo: how to not have to do this in rust?
     let mut pane_tab_r = ui.pane_tab_r; // @Todo: how to not have to do this in rust?
 
-    
+
     let mut c = clay.begin::<(), ()>();
-    
+
     unsafe { clay::Clay_SetCurrentContext(c.clay.context); }
     unsafe { clay::Clay_SetMaxMeasureTextCacheWordCount(262144); }
 
@@ -1161,7 +1174,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
         }) {
 
             if let _ = elem().decl(Decl { align: Top, width: grow!(), ..Decl }) {
-                ui.text(frame_strf!(data, "TODO: Put BFT height here!"), TextDecl { h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+                ui.text(frame_strf!(data, "BFT Height: 0"), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+            }
+            if let _ = elem().decl(Decl { align: Top, width: grow!(), ..Decl }) {
+                ui.text(frame_strf!(data, "PoW Height: 0"), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
             }
 
             if let _ = elem().decl(Decl { height: grow!(), ..Decl }) {}

@@ -160,12 +160,13 @@ impl Default for OnScreenBft {
     }
 }
 
-const COLOR_BC:  u32 = 0x82ccc0;
-const COLOR_BFT: u32 = 0xdc4c4f;
+const COLOR_BC:     u32 = 0x82ccc0;
+const COLOR_BFT:    u32 = 0xdc4c4f;
+const COLOR_ACCENT: u32 = 0x121212;
 
-const COLOR_BC_LINK:    u32 = 0x32556e;
+const COLOR_BC_LINK:    u32 = 0x4e7b73;
 const COLOR_BFT_LINK:   u32 = 0x9a2d37;
-const COLOR_CROSS_LINK: u32 = 0x32556e;
+const COLOR_CROSS_LINK: u32 = 0x4e7b73;
 
 pub struct VizState {
     pub camera_x: f32,
@@ -429,8 +430,6 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         }
     }
 
-    let hash_text_line_w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &format!("{}", Hash32::from_u64(0))) / screen_unit;
-
     {
         let mut working_map = HashMap::<Hash32, u16>::new();
         let mut width_map = HashMap::<u64, u16>::new();
@@ -473,11 +472,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             }
         }
 
+        let hash_text_line_w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &format!("{}*", Hash32::from_u64(0).display_str())) / screen_unit;
         for (hash, x_pos) in &working_map {
             viz_state.on_screen_bcs.get_mut(hash).unwrap().t_x = -5.0 - hash_text_line_w - 5.0*(1.0 + *x_pos as f32);
         }
     }
-
 
     // animate to targets
     for on_screen_bc in viz_state.on_screen_bcs.values_mut() {
@@ -506,25 +505,26 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         let x = on_screen_bc.x;
         let y = on_screen_bc.y;
         let color = (((on_screen_bc.alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BC, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
-        let color_white = (((on_screen_bc.alpha*on_screen_bc.finalized_alpha*255.0) as u32) << 24) | blend_u32(0x000000, 0xFFffFF, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
+        let color_accent = (((on_screen_bc.alpha*on_screen_bc.finalized_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_ACCENT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
         let color_bft = (((on_screen_bc.alpha*on_screen_bc.implicated_by_bft_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BFT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
+
         draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bc.roundness, color);
-        draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit / 2.0, (screen_unit / 2.0)*on_screen_bc.roundness, color_white);
+        draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit / 2.0, (screen_unit / 2.0)*on_screen_bc.roundness, color_accent);
 
         // @todo(judah): not sure what this circle is supposed to represent
         // draw_ctx.circle_square(origin_x + (x*screen_unit) + screen_unit / 3.0, origin_y + (y*screen_unit) - screen_unit / 3.0, screen_unit / 3.0, (screen_unit / 3.0), color_bft);
 
         if on_screen_bc.block.is_best_chain {
             // hash
-            let text_line = format!("{}", on_screen_bc.block.this_hash);
-            draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - hash_text_line_w)*screen_unit, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &text_line, color);
+            let text_line = &on_screen_bc.block.this_hash.display_str();
+            let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
+            draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &on_screen_bc.block.this_hash.display_str(), color);
 
             // height
             draw_ctx.text_line(FontKind::Mono, origin_x + (x + 1.5)*screen_unit, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &format!("{}", on_screen_bc.block.this_height), color);
         } else {
             // hash
-            let text_line = format!("{}", on_screen_bc.block.this_hash);
-            let text_line = format!("..{}", &text_line[text_line.len()-2..]);
+            let text_line = format!("{}*", &on_screen_bc.block.this_hash.display_str());
             let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
             draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &text_line, color);
         }
@@ -566,7 +566,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bft.roundness, color);
 
         // hash
-        draw_ctx.text_line(FontKind::Mono, (origin_x + (x + 1.5)*screen_unit) as f32, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit as f32, &format!("{}", on_screen_bft.block.this_hash), color);
+        draw_ctx.text_line(FontKind::Mono, (origin_x + (x + 1.5)*screen_unit) as f32, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit as f32, &on_screen_bft.block.this_hash.display_str(), color);
 
         // height
         let text_line = format!("{}", on_screen_bft.block.this_height);
@@ -653,6 +653,22 @@ impl Hash32 {
     }
     pub fn from_u64(u: u64) -> Hash32 {
         Hash32 { le_chunks: [u,0u64,0u64,0u64], }
+    }
+
+    pub fn display_str(&self) -> String {
+        let mut str = String::new();
+        let mut bytes = self.as_bytes();
+        bytes.reverse();
+
+        for b in &bytes[0..4] {
+            str.push_str(&format!("{:02x}", b));
+        }
+        str.push_str(":");
+        for b in &bytes[bytes.len() - 4..] {
+            str.push_str(&format!("{:02x}", b));
+        }
+
+        str
     }
 }
 
