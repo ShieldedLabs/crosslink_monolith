@@ -58,6 +58,7 @@ use tracing::Instrument;
 
 use zcash_address::{unified::Encoding, TryFromAddress};
 use zcash_protocol::consensus::Parameters;
+use zcash_primitives::transaction::{RosterMember, StakeTxId};
 
 use zebra_chain::{
     amount::{self, Amount, NegativeAllowed, NonNegative},
@@ -289,7 +290,7 @@ pub trait Rpc {
     /// ```
     /// *(The `address:port` matches the value in `zebrad.toml > [rpc] > listen_addr`)*
     #[method(name = "get_tfl_roster_zats")]
-    async fn get_tfl_roster_zats(&self) -> Option<Vec<TFLStakerZats>>;
+    async fn get_tfl_roster_zats(&self) -> Option<Vec<RosterMember>>;
 
     /// Get the fat pointer to the BFT Chain tip. TODO: Example
     #[method(name = "get_tfl_fat_pointer_to_bft_chain_tip")]
@@ -1801,6 +1802,7 @@ where
         }
     }
 
+    // TODO: remove
     async fn get_tfl_roster_zec(&self) -> Option<Vec<TFLStakerZec>> {
         let ret = self
             .tfl_service
@@ -1812,10 +1814,10 @@ where
             .await;
         if let Ok(TFLServiceResponse::Roster(roster)) = ret {
             let mut new_roster = Vec::with_capacity(roster.len());
-            for (id, stake) in &roster {
+            for m in &roster {
                 new_roster.push(TFLStakerZec(
-                    *id,
-                    Zec::from(Amount::new(i64::try_from(*stake).ok()?)),
+                    m.pub_key,
+                    Zec::from(Amount::new(i64::try_from(m.voting_power).ok()?)),
                 ));
             }
             Some(new_roster)
@@ -1825,7 +1827,7 @@ where
         }
     }
 
-    async fn get_tfl_roster_zats(&self) -> Option<Vec<TFLStakerZats>> {
+    async fn get_tfl_roster_zats(&self) -> Option<Vec<RosterMember>> {
         let ret = self
             .tfl_service
             .clone()
@@ -1835,11 +1837,7 @@ where
             .call(TFLServiceRequest::Roster)
             .await;
         if let Ok(TFLServiceResponse::Roster(roster)) = ret {
-            let mut new_roster = Vec::with_capacity(roster.len());
-            for (id, stake) in &roster {
-                new_roster.push(TFLStakerZats(*id, *stake));
-            }
-            Some(new_roster)
+            Some(roster)
         } else {
             tracing::error!(?ret, "Bad tfl service return.");
             None
@@ -5060,5 +5058,3 @@ pub enum AddNodeCommand {
 
 #[derive(Clone, serde::Serialize)]
 pub struct TFLStakerZec(#[serde(with = "hex")] [u8; 32], Zec<NonNegative>);
-#[derive(Clone, serde::Serialize)]
-pub struct TFLStakerZats(#[serde(with = "hex")] [u8; 32], u64);

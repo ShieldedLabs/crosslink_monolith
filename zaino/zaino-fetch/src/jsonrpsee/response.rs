@@ -1435,8 +1435,6 @@ impl<'de> serde::Deserialize<'de> for Script {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct TFLStakerZats(#[serde(with = "hex")] pub [u8; 32], pub u64);
 // #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 // pub struct TFLStakerZec {
 //     #[serde(with = "hex")]
@@ -1456,7 +1454,7 @@ pub enum GetRosterError {
     InvalidEncoding(String),
 }
 
-impl ResponseToError for Vec<TFLStakerZats> {
+impl ResponseToError for Vec<zcash_primitives::transaction::RosterMember> {
     type RpcError = Infallible;
 }
 

@@ -84,8 +84,7 @@ use zcash_transparent::{
     address::TransparentAddress,
     keys::{IncomingViewingKey, TransparentKeyScope},
 };
-use zcash_primitives::transaction::StakingAction;
-use zcash_primitives::transaction::StakingActionKind;
+use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 
 pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
@@ -141,7 +140,7 @@ pub enum WalletTxKind {
 pub struct WalletTx(pub TransactionSummary<AccountUuid>, pub WalletTxKind);
 
 impl WalletTx {
-    pub fn with_fake_data(kind: WalletTxKind, sent: u64, received: u64, shielding: bool, memo: &str) -> Self {
+    pub fn with_fake_data(kind: WalletTxKind, sent: u64, received: u64, shielding: bool, memo: &str, mined_height: u32) -> Self {
         let mut memo_as_bytes = [0u8; 512];
         &memo_as_bytes[0..memo.len()].copy_from_slice(memo.as_bytes());
 
@@ -150,7 +149,7 @@ impl WalletTx {
                 account_id: AccountUuid::default(),
                 txid: TxId::from_bytes([0; 32]),
                 expiry_height: None,
-                mined_height: Some(BlockHeight::from_u32(10)),
+                mined_height: if mined_height != 0 { Some(BlockHeight::from_u32(mined_height)) } else { None },
                 account_value_delta: ZatBalance::from_i64(-(sent as i64)).unwrap(),
                 total_spent: Zatoshis::from_u64(sent).unwrap(),
                 total_received: Zatoshis::from_u64(received).unwrap(),
@@ -167,8 +166,10 @@ impl WalletTx {
             kind,
         )
     }
-
 }
+
+// @note(judah): needed so the visualizer doesn't take a dependency on zcash_primitives
+pub type WalletRosterMember = RosterMember;
 
 #[derive(Default, Debug, Clone)]
 pub struct WalletState {
@@ -177,7 +178,7 @@ pub struct WalletState {
     pub staked_balance: i64, // in zats
 
     pub txs: Vec<WalletTx>,
-    pub roster: Vec<RosterMember>,
+    pub roster: Vec<WalletRosterMember>,
 
     pub waiting_for_faucet: bool,
     pub waiting_for_stake_to_miner: bool,
@@ -244,10 +245,17 @@ pub fn str_from_ctaz(val: u64) -> String {
     format!("{full}.{}", &part_str[..trim_part.len().max(3)])
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct RosterMember {
-    pub pub_key: [u8; 32],
-    pub stake: u64,
+struct TxOptions {
+    memo: Option<zcash_protocol::memo::MemoBytes>,
+    staking_action: Option<StakingAction>,
+}
+impl Default for TxOptions {
+    fn default() -> Self {
+        Self {
+            memo: None,
+            staking_action: None,
+        }
+    }
 }
 
 pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
@@ -305,6 +313,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // Some(account.default_address().ok()??.0)
     }
 
+    let addrs_from_wallet = |wallet: &WalletDb<_, _, _, _>| -> Option<(TransparentAddress, UnifiedAddress)> {
+        let Ok(ids)  = wallet.get_account_ids() else { return None; };
+        let Some(id) = ids.first() else { return None; };
+        let Ok(Some(account)) = wallet.get_account(*id) else { return None; };
+        addrs_from_account(&account, 0)
+    };
+
     fn get_transaction_history<P: zcash_protocol::consensus::Parameters>(wallet: &zcash_client_sqlite::WalletDb<rusqlite::Connection, P, SystemClock, OsRng>) -> Result<Vec<TransactionSummary<AccountUuid>>, SqliteClientError> {
         let mut stmt = wallet.conn.prepare_cached(
             "SELECT accounts.uuid as account_uuid, v_transactions.*
@@ -340,7 +355,14 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        return Ok(results);
+        // lol
+        let mut pending: Vec<_> = results.iter().filter(|tx| tx.mined_height.is_none()).map(|tx| tx.clone()).collect();
+        let mut mined:   Vec<_> = results.iter().filter(|tx| tx.mined_height.is_some()).map(|tx| tx.clone()).collect();
+        pending.sort_by(| a, b | a.txid.cmp(&b.txid));
+        mined.sort_by(|a, b| a.mined_height.unwrap().cmp(&b.mined_height.unwrap()));
+        pending.extend_from_slice(&mined);
+
+        return Ok(pending);
     }
 
     async fn get_received_memos<P: zcash_protocol::consensus::Parameters>(client: &mut CompactTxStreamerClient<Channel>, wallet: &zcash_client_sqlite::WalletDb<rusqlite::Connection, P, SystemClock, OsRng>, params: P) -> Vec<(TxId, String)> {
@@ -408,16 +430,28 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         memos
     }
 
-    let send_zats = async | client: &mut CompactTxStreamerClient<_>, dst_wallet: &mut WalletDb<_, _, _, _>, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params, staking_action: Option<StakingAction>| -> bool {
-        // @todo(judah): handle multiple accounts?
-        let Ok(src_ids)  = src_wallet.get_account_ids() else { return false; };
-        let Some(src_id) = src_ids.first() else { return false; };
-        let Ok(Some(src_account)) = src_wallet.get_account(*src_id) else { return false; };
+    struct Timer { t_bgn: std::time::Instant, name: &'static str };
+    impl Timer {
+        pub fn scope(name: &'static str) -> Self {
+            println!("started {}", name);
+            Self {
+                name, t_bgn: std::time::Instant::now()
+            }
+        }
+    };
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            println!("{} took {}ms", self.name, self.t_bgn.elapsed().as_millis());
+        }
+    }
 
-        let Ok(dst_ids)  = dst_wallet.get_account_ids() else { return false; };
-        let Some(dst_id) = dst_ids.first() else { return false; };
-        let Ok(Some(dst_account)) = dst_wallet.get_account(*dst_id) else { return false; };
-        let Some((_, dst_ua)) = addrs_from_account(&dst_account, 0) else { return false; };
+    let send_zats = async | client: &mut CompactTxStreamerClient<_>, dst_ua: &UnifiedAddress, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params, opts: &TxOptions| -> Option<[u8;32]> {
+        let t = Timer::scope("send_zats");
+
+        // @todo(judah): handle multiple accounts?
+        let Ok(src_ids)  = src_wallet.get_account_ids() else { return None; };
+        let Some(src_id) = src_ids.first() else { return None; };
+        let Ok(Some(src_account)) = src_wallet.get_account(*src_id) else { return None; };
 
         const FALLBACK_CHANGE_POOL: zcash_protocol::ShieldedProtocol = zcash_protocol::ShieldedProtocol::Orchard;
 
@@ -429,13 +463,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             block_policy_10(),
             &zcash_client_backend::address::Address::Unified(dst_ua.clone()),
             zats,
-            Some(zcash_protocol::memo::MemoBytes::from_bytes(dst_ua.encode(params).to_string().as_bytes()).unwrap()),
+            opts.memo.clone(),
             None,
             FALLBACK_CHANGE_POOL)
         {
             Err(err) => {
                 println!("propose_transfer error: {err:?}");
-                return false;
+                None
             },
             Ok(proposal) => {
                 let prover = LocalTxProver::bundled();
@@ -447,116 +481,57 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     &wallet::SpendingKeys::from_unified_spending_key(src_usk.clone()),
                     zcash_client_backend::wallet::OvkPolicy::Sender,
                     &proposal,
-                    staking_action,
+                    opts.staking_action.clone(),
                 ) {
-                    Err(err) => println!("create_proposed_transactions error: {err:?}"),
-                    Ok(txids) => for txid in txids {
+                    Err(err) => {
+                        println!("create_proposed_transactions error: {err:?}");
+                        None
+                    },
+                    Ok(txids) => {
+                        if txids.len() > 1 {
+                            println!("Unexpectedly created {} transactions", txids.len());
+                        }
+
+                        let txid = txids[0];
                         let tx = match src_wallet.get_transaction(txid) {
                             Err(err) => {
                                 println!("failed to get tx {txid:?} immediately after making it: {err:?}");
-                                continue;
+                                return None;
                             }
                             Ok(Some(tx)) => tx,
                             Ok(None) => {
                                 println!("failed to get tx {txid:?} immediately after making it: (None)");
-                                continue;
+                                return None;
                             }
                         };
 
                         let mut data = Vec::new();
                         if let Err(err) = tx.write(&mut data) {
                             println!("Serialization error for tx {:?}: {:?}", txid, err);
-                            continue;
+                            return None;
                         }
 
                         let raw_tx = RawTransaction { data, height: 0 };
                         match client.send_transaction(raw_tx).await {
                             Ok(res)  => println!("sent transaction: {res:?}"),
                             Err(err) => {
-                                continue;
+                                return None;
                             }
                         }
 
                         println!("created transaction {txid:?}");
+                        Some(*txid.as_ref())
                     }
                 }
             }
         }
-
-        return true;
     };
 
-    let send_zats_externally = async | client: &mut CompactTxStreamerClient<_>, dst_ua: &UnifiedAddress, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params | -> bool {
-        // @todo(judah): handle multiple accounts?
-        let Ok(src_ids)  = src_wallet.get_account_ids() else { return false; };
-        let Some(src_id) = src_ids.first() else { return false; };
-        let Ok(Some(src_account)) = src_wallet.get_account(*src_id) else { return false; };
-
-        const FALLBACK_CHANGE_POOL: zcash_protocol::ShieldedProtocol = zcash_protocol::ShieldedProtocol::Orchard;
-
-        match wallet::propose_standard_transfer_to_address::<_, _, Infallible>(
-            src_wallet,
-            params,
-            zcash_client_backend::fees::StandardFeeRule::Zip317,
-            src_account.id(),
-            block_policy_10(),
-            &zcash_client_backend::address::Address::Unified(dst_ua.clone()),
-            zats,
-            None,
-            None,
-            FALLBACK_CHANGE_POOL)
-        {
-            Err(err) => {
-                println!("propose_transfer error: {err:?}");
-                return false;
-            },
-            Ok(proposal) => {
-                let prover = LocalTxProver::bundled();
-                match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
-                    src_wallet,
-                    params,
-                    &prover,
-                    &prover,
-                    &wallet::SpendingKeys::from_unified_spending_key(src_usk.clone()),
-                    zcash_client_backend::wallet::OvkPolicy::Sender,
-                    &proposal,
-                    None,
-                ) {
-                    Err(err) => println!("create_proposed_transactions error: {err:?}"),
-                    Ok(txids) => for txid in txids {
-                        let tx = match src_wallet.get_transaction(txid) {
-                            Err(err) => {
-                                println!("failed to get tx {txid:?} immediately after making it: {err:?}");
-                                continue;
-                            }
-                            Ok(Some(tx)) => tx,
-                            Ok(None) => {
-                                println!("failed to get tx {txid:?} immediately after making it: (None)");
-                                continue;
-                            }
-                        };
-
-                        let mut data = Vec::new();
-                        if let Err(err) = tx.write(&mut data) {
-                            println!("Serialization error for tx {:?}: {:?}", txid, err);
-                            continue;
-                        }
-
-                        let raw_tx = RawTransaction { data, height: 0 };
-                        match client.send_transaction(raw_tx).await {
-                            Ok(res)  => println!("sent transaction: {res:?}"),
-                            Err(err) => {
-                                continue;
-                            }
-                        }
-
-                        println!("created transaction {txid:?}");
-                    }
-                }
-            }
+    let send_zats_to_wallet = async | client: &mut CompactTxStreamerClient<_>, dst_wallet: &mut WalletDb<_, _, _, _>, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params, opts: &TxOptions| -> Option<[u8;32]> {
+        match addrs_from_wallet(dst_wallet) {
+            Some((_, dst_ua)) => send_zats(client, &dst_ua, src_wallet, src_usk, zats, params, opts).await,
+            None => None,
         }
-
-        return true;
     };
 
     println!("waiting for zaino to be ready...");
@@ -640,35 +615,71 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let mut time_since_last_transparent_shielded = std::time::Instant::now() - std::time::Duration::from_secs(1000);
 
         loop {
-            if let Ok(res) = client.get_roster(Empty{}).await {
-                use std::io::{ Cursor,Read };
-                let roster_bytes = res.into_inner().data;
+            match client.get_roster(Empty{}).await {
+                Err(err) => println!("Get roster error: {err:?}"),
+                Ok(res) => {
+                    use std::io::{ Cursor,Read };
+                    let roster_bytes = res.into_inner().data;
 
-                let mut ok = roster_bytes.len() > 0;
-                let mut cur = Cursor::new(&roster_bytes);
+                    let mut ok = roster_bytes.len() > 0;
+                    let mut cur = Cursor::new(&roster_bytes);
 
-                let mut new_roster = Vec::new();
-                let mut num_buf = [0u8; 8];
-                while cur.position() < roster_bytes.len() as u64 {
-                    let mut m = RosterMember{ pub_key: [0;32], stake:0 };
-                    if let Err(err) = cur.read_exact(&mut m.pub_key) {
-                        println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
-                        ok = false;
-                        break;
+                    let mut new_roster = Vec::new();
+                    let mut num_buf = [0u8; 8];
+                    'read: while cur.position() < roster_bytes.len() as u64 {
+                        let mut m = RosterMember{ pub_key: [0;32], voting_power:0, txids: Vec::new() };
+                        if let Err(err) = cur.read_exact(&mut m.pub_key) {
+                            println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
+                            ok = false;
+                            break;
+                        }
+                        if let Err(err) = cur.read_exact(&mut num_buf) {
+                            println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
+                            ok = false;
+                            break;
+                        }
+                        m.voting_power = u64::from_le_bytes(num_buf);
+
+                        if let Err(err) = cur.read_exact(&mut num_buf) {
+                            println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
+                            ok = false;
+                            break;
+                        }
+
+                        let mut voting_power_check = 0;
+                        let txids_n = u64::from_le_bytes(num_buf);
+                        for _ in 0..txids_n {
+                            let mut stake_txid = StakeTxId{ txid:[0;32], zats:0 };
+                            if let Err(err) = cur.read_exact(&mut stake_txid.txid) {
+                                println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
+                                ok = false;
+                                break 'read;
+                            }
+                            if let Err(err) = cur.read_exact(&mut num_buf) {
+                                println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
+                                ok = false;
+                                break 'read;
+                            }
+                            stake_txid.zats = u64::from_le_bytes(num_buf);
+                            voting_power_check += stake_txid.zats;
+                            m.txids.push(stake_txid);
+                        }
+
+                        if m.voting_power != voting_power_check {
+                            // TODO: use manually-found one?
+                            println!("******* RECEIVED ROSTER VOTING POWER INACCURATE");
+                            ok = false;
+                            break;
+                        }
+
+                        new_roster.push(m);
                     }
-                    if let Err(err) = cur.read_exact(&mut num_buf) {
-                        println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
-                        ok = false;
-                        break;
-                    }
-                    m.stake = u64::from_le_bytes(num_buf);
-                    new_roster.push(m);
-                }
 
-                if ok {
-                    roster = new_roster;
+                    if ok {
+                        roster = new_roster;
+                    }
+                    wallet_state.lock().unwrap().roster = roster.clone();
                 }
-                wallet_state.lock().unwrap().roster = roster.clone();
             }
             println!("*********** ROSTER: {roster:?}");
 
@@ -732,20 +743,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     if summary.chain_tip_height() != summary.fully_scanned_height() { return; }
                     println!("#############*************############# === CREATING SHIELDING TRANSACTION FOR MINING OUTPUTS");
 
-                    // let Ok(chain_height) = wallet.chain_height() else {
-                    //     println!("Failed to get chain height");
-                    //     return;
-                    // };
-                    // let target_height: TargetHeight = match chain_height {
-                    //     Some(height) => (height + 1).into(),
-                    //     None => {
-                    //         return; // nothing to do yet
-                    //     }
-                    // };
-                    // let Ok(tbaances) = wallet.get_transparent_balances(miner_account.id(), target_height, block_policy_10()) else { return; };
-                    // let from_addrs = tbalances
-                    //     .into_keys();
-
                     let Some((t_addr, _ua)) = addrs_from_account(&account, 0) else {
                         println!("Failed to get transparent address from account!");
                         return;
@@ -760,6 +757,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         fees::DustOutputPolicy::default(),
                     );
                     let min_zats_for_shielding = Zatoshis::const_from_u64(10_000);
+                    let t_shield = Timer::scope("wallet::propose_shielding");
                     match wallet::propose_shielding::<_, _, _, _, Infallible>(
                         wallet,
                         network,
@@ -768,11 +766,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         min_zats_for_shielding,
                         &[t_addr],
                         account.id(),
-                        block_policy_10(),
+                        wallet::ConfirmationsPolicy::MIN,
                     ) {
                         Ok(proposal) => {
                             let prover = LocalTxProver::bundled();
-                            let txids = match tokio::task::block_in_place(|| { wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+                            let txids = match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
                                 wallet,
                                 network,
                                 &prover,
@@ -781,7 +779,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 zcash_client_backend::wallet::OvkPolicy::Sender,
                                 &proposal,
                                 None,
-                            ) }) {
+                            ) {
                                 Ok(txids) => txids,
                                 Err(err) => {
                                     println!("Failed to create transactions: {:?}", err);
@@ -823,9 +821,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             return;
                         }
                     }
+                    // drop(t_shield);
                 })(&mut miner_wallet, &miner_account, &miner_usk).await;
             }
-
 
             // Update gui wallet state
             (async |user_wallet: &mut WalletDb<_, _, _, _>, miner_wallet: &mut WalletDb<_, _, _, _>| {
@@ -1149,78 +1147,20 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
                         true
                     } else {
-                        let zats = (Zatoshis::from_nonnegative_i64(500_000_000).unwrap() - MINIMUM_FEE).unwrap();
+                        let t = Timer::scope("faucet send");
                         // NOTE: we can't send transparent->transparent through the high-level API, we
                         // have to propose_shielding first, then send in a later block
-                        const FALLBACK_CHANGE_POOL: zcash_protocol::ShieldedProtocol = zcash_protocol::ShieldedProtocol::Orchard;
-                        match wallet::propose_standard_transfer_to_address::<_, _, Infallible>(
-                            &mut miner_wallet,
-                            network,
-                            zcash_client_backend::fees::StandardFeeRule::Zip317,
-                            miner_account.id(),
-                            block_policy_10(),
-                            // &zcash_client_backend::address::Address::Transparent(user_t_addr),
-                            &zcash_client_backend::address::Address::Unified(user_ua.clone()),
-                            zats,
-                            Some(zcash_protocol::memo::MemoBytes::from_bytes("Happy spending, with love from your favourite faucet".as_bytes()).unwrap()),
-                            None,
-                            FALLBACK_CHANGE_POOL)
-                        {
-                            Err(err) => {
-                                println!("propose_transfer error: {err:?}");
+                        let zats = (Zatoshis::from_nonnegative_i64(500_000_000).unwrap() - MINIMUM_FEE).unwrap();
+                        match send_zats_to_wallet(&mut client, &mut user_wallet, &mut miner_wallet, &miner_usk, zats, network, &TxOptions{
+                            memo: Some(zcash_protocol::memo::MemoBytes::from_bytes("Happy spending, with love from your favourite faucet".as_bytes()).unwrap()),
+                            ..TxOptions::default()
+                        }).await {
+                            None => {
                                 wallet_state.lock().unwrap().waiting_for_faucet = false;
-                            },
-                            Ok(proposal) => {
-                                let prover = LocalTxProver::bundled();
-                                match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
-                                    &mut miner_wallet, network,
-                                    &prover,
-                                    &prover,
-                                    &wallet::SpendingKeys::from_unified_spending_key(miner_usk.clone()),
-                                    zcash_client_backend::wallet::OvkPolicy::Sender,
-                                    &proposal,
-                                    None,
-                                ) {
-                                    Err(err) => println!("create_proposed_transactions error: {err:?}"),
-                                    Ok(txids) => for txid in txids {
-                                        let tx = match miner_wallet.get_transaction(txid) {
-                                            Err(err) => {
-                                                println!("failed to get tx {txid:?} immediately after making it: {err:?}");
-                                                wallet_state.lock().unwrap().waiting_for_faucet = false;
-                                                continue;
-                                            }
-                                            Ok(Some(tx)) => tx,
-                                            Ok(None) => {
-                                                println!("failed to get tx {txid:?} immediately after making it: (None)");
-                                                wallet_state.lock().unwrap().waiting_for_faucet = false;
-                                                continue;
-                                            }
-                                        };
-
-                                        let mut data = Vec::new();
-                                        if let Err(err) = tx.write(&mut data) {
-                                            println!("Serialization error for tx {:?}: {:?}", txid, err);
-                                            wallet_state.lock().unwrap().waiting_for_faucet = false;
-                                            continue;
-                                        }
-
-                                        let raw_tx = RawTransaction { data, height: 0 };
-
-                                        match client.send_transaction(raw_tx).await {
-                                            Ok(res) => println!("sent transaction: {res:?}"),
-                                            Err(err) => {
-                                                println!("failed to send transaction: {err:?}");
-                                                wallet_state.lock().unwrap().waiting_for_faucet = false;
-                                            }
-                                        }
-
-                                        println!("created transaction {txid:?}");
-                                        // already_sent = true;
-                                    },
-                                }
+                                continue;
                             }
+                            Some(_) => true,
                         }
-                        true
                     }
 
                     WalletAction::StakeToMiner(amount, target_finalizer) => {
@@ -1243,26 +1183,27 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
 
                         println!("********** STAKING ZEC {:?} ({:?}) TO THE MINER but also to {:?}", amount, amount_with_fee, target_finalizer);
-                        let ok = send_zats(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network,
-                            Some(StakingAction {
+                        let opts = TxOptions {
+                            staking_action: Some(StakingAction {
                                 kind: StakingActionKind::Add,
                                 val: amount_with_fee.into_u64(),
                                 target: target_finalizer,
                                 source: [0_u8; 32],
                                 insecure_target_name: "".to_owned(),
                                 insecure_source_name: "".to_owned(),
-                            })
-                        ).await;
-                        if !ok {
-                            println!("Failed to send ZEC to miner");
-                            break;
+                            }),
+                            memo: Some(zcash_protocol::memo::MemoBytes::from_bytes(user_ua.encode(network).to_string().as_bytes()).unwrap()),
+                        };
+                        match send_zats_to_wallet(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network, &opts).await {
+                            None => {
+                                println!("Failed to send ZEC to miner");
+                                wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
+                                break;
+                            }
+                            Some(_) => {
+                                true
+                            }
                         }
-
-                        if ok {
-                            wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
-                        }
-
-                        ok
                     }
 
                     WalletAction::SendToAddress(address, amount) => {
@@ -1285,16 +1226,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
 
                         println!("*********** SEND ZEC {:?} ({:?}) TO {}", amount, amount_with_fee, &address.encode(network));
-                        let ok = send_zats_externally(&mut client, &address, &mut user_wallet, &user_usk, amount_with_fee, network).await;
-                        if !ok {
-                            println!("Failed to send ZEC to {}", address.encode(network));
-                            break;
+                        match send_zats(&mut client, &address, &mut user_wallet, &user_usk, amount_with_fee, network, &TxOptions::default()).await {
+                            None => {
+                                println!("Failed to send ZEC to {}", address.encode(network));
+                                wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
+                                break;
+                            }
+                            Some(_) => {
+                                true
+                            }
                         }
-                        else {
-                            wallet_state.lock().unwrap().waiting_for_send = false;
-                        }
-
-                        ok
                     }
 
                     _ => { true }

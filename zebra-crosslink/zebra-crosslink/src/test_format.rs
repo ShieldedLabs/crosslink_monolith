@@ -613,7 +613,7 @@ pub(crate) async fn handle_instr(
             let mut internal = internal_handle.internal.lock().await;
             internal
                 .validators_at_current_height
-                .push(crate::MalValidator::new(pub_key.into(), stake));
+                .push(crate::MalValidator::new(pub_key.into(), vec![StakeTxId{ txid: [0;32], zats: stake }]));
         }
     }
 }

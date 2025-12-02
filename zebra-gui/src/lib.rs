@@ -939,7 +939,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                 let twindow = Rc::new(elwt.create_window(
                     winit::window::WindowAttributes::default()
                     .with_maximized(true)
-                    .with_title("ZCash Visualizer")
+                    .with_title("Zcash Visualizer")
                     .with_inner_size(Size::Physical(winit::dpi::PhysicalSize { width: 1600, height: 900 }))
                 ).unwrap());
                 let context = softbuffer::Context::new(twindow.clone()).unwrap();
@@ -1191,12 +1191,13 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 let put = draw_ctx.draw_command_buffer.add(*draw_ctx.draw_command_count);
                                                 *draw_ctx.draw_command_count += 1;
                                                 assert!(*draw_ctx.draw_command_count <= DRAW_CALL_MAX);
-                                                *put = DrawCommand::ClearScreenToColor { color: 0x080808 };
+                                                *put = DrawCommand::ClearScreenToColor { color: 0x080808 /* @todo colors */};
                                             }
 
                                             gui_ctx.input = &input_ctx;
                                             gui_ctx.draw  = &draw_ctx;
                                             gui_ctx.dpi_scale = window.scale_factor() as f32;
+                                            gui_ctx.delta = dt as f32;
 
                                             viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut gui_ctx, &draw_ctx, dt as f32, &input_ctx);
 
@@ -1347,6 +1348,8 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                                         hasher.write_u32(radius_br.to_bits());
                                                                         hasher.write_u32(color);
                                                                         if should_draw == false { continue; }
+                                                                        if scissor_x1 >= scissor_x2 { continue; }
+                                                                        if scissor_y1 >= scissor_y2 { continue; }
                                                                         let mut row_pixels = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
                                                                         let color_alpha = (color >> 24) as f32 / 255.0;
                                                                         for _y in iy..iy2 {
@@ -1422,6 +1425,8 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                                             hasher.write_u32(color);
                                                                             // TODO rethink, font id?
                                                                             if should_draw == false { continue; }
+                                                                            if scissor_x1 >= scissor_x2 { continue; }
+                                                                            if scissor_y1 >= scissor_y2 { continue; }
 
                                                                             let mut copy_data = row_bitmaps.byte_add((lookup_index as usize) << glyph_row_shift);
                                                                             let mut put_data = ctx.render_target_0.byte_add((y as usize) << (pixel_row_shift+2)).byte_offset(start_x as isize *4);

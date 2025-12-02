@@ -9956,6 +9956,7 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "tracing",
+ "zcash_primitives",
  "zebra-chain",
  "zebra-test",
 ]

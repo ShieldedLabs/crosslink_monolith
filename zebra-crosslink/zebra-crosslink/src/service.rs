@@ -27,6 +27,7 @@ use crate::FatPointerToBftBlock2;
 use crate::{
     rng_private_public_key_from_address, tfl_service_incoming_request, TFLBlockFinality,
     TFLServiceInternal,
+    StakeTxId,
 };
 
 use tower::Service;
@@ -126,7 +127,7 @@ pub fn spawn_new_tfl_service(
 
         for peer in config.malachite_peers.iter() {
             let (_, _, public_key) = rng_private_public_key_from_address(peer.as_bytes());
-            array.push(crate::MalValidator::new(public_key, 1));
+            array.push(crate::MalValidator::new(public_key, vec![StakeTxId{ txid: [0;32], zats:1 }]));
             map.insert(public_key, peer.to_string());
         }
 
@@ -142,7 +143,7 @@ pub fn spawn_new_tfl_service(
             // .unwrap_or(String::from_str("tester").unwrap());
             info!("user_name: {}", user_name);
             let (_, _, public_key) = rng_private_public_key_from_address(&user_name.as_bytes());
-            array.push(crate::MalValidator::new(public_key, 1));
+            array.push(crate::MalValidator::new(public_key, vec![StakeTxId{ txid: [0;32], zats:1 }]));
             map.insert(public_key, user_name);
         }
 

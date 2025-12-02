@@ -177,6 +177,8 @@ pub struct VizState {
     pub send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
     pub receive_from_zebra: std::sync::mpsc::Receiver<ResponseFromZebra>,
 
+    pub time_since_last_animation: std::time::Instant,
+
     pub bc_tip_y: f32,
 
     pub bc_tip_height: u64,
@@ -217,6 +219,8 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 
         inspecting_block_screen_x: 0.0,
         inspecting_block_screen_y: 0.0,
+
+        time_since_last_animation: Instant::now(),
     };
     if fake_data {
         let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
@@ -246,6 +250,11 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 }
 pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
     let mut anything_happened = false;
+
+    if viz_state.time_since_last_animation.elapsed().as_secs_f32() > 0.333 {
+        anything_happened = true;
+        viz_state.time_since_last_animation = Instant::now();
+    }
 
     while let Ok(message) = viz_state.receive_from_zebra.try_recv() {
         anything_happened |= viz_state.bc_tip_height != message.bc_tip_height;
