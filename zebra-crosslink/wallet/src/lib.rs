@@ -173,8 +173,10 @@ impl WalletTx {
             kind,
         )
     }
-
 }
+
+// @note(judah): needed so the visualizer doesn't take a dependency on zcash_primitives
+pub type WalletRosterMember = RosterMember;
 
 #[derive(Default, Debug, Clone)]
 pub struct WalletState {
@@ -183,7 +185,7 @@ pub struct WalletState {
     pub staked_balance: i64, // in zats
 
     pub txs: Vec<WalletTx>,
-    pub roster: Vec<RosterMember>,
+    pub roster: Vec<WalletRosterMember>,
 
     pub waiting_for_faucet: bool,
     pub waiting_for_stake_to_miner: bool,
