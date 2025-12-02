@@ -939,7 +939,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                 let twindow = Rc::new(elwt.create_window(
                     winit::window::WindowAttributes::default()
                     .with_maximized(true)
-                    .with_title("ZCash Visualizer")
+                    .with_title("Zcash Visualizer")
                     .with_inner_size(Size::Physical(winit::dpi::PhysicalSize { width: 1600, height: 900 }))
                 ).unwrap());
                 let context = softbuffer::Context::new(twindow.clone()).unwrap();
