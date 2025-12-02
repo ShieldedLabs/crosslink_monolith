@@ -52,28 +52,28 @@ fn main() {
 
         wallet_state.lock().unwrap().txs = pending;
         wallet_state.lock().unwrap().roster = vec![
-            WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 25540_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0xBBu8; 32], voting_power: 111000100_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0xCCu8; 32], voting_power: 250_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0xDDu8; 32], voting_power: 100_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0xEEu8; 32], voting_power: 250_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0xFFu8; 32], voting_power: 100_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0x01u8; 32], voting_power: 250_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0x11u8; 32], voting_power: 100_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0x22u8; 32], voting_power: 250_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0x33u8; 32], voting_power: 100_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0x44u8; 32], voting_power: 250_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0x55u8; 32], voting_power: 100_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0x66u8; 32], voting_power: 250_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0x77u8; 32], voting_power: 100_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0x88u8; 32], voting_power: 250_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0x99u8; 32], voting_power: 100_000_000, txids: vec![] },
+            WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 25540_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0xBBu8; 32], voting_power: 111000100_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0xCCu8; 32], voting_power: 250_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0xDDu8; 32], voting_power: 100_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0xEEu8; 32], voting_power: 250_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0xFFu8; 32], voting_power: 100_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0x01u8; 32], voting_power: 250_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0x11u8; 32], voting_power: 100_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0x22u8; 32], voting_power: 250_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0x33u8; 32], voting_power: 100_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0x44u8; 32], voting_power: 250_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0x55u8; 32], voting_power: 100_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0x66u8; 32], voting_power: 250_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0x77u8; 32], voting_power: 100_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0x88u8; 32], voting_power: 250_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0x99u8; 32], voting_power: 100_000_000, txids: vec![], show_initial_stake_amount: false },
         ];
         wallet_state.lock().unwrap().staked_roster = vec![
-            WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 250_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0xBBu8; 32], voting_power: 100_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0xCCu8; 32], voting_power: 250_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0xDDu8; 32], voting_power: 100_000_000, txids: vec![] },
+            WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 250_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0xBBu8; 32], voting_power: 100_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0xCCu8; 32], voting_power: 250_000_000, txids: vec![], show_initial_stake_amount: false },
+            WalletRosterMember{ pub_key: [0xDDu8; 32], voting_power: 100_000_000, txids: vec![], show_initial_stake_amount: false },
         ];
     }
 

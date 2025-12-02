@@ -964,12 +964,12 @@ pub fn ui_left_pane(ui: &mut Context,
                     };
 
 
-                    let staked_roster = &wallet_state.lock().unwrap().staked_roster.clone();
+                    let mut staked_roster = &mut wallet_state.lock().unwrap().staked_roster;
                     if staked_roster.len() == 0 {
                         ui.unstake_scroll = 0.0;
                     }
 
-                    let id = id("History Scroll Container");
+                    let id = id("Unstake Scroll Container");
                     if ui.hovered(id) {
                         ui.unstake_scroll -= ui.input().zoom_delta     as f32 * 32.0;
                         ui.unstake_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
@@ -1008,14 +1008,14 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 ui.text(ICON_EYE_OFF, TextDecl { font: Icons, colour: WHITE.mul(0.6), h: ui.scale(64.0), align: AlignX::Center, ..TextDecl });
-                                ui.text("There are no finalizers yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
+                                ui.text("You have not staked to any finalizers yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
                             }
                         }
                         else {
                             let kind_text_h = ui.scale(18.0);
                             let transaction_text_h = ui.scale(16.0);
 
-                            for (index, member) in staked_roster.iter().enumerate() {
+                            for (index, member) in &mut staked_roster.iter_mut().enumerate() {
                                 if index > 0 { // separator
                                     let colour = {
                                         let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
@@ -1094,8 +1094,29 @@ pub fn ui_left_pane(ui: &mut Context,
                                         let part = stake_amount % 100_000_000;
                                         let part_str = format!("{part}00");
                                         let trim_part = part_str.trim_end_matches("0");
-                                        let colour = (0xff, 0xaf, 0x0e, 0xff);
-                                        ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { font: Mono, h: ui.scale(14.0), colour, align: AlignX::Right, ..TextDecl });
+
+                                        let id = id_index("Unstake Clickable Text", index as u32);
+
+                                        let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
+                                        let mut str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
+                                        if member.show_initial_stake_amount {
+                                            colour = WHITE;
+                                            str = frame_strf!(data, "0.0 cTAZ"); // @todo initial stake
+                                        }
+
+                                        let (clicked, colour, _) = ui.button_ex(true, colour, id, true, true);
+                                        if clicked {
+                                            member.show_initial_stake_amount = !member.show_initial_stake_amount;
+                                        }
+
+                                        if let _ = elem().decl(Decl{
+                                            id,
+                                            width: fit!(),
+                                            height: fit!(),
+                                            ..Decl
+                                        }) {
+                                            ui.text(str, TextDecl { font: Mono, h: ui.scale(14.0), colour, align: AlignX::Right, ..TextDecl });
+                                        }
                                     }
                                 }
                             }
@@ -2079,12 +2100,15 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
     }
 
 
-
     if !ui.input().mouse_held(winit::event::MouseButton::Left) {
         ui.clicked_id = Id::default();
     }
     if ui.clicked_id != Id::default() {
         ui.capture = true;
+    }
+
+    if ui.clicked_id != Id::default() {
+        ui.most_recently_clicked_id = ui.clicked_id;
     }
 
     // Return the list of render commands of your layout
@@ -2193,8 +2217,9 @@ pub struct Context {
 
     pub capture: bool,
 
-    pub clicked_id: Id,
-    pub focused_id: Id,
+    pub clicked_id:               Id,
+    pub focused_id:               Id,
+    pub most_recently_clicked_id: Id,
 
     pub pane_tab_l: Id,
     pub pane_tab_r: Id,

@@ -10,6 +10,7 @@ use sapling_crypto::zip32::ExtendedSpendingKey;
 use std::collections::{HashMap, VecDeque};
 use std::convert::{identity, Infallible};
 use std::future::Future;
+use std::mem;
 use std::sync::{Arc, Mutex};
 use tokio_rustls::rustls;
 use tonic::client::GrpcService;
@@ -170,7 +171,13 @@ impl WalletTx {
 }
 
 // @note(judah): needed so the visualizer doesn't take a dependency on zcash_primitives
-pub type WalletRosterMember = RosterMember;
+#[derive(Default, Debug, Clone)]
+pub struct WalletRosterMember {
+    pub pub_key: [u8; 32],
+    pub voting_power: u64,
+    pub txids: std::vec::Vec<StakeTxId>,
+    pub show_initial_stake_amount: bool,
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct WalletState {
@@ -703,7 +710,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     if ok {
                         roster = new_roster;
                     }
-                    wallet_state.lock().unwrap().roster = roster.clone();
+
+                    wallet_state.lock().unwrap().roster = roster
+                        .iter()
+                        .map(|member| WalletRosterMember{
+                            pub_key: member.pub_key,
+                            voting_power: member.voting_power,
+                            txids: member.txids.clone(),
+                            show_initial_stake_amount: false,
+                        })
+                        .collect::<Vec<WalletRosterMember>>()
+                        .clone();
                 }
             }
             println!("*********** ROSTER: {roster:?}");
