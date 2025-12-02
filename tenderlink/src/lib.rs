@@ -1315,7 +1315,7 @@ struct Peer {
 
     connection_is_unknown: bool,
 
-    unacted_upon_status_height: Option<u64>,
+    latest_status_request: Option<u64>,
     latest_status: Option<PacketStatus>,
 }
 impl Default for Peer {
@@ -1330,7 +1330,7 @@ impl Default for Peer {
             transport: PeerTransport::default(),
 
             connection_is_unknown: false,
-            unacted_upon_status_height: None,
+            latest_status_request: None,
             latest_status: None,
         }
     }
@@ -1354,7 +1354,7 @@ struct UnknownPeer {
     watch_dog: Instant,
 
     transport: PeerTransport,
-    unacted_upon_status_height: Option<u64>,
+    latest_status_request: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -1859,7 +1859,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         peer.pending_client_ack_snow_state = None;
                         peer.snow_state = None;
                         peer.watch_dog = Instant::now();
-                        peer.unacted_upon_status_height = None;
+                        peer.latest_status_request = None;
                         peer.latest_status = None;
                     }
 
@@ -2090,8 +2090,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 for peer_i in 0..peers.len() {
                     let peer = &mut peers[peer_i];
                     if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
-                    if let Some(height) = peer.unacted_upon_status_height && height < bft_state.height {
-                        peer.unacted_upon_status_height = None;
+                    if let Some(height) = peer.latest_status_request && height < bft_state.height {
+                        peer.latest_status_request = None;
                         send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
                     }
                     else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
@@ -2116,8 +2116,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                 for peer_i in 0..unknown_peers.len() {
                     let peer = &mut unknown_peers[peer_i];
-                    if let Some(height) = peer.unacted_upon_status_height && height < bft_state.height {
-                        peer.unacted_upon_status_height = None;
+                    if let Some(height) = peer.latest_status_request && height < bft_state.height {
+                        peer.latest_status_request = None;
                         send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, [0; 32], &sock, &mut net_stats);
                     }
 
@@ -2445,7 +2445,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             print_packet_tag_send(header);
                             send_sock_msg(&ctx_str, &mut transport, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
                             transport.nonce += 1;
-                            unknown_peers.push(UnknownPeer { endpoint: client_endpoint, snow_state: stateless_snow_state, pending_client_ack: true, watch_dog: Instant::now(), transport, unacted_upon_status_height: None });
+                            unknown_peers.push(UnknownPeer { endpoint: client_endpoint, snow_state: stateless_snow_state, pending_client_ack: true, watch_dog: Instant::now(), transport, latest_status_request: None });
                         }
                         break;
                     }
@@ -2469,7 +2469,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             process_acks(&mut peer.transport, header);
 
             if let Some(status) = status {
-                peer.unacted_upon_status_height = Some(status.height);
+                peer.latest_status_request = Some(status.height);
             }
 
             match packet_type {
@@ -2514,7 +2514,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     peer.connection_is_unknown = false;
                 }
 
-                peer.unacted_upon_status_height = Some(status.height);
+                peer.latest_status_request = Some(status.height);
                 peer.latest_status = Some(status);
             }
 
