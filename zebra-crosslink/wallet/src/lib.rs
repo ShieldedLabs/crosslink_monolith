@@ -181,6 +181,8 @@ impl WalletTx {
 pub struct WalletState {
     pub balance: i64, // in zats
     pub pending_balance: i64, // in zats
+    pub staked_balance: i64, // in zats
+
     pub txs: Vec<WalletTx>,
     pub roster: Vec<RosterMember>,
 

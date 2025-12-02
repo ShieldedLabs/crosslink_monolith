@@ -12,8 +12,8 @@ fn main() {
             WalletTx::with_fake_data(WalletTxKind::Shield, 10_000_000_000, 0, true, ""),
         ];
         wallet_state.lock().unwrap().roster = vec![
-            RosterMember{ pub_key: [1u8; 32], stake: 250_000_000 },
-            RosterMember{ pub_key: [1u8; 32], stake: 100_000_000 },
+            RosterMember{ pub_key: [0xAAu8; 32], stake: 250_000_000 },
+            RosterMember{ pub_key: [0xBBu8; 32], stake: 100_000_000 },
         ];
     }
 
