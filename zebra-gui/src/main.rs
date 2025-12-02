@@ -10,10 +10,12 @@ fn main() {
             WalletTx::with_fake_data(WalletTxKind::Receive, 0, 100_000_000, false, "Other things"),
             WalletTx::with_fake_data(WalletTxKind::Send, 250_000_000, 0, true, "More things"),
             WalletTx::with_fake_data(WalletTxKind::Shield, 10_000_000_000, 0, true, ""),
+            WalletTx::with_fake_data(WalletTxKind::Stake, 10_000_000_000, 0, false, ""),
+            WalletTx::with_fake_data(WalletTxKind::Unstake, 10_000_000_000, 0, false, ""),
         ];
         wallet_state.lock().unwrap().roster = vec![
-            RosterMember{ pub_key: [1u8; 32], stake: 250_000_000 },
-            RosterMember{ pub_key: [1u8; 32], stake: 100_000_000 },
+            RosterMember{ pub_key: [0xAAu8; 32], stake: 250_000_000 },
+            RosterMember{ pub_key: [0xBBu8; 32], stake: 100_000_000 },
         ];
     }
 

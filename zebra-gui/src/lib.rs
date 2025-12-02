@@ -1,6 +1,9 @@
 #![allow(unsafe_code)]
 #![allow(warnings)]
 
+mod style;
+use style::*;
+
 mod ui;
 use ui::*;
 

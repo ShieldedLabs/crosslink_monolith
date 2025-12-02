@@ -460,7 +460,7 @@ impl Context {
 
     pub fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
 
-    pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
+    pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: bool) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
         let mouse_held     = self.input().mouse_held(winit::event::MouseButton::Left);
         let mouse_pressed  = self.input().mouse_pressed(winit::event::MouseButton::Left);
         let mouse_released = self.input().mouse_released(winit::event::MouseButton::Left);
@@ -473,8 +473,8 @@ impl Context {
             self.clicked_id = id;
         }
 
-        if hover {
-            // self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
+        if hover && pointer_on_hover {
+            self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
         }
 
         let activated = enabled && (self.clicked_id == id) && if act_on_press {
@@ -512,7 +512,7 @@ impl Context {
         (activated, colour, text_colour)
     }
 
-    pub fn button(&mut self, id: Id) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) { return self.button_ex(true, BUTTON_GREY, id, true); }
+    pub fn button(&mut self, id: Id) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) { return self.button_ex(true, BUTTON_GREY, id, true, false); }
 
     pub fn text(&self, label: &str, decl: TextDecl) {
         let config = clay::text::TextConfig::new()
@@ -627,13 +627,18 @@ pub fn ui_left_pane(ui: &mut Context,
 
         if container_hovered { ui.capture = true; }
 
+        let mut height = grow!(ui.scale(192.0), ui.scale(384.0));
+        if ui.modal == Modal::Stake {
+            height = fit!();
+        }
+
         if let _elem = elem().decl(Decl {
             child_gap, radius,
             id: id("Modal Contents"),
             padding: padding.mul(2.0),
             colour: MODAL_COL,
             width:  grow!(ui.scale(192.0), ui.scale(384.0)),
-            height: grow!(ui.scale(192.0), ui.scale(384.0)),
+            height: height,
             align: Top,
             direction: TopToBottom,
             ..Decl
@@ -662,7 +667,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Right, ..Decl }) && closeable {
                         let id = id("Close This Modal");
 
-                        let (clicked, colour, _) = ui.button_ex(false, BUTTON_GREY, id, true);
+                        let (clicked, colour, _) = ui.button_ex(false, BUTTON_GREY, id, true, false);
                         if clicked || ui.input().key_pressed(KeyCode::Escape) {
                             ui.modal = Modal::None;
                         }
@@ -696,7 +701,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     hsva.2 = ((hsva.2 as f32) * 1.25).min(255.0) as u8;
                     hsva.rgba()
                 };
-                let (clicked, colour, text_colour) = ui.button_ex(false, colour, id, enabled);
+                let (clicked, colour, text_colour) = ui.button_ex(false, colour, id, enabled, false);
                 let radius = ui.scale(24.0);
                 if let _ = elem().decl(Decl {
                     id,
@@ -734,15 +739,12 @@ pub fn ui_left_pane(ui: &mut Context,
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                        let mut send_address = "00000000..00000000";
-                        if data.send_address.len() != 0 {
+                        let mut send_address = "0000000000000000";
+                        if data.send_address.len() >= 16 {
                             send_address = &data.send_address;
-                            if send_address.len() > 20 {
-                                send_address = &send_address[..20];
-                            }
                         }
 
-                        ui.text(frame_strf!(data, "[{}]", send_address), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                        ui.text(frame_strf!(data, "[{}..{}]", &send_address[..8], &send_address[send_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                         if button_ex(ui, "Paste Address", true) {
                             data.send_address = ui.input().get_from_clipboard().trim().to_string();
                         }
@@ -767,10 +769,19 @@ pub fn ui_left_pane(ui: &mut Context,
                             direction: TopToBottom,
                             ..Decl
                         }) {
-                            let balance = wallet_state.lock().unwrap().balance;
+                            let (
+                                balance,
+                                waiting_for_send
+                            ) = {
+                                let wallet_state = wallet_state.lock().unwrap();
+                                (
+                                    wallet_state.balance,
+                                    wallet_state.waiting_for_send,
+                                )
+                            };
 
-                            let can = data.send_address.len() != 0;
-                            if button_ex(ui,   "1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ);       }
+                            let can = !waiting_for_send && data.send_address.len() != 0;
+                            if button_ex(ui,   "1 cTAZ", can && (balance as u64) >= ONE_cTAZ)        { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ);       }
                             if button_ex(ui,   "10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ * 10);  }
                         }
                     }
@@ -788,8 +799,8 @@ pub fn ui_left_pane(ui: &mut Context,
                         direction: TopToBottom,
                         ..Decl
                     }) {
-                        let recv_address = "00000000..00000000";
-                        ui.text(frame_strf!(data, "[{}]", recv_address), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                        let recv_address = "0000000000000000";
+                        ui.text(frame_strf!(data, "[{}..{}]", &recv_address[..8], &recv_address[recv_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                         if button_ex(ui, "Copy Address", true) {
                             ui.input().send_to_clipboard(recv_address);
                         }
@@ -798,15 +809,12 @@ pub fn ui_left_pane(ui: &mut Context,
                 Modal::Stake => {
                     title_bar(ui, true, "Stake",   id("Stake Title Bar"));
 
-                    let mut stake_address = "00000000..00000000";
-                    if data.stake_address.len() != 0 {
+                    let mut stake_address = "0000000000000000";
+                    if data.stake_address.len() >= 16 {
                         stake_address = &data.stake_address;
-                        if stake_address.len() > 20 {
-                            stake_address = &stake_address[..20];
-                        }
                     }
 
-                    ui.text(frame_strf!(data, "[{}]", stake_address), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                    ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                     if button_ex(ui, "Paste Address", true) {
                         data.stake_address = ui.input().get_from_clipboard().trim().to_string();
                     }
@@ -822,16 +830,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     const ONE_cTAZ: u64 = 100_000_000;
                     let waiting_for_stake_to_miner = wallet_state.lock().unwrap().waiting_for_stake_to_miner;
 
-                    if let _ = elem().decl(Decl {
-                        child_gap, radius,
-                        id: id("Staking Buttons"),
-                        colour: MODAL_COL,
-                        width:  grow!(),
-                        height: grow!(),
-                        align: Center,
-                        direction: TopToBottom,
-                        ..Decl
-                    }) {
+                    {
                         let balance = wallet_state.lock().unwrap().balance;
 
                         // if (balance as u64) < ONE_cTAZ / 100 {
@@ -892,10 +891,9 @@ pub fn ui_left_pane(ui: &mut Context,
         }
     }
 
+    // @TODO: MAKE THESE NOT USE TABS, JUST USE HEADERS
 
     let mut tab_id_wallet = Id::default();
-    let mut tab_id_finalizers = Id::default();
-    let mut tab_id_history = Id::default();
 
     if let _ = elem().decl(Decl {
         id: id("Tab Bar"),
@@ -905,9 +903,7 @@ pub fn ui_left_pane(ui: &mut Context,
         align: Center,
         ..Decl
     }) {
-        tab_id_wallet     = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Wallet");
-        // tab_id_finalizers = ui.tab(radius, padding, tab_id, "Finalizers");
-        tab_id_history    = ui.tab_ex(radius, padding, tab_id, id("History"), frame_strf!(data, "History ({})", &wallet_state.lock().unwrap().txs.len()));
+        tab_id_wallet = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Wallet");
     }
 
     // Main contents
@@ -926,276 +922,291 @@ pub fn ui_left_pane(ui: &mut Context,
         let balance_text_h = ui.scale(48.0);
         let accent_text_h  = ui.scale(16.0);
 
-        if *tab_id == tab_id_wallet {
-            // spacer
-            if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
+        // spacer
+        // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
-            let (
-                balance,
-                pending_balance,
-            ) = {
-                let wallet_state = wallet_state.lock().unwrap();
-                (
-                    wallet_state.balance,
-                    wallet_state.pending_balance,
-                )
-            };
+        let (
+            balance,
+            pending_balance,
+            staked_balance,
+        ) = {
+            let wallet_state = wallet_state.lock().unwrap();
+            (
+                wallet_state.balance,
+                wallet_state.pending_balance,
+                wallet_state.staked_balance,
+            )
+        };
 
-            // balance container
-            if let _ = elem().decl(Decl {
-                width: grow!(),
-                height: fit!(),
-                align: Center,
-                ..Decl
-            }) {
-                let balance_str = frame_strf!(data, "{} cTAZ", str_from_ctaz(balance.try_into().unwrap()));
-                ui.text(&balance_str, TextDecl { h: balance_text_h, align: AlignX::Center, ..TextDecl });
-            }
+        // balance container
+        if let _ = elem().decl(Decl {
+            width: grow!(),
+            height: fit!(),
+            align: Center,
+            ..Decl
+        }) {
+            let balance_str = frame_strf!(data, "{} cTAZ", str_from_ctaz(balance.try_into().unwrap()));
+            ui.text(&balance_str, TextDecl { h: balance_text_h, align: AlignX::Center, ..TextDecl });
+        }
 
-            // pending container
-            if let _ = elem().decl(Decl {
-                width: grow!(),
-                height: fit!(),
-                align: Center,
-                ..Decl
-            }) {
-                let balance_str = frame_strf!(data, "{} cTAZ Pending", str_from_ctaz(pending_balance.try_into().unwrap()));
-                ui.text(&balance_str, TextDecl { h: accent_text_h, align: AlignX::Center, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
-            }
+        // pending container
+        if let _ = elem().decl(Decl {
+            width: grow!(),
+            height: fit!(),
+            align: Center,
+            ..Decl
+        }) {
+            // let staked_str = frame_strf!(data, "{} cTAZ Staked", str_from_ctaz(staked_balance.try_into().unwrap()));
+            // ui.text(&staked_str, TextDecl { h: accent_text_h, align: AlignX::Center, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
 
-            // spacer
-            // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+            let balance_str = frame_strf!(data, "{} cTAZ Pending", str_from_ctaz(pending_balance.try_into().unwrap()));
+            ui.text(&balance_str, TextDecl { h: accent_text_h, align: AlignX::Center, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
+        }
 
-            let child_gap = child_gap as f32;
-            let padding = child_gap.dup4();
+        // spacer
+        // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
-            // buttons container
-            if let _ = elem().decl(Decl {
-                id: id("Buttons Container"),
-                padding, child_gap, align: Center,
-                width: grow!(),
-                height: fit!(),
-                ..Decl
-            }) {
+        let child_gap = child_gap as f32;
+        let padding = child_gap.dup4();
 
-                let mut button = |ui: &mut Context, icon: &'static str, label: &'static str| {
-                    let id = id(label);
-                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, true);
-                    if let _ = elem().decl(Decl {
-                        id, child_gap, align: Center,
-                        direction: TopToBottom,
-                        width: fit!(),
-                        height: fit!(),
-                        ..Decl
-                    }) {
+        // buttons container
+        if let _ = elem().decl(Decl {
+            id: id("Buttons Container"),
+            padding, child_gap, align: Center,
+            width: grow!(),
+            height: fit!(),
+            ..Decl
+        }) {
 
-                        let radius = ui.scale(24.0);
-
-                        // Button circle
-                        if let _ = elem().decl(Decl {
-                            colour, radius: radius.dup4(), padding, child_gap, align: Center,
-                            width:  fixed!(radius * 2.0),
-                            height: fixed!(radius * 2.0),
-                            ..Decl
-                        }) {
-                            let temp_letter_symbol_h = ui.scale(28.0);
-                            ui.text(icon, TextDecl { colour: text_colour, font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
-                        }
-
-                        let button_text_h = ui.scale(16.0);
-                        ui.text(label, TextDecl { h: button_text_h, align: AlignX::Center, ..TextDecl });
-                    }
-                    clicked
-                };
-
-                if button(ui, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
-                // if button(ui, ICON_DATABASE, "Send")    { ui.modal = Modal::Send;    }
-                if button(ui, ICON_QRCODE,   "Receive") { ui.modal = Modal::Receive; }
-                // if button(ui, ICON_PLUS,     "Stake")   { ui.modal = Modal::Stake;   }
-                if button(ui, ICON_DATABASE,     "Stake")   { ui.modal = Modal::Stake;   }
-                // if button(ui, ICON_MINUS_1,  "Unstake") { ui.modal = Modal::Unstake; }
-            }
-        } else if *tab_id == tab_id_finalizers {
-        } else if *tab_id == tab_id_history {
-            {
-                let txs = &wallet_state.lock().unwrap().txs;
-
-                if txs.len() == 0 {
-                    ui.history_scroll = 0.0;
-                }
-
-                let id = id("History Scroll Container");
-                if ui.hovered(id) {
-                    ui.history_scroll -= ui.input().zoom_delta     as f32 * 32.0;
-                    ui.history_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
-                }
-                if ui.history_scroll < 0.0 {
-                    ui.history_scroll = 0.0;
-                }
-                let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
-                if scroll_container_data.found {
-                    let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
-                    if ui.history_scroll > max {
-                        ui.history_scroll = max;
-                    }
-                };
+            let mut button = |ui: &mut Context, icon: &'static str, label: &'static str| {
+                let id = id(label);
+                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, true, false);
                 if let _ = elem().decl(Decl {
-                    id,
-                    colour: TRANSACTION_HISTORY_CONTAINER_COL,
-                    child_gap: child_gap * 0.5, padding,
-                    radius: padding.0.dup4(),
-                    width:  percent!(1.0),
-                    // height: grow!(radius.0 * 2.0),
-                    height: percent!(1.0),
+                    id, child_gap, align: Center,
                     direction: TopToBottom,
-                    clip: Scroll(0.0, -ui.history_scroll * ui.scale),
-                    align: Top,
+                    width: fit!(),
+                    height: fit!(),
                     ..Decl
                 }) {
-                    if txs.len() == 0 {
-                        let h = ui.scale(24.0);
-                        if let _ = elem().decl(Decl {
-                            direction: TopToBottom,
-                            width:  percent!(1.0),
-                            height: percent!(1.0),
+
+                    let radius = ui.scale(24.0);
+
+                    // Button circle
+                    if let _ = elem().decl(Decl {
+                        colour, radius: radius.dup4(), padding, child_gap, align: Center,
+                        width:  fixed!(radius * 2.0),
+                        height: fixed!(radius * 2.0),
+                        ..Decl
+                    }) {
+                        let temp_letter_symbol_h = ui.scale(28.0);
+                        ui.text(icon, TextDecl { colour: text_colour, font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
+                    }
+
+                    let button_text_h = ui.scale(16.0);
+                    ui.text(label, TextDecl { h: button_text_h, align: AlignX::Center, ..TextDecl });
+                }
+                clicked
+            };
+
+            if button(ui, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
+            // if button(ui, ICON_DATABASE, "Send")    { ui.modal = Modal::Send;    }
+            if button(ui, ICON_QRCODE,   "Receive") { ui.modal = Modal::Receive; }
+            // if button(ui, ICON_PLUS,     "Stake")   { ui.modal = Modal::Stake;   }
+            if button(ui, ICON_DATABASE,     "Stake")   { ui.modal = Modal::Stake;   }
+            // if button(ui, ICON_MINUS_1,  "Unstake") { ui.modal = Modal::Unstake; }
+        }
+
+        // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+
+        {
+            let txs = &wallet_state.lock().unwrap().txs;
+
+            if txs.len() == 0 {
+                ui.history_scroll = 0.0;
+            }
+
+            let id = id("History Scroll Container");
+            if ui.hovered(id) {
+                ui.history_scroll -= ui.input().zoom_delta     as f32 * 32.0;
+                ui.history_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
+            }
+            if ui.history_scroll < 0.0 {
+                ui.history_scroll = 0.0;
+            }
+            let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
+            if scroll_container_data.found {
+                let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
+                if ui.history_scroll > max {
+                    ui.history_scroll = max;
+                }
+            };
+            if let _ = elem().decl(Decl {
+                id,
+                colour: TRANSACTION_HISTORY_CONTAINER_COL,
+                child_gap: child_gap * 0.5, padding,
+                radius: padding.0.dup4(),
+                width:  percent!(1.0),
+                height: grow!(),
+                // height: percent!(1.0),
+                direction: TopToBottom,
+                clip: Scroll(0.0, -ui.history_scroll * ui.scale),
+                align: Top,
+                ..Decl
+            }) {
+                if txs.len() == 0 {
+                    let h = ui.scale(24.0);
+                    if let _ = elem().decl(Decl {
+                        direction: TopToBottom,
+                        width:  percent!(1.0),
+                        height: percent!(1.0),
+                        child_gap,
+                        align:  Center,
+                        ..Decl
+                    }) {
+                        ui.text(ICON_DROPBOX_1, TextDecl { font: Icons, colour: WHITE.mul(0.6), h: ui.scale(64.0), align: AlignX::Center, ..TextDecl });
+                        ui.text("There are no transactions yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
+                    }
+                }
+                else {
+                    let kind_text_h = ui.scale(18.0);
+                    let transaction_text_h = ui.scale(16.0);
+
+                    for (index, tx) in txs.iter().enumerate() {
+                        if index > 0 { // separator
+                            let colour = {
+                                let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
+                                col = col.hsva();
+                                col.2 = col.2.mul(1.5).min(255);
+                                col.rgba()
+                            };
+
+                            let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
+                        }
+                        if let _ = elem().decl(Decl{
+                            id: id_index("Transaction", index as u32),
+                            padding,
                             child_gap,
-                            align:  Center,
+                            height: fixed!(ui.scale(64.0)),
+                            width: percent!(1.0),
+                            direction: LeftToRight,
+                            align: Center,
                             ..Decl
                         }) {
-                            ui.text(ICON_DROPBOX_1, TextDecl { font: Icons, colour: WHITE.mul(0.6), h: ui.scale(64.0), align: AlignX::Center, ..TextDecl });
-                            ui.text("There are no transactions yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
-                        }
-                    }
-                    else {
-                        let kind_text_h = ui.scale(18.0);
-                        let transaction_text_h = ui.scale(16.0);
-
-                        for (index, tx) in txs.iter().enumerate() {
-                            if index > 0 { // separator
-                                let colour = {
-                                    let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
-                                    col = col.hsva();
-                                    col.2 = col.2.mul(1.5).min(255);
-                                    col.rgba()
-                                };
-
-                                let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
-                            }
+                            // left icon
                             if let _ = elem().decl(Decl{
-                                id: id_index("Transaction", index as u32),
-                                padding,
-                                child_gap,
-                                height: fixed!(ui.scale(64.0)),
-                                width: percent!(1.0),
-                                direction: LeftToRight,
+                                id: id_index("Left Icon", index as u32),
+                                height: fit!(),
+                                width: fixed!(ui.scale(32.0)),
+                                direction: TopToBottom,
                                 align: Center,
                                 ..Decl
                             }) {
-                                // left icon
-                                if let _ = elem().decl(Decl{
-                                    id: id_index("Left Icon", index as u32),
-                                    height: fit!(),
-                                    width: fixed!(ui.scale(32.0)),
-                                    direction: TopToBottom,
-                                    align: Center,
-                                    ..Decl
-                                }) {
-                                    let icon = match tx.1 {
-                                        wallet::WalletTxKind::Send    => ICON_UP_SMALL,
-                                        wallet::WalletTxKind::Receive => ICON_DOWN_SMALL,
-                                        wallet::WalletTxKind::Shield  => ICON_SHIELD,
-                                        _ => todo!(),
-                                    };
-                                    ui.text(icon, TextDecl { font: Icons, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+                                let icon = match tx.1 {
+                                    wallet::WalletTxKind::Send    => ICON_UP_SMALL,
+                                    wallet::WalletTxKind::Receive => ICON_DOWN_SMALL,
+                                    wallet::WalletTxKind::Shield  => ICON_SHIELD,
+                                    wallet::WalletTxKind::Stake   => ICON_LINK_1,
+                                    wallet::WalletTxKind::Unstake => ICON_UNLINK,
+                                };
+                                ui.text(icon, TextDecl { font: Icons, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+                            }
+
+                            // info
+                            if let _ = elem().decl(Decl{
+                                id: id_index("Centre Info", index as u32),
+                                height: fit!(),
+                                width: grow!(),
+                                direction: TopToBottom,
+                                align: Left,
+                                ..Decl
+                            }) {
+                                let label = match tx.1 {
+                                    wallet::WalletTxKind::Send    => "Sent",
+                                    wallet::WalletTxKind::Receive => "Received",
+                                    wallet::WalletTxKind::Shield  => "Shielded",
+                                    wallet::WalletTxKind::Stake   => "Staked",
+                                    wallet::WalletTxKind::Unstake => "Unstaked",
+                                };
+
+                                let txid = tx.0.txid.to_string();
+                                let label_str = if let Some(mined_height) = tx.0.mined_height {
+                                    frame_strf!(data, "{} @ {}", label, mined_height)
+                                } else {
+                                    frame_strf!(data, "{}", label)
+                                };
+
+                                ui.text(label_str, TextDecl { h: kind_text_h, align: AlignX::Left, ..TextDecl });
+
+                                // spacer
+                                if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
+
+                                ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { font: Mono, h: transaction_text_h, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, align: AlignX::Left, ..TextDecl });
+
+                                // spacer
+                                if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
+
+                                let mut memo_str = String::from_utf8(tx.0.memo.as_slice().to_vec()).unwrap().trim_end_matches(|c| c == '\0').to_string();
+                                if memo_str.len() != 0 {
+                                    if memo_str.len() > 32 {
+                                        memo_str = format!("{}...", memo_str[..32].to_string()); // @todo: better truncation
+                                    }
+
+                                    ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
                                 }
+                            }
 
-                                // info
-                                if let _ = elem().decl(Decl{
-                                    id: id_index("Centre Info", index as u32),
-                                    height: fit!(),
-                                    width: grow!(),
-                                    direction: TopToBottom,
-                                    align: Left,
-                                    ..Decl
-                                }) {
-                                    let label = match tx.1 {
-                                        wallet::WalletTxKind::Send    => "Sent",
-                                        wallet::WalletTxKind::Receive => "Received",
-                                        wallet::WalletTxKind::Shield  => "Shielded",
-                                        _ => todo!(),
-                                    };
+                            // right info
+                            if let _ = elem().decl(Decl{
+                                id: id_index("Right Info", index as u32),
+                                height: fit!(),
+                                width: fit!(),
+                                direction: TopToBottom,
+                                align: Right,
+                                ..Decl
+                            }) {
+                                // @todo colors
+                                let color = match tx.1 {
+                                    wallet::WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
+                                    wallet::WalletTxKind::Receive => (0x5a, 0xb5, 0x52, 0xff),
+                                    wallet::WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
+                                    _ => WHITE,
+                                };
 
-                                    let txid = tx.0.txid.to_string();
-                                    let label_str = if let Some(mined_height) = tx.0.mined_height {
-                                        frame_strf!(data, "{} @ {}", label, mined_height)
-                                    } else {
-                                        frame_strf!(data, "{}", label)
-                                    };
-
-                                    ui.text(label_str, TextDecl { h: kind_text_h, align: AlignX::Left, ..TextDecl });
-
-                                    // spacer
-                                    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
-
-                                    ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { h: transaction_text_h, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, align: AlignX::Left, ..TextDecl });
-
-                                    // spacer
-                                    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
-
-                                    let mut memo_str = String::from_utf8(tx.0.memo.as_slice().to_vec()).unwrap().trim_end_matches(|c| c == '\0').to_string();
-                                    if memo_str.len() != 0 {
-                                        if memo_str.len() > 32 {
-                                            memo_str = format!("{}...", memo_str[..32].to_string());
+                                match tx.1 {
+                                    wallet::WalletTxKind::Send => {
+                                        let send_amount: i64 = tx.0.account_value_delta.into();
+                                        let send_amount: u64 = send_amount.abs() as u64;
+                                        let full = send_amount / 100_000_000;
+                                        let part = send_amount % 100_000_000;
+                                        let mut part_str = format!("{part}00");
+                                        if part_str.len() > 3 {
+                                            part_str = part_str[..3].to_string();
                                         }
 
-                                        ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
-                                    }
+                                        ui.text(frame_strf!(data, "-{}.{} cTAZ", full, part_str), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                    },
+                                    wallet::WalletTxKind::Receive => {
+                                        ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.0.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                    },
+                                    wallet::WalletTxKind::Shield => {
+                                        let shield_amount: i64 = tx.0.account_value_delta.into();
+                                        let full = shield_amount / 100_000_000;
+                                        let part = shield_amount % 100_000_000;
+                                        let part_str = format!("{part}00");
+                                        let trim_part = part_str.trim_end_matches("0");
+
+                                        ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                    },
+                                    _ => {
+                                        ui.text("TODO cTAZ", TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                    },
                                 }
-
-                                // right info
-                                if let _ = elem().decl(Decl{
-                                    id: id_index("Right Info", index as u32),
-                                    height: fit!(),
-                                    width: fit!(),
-                                    direction: TopToBottom,
-                                    align: Right,
-                                    ..Decl
-                                }) {
-                                    // @todo colors
-                                    let color = match tx.1 {
-                                        wallet::WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
-                                        wallet::WalletTxKind::Receive => (0x5a, 0xb5, 0x52, 0xff),
-                                        wallet::WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
-                                        _ => WHITE,
-
-                                    };
-
-                                    match tx.1 {
-                                        wallet::WalletTxKind::Send => {
-                                            ui.text(frame_strf!(data, "-{} cTAZ", str_from_ctaz(tx.0.total_spent.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
-                                        },
-                                        wallet::WalletTxKind::Receive => {
-                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.0.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
-                                        },
-                                        wallet::WalletTxKind::Shield => {
-                                            let shield_amount: i64 = tx.0.account_value_delta.into();
-                                            let full = shield_amount / 100_000_000;
-                                            let part = shield_amount % 100_000_000;
-                                            let part_str = format!("{part}00");
-                                            let trim_part = part_str.trim_end_matches("0");
-
-                                            let prefix = if shield_amount < 0 { "-" } else { "" };
-                                            ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..trim_part.len().max(3)]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
-                                        },
-                                        _ => todo!(),
-                                    }
-                                }
-
-                                // manually split id text
-                                // let string = format!("{:?} {:?}", tx.0.txid, tx.1);
-                                // ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), TextDecl { h: transaction_text_h, align: AlignX::Right, ..TextDecl });
-                                // ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), TextDecl { h: transaction_text_h, align: AlignX::Right, ..TextDecl });
                             }
+
+                            // manually split id text
+                            // let string = format!("{:?} {:?}", tx.0.txid, tx.1);
+                            // ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), TextDecl { h: transaction_text_h, align: AlignX::Right, ..TextDecl });
+                            // ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), TextDecl { h: transaction_text_h, align: AlignX::Right, ..TextDecl });
                         }
                     }
                 }
@@ -1212,355 +1223,449 @@ pub fn ui_right_pane(ui: &mut Context,
                  padding: (f32, f32, f32, f32),
                  radius:  (f32, f32, f32, f32),
                  tab_id: &mut Id) {
+    // @TODO: MAKE THESE NOT USE TABS, JUST USE HEADERS
     let mut tab_id_faucet = Id::default();
     let mut tab_id_roster = Id::default();
 
+    let roster = &wallet_state.lock().unwrap().roster.clone();
+
     if let _ = elem().decl(Decl {
-        id: id("Tab Bar"),
+        id: id("Finalizers Tab Bar"),
         child_gap,
         width: percent!(1.0),
         height: fit!(),
         align: Center,
         ..Decl
     }) {
-        tab_id_faucet = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet ({})", &wallet_state.lock().unwrap().miner_seen_height));
-        tab_id_roster = ui.tab((0.0, radius.1, radius.2, radius.3), padding, tab_id, "Guardians");
+        tab_id_roster = ui.tab_ex((0.0, radius.1, radius.2, radius.3), padding, tab_id, id("Finalizers"), frame_strf!(data, "Finalizers ({})", roster.len()));
     }
-
-    // Main contents
     if let _ = elem().decl(Decl {
-        id: id("Main Contents"),
-        colour: PANE_COL,
+        id: id("Finalizers Contents"),
+        padding, child_gap,
         radius: (0.0, 0.0, 0.0, radius.3),
+        colour: PANE_COL,
         direction: TopToBottom,
         width: percent!(1.0),
         height: grow!(),
         ..Decl
     }) {
-
-        // spacer
-        if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
-
-        if *tab_id == tab_id_faucet {
-
-            // big text container
-            // if let _ = elem().decl(Decl {
-            //     width: percent!(1.0),
-            //     height: fit!(),
-            //     padding,
-            //     align: Center,
-            //     ..Decl
-            // }) {
-            //     let big_text_h = ui.scale(32.0);
-            //     ui.text(&balance_str, TextDecl { h: big_text_h, align: AlignX::Center, ..TextDecl });
-            // }
-
-            let child_gap = child_gap as f32;
-            let padding = child_gap.dup4();
-
-            // buttons container
-            if let _ = elem().decl(Decl {
-                id: id("Buttons Container"),
-                padding, child_gap, align: Center,
-                width: percent!(1.0),
-                height: fit!(),
-                ..Decl
-            }) {
-
-                let mut button_ex = |label, act_on_press, enabled: bool| {
-                    let id = id(label);
-                    let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled);
-                    if let _ = elem().decl(Decl {
-                        id,
-                        child_gap,
-                        align: Center,
-                        direction: TopToBottom,
-                        width: fit!(),
-                        height: fit!(),
-                        ..Decl
-                    }) {
-                        let radius = ui.scale(24.0);
-
-                        // Button
-                        if let _ = elem().decl(Decl {
-                            colour,
-                            padding,
-                            child_gap,
-                            radius: radius.dup4(),
-                            align: Center,
-                            width:  fit!(ui.scale(192.0)),
-                            height: fit!(radius * 2.0),
-                            ..Decl
-                        }) {
-                            let h = ui.scale(20.0);
-                            ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
-                        }
-                    }
-
-                    clicked
-                };
-
-                if button_ex("Receive cTAZ", false, !wallet_state.lock().unwrap().waiting_for_faucet) {
-                    wallet_state.lock().unwrap().request_from_faucet();
+        fn display_str(chunks: &[u64; 4]) -> String {
+            let mut bytes = {
+                let mut out = [0u8; 32];
+                let mut i = 0;
+                for &chunk in chunks {
+                    let le = chunk.to_le_bytes(); // linear memory bytes for a LE u64
+                    out[i..i + 8].copy_from_slice(&le);
+                    i += 8;
                 }
-            }
-
-            // info container
-            if let _ = elem().decl(Decl {
-                padding: ui.scale(32.0).dup4(), child_gap, align: TopLeft,
-                width: grow!(), height: fit!(),
-                direction: TopToBottom,
-                ..Decl
-            }) {
-                let title_h = ui.scale(28.0);
-                let text_h = ui.scale(22.0);
-                let (un, sh_p, sh_s, fc) = {
-                    let w = wallet_state.lock().unwrap();
-                    (
-                        w.miner_unshielded_funds,
-                        w.miner_shielded_pending_funds,
-                        w.miner_shielded_spendable_funds,
-                        w.faucet_funds_available,
-                    )
-                };
-
-                let row   = Decl { width: percent!(1.0), child_gap, height: fit!(), ..Decl };
-
-                let left  = Decl { width: grow!(), height: fit!(), align: Left,  ..Decl };
-                let right = Decl { width: grow!(), height: fit!(), align: Right, ..Decl };
-
-                let left_text  = TextDecl { h: text_h,  align: AlignX::Left,  ..TextDecl  };
-                let right_text = TextDecl { font: Mono, align: AlignX::Right, ..left_text };
-
-                if let _ = elem().decl(row) {
-                    if let _ = elem().decl(left)  { ui.text("Available:", left_text); }
-                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(fc)), right_text); }
-                }
-                if let _ = elem().decl(row) {
-                    if let _ = elem().decl(left)  { ui.text("Unshielded:", left_text); }
-                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(un)), right_text); }
-                }
-                if let _ = elem().decl(row) {
-                    if let _ = elem().decl(left)  { ui.text("Shielded (Spendable):", left_text); }
-                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_s)), right_text); }
-                }
-                if let _ = elem().decl(row) {
-                    if let _ = elem().decl(left)  { ui.text("Shielded (Pending):", left_text); }
-                    if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_p)), right_text); }
-                }
-                if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+                out
             };
-        } else if *tab_id == tab_id_roster {
-            fn display_str(chunks: &[u64; 4]) -> String {
-                let mut bytes = {
-                    let mut out = [0u8; 32];
-                    let mut i = 0;
-                    for &chunk in chunks {
-                        let le = chunk.to_le_bytes(); // linear memory bytes for a LE u64
-                        out[i..i + 8].copy_from_slice(&le);
-                        i += 8;
-                    }
-                    out
-                };
 
-                let mut str = String::new();
-                bytes.reverse();
+            let mut str = String::new();
+            bytes.reverse();
 
-                for b in &bytes[0..4] {
-                    str.push_str(&format!("{:02x}", b));
-                }
-                str.push_str("..");
-                for b in &bytes[bytes.len() - 4..] {
-                    str.push_str(&format!("{:02x}", b));
-                }
-
-                str
+            for b in &bytes[0..4] {
+                str.push_str(&format!("{:02x}", b));
+            }
+            str.push_str("..");
+            for b in &bytes[bytes.len() - 4..] {
+                str.push_str(&format!("{:02x}", b));
             }
 
-            let roster = wallet_state.lock().unwrap().roster.clone();
+            str
+        }
 
+        let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
+            let id = id(label);
+            let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, false);
             if let _ = elem().decl(Decl {
-                id: id("Roster Container"),
-                padding, child_gap, align: Center,
+                id,
+                child_gap,
+                align: Center,
                 direction: TopToBottom,
-                width: percent!(1.0),
+                width: fit!(),
                 height: fit!(),
                 ..Decl
             }) {
-                let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
-                    let id = id(label);
-                    let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled);
-                    if let _ = elem().decl(Decl {
-                        id,
-                        child_gap,
-                        align: Center,
-                        direction: TopToBottom,
-                        width: fit!(),
-                        height: fit!(),
-                        ..Decl
-                    }) {
-                        let radius = ui.scale(24.0);
+                let radius = ui.scale(24.0);
 
-                        // Button
-                        if let _ = elem().decl(Decl {
-                            colour,
-                            padding,
-                            child_gap,
-                            radius: radius.dup4(),
-                            align: Center,
-                            width:  fit!(ui.scale(192.0)),
-                            height: fit!(radius * 2.0),
-                            ..Decl
-                        }) {
-                            let h = ui.scale(20.0);
-                            ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
-                        }
-                    }
-
-                    clicked
-                };
-
-
-                let mut recv_address = String::new();
-                for b in wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().iter().rev() {
-                    recv_address.push_str(&format!("{:02x}", b));
+                // Button
+                if let _ = elem().decl(Decl {
+                    colour,
+                    padding,
+                    child_gap,
+                    radius: radius.dup4(),
+                    align: Center,
+                    width:  fit!(ui.scale(192.0)),
+                    height: fit!(radius * 2.0),
+                    ..Decl
+                }) {
+                    let h = ui.scale(20.0);
+                    ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
                 }
-                ui.text("Your Finalizer Address", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                ui.text(frame_strf!(data, "[{}]", &recv_address), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                if button_ex(ui, "Copy Finalizer Address", true, true) {
-                    ui.input().send_to_clipboard(&recv_address);
+            }
+
+            clicked
+        };
+
+        let mut clickable_icon = |ui: &mut Context, id, icon, enabled | {
+            let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, true);
+            if let _ = elem().decl(Decl{
+                id,
+                child_gap,
+                align: Center,
+                direction: TopToBottom,
+                width: fit!(),
+                height: fit!(),
+                ..Decl
+            }) {
+                ui.text(ICON_DOC_INV, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+            }
+
+            clicked
+        };
+
+        // @todo(judah): incorporate into list below? (i.e. always at the top of the list (and doesn't scroll with the rest), styled different from the others)
+        if let _ = elem().decl(Decl {
+            id: id("Finalizers Buttons"),
+            padding, child_gap, align: Center,
+            direction: TopToBottom,
+            width: percent!(1.0),
+            height: fit!(),
+            ..Decl
+        }) {
+            let mut recv_address = String::new();
+            for b in wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().iter().rev() {
+                recv_address.push_str(&format!("{:02x}", b));
+            }
+
+            ui.text("Your Finalizer Address", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+            ui.text(frame_strf!(data, "[{}..{}]", &recv_address[0..8], &recv_address[recv_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+
+            if button_ex(ui, "Copy Address", true, true) {
+                ui.input().send_to_clipboard(&recv_address);
+            }
+        }
+
+        if roster.len() == 0 {
+            ui.finalizers_scroll = 0.0;
+        }
+
+        let id = id("History Scroll Container");
+        if ui.hovered(id) {
+            ui.finalizers_scroll -= ui.input().zoom_delta     as f32 * 32.0;
+            ui.finalizers_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
+        }
+        if ui.finalizers_scroll < 0.0 {
+            ui.finalizers_scroll = 0.0;
+        }
+        let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
+        if scroll_container_data.found {
+            let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
+            if ui.finalizers_scroll > max {
+                ui.finalizers_scroll = max;
+            }
+        };
+        if let _ = elem().decl(Decl {
+            id,
+            colour: TRANSACTION_HISTORY_CONTAINER_COL,
+            child_gap: child_gap * 0.5, padding,
+            radius: padding.0.dup4(),
+            width:  percent!(1.0),
+            height: grow!(),
+            // height: percent!(1.0),
+            direction: TopToBottom,
+            clip: Scroll(0.0, -ui.finalizers_scroll * ui.scale),
+            align: Top,
+            ..Decl
+        }) {
+            if roster.len() == 0 {
+                let h = ui.scale(24.0);
+                if let _ = elem().decl(Decl {
+                    direction: TopToBottom,
+                    width:  percent!(1.0),
+                    height: percent!(1.0),
+                    child_gap,
+                    align:  Center,
+                    ..Decl
+                }) {
+                    ui.text(ICON_EYE_OFF, TextDecl { font: Icons, colour: WHITE.mul(0.6), h: ui.scale(64.0), align: AlignX::Center, ..TextDecl });
+                    ui.text("There are no finalizers yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
                 }
+            }
+            else {
+                let kind_text_h = ui.scale(18.0);
+                let transaction_text_h = ui.scale(16.0);
 
                 for (index, member) in roster.iter().enumerate() {
-                    let bytes = member.pub_key;
-                    let chunks = {
-                        let mut chunks = [0u64; 4];
-                        for i in 0..4 {
-                            let start = i * 8;
-                            let end = start + 8;
-                            let mut buf = [0u8; 8];
-                            buf.copy_from_slice(&bytes[start..end]);
-                            chunks[i] = u64::from_le_bytes(buf);
-                        }
+                    if index > 0 { // separator
+                        let colour = {
+                            let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
+                            col = col.hsva();
+                            col.2 = col.2.mul(1.5).min(255);
+                            col.rgba()
+                        };
 
-                        chunks
-                    };
-
-                    if let _ = elem().decl(Decl {
+                        let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
+                    }
+                    if let _ = elem().decl(Decl{
                         id: id_index("Roster Member", index as u32),
                         padding,
                         child_gap,
-                        height: fixed!(ui.scale(64.0)),
+                        height: fixed!(ui.scale(48.0)),
                         width: percent!(1.0),
                         direction: LeftToRight,
-                        align: Left,
+                        align: Center,
                         ..Decl
                     }) {
-                        let row   = Decl { width: percent!(1.0), child_gap, height: fit!(), ..Decl };
-                        let left  = Decl { width: grow!(), height: fit!(), child_gap, align: Left,  ..Decl };
-                        let right = Decl { width: grow!(), height: fit!(), align: Right, ..Decl };
-
-                        let left_text  = TextDecl { h: ui.scale(24.0),  align: AlignX::Left,  ..TextDecl  };
-                        let right_text = TextDecl { font: Mono, align: AlignX::Right, ..left_text };
-
-                        let mut button = |ui: &mut Context, icon: &'static str, id| {
-                            let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, true);
-                            if let _ = elem().decl(Decl {
-                                id, child_gap, align: Center,
-                                direction: TopToBottom,
-                                width: fit!(),
-                                height: fit!(),
-                                ..Decl
-                            }) {
-
-                                let radius = ui.scale(24.0);
-
-                                // Button circle
-                                if let _ = elem().decl(Decl {
-                                    colour, radius: radius.dup4(), padding, child_gap, align: Center,
-                                    width:  fixed!(radius * 2.0),
-                                    height: fixed!(radius * 2.0),
-                                    ..Decl
-                                }) {
-                                    let temp_letter_symbol_h = ui.scale(24.0);
-                                    ui.text(icon, TextDecl { colour: text_colour, font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
+                        // left icon
+                        if let _ = elem().decl(Decl{
+                            id: id_index("Roster Member Left Icon", index as u32),
+                            height: fit!(),
+                            width: fixed!(ui.scale(32.0)),
+                            direction: TopToBottom,
+                            align: Center,
+                            ..Decl
+                        }) {
+                            if clickable_icon(ui, id_index("Copy Button", index as u32), ICON_DOC_INV /* @todo CLIPBOARD BUTTON */, true) {
+                                let mut address_str = String::new();
+                                for b in member.pub_key.iter().rev() {
+                                    address_str.push_str(&format!("{:02x}", b));
                                 }
-                            }
-                            clicked
-                        };
-
-                        if let _ = elem().decl(row) {
-                            if let _ = elem().decl(left)  {
-                                if button(ui, ICON_DOC_INV, id_index("Button", index as u32)) {
-                                    let mut address_str = String::new();
-                                    for b in member.pub_key.iter().rev() {
-                                        address_str.push_str(&format!("{:02x}", b));
-                                    }
-                                    ui.input().send_to_clipboard(&address_str);
-                                }
-
-                                ui.text(frame_strf!(data, "{}:", display_str(&chunks)), left_text);
+                                ui.input().send_to_clipboard(&address_str);
                             }
 
-                            if let _ = elem().decl(right) {
-                                let full = member.stake / 100_000_000;
-                                let part = member.stake % 100_000_000;
-                                let part_str = format!("{part}00");
-                                let trim_part = part_str.trim_end_matches("0");
-
-                                ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), right_text);
-                            }
+                            // ui.text(ICON_DOC_INV, TextDecl { font: Icons, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
                         }
 
-                        // spacer
-                        if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+                        // info
+                        if let _ = elem().decl(Decl{
+                            id: id_index("Roster Member Info", index as u32),
+                            height: fit!(),
+                            width: grow!(),
+                            direction: TopToBottom,
+                            align: Left,
+                            ..Decl
+                        }) {
+                            let bytes = member.pub_key;
+                            let chunks = {
+                                let mut chunks = [0u64; 4];
+                                for i in 0..4 {
+                                    let start = i * 8;
+                                    let end = start + 8;
+                                    let mut buf = [0u8; 8];
+                                    buf.copy_from_slice(&bytes[start..end]);
+                                    chunks[i] = u64::from_le_bytes(buf);
+                                }
+
+                                chunks
+                            };
+
+                            ui.text(frame_strf!(data, "{}", display_str(&chunks)), TextDecl { font: Mono, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
+                        }
+
+                        // right info
+                        if let _ = elem().decl(Decl{
+                            id: id_index("Roster Member Amounts", index as u32),
+                            height: fit!(),
+                            width: fit!(),
+                            direction: TopToBottom,
+                            align: Right,
+                            ..Decl
+                        }) {
+                            let stake_amount: i64 = member.stake as i64;
+                            let full = stake_amount / 100_000_000;
+                            let part = stake_amount % 100_000_000;
+                            let part_str = format!("{part}00");
+                            let trim_part = part_str.trim_end_matches("0");
+                            let colour = (0xff, 0xaf, 0x0e, 0xff);
+                            ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { h: ui.scale(18.0), colour, align: AlignX::Right, ..TextDecl });
+                        }
                     }
                 }
             }
         }
-        // } else if *tab_id == tab_id_settings {
+
+        // spacer
+        // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+    }
+
+    // spacer
+    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
+
+    if let _ = elem().decl(Decl {
+        id: id("Faucet Tab Bar"),
+        child_gap,
+        width: percent!(1.0),
+        height: fit!(),
+        align: Center,
+        ..Decl
+    }) {
+        tab_id_faucet = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet (Height {})", &wallet_state.lock().unwrap().miner_seen_height));
+    }
+    if let _ = elem().decl(Decl {
+        id: id("Faucet Contents"),
+        padding, child_gap,
+        radius: (0.0, 0.0, 0.0, radius.3),
+        colour: PANE_COL,
+        direction: TopToBottom,
+        align: Center,
+        width: percent!(1.0),
+        height: fit!(),
+        ..Decl
+    }) {
+        // spacer
+        if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
+
+        // big text container
+        // if let _ = elem().decl(Decl {
+        //     width: percent!(1.0),
+        //     height: fit!(),
+        //     padding,
+        //     align: Center,
+        //     ..Decl
+        // }) {
+        //     let big_text_h = ui.scale(32.0);
+        //     ui.text(&balance_str, TextDecl { h: big_text_h, align: AlignX::Center, ..TextDecl });
+        // }
+
+        let child_gap = child_gap as f32;
+        let padding = child_gap.dup4();
+
+        // info container
+        if let _ = elem().decl(Decl {
+            padding: ui.scale(32.0).dup4(), child_gap, align: TopLeft,
+            width: grow!(), height: fit!(),
+            direction: TopToBottom,
+            ..Decl
+        }) {
+            let title_h = ui.scale(28.0);
+            let text_h = ui.scale(22.0);
+            let (un, sh_p, sh_s, fc) = {
+                let w = wallet_state.lock().unwrap();
+                (
+                    w.miner_unshielded_funds,
+                    w.miner_shielded_pending_funds,
+                    w.miner_shielded_spendable_funds,
+                    w.faucet_funds_available,
+                )
+            };
+
+            let row   = Decl { width: percent!(1.0), child_gap, height: fit!(), ..Decl };
+
+            let left  = Decl { width: grow!(), height: fit!(), align: Left,  ..Decl };
+            let right = Decl { width: grow!(), height: fit!(), align: Right, ..Decl };
+
+            let left_text  = TextDecl { h: text_h,  align: AlignX::Left,  ..TextDecl  };
+            let right_text = TextDecl { font: Mono, align: AlignX::Right, ..left_text };
+
+            if let _ = elem().decl(row) {
+                if let _ = elem().decl(left)  { ui.text("Available:", left_text); }
+                if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(fc)), right_text); }
+            }
+            if let _ = elem().decl(row) {
+                if let _ = elem().decl(left)  { ui.text("Unshielded:", left_text); }
+                if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(un)), right_text); }
+            }
+            if let _ = elem().decl(row) {
+                if let _ = elem().decl(left)  { ui.text("Shielded (Spendable):", left_text); }
+                if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_s)), right_text); }
+            }
+            if let _ = elem().decl(row) {
+                if let _ = elem().decl(left)  { ui.text("Shielded (Pending):", left_text); }
+                if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_p)), right_text); }
+            }
+            // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
+        };
+
+        // buttons container
+        if let _ = elem().decl(Decl {
+            id: id("Buttons Container"),
+            padding, child_gap, align: Center,
+            width: percent!(1.0),
+            height: fit!(),
+            ..Decl
+        }) {
+
+            let mut button_ex = |label, act_on_press, enabled: bool| {
+                let id = id(label);
+                let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, false);
+                if let _ = elem().decl(Decl {
+                    id,
+                    child_gap,
+                    align: Center,
+                    direction: TopToBottom,
+                    width: fit!(),
+                    height: fit!(),
+                    ..Decl
+                }) {
+                    let radius = ui.scale(24.0);
+
+                    // Button
+                    if let _ = elem().decl(Decl {
+                        colour,
+                        padding,
+                        child_gap,
+                        radius: radius.dup4(),
+                        align: Center,
+                        width:  fit!(ui.scale(192.0)),
+                        height: fit!(radius * 2.0),
+                        ..Decl
+                    }) {
+                        let h = ui.scale(20.0);
+                        ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
+                    }
+                }
+
+                clicked
+            };
+
+            if button_ex("Receive cTAZ", false, !wallet_state.lock().unwrap().waiting_for_faucet) {
+                wallet_state.lock().unwrap().request_from_faucet();
+            }
+        }
     }
 }
 
 
 pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
-    data.per_frame_strs.clear();
+data.per_frame_strs.clear();
 
-    let mut result = false;
+let mut result = false;
 
-    const MIN_ZOOM: f32 = 0.5;
-    const MAX_ZOOM: f32 = 1.65; // @PreventPanesColliding
+const MIN_ZOOM: f32 = 0.5;
+const MAX_ZOOM: f32 = 1.65; // @PreventPanesColliding
 
-    if ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight) {
-        if ui.input().key_pressed(KeyCode::Equal) {
-            let new_zoom = ui.zoom * (1.0f32 + 1.0f32 / 8f32);
-            if new_zoom <= MAX_ZOOM {
-                ui.zoom = new_zoom;
-            }
-        }
-        if ui.input().key_pressed(KeyCode::Minus) {
-            let new_zoom = ui.zoom / (1.0f32 + 1.0f32 / 8f32);
-            if new_zoom >= MIN_ZOOM {
-                ui.zoom = new_zoom;
-            }
-        }
-        if ui.input().key_pressed(KeyCode::Digit0) {
-            ui.zoom = 1.0f32;
+if ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight) {
+    if ui.input().key_pressed(KeyCode::Equal) {
+        let new_zoom = ui.zoom * (1.0f32 + 1.0f32 / 8f32);
+        if new_zoom <= MAX_ZOOM {
+            ui.zoom = new_zoom;
         }
     }
-    if ui.zoom < MIN_ZOOM {
-        ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
+    if ui.input().key_pressed(KeyCode::Minus) {
+        let new_zoom = ui.zoom / (1.0f32 + 1.0f32 / 8f32);
+        if new_zoom >= MIN_ZOOM {
+            ui.zoom = new_zoom;
+        }
     }
-    if ui.zoom > MAX_ZOOM {
-        ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
+    if ui.input().key_pressed(KeyCode::Digit0) {
+        ui.zoom = 1.0f32;
     }
-    ui.scale = ui.zoom * ui.dpi_scale;
+}
+if ui.zoom < MIN_ZOOM {
+    ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
+}
+if ui.zoom > MAX_ZOOM {
+    ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
+}
+ui.scale = ui.zoom * ui.dpi_scale;
 
-    ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Default);
+ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Default);
 
-    ui.capture = false;
+ui.capture = false;
 
-    let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_height as f32);
+let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_height as f32);
     let mouse_pos = (ui.input().mouse_pos().0 as f32, ui.input().mouse_pos().1 as f32);
 
     let child_gap = ui.scale(12.0);
@@ -1625,24 +1730,41 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             height: grow!(),
             ..Decl
         }) {
-
-            if let _ = elem().decl(Decl { align: Top, width: grow!(), ..Decl }) {
-                ui.text(frame_strf!(data, "BFT Height: {}", viz.bft_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+            if let _elem = elem().decl(Decl {
+                id: id("Readability Box"),
+                direction: TopToBottom,
+                align: Top,
+                width: grow!(),
+                height: fit!(),
+                ..Decl
+            }) {
+                if let _ = elem().decl(Decl {
+                    radius,
+                    padding: padding.mul(0.5),
+                    // child_gap,
+                    align: Top,
+                    direction: TopToBottom,
+                    width: fit!(),
+                    colour: (0, 0, 0, 127),
+                    ..Decl
+                }) {
+                    // @todo: two vertical panes with right aligned label and left aligned height
+                    ui.text(frame_strf!(data, "PoS Height: {}", viz.bft_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                    ui.text(frame_strf!(data, "PoW Height: {}", viz.bc_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                }
             }
-            if let _ = elem().decl(Decl { align: Top, width: grow!(), ..Decl }) {
-                ui.text(frame_strf!(data, "PoW Height: {}", viz.bc_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
-            }
 
+            // spacer
             if let _ = elem().decl(Decl { height: grow!(), ..Decl }) {}
 
             // "Reset View" button
             if let _ = elem().decl(Decl { align: Bottom, width: grow!(), ..Decl }) {
                 let label = "Reset View";
 
-                let enabled = viz.camera_x != 0.0 || viz.camera_y != 0.0 || viz.zoom != 0.0;
+                let enabled = viz.camera_x != 0.0 || viz.camera_y != viz.bc_tip_y || viz.zoom != 0.0;
 
                 let id = id(label);
-                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, id, enabled);
+                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, id, enabled, false);
                 let radius = ui.scale(20.0);
 
                 if ui.hovered(id) {
@@ -1667,7 +1789,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
 
                 if clicked {
                     viz.camera_x = 0.0;
-                    viz.camera_y = 0.0;
+                    viz.camera_y = viz.bc_tip_y;
                     viz.zoom = 0.0;
                 }
             }
@@ -1849,7 +1971,8 @@ pub struct Context {
 
     pub modal: Modal,
 
-    pub history_scroll: f32,
+    pub history_scroll:    f32,
+    pub finalizers_scroll: f32,
 }
 
 #[derive(Debug, Default, Copy, Clone)]

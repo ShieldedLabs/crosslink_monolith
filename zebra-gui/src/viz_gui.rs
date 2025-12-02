@@ -177,6 +177,8 @@ pub struct VizState {
     pub send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
     pub receive_from_zebra: std::sync::mpsc::Receiver<ResponseFromZebra>,
 
+    pub bc_tip_y: f32,
+
     pub bc_tip_height: u64,
     pub bft_tip_height: u64,
 
@@ -205,6 +207,8 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         receive_from_zebra: me_receive,
         bc_tip_height: 0,
         bft_tip_height: 0,
+
+        bc_tip_y: 0.0,
 
         last_frame_hovered_hash: Hash32::from_u64(0),
 
@@ -411,6 +415,10 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         on_screen_bc.t_implicated_by_bft_alpha = if on_screen_bc.block.is_implicated_by_bft { 1.0 } else { 0.0 };
         on_screen_bc.t_x = -5.0;
         on_screen_bc.t_y = -10.0 * on_screen_bc.block.this_height as f32;
+
+        if on_screen_bc.block.this_height == viz_state.bc_tip_height {
+            viz_state.bc_tip_y = on_screen_bc.t_y;
+        }
     }
     for on_screen_bft in magic(&mut viz_state.on_screen_bfts).values_mut() {
         if on_screen_bft.block.this_hash == hovered_block {
