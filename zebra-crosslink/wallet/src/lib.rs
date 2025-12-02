@@ -904,7 +904,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                         println!("received multiple memos in 1 transaction: {}", memos.len());
                                     }
                                     let bytes = memos[0].as_bytes();
-                                    tx.0.memo[0..bytes.len()].copy_from_slice(bytes);
+                                    if bytes.len() > tx.0.memo.len() {
+                                        println!("memo too big ({}/{}):\"\"\"\n{}\n\"\"\"", bytes.len(), memos[0].len(), memos[0]);
+                                    }
+                                    let len = bytes.len().min(tx.0.memo.len());
+                                    tx.0.memo[..len].copy_from_slice(&bytes[..len]);
                                 }
                             }
 
