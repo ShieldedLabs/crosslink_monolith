@@ -744,7 +744,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             send_address = &data.send_address;
                         }
 
-                        ui.text(frame_strf!(data, "[{}..{}]", &send_address[..8], &send_address[send_address.len() - 8..]), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                        ui.text(frame_strf!(data, "[{}..{}]", &send_address[..8], &send_address[send_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                         if button_ex(ui, "Paste Address", true) {
                             data.send_address = ui.input().get_from_clipboard().trim().to_string();
                         }
@@ -769,10 +769,19 @@ pub fn ui_left_pane(ui: &mut Context,
                             direction: TopToBottom,
                             ..Decl
                         }) {
-                            let balance = wallet_state.lock().unwrap().balance;
+                            let (
+                                balance,
+                                waiting_for_send
+                            ) = {
+                                let wallet_state = wallet_state.lock().unwrap();
+                                (
+                                    wallet_state.balance,
+                                    wallet_state.waiting_for_send,
+                                )
+                            };
 
-                            let can = data.send_address.len() != 0;
-                            if button_ex(ui,   "1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ);       }
+                            let can = !waiting_for_send && data.send_address.len() != 0;
+                            if button_ex(ui,   "1 cTAZ", can && (balance as u64) >= ONE_cTAZ)        { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ);       }
                             if button_ex(ui,   "10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ * 10);  }
                         }
                     }
@@ -791,7 +800,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         ..Decl
                     }) {
                         let recv_address = "0000000000000000";
-                        ui.text(frame_strf!(data, "[{}..{}]", &recv_address[..8], &recv_address[recv_address.len() - 8..]), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                        ui.text(frame_strf!(data, "[{}..{}]", &recv_address[..8], &recv_address[recv_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                         if button_ex(ui, "Copy Address", true) {
                             ui.input().send_to_clipboard(recv_address);
                         }
@@ -805,7 +814,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         stake_address = &data.stake_address;
                     }
 
-                    ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                    ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                     if button_ex(ui, "Paste Address", true) {
                         data.stake_address = ui.input().get_from_clipboard().trim().to_string();
                     }
@@ -1096,7 +1105,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     wallet::WalletTxKind::Send    => ICON_UP_SMALL,
                                     wallet::WalletTxKind::Receive => ICON_DOWN_SMALL,
                                     wallet::WalletTxKind::Shield  => ICON_SHIELD,
-                                    _ => todo!(),
+                                    wallet::WalletTxKind::Stake   => ICON_LINK_1,
+                                    wallet::WalletTxKind::Unstake => ICON_UNLINK,
                                 };
                                 ui.text(icon, TextDecl { font: Icons, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
                             }
@@ -1114,7 +1124,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     wallet::WalletTxKind::Send    => "Sent",
                                     wallet::WalletTxKind::Receive => "Received",
                                     wallet::WalletTxKind::Shield  => "Shielded",
-                                    _ => todo!(),
+                                    wallet::WalletTxKind::Stake   => "Staked",
+                                    wallet::WalletTxKind::Unstake => "Unstaked",
                                 };
 
                                 let txid = tx.0.txid.to_string();
@@ -1129,7 +1140,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 // spacer
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                                ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { h: transaction_text_h, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, align: AlignX::Left, ..TextDecl });
+                                ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { font: Mono, h: transaction_text_h, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, align: AlignX::Left, ..TextDecl });
 
                                 // spacer
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
@@ -1137,7 +1148,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 let mut memo_str = String::from_utf8(tx.0.memo.as_slice().to_vec()).unwrap().trim_end_matches(|c| c == '\0').to_string();
                                 if memo_str.len() != 0 {
                                     if memo_str.len() > 32 {
-                                        memo_str = format!("{}...", memo_str[..32].to_string());
+                                        memo_str = format!("{}...", memo_str[..32].to_string()); // @todo: better truncation
                                     }
 
                                     ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
@@ -1159,12 +1170,20 @@ pub fn ui_left_pane(ui: &mut Context,
                                     wallet::WalletTxKind::Receive => (0x5a, 0xb5, 0x52, 0xff),
                                     wallet::WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
                                     _ => WHITE,
-
                                 };
 
                                 match tx.1 {
                                     wallet::WalletTxKind::Send => {
-                                        ui.text(frame_strf!(data, "-{} cTAZ", str_from_ctaz(tx.0.total_spent.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        let send_amount: i64 = tx.0.account_value_delta.into();
+                                        let send_amount: u64 = send_amount.abs() as u64;
+                                        let full = send_amount / 100_000_000;
+                                        let part = send_amount % 100_000_000;
+                                        let mut part_str = format!("{part}00");
+                                        if part_str.len() > 3 {
+                                            part_str = part_str[..3].to_string();
+                                        }
+
+                                        ui.text(frame_strf!(data, "-{}.{} cTAZ", full, part_str), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
                                     wallet::WalletTxKind::Receive => {
                                         ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.0.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
@@ -1176,10 +1195,11 @@ pub fn ui_left_pane(ui: &mut Context,
                                         let part_str = format!("{part}00");
                                         let trim_part = part_str.trim_end_matches("0");
 
-                                        let prefix = if shield_amount < 0 { "-" } else { "" };
-                                        ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..trim_part.len().max(3)]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
-                                    _ => todo!(),
+                                    _ => {
+                                        ui.text("TODO cTAZ", TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                    },
                                 }
                             }
 
@@ -1305,7 +1325,7 @@ pub fn ui_right_pane(ui: &mut Context,
             clicked
         };
 
-        // @todo(judah): incorporate into list below (i.e. always at the top of the list (and doesn't scroll with the rest), styled different from the others)
+        // @todo(judah): incorporate into list below? (i.e. always at the top of the list (and doesn't scroll with the rest), styled different from the others)
         if let _ = elem().decl(Decl {
             id: id("Finalizers Buttons"),
             padding, child_gap, align: Center,
@@ -1320,7 +1340,7 @@ pub fn ui_right_pane(ui: &mut Context,
             }
 
             ui.text("Your Finalizer Address", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-            ui.text(frame_strf!(data, "[{}..{}]", &recv_address[0..8], &recv_address[recv_address.len()-8..]), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+            ui.text(frame_strf!(data, "[{}..{}]", &recv_address[0..8], &recv_address[recv_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
 
             if button_ex(ui, "Copy Address", true, true) {
                 ui.input().send_to_clipboard(&recv_address);
@@ -1407,7 +1427,7 @@ pub fn ui_right_pane(ui: &mut Context,
                             align: Center,
                             ..Decl
                         }) {
-                            if clickable_icon(ui, id_index("Copy Button", index as u32), ICON_DOC_INV, true) {
+                            if clickable_icon(ui, id_index("Copy Button", index as u32), ICON_DOC_INV /* @todo CLIPBOARD BUTTON */, true) {
                                 let mut address_str = String::new();
                                 for b in member.pub_key.iter().rev() {
                                     address_str.push_str(&format!("{:02x}", b));
@@ -1441,7 +1461,7 @@ pub fn ui_right_pane(ui: &mut Context,
                                 chunks
                             };
 
-                            ui.text(frame_strf!(data, "{}", display_str(&chunks)), TextDecl { h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
+                            ui.text(frame_strf!(data, "{}", display_str(&chunks)), TextDecl { font: Mono, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
                         }
 
                         // right info
@@ -1468,116 +1488,6 @@ pub fn ui_right_pane(ui: &mut Context,
 
         // spacer
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
-
-        /*
-        let roster = wallet_state.lock().unwrap().roster.clone();
-
-        if let _ = elem().decl(Decl {
-            id: id("Roster Container"),
-            padding, child_gap, align: Center,
-            direction: TopToBottom,
-            width: percent!(1.0),
-            height: fit!(),
-            ..Decl
-        }) {
-
-            let mut recv_address = String::new();
-            for b in wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().iter().rev() {
-                recv_address.push_str(&format!("{:02x}", b));
-            }
-            ui.text("Your Finalizer Address", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-            ui.text(frame_strf!(data, "[{}]", &recv_address), TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-            if button_ex(ui, "Copy Address", true, true) {
-                ui.input().send_to_clipboard(&recv_address);
-            }
-
-            for (index, member) in roster.iter().enumerate() {
-                let bytes = member.pub_key;
-                let chunks = {
-                    let mut chunks = [0u64; 4];
-                    for i in 0..4 {
-                        let start = i * 8;
-                        let end = start + 8;
-                        let mut buf = [0u8; 8];
-                        buf.copy_from_slice(&bytes[start..end]);
-                        chunks[i] = u64::from_le_bytes(buf);
-                    }
-
-                    chunks
-                };
-
-                if let _ = elem().decl(Decl {
-                    id: id_index("Roster Member", index as u32),
-                    padding,
-                    child_gap,
-                    height: fixed!(ui.scale(64.0)),
-                    width: percent!(1.0),
-                    direction: LeftToRight,
-                    align: Left,
-                    ..Decl
-                }) {
-                    let row   = Decl { width: percent!(1.0), child_gap, height: fit!(), ..Decl };
-                    let left  = Decl { width: grow!(), height: fit!(), child_gap, align: Left,  ..Decl };
-                    let right = Decl { width: grow!(), height: fit!(), align: Right, ..Decl };
-
-                    let left_text  = TextDecl { h: ui.scale(24.0),  align: AlignX::Left,  ..TextDecl  };
-                    let right_text = TextDecl { font: Mono, align: AlignX::Right, ..left_text };
-
-                    let mut button = |ui: &mut Context, icon: &'static str, id| {
-                        let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, true);
-                        if let _ = elem().decl(Decl {
-                            id, child_gap, align: Center,
-                            direction: TopToBottom,
-                            width: fit!(),
-                            height: fit!(),
-                            ..Decl
-                        }) {
-
-                            let radius = ui.scale(24.0);
-
-                            // Button circle
-                            if let _ = elem().decl(Decl {
-                                colour, radius: radius.dup4(), padding, child_gap, align: Center,
-                                width:  fixed!(radius * 2.0),
-                                height: fixed!(radius * 2.0),
-                                ..Decl
-                            }) {
-                                let temp_letter_symbol_h = ui.scale(24.0);
-                                ui.text(icon, TextDecl { colour: text_colour, font: Icons, h: temp_letter_symbol_h, align: AlignX::Center, ..TextDecl });
-                            }
-                        }
-                        clicked
-                    };
-
-                    if let _ = elem().decl(row) {
-                        if let _ = elem().decl(left)  {
-                            if button(ui, ICON_DOC_INV, id_index("Button", index as u32)) {
-                                let mut address_str = String::new();
-                                for b in member.pub_key.iter().rev() {
-                                    address_str.push_str(&format!("{:02x}", b));
-                                }
-                                ui.input().send_to_clipboard(&address_str);
-                            }
-
-                            ui.text(frame_strf!(data, "{}:", display_str(&chunks)), left_text);
-                        }
-
-                        if let _ = elem().decl(right) {
-                            let full = member.stake / 100_000_000;
-                            let part = member.stake % 100_000_000;
-                            let part_str = format!("{part}00");
-                            let trim_part = part_str.trim_end_matches("0");
-
-                            ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), right_text);
-                        }
-                    }
-
-                    // spacer
-                    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
-                }
-            }
-        }
-        */
     }
 
     // spacer
