@@ -66,7 +66,7 @@ pub enum TFLServiceResponse {
     /// Finality status of a transaction
     TxFinalityStatus(Option<TFLBlockFinality>),
     /// Finalizer roster
-    Roster(Vec<([u8; 32], u64)>),
+    Roster(Vec<zcash_primitives::transaction::RosterMember>),
     /// Fat pointer to the BFT chain tip
     FatPointerToBFTChainTip(zebra_chain::block::FatPointerToBftBlock),
     /// Send a staking command transaction

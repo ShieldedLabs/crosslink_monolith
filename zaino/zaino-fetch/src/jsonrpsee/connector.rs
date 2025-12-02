@@ -33,7 +33,6 @@ use crate::jsonrpsee::{
         mining_info::GetMiningInfoWire,
         peer_info::GetPeerInfo,
         GetBalanceError, GetBalanceResponse, GetBlockCountResponse, GetBlockError, GetBlockHash,
-        TFLStakerZats,
         GetBlockResponse, GetBlockchainInfoResponse, GetInfoResponse, GetMempoolInfoResponse,
         GetSubtreesError, GetSubtreesResponse, GetTransactionResponse, GetTreestateError,
         GetTreestateResponse, GetUtxosError, GetUtxosResponse, SendTransactionError,
@@ -741,7 +740,7 @@ impl JsonRpSeeConnector {
     }
 
     /// BFT Roster
-    pub async fn get_roster(&self) -> Result<Vec<TFLStakerZats>, RpcRequestError<Infallible>> {
+    pub async fn get_roster(&self) -> Result<Vec<zcash_primitives::transaction::RosterMember>, RpcRequestError<Infallible>> {
         // dummy params
         let params = vec![
             serde_json::to_value(0).map_err(RpcRequestError::JsonRpc)?,

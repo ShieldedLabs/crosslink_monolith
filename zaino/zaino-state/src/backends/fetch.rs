@@ -602,8 +602,7 @@ impl ZcashIndexer for FetchServiceSubscriber {
         let roster = self.fetcher.get_roster().await?;
         let mut data: Vec<u8> = Vec::new();
         for m in roster {
-            data.write_all(&m.0).unwrap();
-            data.write_all(&m.1.to_le_bytes()).unwrap();
+            m.write_to_vec(&mut data);
         }
         Ok(Bytes{ data })
     }

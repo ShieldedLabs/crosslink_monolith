@@ -13,7 +13,7 @@ use strum::{EnumCount, IntoEnumIterator};
 use strum_macros::{EnumCount, EnumIter};
 
 use tenderlink::SortedRosterMember;
-use zcash_primitives::transaction::{StakingAction, StakingActionKind};
+use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 use zebra_chain::serialization::{
     SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
 };
@@ -497,11 +497,10 @@ async fn malachite_wants_to_know_what_the_current_validator_set_is(
         .position(|v| v.address.0 == internal.my_public_key)
         .is_none()
     {
-        return_validator_list_because_of_malachite_bug.push(MalValidator {
-            address: MalPublicKey2(internal.my_public_key),
-            public_key: internal.my_public_key,
-            voting_power: 0,
-        });
+        return_validator_list_because_of_malachite_bug.push(MalValidator::new(
+            internal.my_public_key,
+            Vec::new()
+        ));
     }
     let finalizers = return_validator_list_because_of_malachite_bug;
     if true {
@@ -543,11 +542,10 @@ async fn new_decided_bft_block_from_malachite(
         .position(|v| v.address.0 == internal.my_public_key)
         .is_none()
     {
-        return_validator_list_because_of_malachite_bug.push(MalValidator {
-            address: MalPublicKey2(internal.my_public_key),
-            public_key: internal.my_public_key,
-            voting_power: 0,
-        });
+        return_validator_list_because_of_malachite_bug.push(MalValidator::new(
+            internal.my_public_key,
+            Vec::new()
+        ));
     }
 
     if fat_pointer.points_at_block_hash() != new_block.blake3_hash() {
@@ -1019,6 +1017,7 @@ async fn push_staking_action_from_cmd_str(
 
 fn update_roster_for_cmd(
     roster: &mut Vec<MalValidator>,
+    txid: [u8; 32],
     validators_keys_to_names: &mut HashMap<MalPublicKey, String>,
     action: &StakingAction,
 ) -> usize {
@@ -1049,44 +1048,45 @@ fn update_roster_for_cmd(
         ),
     };
 
-    let mut amount = action.val;
+    let mut zats = action.val;
     if let Some((sub_key, sub_name)) = sub_key_name {
-        let sub_key = MalPublicKey2(sub_key.into());
-        let Some(member) = roster.iter_mut().find(|cmp| cmp.public_key == sub_key.0) else {
-            warn!(
-                "Roster command invalid: can't subtract from non-present finalizer \"{}\"",
-                sub_name
-            );
-            return 0;
-        };
+        error!("subtraction currently non-functional")
+        // let sub_key = MalPublicKey2(sub_key.into());
+        // let Some(member) = roster.iter_mut().find(|cmp| cmp.public_key == sub_key.0) else {
+        //     warn!(
+        //         "Roster command invalid: can't subtract from non-present finalizer \"{}\"",
+        //         sub_name
+        //     );
+        //     return 0;
+        // };
 
-        if member.voting_power < action.val {
-            if is_clear {
-                warn!("Roster command invalid: can't clear the finalizer to a higher current value \"{}\"/{}: {} => {}",
-                    sub_name, sub_key, member.voting_power, action.val);
-            } else {
-                warn!("Roster command invalid: can't subtract more from the finalizer than their current value \"{}\"/{}: {} - {}",
-                    sub_name, sub_key, member.voting_power, action.val);
-            }
-            return 0;
-        }
+        // if member.voting_power < action.val {
+        //     if is_clear {
+        //         warn!("Roster command invalid: can't clear the finalizer to a higher current value \"{}\"/{}: {} => {}",
+        //             sub_name, sub_key, member.voting_power, action.val);
+        //     } else {
+        //         warn!("Roster command invalid: can't subtract more from the finalizer than their current value \"{}\"/{}: {} - {}",
+        //             sub_name, sub_key, member.voting_power, action.val);
+        //     }
+        //     return 0;
+        // }
 
-        if is_clear {
-            amount = member.voting_power - action.val
-        };
+        // if is_clear {
+        //     zats = member.voting_power - action.val
+        // };
 
-        member.voting_power -= amount;
+        // member.voting_power -= zats;
     }
 
     if has_add {
         // NOTE: all adds are to action.target
         let add_key = MalPublicKey2(action.target.into());
-        if let Some(member) = roster.iter_mut().find(|cmp| cmp.public_key == add_key.0) {
-            member.voting_power += amount;
+        let stake = StakeTxId{ txid, zats };
+        let member = if let Some(mut member) = roster.iter_mut().find(|cmp| cmp.public_key == add_key.0) {
+            member.txids.push(stake)
         } else {
-            roster.push(MalValidator::new(add_key.0, amount));
-            validators_keys_to_names.insert(add_key.0, action.insecure_target_name.clone());
-        }
+            roster.push(MalValidator::new(add_key.0, vec![stake]));
+        };
     }
 
     1
@@ -1103,7 +1103,9 @@ fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> 
             tx.as_ref()
         {
             if let Some(staking_action) = staking_action {
-                cmd_c += update_roster_for_cmd(roster, validators_keys_to_names, &staking_action);
+                let txid = tx.unmined_id().mined_id();
+                info!("got staking action in txid: {}", StakingAction::str_from_addr(txid.0));
+                cmd_c += update_roster_for_cmd(roster, txid.0, validators_keys_to_names, &staking_action);
             }
         };
     }
@@ -1475,7 +1477,7 @@ async fn tfl_service_incoming_request(
             internal
                 .validators_at_current_height
                 .iter()
-                .map(|v| (<[u8; 32]>::from(v.public_key), v.voting_power))
+                .map(|v| RosterMember{ pub_key:<[u8; 32]>::from(v.public_key), voting_power: v.voting_power, txids:v.txids.clone() })
                 .collect()
         })),
 
@@ -1797,16 +1799,35 @@ pub struct MalValidator {
     pub address: MalPublicKey2,
     pub public_key: MalPublicKey,
     pub voting_power: u64,
+
+    pub txids: Vec<StakeTxId>,
 }
 
 impl MalValidator {
     #[cfg_attr(coverage_nightly, coverage(off))]
-    pub fn new(public_key: MalPublicKey, voting_power: u64) -> Self {
+    pub fn new(public_key: MalPublicKey, initial_stakes: Vec<StakeTxId>) -> Self {
         Self {
             address: MalPublicKey2(public_key),
             public_key,
-            voting_power,
+            voting_power: Self::total_stake(&initial_stakes),
+            txids: initial_stakes,
         }
+    }
+
+    pub fn push(&mut self, txid: StakeTxId) {
+        if self.txids.iter().find(|cmp| cmp.txid == txid.txid).is_some() {
+            return;
+        }
+        self.voting_power += txid.zats;
+        self.txids.push(txid);
+    }
+
+    pub fn total_stake(txids: &[StakeTxId]) -> u64 {
+        let mut zats = 0;
+        for it in txids {
+            zats += it.zats;
+        }
+        zats
     }
 }
 
