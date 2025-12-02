@@ -7,7 +7,7 @@ use orchard::note_encryption::CompactAction;
 use rand_chacha::rand_core::SeedableRng;
 use rand_core::OsRng;
 use sapling_crypto::zip32::ExtendedSpendingKey;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::{identity, Infallible};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -365,8 +365,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         return Ok(pending);
     }
 
-    async fn get_received_memos<P: zcash_protocol::consensus::Parameters>(client: &mut CompactTxStreamerClient<Channel>, wallet: &zcash_client_sqlite::WalletDb<rusqlite::Connection, P, SystemClock, OsRng>, params: P) -> Vec<(TxId, String)> {
-
+    async fn get_received_memos_and_actions<P: zcash_protocol::consensus::Parameters>(client: &mut CompactTxStreamerClient<Channel>, wallet: &zcash_client_sqlite::WalletDb<rusqlite::Connection, P, SystemClock, OsRng>, params: P, history: &[TransactionSummary<AccountUuid>]) -> Option<HashMap<TxId, (Option<StakingAction>, Vec<String>)>> {
         fn try_get_orchard_memos(tx: &TransactionData<zcash_primitives::transaction::Authorized>, ivk: &orchard::keys::PreparedIncomingViewingKey) -> Vec<String> {
             let mut memos = Vec::new();
             let Some(bundle) = tx.orchard_bundle() else { return memos; };
@@ -386,11 +385,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             return memos;
         }
 
-        let mut memos = Vec::new();
-        let Ok(history) = get_transaction_history(&wallet) else { return memos; };
+        let mut txid_map = HashMap::new();
         let txids: Vec<TxId> = history.iter().map(|h| h.txid).collect();
 
-        let Ok(ids) = wallet.get_account_ids() else { return memos; };
+        let Ok(ids) = wallet.get_account_ids() else { return None; };
         let accounts: Vec<zcash_client_sqlite::wallet::Account> = ids
             .into_iter()
             .map(|id| wallet.get_account(id))
@@ -412,22 +410,27 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 continue;
             };
 
+            let action = tx.staking_action().clone();
+            let mut memos = Vec::new();
             let txdata = &tx.into_data();
             for uivk in &uivks {
                 let possible_orchard_ivk = if let Some(orchard_ivk) = uivk.orchard() { Some(orchard_ivk.prepare()) } else { None };
 
                 if let Some(orchard_ivk) = possible_orchard_ivk {
-                    let m: Vec<(TxId, String)> = try_get_orchard_memos(txdata, &orchard_ivk)
+                    let m: Vec<String> = try_get_orchard_memos(txdata, &orchard_ivk)
                         .iter()
-                        .map(|memo| (*txid, memo.clone()))
+                        .map(|memo| memo.clone())
                         .collect();
 
-                    memos.extend_from_slice(&m[..]);
+                    for memo in m {
+                        memos.push(memo);
+                    }
                 }
             }
+            txid_map.insert(*txid, (action, memos));
         }
 
-        memos
+        Some(txid_map)
     }
 
     struct Timer { t_bgn: std::time::Instant, name: &'static str };
@@ -552,6 +555,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         miner_pubkey,
         miner_privkey,
         miner_t_address,
+        mut miner_txid_map,
     ) = {
         let (miner_wallet, miner_account, miner_usk) = wallet_from_seed_phrase(network,
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
@@ -562,7 +566,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let miner_t_recs = miner_wallet
             .get_transparent_receivers(miner_account.id(), false, false)
             .unwrap();
-        (miner_wallet, miner_account, miner_usk, miner_pubkey, miner_privkey, miner_t_addr)
+        (miner_wallet, miner_account, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, HashMap::new())
     };
 
     let (
@@ -573,6 +577,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         user_privkey,
         user_t_address,
         user_ua,
+        mut user_txid_map,
     ) = {
         // roundtrip seed through mnemonic phrase
         let mnemonic = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &global_seed).unwrap();
@@ -590,7 +595,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // NOTE: the default isn't the same as below, but I think this is because it forces a diversifier index
         // println!("User wallet: {}/{:?}", user_t_addr_str, user_t_addr1.encode(network));
 
-        (user_wallet,  user_account, user_usk, user_pubkey, user_privkey, user_t_addr, user_ua)
+        (user_wallet,  user_account, user_usk, user_pubkey, user_privkey, user_t_addr, user_ua, HashMap::new())
     };
 
     println!("*************************");
@@ -719,12 +724,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 println!("******* WALLET {:?} *******", t_address.encode(network));
                 println!("BALANCES {:?}", balances);
                 println!("SUMMARY  {:?}", summary);
-
-                println!("MEMOS");
-                let memos = get_received_memos(&mut client, wallet, network).await;
-                for memo in memos {
-                    println!("\tTx {:?}: {}", memo.0, memo.1);
-                }
             }
 
             if time_since_last_transparent_shielded.elapsed().as_secs() > 15 {
@@ -865,38 +864,47 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 println!("WALLET HAS {} ({})) cTAZ", spendable_balance, str_from_ctaz(spendable_balance));
 
                 let txs = if let Ok(mut history) = get_transaction_history(user_wallet) {
-                    let memos = get_received_memos(&mut client, user_wallet, network).await;
-                    let txs: Vec<WalletTx> = history.iter().map(|tx| {
-                        let mut kind: WalletTxKind;
-                        if tx.is_shielding {
-                            kind = WalletTxKind::Shield;
-                        }
-                        else if tx.account_value_delta.is_negative() {
-                            kind =  WalletTxKind::Send;
-                        }
-                        else if tx.account_value_delta.is_positive() {
-                            kind = WalletTxKind::Receive;
-                        }
-                        else {
-                            kind = WalletTxKind::Receive;
-                        }
+                    if let Some(map) = get_received_memos_and_actions(&mut client, user_wallet, network, &history).await {
+                        user_txid_map = map;
+                        let txs: Vec<WalletTx> = history.iter().map(|tx| {
+                            let mut kind: WalletTxKind;
+                            if tx.is_shielding {
+                                kind = WalletTxKind::Shield;
+                            }
+                            else if tx.account_value_delta.is_negative() {
+                                kind =  WalletTxKind::Send;
+                            }
+                            else if tx.account_value_delta.is_positive() {
+                                kind = WalletTxKind::Receive;
+                            }
+                            else {
+                                kind = WalletTxKind::Receive;
+                            }
 
-                        if kind == WalletTxKind::Send && tx.memo_count > 0 {
-                            kind = WalletTxKind::Stake;
-                        }
+                            if kind == WalletTxKind::Send && tx.memo_count > 0 {
+                                kind = WalletTxKind::Stake;
+                            }
 
-                        // @todo: kind = WalletTxKind::Unstake
+                            // @todo: kind = WalletTxKind::Unstake
 
-                        let mut tx = WalletTx(tx.clone(), kind);
-                        if let Some(memo) = memos.iter().find(|m| m.0 == tx.0.txid) {
-                            let bytes = memo.1.as_bytes();
-                            tx.0.memo[0..bytes.len()].copy_from_slice(bytes);
-                        }
+                            let mut tx = WalletTx(tx.clone(), kind);
+                            if let Some((_, memos)) = user_txid_map.get(&tx.0.txid) {
+                                if memos.len() > 0 {
+                                    if memos.len() > 1 {
+                                        println!("received multiple memos in 1 transaction: {}", memos.len());
+                                    }
+                                    let bytes = memos[0].as_bytes();
+                                    tx.0.memo[0..bytes.len()].copy_from_slice(bytes);
+                                }
+                            }
 
-                        tx
-                    }).collect();
+                            tx
+                        }).collect();
 
-                    Some(txs)
+                        Some(txs)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -1051,6 +1059,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             })(&mut user_wallet, &mut miner_wallet).await;
 
+            (async |miner_wallet: &mut WalletDb<_, _, _, _>| {
+                if let Ok(history) = get_transaction_history(miner_wallet) {
+                    if let Some(map) = get_received_memos_and_actions(&mut client, miner_wallet, network, &history).await {
+                        miner_txid_map = map;
+                    }
+                }
+            })(&mut miner_wallet).await;
             // Process gui wallet actions
 
             // @todo(judah): I'm thinking the weird frame hitch we get in the UI is caused by this loop,
