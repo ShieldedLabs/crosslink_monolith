@@ -1473,7 +1473,7 @@ pub fn ui_right_pane(ui: &mut Context,
                             align: Right,
                             ..Decl
                         }) {
-                            let stake_amount: i64 = member.stake as i64;
+                            let stake_amount: i64 = member.voting_power as i64;
                             let full = stake_amount / 100_000_000;
                             let part = stake_amount % 100_000_000;
                             let part_str = format!("{part}00");

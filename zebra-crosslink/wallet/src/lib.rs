@@ -84,8 +84,7 @@ use zcash_transparent::{
     address::TransparentAddress,
     keys::{IncomingViewingKey, TransparentKeyScope},
 };
-use zcash_primitives::transaction::StakingAction;
-use zcash_primitives::transaction::StakingActionKind;
+use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 
 pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
@@ -251,11 +250,6 @@ pub fn str_from_ctaz(val: u64) -> String {
     format!("{full}.{}", &part_str[..trim_part.len().max(3)])
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct RosterMember {
-    pub pub_key: [u8; 32],
-    pub stake: u64,
-}
 
 pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     fn wallet_from_seed_phrase<P: Parameters + 'static>(params: P, phrase: &str) -> (
@@ -665,35 +659,71 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         };
 
         loop {
-            if let Ok(res) = client.get_roster(Empty{}).await {
-                use std::io::{ Cursor,Read };
-                let roster_bytes = res.into_inner().data;
+            match client.get_roster(Empty{}).await {
+                Err(err) => println!("Get roster error: {err:?}"),
+                Ok(res) => {
+                    use std::io::{ Cursor,Read };
+                    let roster_bytes = res.into_inner().data;
 
-                let mut ok = roster_bytes.len() > 0;
-                let mut cur = Cursor::new(&roster_bytes);
+                    let mut ok = roster_bytes.len() > 0;
+                    let mut cur = Cursor::new(&roster_bytes);
 
-                let mut new_roster = Vec::new();
-                let mut num_buf = [0u8; 8];
-                while cur.position() < roster_bytes.len() as u64 {
-                    let mut m = RosterMember{ pub_key: [0;32], stake:0 };
-                    if let Err(err) = cur.read_exact(&mut m.pub_key) {
-                        println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
-                        ok = false;
-                        break;
+                    let mut new_roster = Vec::new();
+                    let mut num_buf = [0u8; 8];
+                    'read: while cur.position() < roster_bytes.len() as u64 {
+                        let mut m = RosterMember{ pub_key: [0;32], voting_power:0, txids: Vec::new() };
+                        if let Err(err) = cur.read_exact(&mut m.pub_key) {
+                            println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
+                            ok = false;
+                            break;
+                        }
+                        if let Err(err) = cur.read_exact(&mut num_buf) {
+                            println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
+                            ok = false;
+                            break;
+                        }
+                        m.voting_power = u64::from_le_bytes(num_buf);
+
+                        if let Err(err) = cur.read_exact(&mut num_buf) {
+                            println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
+                            ok = false;
+                            break;
+                        }
+
+                        let mut voting_power_check = 0;
+                        let txids_n = u64::from_le_bytes(num_buf);
+                        for _ in 0..txids_n {
+                            let mut stake_txid = StakeTxId{ txid:[0;32], zats:0 };
+                            if let Err(err) = cur.read_exact(&mut stake_txid.txid) {
+                                println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
+                                ok = false;
+                                break 'read;
+                            }
+                            if let Err(err) = cur.read_exact(&mut num_buf) {
+                                println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
+                                ok = false;
+                                break 'read;
+                            }
+                            stake_txid.zats = u64::from_le_bytes(num_buf);
+                            voting_power_check += stake_txid.zats;
+                            m.txids.push(stake_txid);
+                        }
+
+                        if m.voting_power != voting_power_check {
+                            // TODO: use manually-found one?
+                            println!("******* RECEIVED ROSTER VOTING POWER INACCURATE");
+                            ok = false;
+                            break;
+                        }
+
+                        new_roster.push(m);
                     }
-                    if let Err(err) = cur.read_exact(&mut num_buf) {
-                        println!("******* ROSTER DESERIALIZE ERROR: {err:?}");
-                        ok = false;
-                        break;
-                    }
-                    m.stake = u64::from_le_bytes(num_buf);
-                    new_roster.push(m);
-                }
 
-                if ok {
-                    roster = new_roster;
+                    if ok {
+                        roster = new_roster;
+                    }
+                    wallet_state.lock().unwrap().roster = roster.clone();
                 }
-                wallet_state.lock().unwrap().roster = roster.clone();
             }
             println!("*********** ROSTER: {roster:?}");
 

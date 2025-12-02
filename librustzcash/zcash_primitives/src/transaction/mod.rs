@@ -1376,6 +1376,37 @@ impl TryFrom<u8> for StakingActionKind {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct StakeTxId {
+    #[serde(with = "hex")]
+    pub txid: [u8;32],
+    pub zats: u64, // accumulated, not initial
+}
+impl StakeTxId {
+    pub fn write_to_vec(&self, data: &mut std::vec::Vec<u8>) {
+        data.write_all(&self.txid).unwrap();
+        data.write_all(&self.zats.to_le_bytes()).unwrap();
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct RosterMember {
+    #[serde(with = "hex")]
+    pub pub_key: [u8; 32],
+    pub voting_power: u64,
+    pub txids: std::vec::Vec<StakeTxId>,
+}
+impl RosterMember {
+    pub fn write_to_vec(&self, data: &mut std::vec::Vec<u8>) {
+        data.write_all(&self.pub_key).unwrap();
+        data.write_all(&self.voting_power.to_le_bytes()).unwrap();
+        data.write_all(&self.txids.len().to_le_bytes()).unwrap();
+        for txid in &self.txids {
+            txid.write_to_vec(data);
+        }
+    }
+}
+
 // TODO(code org): should this be under zcash_protocol?
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct StakingAction {
@@ -1394,6 +1425,53 @@ impl StakingAction {
         writer.write_all(&self.target).ok()?;
         writer.write_all(&self.source).ok()
     }
+
+    // TODO: fold in existing
+    pub fn str_from_addr(addr: [u8; 32]) -> std::string::String {
+        let mut str = std::string::String::with_capacity(64);
+        for i in 0..32 {
+            str.push_str(&format!("{:02x}", addr[31-i]));
+        }
+        str
+    }
+    pub fn addr_from_str_bytes(data: &[u8]) -> Option<[u8; 32]> {
+        const VALS: [u8; 256] = {
+            let mut v = [0xff; 256];
+            v[b'0' as usize] = 0x0;
+            v[b'1' as usize] = 0x1;
+            v[b'2' as usize] = 0x2;
+            v[b'3' as usize] = 0x3;
+            v[b'4' as usize] = 0x4;
+            v[b'5' as usize] = 0x5;
+            v[b'6' as usize] = 0x6;
+            v[b'7' as usize] = 0x7;
+            v[b'8' as usize] = 0x8;
+            v[b'9' as usize] = 0x9;
+            v[b'a' as usize] = 0xa;
+            v[b'b' as usize] = 0xb;
+            v[b'c' as usize] = 0xc;
+            v[b'd' as usize] = 0xd;
+            v[b'e' as usize] = 0xe;
+            v[b'f' as usize] = 0xf;
+            v
+        };
+        let mut buf = [0u8; 32];
+        for i in 0..32 {
+            let a = data.get(2*i)?;
+            let b = data.get(2*i + 1)?;
+            let a = VALS[*a as usize];
+            if a == 0xff {
+                return None;
+            }
+            let b = VALS[*b as usize];
+            if b == 0xff {
+                return None;
+            }
+            buf[31-i] = (a << 4) | b
+        }
+        Some(buf)
+    }
+
 
     pub fn to_cmd_string(&self) -> std::string::String {
         let kind_str = match self.kind {
