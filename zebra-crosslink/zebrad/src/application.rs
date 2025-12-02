@@ -625,7 +625,14 @@ pub fn boot(app_cell: &'static AppCell<ZebradApp>) -> ! {
         let wallet_state2 = wallet_state.clone();
 
         std::thread::spawn(move || {
-            zebra_crosslink::wallet::wallet_main(wallet_state2);
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_time()
+                .enable_io()
+                .build()
+                .unwrap();
+
+            rt.block_on(zebra_crosslink::wallet::wallet_main(wallet_state2));
         });
 
         // TODO: gate behind feature-flag
