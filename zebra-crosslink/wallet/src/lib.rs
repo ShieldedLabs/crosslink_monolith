@@ -672,9 +672,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                         if m.voting_power != voting_power_check {
                             // TODO: use manually-found one?
-                            println!("******* RECEIVED ROSTER VOTING POWER INACCURATE");
-                            ok = false;
-                            break;
+                            println!("******* RECEIVED ROSTER VOTING POWER INACCURATE: {} vs {}", m.voting_power, voting_power_check);
+                            // ok = false;
+                            // break;
                         }
 
                         new_roster.push(m);
@@ -1175,10 +1175,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             match send_zats(&mut client, &address, &mut user_wallet, &user_usk, amount_with_fee, network, &TxOptions::default()).await {
                                 None => {
                                     println!("Failed to send ZEC to {}", address.encode(network));
-                                    wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
+                                    wallet_state.lock().unwrap().waiting_for_send = false;
                                     false
                                 }
                                 Some(_) => {
+                                    wallet_state.lock().unwrap().waiting_for_send = false;
                                     true
                                 }
                             }
