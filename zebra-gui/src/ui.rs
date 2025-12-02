@@ -799,25 +799,20 @@ pub fn ui_left_pane(ui: &mut Context,
                         direction: TopToBottom,
                         ..Decl
                     }) {
-                        let recv_address = {
-                            let ua = &wallet_state.lock().unwrap().user_recv_ua;
-                            if ua.len() != 0 {
-                                frame_strf!(data, "[{}..{}]", &ua[..8], &ua[ua.len() - 8..])
-                            } else {
-                                "Loading..."
-                            }
-                        };
+                        let ua = &wallet_state.lock().unwrap().user_recv_ua;
+                        if ua.len() != 0 {
+                            ui.text(frame_strf!(data, "[{}..{}]", &ua[..8], &ua[ua.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
 
-                        ui.text(recv_address, TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                        if recv_address != "Loading..." {
                             if button_ex(ui, "Copy Address", true) {
-                                ui.input().send_to_clipboard(&recv_address);
+                                ui.input().send_to_clipboard(&ua);
                             }
+                        } else {
+                            ui.text("Loading...", TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                         }
                     }
                 }
                 Modal::Stake => {
-                    title_bar(ui, true, "Stake",   id("Stake Title Bar"));
+                    title_bar(ui, true, "Stake", id("Stake Title Bar"));
 
                     let mut stake_address = "0000000000000000";
                     if data.stake_address.len() >= 16 {
