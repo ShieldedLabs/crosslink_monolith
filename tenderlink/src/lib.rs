@@ -1690,12 +1690,12 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     round: bft_state.round,
                     need_proposal_chunk_rngs: [[0, 0]],
                     need_vote_rngs: [[[0, active_roster_len(roster) as u16]]; 2],
-                    powlink_hashes: [BlockHash::NIL; 4],
+                    powlink_hashes: [BlockHash::NIL; 1],
                 };
                 {
                     let mut i = 0;
                     for hash in &bft_state.powlink_hashes {
-                        if i >= 4 { break; }
+                        if i >= bft_state.powlink_hashes.len() { break; }
                         status.powlink_hashes[i] = *hash;
                         i += 1;
                     }
@@ -2655,7 +2655,7 @@ struct PacketStatus {
     round:  u32, // as context for following request ranges
     need_proposal_chunk_rngs: [ProposalRng; STATUS_PROPOSAL_RNGS_N],
     need_vote_rngs: [[VoteRng; STATUS_VOTE_RNGS_N]; 2], // 1 for prevote, 1 for precommit
-    powlink_hashes: [BlockHash; 4], // blocks needed
+    powlink_hashes: [BlockHash; 1], // blocks needed
 }
 impl PacketStatus {
     pub fn write_to(&self, buf: &mut[u8]) -> usize {
