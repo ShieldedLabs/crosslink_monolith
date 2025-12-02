@@ -7,6 +7,18 @@
   "ascent": 850,
   "glyphs": [
     {
+      "uid": "75347b319511175da51af3955919dbac",
+      "css": "key-1",
+      "code": 57352,
+      "src": "linecons"
+    },
+    {
+      "uid": "272e08e0e16226aadf94dcbf33aab2b2",
+      "css": "key",
+      "code": 57477,
+      "src": "elusive"
+    },
+    {
       "uid": "a30a32d49f80bb534c062ae1743ef433",
       "css": "down-thin",
       "code": 59392,
@@ -31,32 +43,14 @@
       "src": "fontawesome"
     },
     {
-      "uid": "272e08e0e16226aadf94dcbf33aab2b2",
-      "css": "key",
-      "code": 59395,
-      "src": "elusive"
-    },
-    {
       "uid": "04f7e0bbd0bba658464ca2b49097f37f",
       "css": "qrcode-1",
       "code": 59396,
       "src": "elusive"
     },
     {
-      "uid": "75347b319511175da51af3955919dbac",
-      "css": "key-1",
-      "code": 59396,
-      "src": "linecons"
-    },
-    {
       "uid": "36a1cee80657a9c66e8384dd57bed66c",
       "css": "water",
-      "code": 59397,
-      "src": "entypo"
-    },
-    {
-      "uid": "8beac4a5fd5bed9f82ca7a96cc8ba218",
-      "css": "key-2",
       "code": 59397,
       "src": "entypo"
     },
@@ -226,6 +220,12 @@
       "uid": "4ecf5fd3870bb82ba003d7f34845448d",
       "css": "leaf",
       "code": 59425,
+      "src": "typicons"
+    },
+    {
+      "uid": "1a27e6346cdf0480c9c22351378bebbb",
+      "css": "clipboard",
+      "code": 59426,
       "src": "typicons"
     },
     {
@@ -821,6 +821,12 @@
       "css": "spread",
       "code": 62759,
       "src": "mfglabs"
+    },
+    {
+      "uid": "8beac4a5fd5bed9f82ca7a96cc8ba218",
+      "css": "key-2",
+      "code": 128273,
+      "src": "entypo"
     }
   ]
 }

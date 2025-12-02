@@ -1347,6 +1347,8 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                                         hasher.write_u32(radius_br.to_bits());
                                                                         hasher.write_u32(color);
                                                                         if should_draw == false { continue; }
+                                                                        if scissor_x1 >= scissor_x2 { continue; }
+                                                                        if scissor_y1 >= scissor_y2 { continue; }
                                                                         let mut row_pixels = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
                                                                         let color_alpha = (color >> 24) as f32 / 255.0;
                                                                         for _y in iy..iy2 {
@@ -1422,6 +1424,8 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                                             hasher.write_u32(color);
                                                                             // TODO rethink, font id?
                                                                             if should_draw == false { continue; }
+                                                                            if scissor_x1 >= scissor_x2 { continue; }
+                                                                            if scissor_y1 >= scissor_y2 { continue; }
 
                                                                             let mut copy_data = row_bitmaps.byte_add((lookup_index as usize) << glyph_row_shift);
                                                                             let mut put_data = ctx.render_target_0.byte_add((y as usize) << (pixel_row_shift+2)).byte_offset(start_x as isize *4);
