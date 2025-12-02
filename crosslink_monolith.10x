@@ -9,7 +9,7 @@
 		<IncludeFilesWithoutExt>false</IncludeFilesWithoutExt>
 		<IsFolder>false</IsFolder>
 		<UseVisualStudioEnvBat>false</UseVisualStudioEnvBat>
-		<CaptureExeOutput>false</CaptureExeOutput>
+		<CaptureExeOutput>true</CaptureExeOutput>
 		<Configurations>
 			<Configuration>Debug</Configuration>
 			<Configuration>Release</Configuration>
@@ -23,7 +23,7 @@
 		<ConfigProperties>
 			<ConfigAndPlatform>
 				<Name>Debug:x64</Name>
-				<BuildCommand></BuildCommand>
+				<BuildCommand>C:\Work\ShieldedLabs\crosslink_monolith\local_testnet.bat</BuildCommand>
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
 				<CleanCommand></CleanCommand>
@@ -33,7 +33,7 @@
 				<Args></Args>
 				<WorkingDirectory></WorkingDirectory>
 				<DebugCommand></DebugCommand>
-				<DebuggerExe>C:\Work\ShieldedLabs\crosslink_monolith\regtest.bat</DebuggerExe>
+				<DebuggerExe></DebuggerExe>
 				<DebugSln></DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
