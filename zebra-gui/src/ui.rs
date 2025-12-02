@@ -799,10 +799,20 @@ pub fn ui_left_pane(ui: &mut Context,
                         direction: TopToBottom,
                         ..Decl
                     }) {
-                        let recv_address = &wallet_state.lock().unwrap().user_recv_ua;
-                        ui.text(frame_strf!(data, "[{}..{}]", &recv_address[..8], &recv_address[recv_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                        if button_ex(ui, "Copy Address", true) {
-                            ui.input().send_to_clipboard(recv_address);
+                        let recv_address = {
+                            let ua = &wallet_state.lock().unwrap().user_recv_ua;
+                            if ua.len() != 0 {
+                                frame_strf!(data, "[{}..{}]", &ua[..8], &ua[ua.len() - 8..])
+                            } else {
+                                "Loading..."
+                            }
+                        };
+
+                        ui.text(recv_address, TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                        if recv_address != "Loading..." {
+                            if button_ex(ui, "Copy Address", true) {
+                                ui.input().send_to_clipboard(&recv_address);
+                            }
                         }
                     }
                 }
