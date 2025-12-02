@@ -1147,6 +1147,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                     false
                                 }
                                 Some(_) => {
+                                    wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
                                     true
                                 }
                             }
