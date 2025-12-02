@@ -190,6 +190,8 @@ pub struct WalletState {
     pub miner_shielded_spendable_funds: u64,
     pub faucet_funds_available: u64,
 
+    pub user_recv_ua: String,
+
     pub actions_in_flight: VecDeque<WalletAction>,
 }
 
@@ -537,9 +539,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
     };
 
-    println!("waiting for zaino to be ready...");
-    wait_for_zainod().await;
-
     let global_seed = loop {
         if let Some(global_seed) = *GLOBAL_SEED.lock().unwrap() {
             break global_seed;
@@ -555,6 +554,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         miner_pubkey,
         miner_privkey,
         miner_t_address,
+        miner_ua,
         mut miner_txid_map,
     ) = {
         let (miner_wallet, miner_account, miner_usk) = wallet_from_seed_phrase(network,
@@ -566,7 +566,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let miner_t_recs = miner_wallet
             .get_transparent_receivers(miner_account.id(), false, false)
             .unwrap();
-        (miner_wallet, miner_account, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, HashMap::new())
+        (miner_wallet, miner_account, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, miner_ua, HashMap::new())
     };
 
     let (
@@ -598,10 +598,20 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         (user_wallet,  user_account, user_usk, user_pubkey, user_privkey, user_t_addr, user_ua, HashMap::new())
     };
 
+    let user_ua_str = user_ua.encode(network);
     println!("*************************");
-    println!("MINER WALLET ADDRESS: {}", miner_t_address.encode(network));
-    println!("USER WALLET ADDRESS:  {}", user_t_address.encode(network));
+    println!("MINER WALLET T-ADDRESS: {}", miner_ua.encode(network));
+    println!("MINER WALLET ADDRESS:   {}", miner_t_address.encode(network));
+    println!("USER WALLET T-ADDRESS:  {}", user_t_address.encode(network));
+    println!("USER WALLET ADDRESS:    {}", user_ua_str);
     println!("*************************");
+
+    wallet_state.lock().unwrap().user_recv_ua = user_ua_str;
+
+
+    println!("waiting for zaino to be ready...");
+    wait_for_zainod().await;
+    //////////////////////////////////////////////////////////////////////////////////
 
     // TODO: use tenderlink types & printing routines
     let mut roster: Vec<RosterMember> = Vec::new();
