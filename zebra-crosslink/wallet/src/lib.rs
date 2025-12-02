@@ -10,6 +10,7 @@ use sapling_crypto::zip32::ExtendedSpendingKey;
 use std::collections::{HashMap, VecDeque};
 use std::convert::{identity, Infallible};
 use std::future::Future;
+use std::mem;
 use std::sync::{Arc, Mutex};
 use tokio_rustls::rustls;
 use tonic::client::GrpcService;
@@ -123,7 +124,8 @@ fn block_policy_10() -> ConfirmationsPolicy { ConfirmationsPolicy::new(std::num:
 enum WalletAction {
     RequestFromFaucet,
     TestStakeAction,
-    StakeToMiner(Zatoshis, [u8; 32]),
+    StakeToFinalizer(Zatoshis, [u8; 32]),
+    UnstakeFromFinalizer(TxId),
     SendToAddress(UnifiedAddress, Zatoshis),
 }
 
@@ -169,7 +171,13 @@ impl WalletTx {
 }
 
 // @note(judah): needed so the visualizer doesn't take a dependency on zcash_primitives
-pub type WalletRosterMember = RosterMember;
+#[derive(Default, Debug, Clone)]
+pub struct WalletRosterMember {
+    pub pub_key: [u8; 32],
+    pub voting_power: u64,
+    pub txids: std::vec::Vec<StakeTxId>,
+    pub show_initial_stake_amount: bool,
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct WalletState {
@@ -177,11 +185,12 @@ pub struct WalletState {
     pub pending_balance: i64, // in zats
     pub staked_balance:  i64, // in zats
 
-    pub txs:    Vec<WalletTx>,
-    pub roster: Vec<WalletRosterMember>,
+    pub txs:           Vec<WalletTx>,
+    pub roster:        Vec<WalletRosterMember>,
+    pub staked_roster: Vec<WalletRosterMember>,
 
     pub waiting_for_faucet: bool,
-    pub waiting_for_stake_to_miner: bool,
+    pub waiting_for_stake_to_finalizer: bool,
     pub waiting_for_send: bool,
 
     pub miner_seen_height: u32,
@@ -189,6 +198,8 @@ pub struct WalletState {
     pub miner_shielded_pending_funds: u64,
     pub miner_shielded_spendable_funds: u64,
     pub faucet_funds_available: u64,
+
+    pub user_recv_ua: String,
 
     pub actions_in_flight: VecDeque<WalletAction>,
 }
@@ -210,13 +221,21 @@ impl WalletState {
         self.actions_in_flight.push_back(WalletAction::RequestFromFaucet);
     }
 
-    pub fn stake_to_miner(&mut self, amount: u64, target_finalizer: [u8; 32]) {
-        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::StakeToMiner(_,_) => true, _ => false }).count() != 0 {
+    pub fn stake_to_finalizer(&mut self, amount: u64, target_finalizer: [u8; 32]) {
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::StakeToFinalizer(_,_) => true, _ => false }).count() != 0 {
             return;
         }
 
-        self.waiting_for_stake_to_miner = true;
-        self.actions_in_flight.push_back(WalletAction::StakeToMiner(Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_miner"), target_finalizer));
+        self.waiting_for_stake_to_finalizer = true;
+        self.actions_in_flight.push_back(WalletAction::StakeToFinalizer(Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_finalizer"), target_finalizer));
+    }
+
+    pub fn unstake_from_finalizer(&mut self, txid: [u8; 32]) {
+        let txid = TxId::from_bytes(txid);
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::UnstakeFromFinalizer(id) if id.eq(&txid) => true, _ => false }).count() != 0 {
+            return;
+        }
+        self.actions_in_flight.push_back(WalletAction::UnstakeFromFinalizer(txid));
     }
 
     pub fn send_to_address(&mut self, address: String, amount: u64) {
@@ -233,7 +252,7 @@ impl WalletState {
         }
 
         self.waiting_for_send = true;
-        self.actions_in_flight.push_back(WalletAction::SendToAddress(address, Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_miner")));
+        self.actions_in_flight.push_back(WalletAction::SendToAddress(address, Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_finalizer")));
     }
 }
 
@@ -537,9 +556,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
     };
 
-    println!("waiting for zaino to be ready...");
-    wait_for_zainod().await;
-
     let global_seed = loop {
         if let Some(global_seed) = *GLOBAL_SEED.lock().unwrap() {
             break global_seed;
@@ -555,6 +571,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         miner_pubkey,
         miner_privkey,
         miner_t_address,
+        miner_ua,
         mut miner_txid_map,
     ) = {
         let (miner_wallet, miner_account, miner_usk) = wallet_from_seed_phrase(network,
@@ -566,7 +583,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let miner_t_recs = miner_wallet
             .get_transparent_receivers(miner_account.id(), false, false)
             .unwrap();
-        (miner_wallet, miner_account, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, HashMap::new())
+        (miner_wallet, miner_account, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, miner_ua, HashMap::new())
     };
 
     let (
@@ -598,10 +615,20 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         (user_wallet,  user_account, user_usk, user_pubkey, user_privkey, user_t_addr, user_ua, HashMap::new())
     };
 
+    let user_ua_str = user_ua.encode(network);
     println!("*************************");
-    println!("MINER WALLET ADDRESS: {}", miner_t_address.encode(network));
-    println!("USER WALLET ADDRESS:  {}", user_t_address.encode(network));
+    println!("MINER WALLET T-ADDRESS: {}", miner_ua.encode(network));
+    println!("MINER WALLET ADDRESS:   {}", miner_t_address.encode(network));
+    println!("USER WALLET T-ADDRESS:  {}", user_t_address.encode(network));
+    println!("USER WALLET ADDRESS:    {}", user_ua_str);
     println!("*************************");
+
+    wallet_state.lock().unwrap().user_recv_ua = user_ua_str;
+
+
+    println!("waiting for zaino to be ready...");
+    wait_for_zainod().await;
+    //////////////////////////////////////////////////////////////////////////////////
 
     // TODO: use tenderlink types & printing routines
     let mut roster: Vec<RosterMember> = Vec::new();
@@ -683,7 +710,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     if ok {
                         roster = new_roster;
                     }
-                    wallet_state.lock().unwrap().roster = roster.clone();
+
+                    wallet_state.lock().unwrap().roster = roster
+                        .iter()
+                        .map(|member| WalletRosterMember{
+                            pub_key: member.pub_key,
+                            voting_power: member.voting_power,
+                            txids: member.txids.clone(),
+                            show_initial_stake_amount: false,
+                        })
+                        .collect::<Vec<WalletRosterMember>>()
+                        .clone();
                 }
             }
             println!("*********** ROSTER: {roster:?}");
@@ -894,7 +931,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                         println!("received multiple memos in 1 transaction: {}", memos.len());
                                     }
                                     let bytes = memos[0].as_bytes();
-                                    tx.0.memo[0..bytes.len()].copy_from_slice(bytes);
+                                    if bytes.len() > tx.0.memo.len() {
+                                        println!("memo too big ({}/{}):\"\"\"\n{}\n\"\"\"", bytes.len(), memos[0].len(), memos[0]);
+                                    }
+                                    let len = bytes.len().min(tx.0.memo.len());
+                                    tx.0.memo[..len].copy_from_slice(&bytes[..len]);
                                 }
                             }
 
@@ -1111,7 +1152,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             }
                         }
 
-                        WalletAction::StakeToMiner(amount, target_finalizer) => {
+                        WalletAction::StakeToFinalizer(amount, target_finalizer) => {
                             let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
                                 println!("Failed to get wallet summary");
                                 break 'process_action false;
@@ -1146,11 +1187,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             match send_zats_to_wallet(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network, &opts).await {
                                 None => {
                                     println!("Failed to send ZEC to miner");
-                                    wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
+                                    wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
                                     false
                                 }
                                 Some(_) => {
-                                    wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
+                                    wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
                                     true
                                 }
                             }
@@ -1187,6 +1228,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                     true
                                 }
                             }
+                        }
+
+                        WalletAction::UnstakeFromFinalizer(txid) => {
+                            println!("******************** TODO: UnstakeFromFinalizer");
+                            true
                         }
 
                         _ => { true }
