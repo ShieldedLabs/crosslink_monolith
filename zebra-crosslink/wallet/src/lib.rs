@@ -415,7 +415,24 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         memos
     }
 
+    struct Timer { t_bgn: std::time::Instant, name: &'static str };
+    impl Timer {
+        pub fn scope(name: &'static str) -> Self {
+            println!("started {}", name);
+            Self {
+                name, t_bgn: std::time::Instant::now()
+            }
+        }
+    };
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            println!("{} took {}ms", self.name, self.t_bgn.elapsed().as_millis());
+        }
+    }
+
     let send_zats = async | client: &mut CompactTxStreamerClient<_>, dst_wallet: &mut WalletDb<_, _, _, _>, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params, staking_action: Option<StakingAction>| -> bool {
+        let t = Timer::scope("send_zats");
+
         // @todo(judah): handle multiple accounts?
         let Ok(src_ids)  = src_wallet.get_account_ids() else { return false; };
         let Some(src_id) = src_ids.first() else { return false; };
@@ -494,6 +511,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     };
 
     let send_zats_externally = async | client: &mut CompactTxStreamerClient<_>, dst_ua: &UnifiedAddress, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params | -> bool {
+        let t = Timer::scope("send_zats_externally");
         // @todo(judah): handle multiple accounts?
         let Ok(src_ids)  = src_wallet.get_account_ids() else { return false; };
         let Some(src_id) = src_ids.first() else { return false; };
@@ -763,6 +781,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     fees::DustOutputPolicy::default(),
                 );
                 let min_zats_for_shielding = Zatoshis::const_from_u64(10_000);
+                let t_shield = Timer::scope("wallet::propose_shielding");
                 match wallet::propose_shielding::<_, _, _, _, Infallible>(
                     wallet,
                     network,
@@ -825,6 +844,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         return;
                     }
                 }
+                // drop(t_shield);
             })(&mut miner_wallet, &miner_account, &miner_usk).await;
 
             // Update gui wallet state
@@ -1150,6 +1170,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
                         true
                     } else {
+                        let t = Timer::scope("faucet send");
                         let zats = (Zatoshis::from_nonnegative_i64(500_000_000).unwrap() - MINIMUM_FEE).unwrap();
                         // NOTE: we can't send transparent->transparent through the high-level API, we
                         // have to propose_shielding first, then send in a later block
