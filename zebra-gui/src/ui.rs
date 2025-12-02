@@ -799,7 +799,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         direction: TopToBottom,
                         ..Decl
                     }) {
-                        let recv_address = "0000000000000000";
+                        let recv_address = &wallet_state.lock().unwrap().user_recv_ua;
                         ui.text(frame_strf!(data, "[{}..{}]", &recv_address[..8], &recv_address[recv_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
                         if button_ex(ui, "Copy Address", true) {
                             ui.input().send_to_clipboard(recv_address);
