@@ -1585,12 +1585,12 @@ pub fn ui_right_pane(ui: &mut Context,
                 if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(un)), right_text); }
             }
             if let _ = elem().decl(row) {
-                if let _ = elem().decl(left)  { ui.text("Shielded (Spendable):", left_text); }
-                if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_s)), right_text); }
-            }
-            if let _ = elem().decl(row) {
                 if let _ = elem().decl(left)  { ui.text("Shielded (Pending):", left_text); }
                 if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_p)), right_text); }
+            }
+            if let _ = elem().decl(row) {
+                if let _ = elem().decl(left)  { ui.text("Shielded (Spendable):", left_text); }
+                if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_s)), right_text); }
             }
             // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
         };
