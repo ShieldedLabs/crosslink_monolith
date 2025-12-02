@@ -956,8 +956,10 @@ pub fn ui_left_pane(ui: &mut Context,
                         clicked
                     };
 
-                    let mut clickable_icon = |ui: &mut Context, id, icon, enabled | {
+                    let mut clickable_icon = |ui: &mut Context, id, icon, icon_hovered, enabled | {
                         let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, true);
+
+                        let icon = if ui.hovered(id) { icon_hovered } else { icon };
                         if let _ = elem().decl(Decl{
                             id,
                             child_gap,
@@ -1055,7 +1057,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                         align: Center,
                                         ..Decl
                                     }) {
-                                        if clickable_icon(ui, id_index("Copy Button", index as u32), ICON_UNLINK, true) {
+                                        if clickable_icon(ui, id_index("Copy Button", index as u32), ICON_LINK_1, ICON_UNLINK, true) {
                                             let mut address_str = String::new();
                                             for b in member.pub_key.iter().rev() {
                                                 address_str.push_str(&format!("{:02x}", b));
