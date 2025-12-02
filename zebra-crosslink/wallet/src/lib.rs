@@ -123,7 +123,8 @@ fn block_policy_10() -> ConfirmationsPolicy { ConfirmationsPolicy::new(std::num:
 enum WalletAction {
     RequestFromFaucet,
     TestStakeAction,
-    StakeToMiner(Zatoshis, [u8; 32]),
+    StakeToFinalizer(Zatoshis, [u8; 32]),
+    UnstakeFromFinalizer(TxId),
     SendToAddress(UnifiedAddress, Zatoshis),
 }
 
@@ -177,11 +178,12 @@ pub struct WalletState {
     pub pending_balance: i64, // in zats
     pub staked_balance:  i64, // in zats
 
-    pub txs:    Vec<WalletTx>,
-    pub roster: Vec<WalletRosterMember>,
+    pub txs:           Vec<WalletTx>,
+    pub roster:        Vec<WalletRosterMember>,
+    pub staked_roster: Vec<WalletRosterMember>,
 
     pub waiting_for_faucet: bool,
-    pub waiting_for_stake_to_miner: bool,
+    pub waiting_for_stake_to_finalizer: bool,
     pub waiting_for_send: bool,
 
     pub miner_seen_height: u32,
@@ -210,13 +212,21 @@ impl WalletState {
         self.actions_in_flight.push_back(WalletAction::RequestFromFaucet);
     }
 
-    pub fn stake_to_miner(&mut self, amount: u64, target_finalizer: [u8; 32]) {
-        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::StakeToMiner(_,_) => true, _ => false }).count() != 0 {
+    pub fn stake_to_finalizer(&mut self, amount: u64, target_finalizer: [u8; 32]) {
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::StakeToFinalizer(_,_) => true, _ => false }).count() != 0 {
             return;
         }
 
-        self.waiting_for_stake_to_miner = true;
-        self.actions_in_flight.push_back(WalletAction::StakeToMiner(Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_miner"), target_finalizer));
+        self.waiting_for_stake_to_finalizer = true;
+        self.actions_in_flight.push_back(WalletAction::StakeToFinalizer(Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_finalizer"), target_finalizer));
+    }
+
+    pub fn unstake_from_finalizer(&mut self, txid: [u8; 32]) {
+        let txid = TxId::from_bytes(txid);
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::UnstakeFromFinalizer(id) if id.eq(&txid) => true, _ => false }).count() != 0 {
+            return;
+        }
+        self.actions_in_flight.push_back(WalletAction::UnstakeFromFinalizer(txid));
     }
 
     pub fn send_to_address(&mut self, address: String, amount: u64) {
@@ -233,7 +243,7 @@ impl WalletState {
         }
 
         self.waiting_for_send = true;
-        self.actions_in_flight.push_back(WalletAction::SendToAddress(address, Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_miner")));
+        self.actions_in_flight.push_back(WalletAction::SendToAddress(address, Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_finalizer")));
     }
 }
 
@@ -1111,7 +1121,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             }
                         }
 
-                        WalletAction::StakeToMiner(amount, target_finalizer) => {
+                        WalletAction::StakeToFinalizer(amount, target_finalizer) => {
                             let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
                                 println!("Failed to get wallet summary");
                                 break 'process_action false;
@@ -1146,11 +1156,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             match send_zats_to_wallet(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network, &opts).await {
                                 None => {
                                     println!("Failed to send ZEC to miner");
-                                    wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
+                                    wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
                                     false
                                 }
                                 Some(_) => {
-                                    wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
+                                    wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
                                     true
                                 }
                             }
@@ -1187,6 +1197,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                     true
                                 }
                             }
+                        }
+
+                        WalletAction::UnstakeFromFinalizer(txid) => {
+                            println!("******************** TODO: UnstakeFromFinalizer");
+                            true
                         }
 
                         _ => { true }

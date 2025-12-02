@@ -828,7 +828,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
 
                     const ONE_cTAZ: u64 = 100_000_000;
-                    let waiting_for_stake_to_miner = wallet_state.lock().unwrap().waiting_for_stake_to_miner;
+                    let waiting_for_stake_to_finalizer = wallet_state.lock().unwrap().waiting_for_stake_to_finalizer;
 
                     {
                         let balance = wallet_state.lock().unwrap().balance;
@@ -877,15 +877,230 @@ pub fn ui_left_pane(ui: &mut Context,
                         }
                         let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
 
-                        let can = !waiting_for_stake_to_miner && hex_dest.is_some();
-                        if button_ex(ui, "+0.01 cTAZ", can && (balance as u64) >= ONE_cTAZ / 100) { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ / 100, hex_dest.unwrap()); }
-                        if button_ex(ui,  "+0.1 cTAZ", can && (balance as u64) >= ONE_cTAZ / 10)  { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ / 10, hex_dest.unwrap());  }
-                        if button_ex(ui,    "+1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ, hex_dest.unwrap());       }
-                        if button_ex(ui,   "+10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().stake_to_miner(ONE_cTAZ * 10, hex_dest.unwrap());  }
+                        let can = !waiting_for_stake_to_finalizer && hex_dest.is_some();
+                        if button_ex(ui, "+0.01 cTAZ", can && (balance as u64) >= ONE_cTAZ / 100) { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ / 100, hex_dest.unwrap()); }
+                        if button_ex(ui,  "+0.1 cTAZ", can && (balance as u64) >= ONE_cTAZ / 10)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ / 10, hex_dest.unwrap());  }
+                        if button_ex(ui,    "+1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ, hex_dest.unwrap());       }
+                        if button_ex(ui,   "+10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10, hex_dest.unwrap());  }
                     }
                 }
                 Modal::Unstake => {
                     title_bar(ui, true, "Unstake", id("Unstake Title Bar"));
+
+                    fn display_str(chunks: &[u64; 4]) -> String {
+                        let mut bytes = {
+                            let mut out = [0u8; 32];
+                            let mut i = 0;
+                            for &chunk in chunks {
+                                let le = chunk.to_le_bytes(); // linear memory bytes for a LE u64
+                                out[i..i + 8].copy_from_slice(&le);
+                                i += 8;
+                            }
+                            out
+                        };
+
+                        let mut str = String::new();
+                        bytes.reverse();
+
+                        for b in &bytes[0..4] {
+                            str.push_str(&format!("{:02x}", b));
+                        }
+                        str.push_str("..");
+                        for b in &bytes[bytes.len() - 4..] {
+                            str.push_str(&format!("{:02x}", b));
+                        }
+
+                        str
+                    }
+
+                    let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
+                        let id = id(label);
+                        let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, false);
+                        if let _ = elem().decl(Decl {
+                            id,
+                            child_gap,
+                            align: Center,
+                            direction: TopToBottom,
+                            width: fit!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            let radius = ui.scale(24.0);
+
+                            // Button
+                            if let _ = elem().decl(Decl {
+                                colour,
+                                padding,
+                                child_gap,
+                                radius: radius.dup4(),
+                                align: Center,
+                                width:  fit!(ui.scale(192.0)),
+                                height: fit!(radius * 2.0),
+                                ..Decl
+                            }) {
+                                let h = ui.scale(20.0);
+                                ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
+                            }
+                        }
+
+                        clicked
+                    };
+
+                    let mut clickable_icon = |ui: &mut Context, id, icon, enabled | {
+                        let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, true);
+                        if let _ = elem().decl(Decl{
+                            id,
+                            child_gap,
+                            align: Center,
+                            direction: TopToBottom,
+                            width: fit!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+                        }
+
+                        clicked
+                    };
+
+
+                    let staked_roster = &wallet_state.lock().unwrap().staked_roster.clone();
+                    if staked_roster.len() == 0 {
+                        ui.unstake_scroll = 0.0;
+                    }
+
+                    let id = id("History Scroll Container");
+                    if ui.hovered(id) {
+                        ui.unstake_scroll -= ui.input().zoom_delta     as f32 * 32.0;
+                        ui.unstake_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
+                    }
+                    if ui.unstake_scroll < 0.0 {
+                        ui.unstake_scroll = 0.0;
+                    }
+                    let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
+                    if scroll_container_data.found {
+                        let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
+                        if ui.unstake_scroll > max {
+                            ui.unstake_scroll = max;
+                        }
+                    };
+                    if let _ = elem().decl(Decl {
+                        id,
+                        colour: TRANSACTION_HISTORY_CONTAINER_COL,
+                        child_gap: child_gap * 0.5, padding,
+                        radius: padding.0.dup4(),
+                        width:  percent!(1.0),
+                        height: grow!(),
+                        // height: percent!(1.0),
+                        direction: TopToBottom,
+                        clip: Scroll(0.0, -ui.unstake_scroll * ui.scale),
+                        align: Top,
+                        ..Decl
+                    }) {
+                        if staked_roster.len() == 0 {
+                            let h = ui.scale(24.0);
+                            if let _ = elem().decl(Decl {
+                                direction: TopToBottom,
+                                width:  percent!(1.0),
+                                height: percent!(1.0),
+                                child_gap,
+                                align:  Center,
+                                ..Decl
+                            }) {
+                                ui.text(ICON_EYE_OFF, TextDecl { font: Icons, colour: WHITE.mul(0.6), h: ui.scale(64.0), align: AlignX::Center, ..TextDecl });
+                                ui.text("There are no finalizers yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
+                            }
+                        }
+                        else {
+                            let kind_text_h = ui.scale(18.0);
+                            let transaction_text_h = ui.scale(16.0);
+
+                            for (index, member) in staked_roster.iter().enumerate() {
+                                if index > 0 { // separator
+                                    let colour = {
+                                        let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
+                                        col = col.hsva();
+                                        col.2 = col.2.mul(1.5).min(255);
+                                        col.rgba()
+                                    };
+
+                                    let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
+                                }
+                                if let _ = elem().decl(Decl{
+                                    id: id_index("Unstake Roster Member", index as u32),
+                                    padding,
+                                    child_gap,
+                                    height: fixed!(ui.scale(48.0)),
+                                    width: percent!(1.0),
+                                    direction: LeftToRight,
+                                    align: Center,
+                                    ..Decl
+                                }) {
+                                    // left icon
+                                    if let _ = elem().decl(Decl{
+                                        id: id_index("Unstake Roster Member Left Icon", index as u32),
+                                        height: fit!(),
+                                        width: fixed!(ui.scale(32.0)),
+                                        direction: TopToBottom,
+                                        align: Center,
+                                        ..Decl
+                                    }) {
+                                        if clickable_icon(ui, id_index("Copy Button", index as u32), ICON_UNLINK, true) {
+                                            let mut address_str = String::new();
+                                            for b in member.pub_key.iter().rev() {
+                                                address_str.push_str(&format!("{:02x}", b));
+                                            }
+                                            ui.input().send_to_clipboard(&address_str);
+                                        }
+                                    }
+
+                                    // info
+                                    if let _ = elem().decl(Decl{
+                                        id: id_index("Unstake Roster Member Info", index as u32),
+                                        height: fit!(),
+                                        width: grow!(),
+                                        direction: TopToBottom,
+                                        align: Left,
+                                        ..Decl
+                                    }) {
+                                        let bytes = member.pub_key;
+                                        let chunks = {
+                                            let mut chunks = [0u64; 4];
+                                            for i in 0..4 {
+                                                let start = i * 8;
+                                                let end = start + 8;
+                                                let mut buf = [0u8; 8];
+                                                buf.copy_from_slice(&bytes[start..end]);
+                                                chunks[i] = u64::from_le_bytes(buf);
+                                            }
+
+                                            chunks
+                                        };
+
+                                        ui.text(frame_strf!(data, "{}", display_str(&chunks)), TextDecl { font: Mono, h: ui.scale(14.0), align: AlignX::Left, ..TextDecl });
+                                    }
+
+                                    // right info
+                                    if let _ = elem().decl(Decl{
+                                        id: id_index("Unstake Roster Member Amounts", index as u32),
+                                        height: fit!(),
+                                        width: fit!(),
+                                        direction: TopToBottom,
+                                        align: Right,
+                                        ..Decl
+                                    }) {
+                                        let stake_amount: i64 = member.voting_power as i64;
+                                        let full = stake_amount / 100_000_000;
+                                        let part = stake_amount % 100_000_000;
+                                        let part_str = format!("{part}00");
+                                        let trim_part = part_str.trim_end_matches("0");
+                                        let colour = (0xff, 0xaf, 0x0e, 0xff);
+                                        ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { font: Mono, h: ui.scale(14.0), colour, align: AlignX::Right, ..TextDecl });
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1324,7 +1539,7 @@ pub fn ui_right_pane(ui: &mut Context,
         };
 
         let mut clickable_icon = |ui: &mut Context, id, icon, enabled | {
-            let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, true);
+            let (clicked, colour, _) = ui.button_ex(false, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, true);
             if let _ = elem().decl(Decl{
                 id,
                 child_gap,
@@ -1334,7 +1549,7 @@ pub fn ui_right_pane(ui: &mut Context,
                 height: fit!(),
                 ..Decl
             }) {
-                ui.text(ICON_DOCS_1, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+                ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
             }
 
             clicked
@@ -1442,15 +1657,9 @@ pub fn ui_right_pane(ui: &mut Context,
                             align: Center,
                             ..Decl
                         }) {
-                            if clickable_icon(ui, id_index("Copy Button", index as u32), ICON_DOC_INV /* @todo CLIPBOARD BUTTON */, true) {
-                                let mut address_str = String::new();
-                                for b in member.pub_key.iter().rev() {
-                                    address_str.push_str(&format!("{:02x}", b));
-                                }
-                                ui.input().send_to_clipboard(&address_str);
+                            if clickable_icon(ui, id_index("Copy Button", index as u32), ICON_DOCS_1, true) {
+                                wallet_state.lock().unwrap().unstake_from_finalizer([0u8; 32]); // @todo TXID
                             }
-
-                            // ui.text(ICON_DOC_INV, TextDecl { font: Icons, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
                         }
 
                         // info
@@ -1494,7 +1703,7 @@ pub fn ui_right_pane(ui: &mut Context,
                             let part_str = format!("{part}00");
                             let trim_part = part_str.trim_end_matches("0");
                             let colour = (0xff, 0xaf, 0x0e, 0xff);
-                            ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { font: Mono, h: ui.scale(18.0), colour, align: AlignX::Right, ..TextDecl });
+                            ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { font: Mono, h: ui.scale(16.0), colour, align: AlignX::Right, ..TextDecl });
                         }
                     }
                 }
@@ -1994,6 +2203,7 @@ pub struct Context {
 
     pub history_scroll:    f32,
     pub finalizers_scroll: f32,
+    pub unstake_scroll:    f32,
 
     pub tx_loading_animation_timer: f32,
 }
