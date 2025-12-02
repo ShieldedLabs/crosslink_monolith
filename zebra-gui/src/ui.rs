@@ -1008,10 +1008,10 @@ pub fn ui_left_pane(ui: &mut Context,
                 clicked
             };
 
-            if button(ui, ICON_UP_BIG, "Send") { ui.modal = Modal::Send;    }
-            if button(ui, ICON_QRCODE,   "Receive") { ui.modal = Modal::Receive; }
-            if button(ui, ICON_LINK_1,     "Stake") { ui.modal = Modal::Stake;   }
-            if button(ui, ICON_UNLINK,  "Unstake")  { ui.modal = Modal::Unstake; }
+            if button(ui, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
+            if button(ui, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
+            if button(ui, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
+            if button(ui, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
         }
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
@@ -1494,7 +1494,7 @@ pub fn ui_right_pane(ui: &mut Context,
                             let part_str = format!("{part}00");
                             let trim_part = part_str.trim_end_matches("0");
                             let colour = (0xff, 0xaf, 0x0e, 0xff);
-                            ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { h: ui.scale(18.0), colour, align: AlignX::Right, ..TextDecl });
+                            ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { font: Mono, h: ui.scale(18.0), colour, align: AlignX::Right, ..TextDecl });
                         }
                     }
                 }
