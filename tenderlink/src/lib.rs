@@ -176,7 +176,7 @@ impl std::fmt::Debug for ClosureToProposeNewBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToProposeNewBlock(..)") }
 }
 #[derive(Clone)]
-pub struct ClosureToValidateProposedBlock(pub Arc<dyn for<'a> Fn(&'a BlockValue)-> core::pin::Pin<Box<dyn Future<Output = TMStatus> + Send + 'a>> + Send + Sync + 'static>);
+pub struct ClosureToValidateProposedBlock(pub Arc<dyn for<'a> Fn(&'a BlockValue)-> core::pin::Pin<Box<dyn Future<Output = (TMStatus, TMStatusReason)> + Send + 'a>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToValidateProposedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToValidateProposedBlock(..)") }
 }
@@ -337,6 +337,14 @@ pub enum TMStatus {
     Fail, // f+1 no
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum TMStatusReason {
+    #[default] None,
+    NeedsBlock {
+        hash: [u8; 32]
+    },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ValueId([u8; 32]);
 impl ValueId { const NIL: Self = Self([0; 32]); }
@@ -372,7 +380,7 @@ struct RoundData {
     proposal_sigs: Vec<TMSig>,
     proposal_sigs_n: usize, // filling sigs with random-access
     proposal_id: ValueId,
-    proposal_checked_validity: TMStatus,
+    proposal_checked_validity: (TMStatus, TMStatusReason),
     // TODO: handle early outs because of this
     proposal_is_faulty: bool,
 
@@ -395,7 +403,7 @@ impl RoundData {
         proposal_sigs: Vec::new(),
         proposal_sigs_n: 0,
         proposal_id: ValueId::NIL,
-        proposal_checked_validity: TMStatus::Indeterminate,
+        proposal_checked_validity: (TMStatus::Indeterminate, TMStatusReason::None),
         proposal_is_faulty: false,
         // TODO: probably put both step messages next to each other
         msg_val_sigs: Vec::new(),
@@ -415,14 +423,14 @@ impl RoundData {
     // auto-caching
     async fn proposal_is_valid(&mut self, validate_closure: ClosureToValidateProposedBlock) -> TMStatus {
         // TODO: may want to start doing some of these on < proposal_chunks_n, i.e. shortcut known-invalid
-        if self.proposal_checked_validity == TMStatus::Indeterminate {
+        if self.proposal_checked_validity.0 == TMStatus::Indeterminate {
             if self.proposal_is_faulty {
-                self.proposal_checked_validity = TMStatus::Fail;
+                self.proposal_checked_validity = (TMStatus::Fail, TMStatusReason::None);
             } else if self.has_full_proposal() {
                 self.proposal_checked_validity = validate_closure.0(&self.proposal).await;
             }
         }
-        self.proposal_checked_validity
+        self.proposal_checked_validity.0
     }
 }
 
@@ -569,6 +577,8 @@ impl Default for HashKeys {
     }
 }
 
+use std::collections::HashSet;
+
 #[derive(Debug)]
 struct TMState {
     hash_keys: HashKeys,
@@ -597,6 +607,8 @@ struct TMState {
 
     roster_cmd: Option<String>,
     update_roster_cmd_closure: ClosureToUpdateRosterCmd,
+
+    blocks_needed: HashSet<[u8; 32]>,
 }
 impl TMState {
     fn init(
@@ -626,6 +638,8 @@ impl TMState {
             get_block_closure,
             roster_cmd: None,
             update_roster_cmd_closure,
+
+            blocks_needed: HashSet::new(),
         }
     }
 
@@ -1241,6 +1255,24 @@ impl TMState {
                     },
                 }
             }
+
+
+            // If this value would have been decided, but we can't validate it because we need its PoW block, let's mark this hash as required
+            if (self.height == self.rounds_data[i].height &&
+                self.rounds_data[i].has_full_proposal() && // has_enough_info_to_determine_validity &&
+                big_threshold <= counts.yes_precommits &&
+                self.rounds_data[i].proposal_checked_validity.0 == TMStatus::Indeterminate)
+            {
+                match self.rounds_data[i].proposal_checked_validity.1 {
+                    TMStatusReason::NeedsBlock { hash } => {
+                        println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash);
+                        self.blocks_needed.insert(hash);
+                        let len = self.blocks_needed.len();
+                        println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len);
+                    },
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -1531,10 +1563,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         })),
         ClosureToValidateProposedBlock(Arc::new(move |block| {
             Box::pin(async move {
-                if block.0.len() == 0 { TMStatus::Fail }
-                else if block.0[0] % 2 == 0 { TMStatus::Pass }
-                //else if block.0[0] % 3 == 1 { TMStatus::Indeterminate }
-                else { TMStatus::Fail }
+                if block.0.len() == 0 { (TMStatus::Fail, TMStatusReason::None) }
+                else if block.0[0] % 2 == 0 { (TMStatus::Pass, TMStatusReason::None) }
+                //else if block.0[0] % 3 == 1 { (TMStatus::Indeterminate, TMStatusReason::None) }
+                else { (TMStatus::Fail, TMStatusReason::None) }
             })
         })),
         ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer| {
