@@ -1191,12 +1191,13 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 let put = draw_ctx.draw_command_buffer.add(*draw_ctx.draw_command_count);
                                                 *draw_ctx.draw_command_count += 1;
                                                 assert!(*draw_ctx.draw_command_count <= DRAW_CALL_MAX);
-                                                *put = DrawCommand::ClearScreenToColor { color: 0x080808 };
+                                                *put = DrawCommand::ClearScreenToColor { color: 0x080808 /* @todo colors */};
                                             }
 
                                             gui_ctx.input = &input_ctx;
                                             gui_ctx.draw  = &draw_ctx;
                                             gui_ctx.dpi_scale = window.scale_factor() as f32;
+                                            gui_ctx.delta = dt as f32;
 
                                             viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut gui_ctx, &draw_ctx, dt as f32, &input_ctx);
 

@@ -23,9 +23,9 @@ pub fn magic<'a, 'b, T>(mut_ref: &'a mut T) -> &'b mut T {
 pub struct UiData {
     pub per_frame_strs: Vec<String>,
 
-    pub send_address: String,
+    pub send_address:  String,
     pub stake_address: String,
-    pub recv_address: String,
+    pub recv_address:  String,
 }
 
 
@@ -1101,14 +1101,31 @@ pub fn ui_left_pane(ui: &mut Context,
                                 align: Center,
                                 ..Decl
                             }) {
-                                let icon = match tx.1 {
-                                    wallet::WalletTxKind::Send    => ICON_UP_SMALL,
-                                    wallet::WalletTxKind::Receive => ICON_DOWN_SMALL,
-                                    wallet::WalletTxKind::Shield  => ICON_SHIELD,
-                                    wallet::WalletTxKind::Stake   => ICON_LINK_1,
-                                    wallet::WalletTxKind::Unstake => ICON_UNLINK,
+                                let icon = match (tx.1, tx.0.mined_height) {
+                                    (wallet::WalletTxKind::Send, Some(_))    => ICON_UP_SMALL,
+                                    (wallet::WalletTxKind::Receive, Some(_)) => ICON_DOWN_SMALL,
+                                    (wallet::WalletTxKind::Shield, Some(_))  => ICON_SHIELD,
+                                    (wallet::WalletTxKind::Stake, Some(_))   => ICON_LINK_1,
+                                    (wallet::WalletTxKind::Unstake, Some(_)) => ICON_UNLINK,
+                                    _ => {
+                                        let timer = (ui.tx_loading_animation_timer * 3.0) as u64;
+                                        if timer % 3 == 0 {
+                                            ICON_DOT
+                                        } else if timer % 3 == 1 {
+                                            ICON_DOT_2
+                                        } else {
+                                            ICON_DOT_3
+                                        }
+                                    }
                                 };
-                                ui.text(icon, TextDecl { font: Icons, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+
+                                let colour = if tx.0.mined_height.is_some() {
+                                    WHITE
+                                } else {
+                                    (0x60, 0x60, 0x60, 0xff) /* @todo colors */
+                                };
+
+                                ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
                             }
 
                             // info
@@ -1121,14 +1138,13 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 let label = match tx.1 {
-                                    wallet::WalletTxKind::Send    => "Sent",
-                                    wallet::WalletTxKind::Receive => "Received",
-                                    wallet::WalletTxKind::Shield  => "Shielded",
-                                    wallet::WalletTxKind::Stake   => "Staked",
-                                    wallet::WalletTxKind::Unstake => "Unstaked",
+                                    wallet::WalletTxKind::Send    => if tx.0.mined_height.is_some() { "Sent"     } else { "Sending"   },
+                                    wallet::WalletTxKind::Receive => if tx.0.mined_height.is_some() { "Received" } else { "Receiving" },
+                                    wallet::WalletTxKind::Shield  => if tx.0.mined_height.is_some() { "Shielded" } else { "Shielding" },
+                                    wallet::WalletTxKind::Stake   => if tx.0.mined_height.is_some() { "Staked"   } else { "Staking"   },
+                                    wallet::WalletTxKind::Unstake => if tx.0.mined_height.is_some() { "Unstaked" } else { "Unstaking" },
                                 };
 
-                                let txid = tx.0.txid.to_string();
                                 let label_str = if let Some(mined_height) = tx.0.mined_height {
                                     frame_strf!(data, "{} @ {}", label, mined_height)
                                 } else {
@@ -1140,6 +1156,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 // spacer
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
+                                let txid = tx.0.txid.to_string();
                                 ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { font: Mono, h: transaction_text_h, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, align: AlignX::Left, ..TextDecl });
 
                                 // spacer
@@ -1568,12 +1585,12 @@ pub fn ui_right_pane(ui: &mut Context,
                 if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(un)), right_text); }
             }
             if let _ = elem().decl(row) {
-                if let _ = elem().decl(left)  { ui.text("Shielded (Spendable):", left_text); }
-                if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_s)), right_text); }
-            }
-            if let _ = elem().decl(row) {
                 if let _ = elem().decl(left)  { ui.text("Shielded (Pending):", left_text); }
                 if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_p)), right_text); }
+            }
+            if let _ = elem().decl(row) {
+                if let _ = elem().decl(left)  { ui.text("Shielded (Spendable):", left_text); }
+                if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(sh_s)), right_text); }
             }
             // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
         };
@@ -1927,6 +1944,11 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
 }
 
 pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet_state: Arc<Mutex<wallet::WalletState>>) -> bool {
+    ui.tx_loading_animation_timer += ui.delta;
+    if ui.tx_loading_animation_timer >= 1.0 {
+        ui.tx_loading_animation_timer = 0.0;
+    }
+
     let dummy_input = InputCtx {
         this_mouse_pos: ui.input().this_mouse_pos,
         last_mouse_pos: ui.input().last_mouse_pos,
@@ -1960,6 +1982,7 @@ pub struct Context {
     pub scale:     f32,
     pub zoom:      f32,
     pub dpi_scale: f32,
+    pub delta:     f32,
 
     pub capture: bool,
 
@@ -1973,6 +1996,8 @@ pub struct Context {
 
     pub history_scroll:    f32,
     pub finalizers_scroll: f32,
+
+    pub tx_loading_animation_timer: f32,
 }
 
 #[derive(Debug, Default, Copy, Clone)]
