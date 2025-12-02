@@ -7,8 +7,8 @@ network_magic = [67, 108, 82, 110] # ClRn = Crosslink Regestnet
 checkpoint_sync = false
 
 [crosslink]
-listen_address = "127.0.0.1:28234"
-public_address = "127.0.0.1:28234"
+listen_address = "127.0.0.1:38234"
+public_address = "127.0.0.1:38234"
 do_not_manipulate_config = true
 malachite_peers = [
 	"127.0.0.1:28234",
@@ -40,20 +40,20 @@ initial_testnet_peers = [
 	"127.0.0.1:28233",
 	"127.0.0.1:38233",
 ]
-listen_addr = "[::]:28233"
+listen_addr = "[::]:38233"
 max_connections_per_ip = 100
-network = "Regtest"
+network = "Testnet"
 peerset_initial_target_size = 25
 
 [rpc]
-cookie_dir = "C:/Users/azmre/AppData/Local/zebra_regtestnet_1"
+cookie_dir = "C:/Users/azmre/AppData/Local/zebra_regtestnet_2"
 debug_force_finished_sync = false
 enable_cookie_auth = false
 parallel_cpu_threads = 0
-listen_addr = "127.0.0.1:28232"
+listen_addr = "127.0.0.1:38232"
 
 [state]
-cache_dir = "C:/Users/azmre/AppData/Local/zebra_regtestnet_1"
+cache_dir = "C:/Users/azmre/AppData/Local/zebra_regtestnet_2"
 delete_old_database = true
 ephemeral = false
 
