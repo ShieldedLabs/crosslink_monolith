@@ -2553,7 +2553,9 @@ const PACKET_TYPE_PREVOTE_SIGNATURES   : u8 =  8;
 const PACKET_TYPE_PRECOMMIT_SIGNATURES : u8 =  9;
 // misc
 const PACKET_TYPE_ROSTER_CMD           : u8 = 10;
-const PACKET_TYPE_COUNT                : u8 = 11;
+const PACKET_TYPE_POW_REQUEST          : u8 = 11;
+const PACKET_TYPE_POW_RESPONSE         : u8 = 12;
+const PACKET_TYPE_COUNT                : u8 = 13;
 
 
 const PACKET_TYPE_BITS                 : u8 =  7;
@@ -2568,18 +2570,20 @@ const PACKET_TAG_MASK                  : u8 = ((1 << PACKET_TAG_BITS as u64) - 1
 
 const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     let mut names = [["<MISSING>"; 2]; PACKET_TYPE_COUNT as usize];
-    names[PACKET_TYPE_EMPTY                as usize] = ["<EMPTY>",              "STATUS"];
-    names[PACKET_TYPE_CLIENT_HELLO         as usize] = ["CLIENT_HELLO",         "STATUS+CLIENT_HELLO"];
-    names[PACKET_TYPE_CLIENT_UNKNOWN_ACK   as usize] = ["CLIENT_UNKNOWN_ACK",   "STATUS+CLIENT_UNKNOWN_ACK"];
-    names[PACKET_TYPE_CLIENT_ACK           as usize] = ["CLIENT_ACK",           "STATUS+CLIENT_ACK"];
-    names[PACKET_TYPE_SERVER_UNKNOWN_HELLO as usize] = ["SERVER_UNKNOWN_HELLO", "STATUS+SERVER_UNKNOWN_HELLO"];
-    names[PACKET_TYPE_SERVER_HELLO         as usize] = ["SERVER_HELLO",         "STATUS+SERVER_HELLO"];
-    names[PACKET_TYPE_ENDPOINT_EVIDENCE    as usize] = ["ENDPOINT_EVIDENCE",    "STATUS+ENDPOINT_EVIDENCE"];
-    names[PACKET_TYPE_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",       "STATUS+PROPOSAL_CHUNK"];
-    names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",   "STATUS+PREVOTE_SIGNATURES"];
-    names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES", "STATUS+PRECOMMIT_SIGNATURES"];
-    names[PACKET_TYPE_ROSTER_CMD           as usize] = ["PREVOTE_SIGNATURES",   "STATUS+PREVOTE_SIGNATURES"];
-    const_assert!(PACKET_TYPE_COUNT == 11); // keep names array updated when adding other tags
+    names[PACKET_TYPE_EMPTY                as usize] = ["<EMPTY>",                  "STATUS"];
+    names[PACKET_TYPE_CLIENT_HELLO         as usize] = ["CLIENT_HELLO",             "STATUS+CLIENT_HELLO"];
+    names[PACKET_TYPE_CLIENT_UNKNOWN_ACK   as usize] = ["CLIENT_UNKNOWN_ACK",       "STATUS+CLIENT_UNKNOWN_ACK"];
+    names[PACKET_TYPE_CLIENT_ACK           as usize] = ["CLIENT_ACK",               "STATUS+CLIENT_ACK"];
+    names[PACKET_TYPE_SERVER_UNKNOWN_HELLO as usize] = ["SERVER_UNKNOWN_HELLO",     "STATUS+SERVER_UNKNOWN_HELLO"];
+    names[PACKET_TYPE_SERVER_HELLO         as usize] = ["SERVER_HELLO",             "STATUS+SERVER_HELLO"];
+    names[PACKET_TYPE_ENDPOINT_EVIDENCE    as usize] = ["ENDPOINT_EVIDENCE",        "STATUS+ENDPOINT_EVIDENCE"];
+    names[PACKET_TYPE_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",           "STATUS+PROPOSAL_CHUNK"];
+    names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
+    names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES",     "STATUS+PRECOMMIT_SIGNATURES"];
+    names[PACKET_TYPE_ROSTER_CMD           as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
+    names[PACKET_TYPE_POW_REQUEST          as usize] = ["PACKET_TYPE_POW_REQUEST",  "STATUS+PACKET_TYPE_POW_REQUEST"];
+    names[PACKET_TYPE_POW_RESPONSE         as usize] = ["PACKET_TYPE_POW_RESPONSE", "STATUS+PACKET_TYPE_POW_RESPONSE"];
+    const_assert!(PACKET_TYPE_COUNT == 13); // keep names array updated when adding other tags
     names
 };
 fn packet_name_from_tag(packet_tag: u8) -> &'static str {
