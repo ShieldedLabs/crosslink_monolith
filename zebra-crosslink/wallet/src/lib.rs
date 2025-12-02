@@ -180,11 +180,11 @@ pub type WalletRosterMember = RosterMember;
 
 #[derive(Default, Debug, Clone)]
 pub struct WalletState {
-    pub balance: i64, // in zats
+    pub balance:         i64, // in zats
     pub pending_balance: i64, // in zats
-    pub staked_balance: i64, // in zats
+    pub staked_balance:  i64, // in zats
 
-    pub txs: Vec<WalletTx>,
+    pub txs:    Vec<WalletTx>,
     pub roster: Vec<WalletRosterMember>,
 
     pub waiting_for_faucet: bool,
@@ -366,7 +366,7 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let mut pending: Vec<_> = results.iter().filter(|tx| tx.mined_height.is_none()).map(|tx| tx.clone()).collect();
         let mut mined:   Vec<_> = results.iter().filter(|tx| tx.mined_height.is_some()).map(|tx| tx.clone()).collect();
         pending.sort_by(| a, b | a.txid.cmp(&b.txid));
-        mined.sort_by(|a, b| a.mined_height.unwrap().cmp(&b.mined_height.unwrap()));
+        mined.sort_by(|a, b| b.mined_height.unwrap().cmp(&a.mined_height.unwrap()));
         pending.extend_from_slice(&mined);
 
         return Ok(pending);
@@ -1086,177 +1086,110 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             break;
                         }
                     };
+
                     println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len());
                     let Some(action) = wallet_state.actions_in_flight.front() else { break; };
                     action.clone()
                 };
-                let ok: bool = match action {
-                    WalletAction::RequestFromFaucet => if false {
-                        let Ok(miner_utxos) = client.get_address_utxos(GetAddressUtxosArg{
-                            addresses: [miner_t_address.encode(network).to_string()].to_vec(),
-                            start_height: 0,
-                            max_entries: 0,
-                        }).await else {
-                            println!("Miner had no UTXOs to use");
-                            break;
-                        };
 
-                        let miner_utxos = miner_utxos.into_inner().address_utxos;
-                        if miner_utxos.is_empty() {
-                            println!("Miner had no UTXOs to use");
-                            break;
-                        }
-
-                        let zats = (Zatoshis::from_nonnegative_i64(miner_utxos[0].value_zat).unwrap() - MINIMUM_FEE).unwrap();
-
-                        let mut signing_set = TransparentSigningSet::new();
-                        signing_set.add_key(miner_privkey);
-
-                        let prover = LocalTxProver::bundled();
-                        let extsk: &[ExtendedSpendingKey] = &[];
-                        let sak: &[SpendAuthorizingKey] = &[];
-
-                        let script = zcash_transparent::address::Script(zcash_script::script::Code(miner_utxos[0].script.clone()));
-
-                        let outpoint = OutPoint::new(miner_utxos[0].txid[..32].try_into().unwrap(), miner_utxos[0].index as u32);
-
-                        let Some(target_height) = miner_wallet.chain_height().expect("Failed to get chain height") else {
-                            println!("Failed to get miner's chain height");
-                            break;
-                        };
-
-                        let mut txb = TxBuilder::new(
-                            network,
-                            target_height + 1,
-                            BuildConfig::Standard {
-                                sapling_anchor: None,
-                                orchard_anchor: None,
-                            },
-                        );
-
-                        txb.add_transparent_input(miner_pubkey, outpoint, TxOut::new((zats + MINIMUM_FEE).unwrap(), script)).unwrap();
-                        txb.add_transparent_output(&user_t_address, zats).unwrap();
-
-                        use rand_chacha::ChaCha20Rng;
-                        let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
-                        let tx_res = txb.build(
-                            &signing_set,
-                            extsk,
-                            sak,
-                            rng,
-                            &prover,
-                            &prover,
-                            &zip317::FeeRule::standard(),
-                        ).unwrap();
-
-                        let tx = tx_res.transaction();
-                        let mut tx_bytes = vec![];
-                        tx.write(&mut tx_bytes).unwrap();
-
-                        match client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await {
-                            Ok(_) => {
-                                println!("Faucet transaction sent successfully");
+                let ok: bool = 'process_action: {
+                    match action {
+                        WalletAction::RequestFromFaucet => {
+                            // NOTE: we can't send transparent->transparent through the high-level API, we
+                            // have to propose_shielding first, then send in a later block
+                            let zats = (Zatoshis::from_nonnegative_i64(500_000_000).unwrap() - MINIMUM_FEE).unwrap();
+                            match send_zats_to_wallet(&mut client, &mut user_wallet, &mut miner_wallet, &miner_usk, zats, network, &TxOptions{
+                                memo: Some(zcash_protocol::memo::MemoBytes::from_bytes("Happy spending, with love from your favourite faucet".as_bytes()).unwrap()),
+                                ..TxOptions::default()
+                            }).await {
+                                None => {
+                                    wallet_state.lock().unwrap().waiting_for_faucet = false;
+                                    true
+                                }
+                                Some(_) => true,
                             }
-                            Err(err) => {
-                                println!("Failed to send faucet transaction: {}", err);
-                                wallet_state.lock().unwrap().waiting_for_faucet = false;
-                            },
                         }
-                        true
-                    } else {
-                        let t = Timer::scope("faucet send");
-                        // NOTE: we can't send transparent->transparent through the high-level API, we
-                        // have to propose_shielding first, then send in a later block
-                        let zats = (Zatoshis::from_nonnegative_i64(500_000_000).unwrap() - MINIMUM_FEE).unwrap();
-                        match send_zats_to_wallet(&mut client, &mut user_wallet, &mut miner_wallet, &miner_usk, zats, network, &TxOptions{
-                            memo: Some(zcash_protocol::memo::MemoBytes::from_bytes("Happy spending, with love from your favourite faucet".as_bytes()).unwrap()),
-                            ..TxOptions::default()
-                        }).await {
-                            None => {
-                                wallet_state.lock().unwrap().waiting_for_faucet = false;
-                                continue;
+
+                        WalletAction::StakeToMiner(amount, target_finalizer) => {
+                            let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
+                                println!("Failed to get wallet summary");
+                                break 'process_action false;
+                            };
+
+                            let mut spendable = 0;
+                            let balances = wallet_summary.account_balances();
+                            for (_, b) in balances {
+                                spendable += b.spendable_value().into_u64();
                             }
-                            Some(_) => true,
+
+                            // @todo(judah): better check?
+                            let amount_with_fee = (amount - MINIMUM_FEE).unwrap();
+                            if spendable < amount.into_u64() {
+                                println!("Not enough spendable zats to stake, will try again later...");
+                                break 'process_action false;
+                            }
+
+                            println!("********** STAKING ZEC {:?} ({:?}) TO THE MINER but also to {:?}", amount, amount_with_fee, target_finalizer);
+                            let opts = TxOptions {
+                                staking_action: Some(StakingAction {
+                                    kind: StakingActionKind::Add,
+                                    val: amount_with_fee.into_u64(),
+                                    target: target_finalizer,
+                                    source: [0_u8; 32],
+                                    insecure_target_name: "".to_owned(),
+                                    insecure_source_name: "".to_owned(),
+                                }),
+                                memo: Some(zcash_protocol::memo::MemoBytes::from_bytes(user_ua.encode(network).to_string().as_bytes()).unwrap()),
+                            };
+
+                            match send_zats_to_wallet(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network, &opts).await {
+                                None => {
+                                    println!("Failed to send ZEC to miner");
+                                    wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
+                                    false
+                                }
+                                Some(_) => {
+                                    true
+                                }
+                            }
                         }
+
+                        WalletAction::SendToAddress(address, amount) => {
+                            let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
+                                println!("Failed to get wallet summary");
+                                break 'process_action false;
+                            };
+
+                            let mut spendable = 0;
+                            let balances = wallet_summary.account_balances();
+                            for (_, b) in balances {
+                                spendable += b.spendable_value().into_u64();
+                            }
+
+                            // @todo(judah): better check?
+                            let amount_with_fee = (amount - MINIMUM_FEE).unwrap();
+                            if spendable < amount.into_u64() {
+                                println!("Not enough spendable zats to send!");
+                                break 'process_action false;
+                            }
+
+                            println!("*********** SEND ZEC {:?} ({:?}) TO {}", amount, amount_with_fee, &address.encode(network));
+                            match send_zats(&mut client, &address, &mut user_wallet, &user_usk, amount_with_fee, network, &TxOptions::default()).await {
+                                None => {
+                                    println!("Failed to send ZEC to {}", address.encode(network));
+                                    wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
+                                    false
+                                }
+                                Some(_) => {
+                                    true
+                                }
+                            }
+                        }
+
+                        _ => { true }
                     }
-
-                    WalletAction::StakeToMiner(amount, target_finalizer) => {
-                        let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
-                            println!("Failed to get wallet summary");
-                            break;
-                        };
-
-                        let mut spendable = 0;
-                        let balances = wallet_summary.account_balances();
-                        for (_, b) in balances {
-                            spendable += b.spendable_value().into_u64();
-                        }
-
-                        // @todo(judah): better check?
-                        let amount_with_fee = (amount - MINIMUM_FEE).unwrap();
-                        if spendable < amount.into_u64() {
-                            println!("Not enough spendable zats to stake, will try again later...");
-                            break;
-                        }
-
-                        println!("********** STAKING ZEC {:?} ({:?}) TO THE MINER but also to {:?}", amount, amount_with_fee, target_finalizer);
-                        let opts = TxOptions {
-                            staking_action: Some(StakingAction {
-                                kind: StakingActionKind::Add,
-                                val: amount_with_fee.into_u64(),
-                                target: target_finalizer,
-                                source: [0_u8; 32],
-                                insecure_target_name: "".to_owned(),
-                                insecure_source_name: "".to_owned(),
-                            }),
-                            memo: Some(zcash_protocol::memo::MemoBytes::from_bytes(user_ua.encode(network).to_string().as_bytes()).unwrap()),
-                        };
-                        match send_zats_to_wallet(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network, &opts).await {
-                            None => {
-                                println!("Failed to send ZEC to miner");
-                                wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
-                                break;
-                            }
-                            Some(_) => {
-                                true
-                            }
-                        }
-                    }
-
-                    WalletAction::SendToAddress(address, amount) => {
-                        let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
-                            println!("Failed to get wallet summary");
-                            break;
-                        };
-
-                        let mut spendable = 0;
-                        let balances = wallet_summary.account_balances();
-                        for (_, b) in balances {
-                            spendable += b.spendable_value().into_u64();
-                        }
-
-                        // @todo(judah): better check?
-                        let amount_with_fee = (amount - MINIMUM_FEE).unwrap();
-                        if spendable < amount.into_u64() {
-                            println!("Not enough spendable zats to send!");
-                            break;
-                        }
-
-                        println!("*********** SEND ZEC {:?} ({:?}) TO {}", amount, amount_with_fee, &address.encode(network));
-                        match send_zats(&mut client, &address, &mut user_wallet, &user_usk, amount_with_fee, network, &TxOptions::default()).await {
-                            None => {
-                                println!("Failed to send ZEC to {}", address.encode(network));
-                                wallet_state.lock().unwrap().waiting_for_stake_to_miner = false;
-                                break;
-                            }
-                            Some(_) => {
-                                true
-                            }
-                        }
-                    }
-
-                    _ => { true }
                 };
+
                 if ok {
                     wallet_state.lock().unwrap().actions_in_flight.pop_front();
                 }
