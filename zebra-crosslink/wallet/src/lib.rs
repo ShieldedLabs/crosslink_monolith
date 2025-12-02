@@ -1104,7 +1104,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                     wallet_state.lock().unwrap().waiting_for_faucet = false;
                                     true
                                 }
-                                Some(_) => true,
+                                Some(_) => {
+                                    wallet_state.lock().unwrap().waiting_for_faucet = false;
+                                    true
+                                },
                             }
                         }
 
