@@ -21,6 +21,7 @@ const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
 const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
+const PRINT_POWLINK:        bool = 1 == 1;
 
 
 // MTU discovery is an option, but for now we're adopting a very conservative and VPN-friendly fixed-value MTU.
@@ -346,7 +347,7 @@ pub enum TMStatusReason {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct ValueId([u8; 32]);
+struct ValueId(pub [u8; 32]);
 impl ValueId { const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
 impl std::fmt::Debug   for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "VId{", &self.0)?; write!(f, "}}") } }
@@ -358,7 +359,7 @@ impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<
 impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Pub{", &self.0[..2])?; write!(f, "}}") } }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct TMSig ([u8; 64]);
+struct TMSig(pub [u8; 64]);
 impl TMSig {
     const NIL: Self = Self([0; 64]);
     fn verify(&self, pub_key: PubKeyID, signed_data: &[u8]) -> Result<(), (ed25519_zebra::Error, &str)> {
@@ -608,7 +609,7 @@ struct TMState {
     roster_cmd: Option<String>,
     update_roster_cmd_closure: ClosureToUpdateRosterCmd,
 
-    blocks_needed: HashSet<[u8; 32]>,
+    powlink_hashes: HashSet<BlockHash>,
 }
 impl TMState {
     fn init(
@@ -639,7 +640,7 @@ impl TMState {
             roster_cmd: None,
             update_roster_cmd_closure,
 
-            blocks_needed: HashSet::new(),
+            powlink_hashes: HashSet::new(),
         }
     }
 
@@ -1265,10 +1266,10 @@ impl TMState {
             {
                 match self.rounds_data[i].proposal_checked_validity.1 {
                     TMStatusReason::NeedsBlock { hash } => {
-                        println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash);
-                        self.blocks_needed.insert(hash);
-                        let len = self.blocks_needed.len();
-                        println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len);
+                        self.powlink_hashes.insert(BlockHash(hash));
+                        let len = self.powlink_hashes.len();
+                        if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash); }
+                        if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
                     },
                     _ => {}
                 }
@@ -1689,7 +1690,16 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     round: bft_state.round,
                     need_proposal_chunk_rngs: [[0, 0]],
                     need_vote_rngs: [[[0, active_roster_len(roster) as u16]]; 2],
+                    powlink_hashes: [BlockHash::NIL; 4],
                 };
+                {
+                    let mut i = 0;
+                    for hash in &bft_state.powlink_hashes {
+                        if i >= 4 { break; }
+                        status.powlink_hashes[i] = *hash;
+                        i += 1;
+                    }
+                }
 
 
                 // TODO: scope down required ranges
@@ -2572,32 +2582,31 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 }
 
 // network
-const PACKET_TYPE_EMPTY                : u8 =  0;
-const PACKET_TYPE_CLIENT_HELLO         : u8 =  1;
-const PACKET_TYPE_CLIENT_UNKNOWN_ACK   : u8 =  2;
-const PACKET_TYPE_CLIENT_ACK           : u8 =  3;
-const PACKET_TYPE_SERVER_UNKNOWN_HELLO : u8 =  4;
-const PACKET_TYPE_SERVER_HELLO         : u8 =  5;
-const PACKET_TYPE_ENDPOINT_EVIDENCE    : u8 =  6;
+const PACKET_TYPE_EMPTY:                u8 =  0;
+const PACKET_TYPE_CLIENT_HELLO:         u8 =  1;
+const PACKET_TYPE_CLIENT_UNKNOWN_ACK:   u8 =  2;
+const PACKET_TYPE_CLIENT_ACK:           u8 =  3;
+const PACKET_TYPE_SERVER_UNKNOWN_HELLO: u8 =  4;
+const PACKET_TYPE_SERVER_HELLO:         u8 =  5;
+const PACKET_TYPE_ENDPOINT_EVIDENCE:    u8 =  6;
 // consensus
-const PACKET_TYPE_PROPOSAL_CHUNK       : u8 =  7;
-const PACKET_TYPE_PREVOTE_SIGNATURES   : u8 =  8;
-const PACKET_TYPE_PRECOMMIT_SIGNATURES : u8 =  9;
+const PACKET_TYPE_PROPOSAL_CHUNK:       u8 =  7;
+const PACKET_TYPE_PREVOTE_SIGNATURES:   u8 =  8;
+const PACKET_TYPE_PRECOMMIT_SIGNATURES: u8 =  9;
 // misc
-const PACKET_TYPE_ROSTER_CMD           : u8 = 10;
-const PACKET_TYPE_POW_REQUEST          : u8 = 11;
-const PACKET_TYPE_POW_RESPONSE         : u8 = 12;
-const PACKET_TYPE_COUNT                : u8 = 13;
+const PACKET_TYPE_ROSTER_CMD:           u8 = 10;
+const PACKET_TYPE_POWLINK:              u8 = 11;
+const PACKET_TYPE_COUNT:                u8 = 12;
 
 
-const PACKET_TYPE_BITS                 : u8 =  7;
-const PACKET_TYPE_MASK                 : u8 = (1 << PACKET_TYPE_BITS) - 1;
+const PACKET_TYPE_BITS:                 u8 =  7;
+const PACKET_TYPE_MASK:                 u8 = (1 << PACKET_TYPE_BITS) - 1;
 
-const PACKET_TAG_STATUS_SHIFT          : u8 = PACKET_TYPE_BITS;
-const PACKET_TAG_STATUS_FLAG           : u8 = 1 << PACKET_TAG_STATUS_SHIFT;
+const PACKET_TAG_STATUS_SHIFT:          u8 = PACKET_TYPE_BITS;
+const PACKET_TAG_STATUS_FLAG:           u8 = 1 << PACKET_TAG_STATUS_SHIFT;
 
-const PACKET_TAG_BITS                  : u8 = 8;
-const PACKET_TAG_MASK                  : u8 = ((1 << PACKET_TAG_BITS as u64) - 1) as u8;
+const PACKET_TAG_BITS:                  u8 = 8;
+const PACKET_TAG_MASK:                  u8 = ((1 << PACKET_TAG_BITS as u64) - 1) as u8;
 
 
 const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
@@ -2613,9 +2622,8 @@ const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES",     "STATUS+PRECOMMIT_SIGNATURES"];
     names[PACKET_TYPE_ROSTER_CMD           as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
-    names[PACKET_TYPE_POW_REQUEST          as usize] = ["PACKET_TYPE_POW_REQUEST",  "STATUS+PACKET_TYPE_POW_REQUEST"];
-    names[PACKET_TYPE_POW_RESPONSE         as usize] = ["PACKET_TYPE_POW_RESPONSE", "STATUS+PACKET_TYPE_POW_RESPONSE"];
-    const_assert!(PACKET_TYPE_COUNT == 13); // keep names array updated when adding other tags
+    names[PACKET_TYPE_POWLINK              as usize] = ["PACKET_TYPE_POWLINK",      "STATUS+PACKET_TYPE_POWLINK"];
+    const_assert!(PACKET_TYPE_COUNT == 12); // keep names array updated when adding other tags
     names
 };
 fn packet_name_from_tag(packet_tag: u8) -> &'static str {
@@ -2636,6 +2644,9 @@ fn print_packet_tag_recv(header: PacketHeader) {
 // N.B. with ranges like this, we either want to be half-exclusive & not allow type::MAX values, or use a special value for empty (e.g. hi < lo)
 type ProposalRng = [u32; 2]; // [lo, hi)
 type VoteRng     = [u16; 2];
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct BlockHash(pub [u8; 32]);
+impl BlockHash { const NIL: Self = Self([0; 32]); }
 const STATUS_PROPOSAL_RNGS_N: usize = 1;
 const STATUS_VOTE_RNGS_N: usize = 1; // ALT: split prevote/precommit numbers
 #[derive(Clone, Debug)]
@@ -2644,6 +2655,7 @@ struct PacketStatus {
     round:  u32, // as context for following request ranges
     need_proposal_chunk_rngs: [ProposalRng; STATUS_PROPOSAL_RNGS_N],
     need_vote_rngs: [[VoteRng; STATUS_VOTE_RNGS_N]; 2], // 1 for prevote, 1 for precommit
+    powlink_hashes: [BlockHash; 4], // blocks needed
 }
 impl PacketStatus {
     pub fn write_to(&self, buf: &mut[u8]) -> usize {
@@ -2660,6 +2672,9 @@ impl PacketStatus {
                 o += vote_rng[1].write_to(&mut buf[o..]);
             }
         }
+        for hash in &self.powlink_hashes {
+            o += hash.0.write_to(&mut buf[o..]);
+        }
         o
     }
 
@@ -2668,6 +2683,7 @@ impl PacketStatus {
             height: 0, round: 0,
             need_proposal_chunk_rngs: [[0;2]; STATUS_PROPOSAL_RNGS_N],
             need_vote_rngs: [[[0;2]; STATUS_VOTE_RNGS_N]; 2],
+            powlink_hashes: [BlockHash::NIL; 4]
         };
         packet.height = r.read_u64::<LittleEndian>()?;
         packet.round = r.read_u32::<LittleEndian>()?;
@@ -2680,6 +2696,9 @@ impl PacketStatus {
                 vote_rng[0] = r.read_u16::<LittleEndian>()?;
                 vote_rng[1] = r.read_u16::<LittleEndian>()?;
             }
+        }
+        for hash in &mut packet.powlink_hashes {
+            r.read_exact(&mut hash.0)?;
         }
         Ok(packet)
     }
