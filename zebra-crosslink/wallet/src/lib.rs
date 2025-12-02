@@ -147,7 +147,7 @@ pub enum WalletTxKind {
 pub struct WalletTx(pub TransactionSummary<AccountUuid>, pub WalletTxKind);
 
 impl WalletTx {
-    pub fn with_fake_data(kind: WalletTxKind, sent: u64, received: u64, shielding: bool, memo: &str) -> Self {
+    pub fn with_fake_data(kind: WalletTxKind, sent: u64, received: u64, shielding: bool, memo: &str, mined_height: u32) -> Self {
         let mut memo_as_bytes = [0u8; 512];
         &memo_as_bytes[0..memo.len()].copy_from_slice(memo.as_bytes());
 
@@ -156,7 +156,7 @@ impl WalletTx {
                 account_id: AccountUuid::default(),
                 txid: TxId::from_bytes([0; 32]),
                 expiry_height: None,
-                mined_height: Some(BlockHeight::from_u32(10)),
+                mined_height: if mined_height != 0 { Some(BlockHeight::from_u32(mined_height)) } else { None },
                 account_value_delta: ZatBalance::from_i64(-(sent as i64)).unwrap(),
                 total_spent: Zatoshis::from_u64(sent).unwrap(),
                 total_received: Zatoshis::from_u64(received).unwrap(),
@@ -343,7 +343,14 @@ pub fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        return Ok(results);
+        // lol
+        let mut pending: Vec<_> = results.iter().filter(|tx| tx.mined_height.is_none()).map(|tx| tx.clone()).collect();
+        let mut mined:   Vec<_> = results.iter().filter(|tx| tx.mined_height.is_some()).map(|tx| tx.clone()).collect();
+        pending.sort_by(| a, b | a.txid.cmp(&b.txid));
+        mined.sort_by(|a, b| a.mined_height.unwrap().cmp(&b.mined_height.unwrap()));
+        pending.extend_from_slice(&mined);
+
+        return Ok(pending);
     }
 
     async fn get_received_memos<P: zcash_protocol::consensus::Parameters>(client: &mut CompactTxStreamerClient<Channel>, wallet: &zcash_client_sqlite::WalletDb<rusqlite::Connection, P, SystemClock, OsRng>, params: P) -> Vec<(TxId, String)> {
