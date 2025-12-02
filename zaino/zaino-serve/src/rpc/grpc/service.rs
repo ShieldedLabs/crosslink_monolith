@@ -110,7 +110,7 @@ macro_rules! implement_client_methods {
                 'life: 'async_trait,
                 Self: 'async_trait,
             {
-                info!("[TEST] Received call of {}.", stringify!($method_name));
+                //info!("[TEST] Received call of {}.", stringify!($method_name));
                 Box::pin(async {
                     Ok(
                         // here we pass in pinbox, to optionally add
