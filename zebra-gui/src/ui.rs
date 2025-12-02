@@ -1008,12 +1008,10 @@ pub fn ui_left_pane(ui: &mut Context,
                 clicked
             };
 
-            if button(ui, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
-            // if button(ui, ICON_DATABASE, "Send")    { ui.modal = Modal::Send;    }
+            if button(ui, ICON_UP_BIG, "Send") { ui.modal = Modal::Send;    }
             if button(ui, ICON_QRCODE,   "Receive") { ui.modal = Modal::Receive; }
-            // if button(ui, ICON_PLUS,     "Stake")   { ui.modal = Modal::Stake;   }
-            if button(ui, ICON_DATABASE,     "Stake")   { ui.modal = Modal::Stake;   }
-            // if button(ui, ICON_MINUS_1,  "Unstake") { ui.modal = Modal::Unstake; }
+            if button(ui, ICON_LINK_1,     "Stake") { ui.modal = Modal::Stake;   }
+            if button(ui, ICON_UNLINK,  "Unstake")  { ui.modal = Modal::Unstake; }
         }
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
@@ -1336,7 +1334,7 @@ pub fn ui_right_pane(ui: &mut Context,
                 height: fit!(),
                 ..Decl
             }) {
-                ui.text(ICON_DOC_INV, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+                ui.text(ICON_DOCS_1, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
             }
 
             clicked
