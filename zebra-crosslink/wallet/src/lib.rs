@@ -88,6 +88,8 @@ use zcash_transparent::{
 };
 use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 
+const CHEAT_UNSTAKING: bool = true;
+
 pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
 pub static TENDERLINK_PUBLIC_KEY: Mutex<[u8; 32]> = Mutex::new([0_u8; 32]);
@@ -487,7 +489,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
     }
 
-    let send_zats = async | client: &mut CompactTxStreamerClient<_>, dst_ua: &UnifiedAddress, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params, opts: &TxOptions| -> Option<[u8;32]> {
+    let send_zats = async |client: &mut CompactTxStreamerClient<_>, dst_ua: &UnifiedAddress, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params, opts: &TxOptions| -> Option<[u8;32]> {
         let t = Timer::scope("send_zats");
 
         // @todo(judah): handle multiple accounts?
@@ -569,10 +571,61 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
     };
 
-    let send_zats_to_wallet = async | client: &mut CompactTxStreamerClient<_>, dst_wallet: &mut WalletDb<_, _, _, _>, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params, opts: &TxOptions| -> Option<[u8;32]> {
+    let send_zats_to_wallet = async |client: &mut CompactTxStreamerClient<_>, dst_wallet: &mut WalletDb<_, _, _, _>, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params, opts: &TxOptions| -> Option<[u8;32]> {
         match addrs_from_wallet(dst_wallet) {
             Some((_, dst_ua)) => send_zats(client, &dst_ua, src_wallet, src_usk, zats, params, opts).await,
             None => None,
+        }
+    };
+
+    let send_unstake_reward = async |client: &mut CompactTxStreamerClient<_>, roster: &[RosterMember], txid_map: &HashMap<TxId, (Option<StakingAction>, Vec<String>)>, txid: &TxId, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, params, thing: &mut Vec::<TxId>| -> Option<[u8;32]> {
+        let Some(staked_txid) = ('find_txid: {
+            for mem in roster {
+                for mem_txid in &mem.txids {
+                    if TxId::from_bytes(mem_txid.txid) == *txid {
+                        break 'find_txid Some(mem_txid.clone());
+                    }
+                }
+            }
+            None
+        }) else {
+            println!("*** Failed to find member with txid: {:?}", txid);
+            return None;
+        };
+
+        let Some((action, memos)) = txid_map.get(&txid) else {
+            println!("*** Failed to find miner staking transaction via txid {:?}", txid);
+            return None;
+        };
+
+        let Some(destination_address) = memos.iter().find(|memo| memo.starts_with("utest")) else {
+            println!("*** Failed to find destination address memo in txid {:?}", txid);
+            return None;
+        };
+
+        let destination_address = destination_address.trim_end_matches(|c| c == '\0');
+        let Ok(destination_ua) = UnifiedAddress::decode(params, destination_address) else {
+            println!("*** Failed to decode destination address {:?}", destination_address);
+            return None;
+        };
+
+        let options = TxOptions{
+            memo: Some(zcash_protocol::memo::MemoBytes::from_bytes("@UNSTAKE_RECEIVE:Thanks for staking!".as_bytes()).unwrap()),
+            ..Default::default()
+        };
+
+        match send_zats(client, &destination_ua, src_wallet, &src_usk, Zatoshis::from_u64(staked_txid.zats).unwrap(), params, &options).await {
+            None => {
+                println!("Failed to send reward to user");
+                None
+            }
+            Some(_) => {
+                println!("Successfully sent reward to user");
+                if CHEAT_UNSTAKING {
+                    thing.push(*txid);
+                }
+                Some(*txid.as_ref())
+            }
         }
     };
 
@@ -1391,54 +1444,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             }
                         };
 
-                        ok &= { // Miner sends reward back to user
-                            let Some(staked_txid) = ('find_txid: {
-                                for mem in &roster {
-                                    for mem_txid in &mem.txids {
-                                        if TxId::from_bytes(mem_txid.txid) == *txid {
-                                            break 'find_txid Some(mem_txid.clone());
-                                        }
-                                    }
-                                }
-                                None
-                            }) else {
-                                println!("*** Failed to find member with txid: {:?}", txid);
-                                break 'process_action false;
-                            };
-
-                            let Some((action, memos)) = miner_txid_map.get(&txid) else {
-                                println!("*** Failed to find miner staking transaction via txid {:?}", txid);
-                                break 'process_action false;
-                            };
-
-                            let Some(destination_address) = memos.iter().find(|memo| memo.starts_with("utest")) else {
-                                println!("*** Failed to find destination address memo in txid {:?}", txid);
-                                break 'process_action false;
-                            };
-
-                            let destination_address = destination_address.trim_end_matches(|c| c == '\0');
-                            let Ok(destination_ua) = UnifiedAddress::decode(network, destination_address) else {
-                                println!("*** Failed to decode destination address {:?}", destination_address);
-                                break 'process_action false;
-                            };
-
-                            let options = TxOptions{
-                                memo: Some(zcash_protocol::memo::MemoBytes::from_bytes("@UNSTAKE_RECEIVE:Thanks for staking!".as_bytes()).unwrap()),
-                                ..Default::default()
-                            };
-
-                            match send_zats(&mut client, &destination_ua, miner_wallet, &miner_usk, Zatoshis::from_u64(staked_txid.zats).unwrap(), network, &options).await {
-                                None => {
-                                    println!("Failed to send reward to user");
-                                    false
-                                }
-                                Some(_) => {
-                                    println!("Successfully sent reward to user");
-                                    stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly.push(*txid);
-                                    true
-                                }
-                            }
-                        };
+                        // Miner sends reward back to user
+                        if CHEAT_UNSTAKING {
+                            ok &= send_unstake_reward(&mut client, &roster, &miner_txid_map, txid, miner_wallet, &miner_usk, network, &mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly).await.is_some();
+                        }
 
                         ok
                     }
