@@ -1281,8 +1281,8 @@ impl TMState {
                             self.powlinks.insert(BlockHash(hash), Powlink::default());
 
                             let len = self.powlinks.len();
-                            if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash); }
-                            if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
+                            if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash); }
+                            if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
                         }
                     },
                     _ => {}
@@ -2637,9 +2637,15 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let chunk_src_data = &             msg[chunk_src_o..chunk_src_o + chunk_src_size];
                 let chunk_dst_data = &mut powlink.data[chunk_dst_o..chunk_dst_o + chunk_dst_size];
 
+                if PRINT_POWLINK { println!("{}: PowLink: Received chunk #{} ({} bytes) of block! Hash: {:?}", ctx_str, chunk_i, chunk_dst_size, hash); }
+
                 // Download!
                 chunk_src_data.write_to(chunk_dst_data);
                 powlink.chunk_i += 1;
+
+                if powlink.chunk_i as usize == chunks_n as usize {
+                    if PRINT_POWLINK { println!("{}: PowLink: Block {:?} is DONE! Contents: {:?}", ctx_str, hash, powlink.data); }
+                }
             } else {
                 eprintln!("{}: PowLink: Discarding unneeded block {:?}", ctx_str, hash);
                 continue;
