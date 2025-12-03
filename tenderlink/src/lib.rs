@@ -196,11 +196,16 @@ pub struct ClosureToGetPow(pub Arc<dyn Fn([u8; 32])-> core::pin::Pin<Box<dyn Fut
 impl std::fmt::Debug for ClosureToGetPow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToGetPow(..)") }
 }
-// #[derive(Clone)]
-// pub struct ClosureToPushPow(pub Arc<dyn Fn([u8; 32], )-> core::pin::Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>> + Send + Sync + 'static>); // @Phillip
-// impl std::fmt::Debug for ClosureToPushPow {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushPow(..)") }
-// }
+#[derive(Clone)]
+pub struct ClosureToParsePow(pub Arc<dyn Fn([u8; 32], Vec<u8>)-> core::pin::Pin<Box<dyn Future<Output =     Option<(Arc<zebra_chain::block::Block>, [u8; 32])>     > + Send>> + Send + Sync + 'static>); // @Phillip
+impl std::fmt::Debug for ClosureToParsePow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToParsePow(..)") }
+}
+#[derive(Clone)]
+pub struct ClosureToPushPow(pub Arc<dyn Fn(Arc<zebra_chain::block::Block>)-> core::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>); // @Phillip
+impl std::fmt::Debug for ClosureToPushPow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushPow(..)") }
+}
 #[derive(Clone)]
 pub struct ClosureToUpdateRosterCmd(pub Arc<dyn Fn(Option<String>)-> core::pin::Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToUpdateRosterCmd {
@@ -613,7 +618,10 @@ struct TMState {
     validate_closure: ClosureToValidateProposedBlock,
     push_block_closure: ClosureToPushDecidedBlock,
     get_block_closure: ClosureToGetHistoricalBlock,
+
     get_pow_closure: ClosureToGetPow,
+    parse_pow_closure: ClosureToParsePow,
+    push_pow_closure: ClosureToPushPow,
 
     roster_cmd: Option<String>,
     update_roster_cmd_closure: ClosureToUpdateRosterCmd,
@@ -628,6 +636,8 @@ impl TMState {
         push_block_closure: ClosureToPushDecidedBlock,
         get_block_closure: ClosureToGetHistoricalBlock,
         get_pow_closure: ClosureToGetPow,
+        parse_pow_closure: ClosureToParsePow,
+        push_pow_closure: ClosureToPushPow,
         update_roster_cmd_closure: ClosureToUpdateRosterCmd) -> Self {
         Self {
             hash_keys: HashKeys::default(),
@@ -648,6 +658,8 @@ impl TMState {
             push_block_closure,
             get_block_closure,
             get_pow_closure,
+            parse_pow_closure,
+            push_pow_closure,
             roster_cmd: None,
             update_roster_cmd_closure,
 
@@ -1608,16 +1620,16 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 None
             })
         })),
-        // ClosureToParsePow(Arc::new(move |hash| { // @Phillip
-        //     Box::pin(async move {
-        //         None
-        //     })
-        // })),
-        // ClosureToPushPow(Arc::new(move |hash, bytes| { // @Phillip
-        //     Box::pin(async move {
-        //         None
-        //     })
-        // })),
+        ClosureToParsePow(Arc::new(move |hash, bytes| { // @Phillip
+            Box::pin(async move {
+                None
+            })
+        })),
+        ClosureToPushPow(Arc::new(move |block| { // @Phillip
+            Box::pin(async move {
+                false
+            })
+        })),
         ClosureToUpdateRosterCmd(Arc::new(move |_str| { Box::pin(async move {
             Some(format!("{:?}", pub_key))
         })})),
@@ -1635,6 +1647,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          push_block_closure: ClosureToPushDecidedBlock,
                          get_block_closure: ClosureToGetHistoricalBlock,
                          get_pow_closure: ClosureToGetPow,
+                         parse_pow_closure: ClosureToParsePow,
+                         push_pow_closure: ClosureToPushPow,
                          roster_cmd_closure: ClosureToUpdateRosterCmd,
                         ) -> std::io::Result<()> {
     hook_fail_on_panic();
@@ -1681,7 +1695,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>()); }
 
     // TODO: only convert private to public in 1 location
-    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_bft_key.into()), my_port, propose_closure, validate_closure, push_block_closure, get_block_closure, get_pow_closure, roster_cmd_closure); // TODO: double-check this is the right key
+    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_bft_key.into()), my_port, propose_closure, validate_closure, push_block_closure, get_block_closure, get_pow_closure, parse_pow_closure, push_pow_closure, roster_cmd_closure); // TODO: double-check this is the right key
     bft_state.start_round(&roster, Instant::now(), 0).await;
 
     let mut my_endpoint_evidence = if let Some(i) = roster_endpoint_evidence.iter().position(|e| &e.root_public_bft_key == my_root_public_bft_key.as_ref()) {
@@ -1736,8 +1750,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     powlink_hash: BlockHash::NIL,
                     powlink_chunk_i: 0,
                 };
-                for item in &bft_state.powlinks {
-                    let (hash, powlink) = item;
+                for (hash, powlink) in &bft_state.powlinks {
                     status.powlink_hash = *hash;
                     status.powlink_chunk_i = powlink.chunk_i;
                     break;
@@ -2255,6 +2268,46 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     }
                 }
 
+                // POWLINK UPDATE
+                let mut keys_to_remove = Vec::new();
+                let mut keys_to_insert = Vec::new();
+
+                for (hash, powlink) in &mut bft_state.powlinks {
+                    if let Some(block) = powlink.block.clone() {
+                        let successfully_pushed = bft_state.push_pow_closure.0(block).await;
+                        if successfully_pushed {
+                            keys_to_remove.push(*hash);
+                        }
+                    } else {
+                        if powlink.chunk_i as usize != powlink_chunks_n(powlink.data.len()) {
+                            continue;
+                        }
+
+                        if PRINT_POWLINK { println!("{}: PowLink: Block {:?} is DONE! Contents: {:?}", ctx_str, hash, powlink.data); }
+
+                        let bytes = &powlink.data;
+                        if let Some((block, hash)) = bft_state.parse_pow_closure.0(hash.0, bytes.clone()).await {
+                            powlink.block = Some(block.clone());
+
+                            keys_to_insert.push(hash);
+                        }
+                    }
+                }
+
+                for hash in &keys_to_insert {
+                    if !bft_state.powlinks.contains_key(&BlockHash(*hash)) {
+                        bft_state.powlinks.insert(BlockHash(*hash), Powlink::default());
+
+                        let len = bft_state.powlinks.len();
+                        if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash); }
+                        if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
+                    }
+                }
+
+                for key in &keys_to_remove {
+                    bft_state.powlinks.remove(key);
+                }
+
                 break;
             }
 
@@ -2637,15 +2690,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let chunk_src_data = &             msg[chunk_src_o..chunk_src_o + chunk_src_size];
                 let chunk_dst_data = &mut powlink.data[chunk_dst_o..chunk_dst_o + chunk_dst_size];
 
-                if PRINT_POWLINK { println!("{}: PowLink: Received chunk #{} ({} bytes) of block! Hash: {:?}", ctx_str, chunk_i, chunk_dst_size, hash); }
+                // if PRINT_POWLINK { println!("{}: PowLink: Received chunk #{} ({} bytes) of block! Hash: {:?}", ctx_str, chunk_i, chunk_dst_size, hash); }
 
                 // Download!
                 chunk_src_data.write_to(chunk_dst_data);
                 powlink.chunk_i += 1;
-
-                if powlink.chunk_i as usize == chunks_n as usize {
-                    if PRINT_POWLINK { println!("{}: PowLink: Block {:?} is DONE! Contents: {:?}", ctx_str, hash, powlink.data); }
-                }
             } else {
                 eprintln!("{}: PowLink: Discarding unneeded block {:?}", ctx_str, hash);
                 continue;

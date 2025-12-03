@@ -25,4 +25,4 @@ REM start "" "C:\Work\ShieldedLabs\crosslink_monolith\zebra-crosslink\target\rel
 
 popd
 
-exit /b 1
+REM exit /b 1
