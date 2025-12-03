@@ -971,7 +971,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     };
 
 
-                    let mut staked_roster = &mut wallet_state.lock().unwrap().staked_roster;
+                    let staked_roster = wallet_state.lock().unwrap().staked_roster.clone();
                     if staked_roster.len() == 0 {
                         ui.unstake_scroll = 0.0;
                     }
@@ -1022,7 +1022,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             let kind_text_h = ui.scale(18.0);
                             let transaction_text_h = ui.scale(16.0);
 
-                            for (index, member) in &mut staked_roster.iter_mut().enumerate() {
+                            for (index, member) in staked_roster.iter().enumerate() {
                                 if index > 0 { // separator
                                     let colour = {
                                         let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
@@ -1052,12 +1052,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                         align: Center,
                                         ..Decl
                                     }) {
-                                        if clickable_icon(ui, id_index("Copy Button", index as u32), ICON_LINK_1, ICON_UNLINK, true) {
-                                            let mut address_str = String::new();
-                                            for b in member.pub_key.iter().rev() {
-                                                address_str.push_str(&format!("{:02x}", b));
-                                            }
-                                            ui.input().send_to_clipboard(&address_str);
+                                        if clickable_icon(ui, id_index("Unstake Button", index as u32), ICON_LINK_1, ICON_UNLINK, true) {
+                                            wallet_state.lock().unwrap().unstake_from_finalizer(member.1);
                                         }
                                     }
 
@@ -1070,7 +1066,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                         align: Left,
                                         ..Decl
                                     }) {
-                                        let bytes = member.pub_key;
+                                        let bytes = member.0;
                                         let chunks = {
                                             let mut chunks = [0u64; 4];
                                             for i in 0..4 {
@@ -1096,24 +1092,24 @@ pub fn ui_left_pane(ui: &mut Context,
                                         align: Right,
                                         ..Decl
                                     }) {
-                                        let stake_amount: i64 = member.voting_power as i64;
+                                        let stake_amount: i64 = member.3 as i64;
                                         let full = stake_amount / 100_000_000;
                                         let part = stake_amount % 100_000_000;
                                         let part_str = format!("{part}00");
                                         let trim_part = part_str.trim_end_matches("0");
 
                                         let id = id_index("Unstake Clickable Text", index as u32);
-
                                         let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
                                         let mut str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
-                                        if member.show_initial_stake_amount {
-                                            colour = WHITE;
-                                            str = frame_strf!(data, "0.0 cTAZ"); // @todo initial stake
-                                        }
+                                        if ui.hovered(id) {
+                                            let stake_amount: i64 = member.2 as i64;
+                                            let full = stake_amount / 100_000_000;
+                                            let part = stake_amount % 100_000_000;
+                                            let part_str = format!("{part}00");
+                                            let trim_part = part_str.trim_end_matches("0");
 
-                                        let (clicked, colour, _) = ui.button_ex(true, colour, id, true, true);
-                                        if clicked {
-                                            member.show_initial_stake_amount = !member.show_initial_stake_amount;
+                                            colour = WHITE;
+                                            str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
                                         }
 
                                         if let _ = elem().decl(Decl{
@@ -1404,8 +1400,14 @@ pub fn ui_left_pane(ui: &mut Context,
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
                                 if let Ok(memo_str) = String::from_utf8(tx.0.memo.as_slice().to_vec()) {
-                                    let memo_str = memo_str.trim_end_matches(|c| c == '\0').to_string();
+                                    let mut memo_str = memo_str.chars().filter(|c| c.is_ascii()).collect::<String>().trim_end_matches(|c| c == '\0').to_string();
                                     if memo_str.len() != 0 {
+                                        if memo_str.starts_with("@") {
+                                            if let Some(end) = memo_str.find(":") {
+                                                memo_str = memo_str[end + 1..].to_string();
+                                            }
+                                        }
+
                                         ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
                                     }
                                 }
@@ -1423,14 +1425,15 @@ pub fn ui_left_pane(ui: &mut Context,
                                 // @todo colors
                                 let color = match tx.1 {
                                     wallet::WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
-                                    wallet::WalletTxKind::Receive => (0x5a, 0xb5, 0x52, 0xff),
+                                    wallet::WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
+                                    wallet::WalletTxKind::Receive | wallet::WalletTxKind::Unstake => (0x5a, 0xb5, 0x52, 0xff),
                                     wallet::WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
                                     _ => WHITE,
                                 };
 
                                 match tx.1 {
-                                    wallet::WalletTxKind::Send => {
-                                        let send_amount: i64 = tx.0.account_value_delta.into();
+                                    wallet::WalletTxKind::Send | wallet::WalletTxKind::Stake => {
+                                        let send_amount: i64 = tx.0.total_spent.into();
                                         let send_amount: u64 = send_amount.abs() as u64;
                                         let full = send_amount / 100_000_000;
                                         let part = send_amount % 100_000_000;
@@ -1439,9 +1442,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                             part_str = part_str[..3].to_string();
                                         }
 
-                                        ui.text(frame_strf!(data, "-{}.{} cTAZ", full, part_str), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        let prefix = if tx.1 == wallet::WalletTxKind::Send { "-" } else { "" };
+                                        ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, part_str), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
-                                    wallet::WalletTxKind::Receive => {
+                                    wallet::WalletTxKind::Receive | wallet::WalletTxKind::Unstake => {
                                         ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.0.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
                                     wallet::WalletTxKind::Shield => {
@@ -1458,11 +1462,6 @@ pub fn ui_left_pane(ui: &mut Context,
                                     },
                                 }
                             }
-
-                            // manually split id text
-                            // let string = format!("{:?} {:?}", tx.0.txid, tx.1);
-                            // ui.text(frame_strf!(data, "{} {}", &string[..string.len()/2], &string[string.len()/2..]), TextDecl { h: transaction_text_h, align: AlignX::Right, ..TextDecl });
-                            // ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(tx.0.total_received.into())), TextDecl { h: transaction_text_h, align: AlignX::Right, ..TextDecl });
                         }
                     }
                 }
@@ -1684,7 +1683,11 @@ pub fn ui_right_pane(ui: &mut Context,
                             ..Decl
                         }) {
                             if clickable_icon(ui, id_index("Copy Button", index as u32), ICON_DOCS_1, true) {
-                                wallet_state.lock().unwrap().unstake_from_finalizer([0u8; 32]); // @todo TXID
+                                let mut address_str = String::new();
+                                for b in member.pub_key.iter().rev() {
+                                    address_str.push_str(&format!("{:02x}", b));
+                                }
+                                ui.input().send_to_clipboard(&address_str);
                             }
                         }
 
