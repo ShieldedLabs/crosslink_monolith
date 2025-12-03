@@ -713,23 +713,25 @@ async fn new_decided_bft_block_from_malachite(
 
                     let finalizers = &mut internal.validators_at_current_height;
                     let mut total_voting_power = 0;
-                    let mut max_power_finalizer_i: Option<usize> = None;
+                    let mut max_power_idxs: Option<(usize, usize)> = None;
 
-                    // determine total_voting_power & max_power_finalizer_i
+                    // determine total_voting_power & max_power_idxs
                     for finalizer_i in 0..finalizers.len() {
                         let finalizer = &finalizers[finalizer_i];
                         if finalizer.voting_power == 0 {
                             continue;
                         }
 
-                        if max_power_finalizer_i.is_none()
-                            || finalizers[max_power_finalizer_i.unwrap()].voting_power
-                                < finalizer.voting_power
-                        {
-                            max_power_finalizer_i = Some(finalizer_i);
-                        }
+                        for txid_i in 0..finalizer.txids.len() {
+                            if max_power_idxs.is_none()
+                                || finalizers[max_power_idxs.unwrap().0].txids[max_power_idxs.unwrap().1].zats
+                                    < finalizer.voting_power
+                            {
+                                max_power_idxs = Some((finalizer_i, txid_i));
+                            }
 
-                        total_voting_power += finalizer.voting_power;
+                            total_voting_power += finalizer.txids[txid_i].zats;
+                        }
                     }
 
                     // Give share of block reward to all finalizers based on their stake
@@ -739,30 +741,34 @@ async fn new_decided_bft_block_from_malachite(
                     let mut sum_reward = 0_u64;
                     for finalizer_i in 0..finalizers.len() {
                         let finalizer = &mut finalizers[finalizer_i];
-                        if finalizer.voting_power == 0
-                            || finalizer_i
-                                == max_power_finalizer_i
-                                    .expect("there must be a max finalizer if at least 1 is non-0")
-                        {
+                        if finalizer.voting_power == 0 {
                             continue;
                         }
 
-                        // NOTE: total_voting_power must be non-0 if we have any non-0 roster
-                        // members
-                        // TODO: most numerically stable version of this that won't overflow
-                        let mul: u128 =
-                            (finalizer.voting_power as u128) * (pos_total_reward as u128);
-                        let reward = (mul / (total_voting_power as u128)) as u64;
-                        sum_reward += reward;
-                        finalizer.voting_power += reward;
+                        for txid_i in 0..finalizer.txids.len() {
+                            if (finalizer_i, txid_i) == max_power_idxs.expect("there must be a max finalizer if at least 1 is non-0") {
+                                continue;
+                            }
+
+                            // NOTE: total_voting_power must be non-0 if we have any non-0 roster
+                            // members
+                            // TODO: most numerically stable version of this that won't overflow
+                            let mul: u128 =
+                                (finalizer.txids[txid_i].zats as u128) * (pos_total_reward as u128);
+                            let reward = (mul / (total_voting_power as u128)) as u64;
+                            sum_reward += reward;
+
+                            finalizer.voting_power += reward;
+                            finalizer.txids[txid_i].zats += reward;
+                        }
                     }
 
                     // Give remaining block reward (including any accumulated rounding errors)
                     // to max staker
-                    if let Some(finalizer_i) = max_power_finalizer_i {
+                    if let Some((finalizer_i, txid_i)) = max_power_idxs {
                         let finalizer = &mut finalizers[finalizer_i];
                         let mul: u128 =
-                            (finalizer.voting_power as u128) * (pos_total_reward as u128);
+                            (finalizer.txids[txid_i].zats as u128) * (pos_total_reward as u128);
                         let reward = (mul / (total_voting_power as u128)) as u64;
                         let rem_reward = pos_total_reward - sum_reward;
                         assert!(reward <= rem_reward,
@@ -771,11 +777,12 @@ async fn new_decided_bft_block_from_malachite(
                             reward, rem_reward);
 
                         if reward != rem_reward {
-                            info!("Max finalizer given rounding error: expected {}, got {}, bonus: {}",
+                            info!("Max finalizer/txid given rounding error: expected {}, got {}, bonus: {}",
                                 reward, rem_reward, rem_reward - reward);
                         }
 
                         finalizer.voting_power += rem_reward;
+                        finalizer.txids[txid_i].zats += rem_reward;
                     }
                 }
 
@@ -1074,32 +1081,42 @@ fn update_roster_for_cmd(
 
     let mut zats = action.val;
     if let Some((sub_key, sub_name)) = sub_key_name {
-        error!("subtraction currently non-functional")
-        // let sub_key = MalPublicKey2(sub_key.into());
-        // let Some(member) = roster.iter_mut().find(|cmp| cmp.public_key == sub_key.0) else {
-        //     warn!(
-        //         "Roster command invalid: can't subtract from non-present finalizer \"{}\"",
-        //         sub_name
-        //     );
-        //     return 0;
-        // };
+        // error!("subtraction currently non-functional")
+        let sub_key = MalPublicKey2(sub_key.into());
+        let Some(member) = roster.iter_mut().find(|cmp| cmp.public_key == sub_key.0) else {
+            warn!(
+                "Roster command invalid: can't subtract from non-present finalizer \"{}\"",
+                sub_key
+            );
+            return 0;
+        };
 
-        // if member.voting_power < action.val {
-        //     if is_clear {
-        //         warn!("Roster command invalid: can't clear the finalizer to a higher current value \"{}\"/{}: {} => {}",
-        //             sub_name, sub_key, member.voting_power, action.val);
-        //     } else {
-        //         warn!("Roster command invalid: can't subtract more from the finalizer than their current value \"{}\"/{}: {} - {}",
-        //             sub_name, sub_key, member.voting_power, action.val);
-        //     }
-        //     return 0;
-        // }
+        let ref_txid = action.source;
+        let Some(stake_txid) = member.txids.iter().find(|cmp| cmp.txid == ref_txid) else {
+            warn!(
+                "Roster command invalid: can't unstake non-present TXID \"{}\"",
+                MalPublicKey2(ref_txid.into())
+            );
+            return 0;
+        };
+
+        if stake_txid.zats != action.val {
+            if is_clear {
+                // warn!("Roster command invalid: can't clear the finalizer to a higher current value \"{}\"/{}: {} => {}",
+                //     sub_name, sub_key, member.voting_power, action.val);
+                return 0;
+            } else {
+                warn!("Roster warning: removing staking TXID {} from {} with unexpected value {}; expected {}",
+                    MalPublicKey2(ref_txid.into()), sub_key, stake_txid.zats, action.val);
+            }
+        }
 
         // if is_clear {
         //     zats = member.voting_power - action.val
         // };
 
-        // member.voting_power -= zats;
+        member.voting_power -= stake_txid.zats;
+        member.txids.retain(|cmp| cmp.txid != ref_txid);
     }
 
     if has_add {
@@ -1107,7 +1124,7 @@ fn update_roster_for_cmd(
         let add_key = MalPublicKey2(action.target.into());
         let stake = StakeTxId{ txid, zats };
         let member = if let Some(mut member) = roster.iter_mut().find(|cmp| cmp.public_key == add_key.0) {
-            member.txids.push(stake)
+            member.push_txid(stake);
         } else {
             roster.push(MalValidator::new(add_key.0, vec![stake]));
         };
@@ -1901,7 +1918,7 @@ impl MalValidator {
         }
     }
 
-    pub fn push(&mut self, txid: StakeTxId) {
+    pub fn push_txid(&mut self, txid: StakeTxId) {
         if self.txids.iter().find(|cmp| cmp.txid == txid.txid).is_some() {
             return;
         }
