@@ -28,24 +28,24 @@ fn main() {
     let mut emitter = Emitter::default();
     add_base_emitter_instructions(&mut emitter);
 
-    let all_git = Git2Builder::default()
-        .branch(true)
-        .commit_author_email(true)
-        .commit_author_name(true)
-        .commit_count(true)
-        .commit_date(true)
-        .commit_message(true)
-        .commit_timestamp(true)
-        .describe(false, false, None)
-        .sha(true)
-        .dirty(false)
-        .describe(true, true, Some("v*.*.*"))
-        .build()
-        .expect("all_git + describe + sha should build successfully");
+    // let all_git = Git2Builder::default()
+    //     .branch(true)
+    //     .commit_author_email(true)
+    //     .commit_author_name(true)
+    //     .commit_count(true)
+    //     .commit_date(true)
+    //     .commit_message(true)
+    //     .commit_timestamp(true)
+    //     .describe(false, false, None)
+    //     .sha(true)
+    //     .dirty(false)
+    //     .describe(true, true, Some("v*.*.*"))
+    //     .build()
+    //     .expect("all_git + describe + sha should build successfully");
 
-    emitter
-        .add_instructions(&all_git)
-        .expect("adding all_git + describe + sha instructions should succeed");
+    // emitter
+    //     .add_instructions(&all_git)
+    //     .expect("adding all_git + describe + sha instructions should succeed");
 
     // Disable git if we're building with an invalid `zebra/.git`
     match emitter.fail_on_error().emit() {
