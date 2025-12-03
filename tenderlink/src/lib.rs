@@ -1277,10 +1277,13 @@ impl TMState {
             {
                 match self.rounds_data[i].proposal_checked_validity.1 {
                     TMStatusReason::NeedsBlock { hash } => {
-                        self.powlinks.insert(BlockHash(hash), Powlink::default());
-                        let len = self.powlinks.len();
-                        if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash); }
-                        if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
+                        if !self.powlinks.contains_key(&BlockHash(hash)) {
+                            self.powlinks.insert(BlockHash(hash), Powlink::default());
+
+                            let len = self.powlinks.len();
+                            if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash); }
+                            if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
+                        }
                     },
                     _ => {}
                 }
