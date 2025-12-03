@@ -641,7 +641,7 @@ impl StartCmd {
                     },
                     database: zaino_common::DatabaseConfig {
                         path: std::path::PathBuf::from(tmp_dir.path()),
-                        size: zaino_common::DatabaseSize::Gb(16),
+                        size: zaino_common::DatabaseSize::Gb(4),
                     },
                 },
                 zebra_db_path: std::path::PathBuf::from(&config.state.cache_dir),
