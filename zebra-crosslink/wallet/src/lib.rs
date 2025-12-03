@@ -782,36 +782,46 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
-        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
         // Sync wallet DBs
-        for (wallet, t_address) in [(miner_wallet, miner_t_address), (user_wallet, user_t_address)] {
-            // TODO: outside loop?
-            if 'needs_to_sync: /* what a funny language */ {
-                if let Ok(chain_height) = wallet.chain_height() {
-                    if let Some(chain_height) = chain_height {
-                        network_tip_height != u64::from(chain_height)
+        for (wallets, t_address, idxs) in [
+            (&mut miner_wallets, miner_t_address, [miner_use_i, miner_update_i]),
+            (&mut user_wallets, user_t_address, [user_use_i, user_update_i]),
+        ] {
+            for i_i in 0..idxs.len() {
+                let i = idxs[i_i];
+                if i_i == 1 && idxs[0] == i {
+                    // don't dup work
+                    break;
+                }
+                let wallet = &mut wallets[i];
+
+                if 'needs_to_sync: /* what a funny language */ {
+                    if let Ok(chain_height) = wallet.chain_height() {
+                        if let Some(chain_height) = chain_height {
+                            network_tip_height != u64::from(chain_height)
+                        } else {
+                            network_tip_height > 1
+                        }
                     } else {
-                        network_tip_height > 1
+                        true
                     }
-                } else {
-                    true
                 }
-            }
-            {
-                const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u32 = 64;
-                if let Err(err) = zcash_client_backend::sync::run(&mut client, network, &mut block_cache, wallet, MAX_BLOCKS_TO_DOWNLOAD_AT_TIME).await {
-                    println!("Failed to sync wallet: {}", err);
-                    continue;
+                {
+                    const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u32 = 64;
+                    if let Err(err) = zcash_client_backend::sync::run(&mut client, network, &mut block_cache, wallet, MAX_BLOCKS_TO_DOWNLOAD_AT_TIME).await {
+                        println!("Failed to sync wallet: {}", err);
+                        continue;
+                    }
                 }
+
+                let Ok(summary) = wallet.get_wallet_summary(block_policy_10()) else { continue; };
+                let Some(summary) = summary else { continue; };
+
+                let balances = summary.account_balances();
+                println!("******* WALLET {:?} *******", t_address.encode(network));
+                println!("BALANCES {:?}", balances);
+                println!("SUMMARY  {:?}", summary);
             }
-
-            let Ok(summary) = wallet.get_wallet_summary(block_policy_10()) else { continue; };
-            let Some(summary) = summary else { continue; };
-
-            let balances = summary.account_balances();
-            println!("******* WALLET {:?} *******", t_address.encode(network));
-            println!("BALANCES {:?}", balances);
-            println!("SUMMARY  {:?}", summary);
         }
 
         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
