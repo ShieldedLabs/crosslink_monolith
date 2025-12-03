@@ -355,15 +355,15 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     if !ui.capture {
         let dxm = (input_ctx.mouse_pos().0.clamp(0, draw_ctx.window_width) - draw_ctx.window_width/2) as f32;
         let dym = (input_ctx.mouse_pos().1.clamp(0, draw_ctx.window_height) - draw_ctx.window_height/2) as f32;
-        let old_screen_unit = SCREEN_UNIT_CONST * ZOOM_FACTOR.powf(viz_state.zoom);
+        let old_screen_unit = SCREEN_UNIT_CONST * (ZOOM_FACTOR.powf(viz_state.zoom) * ui.scale);
         viz_state.zoom += input_ctx.zoom_delta as f32;
         viz_state.zoom = viz_state.zoom.min(26.0);
-        let new_screen_unit = SCREEN_UNIT_CONST * ZOOM_FACTOR.powf(viz_state.zoom);
+        let new_screen_unit = SCREEN_UNIT_CONST * (ZOOM_FACTOR.powf(viz_state.zoom) * ui.scale);
         viz_state.camera_x += (dxm / old_screen_unit) - (dxm / new_screen_unit);
         viz_state.camera_y += (dym / old_screen_unit) - (dym / new_screen_unit);
     }
 
-    let zoom = ZOOM_FACTOR.powf(viz_state.zoom);
+    let zoom = (ZOOM_FACTOR.powf(viz_state.zoom) * ui.scale);
     // origin
     let screen_unit = SCREEN_UNIT_CONST * zoom;
 
