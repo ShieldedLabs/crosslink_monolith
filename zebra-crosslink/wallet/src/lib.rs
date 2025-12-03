@@ -26,7 +26,7 @@ use zcash_client_memory::MemBlockCache;
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
-use zcash_note_encryption::{try_compact_note_decryption, try_note_decryption};
+use zcash_note_encryption::{try_compact_note_decryption, try_note_decryption, try_output_recovery_with_ovk};
 use zcash_primitives::transaction::builder::{BuildConfig, Builder as TxBuilder};
 use zcash_primitives::transaction::components::TxOut;
 use zcash_primitives::transaction::fees::zip317::{self, MINIMUM_FEE};
@@ -406,7 +406,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         return Ok(pending);
     }
 
-    async fn get_received_memos_and_actions<P: zcash_protocol::consensus::Parameters>(client: &mut CompactTxStreamerClient<Channel>, wallet: &zcash_client_sqlite::WalletDb<rusqlite::Connection, P, SystemClock, OsRng>, params: P, history: &[TransactionSummary<AccountUuid>]) -> Option<HashMap<TxId, (Option<StakingAction>, Vec<String>)>> {
+    async fn get_received_memos_and_actions<P: zcash_protocol::consensus::Parameters>(client: &mut CompactTxStreamerClient<Channel>, wallet: &zcash_client_sqlite::WalletDb<rusqlite::Connection, P, SystemClock, OsRng>, params: P, history: &[TransactionSummary<AccountUuid>])
+        -> Option<(HashMap<TxId, (Option<StakingAction>, Vec<String>)>, HashMap<TxId, (Option<StakingAction>, Vec<String>)>)> {
         fn try_get_orchard_memos(tx: &TransactionData<zcash_primitives::transaction::Authorized>, ivk: &orchard::keys::PreparedIncomingViewingKey) -> Vec<String> {
             let mut memos = Vec::new();
             let Some(bundle) = tx.orchard_bundle() else { return memos; };
@@ -425,8 +426,27 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             return memos;
         }
+        fn try_get_orchard_sent_memos(tx: &TransactionData<zcash_primitives::transaction::Authorized>, ovk: &orchard::keys::OutgoingViewingKey) -> Vec<String> {
+            let mut memos = Vec::new();
+            let Some(bundle) = tx.orchard_bundle() else { return memos; };
+
+            for action in bundle.actions() {
+                let domain = orchard::note_encryption::OrchardDomain::for_action(action);
+                if let Some((_, _, memo)) = try_output_recovery_with_ovk(&domain, ovk, action, action.cv_net(), &action.encrypted_note().out_ciphertext) {
+                    let memo = String::from_utf8_lossy(&memo[..]);
+                    if memo.len() == 0 {
+                        continue;
+                    }
+
+                    memos.push(memo.to_string());
+                }
+            }
+
+            return memos;
+        }
 
         let mut txid_map = HashMap::new();
+        let mut out_txid_map = HashMap::new();
         let txids: Vec<TxId> = history.iter().map(|h| h.txid).collect();
 
         let Ok(ids) = wallet.get_account_ids() else { return None; };
@@ -437,8 +457,14 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             .filter_map(|acc| acc)
             .collect();
         let uivks: Vec<UnifiedIncomingViewingKey> = accounts
+            .clone()
             .into_iter()
             .map(|acc| acc.uivk())
+            .collect();
+
+        let ufvks: Vec<Option<UnifiedFullViewingKey>> = accounts
+            .into_iter()
+            .map(|acc| acc.ufvk().map(|a|a.clone()))
             .collect();
 
         for txid in &txids {
@@ -456,7 +482,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let txdata = &tx.into_data();
             for uivk in &uivks {
                 let possible_orchard_ivk = if let Some(orchard_ivk) = uivk.orchard() { Some(orchard_ivk.prepare()) } else { None };
-
                 if let Some(orchard_ivk) = possible_orchard_ivk {
                     let m: Vec<String> = try_get_orchard_memos(txdata, &orchard_ivk)
                         .iter()
@@ -468,10 +493,29 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                 }
             }
-            txid_map.insert(*txid, (action, memos));
+            txid_map.insert(*txid, (action.clone(), memos));
+
+
+            let mut memos = Vec::new();
+            for ufvk in &ufvks {
+                let Some(ufvk) = ufvk else { continue; };
+                let Some(ufvk_orchard) = ufvk.orchard() else { continue; };
+                let ovk = ufvk_orchard.to_ovk(orchard::keys::Scope::External);
+                let m: Vec<String> = try_get_orchard_sent_memos(txdata, &ovk)
+                    .iter()
+                    .map(|memo| memo.clone())
+                    .collect();
+
+                for memo in m {
+                    memos.push(memo.clone());
+                }
+            }
+            if memos.len() > 0 {
+                out_txid_map.insert(*txid, (action, memos));
+            }
         }
 
-        Some(txid_map)
+        Some((txid_map, out_txid_map))
     }
 
     struct Timer { t_bgn: std::time::Instant, name: &'static str };
@@ -609,8 +653,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             return None;
         };
 
+        let memo_str = &format!("@UNSTAKE_RECEIVE: {}\nThanks for staking!", StakingAction::str_from_addr(staked_txid.txid));
         let options = TxOptions{
-            memo: Some(zcash_protocol::memo::MemoBytes::from_bytes("@UNSTAKE_RECEIVE:Thanks for staking!".as_bytes()).unwrap()),
+            memo: Some(zcash_protocol::memo::MemoBytes::from_bytes(memo_str.as_bytes()).unwrap()),
             ..Default::default()
         };
 
@@ -647,6 +692,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         miner_t_address,
         miner_ua,
         mut miner_txid_map,
+        mut miner_sent_txid_map,
     ) = {
         let (seed, miner_usk) = stuff_from_seed_phrase(network,
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
@@ -659,7 +705,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let miner_t_recs = miner_wallet
             .get_transparent_receivers(miner_account.id(), false, false)
             .unwrap();
-        (miner_wallet, miner_account, seed, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, miner_ua, HashMap::<TxId, (Option<StakingAction>, Vec<String>)>::new())
+        (miner_wallet, miner_account, seed, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, miner_ua, HashMap::<TxId, (Option<StakingAction>, Vec<String>)>::new(), HashMap::<TxId, (Option<StakingAction>, Vec<String>)>::new())
     };
 
     let (
@@ -1018,7 +1064,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             println!("WALLET HAS {} ({})) cTAZ", spendable_balance, str_from_ctaz(spendable_balance));
 
             let txs = if let Ok(mut history) = get_transaction_history(user_wallet) {
-                if let Some(map) = get_received_memos_and_actions(&mut client, user_wallet, network, &history).await {
+                if let Some((map, _sent_map)) = get_received_memos_and_actions(&mut client, user_wallet, network, &history).await {
                     user_txid_map = map;
 
                     let mut user_staked_txids = Vec::new();
@@ -1041,9 +1087,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
                     }
 
-                    println!("** USER TXID MAP: {user_txid_map:?}");
-                    println!("** USER TXIDS: {user_staked_txids:?}");
-                    println!("** USER TXIDS TOTAL: {total_staked:?}");
+                    // println!("** USER TXID MAP: {user_txid_map:?}");
+                    // println!("** USER TXIDS: {user_staked_txids:?}");
+                    // println!("** USER TXIDS TOTAL: {total_staked:?}");
 
                     {
                         let mut wallet_lock = wallet_state.lock().unwrap();
@@ -1262,13 +1308,37 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         })(user_wallet, miner_wallet).await;
 
-        (async |miner_wallet: &mut WalletDb<_, _, _, _>| {
+        (async |miner_wallet: &mut WalletDb<_, _, _, _>, miner_usk, network| {
             if let Ok(history) = get_transaction_history(miner_wallet) {
-                if let Some(map) = get_received_memos_and_actions(&mut client, miner_wallet, network, &history).await {
+                if let Some((map, sent_map)) = get_received_memos_and_actions(&mut client, miner_wallet, network, &history).await {
                     miner_txid_map = map;
+                    miner_sent_txid_map = sent_map;
+
+                    if !CHEAT_UNSTAKING {
+                        // TODO: does this have a race condition with syncing?
+                        for (tx, (action, memos)) in &miner_txid_map {
+                            let Some(action) = action else { continue; };
+                            if action.kind != StakingActionKind::Sub { continue; }
+
+                            let mut handled = false;
+                            // got a request to unstake; have we already repaid it?
+                            for (sent_tx, (_action, sent_memos)) in &miner_sent_txid_map  {
+                                if sent_memos.len() == 0 { continue; }
+                                if sent_memos[0].len() < "@UNSTAKE_RECEIVE: ".len()+32 { continue; }
+                                if Some(*tx.as_ref()) == StakingAction::addr_from_str_bytes(&sent_memos[0].as_bytes()["@UNSTAKE_RECEIVE: ".len().."@UNSTAKE_RECEIVE: ".len()+32]) {
+                                    handled = true;
+                                    break;
+                                }
+                            }
+
+                            if !handled {
+                                send_unstake_reward(&mut client, &roster, &miner_txid_map, tx, miner_wallet, miner_usk, network, &mut Vec::new());
+                            }
+                        }
+                    }
                 }
             }
-        })(miner_wallet).await;
+        })(miner_wallet, &miner_usk, network).await;
         // Process gui wallet actions
 
         // @todo(judah): I'm thinking the weird frame hitch we get in the UI is caused by this loop,
