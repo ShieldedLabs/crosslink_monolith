@@ -1565,12 +1565,13 @@ async fn powlink_peer(bft_state: &TMState, // @Phillip
     }
 
     if let Some(bytes) = bft_state.get_pow_closure.0(hash.0).await {
-        eprintln!("\n\n\n\n\n\n\n\n@Phillip: PoW bytes obtained!!! :)\n\n\n\n\n\n\n\n");
+        eprintln!("\n\n\n\n\n\n\n\n@Phillip: PoW bytes obtained!!! :) Hash: {:?}\n\n\n\n\n\n\n\n", hash);
 
-        ()
+        Ok(())
+    } else {
+
+        Ok(()) // @TODO: return error result i guess
     }
-
-    Ok(()) // @TODO: return error result i guess
 }
 
 async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
