@@ -1567,7 +1567,7 @@ async fn powlink_peer(bft_state: &TMState, // @Phillip
     if let Some(bytes) = bft_state.get_pow_closure.0(hash.0).await {
         eprintln!("\n\n\n\n\n\n\n\n@Phillip: PoW bytes obtained!!! :)\n\n\n\n\n\n\n\n");
 
-        Ok(())
+        ()
     }
 
     Ok(()) // @TODO: return error result i guess
@@ -2159,7 +2159,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         peer.latest_status_request_height = None;
                         send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
                     }
-                    if let Some(hash) = peer.latest_status_request_powlink {
+                    if let Some(hash) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
                         peer.latest_status_request_powlink = None;
                         powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash).await;
                     }
@@ -2189,7 +2189,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         peer.latest_status_request_height = None;
                         send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, [0; 32], &sock, &mut net_stats);
                     }
-                    if let Some(hash) = peer.latest_status_request_powlink {
+                    if let Some(hash) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
                         peer.latest_status_request_powlink = None;
                         powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, hash).await;
                     }
