@@ -2279,6 +2279,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             keys_to_remove.push(*hash);
                         }
                     } else {
+                        if powlink.data.len() == 0 {
+                            continue;
+                        }
                         if powlink.chunk_i as usize != powlink_chunks_n(powlink.data.len()) {
                             continue;
                         }
