@@ -1181,9 +1181,7 @@ pub fn ui_left_pane(ui: &mut Context,
         let balance_id = id("Balance Text");
         let mut balance = balance;
         let mut colour  = WHITE;
-        let mut icon    = ICON_DATABASE_1;
         if ui.hovered(balance_id) {
-            icon    = ICON_LINK_1;
             balance = staked_balance;
             colour  = (0xff, 0xaf, 0x0e, 0xff);
         }
@@ -1197,8 +1195,7 @@ pub fn ui_left_pane(ui: &mut Context,
             ..Decl
         }) {
             let balance_str = frame_strf!(data, "{} cTAZ", str_from_ctaz(balance.try_into().unwrap()));
-            ui.text(icon, TextDecl { colour, font: Icons, h: balance_text_h, align: AlignX::Center, ..TextDecl });
-            ui.text(&balance_str, TextDecl { colour, font: Mono, h: balance_text_h, align: AlignX::Center, ..TextDecl });
+            ui.text(&balance_str, TextDecl { colour, h: balance_text_h, align: AlignX::Center, ..TextDecl });
         }
 
         // pending container
