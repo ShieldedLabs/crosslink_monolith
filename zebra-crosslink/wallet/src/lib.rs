@@ -1313,6 +1313,15 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         })(user_wallet, miner_wallet).await;
 
         (async |miner_wallet: &mut WalletDb<_, _, _, _>, miner_usk, network| {
+            let Ok(Some(wallet_summary)) = miner_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
+                println!("Failed to get wallet summary");
+                return;
+            };
+            if wallet_summary.chain_tip_height() != wallet_summary.fully_scanned_height() {
+                println!("NOT YET SYNCED");
+                return;
+            };
+
             if let Ok(history) = get_transaction_history(miner_wallet) {
                 if let Some((map, sent_map)) = get_received_memos_and_actions(&mut client, miner_wallet, network, &history).await {
                     miner_txid_map = map;
@@ -1324,24 +1333,18 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             let Some(action) = action else { continue; };
                             if action.kind != StakingActionKind::Sub { continue; }
 
-                            println!("SAM DEBUG got here 1");
-
                             let mut handled = false;
                             // got a request to unstake; have we already repaid it?
                             for (sent_tx, (_action, sent_memos)) in &miner_sent_txid_map  {
-                                println!("SAM DEBUG got here 2");
                                 if sent_memos.len() == 0 { continue; }
                                 if sent_memos[0].len() < "@UNSTAKE_RECEIVE: ".len()+64 { continue; }
-                                println!("SAM DEBUG got here 3");
                                 if Some(action.source) == StakingAction::addr_from_str_bytes(&sent_memos[0].as_bytes()["@UNSTAKE_RECEIVE: ".len().."@UNSTAKE_RECEIVE: ".len()+64]) {
-                                    println!("SAM DEBUG got here 4");
                                     handled = true;
                                     break;
                                 }
                             }
-                            println!("SAM DEBUG got here 5");
+                            
                             if !handled {
-                                println!("SAM DEBUG");
                                 send_unstake_reward(&mut client, &roster, &miner_txid_map, &TxId::from_bytes(action.source), miner_wallet, miner_usk, network, &mut Vec::new()).await;
                             }
                         }
