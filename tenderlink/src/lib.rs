@@ -588,8 +588,6 @@ impl Default for HashKeys {
     }
 }
 
-use std::collections::HashSet;
-
 #[derive(Debug)]
 struct TMState {
     hash_keys: HashKeys,
@@ -620,7 +618,7 @@ struct TMState {
     roster_cmd: Option<String>,
     update_roster_cmd_closure: ClosureToUpdateRosterCmd,
 
-    powlink_hashes: HashSet<BlockHash>,
+    powlinks: HashMap<BlockHash, Powlink>,
 }
 impl TMState {
     fn init(
@@ -653,7 +651,7 @@ impl TMState {
             roster_cmd: None,
             update_roster_cmd_closure,
 
-            powlink_hashes: HashSet::new(),
+            powlinks: HashMap::new(),
         }
     }
 
@@ -1279,10 +1277,13 @@ impl TMState {
             {
                 match self.rounds_data[i].proposal_checked_validity.1 {
                     TMStatusReason::NeedsBlock { hash } => {
-                        self.powlink_hashes.insert(BlockHash(hash));
-                        let len = self.powlink_hashes.len();
-                        if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash); }
-                        if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
+                        if !self.powlinks.contains_key(&BlockHash(hash)) {
+                            self.powlinks.insert(BlockHash(hash), Powlink::default());
+
+                            let len = self.powlinks.len();
+                            if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash); }
+                            if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
+                        }
                     },
                     _ => {}
                 }
@@ -1329,7 +1330,7 @@ struct Peer {
     connection_is_unknown: bool,
 
     latest_status_request_height: Option<u64>,
-    latest_status_request_powlink: Option<BlockHash>,
+    latest_status_request_powlink: Option<(BlockHash, u16)>,
     latest_status: Option<PacketStatus>,
 }
 impl Default for Peer {
@@ -1370,7 +1371,7 @@ struct UnknownPeer {
 
     transport: PeerTransport,
     latest_status_request_height: Option<u64>,
-    latest_status_request_powlink: Option<BlockHash>,
+    latest_status_request_powlink: Option<(BlockHash, u16)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1549,28 +1550,6 @@ pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize
     }
 
     rngs
-}
-
-async fn powlink_peer(bft_state: &TMState, // @Phillip
-                ctx_str: &str,
-                stats: &mut NetworkStats,
-                send_buf1: &mut [u8],
-                send_buf2: &mut [u8],
-                peer_transport: &mut PeerTransport,
-                peer_endpoint: SecureUdpEndpoint,
-                peer_snow_state: &mut snow::StatelessTransportState,
-                hash: BlockHash) -> std::io::Result<()> {
-    if hash == BlockHash::NIL {
-        return Ok(());
-    }
-
-    if let Some(bytes) = bft_state.get_pow_closure.0(hash.0).await {
-        eprintln!("\n\n\n\n\n\n\n\n@Phillip: PoW bytes obtained!!! :)\n\n\n\n\n\n\n\n");
-
-        ()
-    }
-
-    Ok(()) // @TODO: return error result i guess
 }
 
 async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
@@ -1754,15 +1733,14 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     round: bft_state.round,
                     need_proposal_chunk_rngs: [[0, 0]],
                     need_vote_rngs: [[[0, active_roster_len(roster) as u16]]; 2],
-                    powlink_hashes: [BlockHash::NIL; 1],
+                    powlink_hash: BlockHash::NIL,
+                    powlink_chunk_i: 0,
                 };
-                {
-                    let mut i = 0;
-                    for hash in &bft_state.powlink_hashes {
-                        if i >= bft_state.powlink_hashes.len() { break; }
-                        status.powlink_hashes[i] = *hash;
-                        i += 1;
-                    }
+                for item in &bft_state.powlinks {
+                    let (hash, powlink) = item;
+                    status.powlink_hash = *hash;
+                    status.powlink_chunk_i = powlink.chunk_i;
+                    break;
                 }
 
 
@@ -1867,6 +1845,62 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             send_sock_msg(ctx_str, transport, sock, peer_endpoint, &send_buf2[..o], stats);
 
             transport.nonce += 1;
+        }
+
+        async fn powlink_peer(bft_state: &TMState, // @Phillip
+                              ctx_str: &str,
+                              stats: &mut NetworkStats,
+                              send_buf1: &mut [u8],
+                              send_buf2: &mut [u8],
+                              sock: &tokio::net::UdpSocket,
+                              peer_transport: &mut PeerTransport,
+                              peer_endpoint: SecureUdpEndpoint,
+                              peer_snow_state: &mut snow::StatelessTransportState,
+                              hash: BlockHash,
+                              chunk_needed_i: u16) -> std::io::Result<()> {
+            let chunk_needed_i = chunk_needed_i as usize;
+
+            if hash == BlockHash::NIL {
+                return Ok(());
+            }
+
+            let bytes = {
+                if let Some(bytes) = bft_state.get_pow_closure.0(hash.0).await {
+                    bytes
+                } else {
+                    return Ok(()); // @TODO: return error result i guess
+                }
+            };
+
+            // eprintln!("\n\n\n\n\n\n\n\n@Phillip: PoW bytes obtained!!! :) Hash: {:?}\n\n\n\n\n\n\n\n", hash);
+
+            let chunks_n = powlink_chunks_n(bytes.len());
+            if chunk_needed_i >= chunks_n {
+                return Ok(()); // all bytes sent
+            }
+
+            let block_size = bytes.len().try_into().unwrap();
+            let bytes      = &bytes[..];
+
+            for chunk_i in chunk_needed_i..(chunk_needed_i + 1).min(chunks_n) {
+                let (chunk_o, chunk_size) = powlink_chunk_o_size(bytes.len(), chunk_i);
+                let chunk_i: u16          = chunk_i.try_into().unwrap();
+                let chunk                 = PacketPowlinkChunkHeader { hash, block_size, chunk_i };
+                let data                  = &bytes[chunk_o..chunk_o + chunk_size];
+
+                let header = PacketHeader::new::<PACKET_TYPE_POWLINK_CHUNK>(peer_transport.ack_latest, peer_transport.ack_field); // @TodoHeaderAndStatus
+
+                let mut o  = 0;
+                o += header.write_to(&mut send_buf1[o..]);
+                o += chunk .write_to(&mut send_buf1[o..]);
+                o += data  .write_to(&mut send_buf1[o..]);
+
+                if PRINT_POWLINK { eprintln!("{} sending PoW block hash {:?} chunk {} to {:?}", ctx_str, hash, chunk_i, peer_endpoint); }
+                print_packet_tag_send(header);
+                send_noise_msg(&ctx_str, peer_transport, peer_snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
+            }
+
+            Ok(())
         }
 
         fn process_acks(transport: &mut PeerTransport, header: PacketHeader) {
@@ -2159,9 +2193,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         peer.latest_status_request_height = None;
                         send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
                     }
-                    if let Some(hash) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
+                    if let Some((hash, chunk_i)) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
                         peer.latest_status_request_powlink = None;
-                        powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash).await;
+                        powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &sock, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash, chunk_i).await;
                     }
                     else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                     {
@@ -2189,9 +2223,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         peer.latest_status_request_height = None;
                         send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, [0; 32], &sock, &mut net_stats);
                     }
-                    if let Some(hash) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
+                    if let Some((hash, chunk_i)) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
                         peer.latest_status_request_powlink = None;
-                        powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, hash).await;
+                        powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &sock, &mut peer.transport, peer.endpoint, &mut peer.snow_state, hash, chunk_i).await;
                     }
 
                     if let Some(cmd) = &roster_cmd {
@@ -2542,6 +2576,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         };
         let packet_type = header.type_();
 
+        // if packet_type == PACKET_TYPE_POWLINK_CHUNK
+
         if peer_is_unknown {
             let peer = &mut unknown_peers[peer_index];
             peer.watch_dog = Instant::now();
@@ -2551,7 +2587,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
             if let Some(status) = status {
                 peer.latest_status_request_height = Some(status.height);
-                peer.latest_status_request_powlink = Some(status.powlink_hashes[0]);
+                peer.latest_status_request_powlink = Some((status.powlink_hash, status.powlink_chunk_i));
             }
 
             match packet_type {
@@ -2597,7 +2633,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 }
 
                 peer.latest_status_request_height = Some(status.height);
-                peer.latest_status_request_powlink = Some(status.powlink_hashes[0]);
+                peer.latest_status_request_powlink = Some((status.powlink_hash, status.powlink_chunk_i));
                 peer.latest_status = Some(status);
             }
 
@@ -2678,7 +2714,7 @@ const PACKET_TYPE_PREVOTE_SIGNATURES:   u8 =  8;
 const PACKET_TYPE_PRECOMMIT_SIGNATURES: u8 =  9;
 // misc
 const PACKET_TYPE_ROSTER_CMD:           u8 = 10;
-const PACKET_TYPE_POWLINK:              u8 = 11;
+const PACKET_TYPE_POWLINK_CHUNK:        u8 = 11;
 const PACKET_TYPE_COUNT:                u8 = 12;
 
 
@@ -2705,7 +2741,7 @@ const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES",     "STATUS+PRECOMMIT_SIGNATURES"];
     names[PACKET_TYPE_ROSTER_CMD           as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
-    names[PACKET_TYPE_POWLINK              as usize] = ["PACKET_TYPE_POWLINK",      "STATUS+PACKET_TYPE_POWLINK"];
+    names[PACKET_TYPE_POWLINK_CHUNK              as usize] = ["PACKET_TYPE_POWLINK_CHUNK",      "STATUS+PACKET_TYPE_POWLINK_CHUNK"];
     const_assert!(PACKET_TYPE_COUNT == 12); // keep names array updated when adding other tags
     names
 };
@@ -2738,7 +2774,8 @@ struct PacketStatus {
     round:  u32, // as context for following request ranges
     need_proposal_chunk_rngs: [ProposalRng; STATUS_PROPOSAL_RNGS_N],
     need_vote_rngs: [[VoteRng; STATUS_VOTE_RNGS_N]; 2], // 1 for prevote, 1 for precommit
-    powlink_hashes: [BlockHash; 1], // blocks needed
+    powlink_hash: BlockHash, // block needed
+    powlink_chunk_i: u16, // my next needed index into the stream of chunks of the block
 }
 impl PacketStatus {
     pub fn write_to(&self, buf: &mut[u8]) -> usize {
@@ -2755,9 +2792,8 @@ impl PacketStatus {
                 o += vote_rng[1].write_to(&mut buf[o..]);
             }
         }
-        for hash in &self.powlink_hashes {
-            o += hash.0.write_to(&mut buf[o..]);
-        }
+        o += self.powlink_hash.0.write_to(&mut buf[o..]);
+        o += self.powlink_chunk_i.write_to(&mut buf[o..]);
         o
     }
 
@@ -2766,7 +2802,8 @@ impl PacketStatus {
             height: 0, round: 0,
             need_proposal_chunk_rngs: [[0;2]; STATUS_PROPOSAL_RNGS_N],
             need_vote_rngs: [[[0;2]; STATUS_VOTE_RNGS_N]; 2],
-            powlink_hashes: [BlockHash::NIL; 1]
+            powlink_hash: BlockHash::NIL,
+            powlink_chunk_i: 0,
         };
         packet.height = r.read_u64::<LittleEndian>()?;
         packet.round = r.read_u32::<LittleEndian>()?;
@@ -2780,9 +2817,8 @@ impl PacketStatus {
                 vote_rng[1] = r.read_u16::<LittleEndian>()?;
             }
         }
-        for hash in &mut packet.powlink_hashes {
-            r.read_exact(&mut hash.0)?;
-        }
+        r.read_exact(&mut packet.powlink_hash.0)?;
+        packet.powlink_chunk_i = r.read_u16::<LittleEndian>()?;
         Ok(packet)
     }
 }
@@ -2939,6 +2975,62 @@ impl PacketProposalChunkHeader {
         r.read_exact(&mut packet.proposal_id.0)?;
 
         packet.valid_round = if valid_round != u32::MAX { valid_round.into() } else { -1 };
+        Ok(packet)
+    }
+}
+
+use std::collections::HashMap;
+
+const POWLINK_MAX_DATA_SIZE:   usize = 2_000_000;
+const POWLINK_CHUNK_DATA_SIZE: usize =     1_000;
+
+// @Todo: This is not secure to adversarial sync-servers who give you false PoW block data. We don't isolate streams to individual peers yet.
+//        However, as this is meant as just an optimization, we can safely fallback to Zebra sync.
+// #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Powlink {
+    pub chunk_i: u16,  // download-stream chunk index
+    pub data: Vec<u8>, // the block as bytes
+    pub block: Option<Arc<zebra_chain::block::Block>>,
+}
+fn powlink_chunks_n(len: usize) -> usize {
+    len.div_ceil(POWLINK_CHUNK_DATA_SIZE)
+}
+fn powlink_chunk_o_size(len: usize, chunk_i: usize) -> (usize, usize) {
+    let o = chunk_i * POWLINK_CHUNK_DATA_SIZE;
+    (o, usize::min(POWLINK_CHUNK_DATA_SIZE, len - o))
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PacketPowlinkChunkHeader {
+    pub hash:       BlockHash,
+    pub block_size: u32,
+    pub chunk_i:    u16,
+}
+impl Default for PacketPowlinkChunkHeader {
+    fn default() -> Self {
+        Self {
+            hash:       BlockHash::NIL,
+            block_size: 0,
+            chunk_i:    0,
+        }
+    }
+}
+impl PacketPowlinkChunkHeader {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.hash    .0.write_to(&mut buf[o..]);
+        o += self.block_size.write_to(&mut buf[o..]);
+        o += self.chunk_i   .write_to(&mut buf[o..]);
+        o
+    }
+
+    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
+        let mut packet = PacketPowlinkChunkHeader::default();
+        r.read_exact(&mut packet.hash.0)?;
+        packet.block_size = r.read_u32::<LittleEndian>()?;
+        packet.chunk_i    = r.read_u16::<LittleEndian>()?;
+
         Ok(packet)
     }
 }
