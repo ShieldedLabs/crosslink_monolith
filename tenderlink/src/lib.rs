@@ -1315,7 +1315,8 @@ struct Peer {
 
     connection_is_unknown: bool,
 
-    latest_status_request: Option<u64>,
+    latest_status_request_height: Option<u64>,
+    latest_status_request_powlink: Option<BlockHash>,
     latest_status: Option<PacketStatus>,
 }
 impl Default for Peer {
@@ -1330,7 +1331,8 @@ impl Default for Peer {
             transport: PeerTransport::default(),
 
             connection_is_unknown: false,
-            latest_status_request: None,
+            latest_status_request_height: None,
+            latest_status_request_powlink: None,
             latest_status: None,
         }
     }
@@ -1354,7 +1356,8 @@ struct UnknownPeer {
     watch_dog: Instant,
 
     transport: PeerTransport,
-    latest_status_request: Option<u64>,
+    latest_status_request_height: Option<u64>,
+    latest_status_request_powlink: Option<BlockHash>,
 }
 
 #[derive(Clone, Copy)]
@@ -1533,6 +1536,21 @@ pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize
     }
 
     rngs
+}
+
+fn powlink_peer(ctx_str: &str,
+                stats: &mut NetworkStats,
+                send_buf1: &mut [u8],
+                send_buf2: &mut [u8],
+                peer_transport: &mut PeerTransport,
+                peer_endpoint: SecureUdpEndpoint,
+                peer_snow_state: &mut snow::StatelessTransportState,
+                hash: BlockHash) {
+    if hash == BlockHash::NIL {
+        return;
+    }
+
+
 }
 
 async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
@@ -1859,7 +1877,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         peer.pending_client_ack_snow_state = None;
                         peer.snow_state = None;
                         peer.watch_dog = Instant::now();
-                        peer.latest_status_request = None;
+                        peer.latest_status_request_height = None;
+                        peer.latest_status_request_powlink = None;
                         peer.latest_status = None;
                     }
 
@@ -2090,9 +2109,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 for peer_i in 0..peers.len() {
                     let peer = &mut peers[peer_i];
                     if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
-                    if let Some(height) = peer.latest_status_request && height < bft_state.height {
-                        peer.latest_status_request = None;
+                    if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
+                        peer.latest_status_request_height = None;
                         send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
+                    }
+                    if let Some(hash) = peer.latest_status_request_powlink {
+                        peer.latest_status_request_powlink = None;
+                        powlink_peer(&ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash);
                     }
                     else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                     {
@@ -2116,9 +2139,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                 for peer_i in 0..unknown_peers.len() {
                     let peer = &mut unknown_peers[peer_i];
-                    if let Some(height) = peer.latest_status_request && height < bft_state.height {
-                        peer.latest_status_request = None;
+                    if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
+                        peer.latest_status_request_height = None;
                         send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, [0; 32], &sock, &mut net_stats);
+                    }
+                    if let Some(hash) = peer.latest_status_request_powlink {
+                        peer.latest_status_request_powlink = None;
+                        powlink_peer(&ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, hash);
                     }
 
                     if let Some(cmd) = &roster_cmd {
@@ -2445,7 +2472,15 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             print_packet_tag_send(header);
                             send_sock_msg(&ctx_str, &mut transport, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
                             transport.nonce += 1;
-                            unknown_peers.push(UnknownPeer { endpoint: client_endpoint, snow_state: stateless_snow_state, pending_client_ack: true, watch_dog: Instant::now(), transport, latest_status_request: None });
+                            unknown_peers.push(UnknownPeer {
+                                endpoint: client_endpoint,
+                                snow_state: stateless_snow_state,
+                                pending_client_ack: true,
+                                watch_dog: Instant::now(),
+                                transport,
+                                latest_status_request_height: None,
+                                latest_status_request_powlink: None,
+                            });
                         }
                         break;
                     }
@@ -2469,7 +2504,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             process_acks(&mut peer.transport, header);
 
             if let Some(status) = status {
-                peer.latest_status_request = Some(status.height);
+                peer.latest_status_request_height = Some(status.height);
             }
 
             match packet_type {
@@ -2514,7 +2549,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     peer.connection_is_unknown = false;
                 }
 
-                peer.latest_status_request = Some(status.height);
+                peer.latest_status_request_height = Some(status.height);
                 peer.latest_status = Some(status);
             }
 
@@ -2683,7 +2718,7 @@ impl PacketStatus {
             height: 0, round: 0,
             need_proposal_chunk_rngs: [[0;2]; STATUS_PROPOSAL_RNGS_N],
             need_vote_rngs: [[[0;2]; STATUS_VOTE_RNGS_N]; 2],
-            powlink_hashes: [BlockHash::NIL; 4]
+            powlink_hashes: [BlockHash::NIL; 1]
         };
         packet.height = r.read_u64::<LittleEndian>()?;
         packet.round = r.read_u32::<LittleEndian>()?;
