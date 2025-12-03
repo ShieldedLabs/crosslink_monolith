@@ -52,20 +52,21 @@ fn get_zcash_params() {
         }
     };
 
-    // Copy the params to the internal location.
-    let internal_params_path = Path::new("zcash-params");
-    std::fs::create_dir_all(internal_params_path).unwrap();
-    std::fs::copy(
-        params_path.spend,
-        internal_params_path.join("sapling-spend.params"),
-    )
-    .unwrap();
-
-    std::fs::copy(
-        params_path.output,
-        internal_params_path.join("sapling-output.params"),
-    )
-    .unwrap();
+    // @CrosslinkDevBuildIterationTimesOnly
+    // // Copy the params to the internal location.
+    // let internal_params_path = Path::new("zcash-params");
+    // std::fs::create_dir_all(internal_params_path).unwrap();
+    // std::fs::copy(
+    //     params_path.spend,
+    //     internal_params_path.join("sapling-spend.params"),
+    // )
+    // .unwrap();
+    // 
+    // std::fs::copy(
+    //     params_path.output,
+    //     internal_params_path.join("sapling-output.params"),
+    // )
+    // .unwrap();
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
