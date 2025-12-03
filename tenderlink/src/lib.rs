@@ -1848,16 +1848,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         }
 
         async fn powlink_peer(bft_state: &TMState, // @Phillip
-                            ctx_str: &str,
-                            stats: &mut NetworkStats,
-                            send_buf1: &mut [u8],
-                            send_buf2: &mut [u8],
-                            sock: &tokio::net::UdpSocket,
-                            peer_transport: &mut PeerTransport,
-                            peer_endpoint: SecureUdpEndpoint,
-                            peer_snow_state: &mut snow::StatelessTransportState,
-                            hash: BlockHash,
-                            chunk_needed_i: u16) -> std::io::Result<()> {
+                              ctx_str: &str,
+                              stats: &mut NetworkStats,
+                              send_buf1: &mut [u8],
+                              send_buf2: &mut [u8],
+                              sock: &tokio::net::UdpSocket,
+                              peer_transport: &mut PeerTransport,
+                              peer_endpoint: SecureUdpEndpoint,
+                              peer_snow_state: &mut snow::StatelessTransportState,
+                              hash: BlockHash,
+                              chunk_needed_i: u16) -> std::io::Result<()> {
             let chunk_needed_i = chunk_needed_i as usize;
 
             if hash == BlockHash::NIL {
