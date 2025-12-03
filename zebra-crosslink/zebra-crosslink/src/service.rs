@@ -125,7 +125,7 @@ pub fn spawn_new_tfl_service(
         let mut array = Vec::with_capacity(config.malachite_peers.len());
         let mut map = std::collections::HashMap::with_capacity(config.malachite_peers.len());
 
-        for peer in config.malachite_peers.iter() {
+        for (i, peer) in config.malachite_peers.iter().enumerate() {
             let (_, _, public_key) = rng_private_public_key_from_address(peer.as_bytes());
             array.push(crate::MalValidator::new(public_key, vec![StakeTxId{ txid: [0;32], zats:1 }]));
             map.insert(public_key, peer.to_string());

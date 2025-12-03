@@ -192,6 +192,16 @@ impl std::fmt::Debug for ClosureToGetHistoricalBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToGetHistoricalBlock(..)") }
 }
 #[derive(Clone)]
+pub struct ClosureToGetPow(pub Arc<dyn Fn([u8; 32])-> core::pin::Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>> + Send + Sync + 'static>); // @Phillip
+impl std::fmt::Debug for ClosureToGetPow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToGetPow(..)") }
+}
+// #[derive(Clone)]
+// pub struct ClosureToPushPow(pub Arc<dyn Fn([u8; 32], )-> core::pin::Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>> + Send + Sync + 'static>); // @Phillip
+// impl std::fmt::Debug for ClosureToPushPow {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushPow(..)") }
+// }
+#[derive(Clone)]
 pub struct ClosureToUpdateRosterCmd(pub Arc<dyn Fn(Option<String>)-> core::pin::Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToUpdateRosterCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToUpdateRosterCmd(..)") }
@@ -605,6 +615,7 @@ struct TMState {
     validate_closure: ClosureToValidateProposedBlock,
     push_block_closure: ClosureToPushDecidedBlock,
     get_block_closure: ClosureToGetHistoricalBlock,
+    get_pow_closure: ClosureToGetPow,
 
     roster_cmd: Option<String>,
     update_roster_cmd_closure: ClosureToUpdateRosterCmd,
@@ -618,6 +629,7 @@ impl TMState {
         validate_closure: ClosureToValidateProposedBlock,
         push_block_closure: ClosureToPushDecidedBlock,
         get_block_closure: ClosureToGetHistoricalBlock,
+        get_pow_closure: ClosureToGetPow,
         update_roster_cmd_closure: ClosureToUpdateRosterCmd) -> Self {
         Self {
             hash_keys: HashKeys::default(),
@@ -637,6 +649,7 @@ impl TMState {
             validate_closure,
             push_block_closure,
             get_block_closure,
+            get_pow_closure,
             roster_cmd: None,
             update_roster_cmd_closure,
 
@@ -1538,19 +1551,26 @@ pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize
     rngs
 }
 
-fn powlink_peer(ctx_str: &str,
+async fn powlink_peer(bft_state: &TMState, // @Phillip
+                ctx_str: &str,
                 stats: &mut NetworkStats,
                 send_buf1: &mut [u8],
                 send_buf2: &mut [u8],
                 peer_transport: &mut PeerTransport,
                 peer_endpoint: SecureUdpEndpoint,
                 peer_snow_state: &mut snow::StatelessTransportState,
-                hash: BlockHash) {
+                hash: BlockHash) -> std::io::Result<()> {
     if hash == BlockHash::NIL {
-        return;
+        return Ok(());
     }
 
+    if let Some(bytes) = bft_state.get_pow_closure.0(hash.0).await {
+        eprintln!("\n\n\n\n\n\n\n\n@Phillip: PoW bytes obtained!!! :)\n\n\n\n\n\n\n\n");
 
+        Ok(())
+    }
+
+    Ok(()) // @TODO: return error result i guess
 }
 
 async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
@@ -1604,14 +1624,40 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 decisions.lock().unwrap()[height as usize].clone()
             })
         })),
+        ClosureToGetPow(Arc::new(move |hash| { // @Phillip
+            Box::pin(async move {
+                None
+            })
+        })),
+        // ClosureToParsePow(Arc::new(move |hash| { // @Phillip
+        //     Box::pin(async move {
+        //         None
+        //     })
+        // })),
+        // ClosureToPushPow(Arc::new(move |hash, bytes| { // @Phillip
+        //     Box::pin(async move {
+        //         None
+        //     })
+        // })),
         ClosureToUpdateRosterCmd(Arc::new(move |_str| { Box::pin(async move {
             Some(format!("{:?}", pub_key))
         })})),
     ).await
 }
 
-pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, mut roster: Vec<SortedRosterMember>, mut roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>,
-    propose_closure: ClosureToProposeNewBlock, validate_closure: ClosureToValidateProposedBlock, push_block_closure: ClosureToPushDecidedBlock, get_block_closure: ClosureToGetHistoricalBlock, roster_cmd_closure: ClosureToUpdateRosterCmd) -> std::io::Result<()> {
+pub async fn entry_point(my_root_private_key: SigningKey,
+                         my_static_keypair: Option<StaticDHKeyPair>,
+                         my_endpoint: Option<SecureUdpEndpoint>,
+                         mut roster: Vec<SortedRosterMember>,
+                         mut roster_endpoint_evidence: Vec<EndpointEvidence>,
+                         maybe_seed: Option<u128>,
+                         propose_closure: ClosureToProposeNewBlock,
+                         validate_closure: ClosureToValidateProposedBlock,
+                         push_block_closure: ClosureToPushDecidedBlock,
+                         get_block_closure: ClosureToGetHistoricalBlock,
+                         get_pow_closure: ClosureToGetPow,
+                         roster_cmd_closure: ClosureToUpdateRosterCmd,
+                        ) -> std::io::Result<()> {
     hook_fail_on_panic();
     let mut base_rng = {
         let seed : u128 = maybe_seed.unwrap_or_else(|| {
@@ -1656,7 +1702,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
     if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>()); }
 
     // TODO: only convert private to public in 1 location
-    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_bft_key.into()), my_port, propose_closure, validate_closure, push_block_closure, get_block_closure, roster_cmd_closure); // TODO: double-check this is the right key
+    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_bft_key.into()), my_port, propose_closure, validate_closure, push_block_closure, get_block_closure, get_pow_closure, roster_cmd_closure); // TODO: double-check this is the right key
     bft_state.start_round(&roster, Instant::now(), 0).await;
 
     let mut my_endpoint_evidence = if let Some(i) = roster_endpoint_evidence.iter().position(|e| &e.root_public_bft_key == my_root_public_bft_key.as_ref()) {
@@ -2115,7 +2161,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     }
                     if let Some(hash) = peer.latest_status_request_powlink {
                         peer.latest_status_request_powlink = None;
-                        powlink_peer(&ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash);
+                        powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash).await;
                     }
                     else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                     {
@@ -2145,7 +2191,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     }
                     if let Some(hash) = peer.latest_status_request_powlink {
                         peer.latest_status_request_powlink = None;
-                        powlink_peer(&ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, hash);
+                        powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, hash).await;
                     }
 
                     if let Some(cmd) = &roster_cmd {
@@ -2505,6 +2551,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
             if let Some(status) = status {
                 peer.latest_status_request_height = Some(status.height);
+                peer.latest_status_request_powlink = Some(status.powlink_hashes[0]);
             }
 
             match packet_type {
@@ -2550,6 +2597,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 }
 
                 peer.latest_status_request_height = Some(status.height);
+                peer.latest_status_request_powlink = Some(status.powlink_hashes[0]);
                 peer.latest_status = Some(status);
             }
 
