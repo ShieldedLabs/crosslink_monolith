@@ -7040,6 +7040,7 @@ dependencies = [
  "socket2 0.6.1",
  "static_assertions",
  "tokio",
+ "zebra-chain",
 ]
 
 [[package]]
