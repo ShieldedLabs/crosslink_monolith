@@ -743,7 +743,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     roster = new_roster;
                 }
 
-                wallet_state.lock().unwrap().roster = roster
+                let wallet_roster = roster
                     .iter()
                     .map(|member| WalletRosterMember{
                         pub_key: member.pub_key,
@@ -752,6 +752,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     })
                     .collect::<Vec<WalletRosterMember>>()
                     .clone();
+                println!("*********** WALLET ROSTER: {wallet_roster:?}");
+                wallet_state.lock().unwrap().roster = wallet_roster;
             }
         }
         println!("*********** ROSTER: {roster:?}");
@@ -985,6 +987,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             }
                         }
                     }
+
+                    println!("** USER TXID MAP: {user_txid_map:?}");
+                    println!("** USER TXIDS: {user_staked_txids:?}");
+                    println!("** USER TXIDS TOTAL: {total_staked:?}");
 
                     {
                         let mut wallet_lock = wallet_state.lock().unwrap();
