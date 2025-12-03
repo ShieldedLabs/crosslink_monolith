@@ -1178,14 +1178,27 @@ pub fn ui_left_pane(ui: &mut Context,
         };
 
         // balance container
+        let balance_id = id("Balance Text");
+        let mut balance = balance;
+        let mut colour  = WHITE;
+        let mut icon    = ICON_DATABASE_1;
+        if ui.hovered(balance_id) {
+            icon    = ICON_LINK_1;
+            balance = staked_balance;
+            colour  = (0xff, 0xaf, 0x0e, 0xff);
+        }
+
         if let _ = elem().decl(Decl {
+            id: balance_id,
             width: grow!(),
             height: fit!(),
+            direction: LeftToRight,
             align: Center,
             ..Decl
         }) {
             let balance_str = frame_strf!(data, "{} cTAZ", str_from_ctaz(balance.try_into().unwrap()));
-            ui.text(&balance_str, TextDecl { h: balance_text_h, align: AlignX::Center, ..TextDecl });
+            ui.text(icon, TextDecl { colour, font: Icons, h: balance_text_h, align: AlignX::Center, ..TextDecl });
+            ui.text(&balance_str, TextDecl { colour, font: Mono, h: balance_text_h, align: AlignX::Center, ..TextDecl });
         }
 
         // pending container
@@ -1433,7 +1446,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                 match tx.1 {
                                     wallet::WalletTxKind::Send | wallet::WalletTxKind::Stake => {
-                                        let send_amount: i64 = tx.0.total_spent.into();
+                                        let send_amount: i64 = tx.0.account_value_delta.into();
                                         let send_amount: u64 = send_amount.abs() as u64;
                                         let full = send_amount / 100_000_000;
                                         let part = send_amount % 100_000_000;

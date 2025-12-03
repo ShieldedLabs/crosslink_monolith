@@ -605,7 +605,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let miner_t_recs = miner_wallet
             .get_transparent_receivers(miner_account.id(), false, false)
             .unwrap();
-        (miner_wallet, miner_account, seed, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, miner_ua, HashMap::new())
+        (miner_wallet, miner_account, seed, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, miner_ua, HashMap::<TxId, (Option<StakingAction>, Vec<String>)>::new())
     };
 
     let (
@@ -674,6 +674,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let (mut miner_use_i, mut miner_update_i) = (0,0);
     let mut user_wallets  = [user_wallet_init,  WalletDb::for_path(":memory:", network, SystemClock, OsRng).unwrap()];
     let mut miner_wallets = [miner_wallet_init, WalletDb::for_path(":memory:", network, SystemClock, OsRng).unwrap()];
+
+    let mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly = Vec::<TxId>::new();
 
     loop {
         match client.get_roster(Empty{}).await {
@@ -954,6 +956,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     user_txid_map = map;
 
                     let mut user_staked_txids = Vec::new();
+                    let mut total_staked: u64 = 0;
                     for mem in &roster {
                         for mem_txid in &mem.txids {
                             let txid = TxId::from_bytes(mem_txid.txid);
@@ -961,11 +964,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             let Some(action) = action else { continue; };
                             match action.kind {
                                 StakingActionKind::Add => {
-                                    user_staked_txids.push((mem.pub_key, *txid.as_ref(), action.val, mem_txid.zats))
-                                }
-                                StakingActionKind::Sub => {
-                                    let txid = *txid.as_ref();
-                                    user_staked_txids.retain(|(_, existing_txid, _, _)| !existing_txid.eq(&txid));
+                                    if !stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly.contains(&txid) {
+                                        total_staked += mem_txid.zats;
+                                        user_staked_txids.push((mem.pub_key, *txid.as_ref(), action.val, mem_txid.zats))
+                                    }
                                 }
 
                                 _ => {}
@@ -973,7 +975,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
                     }
 
-                    wallet_state.lock().unwrap().staked_roster = user_staked_txids;
+                    {
+                        let mut wallet_lock = wallet_state.lock().unwrap();
+                        wallet_lock.staked_roster  = user_staked_txids;
+                        wallet_lock.staked_balance = total_staked.try_into().unwrap();
+                    }
 
                     let mut txs: Vec<WalletTx> = history.iter().map(|tx| {
                         let mut kind: WalletTxKind;
@@ -1326,7 +1332,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             };
 
                             let Some((action, _)) = user_txid_map.get(&txid) else {
-                                println!("*** Failed to find staking transaction via txid {:?}", txid);
+                                println!("*** Failed to find user staking transaction via txid {:?}", txid);
                                 break 'process_action false;
                             };
 
@@ -1347,7 +1353,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 memo: None,
                             };
 
-                            // @note(judah): the miner sends this to its own address because if the user sends it,
+                            // @note(judah): the miner sends to its own address because if the user sends it,
                             // the tx will appear as a regular send of -0.2 cTAZ....
                             match send_zats(&mut client, &miner_ua, miner_wallet, &miner_usk, Zatoshis::from_u64(10_000).unwrap() /* @todo fees */, network, &opts).await {
                                 None => {
@@ -1377,7 +1383,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             };
 
                             let Some((action, memos)) = miner_txid_map.get(&txid) else {
-                                println!("*** Failed to find staking transaction via txid {:?}", txid);
+                                println!("*** Failed to find miner staking transaction via txid {:?}", txid);
                                 break 'process_action false;
                             };
 
@@ -1404,6 +1410,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 }
                                 Some(_) => {
                                     println!("Successfully sent reward to user");
+                                    stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly.push(*txid);
                                     true
                                 }
                             }
