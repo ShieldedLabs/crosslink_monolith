@@ -1,22 +1,22 @@
 [workspace]
 members = [
-    "components/equihash",
-    "components/f4jumble",
-    "components/zcash_address",
-    "components/zcash_encoding",
-    "components/zcash_protocol",
-    "components/zip321",
-    "pczt",
-    "zcash",
-    "zcash_client_backend",
-    "zcash_client_memory",
-    "zcash_client_sqlite",
-    "zcash_extensions",
-    "zcash_history",
-    "zcash_keys",
-    "zcash_primitives",
-    "zcash_proofs",
-    "zcash_transparent",
+  "components/equihash",
+  "components/f4jumble",
+  "components/zcash_address",
+  "components/zcash_encoding",
+  "components/zcash_protocol",
+  "components/zip321",
+  "pczt",
+  "zcash",
+  "zcash_client_backend",
+  "zcash_client_memory",
+  "zcash_client_sqlite",
+  "zcash_extensions",
+  "zcash_history",
+  "zcash_keys",
+  "zcash_primitives",
+  "zcash_proofs",
+  "zcash_transparent",
 ]
 
 resolver = "2"
@@ -40,11 +40,11 @@ zcash_address = { version = "0.10", path = "components/zcash_address", default-f
 zcash_client_backend = { version = "0.21", path = "zcash_client_backend" }
 zcash_encoding = { version = "0.3", path = "components/zcash_encoding", default-features = false }
 zcash_keys = { version = "0.12", path = "zcash_keys" }
-zcash_protocol = { version = "0.7", path = "components/zcash_protocol", default-features = false }
+zcash_protocol = { version = "0.7", path = "components/zcash_protocol", default-features = true }
 zip321 = { version = "0.6", path = "components/zip321" }
 
 zcash_note_encryption = "0.4.1"
-zcash_primitives = { version = "0.26", path = "zcash_primitives", default-features = false }
+zcash_primitives = { version = "0.26", path = "zcash_primitives", default-features = true }
 zcash_proofs = { version = "0.26", path = "zcash_proofs", default-features = false }
 
 pczt = { version = "0.5", path = "pczt" }
@@ -71,7 +71,9 @@ orchard = { version = "0.11", default-features = false }
 pasta_curves = "0.5"
 
 # - Transparent
-bip32 = { version = "=0.6.0-pre.1", default-features = false, features = ["alloc"] }
+bip32 = { version = "=0.6.0-pre.1", default-features = false, features = [
+  "alloc",
+] }
 block-buffer = { version = "=0.11.0-rc.3" } # later RCs require edition2024
 crypto-common = { version = "=0.2.0-rc.1" } # later RCs require edition2024
 ripemd = { version = "0.1", default-features = false }
@@ -90,7 +92,9 @@ rand_core = { version = "0.6", default-features = false }
 rand_distr = { version = "0.4", default-features = false }
 
 # Currency conversions
-rust_decimal = { version = "1.35", default-features = false, features = ["serde"] }
+rust_decimal = { version = "1.35", default-features = false, features = [
+  "serde",
+] }
 
 # Digests
 blake2b_simd = { version = "1", default-features = false }
@@ -103,7 +107,10 @@ document-features = "0.2"
 base64 = "0.22"
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
 bitflags = "2"
-bs58 = { version = "0.5", default-features = false, features = ["alloc", "check"] }
+bs58 = { version = "0.5", default-features = false, features = [
+  "alloc",
+  "check",
+] }
 byteorder = "1"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 percent-encoding = "2.1.0"
@@ -160,7 +167,7 @@ static_assertions = "1"
 ambassador = "0.4"
 assert_matches = "1.5"
 criterion = "0.5"
-proptest = ">=1,<1.7" # proptest 1.7 updates to rand 0.9
+proptest = ">=1,<1.7"                 # proptest 1.7 updates to rand 0.9
 rand_chacha = "0.3"
 rand_xorshift = "0.3"
 incrementalmerkletree-testing = "0.3"
@@ -168,7 +175,11 @@ incrementalmerkletree-testing = "0.3"
 # Tor
 # - `arti-client` depends on `rusqlite`, and a version mismatch there causes a compilation
 #   failure due to incompatible `libsqlite3-sys` versions.
-arti-client = { version = "0.35", default-features = false, features = ["compression", "rustls", "tokio"] }
+arti-client = { version = "0.35", default-features = false, features = [
+  "compression",
+  "rustls",
+  "tokio",
+] }
 dynosaur = "0.3"
 fs-mistrust = "0.12"
 tokio = "1"
@@ -191,7 +202,7 @@ pre-release-commit-message = "{{crate_name}} {{version}}"
 tag-message = "Release {{crate_name}} version {{version}}"
 tag-name = "{{prefix}}{{version}}"
 pre-release-replacements = [
-  {file="CHANGELOG.md", search="## \\[Unreleased\\]", replace="## [Unreleased]\n\n## [{{version}}] - {{date}}"},
+  { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}" },
 ]
 pre-release-hook = ["cargo", "vet"]
 # Remove the following options once we're happy to use `cargo-release` without review.
