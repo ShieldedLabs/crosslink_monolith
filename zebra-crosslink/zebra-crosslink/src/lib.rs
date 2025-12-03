@@ -566,7 +566,7 @@ async fn new_decided_bft_block_from_malachite(
     assert_eq!(
         validate_bft_block_from_malachite(&tfl_handle, new_block)
             .await,
-        tenderlink::TMStatus::Pass
+        (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None)
     );
 
     let new_final_hash = new_block.headers.first().expect("at least 1 header").hash();
@@ -819,7 +819,7 @@ fn tenderlink_roster_from_internal(vals: &[MalValidator]) -> Vec<SortedRosterMem
 async fn validate_bft_block_from_malachite(
     tfl_handle: &TFLServiceHandle,
     new_block: &BftBlock,
-) -> tenderlink::TMStatus {
+) -> (tenderlink::TMStatus, tenderlink::TMStatusReason) {
     let mut internal = tfl_handle.internal.lock().await;
     let call = tfl_handle.call.clone();
     let params = &PROTOTYPE_PARAMETERS;
@@ -832,7 +832,7 @@ async fn validate_bft_block_from_malachite(
             new_block.previous_block_fat_ptr.points_at_block_hash(),
             internal.fat_pointer_to_tip.points_at_block_hash(),
         );
-        return tenderlink::TMStatus::Fail;
+        return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
     }
     drop(internal);
 
@@ -845,9 +845,9 @@ async fn validate_bft_block_from_malachite(
                 "Didn't have hash available for confirmation: {}",
                 new_final_hash
             );
-            return tenderlink::TMStatus::Indeterminate;
+            return (tenderlink::TMStatus::Indeterminate, tenderlink::TMStatusReason::NeedsBlock { hash: new_final_hash.0 });
         };
-    return tenderlink::TMStatus::Pass;
+    return (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None);
 }
 
 fn fat_pointer_to_block_at_height(
@@ -1265,7 +1265,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle) -> Result<(), 
                         validate_bft_block_from_malachite(&tfl_handle2, &bft_block).await
                     } else {
                         error!("Failed to deserialize Tenderlink payload.");
-                        tenderlink::TMStatus::Fail
+                        (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None)
                     }
                 })
             })),

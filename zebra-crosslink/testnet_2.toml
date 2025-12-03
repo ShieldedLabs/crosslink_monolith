@@ -46,14 +46,14 @@ network = "Testnet"
 peerset_initial_target_size = 25
 
 [rpc]
-cookie_dir = "C:/Users/azmre/AppData/Local/zebra_regtestnet_2"
+cookie_dir = "C:/Users/Madina/AppData/Local/zebra_testnet_2"
 debug_force_finished_sync = false
 enable_cookie_auth = false
 parallel_cpu_threads = 0
 listen_addr = "127.0.0.1:38232"
 
 [state]
-cache_dir = "C:/Users/azmre/AppData/Local/zebra_regtestnet_2"
+cache_dir = "C:/Users/Madina/AppData/Local/zebra_testnet_2"
 delete_old_database = true
 ephemeral = false
 

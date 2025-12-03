@@ -173,7 +173,7 @@ pub fn spawn_new_tfl_service(
         let handle = handle_mtx2.lock().unwrap().clone().unwrap();
         Box::pin(async move {
             let accepted = if fat_pointer.points_at_block_hash() == block.blake3_hash() {
-                crate::validate_bft_block_from_malachite(&handle, block.as_ref()).await
+                crate::validate_bft_block_from_malachite(&handle, block.as_ref()).await.0
                     == tenderlink::TMStatus::Pass
             } else {
                 false

@@ -21,6 +21,7 @@ const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
 const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
+const PRINT_POWLINK:        bool = 1 == 1;
 
 
 // MTU discovery is an option, but for now we're adopting a very conservative and VPN-friendly fixed-value MTU.
@@ -176,7 +177,7 @@ impl std::fmt::Debug for ClosureToProposeNewBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToProposeNewBlock(..)") }
 }
 #[derive(Clone)]
-pub struct ClosureToValidateProposedBlock(pub Arc<dyn for<'a> Fn(&'a BlockValue)-> core::pin::Pin<Box<dyn Future<Output = TMStatus> + Send + 'a>> + Send + Sync + 'static>);
+pub struct ClosureToValidateProposedBlock(pub Arc<dyn for<'a> Fn(&'a BlockValue)-> core::pin::Pin<Box<dyn Future<Output = (TMStatus, TMStatusReason)> + Send + 'a>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToValidateProposedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToValidateProposedBlock(..)") }
 }
@@ -337,8 +338,16 @@ pub enum TMStatus {
     Fail, // f+1 no
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum TMStatusReason {
+    #[default] None,
+    NeedsBlock {
+        hash: [u8; 32]
+    },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct ValueId([u8; 32]);
+struct ValueId(pub [u8; 32]);
 impl ValueId { const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
 impl std::fmt::Debug   for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "VId{", &self.0)?; write!(f, "}}") } }
@@ -350,7 +359,7 @@ impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<
 impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Pub{", &self.0[..2])?; write!(f, "}}") } }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct TMSig ([u8; 64]);
+struct TMSig(pub [u8; 64]);
 impl TMSig {
     const NIL: Self = Self([0; 64]);
     fn verify(&self, pub_key: PubKeyID, signed_data: &[u8]) -> Result<(), (ed25519_zebra::Error, &str)> {
@@ -372,7 +381,7 @@ struct RoundData {
     proposal_sigs: Vec<TMSig>,
     proposal_sigs_n: usize, // filling sigs with random-access
     proposal_id: ValueId,
-    proposal_checked_validity: TMStatus,
+    proposal_checked_validity: (TMStatus, TMStatusReason),
     // TODO: handle early outs because of this
     proposal_is_faulty: bool,
 
@@ -395,7 +404,7 @@ impl RoundData {
         proposal_sigs: Vec::new(),
         proposal_sigs_n: 0,
         proposal_id: ValueId::NIL,
-        proposal_checked_validity: TMStatus::Indeterminate,
+        proposal_checked_validity: (TMStatus::Indeterminate, TMStatusReason::None),
         proposal_is_faulty: false,
         // TODO: probably put both step messages next to each other
         msg_val_sigs: Vec::new(),
@@ -415,14 +424,14 @@ impl RoundData {
     // auto-caching
     async fn proposal_is_valid(&mut self, validate_closure: ClosureToValidateProposedBlock) -> TMStatus {
         // TODO: may want to start doing some of these on < proposal_chunks_n, i.e. shortcut known-invalid
-        if self.proposal_checked_validity == TMStatus::Indeterminate {
+        if self.proposal_checked_validity.0 == TMStatus::Indeterminate {
             if self.proposal_is_faulty {
-                self.proposal_checked_validity = TMStatus::Fail;
+                self.proposal_checked_validity = (TMStatus::Fail, TMStatusReason::None);
             } else if self.has_full_proposal() {
                 self.proposal_checked_validity = validate_closure.0(&self.proposal).await;
             }
         }
-        self.proposal_checked_validity
+        self.proposal_checked_validity.0
     }
 }
 
@@ -569,6 +578,8 @@ impl Default for HashKeys {
     }
 }
 
+use std::collections::HashSet;
+
 #[derive(Debug)]
 struct TMState {
     hash_keys: HashKeys,
@@ -597,6 +608,8 @@ struct TMState {
 
     roster_cmd: Option<String>,
     update_roster_cmd_closure: ClosureToUpdateRosterCmd,
+
+    powlink_hashes: HashSet<BlockHash>,
 }
 impl TMState {
     fn init(
@@ -626,6 +639,8 @@ impl TMState {
             get_block_closure,
             roster_cmd: None,
             update_roster_cmd_closure,
+
+            powlink_hashes: HashSet::new(),
         }
     }
 
@@ -1241,6 +1256,24 @@ impl TMState {
                     },
                 }
             }
+
+
+            // If this value would have been decided, but we can't validate it because we need its PoW block, let's mark this hash as required
+            if (self.height == self.rounds_data[i].height &&
+                self.rounds_data[i].has_full_proposal() && // has_enough_info_to_determine_validity &&
+                big_threshold <= counts.yes_precommits &&
+                self.rounds_data[i].proposal_checked_validity.0 == TMStatus::Indeterminate)
+            {
+                match self.rounds_data[i].proposal_checked_validity.1 {
+                    TMStatusReason::NeedsBlock { hash } => {
+                        self.powlink_hashes.insert(BlockHash(hash));
+                        let len = self.powlink_hashes.len();
+                        if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash); }
+                        if PRINT_POWLINK { println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
+                    },
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -1282,7 +1315,8 @@ struct Peer {
 
     connection_is_unknown: bool,
 
-    unacted_upon_status_height: Option<u64>,
+    latest_status_request_height: Option<u64>,
+    latest_status_request_powlink: Option<BlockHash>,
     latest_status: Option<PacketStatus>,
 }
 impl Default for Peer {
@@ -1297,7 +1331,8 @@ impl Default for Peer {
             transport: PeerTransport::default(),
 
             connection_is_unknown: false,
-            unacted_upon_status_height: None,
+            latest_status_request_height: None,
+            latest_status_request_powlink: None,
             latest_status: None,
         }
     }
@@ -1321,7 +1356,8 @@ struct UnknownPeer {
     watch_dog: Instant,
 
     transport: PeerTransport,
-    unacted_upon_status_height: Option<u64>,
+    latest_status_request_height: Option<u64>,
+    latest_status_request_powlink: Option<BlockHash>,
 }
 
 #[derive(Clone, Copy)]
@@ -1502,6 +1538,21 @@ pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize
     rngs
 }
 
+fn powlink_peer(ctx_str: &str,
+                stats: &mut NetworkStats,
+                send_buf1: &mut [u8],
+                send_buf2: &mut [u8],
+                peer_transport: &mut PeerTransport,
+                peer_endpoint: SecureUdpEndpoint,
+                peer_snow_state: &mut snow::StatelessTransportState,
+                hash: BlockHash) {
+    if hash == BlockHash::NIL {
+        return;
+    }
+
+
+}
+
 async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
     let block_rng = Arc::new(Mutex::new({
         let seed : u128 = maybe_seed.clone().unwrap_or_else(|| {
@@ -1531,10 +1582,10 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         })),
         ClosureToValidateProposedBlock(Arc::new(move |block| {
             Box::pin(async move {
-                if block.0.len() == 0 { TMStatus::Fail }
-                else if block.0[0] % 2 == 0 { TMStatus::Pass }
-                //else if block.0[0] % 3 == 1 { TMStatus::Indeterminate }
-                else { TMStatus::Fail }
+                if block.0.len() == 0 { (TMStatus::Fail, TMStatusReason::None) }
+                else if block.0[0] % 2 == 0 { (TMStatus::Pass, TMStatusReason::None) }
+                //else if block.0[0] % 3 == 1 { (TMStatus::Indeterminate, TMStatusReason::None) }
+                else { (TMStatus::Fail, TMStatusReason::None) }
             })
         })),
         ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer| {
@@ -1657,7 +1708,16 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     round: bft_state.round,
                     need_proposal_chunk_rngs: [[0, 0]],
                     need_vote_rngs: [[[0, active_roster_len(roster) as u16]]; 2],
+                    powlink_hashes: [BlockHash::NIL; 1],
                 };
+                {
+                    let mut i = 0;
+                    for hash in &bft_state.powlink_hashes {
+                        if i >= bft_state.powlink_hashes.len() { break; }
+                        status.powlink_hashes[i] = *hash;
+                        i += 1;
+                    }
+                }
 
 
                 // TODO: scope down required ranges
@@ -1817,7 +1877,8 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                         peer.pending_client_ack_snow_state = None;
                         peer.snow_state = None;
                         peer.watch_dog = Instant::now();
-                        peer.unacted_upon_status_height = None;
+                        peer.latest_status_request_height = None;
+                        peer.latest_status_request_powlink = None;
                         peer.latest_status = None;
                     }
 
@@ -2048,9 +2109,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                 for peer_i in 0..peers.len() {
                     let peer = &mut peers[peer_i];
                     if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
-                    if let Some(height) = peer.unacted_upon_status_height && height < bft_state.height {
-                        peer.unacted_upon_status_height = None;
+                    if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
+                        peer.latest_status_request_height = None;
                         send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
+                    }
+                    if let Some(hash) = peer.latest_status_request_powlink {
+                        peer.latest_status_request_powlink = None;
+                        powlink_peer(&ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash);
                     }
                     else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                     {
@@ -2074,9 +2139,13 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 
                 for peer_i in 0..unknown_peers.len() {
                     let peer = &mut unknown_peers[peer_i];
-                    if let Some(height) = peer.unacted_upon_status_height && height < bft_state.height {
-                        peer.unacted_upon_status_height = None;
+                    if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
+                        peer.latest_status_request_height = None;
                         send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, [0; 32], &sock, &mut net_stats);
+                    }
+                    if let Some(hash) = peer.latest_status_request_powlink {
+                        peer.latest_status_request_powlink = None;
+                        powlink_peer(&ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, hash);
                     }
 
                     if let Some(cmd) = &roster_cmd {
@@ -2403,7 +2472,15 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                             print_packet_tag_send(header);
                             send_sock_msg(&ctx_str, &mut transport, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
                             transport.nonce += 1;
-                            unknown_peers.push(UnknownPeer { endpoint: client_endpoint, snow_state: stateless_snow_state, pending_client_ack: true, watch_dog: Instant::now(), transport, unacted_upon_status_height: None });
+                            unknown_peers.push(UnknownPeer {
+                                endpoint: client_endpoint,
+                                snow_state: stateless_snow_state,
+                                pending_client_ack: true,
+                                watch_dog: Instant::now(),
+                                transport,
+                                latest_status_request_height: None,
+                                latest_status_request_powlink: None,
+                            });
                         }
                         break;
                     }
@@ -2427,7 +2504,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
             process_acks(&mut peer.transport, header);
 
             if let Some(status) = status {
-                peer.unacted_upon_status_height = Some(status.height);
+                peer.latest_status_request_height = Some(status.height);
             }
 
             match packet_type {
@@ -2472,7 +2549,7 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
                     peer.connection_is_unknown = false;
                 }
 
-                peer.unacted_upon_status_height = Some(status.height);
+                peer.latest_status_request_height = Some(status.height);
                 peer.latest_status = Some(status);
             }
 
@@ -2540,32 +2617,31 @@ pub async fn entry_point(my_root_private_key: SigningKey, my_static_keypair: Opt
 }
 
 // network
-const PACKET_TYPE_EMPTY                : u8 =  0;
-const PACKET_TYPE_CLIENT_HELLO         : u8 =  1;
-const PACKET_TYPE_CLIENT_UNKNOWN_ACK   : u8 =  2;
-const PACKET_TYPE_CLIENT_ACK           : u8 =  3;
-const PACKET_TYPE_SERVER_UNKNOWN_HELLO : u8 =  4;
-const PACKET_TYPE_SERVER_HELLO         : u8 =  5;
-const PACKET_TYPE_ENDPOINT_EVIDENCE    : u8 =  6;
+const PACKET_TYPE_EMPTY:                u8 =  0;
+const PACKET_TYPE_CLIENT_HELLO:         u8 =  1;
+const PACKET_TYPE_CLIENT_UNKNOWN_ACK:   u8 =  2;
+const PACKET_TYPE_CLIENT_ACK:           u8 =  3;
+const PACKET_TYPE_SERVER_UNKNOWN_HELLO: u8 =  4;
+const PACKET_TYPE_SERVER_HELLO:         u8 =  5;
+const PACKET_TYPE_ENDPOINT_EVIDENCE:    u8 =  6;
 // consensus
-const PACKET_TYPE_PROPOSAL_CHUNK       : u8 =  7;
-const PACKET_TYPE_PREVOTE_SIGNATURES   : u8 =  8;
-const PACKET_TYPE_PRECOMMIT_SIGNATURES : u8 =  9;
+const PACKET_TYPE_PROPOSAL_CHUNK:       u8 =  7;
+const PACKET_TYPE_PREVOTE_SIGNATURES:   u8 =  8;
+const PACKET_TYPE_PRECOMMIT_SIGNATURES: u8 =  9;
 // misc
-const PACKET_TYPE_ROSTER_CMD           : u8 = 10;
-const PACKET_TYPE_POW_REQUEST          : u8 = 11;
-const PACKET_TYPE_POW_RESPONSE         : u8 = 12;
-const PACKET_TYPE_COUNT                : u8 = 13;
+const PACKET_TYPE_ROSTER_CMD:           u8 = 10;
+const PACKET_TYPE_POWLINK:              u8 = 11;
+const PACKET_TYPE_COUNT:                u8 = 12;
 
 
-const PACKET_TYPE_BITS                 : u8 =  7;
-const PACKET_TYPE_MASK                 : u8 = (1 << PACKET_TYPE_BITS) - 1;
+const PACKET_TYPE_BITS:                 u8 =  7;
+const PACKET_TYPE_MASK:                 u8 = (1 << PACKET_TYPE_BITS) - 1;
 
-const PACKET_TAG_STATUS_SHIFT          : u8 = PACKET_TYPE_BITS;
-const PACKET_TAG_STATUS_FLAG           : u8 = 1 << PACKET_TAG_STATUS_SHIFT;
+const PACKET_TAG_STATUS_SHIFT:          u8 = PACKET_TYPE_BITS;
+const PACKET_TAG_STATUS_FLAG:           u8 = 1 << PACKET_TAG_STATUS_SHIFT;
 
-const PACKET_TAG_BITS                  : u8 = 8;
-const PACKET_TAG_MASK                  : u8 = ((1 << PACKET_TAG_BITS as u64) - 1) as u8;
+const PACKET_TAG_BITS:                  u8 = 8;
+const PACKET_TAG_MASK:                  u8 = ((1 << PACKET_TAG_BITS as u64) - 1) as u8;
 
 
 const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
@@ -2581,9 +2657,8 @@ const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES",     "STATUS+PRECOMMIT_SIGNATURES"];
     names[PACKET_TYPE_ROSTER_CMD           as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
-    names[PACKET_TYPE_POW_REQUEST          as usize] = ["PACKET_TYPE_POW_REQUEST",  "STATUS+PACKET_TYPE_POW_REQUEST"];
-    names[PACKET_TYPE_POW_RESPONSE         as usize] = ["PACKET_TYPE_POW_RESPONSE", "STATUS+PACKET_TYPE_POW_RESPONSE"];
-    const_assert!(PACKET_TYPE_COUNT == 13); // keep names array updated when adding other tags
+    names[PACKET_TYPE_POWLINK              as usize] = ["PACKET_TYPE_POWLINK",      "STATUS+PACKET_TYPE_POWLINK"];
+    const_assert!(PACKET_TYPE_COUNT == 12); // keep names array updated when adding other tags
     names
 };
 fn packet_name_from_tag(packet_tag: u8) -> &'static str {
@@ -2604,6 +2679,9 @@ fn print_packet_tag_recv(header: PacketHeader) {
 // N.B. with ranges like this, we either want to be half-exclusive & not allow type::MAX values, or use a special value for empty (e.g. hi < lo)
 type ProposalRng = [u32; 2]; // [lo, hi)
 type VoteRng     = [u16; 2];
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct BlockHash(pub [u8; 32]);
+impl BlockHash { const NIL: Self = Self([0; 32]); }
 const STATUS_PROPOSAL_RNGS_N: usize = 1;
 const STATUS_VOTE_RNGS_N: usize = 1; // ALT: split prevote/precommit numbers
 #[derive(Clone, Debug)]
@@ -2612,6 +2690,7 @@ struct PacketStatus {
     round:  u32, // as context for following request ranges
     need_proposal_chunk_rngs: [ProposalRng; STATUS_PROPOSAL_RNGS_N],
     need_vote_rngs: [[VoteRng; STATUS_VOTE_RNGS_N]; 2], // 1 for prevote, 1 for precommit
+    powlink_hashes: [BlockHash; 1], // blocks needed
 }
 impl PacketStatus {
     pub fn write_to(&self, buf: &mut[u8]) -> usize {
@@ -2628,6 +2707,9 @@ impl PacketStatus {
                 o += vote_rng[1].write_to(&mut buf[o..]);
             }
         }
+        for hash in &self.powlink_hashes {
+            o += hash.0.write_to(&mut buf[o..]);
+        }
         o
     }
 
@@ -2636,6 +2718,7 @@ impl PacketStatus {
             height: 0, round: 0,
             need_proposal_chunk_rngs: [[0;2]; STATUS_PROPOSAL_RNGS_N],
             need_vote_rngs: [[[0;2]; STATUS_VOTE_RNGS_N]; 2],
+            powlink_hashes: [BlockHash::NIL; 1]
         };
         packet.height = r.read_u64::<LittleEndian>()?;
         packet.round = r.read_u32::<LittleEndian>()?;
@@ -2648,6 +2731,9 @@ impl PacketStatus {
                 vote_rng[0] = r.read_u16::<LittleEndian>()?;
                 vote_rng[1] = r.read_u16::<LittleEndian>()?;
             }
+        }
+        for hash in &mut packet.powlink_hashes {
+            r.read_exact(&mut hash.0)?;
         }
         Ok(packet)
     }

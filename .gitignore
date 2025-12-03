@@ -8,3 +8,5 @@
 */target
 *.local.toml
 zebra-gui/icon-font/fontello-*/
+zebra-crosslink/zebra_testnet.zip
+zebra-crosslink/zebra_testnet
