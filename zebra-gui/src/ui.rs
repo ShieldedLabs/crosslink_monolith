@@ -1,5 +1,6 @@
 #![allow(warnings)]
 
+use std::net::Shutdown;
 use std::thread::current;
 use std::{hash::Hash};
 use winit::{event::MouseButton, keyboard::KeyCode};
@@ -1168,22 +1169,29 @@ pub fn ui_left_pane(ui: &mut Context,
             balance,
             pending_balance,
             staked_balance,
+            show_staked_balance,
         ) = {
             let wallet_state = wallet_state.lock().unwrap();
             (
                 wallet_state.balance,
                 wallet_state.pending_balance,
                 wallet_state.staked_balance,
+                wallet_state.show_staked_balance,
             )
         };
 
         // balance container
-        let balance_id = id("Balance Text");
         let mut balance = balance;
         let mut colour  = WHITE;
-        if ui.hovered(balance_id) {
+        if show_staked_balance {
             balance = staked_balance;
             colour  = (0xff, 0xaf, 0x0e, 0xff);
+        }
+
+        let balance_id = id("Balance Text");
+        let (clicked, colour, _) = ui.button_ex(true, colour, balance_id, true, true);
+        if clicked {
+            wallet_state.lock().unwrap().show_staked_balance = !show_staked_balance;
         }
 
         if let _ = elem().decl(Decl {
@@ -1194,7 +1202,8 @@ pub fn ui_left_pane(ui: &mut Context,
             align: Center,
             ..Decl
         }) {
-            let balance_str = frame_strf!(data, "{} cTAZ", str_from_ctaz(balance.try_into().unwrap()));
+            let suffix = if !show_staked_balance && staked_balance > 0 { "*" } else { "" };
+            let balance_str = frame_strf!(data, "{} cTAZ{}", str_from_ctaz(balance.try_into().unwrap()), suffix);
             ui.text(&balance_str, TextDecl { colour, h: balance_text_h, align: AlignX::Center, ..TextDecl });
         }
 
