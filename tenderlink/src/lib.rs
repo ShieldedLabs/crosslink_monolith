@@ -1552,29 +1552,6 @@ pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize
     rngs
 }
 
-async fn powlink_peer(bft_state: &TMState, // @Phillip
-                ctx_str: &str,
-                stats: &mut NetworkStats,
-                send_buf1: &mut [u8],
-                send_buf2: &mut [u8],
-                peer_transport: &mut PeerTransport,
-                peer_endpoint: SecureUdpEndpoint,
-                peer_snow_state: &mut snow::StatelessTransportState,
-                hash: BlockHash) -> std::io::Result<()> {
-    if hash == BlockHash::NIL {
-        return Ok(());
-    }
-
-    if let Some(bytes) = bft_state.get_pow_closure.0(hash.0).await {
-        eprintln!("\n\n\n\n\n\n\n\n@Phillip: PoW bytes obtained!!! :) Hash: {:?}\n\n\n\n\n\n\n\n", hash);
-
-        Ok(())
-    } else {
-
-        Ok(()) // @TODO: return error result i guess
-    }
-}
-
 async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
     let block_rng = Arc::new(Mutex::new({
         let seed : u128 = maybe_seed.clone().unwrap_or_else(|| {
@@ -1870,6 +1847,62 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             transport.nonce += 1;
         }
 
+        async fn powlink_peer(bft_state: &TMState, // @Phillip
+                            ctx_str: &str,
+                            stats: &mut NetworkStats,
+                            send_buf1: &mut [u8],
+                            send_buf2: &mut [u8],
+                            sock: &tokio::net::UdpSocket,
+                            peer_transport: &mut PeerTransport,
+                            peer_endpoint: SecureUdpEndpoint,
+                            peer_snow_state: &mut snow::StatelessTransportState,
+                            hash: BlockHash,
+                            chunk_needed_i: u16) -> std::io::Result<()> {
+            let chunk_needed_i = chunk_needed_i as usize;
+
+            if hash == BlockHash::NIL {
+                return Ok(());
+            }
+
+            let bytes = {
+                if let Some(bytes) = bft_state.get_pow_closure.0(hash.0).await {
+                    bytes
+                } else {
+                    return Ok(()); // @TODO: return error result i guess
+                }
+            };
+
+            // eprintln!("\n\n\n\n\n\n\n\n@Phillip: PoW bytes obtained!!! :) Hash: {:?}\n\n\n\n\n\n\n\n", hash);
+
+            let chunks_n = powlink_chunks_n(bytes.len());
+            if chunk_needed_i >= chunks_n {
+                return Ok(()); // all bytes sent
+            }
+
+            let block_size = bytes.len().try_into().unwrap();
+            let bytes      = &bytes[..];
+
+            for chunk_i in chunk_needed_i..(chunk_needed_i + 1).min(chunks_n) {
+                let (chunk_o, chunk_size) = powlink_chunk_o_size(bytes.len(), chunk_i);
+                let chunk_i: u16          = chunk_i.try_into().unwrap();
+                let chunk                 = PacketPowlinkChunkHeader { hash, block_size, chunk_i };
+                let data                  = &bytes[chunk_o..chunk_o + chunk_size];
+
+                let header = PacketHeader::new::<PACKET_TYPE_POWLINK_CHUNK>(peer_transport.ack_latest, peer_transport.ack_field); // @TodoHeaderAndStatus
+
+                let mut o  = 0;
+                o += header.write_to(&mut send_buf1[o..]);
+                o += chunk .write_to(&mut send_buf1[o..]);
+                o += data  .write_to(&mut send_buf1[o..]);
+
+                if PRINT_POWLINK { eprintln!("{} sending PoW block hash {:?} chunk {} to {:?}", ctx_str, hash, chunk_i, peer_endpoint); }
+                print_packet_tag_send(header);
+                send_noise_msg(&ctx_str, peer_transport, peer_snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
+            }
+
+            Ok(())
+        }
+
         fn process_acks(transport: &mut PeerTransport, header: PacketHeader) {
             let now = Instant::now();
 
@@ -2162,7 +2195,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     }
                     if let Some((hash, chunk_i)) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
                         peer.latest_status_request_powlink = None;
-                        powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash).await;
+                        powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &sock, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash, chunk_i).await;
                     }
                     else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                     {
@@ -2192,7 +2225,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     }
                     if let Some((hash, chunk_i)) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
                         peer.latest_status_request_powlink = None;
-                        powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, hash).await;
+                        powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &sock, &mut peer.transport, peer.endpoint, &mut peer.snow_state, hash, chunk_i).await;
                     }
 
                     if let Some(cmd) = &roster_cmd {
@@ -2960,49 +2993,43 @@ pub struct Powlink {
     pub data: Vec<u8>, // the block as bytes
     pub block: Option<Arc<zebra_chain::block::Block>>,
 }
-impl Powlink {
-    fn chunks_n(&self) -> usize {
-        self.data.len().div_ceil(POWLINK_CHUNK_DATA_SIZE)
-    }
-    fn chunk_o_size(&self, chunk_i: usize) -> (usize, usize) {
-        let o = chunk_i * POWLINK_CHUNK_DATA_SIZE;
-        (o, usize::min(POWLINK_CHUNK_DATA_SIZE, self.data.len() - o))
-    }
+fn powlink_chunks_n(len: usize) -> usize {
+    len.div_ceil(POWLINK_CHUNK_DATA_SIZE)
+}
+fn powlink_chunk_o_size(len: usize, chunk_i: usize) -> (usize, usize) {
+    let o = chunk_i * POWLINK_CHUNK_DATA_SIZE;
+    (o, usize::min(POWLINK_CHUNK_DATA_SIZE, len - o))
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PacketPowlinkChunk {
+pub struct PacketPowlinkChunkHeader {
     pub hash:       BlockHash,
     pub block_size: u32,
     pub chunk_i:    u16,
-    pub data:       [u8; 1000],
 }
-impl Default for PacketPowlinkChunk {
+impl Default for PacketPowlinkChunkHeader {
     fn default() -> Self {
         Self {
             hash:       BlockHash::NIL,
             block_size: 0,
             chunk_i:    0,
-            data:       [0; 1000],
         }
     }
 }
-impl PacketPowlinkChunk {
+impl PacketPowlinkChunkHeader {
     fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = 0;
         o += self.hash    .0.write_to(&mut buf[o..]);
         o += self.block_size.write_to(&mut buf[o..]);
         o += self.chunk_i   .write_to(&mut buf[o..]);
-        o += self.data      .write_to(&mut buf[o..]);
         o
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
-        let mut packet = PacketPowlinkChunk::default();
+        let mut packet = PacketPowlinkChunkHeader::default();
         r.read_exact(&mut packet.hash.0)?;
         packet.block_size = r.read_u32::<LittleEndian>()?;
         packet.chunk_i    = r.read_u16::<LittleEndian>()?;
-        r.read_exact(&mut packet.data)?;
 
         Ok(packet)
     }
