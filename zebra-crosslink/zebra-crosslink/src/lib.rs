@@ -1356,14 +1356,19 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle) -> Result<(), 
             tenderlink::ClosureToPushPow(Arc::new(move |block| { // @Phillip
                 let tfl_handle7 = tfl_handle7.clone();
                 Box::pin(async move {
-                    let is_block_known = is_block_known(&tfl_handle7.call, block.as_ref().header.as_ref().previous_block_hash).await;
-                    if is_block_known {
-                        let force_feed_ok = (tfl_handle7.call.force_feed_pow)(block).await;
-                        if force_feed_ok {
+                    let is_prev_block_known = is_block_known(&tfl_handle7.call, block.as_ref().header.as_ref().previous_block_hash).await;
+                    if is_prev_block_known {
+                        let is_this_block_known = is_block_known(&tfl_handle7.call, block.hash()).await;
+                        if is_this_block_known {
                             true
                         } else {
-                            eprintln!("\n\n\n\n\n\n\n\n@Phillip: Feeding the block failed!\n\n\n\n\n\n\n\n");
-                            false
+                            let force_feed_ok = (tfl_handle7.call.force_feed_pow)(block).await;
+                            if force_feed_ok {
+                                true
+                            } else {
+                                eprintln!("\n\n\n\n\n\n\n\n@Phillip: Feeding the block failed!\n\n\n\n\n\n\n\n");
+                                false
+                            }
                         }
                     } else {
                         false
