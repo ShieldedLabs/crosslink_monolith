@@ -18,7 +18,7 @@ fn main() {
             WalletTx::with_fake_data(WalletTxKind::Shield, 10_000_000_000, 0, true, "", 64),
             WalletTx::with_fake_data(WalletTxKind::Stake, 10_000_000_000, 0, false, "", 0),
             WalletTx::with_fake_data(WalletTxKind::Unstake, 10_000_000_000, 0, false, "", 0),
-            WalletTx::with_fake_data(WalletTxKind::Send, 100_000_000, 0, false, "Hello, world!", 0),
+            WalletTx::with_fake_data(WalletTxKind::Send, 100_000_000, 0, false, "Hello this is a test to see if the word wrapping works properly........", 0),
             WalletTx::with_fake_data(WalletTxKind::Receive, 0, 100_000_000, false, "Other things", 0),
             WalletTx::with_fake_data(WalletTxKind::Send, 250_000_000, 0, true, "More things", 0),
             WalletTx::with_fake_data(WalletTxKind::Shield, 10_000_000_000, 0, true, "", 73),
