@@ -88,7 +88,9 @@ use zcash_transparent::{
 };
 use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 
-const CHEAT_UNSTAKING: bool = true;
+const CHEAT_UNSTAKING: bool = false;
+
+pub static AM_I_THE_UNSTAKER: Mutex<bool> = Mutex::new(false);
 
 pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
@@ -1314,7 +1316,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     miner_txid_map = map;
                     miner_sent_txid_map = sent_map;
 
-                    if !CHEAT_UNSTAKING {
+                    if !CHEAT_UNSTAKING && *AM_I_THE_UNSTAKER.lock().unwrap() {
                         // TODO: does this have a race condition with syncing?
                         for (tx, (action, memos)) in &miner_txid_map {
                             let Some(action) = action else { continue; };

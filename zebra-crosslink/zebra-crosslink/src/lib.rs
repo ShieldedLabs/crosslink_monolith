@@ -114,6 +114,8 @@ pub mod config {
         pub malachite_peers: Vec<String>,
         /// Do not manipulate config
         pub do_not_manipulate_config: bool,
+        /// I am the unstaker.
+        pub i_am_the_unstaker: bool,
     }
     impl Default for Config {
         fn default() -> Self {
@@ -123,6 +125,7 @@ pub mod config {
                 insecure_user_name: None,
                 malachite_peers: Vec::new(),
                 do_not_manipulate_config: false,
+                i_am_the_unstaker: false,
             }
         }
     }
@@ -1183,6 +1186,10 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
     } else {
         format!("adrheardhed{:?}", global_seed)
     };
+
+    if config.i_am_the_unstaker {
+        *wallet::AM_I_THE_UNSTAKER.lock().unwrap() = true;
+    }
 
     let (mut rng, my_private_key, my_public_key) =
         rng_private_public_key_from_address(&user_name.as_bytes());
