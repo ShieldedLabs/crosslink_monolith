@@ -767,8 +767,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         if let Ok(chain_height) = miner_wallets[miner_update_i].chain_height() {
             if let Some(chain_height) = chain_height {
                 if network_tip_height == u64::from(chain_height) {
-                    println!("DOUBLE WALLET: flipping miner");
                     w_flip(&mut miner_use_i, &mut miner_update_i);
+                    println!("DOUBLE WALLET: flipping miner to {miner_use_i} at height {network_tip_height}");
                     (miner_wallets[miner_update_i], miner_account) = wallet_from_stuff(network, Secret::new(miner_seed.expose_secret().clone()));
                 }
             }
@@ -777,8 +777,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         if let Ok(chain_height) = user_wallets[user_update_i].chain_height() {
             if let Some(chain_height) = chain_height {
                 if network_tip_height == u64::from(chain_height) {
-                    println!("DOUBLE WALLET: flipping user");
                     w_flip(&mut user_use_i, &mut user_update_i);
+                    println!("DOUBLE WALLET: flipping user to {user_use_i} at height {network_tip_height}");
                     (user_wallets[user_update_i], user_account) = wallet_from_stuff(network, Secret::new(user_seed.expose_secret().clone()));
                 }
             }
