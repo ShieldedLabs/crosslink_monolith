@@ -236,6 +236,30 @@ async fn block_height_hash_from_hash(
     }
 }
 
+async fn block_from_hash( // @Phillip
+    call: &TFLServiceCalls,
+    hash: BlockHash,
+) -> Option<Arc<Block>> {
+    if let Ok(StateResponse::Block(Some(block))) = (call.state)(StateRequest::Block(zebra_state::HashOrHeight::Hash(hash.into()))).await {
+        let check_hash = block.as_ref().hash();
+        assert_eq!(hash, check_hash);
+        Some(block)
+    } else {
+        None
+    }
+}
+
+async fn is_block_known( // @Phillip
+    call: &TFLServiceCalls,
+    hash: BlockHash,
+) -> bool {
+    if let Ok(StateResponse::KnownBlock(Some(block))) = (call.state)(StateRequest::KnownBlock(hash.into())).await {
+        true
+    } else {
+        false
+    }
+}
+
 async fn _block_header_from_hash(
     call: &TFLServiceCalls,
     hash: BlockHash,
@@ -1235,6 +1259,8 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle) -> Result<(), 
         let tfl_handle2 = internal_handle.clone();
         let tfl_handle3 = internal_handle.clone();
         let tfl_handle4 = internal_handle.clone();
+        let tfl_handle5 = internal_handle.clone();
+        let tfl_handle6 = internal_handle.clone();
 
         use ed25519_zebra::VerificationKeyBytes;
         let tender_pub = VerificationKeyBytes::from(&my_private_key);
@@ -1288,6 +1314,54 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle) -> Result<(), 
                     panic!();
                 })
             })),
+            tenderlink::ClosureToGetPow(Arc::new(move |hash| { // @Phillip
+                let tfl_handle5 = tfl_handle5.clone();
+                Box::pin(async move {
+                    if let Some(block) = block_from_hash(&tfl_handle5.call, hash.into()).await {
+                        let mut serialized = Vec::new();
+                        if let Ok(()) = block.as_ref().zcash_serialize(&mut serialized) {
+                            let bytes = serialized.to_vec();
+                            Some(bytes)
+                        } else {
+                            eprintln!("\n\n\n\n\n\n\n\n@Phillip: Serializing failed for PoW block with hash {:?}.\n\n\n\n\n\n\n\n", hash);
+                            None
+                        }
+                    } else {
+                        eprintln!("\n\n\n\n\n\n\n\n@Phillip: Couldn't find PoW block for hash {:?}.\n\n\n\n\n\n\n\n", hash);
+                        None
+                    }
+                })
+            })),
+            // tenderlink::ClosureToParsePow(Arc::new(move |hash, bytes| { // @Phillip
+            //     Box::pin(async move {
+            //         if let Ok(block) = Block::zcash_deserialize(bytes) {
+            //             let check_hash = block.hash();
+            //             if check_hash == hash {
+            //                 Some(Arc::new(block), block.header.as_ref().previous_block_hash)
+            //             } else {
+            //                 eprintln!("\n\n\n\n\n\n\n\n@Phillip: Serializing the bytes succeeded but the block hash was different.\n\n\n\n\n\n\n\n");
+            //                 None
+            //             }
+            //         } else {
+            //             eprintln!("\n\n\n\n\n\n\n\n@Phillip: Deserializing the bytes failed.\n\n\n\n\n\n\n\n");
+            //             None
+            //         }
+            //     })
+            // })),
+            // tenderlink::ClosureToPushPow(Arc::new(move |block| { // @Phillip
+            //     Box::pin(async move {
+            //         let is_block_known = is_block_known(block.as_ref().header.as_ref().previous_block_hash).await
+            //         if is_block_known {
+            //             let force_feed_ok = (tfl_handle6.call.force_feed_pow)(block).await;
+            //             if force_feed_ok {
+            //                 Some()
+            //             } else {
+            //                 eprintln!("\n\n\n\n\n\n\n\n@Phillip: Feeding the block failed!\n\n\n\n\n\n\n\n");
+            //                 None
+            //             }
+            //         }
+            //     })
+            // })),
             tenderlink::ClosureToUpdateRosterCmd(Arc::new(move |str| {
                 let tfl_handle = tfl_handle4.clone();
                 Box::pin(async move {

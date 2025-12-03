@@ -53,17 +53,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .status()
             .expect("failed to build external binary");
 
-        fs::copy(
-            build_dir.join(format!("target/{profile}/zallet")),
-            target_dir.join("zallet"),
-        )
-        .unwrap_or_else(|_| {
-            panic!(
-                "failed to copy zallet binary from {} to {}",
-                build_dir.display(),
-                target_dir.display()
-            )
-        });
+        // @CrosslinkDevBuildIterationTimesOnly
+        // fs::copy(
+        //     build_dir.join(format!("target/{profile}/zallet")),
+        //     target_dir.join("zallet"),
+        // )
+        // .unwrap_or_else(|_| {
+        //     panic!(
+        //         "failed to copy zallet binary from {} to {}",
+        //         build_dir.display(),
+        //         target_dir.display()
+        //     )
+        // });
     }
 
     Ok(())

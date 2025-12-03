@@ -7,7 +7,7 @@ license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 categories.workspace = true
-build = "build.rs"
+# build = "build.rs" # // @CrosslinkDevBuildIterationTimesOnly
 
 # Exclude proto files so crates.io consumers don't need protoc.
 exclude = ["*.proto"]
