@@ -1895,7 +1895,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 o += chunk .write_to(&mut send_buf1[o..]);
                 o += data  .write_to(&mut send_buf1[o..]);
 
-                if PRINT_POWLINK { eprintln!("{} sending PoW block hash {:?} chunk {} to {:?}", ctx_str, hash, chunk_i, peer_endpoint); }
+                if PRINT_POWLINK { eprintln!("{} PowLink: sending PoW block hash {:?} chunk {} to {:?}", ctx_str, hash, chunk_i, peer_endpoint); }
                 print_packet_tag_send(header);
                 send_noise_msg(&ctx_str, peer_transport, peer_snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
             }
@@ -2576,7 +2576,75 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         };
         let packet_type = header.type_();
 
-        // if packet_type == PACKET_TYPE_POWLINK_CHUNK
+        if packet_type == PACKET_TYPE_POWLINK_CHUNK {
+            let ctx_str = bft_state.ctx_str(&roster);
+
+            let hdr = match PacketPowlinkChunkHeader::read_from(&msg[read_o..]) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("{}: PowLink: couldn't read chunk header: {}", ctx_str, err);
+                    continue;
+                }
+            };
+            let hash        = hdr.hash;
+            let block_size  = hdr.block_size as usize;
+            let chunk_i     = hdr.chunk_i    as usize;
+            let chunk_size  = usize::min(POWLINK_CHUNK_DATA_SIZE, block_size - chunk_i * POWLINK_CHUNK_DATA_SIZE);
+            let packet_size = PACKET_HEADER_SIZE + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
+            let chunks_n    = powlink_chunks_n(block_size);
+
+            if hdr.block_size as usize > POWLINK_MAX_DATA_SIZE {
+                eprintln!("{}: PowLink: Block was too big: {} bytes (max 2,000,000)", ctx_str, hdr.block_size);
+                continue;
+            }
+            if chunk_i >= chunks_n {
+                eprintln!("{}: PowLink: Chunk index #{} out of bounds (maximum {} -- the block size is {})", ctx_str, chunk_i, chunks_n, block_size);
+                continue;
+            }
+
+            if msg.len() != packet_size {
+                eprintln!("{}: PowLink: Couldn't read chunk #{}: incorrect size {} (wanted {})", ctx_str, chunk_i, msg.len(), packet_size);
+                continue;
+            }
+
+            if let Some(powlink) = bft_state.powlinks.get_mut(&hash) {
+                if (powlink.chunk_i as usize) < chunk_i {
+                    eprintln!("{}: PowLink: Unfortunately dropping chunk {} for block {:?} because it is {} chunks ahead of our current edge {}", ctx_str, chunk_i, hash, (chunk_i - powlink.chunk_i as usize), powlink.chunk_i);
+                    continue;
+                }
+                if (powlink.chunk_i as usize) > chunk_i {
+                    eprintln!("{}: PowLink: Discarding redundant chunk {} for block {:?} because it is {} chunks behind our current edge {}", ctx_str, chunk_i, hash, (powlink.chunk_i as usize - chunk_i), powlink.chunk_i);
+                    continue;
+                }
+
+                // Just expand or shrink to "new" block size. PowLink is not trustless anyway, so nothing important is worth doing here to ward off adversaries.
+                if powlink.data.len() != 0 &&
+                   powlink.data.len() != block_size {
+                    eprintln!("{}: PowLink: Warning: Block size changed for hash {:?}. Shenanigans afoot.", ctx_str, hash);
+                }
+
+                powlink.data.resize(block_size, 0);
+
+                let (chunk_src_o, chunk_src_size) = (packet_size - chunk_size, chunk_size);
+                let (chunk_dst_o, chunk_dst_size) = powlink_chunk_o_size(block_size, chunk_i);
+
+                debug_assert!(chunk_dst_size == chunk_src_size);
+                if chunk_dst_size != chunk_src_size {
+                    eprintln!("{}: PowLink Error: Destination size and source size differ - {} vs {}. Hash is {:?}", ctx_str, chunk_dst_size, chunk_src_size, hash);
+                    continue;
+                }
+
+                let chunk_src_data = &             msg[chunk_src_o..chunk_src_o + chunk_src_size];
+                let chunk_dst_data = &mut powlink.data[chunk_dst_o..chunk_dst_o + chunk_dst_size];
+
+                // Download!
+                chunk_src_data.write_to(chunk_dst_data);
+                powlink.chunk_i += 1;
+            } else {
+                eprintln!("{}: PowLink: Discarding unneeded block {:?}", ctx_str, hash);
+                continue;
+            }
+        }
 
         if peer_is_unknown {
             let peer = &mut unknown_peers[peer_index];
@@ -3017,6 +3085,8 @@ impl Default for PacketPowlinkChunkHeader {
     }
 }
 impl PacketPowlinkChunkHeader {
+    const SERIALIZED_SIZE: usize = 32 + 4 + 2; // 38
+
     fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = 0;
         o += self.hash    .0.write_to(&mut buf[o..]);
