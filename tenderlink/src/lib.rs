@@ -1751,8 +1751,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     powlink_chunk_i: 0,
                 };
                 for (hash, powlink) in &bft_state.powlinks {
+                    if powlink.block.is_some() {
+                        continue;
+                    }
+
                     status.powlink_hash = *hash;
                     status.powlink_chunk_i = powlink.chunk_i;
+
                     break;
                 }
 
