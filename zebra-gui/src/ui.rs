@@ -1327,7 +1327,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             id: id_index("Transaction", index as u32),
                             padding,
                             child_gap,
-                            height: fixed!(ui.scale(64.0)),
+                            height: fit!(),
                             width: percent!(1.0),
                             direction: LeftToRight,
                             align: Center,
@@ -1403,13 +1403,11 @@ pub fn ui_left_pane(ui: &mut Context,
                                 // spacer
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                                let mut memo_str = String::from_utf8(tx.0.memo.as_slice().to_vec()).unwrap().trim_end_matches(|c| c == '\0').to_string();
-                                if memo_str.len() != 0 {
-                                    if memo_str.len() > 32 {
-                                        memo_str = format!("{}...", memo_str[..32].to_string()); // @todo: better truncation
+                                if let Ok(memo_str) = String::from_utf8(tx.0.memo.as_slice().to_vec()) {
+                                    let memo_str = memo_str.trim_end_matches(|c| c == '\0').to_string();
+                                    if memo_str.len() != 0 {
+                                        ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
                                     }
-
-                                    ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
                                 }
                             }
 
