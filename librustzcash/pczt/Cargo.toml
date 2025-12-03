@@ -17,7 +17,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 zcash_note_encryption = { workspace = true, optional = true }
 zcash_primitives = { workspace = true, optional = true }
-zcash_protocol = { workspace = true, default-features = false }
+zcash_protocol = { workspace = true, default-features = true }
 
 blake2b_simd = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
@@ -25,7 +25,10 @@ rand_core = { workspace = true, optional = true }
 # Encoding
 postcard.workspace = true
 serde.workspace = true
-serde_with = { version = "3", default-features = false, features = ["alloc", "macros"] }
+serde_with = { version = "3", default-features = false, features = [
+    "alloc",
+    "macros",
+] }
 
 # Payment protocols
 # - Transparent
@@ -72,12 +75,7 @@ std = ["document-features"]
 zip-233 = ["zcash_primitives/zip-233"]
 
 ## Enables functionality that requires Orchard protocol types.
-orchard = [
-    "dep:ff",
-    "dep:nonempty",
-    "dep:orchard",
-    "dep:pasta_curves",
-]
+orchard = ["dep:ff", "dep:nonempty", "dep:orchard", "dep:pasta_curves"]
 
 ## Enables functionality that requires Sapling protocol types.
 sapling = [
