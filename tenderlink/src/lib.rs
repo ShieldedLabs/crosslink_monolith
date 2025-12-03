@@ -2590,7 +2590,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             let block_size  = hdr.block_size as usize;
             let chunk_i     = hdr.chunk_i    as usize;
             let chunk_size  = usize::min(POWLINK_CHUNK_DATA_SIZE, block_size - chunk_i * POWLINK_CHUNK_DATA_SIZE);
-            let packet_size = PACKET_HEADER_SIZE + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
+            let packet_size = PACKET_HEADER_SIZE + PacketPowlinkChunkHeader::SERIALIZED_SIZE + chunk_size;
             let chunks_n    = powlink_chunks_n(block_size);
 
             if hdr.block_size as usize > POWLINK_MAX_DATA_SIZE {
