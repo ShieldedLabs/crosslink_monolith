@@ -941,7 +941,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let mut pending_balance   = 0;
             for (_, b) in balances {
                 spendable_balance += b.spendable_value().into_u64();
-                pending_balance   += b.value_pending_spendability().into_u64();
+                pending_balance   += b.change_pending_confirmation().into_u64() + b.value_pending_spendability().into_u64();
             }
 
             use core::ops::Add;
