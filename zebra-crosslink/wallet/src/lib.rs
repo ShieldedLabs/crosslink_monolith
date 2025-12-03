@@ -177,7 +177,6 @@ pub struct WalletRosterMember {
     pub pub_key: [u8; 32],
     pub voting_power: u64,
     pub txids: std::vec::Vec<StakeTxId>,
-    pub show_initial_stake_amount: bool,
 }
 
 fn w_flip(use_i: &mut usize, update_i: &mut usize) {
@@ -197,7 +196,7 @@ pub struct WalletState {
 
     pub txs:           Vec<WalletTx>,
     pub roster:        Vec<WalletRosterMember>,
-    pub staked_roster: Vec<WalletRosterMember>,
+    pub staked_roster: Vec<([u8; 32] /* pub key */, [u8; 32] /* txid */, u64 /* initial */, u64 /* accumulated */)>,
 
     pub waiting_for_faucet: bool,
     pub waiting_for_stake_to_finalizer: bool,
@@ -606,7 +605,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let miner_t_recs = miner_wallet
             .get_transparent_receivers(miner_account.id(), false, false)
             .unwrap();
-        (miner_wallet, miner_account, seed, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, miner_ua, HashMap::new())
+        (miner_wallet, miner_account, seed, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, miner_ua, HashMap::<TxId, (Option<StakingAction>, Vec<String>)>::new())
     };
 
     let (
@@ -675,6 +674,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let (mut miner_use_i, mut miner_update_i) = (0,0);
     let mut user_wallets  = [user_wallet_init,  WalletDb::for_path(":memory:", network, SystemClock, OsRng).unwrap()];
     let mut miner_wallets = [miner_wallet_init, WalletDb::for_path(":memory:", network, SystemClock, OsRng).unwrap()];
+
+    let mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly = Vec::<TxId>::new();
 
     loop {
         match client.get_roster(Empty{}).await {
@@ -746,8 +747,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     .map(|member| WalletRosterMember{
                         pub_key: member.pub_key,
                         voting_power: member.voting_power,
-                        txids: member.txids.clone(),
-                        show_initial_stake_amount: false,
+                        txids: member.txids.clone()
                     })
                     .collect::<Vec<WalletRosterMember>>()
                     .clone();
@@ -954,13 +954,44 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let txs = if let Ok(mut history) = get_transaction_history(user_wallet) {
                 if let Some(map) = get_received_memos_and_actions(&mut client, user_wallet, network, &history).await {
                     user_txid_map = map;
-                    let txs: Vec<WalletTx> = history.iter().map(|tx| {
+
+                    let mut user_staked_txids = Vec::new();
+                    let mut total_staked: u64 = 0;
+                    for mem in &roster {
+                        for mem_txid in &mem.txids {
+                            let txid = TxId::from_bytes(mem_txid.txid);
+                            let Some((action, memos)) = user_txid_map.get(&txid) else { continue; };
+                            let Some(action) = action else { continue; };
+                            match action.kind {
+                                StakingActionKind::Add => {
+                                    if !stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly.contains(&txid) {
+                                        total_staked += mem_txid.zats;
+                                        user_staked_txids.push((mem.pub_key, *txid.as_ref(), action.val, mem_txid.zats))
+                                    }
+                                }
+
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    {
+                        let mut wallet_lock = wallet_state.lock().unwrap();
+                        wallet_lock.staked_roster  = user_staked_txids;
+                        wallet_lock.staked_balance = total_staked.try_into().unwrap();
+                    }
+
+                    let mut txs: Vec<WalletTx> = history.iter().map(|tx| {
                         let mut kind: WalletTxKind;
                         if tx.is_shielding {
                             kind = WalletTxKind::Shield;
                         }
                         else if tx.account_value_delta.is_negative() {
-                            kind =  WalletTxKind::Send;
+                            if tx.memo_count > 0 {
+                                kind = WalletTxKind::Stake;
+                            } else {
+                                kind = WalletTxKind::Send;
+                            }
                         }
                         else if tx.account_value_delta.is_positive() {
                             kind = WalletTxKind::Receive;
@@ -968,12 +999,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         else {
                             kind = WalletTxKind::Receive;
                         }
-
-                        if kind == WalletTxKind::Send && tx.memo_count > 0 {
-                            kind = WalletTxKind::Stake;
-                        }
-
-                        // @todo: kind = WalletTxKind::Unstake
 
                         let mut tx = WalletTx(tx.clone(), kind);
                         if let Some((_, memos)) = user_txid_map.get(&tx.0.txid) {
@@ -991,7 +1016,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
 
                         tx
-                    }).collect();
+                    })
+                    .collect();
+
+                    // @todo(judah): because of the database, we can't differentiate regular receives
+                    // and staking receives... This is how we do that for now.
+                    for tx in &mut txs {
+                        if tx.0.memo.starts_with("@UNSTAKE_RECEIVE:".as_bytes()) {
+                            tx.1 = WalletTxKind::Unstake;
+                        }
+                    }
 
                     Some(txs)
                 } else {
@@ -1054,7 +1088,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 if let Some(txs) = txs {
                     wallet_lock.waiting_for_faucet = false; // TODO:???
-                    wallet_lock.txs = txs; // @temp: doesn't need to be its own type
+                    wallet_lock.txs = txs;
                 }
                 if let Some(tip_h) = tip_h {
                     wallet_lock.miner_seen_height = tip_h;
@@ -1183,7 +1217,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             };
 
             let ok: bool = 'process_action: {
-                match action {
+                match &action {
                     WalletAction::RequestFromFaucet => {
                         // NOTE: we can't send transparent->transparent through the high-level API, we
                         // have to propose_shielding first, then send in a later block
@@ -1216,7 +1250,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
 
                         // @todo(judah): better check?
-                        let amount_with_fee = (amount - MINIMUM_FEE).unwrap();
+                        let amount_with_fee = (*amount - MINIMUM_FEE).unwrap();
                         if spendable < amount.into_u64() {
                             println!("Not enough spendable zats to stake, will try again later...");
                             break 'process_action false;
@@ -1227,7 +1261,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             staking_action: Some(StakingAction {
                                 kind: StakingActionKind::Add,
                                 val: amount_with_fee.into_u64(),
-                                target: target_finalizer,
+                                target: *target_finalizer,
                                 source: [0_u8; 32],
                                 insecure_target_name: "".to_owned(),
                                 insecure_source_name: "".to_owned(),
@@ -1261,7 +1295,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
 
                         // @todo(judah): better check?
-                        let amount_with_fee = (amount - MINIMUM_FEE).unwrap();
+                        let amount_with_fee = (*amount - MINIMUM_FEE).unwrap();
                         if spendable < amount.into_u64() {
                             println!("Not enough spendable zats to send!");
                             break 'process_action false;
@@ -1282,17 +1316,118 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
 
                     WalletAction::UnstakeFromFinalizer(txid) => {
-                        println!("******************** TODO: UnstakeFromFinalizer");
-                        true
+                        let mut ok = { // User sends unstaking action
+                            let Some((member_pub_key, staked_txid)) = ('find_txid: {
+                                for mem in &roster {
+                                    for mem_txid in &mem.txids {
+                                        if TxId::from_bytes(mem_txid.txid) == *txid {
+                                            break 'find_txid Some((mem.pub_key, mem_txid.clone()));
+                                        }
+                                    }
+                                }
+                                None
+                            }) else {
+                                println!("*** Failed to find member with txid: {:?}", txid);
+                                break 'process_action false;
+                            };
+
+                            let Some((action, _)) = user_txid_map.get(&txid) else {
+                                println!("*** Failed to find user staking transaction via txid {:?}", txid);
+                                break 'process_action false;
+                            };
+
+                            let Some(action) = action else {
+                                println!("*** Staking action was unset in txid {:?}", txid);
+                                break 'process_action false;
+                            };
+
+                            let opts = TxOptions {
+                                staking_action: Some(StakingAction {
+                                    kind: StakingActionKind::Sub, // @todo: clear?
+                                    val: staked_txid.zats,
+                                    target: member_pub_key,
+                                    source: *txid.as_ref(),
+                                    insecure_target_name: "".to_owned(),
+                                    insecure_source_name: "".to_owned(),
+                                }),
+                                memo: None,
+                            };
+
+                            // @note(judah): the miner sends to its own address because if the user sends it,
+                            // the tx will appear as a regular send of -0.2 cTAZ....
+                            match send_zats(&mut client, &miner_ua, miner_wallet, &miner_usk, Zatoshis::from_u64(10_000).unwrap() /* @todo fees */, network, &opts).await {
+                                None => {
+                                    println!("Failed to send unstaking action to miner");
+                                    false
+                                }
+                                Some(_) => {
+                                    println!("Successfully sent unstaking action to miner");
+                                    true
+                                }
+                            }
+                        };
+
+                        ok &= { // Miner sends reward back to user
+                            let Some(staked_txid) = ('find_txid: {
+                                for mem in &roster {
+                                    for mem_txid in &mem.txids {
+                                        if TxId::from_bytes(mem_txid.txid) == *txid {
+                                            break 'find_txid Some(mem_txid.clone());
+                                        }
+                                    }
+                                }
+                                None
+                            }) else {
+                                println!("*** Failed to find member with txid: {:?}", txid);
+                                break 'process_action false;
+                            };
+
+                            let Some((action, memos)) = miner_txid_map.get(&txid) else {
+                                println!("*** Failed to find miner staking transaction via txid {:?}", txid);
+                                break 'process_action false;
+                            };
+
+                            let Some(destination_address) = memos.iter().find(|memo| memo.starts_with("utest")) else {
+                                println!("*** Failed to find destination address memo in txid {:?}", txid);
+                                break 'process_action false;
+                            };
+
+                            let destination_address = destination_address.trim_end_matches(|c| c == '\0');
+                            let Ok(destination_ua) = UnifiedAddress::decode(network, destination_address) else {
+                                println!("*** Failed to decode destination address {:?}", destination_address);
+                                break 'process_action false;
+                            };
+
+                            let options = TxOptions{
+                                memo: Some(zcash_protocol::memo::MemoBytes::from_bytes("@UNSTAKE_RECEIVE:Thanks for staking!".as_bytes()).unwrap()),
+                                ..Default::default()
+                            };
+
+                            match send_zats(&mut client, &destination_ua, miner_wallet, &miner_usk, Zatoshis::from_u64(staked_txid.zats).unwrap(), network, &options).await {
+                                None => {
+                                    println!("Failed to send reward to user");
+                                    false
+                                }
+                                Some(_) => {
+                                    println!("Successfully sent reward to user");
+                                    stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly.push(*txid);
+                                    true
+                                }
+                            }
+                        };
+
+                        ok
                     }
 
                     _ => { true }
                 }
             };
 
-            if ok {
-                wallet_state.lock().unwrap().actions_in_flight.pop_front();
+            if !ok {
+                println!("** Failed to process action: {:?}", &action);
             }
+
+            wallet_state.lock().unwrap().actions_in_flight.pop_front();
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
