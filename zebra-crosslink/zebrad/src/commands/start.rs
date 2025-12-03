@@ -347,7 +347,7 @@ impl StartCmd {
                     let block_hash = block.hash();
 
                     Box::pin(async move {
-                        let attempt_result = timeout(Duration::from_millis(100), async move {
+                        let attempt_result = timeout(Duration::from_millis(500), async move {
                             let mut block_verifier_router = gbt.block_verifier_router();
 
                             let height = block

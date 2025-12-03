@@ -253,8 +253,8 @@ async fn is_block_known( // @Phillip
     call: &TFLServiceCalls,
     hash: BlockHash,
 ) -> bool {
-    if let Ok(StateResponse::KnownBlock(Some(block))) = (call.state)(StateRequest::KnownBlock(hash.into())).await {
-        true
+    if let Ok(StateResponse::KnownBlock(Some(known_block))) = (call.state)(StateRequest::KnownBlock(hash.into())).await {
+        known_block.location == zebra_state::KnownBlockLocation::BestChain || known_block.location == zebra_state::KnownBlockLocation::SideChain
     } else {
         false
     }
@@ -1155,7 +1155,7 @@ fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> 
     cmd_c
 }
 
-async fn tfl_service_main_loop(internal_handle: TFLServiceHandle) -> Result<(), String> {
+async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [u8; 32]) -> Result<(), String> {
     let call = internal_handle.call.clone();
     let config = internal_handle.config.clone();
     let params = &PROTOTYPE_PARAMETERS;
@@ -1178,11 +1178,11 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle) -> Result<(), 
         .unwrap_or(String::from_str("/ip4/127.0.0.1/tcp/45869").unwrap());
     info!("public IP: {}", public_ip_string);
 
-    let user_name = config
-        .insecure_user_name
-        .unwrap_or(public_ip_string.clone());
-    // .unwrap_or(String::from_str("tester").unwrap());
-    info!("user_name: {}", user_name);
+    let user_name = if config.do_not_manipulate_config {
+        public_ip_string.clone()
+    } else {
+        format!("adrheardhed{:?}", global_seed)
+    };
 
     let (mut rng, my_private_key, my_public_key) =
         rng_private_public_key_from_address(&user_name.as_bytes());
@@ -1351,15 +1351,13 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle) -> Result<(), 
                 })
             })),
             tenderlink::ClosureToParsePow(Arc::new(move |hash, bytes| { // @Phillip
-                let tfl_handle6 = tfl_handle6.clone();
                 Box::pin(async move {
                     let mut slice = &bytes[..];
                     // let slice_ref = &mut slice;
                     if let Ok(block) = Block::zcash_deserialize(&mut slice) {
                         let check_hash = block.hash();
                         if check_hash.0 == hash {
-                            let prev_hash = block.header.as_ref().previous_block_hash.0;
-                            Some((Arc::new(block), prev_hash))
+                            Some(Arc::new(block))
                         } else {
                             eprintln!("\n\n\n\n\n\n\n\n@Phillip: Serializing the bytes succeeded but the block hash was different.\n\n\n\n\n\n\n\n");
                             None
@@ -1370,26 +1368,16 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle) -> Result<(), 
                     }
                 })
             })),
+            tenderlink::ClosureIsPoWInChain(Arc::new(move |hash| { // @Phillip
+                let tfl_handle6 = tfl_handle6.clone();
+                Box::pin(async move {
+                    is_block_known(&tfl_handle6.call, BlockHash(hash)).await
+                })
+            })),
             tenderlink::ClosureToPushPow(Arc::new(move |block| { // @Phillip
                 let tfl_handle7 = tfl_handle7.clone();
                 Box::pin(async move {
-                    let is_prev_block_known = is_block_known(&tfl_handle7.call, block.as_ref().header.as_ref().previous_block_hash).await;
-                    if is_prev_block_known {
-                        let is_this_block_known = is_block_known(&tfl_handle7.call, block.hash()).await;
-                        if is_this_block_known {
-                            true
-                        } else {
-                            let force_feed_ok = (tfl_handle7.call.force_feed_pow)(block).await;
-                            if force_feed_ok {
-                                true
-                            } else {
-                                eprintln!("\n\n\n\n\n\n\n\n@Phillip: Feeding the block failed!\n\n\n\n\n\n\n\n");
-                                false
-                            }
-                        }
-                    } else {
-                        false
-                    }
+                    (tfl_handle7.call.force_feed_pow)(block.clone()).await;
                 })
             })),
             tenderlink::ClosureToUpdateRosterCmd(Arc::new(move |str| {

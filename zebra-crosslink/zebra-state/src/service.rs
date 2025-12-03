@@ -672,17 +672,6 @@ impl StateService {
             rsp_rx
         };
 
-        // CROSSLINK
-        if parent_block_fat_pointer.is_none() || false == (self.closure_to_call_crosslink)(parent_block_fat_pointer.unwrap(), this_header_fat_pointer) {
-            let (rsp_tx, rsp_rx) = oneshot::channel();
-            let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
-                ValidateContextError::CrosslinkNotReady {
-                    block_height: semantically_verrified_height,
-                },
-            )));
-            return rsp_rx;
-        }
-
         // We've finished sending checkpoint verified blocks when:
         // - we've sent the verified block for the last checkpoint, and
         // - it has been successfully written to disk.
@@ -698,6 +687,17 @@ impl StateService {
             && self.read_service.db.finalized_tip_hash()
                 == self.finalized_block_write_last_sent_hash
         {
+            // CROSSLINK
+            if parent_block_fat_pointer.is_none() || false == (self.closure_to_call_crosslink)(parent_block_fat_pointer.unwrap(), this_header_fat_pointer) {
+                let (rsp_tx, rsp_rx) = oneshot::channel();
+                let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
+                    ValidateContextError::CrosslinkNotReady {
+                        block_height: semantically_verrified_height,
+                    },
+                )));
+                return rsp_rx;
+            }
+
             // Tell the block write task to stop committing checkpoint verified blocks to the finalized state,
             // and move on to committing semantically verified blocks to the non-finalized state.
             std::mem::drop(self.block_write_sender.finalized.take());
@@ -716,6 +716,17 @@ impl StateService {
         } else if !self.can_fork_chain_at(&parent_hash) {
             tracing::trace!("unready to verify, returning early");
         } else if self.block_write_sender.finalized.is_none() {
+            // CROSSLINK
+            if parent_block_fat_pointer.is_none() || false == (self.closure_to_call_crosslink)(parent_block_fat_pointer.unwrap(), this_header_fat_pointer) {
+                let (rsp_tx, rsp_rx) = oneshot::channel();
+                let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
+                    ValidateContextError::CrosslinkNotReady {
+                        block_height: semantically_verrified_height,
+                    },
+                )));
+                return rsp_rx;
+            }
+
             // Wait until block commit task is ready to write non-finalized blocks before dequeuing them
             self.send_ready_non_finalized_queued(parent_hash);
 

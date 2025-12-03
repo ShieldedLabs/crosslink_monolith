@@ -209,7 +209,7 @@ pub fn spawn_new_tfl_service(
     let handle2 = handle1.clone();
     (
         handle1,
-        tokio::spawn(async move { crate::tfl_service_main_loop(handle2).await }),
+        tokio::spawn(async move { crate::tfl_service_main_loop(handle2, global_seed).await }),
     )
 }
 

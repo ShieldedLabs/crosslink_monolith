@@ -197,12 +197,17 @@ impl std::fmt::Debug for ClosureToGetPow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToGetPow(..)") }
 }
 #[derive(Clone)]
-pub struct ClosureToParsePow(pub Arc<dyn Fn([u8; 32], Vec<u8>)-> core::pin::Pin<Box<dyn Future<Output =     Option<(Arc<zebra_chain::block::Block>, [u8; 32])>     > + Send>> + Send + Sync + 'static>); // @Phillip
+pub struct ClosureToParsePow(pub Arc<dyn Fn([u8; 32], Vec<u8>)-> core::pin::Pin<Box<dyn Future<Output =     Option<Arc<zebra_chain::block::Block>>     > + Send>> + Send + Sync + 'static>); // @Phillip
 impl std::fmt::Debug for ClosureToParsePow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToParsePow(..)") }
 }
 #[derive(Clone)]
-pub struct ClosureToPushPow(pub Arc<dyn Fn(Arc<zebra_chain::block::Block>)-> core::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>); // @Phillip
+pub struct ClosureIsPoWInChain(pub Arc<dyn Fn([u8; 32])-> core::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>); // @Phillip
+impl std::fmt::Debug for ClosureIsPoWInChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureIsPoWInChain(..)") }
+}
+#[derive(Clone)]
+pub struct ClosureToPushPow(pub Arc<dyn Fn(Arc<zebra_chain::block::Block>)-> core::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>); // @Phillip
 impl std::fmt::Debug for ClosureToPushPow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushPow(..)") }
 }
@@ -621,12 +626,14 @@ struct TMState {
 
     get_pow_closure: ClosureToGetPow,
     parse_pow_closure: ClosureToParsePow,
+    is_pow_in_chain_closure: ClosureIsPoWInChain,
     push_pow_closure: ClosureToPushPow,
 
     roster_cmd: Option<String>,
     update_roster_cmd_closure: ClosureToUpdateRosterCmd,
 
-    powlinks: HashMap<BlockHash, Powlink>,
+    pow_submit_block_queue: Vec<Arc<zebra_chain::block::Block>>,
+    current_powlink: Option<(BlockHash, Powlink)>,
 }
 impl TMState {
     fn init(
@@ -637,6 +644,7 @@ impl TMState {
         get_block_closure: ClosureToGetHistoricalBlock,
         get_pow_closure: ClosureToGetPow,
         parse_pow_closure: ClosureToParsePow,
+        is_pow_in_chain_closure: ClosureIsPoWInChain,
         push_pow_closure: ClosureToPushPow,
         update_roster_cmd_closure: ClosureToUpdateRosterCmd) -> Self {
         Self {
@@ -659,11 +667,13 @@ impl TMState {
             get_block_closure,
             get_pow_closure,
             parse_pow_closure,
+            is_pow_in_chain_closure,
             push_pow_closure,
             roster_cmd: None,
             update_roster_cmd_closure,
 
-            powlinks: HashMap::new(),
+            pow_submit_block_queue: Vec::new(),
+            current_powlink: None,
         }
     }
 
@@ -1289,15 +1299,19 @@ impl TMState {
             {
                 match self.rounds_data[i].proposal_checked_validity.1 {
                     TMStatusReason::NeedsBlock { hash } => {
-                        if !self.powlinks.contains_key(&BlockHash(hash)) {
-                            self.powlinks.insert(BlockHash(hash), Powlink::default());
+                        if self.current_powlink.is_none() {
+                            self.current_powlink = Some((BlockHash(hash), Powlink::default()));
+                            self.pow_submit_block_queue.truncate(0);
 
-                            let len = self.powlinks.len();
+                            let len = self.pow_submit_block_queue.len() + 1;
                             if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash); }
                             if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
                         }
                     },
-                    _ => {}
+                    _ => {
+                        self.current_powlink = None;
+                        self.pow_submit_block_queue.truncate(0);
+                    }
                 }
             }
         }
@@ -1625,9 +1639,13 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 None
             })
         })),
+        ClosureIsPoWInChain(Arc::new(move |block| { // @Phillip
+            Box::pin(async move {
+                true
+            })
+        })),
         ClosureToPushPow(Arc::new(move |block| { // @Phillip
             Box::pin(async move {
-                false
             })
         })),
         ClosureToUpdateRosterCmd(Arc::new(move |_str| { Box::pin(async move {
@@ -1648,6 +1666,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          get_block_closure: ClosureToGetHistoricalBlock,
                          get_pow_closure: ClosureToGetPow,
                          parse_pow_closure: ClosureToParsePow,
+                         is_pow_in_chain_closure: ClosureIsPoWInChain,
                          push_pow_closure: ClosureToPushPow,
                          roster_cmd_closure: ClosureToUpdateRosterCmd,
                         ) -> std::io::Result<()> {
@@ -1695,7 +1714,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>()); }
 
     // TODO: only convert private to public in 1 location
-    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_bft_key.into()), my_port, propose_closure, validate_closure, push_block_closure, get_block_closure, get_pow_closure, parse_pow_closure, push_pow_closure, roster_cmd_closure); // TODO: double-check this is the right key
+    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_bft_key.into()), my_port, propose_closure, validate_closure, push_block_closure, get_block_closure, get_pow_closure, parse_pow_closure, is_pow_in_chain_closure, push_pow_closure, roster_cmd_closure); // TODO: double-check this is the right key
     bft_state.start_round(&roster, Instant::now(), 0).await;
 
     let mut my_endpoint_evidence = if let Some(i) = roster_endpoint_evidence.iter().position(|e| &e.root_public_bft_key == my_root_public_bft_key.as_ref()) {
@@ -1750,15 +1769,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     powlink_hash: BlockHash::NIL,
                     powlink_chunk_i: 0,
                 };
-                for (hash, powlink) in &bft_state.powlinks {
-                    if powlink.block.is_some() {
-                        continue;
+                if let Some((hash, powlink)) = &bft_state.current_powlink {
+                    if powlink.block.is_none() {
+                        status.powlink_hash = *hash;
+                        status.powlink_chunk_i = powlink.chunk_i;
                     }
-
-                    status.powlink_hash = *hash;
-                    status.powlink_chunk_i = powlink.chunk_i;
-
-                    break;
                 }
 
 
@@ -2274,48 +2289,51 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 }
 
                 // POWLINK UPDATE
-                let mut keys_to_remove = Vec::new();
-                let mut keys_to_insert = Vec::new();
-
-                for (hash, powlink) in &mut bft_state.powlinks {
-                    if let Some(block) = powlink.block.clone() {
-                        let successfully_pushed = bft_state.push_pow_closure.0(block).await;
-                        if successfully_pushed {
-                            keys_to_remove.push(*hash);
-                        }
-                    } else {
-                        if powlink.data.len() == 0 {
-                            continue;
-                        }
-                        if powlink.chunk_i as usize != powlink_chunks_n(powlink.data.len()) {
-                            continue;
-                        }
-
-                        if PRINT_POWLINK { println!("{}: PowLink: Block {:?} is DONE! Contents: {:?}", ctx_str, hash, powlink.data); }
+                if let Some((hash, powlink)) = bft_state.current_powlink.as_mut() {
+                    let hash = *hash;
+                    if powlink.block.is_none() && powlink.data.len() != 0 && powlink.chunk_i as usize == powlink_chunks_n(powlink.data.len()) {
+                        if PRINT_POWLINK { println!("{}: PowLink: Block {:?} is DONE!", ctx_str, hash); }
 
                         let bytes = &powlink.data;
-                        if let Some((block, hash)) = bft_state.parse_pow_closure.0(hash.0, bytes.clone()).await {
+                        if let Some(block) = bft_state.parse_pow_closure.0(hash.0, bytes.clone()).await {
                             powlink.block = Some(block.clone());
+                        }
+                    }
 
-                            keys_to_insert.push(hash);
+                    if let Some(block) = powlink.block.take() {
+                        bft_state.current_powlink = None;
+
+                        let prev_hash = block.header.previous_block_hash.0;
+                        bft_state.pow_submit_block_queue.push(block);
+                        if bft_state.is_pow_in_chain_closure.0(prev_hash).await {
+                            let mut push_buffer = Vec::new();
+                            std::mem::swap(&mut push_buffer, &mut bft_state.pow_submit_block_queue);
+                            for block in push_buffer.into_iter().rev() {
+                                if PRINT_POWLINK { println!("{}: PowLink: \x1b[92mFLUSHING POW\x1b[0;0m hash: {:?}...", ctx_str, block.hash()); }
+                                bft_state.push_pow_closure.0(block).await;
+                            }
+                        } else {
+                            bft_state.current_powlink = Some((BlockHash(prev_hash), Powlink::default()));
+                            let len = bft_state.pow_submit_block_queue.len() + 1;
+                            if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, prev_hash); }
+                            if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
+                        }
+                    } else {
+                        if bft_state.pow_submit_block_queue.len() > 0 {
+                            if bft_state.is_pow_in_chain_closure.0(bft_state.pow_submit_block_queue[bft_state.pow_submit_block_queue.len()-1].hash().0).await {
+                                bft_state.current_powlink = None;
+                                let mut push_buffer = Vec::new();
+                                std::mem::swap(&mut push_buffer, &mut bft_state.pow_submit_block_queue);
+                                push_buffer.truncate(push_buffer.len() - 1);
+                                for block in push_buffer.into_iter().rev() {
+                                    if PRINT_POWLINK { println!("{}: PowLink: \x1b[92mFLUSHING POW\x1b[0;0m hash: {:?}...", ctx_str, block.hash()); }
+                                    bft_state.push_pow_closure.0(block).await;
+                                }
+                            }
                         }
                     }
                 }
-
-                for hash in &keys_to_insert {
-                    if !bft_state.powlinks.contains_key(&BlockHash(*hash)) {
-                        bft_state.powlinks.insert(BlockHash(*hash), Powlink::default());
-
-                        let len = bft_state.powlinks.len();
-                        if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash); }
-                        if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
-                    }
-                }
-
-                for key in &keys_to_remove {
-                    bft_state.powlinks.remove(key);
-                }
-
+                
                 break;
             }
 
@@ -2668,7 +2686,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 continue;
             }
 
-            if let Some(powlink) = bft_state.powlinks.get_mut(&hash) {
+            if bft_state.current_powlink.is_some() && bft_state.current_powlink.as_ref().unwrap().0 == hash {
+                let powlink = &mut bft_state.current_powlink.as_mut().unwrap().1;
                 if (powlink.chunk_i as usize) < chunk_i {
                     eprintln!("{}: PowLink: Unfortunately dropping chunk {} for block {:?} because it is {} chunks ahead of our current edge {}", ctx_str, chunk_i, hash, (chunk_i - powlink.chunk_i as usize), powlink.chunk_i);
                     continue;
