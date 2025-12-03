@@ -625,6 +625,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     };
 
     let send_unstake_reward = async |client: &mut CompactTxStreamerClient<_>, roster: &[RosterMember], txid_map: &HashMap<TxId, (Option<StakingAction>, Vec<String>)>, txid: &TxId, src_wallet: &mut WalletDb<_, _, _, _>, src_usk: &UnifiedSpendingKey, params, thing: &mut Vec::<TxId>| -> Option<[u8;32]> {
+        println!("SENDING UNSTAKE REWARD");
+
         let Some(staked_txid) = ('find_txid: {
             for mem in roster {
                 for mem_txid in &mem.txids {
@@ -1322,19 +1324,25 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             let Some(action) = action else { continue; };
                             if action.kind != StakingActionKind::Sub { continue; }
 
+                            println!("SAM DEBUG got here 1");
+
                             let mut handled = false;
                             // got a request to unstake; have we already repaid it?
                             for (sent_tx, (_action, sent_memos)) in &miner_sent_txid_map  {
+                                println!("SAM DEBUG got here 2");
                                 if sent_memos.len() == 0 { continue; }
-                                if sent_memos[0].len() < "@UNSTAKE_RECEIVE: ".len()+32 { continue; }
-                                if Some(*tx.as_ref()) == StakingAction::addr_from_str_bytes(&sent_memos[0].as_bytes()["@UNSTAKE_RECEIVE: ".len().."@UNSTAKE_RECEIVE: ".len()+32]) {
+                                if sent_memos[0].len() < "@UNSTAKE_RECEIVE: ".len()+64 { continue; }
+                                println!("SAM DEBUG got here 3");
+                                if Some(action.source) == StakingAction::addr_from_str_bytes(&sent_memos[0].as_bytes()["@UNSTAKE_RECEIVE: ".len().."@UNSTAKE_RECEIVE: ".len()+64]) {
+                                    println!("SAM DEBUG got here 4");
                                     handled = true;
                                     break;
                                 }
                             }
-
+                            println!("SAM DEBUG got here 5");
                             if !handled {
-                                send_unstake_reward(&mut client, &roster, &miner_txid_map, tx, miner_wallet, miner_usk, network, &mut Vec::new());
+                                println!("SAM DEBUG");
+                                send_unstake_reward(&mut client, &roster, &miner_txid_map, &TxId::from_bytes(action.source), miner_wallet, miner_usk, network, &mut Vec::new()).await;
                             }
                         }
                     }
