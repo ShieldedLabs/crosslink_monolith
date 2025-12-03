@@ -7,6 +7,7 @@ use orchard::note_encryption::CompactAction;
 use rand_chacha::rand_core::SeedableRng;
 use rand_core::OsRng;
 use sapling_crypto::zip32::ExtendedSpendingKey;
+use secrecy::{ExposeSecret,SecretVec,Secret};
 use std::collections::{HashMap, VecDeque};
 use std::convert::{identity, Infallible};
 use std::future::Future;
@@ -179,6 +180,15 @@ pub struct WalletRosterMember {
     pub show_initial_stake_amount: bool,
 }
 
+fn w_flip(use_i: &mut usize, update_i: &mut usize) {
+    if *use_i == *update_i {
+        *update_i = 1;
+    } else {
+        *use_i ^= 1;
+        *update_i ^= 1;
+    }
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct WalletState {
     pub balance:         i64, // in zats
@@ -278,9 +288,8 @@ impl Default for TxOptions {
 }
 
 pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
-    fn wallet_from_seed_phrase<P: Parameters + 'static>(params: P, phrase: &str) -> (
-        zcash_client_sqlite::WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
-        zcash_client_sqlite::wallet::Account,
+    fn stuff_from_seed_phrase<P: Parameters + 'static>(params:P, phrase: &str) -> (
+        SecretVec<u8>,
         UnifiedSpendingKey,
     ) {
         use secrecy::ExposeSecret;
@@ -288,7 +297,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let mnemonic = bip39::Mnemonic::parse(phrase).unwrap();
         let bip39_passphrase = ""; // optional
         let seed64 = mnemonic.to_seed(bip39_passphrase);
-        let seed = secrecy::SecretVec::new(seed64[..32].to_vec());
+        let seed = SecretVec::new(seed64[..32].to_vec());
         let seed_fp = zip32::fingerprint::SeedFingerprint::from_seed(seed.expose_secret()).unwrap();
         let account_id = zip32::AccountId::try_from(0).unwrap();
 
@@ -298,18 +307,29 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             None,
         );
 
+        (seed, usk)
+    }
+
+    fn wallet_from_stuff<P: Parameters + 'static>(params: P, seed: SecretVec<u8>) -> (
+        WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
+        zcash_client_sqlite::wallet::Account,
+    ) {
         let mut wallet = zcash_client_sqlite::WalletDb::for_path(":memory:", params, SystemClock, OsRng).unwrap();
         zcash_client_sqlite::wallet::init::init_wallet_db(
             &mut wallet,
-            Some(secrecy::Secret::new(seed.expose_secret().clone())),
+            Some(Secret::new(seed.expose_secret().clone())),
         ).unwrap();
+
+        let birthday = &AccountBirthday::from_parts(
+            ChainState::empty(BlockHeight::from_u32(0), zcash_primitives::block::BlockHash([0; 32])),
+            None,
+        );
 
         let (account_uuid, _) = wallet
             .create_account("main_account", &seed, birthday, None)
             .unwrap();
         let account = wallet.get_account(account_uuid).unwrap().unwrap();
-
-        (wallet, account, usk)
+        (wallet, account)
     }
 
     fn transparent_keys_from_usk(usk: &UnifiedSpendingKey, index: u32) -> Option<(secp256k1::PublicKey, secp256k1::SecretKey)> {
@@ -565,8 +585,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let network = &TEST_NETWORK;
 
     let (
-        mut miner_wallet,
-        miner_account,
+        miner_wallet_init,
+        mut miner_account,
+        miner_seed,
         miner_usk,
         miner_pubkey,
         miner_privkey,
@@ -574,21 +595,24 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         miner_ua,
         mut miner_txid_map,
     ) = {
-        let (miner_wallet, miner_account, miner_usk) = wallet_from_seed_phrase(network,
+        let (seed, miner_usk) = stuff_from_seed_phrase(network,
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
         );
+        let (miner_wallet, miner_account) = wallet_from_stuff(network, Secret::new(seed.expose_secret().clone()));
+
         let (miner_t_addr, miner_ua) = addrs_from_account(&miner_account, 0).unwrap();
         let miner_t_addr_str = miner_t_addr.encode(network);
         let (miner_pubkey, miner_privkey) = transparent_keys_from_usk(&miner_usk, 0).unwrap();
         let miner_t_recs = miner_wallet
             .get_transparent_receivers(miner_account.id(), false, false)
             .unwrap();
-        (miner_wallet, miner_account, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, miner_ua, HashMap::new())
+        (miner_wallet, miner_account, seed, miner_usk, miner_pubkey, miner_privkey, miner_t_addr, miner_ua, HashMap::new())
     };
 
     let (
-        mut user_wallet,
-        user_account,
+        user_wallet_init,
+        mut user_account,
+        user_seed,
         user_usk,
         user_pubkey,
         user_privkey,
@@ -600,7 +624,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let mnemonic = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &global_seed).unwrap();
         let phrase = mnemonic.words().map(|s| s.to_string()).collect::<Vec<String>>().join(" ");
 
-        let (user_wallet, user_account, user_usk) = wallet_from_seed_phrase(network, &phrase);
+        let (seed, user_usk) = stuff_from_seed_phrase(network, &phrase);
+        let (user_wallet, user_account) = wallet_from_stuff(network, Secret::new(seed.expose_secret().clone()));
         let (user_t_addr, user_ua) = addrs_from_account(&user_account, 0).unwrap();
         let user_t_addr_str = user_t_addr.encode(network);
         let (user_pubkey, user_privkey) = transparent_keys_from_usk(&user_usk, 0).unwrap();
@@ -612,7 +637,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // NOTE: the default isn't the same as below, but I think this is because it forces a diversifier index
         // println!("User wallet: {}/{:?}", user_t_addr_str, user_t_addr1.encode(network));
 
-        (user_wallet,  user_account, user_usk, user_pubkey, user_privkey, user_t_addr, user_ua, HashMap::new())
+        (user_wallet, user_account, seed, user_usk, user_pubkey, user_privkey, user_t_addr, user_ua, HashMap::new())
     };
 
     let user_ua_str = user_ua.encode(network);
@@ -646,6 +671,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         let mut time_since_last_transparent_shielded = std::time::Instant::now() - std::time::Duration::from_secs(1000);
 
+        let (mut user_use_i, mut user_update_i) = (0,0);
+        let (mut miner_use_i, mut miner_update_i) = (0,0);
+        let mut user_wallets = [user_wallet_init, WalletDb::for_path(":memory:", network, SystemClock, OsRng).unwrap()];
+        let mut miner_wallets = [miner_wallet_init, WalletDb::for_path(":memory:", network, SystemClock, OsRng).unwrap()];
         loop {
             match client.get_roster(Empty{}).await {
                 Err(err) => println!("Get roster error: {err:?}"),
@@ -725,16 +754,36 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
             println!("*********** ROSTER: {roster:?}");
 
+            let Ok(info) = client.get_lightd_info(Empty {}).await else {
+                println!("Failed to get lightd info");
+                continue;
+            };
+            let network_tip_height = info.into_inner().block_height;
+
+            if let Ok(chain_height) = miner_wallets[miner_update_i].chain_height() {
+                if let Some(chain_height) = chain_height {
+                    if network_tip_height == u64::from(chain_height) {
+                        println!("DOUBLE WALLET: flipping miner");
+                        w_flip(&mut miner_use_i, &mut miner_update_i);
+                        (miner_wallets[miner_update_i], miner_account) = wallet_from_stuff(network, Secret::new(miner_seed.expose_secret().clone()));
+                    }
+                }
+            }
+
+            if let Ok(chain_height) = user_wallets[user_update_i].chain_height() {
+                if let Some(chain_height) = chain_height {
+                    if network_tip_height == u64::from(chain_height) {
+                        println!("DOUBLE WALLET: flipping user");
+                        w_flip(&mut user_use_i, &mut user_update_i);
+                        (user_wallets[user_update_i], user_account) = wallet_from_stuff(network, Secret::new(user_seed.expose_secret().clone()));
+                    }
+                }
+            }
+
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             // Sync wallet DBs
-            for (wallet, t_address) in [(&mut miner_wallet, miner_t_address), (&mut user_wallet, user_t_address)] {
+            for (wallet, t_address) in [(miner_wallet, miner_t_address), (user_wallet, user_t_address)] {
                 // TODO: outside loop?
-                let Ok(info) = client.get_lightd_info(Empty {}).await else {
-                    println!("Failed to get lightd info");
-                    continue;
-                };
-
-                let network_tip_height = info.into_inner().block_height;
-
                 if 'needs_to_sync: /* what a funny language */ {
                     if let Ok(chain_height) = wallet.chain_height() {
                         if let Some(chain_height) = chain_height {
@@ -763,6 +812,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 println!("SUMMARY  {:?}", summary);
             }
 
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             if time_since_last_transparent_shielded.elapsed().as_secs() > 15 {
                 // Shield miner's transparent ZATOSHIz
                 (async | wallet: &mut WalletDb<_, _, _, _>, account: &zcash_client_sqlite::wallet::Account, usk: &UnifiedSpendingKey | {
@@ -858,7 +908,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
                     }
                     // drop(t_shield);
-                })(&mut miner_wallet, &miner_account, &miner_usk).await;
+                })(miner_wallet, &miner_account, &miner_usk).await;
             }
 
             // Update gui wallet state
@@ -1009,7 +1059,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         wallet_lock.miner_seen_height = tip_h;
                     }
                     if let Some(faucet_available) = faucet_available {
-                        // automatically_send_to_the_user = faucet_available > 500_000_000; // @NOCHECKIN
+                        automatically_send_to_the_user = faucet_available > 500_000_000; // @NOCHECKIN
                         wallet_lock.faucet_funds_available = faucet_available;
                     }
                     if let Some(vals) = miner_vals {
@@ -1098,7 +1148,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
                     }
                 }
-            })(&mut user_wallet, &mut miner_wallet).await;
+            })(user_wallet, miner_wallet).await;
 
             (async |miner_wallet: &mut WalletDb<_, _, _, _>| {
                 if let Ok(history) = get_transaction_history(miner_wallet) {
@@ -1106,7 +1156,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         miner_txid_map = map;
                     }
                 }
-            })(&mut miner_wallet).await;
+            })(miner_wallet).await;
             // Process gui wallet actions
 
             // @todo(judah): I'm thinking the weird frame hitch we get in the UI is caused by this loop,
@@ -1137,7 +1187,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             // NOTE: we can't send transparent->transparent through the high-level API, we
                             // have to propose_shielding first, then send in a later block
                             let zats = (Zatoshis::from_nonnegative_i64(500_000_000).unwrap() - MINIMUM_FEE).unwrap();
-                            match send_zats_to_wallet(&mut client, &mut user_wallet, &mut miner_wallet, &miner_usk, zats, network, &TxOptions{
+                            match send_zats_to_wallet(&mut client, user_wallet, miner_wallet, &miner_usk, zats, network, &TxOptions{
                                 memo: Some(zcash_protocol::memo::MemoBytes::from_bytes("Happy spending, with love from your favourite faucet".as_bytes()).unwrap()),
                                 ..TxOptions::default()
                             }).await {
@@ -1184,7 +1234,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 memo: Some(zcash_protocol::memo::MemoBytes::from_bytes(user_ua.encode(network).to_string().as_bytes()).unwrap()),
                             };
 
-                            match send_zats_to_wallet(&mut client, &mut miner_wallet, &mut user_wallet, &user_usk, amount_with_fee, network, &opts).await {
+                            match send_zats_to_wallet(&mut client, miner_wallet, user_wallet, &user_usk, amount_with_fee, network, &opts).await {
                                 None => {
                                     println!("Failed to send ZEC to miner");
                                     wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
@@ -1217,7 +1267,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             }
 
                             println!("*********** SEND ZEC {:?} ({:?}) TO {}", amount, amount_with_fee, &address.encode(network));
-                            match send_zats(&mut client, &address, &mut user_wallet, &user_usk, amount_with_fee, network, &TxOptions::default()).await {
+                            match send_zats(&mut client, &address, user_wallet, &user_usk, amount_with_fee, network, &TxOptions::default()).await {
                                 None => {
                                     println!("Failed to send ZEC to {}", address.encode(network));
                                     wallet_state.lock().unwrap().waiting_for_send = false;
