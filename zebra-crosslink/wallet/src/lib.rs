@@ -999,12 +999,19 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
 
                     let mut txs: Vec<WalletTx> = history.iter().map(|tx| {
+                        let maybe_action_memo = user_txid_map.get(&tx.txid);
+
                         let mut kind: WalletTxKind;
                         if tx.is_shielding {
                             kind = WalletTxKind::Shield;
                         }
                         else if tx.account_value_delta.is_negative() {
-                            if tx.memo_count > 0 {
+                            let is_action_stake = if let &Some((Some(action), _)) = &maybe_action_memo {
+                                action.kind == StakingActionKind::Add
+                            } else {
+                                false
+                            };
+                            if tx.memo_count > 0 || is_action_stake {
                                 kind = WalletTxKind::Stake;
                             } else {
                                 kind = WalletTxKind::Send;
@@ -1018,7 +1025,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
 
                         let mut tx = WalletTx(tx.clone(), kind);
-                        if let Some((_, memos)) = user_txid_map.get(&tx.0.txid) {
+                        if let Some((_, memos)) = maybe_action_memo {
                             if memos.len() > 0 {
                                 if memos.len() > 1 {
                                     println!("received multiple memos in 1 transaction: {}", memos.len());
