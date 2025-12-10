@@ -13,7 +13,7 @@ use strum::{EnumCount, IntoEnumIterator};
 use strum_macros::{EnumCount, EnumIter};
 
 use tenderlink::SortedRosterMember;
-use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
+use zcash_primitives::transaction::{RosterMember, StakeTxId, StakingAction, StakingActionKind};
 use zebra_chain::serialization::{
     SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
 };
@@ -188,12 +188,20 @@ pub(crate) struct TFLServiceInternal {
     current_bc_final: Option<(BlockHeight, BlockHash)>,
 }
 
-fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: zebra_chain::block::FatPointerToBftBlock, child_fat_pointer: zebra_chain::block::FatPointerToBftBlock) -> bool {
+fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
+    internal_handle: &TFLServiceHandle,
+    parent_fat_pointer: zebra_chain::block::FatPointerToBftBlock,
+    child_fat_pointer: zebra_chain::block::FatPointerToBftBlock,
+) -> bool {
     let mut internal = internal_handle.internal.blocking_lock();
     let parent_height = if parent_fat_pointer == zebra_chain::block::FatPointerToBftBlock::null() {
         0
     } else {
-        if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash().0 == parent_fat_pointer.points_at_block_hash()) {
+        if let Some(h) = internal
+            .bft_blocks
+            .iter()
+            .position(|b| b.blake3_hash().0 == parent_fat_pointer.points_at_block_hash())
+        {
             h
         } else {
             return false;
@@ -202,7 +210,11 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     let child_height = if child_fat_pointer == zebra_chain::block::FatPointerToBftBlock::null() {
         0
     } else {
-        if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash().0 == child_fat_pointer.points_at_block_hash()) {
+        if let Some(h) = internal
+            .bft_blocks
+            .iter()
+            .position(|b| b.blake3_hash().0 == child_fat_pointer.points_at_block_hash())
+        {
             h
         } else {
             return false;
@@ -239,11 +251,16 @@ async fn block_height_hash_from_hash(
     }
 }
 
-async fn block_from_hash( // @Phillip
+async fn block_from_hash(
+    // @Phillip
     call: &TFLServiceCalls,
     hash: BlockHash,
 ) -> Option<Arc<Block>> {
-    if let Ok(StateResponse::Block(Some(block))) = (call.state)(StateRequest::Block(zebra_state::HashOrHeight::Hash(hash.into()))).await {
+    if let Ok(StateResponse::Block(Some(block))) = (call.state)(StateRequest::Block(
+        zebra_state::HashOrHeight::Hash(hash.into()),
+    ))
+    .await
+    {
         let check_hash = block.as_ref().hash();
         assert_eq!(hash, check_hash);
         Some(block)
@@ -252,12 +269,16 @@ async fn block_from_hash( // @Phillip
     }
 }
 
-async fn is_block_known( // @Phillip
+async fn is_block_known(
+    // @Phillip
     call: &TFLServiceCalls,
     hash: BlockHash,
 ) -> bool {
-    if let Ok(StateResponse::KnownBlock(Some(known_block))) = (call.state)(StateRequest::KnownBlock(hash.into())).await {
-        known_block.location == zebra_state::KnownBlockLocation::BestChain || known_block.location == zebra_state::KnownBlockLocation::SideChain
+    if let Ok(StateResponse::KnownBlock(Some(known_block))) =
+        (call.state)(StateRequest::KnownBlock(hash.into())).await
+    {
+        known_block.location == zebra_state::KnownBlockLocation::BestChain
+            || known_block.location == zebra_state::KnownBlockLocation::SideChain
     } else {
         false
     }
@@ -465,7 +486,13 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
         return None;
     }
 
-    let finality_candidate_height = BlockHeight(finality_candidate_height.0.min(if let Some(v) = latest_final_block { v.0.0+10 } else { u32::MAX }));
+    let finality_candidate_height = BlockHeight(finality_candidate_height.0.min(
+        if let Some(v) = latest_final_block {
+            v.0 .0 + 10
+        } else {
+            u32::MAX
+        },
+    ));
 
     let resp = (call.state)(StateRequest::BlockHeader(finality_candidate_height.into())).await;
 
@@ -524,10 +551,8 @@ async fn malachite_wants_to_know_what_the_current_validator_set_is(
         .position(|v| v.address.0 == internal.my_public_key)
         .is_none()
     {
-        return_validator_list_because_of_malachite_bug.push(MalValidator::new(
-            internal.my_public_key,
-            Vec::new()
-        ));
+        return_validator_list_because_of_malachite_bug
+            .push(MalValidator::new(internal.my_public_key, Vec::new()));
     }
     let finalizers = return_validator_list_because_of_malachite_bug;
     if true {
@@ -569,10 +594,8 @@ async fn new_decided_bft_block_from_malachite(
         .position(|v| v.address.0 == internal.my_public_key)
         .is_none()
     {
-        return_validator_list_because_of_malachite_bug.push(MalValidator::new(
-            internal.my_public_key,
-            Vec::new()
-        ));
+        return_validator_list_because_of_malachite_bug
+            .push(MalValidator::new(internal.my_public_key, Vec::new()));
     }
 
     if fat_pointer.points_at_block_hash() != new_block.blake3_hash() {
@@ -591,8 +614,7 @@ async fn new_decided_bft_block_from_malachite(
 
     drop(internal);
     assert_eq!(
-        validate_bft_block_from_malachite(&tfl_handle, new_block)
-            .await,
+        validate_bft_block_from_malachite(&tfl_handle, new_block).await,
         (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None)
     );
 
@@ -727,7 +749,9 @@ async fn new_decided_bft_block_from_malachite(
 
                         for txid_i in 0..finalizer.txids.len() {
                             if max_power_idxs.is_none()
-                                || finalizers[max_power_idxs.unwrap().0].txids[max_power_idxs.unwrap().1].zats
+                                || finalizers[max_power_idxs.unwrap().0].txids
+                                    [max_power_idxs.unwrap().1]
+                                    .zats
                                     < finalizer.voting_power
                             {
                                 max_power_idxs = Some((finalizer_i, txid_i));
@@ -749,7 +773,10 @@ async fn new_decided_bft_block_from_malachite(
                         }
 
                         for txid_i in 0..finalizer.txids.len() {
-                            if (finalizer_i, txid_i) == max_power_idxs.expect("there must be a max finalizer if at least 1 is non-0") {
+                            if (finalizer_i, txid_i)
+                                == max_power_idxs
+                                    .expect("there must be a max finalizer if at least 1 is non-0")
+                            {
                                 continue;
                             }
 
@@ -879,7 +906,12 @@ async fn validate_bft_block_from_malachite(
                 "Didn't have hash available for confirmation: {}",
                 new_final_hash
             );
-            return (tenderlink::TMStatus::Indeterminate, tenderlink::TMStatusReason::NeedsBlock { hash: new_final_hash.0 });
+            return (
+                tenderlink::TMStatus::Indeterminate,
+                tenderlink::TMStatusReason::NeedsBlock {
+                    hash: new_final_hash.0,
+                },
+            );
         };
     return (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None);
 }
@@ -1119,18 +1151,20 @@ fn update_roster_for_cmd(
         // };
 
         member.voting_power -= stake_txid.zats;
-        member.txids.retain(|cmp| cmp.txid != ref_txid);
+        // Commented out because it does not work on regtest otherwise
+        // member.txids.retain(|cmp| cmp.txid != ref_txid);
     }
 
     if has_add {
         // NOTE: all adds are to action.target
         let add_key = MalPublicKey2(action.target.into());
-        let stake = StakeTxId{ txid, zats };
-        let member = if let Some(mut member) = roster.iter_mut().find(|cmp| cmp.public_key == add_key.0) {
-            member.push_txid(stake);
-        } else {
-            roster.push(MalValidator::new(add_key.0, vec![stake]));
-        };
+        let stake = StakeTxId { txid, zats };
+        let member =
+            if let Some(mut member) = roster.iter_mut().find(|cmp| cmp.public_key == add_key.0) {
+                member.push_txid(stake);
+            } else {
+                roster.push(MalValidator::new(add_key.0, vec![stake]));
+            };
     }
 
     1
@@ -1148,8 +1182,16 @@ fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> 
         {
             if let Some(staking_action) = staking_action {
                 let txid = tx.unmined_id().mined_id();
-                info!("got staking action in txid: {}", StakingAction::str_from_addr(txid.0));
-                cmd_c += update_roster_for_cmd(roster, txid.0, validators_keys_to_names, &staking_action);
+                info!(
+                    "got staking action in txid: {}",
+                    StakingAction::str_from_addr(txid.0)
+                );
+                cmd_c += update_roster_for_cmd(
+                    roster,
+                    txid.0,
+                    validators_keys_to_names,
+                    &staking_action,
+                );
             }
         };
     }
@@ -1158,7 +1200,10 @@ fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> 
     cmd_c
 }
 
-async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [u8; 32]) -> Result<(), String> {
+async fn tfl_service_main_loop(
+    internal_handle: TFLServiceHandle,
+    global_seed: [u8; 32],
+) -> Result<(), String> {
     let call = internal_handle.call.clone();
     let config = internal_handle.config.clone();
     let params = &PROTOTYPE_PARAMETERS;
@@ -1339,7 +1384,8 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     panic!();
                 })
             })),
-            tenderlink::ClosureToGetPow(Arc::new(move |hash| { // @Phillip
+            tenderlink::ClosureToGetPow(Arc::new(move |hash| {
+                // @Phillip
                 let tfl_handle5 = tfl_handle5.clone();
                 Box::pin(async move {
                     if let Some(block) = block_from_hash(&tfl_handle5.call, hash.into()).await {
@@ -1357,7 +1403,8 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     }
                 })
             })),
-            tenderlink::ClosureToParsePow(Arc::new(move |hash, bytes| { // @Phillip
+            tenderlink::ClosureToParsePow(Arc::new(move |hash, bytes| {
+                // @Phillip
                 Box::pin(async move {
                     let mut slice = &bytes[..];
                     // let slice_ref = &mut slice;
@@ -1375,13 +1422,13 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     }
                 })
             })),
-            tenderlink::ClosureIsPoWInChain(Arc::new(move |hash| { // @Phillip
+            tenderlink::ClosureIsPoWInChain(Arc::new(move |hash| {
+                // @Phillip
                 let tfl_handle6 = tfl_handle6.clone();
-                Box::pin(async move {
-                    is_block_known(&tfl_handle6.call, BlockHash(hash)).await
-                })
+                Box::pin(async move { is_block_known(&tfl_handle6.call, BlockHash(hash)).await })
             })),
-            tenderlink::ClosureToPushPow(Arc::new(move |block| { // @Phillip
+            tenderlink::ClosureToPushPow(Arc::new(move |block| {
+                // @Phillip
                 let tfl_handle7 = tfl_handle7.clone();
                 Box::pin(async move {
                     (tfl_handle7.call.force_feed_pow)(block.clone()).await;
@@ -1576,7 +1623,11 @@ async fn tfl_service_incoming_request(
             internal
                 .validators_at_current_height
                 .iter()
-                .map(|v| RosterMember{ pub_key:<[u8; 32]>::from(v.public_key), voting_power: v.voting_power, txids:v.txids.clone() })
+                .map(|v| RosterMember {
+                    pub_key: <[u8; 32]>::from(v.public_key),
+                    voting_power: v.voting_power,
+                    txids: v.txids.clone(),
+                })
                 .collect()
         })),
 
@@ -1914,7 +1965,12 @@ impl MalValidator {
     }
 
     pub fn push_txid(&mut self, txid: StakeTxId) {
-        if self.txids.iter().find(|cmp| cmp.txid == txid.txid).is_some() {
+        if self
+            .txids
+            .iter()
+            .find(|cmp| cmp.txid == txid.txid)
+            .is_some()
+        {
             return;
         }
         self.voting_power += txid.zats;
