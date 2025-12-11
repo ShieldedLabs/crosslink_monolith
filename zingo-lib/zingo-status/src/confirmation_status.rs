@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
-use zcash_primitives::consensus::BlockHeight;
+use zcash_protocol::consensus::BlockHeight;
 
 /// Transaction confirmation states. Every transaction record includes exactly one of these variants.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

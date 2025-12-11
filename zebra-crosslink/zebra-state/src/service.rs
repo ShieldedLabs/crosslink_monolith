@@ -2396,7 +2396,7 @@ pub fn init_test(network: &Network) -> Buffer<BoxService<Request, Response, BoxE
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, _, _, _) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0);
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, Arc::new(|_,_| true));
 
     Buffer::new(BoxService::new(state_service), 1)
 }
@@ -2417,7 +2417,7 @@ pub fn init_test_services(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, read_state_service, latest_chain_tip, chain_tip_change) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0);
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, std::sync::Arc::new(|_,_| true));
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
 

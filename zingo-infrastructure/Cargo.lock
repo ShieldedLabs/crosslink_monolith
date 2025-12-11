@@ -5396,6 +5396,7 @@ dependencies = [
  "socket2",
  "static_assertions",
  "tokio",
+ "zebra-chain",
 ]
 
 [[package]]
@@ -7667,6 +7668,7 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "tracing",
+ "zcash_primitives",
  "zebra-chain",
 ]
 

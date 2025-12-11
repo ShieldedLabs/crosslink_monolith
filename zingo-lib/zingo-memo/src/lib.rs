@@ -116,7 +116,7 @@ pub fn write_unified_address_to_raw_encoding<W: Write>(
     ua: &UnifiedAddress,
     writer: W,
 ) -> io::Result<()> {
-    let mainnet_encoded_ua = ua.encode(&zcash_primitives::consensus::MAIN_NETWORK);
+    let mainnet_encoded_ua = ua.encode(&zcash_protocol::consensus::MAIN_NETWORK);
     let (_mainnet, address) =
         Address::decode(&mainnet_encoded_ua).expect("freshly encoded ua to decode!");
     let receivers = address.items();
@@ -204,7 +204,7 @@ mod tests {
     use super::*;
     use rand::{self, Rng};
     use test_vectors::TestVector;
-    use zcash_primitives::consensus::MAIN_NETWORK;
+    use zcash_protocol::consensus::MAIN_NETWORK;
 
     fn get_some_number_of_ephemeral_indexes() -> Vec<u32> {
         // Generate a random number of elements between 0 and 10
