@@ -920,6 +920,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
     draw_ctx._init_font_tracker(FONT_PIXEL_GOHU_14, 15, FontKind::Mono, 15);
     draw_ctx._init_font_tracker(FONT_PIXEL_GOHU_14, 16, FontKind::Mono, 15);
 
+    unsafe { clay_layout::Clay_SetMaxMeasureTextCacheWordCount(262144); }
     let mut gui_clay = clay_layout::Clay::new((1280., 720.).into());
 
     let mut gui_ctx = ui::Context::new();
