@@ -350,6 +350,7 @@ pub struct ManualAccount {
 // NOTE: WalletDb doesn't store spending key, so we'll do the same here...
 #[derive(Clone, Debug)]
 pub struct ManualWallet {
+    pub name: &'static str,
     pub accounts: Vec<ManualAccount>,
     pub chain_tip_height: BlockHeight,
     // TODO: change type
@@ -475,7 +476,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         (seed, usk)
     }
 
-    fn wallet_from_stuff<P: Parameters + 'static>(params: P, seed: SecretVec<u8>) -> (ManualWallet, ManualAccount) {
+    fn wallet_from_stuff<P: Parameters + 'static>(params: P, name: &'static str, seed: SecretVec<u8>) -> (ManualWallet, ManualAccount) {
         // TODO: skip this by changing API slightly
         let account_id = zip32::AccountId::try_from(0).unwrap();
         let usk = UnifiedSpendingKey::from_seed(&params, seed.expose_secret(), account_id).unwrap();
@@ -489,6 +490,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         };
 
         let wallet = ManualWallet {
+            name,
             accounts: vec![account.clone()],
             chain_tip_height: BlockHeight::from_u32(0),
             txs: Vec::new(),
@@ -744,7 +746,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let (seed, miner_usk) = stuff_from_seed_phrase(network,
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
         );
-        let (miner_wallet, miner_account) = wallet_from_stuff(network, Secret::new(seed.expose_secret().clone()));
+        let (miner_wallet, miner_account) = wallet_from_stuff(network, "miner", Secret::new(seed.expose_secret().clone()));
 
         let (miner_t_addr, miner_ua) = addrs_from_account(&miner_account, 0).unwrap();
         let miner_t_addr_str = miner_t_addr.encode(network);
@@ -768,7 +770,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let phrase = mnemonic.words().map(|s| s.to_string()).collect::<Vec<String>>().join(" ");
 
         let (seed, user_usk) = stuff_from_seed_phrase(network, &phrase);
-        let (user_wallet, user_account) = wallet_from_stuff(network, Secret::new(seed.expose_secret().clone()));
+        let (user_wallet, user_account) = wallet_from_stuff(network, "user", Secret::new(seed.expose_secret().clone()));
         let (user_t_addr, user_ua) = addrs_from_account(&user_account, 0).unwrap();
         let user_t_addr_str = user_t_addr.encode(network);
         let (user_pubkey, user_privkey) = transparent_keys_from_usk(&user_usk, 0).unwrap();
@@ -851,25 +853,34 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         // NOTE: if you're dealing with multiple wallets, you don't want to resync all blocks for each
         // of them. They can all sync from the same blocks.
-        let (new_blocks, mut sync_from_i): (Vec<CompactBlock>, Option<usize>) = 'sync_find_continuation_point: loop {
+        // TODO: this needs to be a bit more complicated to handle arbitrarily many transparent addresses
+        let (new_blocks, miner_t_txs, mut sync_from_i):
+            (Vec<CompactBlock>, Vec<(BlockHeight, Transaction)>, Option<usize>) =
+             'sync_find_continuation_point: loop
+        {
             // GET THE CURRENT STATE OF THE WORLD ////////////////////
             // BATCH NETWORK REQUESTS
-            let (tree_state_res, lightd_res, block_range_res) = {
+            let (tree_state_res, lightd_res, block_range_res, t_txs_res) = {
                 use std::future::Ready;
                 // NOTE: clients are cheap to clone, and this is recommended in docs:
                 // REF: https://docs.rs/tonic/0.14.2/tonic/client/index.html
-                let mut client0 = client.clone();
-                let mut client1 = client.clone();
+                let (mut client0, mut client1, mut client2) = (client.clone(), client.clone(), client.clone());
+                let block_range = BlockRange {
+                    start: Some(BlockId { height: req_start_height + 1,                              hash: Vec::new() }),
+                    end:   Some(BlockId { height: req_start_height + MAX_BLOCKS_TO_DOWNLOAD_AT_TIME, hash: Vec::new() }),
+                };
                 tokio::join!(
                     client.get_tree_state(BlockId {height: req_start_height, hash: Vec::new()}),
                     client0.get_lightd_info(Empty {}),
-                    client1.get_block_range(BlockRange {
-                        start: Some(BlockId { height: req_start_height + 1,                              hash: Vec::new() }),
-                        end:   Some(BlockId { height: req_start_height + MAX_BLOCKS_TO_DOWNLOAD_AT_TIME, hash: Vec::new() }),
+                    client1.get_block_range(block_range.clone()),
+                    client2.get_taddress_txids(TransparentAddressBlockFilter {
+                        address: miner_t_address.encode(network),
+                        range: Some(block_range),
                     })
                 )
             };
 
+            // NETWORK TIP HEIGHT
             // NOTE: I think this is only needed for telling the user how sync'd we are?
             match lightd_res {
                 Ok(info) => {
@@ -892,6 +903,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             };
 
 
+            // PREV CHAIN STATE
             // TODO: do we need to redownload this? surely we have it locally (and catch reorgs without it)
             //       maybe we don't get enough info to compute it in CompactBlocks...
             let prev_tip_chain_state: ChainState = {
@@ -906,12 +918,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 match tree_state.to_chain_state() {
                     Ok(chain_state) => chain_state,
                     Err(err) => {
-                        println!("Failed to convert tree state to chain state at {local_tip_height:?}: {err:?}");
+                        println!("Failed to convert tree state to chain state at {req_start_height:?}: {err:?}");
                         continue 'outer_sync;
                     }
                 }
             };
 
+            // COMPACT BLOCKS
             let mut new_blocks: Vec<CompactBlock> = Vec::new();
             match block_range_res {
                 Ok(blocks) => {
@@ -919,7 +932,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     loop {
                         match block_stream.message().await { // TODO: bulk await these?
                             Ok(Some(block)) => {
-                                local_tip_height = block.height;
                                 new_blocks.push(block)
                             }
                             Ok(None) => break,
@@ -1009,11 +1021,99 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
 
                     pow_cache.push_new_tip(new_blocks[block_i].height, hash);
+                    // TODO: if this changes we need to skip to the equivalent on the transparent txs
                     sync_from_i = Some(first_new_block_i);
                 }
             }
 
-            break (new_blocks, sync_from_i);
+            if sync_from_i.is_none() {
+                break (Vec::new(), Vec::new(), None);
+            }
+
+            let compact_block_max_height = new_blocks.last().expect("non-empty vector").height;
+
+            // TRANSPARENT TRANSACTIONS
+            let mut new_raw_t_txs: Vec<RawTransaction> = Vec::new();
+            match t_txs_res {
+                Ok(t_txs) => {
+                    let mut tx_stream = t_txs.into_inner();
+                    loop {
+                        match tx_stream.message().await { // TODO: bulk await these?
+                            Ok(Some(tx)) => {
+                                new_raw_t_txs.push(tx)
+                            }
+                            Ok(None) => break,
+                            Err(err) => {
+                                if err.code() != tonic::Code::OutOfRange {
+                                    println!("Failed to get tx: {err:?}");
+                                }
+                                break; // we can still update with the txs we got, we don't need to fully reset
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    println!("Failed to get block range: {err:?}");
+                    continue 'outer_sync;
+                }
+            };
+
+            let mut t_failed_at_h = None;
+            let mut new_t_txs = Vec::<(BlockHeight, Transaction)>::with_capacity(new_raw_t_txs.len());
+            for tx_i in 0..new_raw_t_txs.len() {
+                let raw_tx = &new_raw_t_txs[tx_i];
+
+                // height can be 0 for mempool, 0xff..ff for sidechain
+                if raw_tx.height == u64::MAX {
+                    continue;
+                }
+
+                if raw_tx.height > compact_block_max_height {
+                    // @in_step_sync
+                    break;
+                }
+
+                let Ok(h) = <u32>::try_from(raw_tx.height) else {
+                    println!("transparent tx's height can't be represented in 32 bits: {}", raw_tx.height);
+                    break;
+                };
+                let height = BlockHeight::from_u32(h);
+
+                let tx = match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, height)) {
+                    Ok(tx) => tx,
+                    Err(err) => {
+                        println!("failed to read transparent tx at height {h}");
+                        t_failed_at_h = Some(raw_tx.height);
+                        // @in_step_sync
+                        // remove everything at the failed height
+                        while new_t_txs.len() > 0 {
+                            if new_t_txs.last().unwrap().0 != height {
+                                break;
+                            }
+                            new_t_txs.pop();
+                        }
+                        break;
+                    }
+                };
+                new_t_txs.push((height, tx));
+            }
+
+            // truncate compact blocks to match transparent // @in_step_sync
+            if let Some(h) = t_failed_at_h {
+                // ALT: partition_point then truncate
+                while new_blocks.len() > 0 {
+                    if new_blocks.last().unwrap().height < h {
+                        break;
+                    }
+                    new_blocks.pop();
+                }
+
+                if new_blocks.len() == 0 {
+                    sync_from_i = None;
+                }
+            }
+
+            break (new_blocks, new_t_txs, sync_from_i);
         };
 
         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
@@ -1022,7 +1122,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // TODO: ideally the GUI won't see this intermediate state
         if let Some(start_block_i) = sync_from_i {
             let sync_start_h = <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above");
-            for wallet in [miner_wallet, user_wallet] {
+            local_tip_height = new_blocks.last().unwrap().height;
+
+            for (wallet_i, wallet) in [miner_wallet, user_wallet].into_iter().enumerate() {
                 // -- INVALIDATE TXS >= NEW BLOCKS HEIGHT
                 // the regime is basically "always reorg", but that's often a no-op
                 // truncate wallet for everything below height
@@ -1048,7 +1150,55 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
 
                 // -- ADD/REVALIDATE TXS FROM NEW BLOCKS
-                // TODO: transparent transactions (ideally in lock-step)
+                let mut t_tx_i = 0;
+                if wallet_i == 0 {
+                    while t_tx_i < miner_t_txs.len() && miner_t_txs[t_tx_i].0 < BlockHeight::from_u32(sync_start_h) {
+                        // @in_step_sync
+                        println!("out-of-range transparent tx at {:?} (should be >= {})", miner_t_txs[t_tx_i].0, sync_start_h);
+                        t_tx_i += 1;
+                    }
+                }
+
+                fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, new_wallet_tx: WalletTx, block_h: BlockHeight, insert_i: &mut usize) {
+                    // find if there's an existing height/transaction for this txid
+                    if let Some(tx_h) = wallet.tx_height_map.get_mut(&txid) {
+                        let mut find_i = wallet.txs.partition_point(|tx|
+                            tx.0.mined_height.is_some() && tx.0.mined_height.unwrap() < *tx_h
+                        );
+                        let mut found_idx = None;
+                        let txs_n = wallet.txs.len();
+                        while find_i < txs_n {
+                            let tx = &mut wallet.txs[find_i];
+                            if tx.0.mined_height != Some(*tx_h) {
+                                break;
+                            }
+                            if tx.0.txid == txid {
+                                found_idx = Some(find_i);
+                                break;
+                            }
+                            find_i += 1;
+                        }
+
+                        if let Some(tx_i) = found_idx {
+                            // overwrite existing tx
+                            // tx.0.mined_height = Some(block_h);
+                            // tx.2 = false;
+                            wallet.txs[tx_i] = new_wallet_tx;
+                            println!("{} wallet updated existing transaction {txid} at {block_h:?}", wallet.name);
+                        } else {
+                            wallet.txs.insert(*insert_i, new_wallet_tx);
+                            *insert_i += 1;
+                            println!("ERROR: {txid:?} not found at associated height {tx_h}");
+                        }
+                        *tx_h = block_h;
+                    } else {
+                        wallet.tx_height_map.insert(txid, block_h);
+                        wallet.txs.insert(*insert_i, new_wallet_tx);
+                        *insert_i += 1;
+                        println!("{} wallet inserted unknown transaction {txid} at {block_h:?}", wallet.name);
+                    }
+                }
+
                 let mut insert_i = 0;
                 for block in &new_blocks {
                     let block_h = BlockHeight::from_u32(block.height.try_into().unwrap());
@@ -1057,14 +1207,52 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     insert_i += wallet.txs[insert_i..].partition_point(|tx|
                         tx.0.mined_height.is_some() && tx.0.mined_height.unwrap() <= block_h
                     );
+
+                    // TRANSPARENT TRANSACTIONS AT HEIGHT
+                    if wallet_i == 0 {
+                        // miner wallet
+                        while t_tx_i < miner_t_txs.len() && miner_t_txs[t_tx_i].0 == block_h {
+                            let t_tx = &miner_t_txs[t_tx_i].1;
+                            t_tx_i += 1;
+
+                            // TODO: complete
+                            let new_wallet_tx = WalletTx(
+                                TransactionSummary {
+                                    account_id: 0,
+                                    txid: t_tx.txid(),
+                                    expiry_height: None,
+                                    mined_height: Some(block_h),
+                                    account_value_delta: ZatBalance::from_i64(0).unwrap(),
+                                    total_spent: Zatoshis::from_u64(0).unwrap(),
+                                    total_received: Zatoshis::from_u64(0).unwrap(),
+                                    fee_paid: Some(Zatoshis::from_u64(0).unwrap()),
+                                    spent_note_count: 0,
+                                    has_change: false,
+                                    sent_note_count: 0,
+                                    received_note_count: 0,
+                                    memo_count: 0,
+                                    expired_unmined: false,
+                                    is_shielding: false,
+                                    memo: [0; 512],
+                                },
+                                WalletTxKind::Receive,
+                                false,
+                            );
+                            update_with_tx(wallet, new_wallet_tx.0.txid, new_wallet_tx, block_h, &mut insert_i);
+                        }
+                    }
+
+
+                    // SHIELDED TRANSACTIONS AT HEIGHT
                     for tx in &block.vtx {
-                        let txid = TxId::from_bytes(<[u8;32]>::try_from(&new_blocks[i].hash[..]).expect("successfully converted above"));
+                        let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
 
                         // TODO: do we want to always recompute or can we assume data is constant
                         // if txid is the same? (N.B. the txid is a hash of some transaction data
                         // but not all)
                         // Conservative approach: always recompute
                         // TODO: decrypt our transactions & fill in actual data here
+                        // TODO: get full info with memos
                         let new_wallet_tx = WalletTx(
                             TransactionSummary {
                                 account_id: 0,
@@ -1087,43 +1275,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             WalletTxKind::Receive,
                             false,
                         );
-
-
-                        // find if there's an existing height/transaction for this txid
-                        if let Some(tx_h) = wallet.tx_height_map.get_mut(&txid) {
-                            let mut find_i = wallet.txs.partition_point(|tx|
-                                tx.0.mined_height.is_some() && tx.0.mined_height.unwrap() < *tx_h
-                            );
-                            let mut found_idx = None;
-                            let txs_n = wallet.txs.len();
-                            while find_i < txs_n {
-                                let tx = &mut wallet.txs[find_i];
-                                if tx.0.mined_height != Some(*tx_h) {
-                                    break;
-                                }
-                                if tx.0.txid == txid {
-                                    found_idx = Some(find_i);
-                                    break;
-                                }
-                                find_i += 1;
-                            }
-
-                            if let Some(tx_i) = found_idx {
-                                // overwrite existing tx
-                                // tx.0.mined_height = Some(block_h);
-                                // tx.2 = false;
-                                wallet.txs[tx_i] = new_wallet_tx;
-                            } else {
-                                wallet.txs.insert(insert_i, new_wallet_tx);
-                                insert_i += 1;
-                                println!("ERROR: {txid:?} not found at associated height {tx_h}");
-                            }
-                            *tx_h = block_h;
-                        } else {
-                            wallet.tx_height_map.insert(txid, block_h);
-                            wallet.txs.insert(insert_i, new_wallet_tx);
-                            insert_i += 1;
-                        }
+                        update_with_tx(wallet, txid, new_wallet_tx, block_h, &mut insert_i);
                     }
                 }
             }
