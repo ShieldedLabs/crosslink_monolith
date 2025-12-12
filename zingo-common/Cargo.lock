@@ -1562,6 +1562,7 @@ version = "0.2.2"
 dependencies = [
  "blake2b_simd",
  "core2",
+ "document-features",
 ]
 
 [[package]]

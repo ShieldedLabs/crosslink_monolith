@@ -3,7 +3,8 @@
 use std::{array::TryFromSliceError, convert::Infallible};
 
 use shardtree::error::ShardTreeError;
-use zcash_primitives::{block::BlockHash, consensus::BlockHeight, transaction::TxId};
+use zcash_primitives::{block::BlockHash, transaction::TxId};
+use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::PoolType;
 
 use crate::wallet::OutputId;
@@ -123,7 +124,7 @@ pub enum ScanError {
     DecryptedNoteDataNotFound(OutputId),
     /// Invalid memo bytes..
     #[error("invalid memo bytes. {0}")]
-    InvalidMemoBytes(#[from] zcash_primitives::memo::Error),
+    InvalidMemoBytes(#[from] zcash_protocol::memo::Error),
     /// Failed to parse encoded address.
     #[error("failed to parse encoded address. {0}")]
     AddressParseError(#[from] zcash_address::unified::ParseError),

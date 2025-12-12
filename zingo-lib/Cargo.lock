@@ -1764,12 +1764,14 @@ dependencies = [
  "incrementalmerkletree",
  "orchard",
  "proptest",
- "prost 0.13.5",
+ "prost 0.14.1",
  "sapling-crypto",
  "serde_json",
  "tokio",
- "tonic 0.13.1",
- "tonic-build 0.13.1",
+ "tonic",
+ "tonic-build",
+ "tonic-prost",
+ "tonic-prost-build",
  "tower 0.5.2",
  "tracing",
  "tracing-subscriber",
@@ -2439,6 +2441,7 @@ version = "0.2.2"
 dependencies = [
  "blake2b_simd",
  "core2 0.3.3",
+ "document-features",
 ]
 
 [[package]]
@@ -3322,7 +3325,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.1",
+ "socket2",
  "tokio",
  "tower-service",
  "tracing",
@@ -3934,6 +3937,7 @@ dependencies = [
  "zcash_local_net",
  "zcash_primitives",
  "zcash_protocol",
+ "zcash_transparent",
  "zebra-chain",
  "zingo-status",
  "zingo_common_components",
@@ -5143,7 +5147,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.17",
  "tokio",
- "tonic 0.13.1",
+ "tonic",
  "tracing",
  "zcash_address",
  "zcash_client_backend",
@@ -5747,7 +5751,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.35",
- "socket2 0.6.1",
+ "socket2",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -5784,7 +5788,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.1",
+ "socket2",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -7192,16 +7196,6 @@ dependencies = [
 
 [[package]]
 name = "socket2"
-version = "0.5.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
-dependencies = [
- "libc",
- "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "socket2"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "17129e116933cf371d018bb80ae557e889637989d8638274fb25622827b03881"
@@ -7642,7 +7636,7 @@ dependencies = [
  "rand_chacha 0.9.0",
  "rand_pcg",
  "snow",
- "socket2 0.6.1",
+ "socket2",
  "static_assertions",
  "tokio",
  "zebra-chain",
@@ -7860,7 +7854,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2 0.6.1",
+ "socket2",
  "tokio-macros",
  "tracing",
  "windows-sys 0.61.2",
@@ -8007,37 +8001,6 @@ checksum = "df8b2b54733674ad286d16267dcfc7a71ed5c776e4ac7aa3c3e2561f7c637bf2"
 
 [[package]]
 name = "tonic"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e581ba15a835f4d9ea06c55ab1bd4dce26fc53752c69a04aac00703bfb49ba9"
-dependencies = [
- "async-trait",
- "axum",
- "base64",
- "bytes",
- "h2",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-timeout",
- "hyper-util",
- "percent-encoding",
- "pin-project",
- "prost 0.13.5",
- "socket2 0.5.10",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tower 0.5.2",
- "tower-layer",
- "tower-service",
- "tracing",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "tonic"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb7613188ce9f7df5bfe185db26c5814347d110db17920415cf2fbcad85e7203"
@@ -8055,7 +8018,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
- "socket2 0.6.1",
+ "socket2",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -8065,20 +8028,6 @@ dependencies = [
  "tower-service",
  "tracing",
  "webpki-roots 1.0.4",
-]
-
-[[package]]
-name = "tonic-build"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eac6f67be712d12f0b41328db3137e0d0757645d8904b4cb7d51cd9c2279e847"
-dependencies = [
- "prettyplease",
- "proc-macro2",
- "prost-build 0.13.5",
- "prost-types 0.13.5",
- "quote",
- "syn 2.0.110",
 ]
 
 [[package]]
@@ -8101,7 +8050,7 @@ checksum = "66bd50ad6ce1252d87ef024b3d64fe4c3cf54a86fb9ef4c631fdd0ded7aeaa67"
 dependencies = [
  "bytes",
  "prost 0.14.1",
- "tonic 0.14.2",
+ "tonic",
 ]
 
 [[package]]
@@ -8117,7 +8066,7 @@ dependencies = [
  "quote",
  "syn 2.0.110",
  "tempfile",
- "tonic-build 0.14.2",
+ "tonic-build",
 ]
 
 [[package]]
@@ -8130,7 +8079,7 @@ dependencies = [
  "prost-types 0.14.1",
  "tokio",
  "tokio-stream",
- "tonic 0.14.2",
+ "tonic",
  "tonic-prost",
 ]
 
@@ -9618,7 +9567,7 @@ version = "1.0.0-beta.1"
 dependencies = [
  "bip39",
  "orchard",
- "prost 0.13.5",
+ "prost 0.14.1",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
@@ -9632,8 +9581,8 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
- "tonic 0.14.2",
- "tonic-build 0.13.1",
+ "tonic",
+ "tonic-build",
  "zcash_client_backend",
  "zcash_client_memory",
  "zcash_client_sqlite",
@@ -9896,15 +9845,6 @@ name = "webpki-roots"
 version = "0.25.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.4",
-]
 
 [[package]]
 name = "webpki-roots"
@@ -10687,7 +10627,7 @@ dependencies = [
  "time-core",
  "tokio",
  "tokio-rustls",
- "tonic 0.14.2",
+ "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tor-rtcompat",
@@ -11115,7 +11055,7 @@ dependencies = [
  "libp2p-identity",
  "multiaddr",
  "pin-project",
- "prost 0.13.5",
+ "prost 0.14.1",
  "prost-build 0.13.5",
  "rand 0.8.5",
  "rayon",
@@ -11222,7 +11162,7 @@ dependencies = [
  "serde_with",
  "tokio",
  "tokio-stream",
- "tonic 0.14.2",
+ "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tonic-reflection",
@@ -11472,7 +11412,7 @@ dependencies = [
  "hyper-util",
  "thiserror 1.0.69",
  "tokio-rustls",
- "tonic 0.14.2",
+ "tonic",
  "tower 0.5.2",
  "webpki-roots 0.25.4",
  "zcash_client_backend",
@@ -11513,7 +11453,7 @@ dependencies = [
  "orchard",
  "pepper-sync",
  "portpicker",
- "prost 0.13.5",
+ "prost 0.14.1",
  "rand 0.8.5",
  "ring",
  "rust-embed",
@@ -11528,7 +11468,7 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "tokio-rustls",
- "tonic 0.13.1",
+ "tonic",
  "tower 0.5.2",
  "tracing",
  "tracing-subscriber",

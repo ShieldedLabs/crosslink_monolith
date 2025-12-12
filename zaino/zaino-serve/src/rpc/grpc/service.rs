@@ -8,8 +8,7 @@ use zaino_proto::proto::{
     compact_formats::CompactBlock,
     service::{
         compact_tx_streamer_server::CompactTxStreamer, Address, AddressList, Balance, BlockId,
-        Bytes,
-        BlockRange, ChainSpec, Duration, Empty, Exclude, GetAddressUtxosArg,
+        BlockRange, Bytes, ChainSpec, Duration, Empty, Exclude, GetAddressUtxosArg,
         GetAddressUtxosReplyList, GetSubtreeRootsArg, LightdInfo, PingResponse, RawTransaction,
         SendResponse, TransparentAddressBlockFilter, TreeState, TxFilter,
     },
@@ -145,6 +144,8 @@ where
         send_transaction(RawTransaction) -> SendResponse,
         "This name is misleading, returns the full transactions that have either inputs or outputs connected to the given transparent address."
         get_taddress_txids(TransparentAddressBlockFilter) -> Self::GetTaddressTxidsStream as streaming,
+        "Return the transactions corresponding to the given t-address within the given block range"
+        get_taddress_transactions(TransparentAddressBlockFilter) -> Self::GetTaddressTransactionsStream as streaming,
         "Returns the total balance for a list of taddrs"
         get_taddress_balance(AddressList) -> Balance,
         "Return the compact transactions currently in the mempool; the results \
@@ -205,6 +206,10 @@ where
     /// Server streaming response type for the GetTaddressTxids method.
     #[doc = "Server streaming response type for the GetTaddressTxids method."]
     type GetTaddressTxidsStream = std::pin::Pin<Box<RawTransactionStream>>;
+
+    /// Server streaming response type for the GetTaddressTransactions method.
+    #[doc = "Server streaming response type for the GetTaddressTransactions method."]
+    type GetTaddressTransactionsStream = std::pin::Pin<Box<RawTransactionStream>>;
 
     /// Returns the total balance for a list of taddrs
     #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]

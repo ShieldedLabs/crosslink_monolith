@@ -604,7 +604,7 @@ impl ZcashIndexer for FetchServiceSubscriber {
         for m in roster {
             m.write_to_vec(&mut data);
         }
-        Ok(Bytes{ data })
+        Ok(Bytes { data })
     }
 
     async fn chain_height(&self) -> Result<Height, Self::Error> {
@@ -1040,6 +1040,15 @@ impl LightWalletIndexer for FetchServiceSubscriber {
     /// Return the txids corresponding to the given t-address within the given block range
     #[allow(deprecated)]
     async fn get_taddress_txids(
+        &self,
+        request: TransparentAddressBlockFilter,
+    ) -> Result<RawTransactionStream, Self::Error> {
+        self.get_taddress_transactions(request).await
+    }
+    
+    /// Return the txids corresponding to the given t-address within the given block range
+    #[allow(deprecated)]
+    async fn get_taddress_transactions(
         &self,
         request: TransparentAddressBlockFilter,
     ) -> Result<RawTransactionStream, Self::Error> {
@@ -1640,6 +1649,7 @@ impl LightWalletIndexer for FetchServiceSubscriber {
             estimated_height: blockchain_info.estimated_height().0 as u64,
             zcashd_build: self.data.zebra_build(),
             zcashd_subversion: self.data.zebra_subversion(),
+            donation_address: "".to_owned(),
         })
     }
 

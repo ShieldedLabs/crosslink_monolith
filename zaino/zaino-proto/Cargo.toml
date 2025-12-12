@@ -11,10 +11,12 @@ version = { workspace = true }
 [dependencies]
 # Miscellaneous Workspace
 tonic = { workspace = true }
-
-# Miscellaneous Crate
 prost = { workspace = true }
+tonic-prost = { workspace = true }
 
 [build-dependencies]
-tonic-build = { workspace = true, features = ["prost"] }
+tonic-build = { workspace = true }
+tonic-prost-build = { workspace = true }
 which = { workspace = true }
+sha2 = "0.10.9"
+walkdir = "2.5.0"
