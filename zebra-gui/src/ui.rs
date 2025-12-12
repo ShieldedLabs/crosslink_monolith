@@ -1962,7 +1962,6 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
     let mut c = clay.begin::<(), ()>();
 
     unsafe { clay::Clay_SetCurrentContext(c.clay.context); }
-    unsafe { clay::Clay_SetMaxMeasureTextCacheWordCount(262144); }
 
     // c.set_debug_mode(true);
 
