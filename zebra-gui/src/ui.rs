@@ -180,14 +180,14 @@ pub struct TextDecl {
     h: f32,
     colour: (u8, u8, u8, u8),
     align: AlignX,
-    break_word: bool,
+    wrap_chars: bool,
 }
 pub const TextDecl: TextDecl = TextDecl {
     font: FontKind::Normal,
     h: 0.0,
     colour: WHITE,
     align: AlignX::Left,
-    break_word: false,
+    wrap_chars: false,
 };
 
 
@@ -525,11 +525,11 @@ impl Context {
                 AlignX::Right  => clay::text::TextAlignment::Right,
                 AlignX::Center => clay::text::TextAlignment::Center,
             })
-            // .wrap_mode(if decl.break_word {
-            //     clay::text::TextElementConfigWrapMode::BreakWord
-            // } else {
-            //     clay::text::TextElementConfigWrapMode::Words
-            // })
+            .wrap_mode(if decl.wrap_chars {
+                clay::text::TextElementConfigWrapMode::Chars
+            } else {
+                clay::text::TextElementConfigWrapMode::Words
+            })
             .end();
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
@@ -2111,16 +2111,16 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
             }) {
                 let text_h = ui.scale(10.0);
                 // Block Inspector Contents
-                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { wrap_chars: true, h: text_h, align: AlignX::Left, ..TextDecl });
 
                 let text = {
                     if let Some(text) = viz.inspect_block_json_text.as_ref() {
                         text.to_string()
                     } else {
-                        "Loading...".to_string()
+                        frame_strf!(data, "Loading info for block {}...", viz.inspecting_block_hash).to_string()
                     }
                 };
-                ui.text(frame_strf!(data, "{}", text), TextDecl { font: Mono, break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "{}", text), TextDecl { font: Mono, wrap_chars: true, h: text_h, align: AlignX::Left, ..TextDecl });
             }
         }
     }
