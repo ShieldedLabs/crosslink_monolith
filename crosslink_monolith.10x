@@ -23,7 +23,7 @@
 		<ConfigProperties>
 			<ConfigAndPlatform>
 				<Name>Debug:x64</Name>
-				<BuildCommand>C:\Work\ShieldedLabs\crosslink_monolith\local_testnet.bat</BuildCommand>
+				<BuildCommand>C:\Work\ShieldedLabs\crosslink_monolith\phillip_test.bat</BuildCommand>
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
 				<CleanCommand></CleanCommand>
