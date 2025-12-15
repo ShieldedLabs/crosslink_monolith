@@ -429,6 +429,7 @@ impl PoWCache {
         }
     }
     pub fn push_new_tip(&mut self, height: u64, hash: [u8; 32]) {
+        println!("pushed tip at {height}: {}", LEHash(hash));
         assert!(height <= self.next_tip_h as u64);
         if height < self.next_tip_h as u64 {
             self.hashes.truncate(height as usize + 1);
@@ -822,7 +823,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut miner_wallets = [miner_wallet_init];
 
     let mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly = Vec::<TxId>::new();
-    let mut local_tip_height = 0; // TODO: start with genesis?
 
     let genesis_hash = loop {
         match client.get_block(BlockId { height: 0, hash: Vec::new() }).await {
@@ -839,17 +839,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     // TODO: randomly sync from a list of multiple lightwalletd servers to reduce info leakage/blind trust.
     //       difficulty: handling discrepancies between them
 
-    let mut i = 0;
+    let mut resync_c = 0;
     'outer_sync: loop {
-        if i > 0 {
+        if resync_c > 0 {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
-        i += 1;
+        resync_c += 1;
 
 
         // NOTE: this is desynced from local_tip because we need to speculatively request blocks
         // further back than the chain divergence on reorg to find out where it occurred
-        let mut req_start_height = local_tip_height;
+        let mut req_start_height = pow_cache.next_tip_h-1;
 
         // NOTE: if you're dealing with multiple wallets, you don't want to resync all blocks for each
         // of them. They can all sync from the same blocks.
@@ -869,6 +869,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     start: Some(BlockId { height: req_start_height + 1,                              hash: Vec::new() }),
                     end:   Some(BlockId { height: req_start_height + MAX_BLOCKS_TO_DOWNLOAD_AT_TIME, hash: Vec::new() }),
                 };
+                // println!("cache at {}, downloading blocks: {}-{}",
+                //     pow_cache.next_tip_h-1, block_range.start.clone().unwrap().height, block_range.end.clone().unwrap().height);
                 tokio::join!(
                     client.get_tree_state(BlockId {height: req_start_height, hash: Vec::new()}),
                     client0.get_lightd_info(Empty {}),
@@ -924,7 +926,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             };
 
-            // COMPACT BLOCKS
+            // COMPACT BLOCKS - DOWNLOAD
             let mut new_blocks: Vec<CompactBlock> = Vec::new();
             match block_range_res {
                 Ok(blocks) => {
@@ -950,67 +952,70 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             };
 
+            // COMPACT BLOCKS - VALIDATE & CACHE
             let mut sync_from_i = None;
             if new_blocks.len() > 0 {
                 // TODO: max of this & finalised height
                 let mut first_new_block_i = 0;
-                let i = 0;
-                // NOTE: here we always truncate back to the first block in a range that overlaps ours
-                // ALT: loop over the range to find the discontiguity. The downside of this is that
-                // we'd need to be serially dependent on requesting the tree state at that point,
-                // and that also provides another race condition for out-of-sync data.
-                // TODO: determine whether we actually need tree/chain state (commitment trees etc) for syncing
-                // for i in 0..new_blocks.len()
-                let Ok(prev_hash) = <[u8;32]>::try_from(&new_blocks[i].prev_hash[..]) else {
-                    println!("invalid prev_hash for compact block at height {}: {}", new_blocks[i].height, LESlice(&new_blocks[i].prev_hash));
-                    continue 'outer_sync;
-                };
+                {
+                    let i = 0;
+                    // NOTE: here we always truncate back to the first block in a range that overlaps ours
+                    // ALT: loop over the range to find the discontiguity. The downside of this is that
+                    // we'd need to be serially dependent on requesting the tree state at that point,
+                    // and that also provides another race condition for out-of-sync data.
+                    // TODO: determine whether we actually need tree/chain state (commitment trees etc) for syncing
+                    // for i in 0..new_blocks.len()
+                    let Ok(prev_hash) = <[u8;32]>::try_from(&new_blocks[i].prev_hash[..]) else {
+                        println!("invalid prev_hash for compact block at height {}: {}", new_blocks[i].height, LESlice(&new_blocks[i].prev_hash));
+                        continue 'outer_sync;
+                    };
 
-                let expected_prev_hash = pow_cache.hash_at_height(new_blocks[i].height-1);
-                if i == 0 {
-                    let mut needs_resync = false;
-                    if prev_hash != prev_tip_chain_state.block_hash().0 {
-                        println!("Non-atomic API meant block range & chain-state are torn reads: {} vs {}", LEHash(prev_hash), LEHash(prev_tip_chain_state.block_hash().0));
-                        req_start_height = req_start_height.saturating_sub(MAX_BLOCKS_TO_DOWNLOAD_AT_TIME / 2);
-                        needs_resync = true;
+                    let expected_prev_hash = pow_cache.hash_at_height(new_blocks[i].height-1);
+                    if i == 0 {
+                        let mut needs_resync = false;
+                        if prev_hash != prev_tip_chain_state.block_hash().0 {
+                            println!("non-atomic API meant block range & chain-state are torn reads: {} vs {}", LEHash(prev_hash), LEHash(prev_tip_chain_state.block_hash().0));
+                            req_start_height = req_start_height.saturating_sub(MAX_BLOCKS_TO_DOWNLOAD_AT_TIME / 2);
+                            needs_resync = true;
+                        }
+                        if Some(prev_hash) != expected_prev_hash {
+                            println!("reorg occurred before height {}; hash mismatch {prev_hash:?} vs {expected_prev_hash:?}", new_blocks[0].height);
+                            req_start_height = req_start_height.saturating_sub(MAX_BLOCKS_TO_DOWNLOAD_AT_TIME);
+                            needs_resync = true;
+                        }
+                        if needs_resync {
+                            println!("hit discontinuity; handling reorg!");
+                            continue 'sync_find_continuation_point;
+                        }
                     }
-                    if Some(prev_hash) != expected_prev_hash {
-                        println!("Reorg occurred before height {}", new_blocks[0].height);
-                        req_start_height = req_start_height.saturating_sub(MAX_BLOCKS_TO_DOWNLOAD_AT_TIME);
-                        needs_resync = true;
-                    }
-                    if needs_resync {
-                        // todo!("hit discontinuity; handle reorg!");
-                        continue 'sync_find_continuation_point;
-                    }
+                    // else {
+                    //     if Some(prev_hash) != expected_prev_hash {
+                    //         // desync occurred within the existing range
+                    //         first_new_block_i = i-1;
+                    //         break;
+                    //     }
+                    // }
                 }
-                // else {
-                //     if Some(prev_hash) != expected_prev_hash {
-                //         // desync occurred within the existing range
-                //         first_new_block_i = i-1;
-                //         break;
-                //     }
-                // }
 
 
                 for block_i in first_new_block_i..new_blocks.len() {
                     // TODO: more data validation?
                     let mut data_is_invalid = false;
-                    let hash = if let Ok(hash) = <[u8;32]>::try_from(&new_blocks[i].hash[..]) {
+                    let hash = if let Ok(hash) = <[u8;32]>::try_from(&new_blocks[block_i].hash[..]) {
                         hash
                     } else {
-                        println!("invalid hash for compact block at height {}: {}", new_blocks[i].height, LESlice(&new_blocks[i].hash));
+                        println!("invalid hash for compact block at height {}: {}", new_blocks[block_i].height, LESlice(&new_blocks[block_i].hash));
                         data_is_invalid = true;
                         [0;32]
                     };
-                    if <u32>::try_from(new_blocks[i].height).is_err() {
-                        println!("block height cannot be stored in 32 bits: {}", new_blocks[i].height);
+                    if <u32>::try_from(new_blocks[block_i].height).is_err() {
+                        println!("block height cannot be stored in 32 bits: {}", new_blocks[block_i].height);
                         data_is_invalid = true;
                     }
-                    for tx in &new_blocks[i].vtx {
-                        if <[u8;32]>::try_from(&new_blocks[i].hash[..]).is_err() {
+                    for tx in &new_blocks[block_i].vtx {
+                        if <[u8;32]>::try_from(&new_blocks[block_i].hash[..]).is_err() {
                             // TODO: are TxIds LE or BE?
-                            println!("invalid hash for compact tx at height {}: {:?}", new_blocks[i].height, tx.hash);
+                            println!("invalid hash for compact tx at height {}: {:?}", new_blocks[block_i].height, tx.hash);
                             data_is_invalid = true;
                             break;
                         }
@@ -1020,19 +1025,29 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         break;
                     }
 
-                    pow_cache.push_new_tip(new_blocks[block_i].height, hash);
+                    let new_tip_h = new_blocks[block_i].height;
+                    let cached_prev_hash = pow_cache.hash_at_height(new_tip_h-1);
+                    let pre_new_tip_hash = <[u8;32]>::try_from(&new_blocks[block_i].prev_hash[..]).unwrap();
+                    // println!("pushing {} at {new_tip_h}, prev hash {pre_new_tip_hash:?} vs cached prev {cached_prev_hash:?}", LEHash(hash));
+                    if let Some(cached_prev_hash) = cached_prev_hash {
+                        debug_assert_eq!(cached_prev_hash, pre_new_tip_hash, "");
+                    }
+                    pow_cache.push_new_tip(new_tip_h, hash);
                     // TODO: if this changes we need to skip to the equivalent on the transparent txs
                     sync_from_i = Some(first_new_block_i);
                 }
             }
 
             if sync_from_i.is_none() {
+                // println!("nothing to sync");
                 break (Vec::new(), Vec::new(), None);
             }
+            println!("downloaded compact blocks {}-{}", new_blocks.first().unwrap().height, new_blocks.last().unwrap().height);
 
             let compact_block_max_height = new_blocks.last().expect("non-empty vector").height;
 
             // TRANSPARENT TRANSACTIONS
+            let mut t_failed_at_h = None;
             let mut new_raw_t_txs: Vec<RawTransaction> = Vec::new();
             match t_txs_res {
                 Ok(t_txs) => {
@@ -1045,7 +1060,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             Ok(None) => break,
                             Err(err) => {
                                 if err.code() != tonic::Code::OutOfRange {
-                                    println!("Failed to get tx: {err:?}");
+                                    println!("failed to get transparent tx: {err:?}");
+                                    // NOTE: this is overly conservative
+                                    t_failed_at_h = Some(new_raw_t_txs.last().map_or(0, |tx| tx.height+1));
                                 }
                                 break; // we can still update with the txs we got, we don't need to fully reset
                             }
@@ -1058,13 +1075,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             };
 
-            let mut t_failed_at_h = None;
             let mut new_t_txs = Vec::<(BlockHeight, Transaction)>::with_capacity(new_raw_t_txs.len());
             for tx_i in 0..new_raw_t_txs.len() {
                 let raw_tx = &new_raw_t_txs[tx_i];
 
                 // height can be 0 for mempool, 0xff..ff for sidechain
                 if raw_tx.height == u64::MAX {
+                    println!("found sidechain transparent tx that we don't have height for, skipping...");
                     continue;
                 }
 
@@ -1083,7 +1100,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     Ok(tx) => tx,
                     Err(err) => {
                         println!("failed to read transparent tx at height {h}");
-                        t_failed_at_h = Some(raw_tx.height);
+                        t_failed_at_h = Some(raw_tx.height); // this will be < the previous val
                         // @in_step_sync
                         // remove everything at the failed height
                         while new_t_txs.len() > 0 {
@@ -1100,6 +1117,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             // truncate compact blocks to match transparent // @in_step_sync
             if let Some(h) = t_failed_at_h {
+                println!("truncating compact blocks to match transparent at {h}");
                 // ALT: partition_point then truncate
                 while new_blocks.len() > 0 {
                     if new_blocks.last().unwrap().height < h {
@@ -1110,6 +1128,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 if new_blocks.len() == 0 {
                     sync_from_i = None;
+                }
+
+                if let Some(hash) = pow_cache.hash_at_height(h) {
+                    pow_cache.push_new_tip(h, hash);
                 }
             }
 
@@ -1122,7 +1144,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // TODO: ideally the GUI won't see this intermediate state
         if let Some(start_block_i) = sync_from_i {
             let sync_start_h = <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above");
-            local_tip_height = new_blocks.last().unwrap().height;
+            println!("cache at {}, new blocks: {}-{}; updating wallets...",
+                pow_cache.next_tip_h-1, new_blocks.first().unwrap().height, new_blocks.last().unwrap().height);
 
             for (wallet_i, wallet) in [miner_wallet, user_wallet].into_iter().enumerate() {
                 // -- INVALIDATE TXS >= NEW BLOCKS HEIGHT
@@ -1215,21 +1238,43 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             let t_tx = &miner_t_txs[t_tx_i].1;
                             t_tx_i += 1;
 
+                            let mut expiry_height = Some(t_tx.expiry_height());
+                            if <u32>::from(expiry_height.unwrap()) == 0 {
+                                expiry_height = None;
+                            }
+
+                            let mut total_received = 0;
+                            if let Some(t_bundle) = t_tx.transparent_bundle() {
+                                // TODO: t_bundle.authorization
+                                for input in &t_bundle.vin {
+                                    // TODO
+                                }
+                                for output in &t_bundle.vout {
+                                    if let Some(t_addr) = output.recipient_address() {
+                                        if t_addr == miner_t_address {
+                                            total_received += output.value().into_u64();
+                                        }
+                                    }
+                                }
+                            }
+
                             // TODO: complete
                             let new_wallet_tx = WalletTx(
                                 TransactionSummary {
                                     account_id: 0,
                                     txid: t_tx.txid(),
-                                    expiry_height: None,
+                                    expiry_height,
                                     mined_height: Some(block_h),
                                     account_value_delta: ZatBalance::from_i64(0).unwrap(),
                                     total_spent: Zatoshis::from_u64(0).unwrap(),
-                                    total_received: Zatoshis::from_u64(0).unwrap(),
+                                    total_received: Zatoshis::from_u64(total_received).unwrap(),
                                     fee_paid: Some(Zatoshis::from_u64(0).unwrap()),
-                                    spent_note_count: 0,
                                     has_change: false,
+
+                                    spent_note_count: 0,
                                     sent_note_count: 0,
                                     received_note_count: 0,
+
                                     memo_count: 0,
                                     expired_unmined: false,
                                     is_shielding: false,
@@ -1281,6 +1326,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
+        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+        let mut txs = miner_wallet.txs.clone();
+        txs.reverse();
+        wallet_state.lock().unwrap().txs = txs;
 
         // let (reorg_required) = 'process_blocks: {
         //     let mut reorg_required = false;
