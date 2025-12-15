@@ -12,7 +12,10 @@ REM cargo build -Fviz_gui
 REM start "" "C:\Users\Madina\Downloads\remedybg_0_4_0_12\remedybg.exe" -g -q "C:\Work\ShieldedLabs\crosslink_monolith\zebra-crosslink\target\debug\deps\zebrad.exe"
 
 pushd C:\Work\ShieldedLabs\crosslink_monolith\zebra-gui\
-cargo build && start "" "C:\Users\Madina\Downloads\remedybg_0_4_0_12\remedybg.exe" -g -q "C:\Work\ShieldedLabs\crosslink_monolith\zebra-gui\target\debug\deps\visualizer_zcash.exe"
+REM cargo build && start "" "C:\Users\Madina\Downloads\remedybg_0_4_0_12\remedybg.exe" -g -q "C:\Work\ShieldedLabs\crosslink_monolith\zebra-gui\target\debug\deps\visualizer_zcash.exe"
+REM cargo build --release && start "" "C:\Users\Madina\Downloads\remedybg_0_4_0_12\remedybg.exe" -g -q "C:\Work\ShieldedLabs\crosslink_monolith\zebra-gui\target\release\deps\visualizer_zcash.exe"
+
+cargo build --release
 
 
 REM copy /Y "C:\Work\ShieldedLabs\crosslink_monolith\zebra-crosslink\target\debug\deps\zebrad.exe" "C:\Work\ShieldedLabs\crosslink_monolith\zebra-crosslink\target\debug\deps\zebrad_testnet_1.exe"
