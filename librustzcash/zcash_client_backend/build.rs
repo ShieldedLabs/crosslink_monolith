@@ -34,6 +34,8 @@ fn build() -> io::Result<()> {
         .expect("Cannot find OUT_DIR environment variable")
         .into();
 
+    println!("cargo:warning=Protos changed; rebuilding…");
+
     // Build the compact format types.
     tonic_prost_build::compile_protos(COMPACT_FORMATS_PROTO)?;
 
