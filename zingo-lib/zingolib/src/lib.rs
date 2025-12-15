@@ -17,9 +17,6 @@ pub mod mocks;
 #[cfg(any(test, feature = "testutils"))]
 pub mod testutils;
 
-// This line includes the generated `git_description()` function directly into this scope.
-include!(concat!(env!("OUT_DIR"), "/git_description.rs"));
-
 #[macro_use]
 extern crate rust_embed;
 /// Embedded zcash-params for mobile devices.

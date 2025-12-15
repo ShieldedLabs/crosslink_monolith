@@ -977,6 +977,7 @@ where
             &SpendingKeys::from_unified_spending_key(usk.clone()),
             ovk_policy,
             &proposal,
+            None,
         )
     }
 
@@ -1141,6 +1142,7 @@ where
             &SpendingKeys::from_unified_spending_key(usk.clone()),
             ovk_policy,
             proposal,
+            None,
         )
     }
 

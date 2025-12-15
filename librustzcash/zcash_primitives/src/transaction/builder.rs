@@ -1198,6 +1198,7 @@ mod tests {
             tze_builder: core::marker::PhantomData,
             _progress_notifier: (),
             orchard_builder: None,
+            staking_action: None,
         };
 
         let mut transparent_signing_set = TransparentSigningSet::new();

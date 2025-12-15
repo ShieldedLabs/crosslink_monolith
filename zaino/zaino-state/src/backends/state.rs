@@ -192,33 +192,34 @@ impl ZcashService for StateService {
 
         let zebra_build_data = rpc_client.get_info().await?;
 
-        // This const is optional, as the build script can only
-        // generate it from hash-based dependencies.
-        // in all other cases, this check will be skipped.
-        if let Some(expected_zebrad_version) = crate::ZEBRA_VERSION {
-            // this `+` indicates a git describe run
-            // i.e. the first seven characters of the commit hash
-            // have been appended. We match on those
-            if zebra_build_data.build.contains('+') {
-                if !zebra_build_data
-                    .build
-                    .contains(&expected_zebrad_version[0..7])
-                {
-                    return Err(StateServiceError::ZebradVersionMismatch {
-                        expected_zebrad_version: expected_zebrad_version.to_string(),
-                        connected_zebrad_version: zebra_build_data.build,
-                    });
-                }
-            } else {
-                // With no `+`, we expect a version number to be an exact match
-                if expected_zebrad_version != zebra_build_data.build {
-                    return Err(StateServiceError::ZebradVersionMismatch {
-                        expected_zebrad_version: expected_zebrad_version.to_string(),
-                        connected_zebrad_version: zebra_build_data.build,
-                    });
-                }
-            }
-        };
+        // Note(Sam): This is disabled for now as the build script caused massive issues when using the library.
+        // // This const is optional, as the build script can only
+        // // generate it from hash-based dependencies.
+        // // in all other cases, this check will be skipped.
+        // if let Some(expected_zebrad_version) = crate::ZEBRA_VERSION {
+        //     // this `+` indicates a git describe run
+        //     // i.e. the first seven characters of the commit hash
+        //     // have been appended. We match on those
+        //     if zebra_build_data.build.contains('+') {
+        //         if !zebra_build_data
+        //             .build
+        //             .contains(&expected_zebrad_version[0..7])
+        //         {
+        //             return Err(StateServiceError::ZebradVersionMismatch {
+        //                 expected_zebrad_version: expected_zebrad_version.to_string(),
+        //                 connected_zebrad_version: zebra_build_data.build,
+        //             });
+        //         }
+        //     } else {
+        //         // With no `+`, we expect a version number to be an exact match
+        //         if expected_zebrad_version != zebra_build_data.build {
+        //             return Err(StateServiceError::ZebradVersionMismatch {
+        //                 expected_zebrad_version: expected_zebrad_version.to_string(),
+        //                 connected_zebrad_version: zebra_build_data.build,
+        //             });
+        //         }
+        //     }
+        // };
         let data = ServiceMetadata::new(
             get_build_info(),
             config.network.to_zebra_network(),
@@ -2045,6 +2046,14 @@ impl LightWalletIndexer for StateServiceSubscriber {
         &self,
         request: TransparentAddressBlockFilter,
     ) -> Result<RawTransactionStream, Self::Error> {
+        self.get_taddress_transactions(request).await
+    }
+
+    /// Return the transactions corresponding to the given t-address within the given block range
+    async fn get_taddress_transactions(
+        &self,
+        request: TransparentAddressBlockFilter,
+    ) -> Result<RawTransactionStream, Self::Error> {
         let txids = self.get_taddress_txids_helper(request).await?;
         let chain_height = self.chain_height().await?;
         let (transmitter, receiver) = mpsc::channel(self.config.service.channel_size as usize);
@@ -2544,6 +2553,7 @@ impl LightWalletIndexer for StateServiceSubscriber {
             estimated_height: blockchain_info.estimated_height().0 as u64,
             zcashd_build: self.data.zebra_build(),
             zcashd_subversion: self.data.zebra_subversion(),
+            donation_address: "".to_owned(),
         })
     }
 

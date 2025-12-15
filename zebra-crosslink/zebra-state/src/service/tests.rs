@@ -505,7 +505,7 @@ proptest! {
         let _init_guard = zebra_test::init();
 
         // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
-        let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change) = StateService::new(Config::ephemeral(), &network, Height::MAX, std::sync::Arc::new(|_,_| true));
+        let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_| true));
 
         prop_assert_eq!(latest_chain_tip.best_tip_height(), None);
         prop_assert_eq!(chain_tip_change.last_tip_change(), None);

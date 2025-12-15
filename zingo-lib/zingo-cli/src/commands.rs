@@ -66,7 +66,7 @@ impl Command for GetVersionCommand {
     }
 
     fn exec(&self, _args: &[&str], _lightclient: &mut LightClient) -> String {
-        zingolib::git_description().to_string()
+        "No Stable Version Yet".to_owned()
     }
 }
 

@@ -570,6 +570,7 @@ impl SpendConflictTestInput {
                 Transaction::V1 { .. } | Transaction::V5 { .. } => {}
                 #[cfg(feature = "tx_v6")]
                 Transaction::V6 { .. } => {}
+                Transaction::VCrosslink { .. } => {}
             }
         }
     }
@@ -642,6 +643,13 @@ impl SpendConflictTestInput {
 
                 #[cfg(feature = "tx_v6")]
                 Transaction::V6 {
+                    sapling_shielded_data,
+                    ..
+                } => {
+                    Self::remove_sapling_transfers_with_conflicts(sapling_shielded_data, &conflicts)
+                }
+
+                Transaction::VCrosslink {
                     sapling_shielded_data,
                     ..
                 } => {
@@ -721,6 +729,11 @@ impl SpendConflictTestInput {
 
                 #[cfg(feature = "tx_v6")]
                 Transaction::V6 {
+                    orchard_shielded_data,
+                    ..
+                } => Self::remove_orchard_actions_with_conflicts(orchard_shielded_data, &conflicts),
+
+                Transaction::VCrosslink {
                     orchard_shielded_data,
                     ..
                 } => Self::remove_orchard_actions_with_conflicts(orchard_shielded_data, &conflicts),

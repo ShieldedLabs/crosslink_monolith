@@ -75,6 +75,9 @@ message ChainSpec {}
 // Empty is for gRPCs that take no arguments, currently only GetLightdInfo.
 message Empty {}
 
+// Bytes is for bytes
+message Bytes { bytes data = 1; }
+
 // LightdInfo returns various information about this lightwalletd instance
 // and the state of the blockchain.
 message LightdInfo {
@@ -237,6 +240,9 @@ service CompactTxStreamer {
 
     rpc GetAddressUtxos(GetAddressUtxosArg) returns (GetAddressUtxosReplyList) {}
     rpc GetAddressUtxosStream(GetAddressUtxosArg) returns (stream GetAddressUtxosReply) {}
+
+    // Return information about BFT roster
+    rpc GetRoster(Empty) returns (Bytes) {}
 
     // Return information about this lightwalletd instance and the blockchain
     rpc GetLightdInfo(Empty) returns (LightdInfo) {}

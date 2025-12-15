@@ -6,9 +6,9 @@ use orchard::tree::MerkleHashOrchard;
 use shardtree::store::{Checkpoint, ShardStore, TreeState};
 use tokio::sync::mpsc;
 use zcash_client_backend::keys::UnifiedFullViewingKey;
-use zcash_primitives::consensus::BlockHeight;
+use zcash_protocol::consensus::BlockHeight;
 use zcash_primitives::transaction::TxId;
-use zcash_primitives::zip32::AccountId;
+use zip32::AccountId;
 use zcash_protocol::ShieldedProtocol;
 use zip32::DiversifierIndex;
 
