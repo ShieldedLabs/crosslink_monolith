@@ -20,13 +20,21 @@ impl RequestToZebra {
         }
     }
 }
+
+// @Todo: enum BlockInspection {
+//     None,
+//     PoW(Arc<zebra_chain::Block>),
+//     PoS(Arc<zebra_chain::block::BftBlock>)
+// }
+
 pub struct ResponseFromZebra {
     pub bc_tip_height: u64,
     pub bft_tip_height: u64,
     pub bc_blocks: Vec<BcBlock>,
     pub bft_blocks: Vec<BftBlock>,
     pub what_block_it_is: Hash32,
-    pub json_dump_of_the_block: String,
+    pub json_dump_of_the_block: String, // @Todo: @Remove and replace with structured data.
+    // @Todo: pub block_inspection: BlockInspection,
 }
 impl ResponseFromZebra {
     pub fn _0() -> Self {
@@ -37,6 +45,7 @@ impl ResponseFromZebra {
             bft_blocks: Vec::new(),
             what_block_it_is: Hash32::from_u64(0),
             json_dump_of_the_block: "Data not available.".to_owned(),
+            // @Todo: block_inspection: BlockInspection::None,
         }
     }
 }

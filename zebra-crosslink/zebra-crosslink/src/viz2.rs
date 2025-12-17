@@ -142,7 +142,7 @@ pub async fn service_viz_requests(
                             let this_hash = Hash32::from_bytes(bc.header.hash().0);
                             if request.want_to_inspect_block == this_hash {
                                 response.what_block_it_is = this_hash;
-                                response.json_dump_of_the_block = format!("{:?}", bc);
+                                response.json_dump_of_the_block = format!("{:#?}", bc);
                             }
                             response.bc_blocks.push(visualizer_zcash::BcBlock {
                                 this_hash: this_hash,
@@ -159,7 +159,7 @@ pub async fn service_viz_requests(
                         let this_hash = Hash32::from_bytes(b.blake3_hash().0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;
-                            response.json_dump_of_the_block = format!("{:?}", b);
+                            response.json_dump_of_the_block = format!("{:#?}", b);
                         }
                         response.bft_blocks.push(visualizer_zcash::BftBlock {
                             this_hash: this_hash,
