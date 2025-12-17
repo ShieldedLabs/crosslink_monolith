@@ -7,8 +7,8 @@ set "RUSTFLAGS=-Awarnings"
 set "PROTOC=C:\Work\ShieldedLabs\protoc-33.1-win64\bin\protoc.exe"
 set "SOURCE_DATE_EPOCH=0"
 
-set "project=zebra-crosslink"
-REM set "project=zebra-gui"
+REM set "project=zebra-crosslink"
+set "project=zebra-gui"
 
 set "config=%1"
 
@@ -24,9 +24,9 @@ if "%project%"=="zebra-crosslink" (
     set "flags=%flags% -Fviz_gui"
 )
 
-echo pushd %root%\%project%\
-echo cargo build %flags%
-echo popd
+pushd %root%\%project%\
+cargo build %flags%
+popd
 
 if %errorlevel% neq 0 exit /b %errorlevel%
 

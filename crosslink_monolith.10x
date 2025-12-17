@@ -16,14 +16,13 @@
 		</Configurations>
 		<Platforms>
 			<Platform>x64</Platform>
-			<Platform>Win32</Platform>
 		</Platforms>
 		<AdditionalIncludePaths></AdditionalIncludePaths>
 		<Defines></Defines>
 		<ConfigProperties>
 			<ConfigAndPlatform>
 				<Name>Debug:x64</Name>
-				<BuildCommand>C:\Work\ShieldedLabs\crosslink_monolith\phillip_test.bat</BuildCommand>
+				<BuildCommand>phuild.bat -$(Configuration)</BuildCommand>
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
 				<CleanCommand></CleanCommand>
@@ -31,16 +30,82 @@
 				<CancelBuild></CancelBuild>
 				<Exe></Exe>
 				<Args></Args>
-				<WorkingDirectory>C:\Work\ShieldedLabs\crosslink_monolith\zebra-gui</WorkingDirectory>
-				<DebugCommand>C:\Work\ShieldedLabs\crosslink_monolith\zebra-crosslink\zebrad.rdbg</DebugCommand>
+				<WorkingDirectory>zebra-gui</WorkingDirectory>
+				<DebugCommand>zebra-crosslink\zebrad.rdbg</DebugCommand>
 				<DebuggerExe></DebuggerExe>
 				<DebugSln>fake_file.sln</DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
 				<PrioritiseFiles></PrioritiseFiles>
 			</ConfigAndPlatform>
+			<ConfigAndPlatform>
+				<Name>Release:x64</Name>
+				<BuildCommand>phuild.bat -$(Configuration) </BuildCommand>
+				<RebuildCommand></RebuildCommand>
+				<BuildFileCommand></BuildFileCommand>
+				<CleanCommand></CleanCommand>
+				<BuildWorkingDirectory></BuildWorkingDirectory>
+				<CancelBuild></CancelBuild>
+				<Exe></Exe>
+				<Args></Args>
+				<WorkingDirectory>$(WorkspaceDirectory)</WorkingDirectory>
+				<DebugCommand>$(Executable)</DebugCommand>
+				<DebuggerExe></DebuggerExe>
+				<DebugSln></DebugSln>
+				<Defines></Defines>
+				<ForceIncludes></ForceIncludes>
+				<PrioritiseFiles></PrioritiseFiles>
+			</ConfigAndPlatform>
+			<ConfigAndPlatform>
+				<Name>debug:x64</Name>
+				<BuildCommand>phuild.bat -$(Configuration)</BuildCommand>
+				<RebuildCommand></RebuildCommand>
+				<BuildFileCommand></BuildFileCommand>
+				<CleanCommand></CleanCommand>
+				<BuildWorkingDirectory></BuildWorkingDirectory>
+				<CancelBuild></CancelBuild>
+				<Exe></Exe>
+				<Args></Args>
+				<WorkingDirectory>$(WorkspaceDirectory)</WorkingDirectory>
+				<DebugCommand>$(Executable)</DebugCommand>
+				<DebuggerExe></DebuggerExe>
+				<DebugSln></DebugSln>
+				<Defines></Defines>
+				<ForceIncludes></ForceIncludes>
+				<PrioritiseFiles></PrioritiseFiles>
+			</ConfigAndPlatform>
+			<ConfigAndPlatform>
+				<Name>release:x64</Name>
+				<BuildCommand>phuild.bat -$(Configuration)</BuildCommand>
+				<RebuildCommand></RebuildCommand>
+				<BuildFileCommand></BuildFileCommand>
+				<CleanCommand></CleanCommand>
+				<BuildWorkingDirectory></BuildWorkingDirectory>
+				<CancelBuild></CancelBuild>
+				<Exe></Exe>
+				<Args></Args>
+				<WorkingDirectory>$(WorkspaceDirectory)</WorkingDirectory>
+				<DebugCommand>$(Executable)</DebugCommand>
+				<DebuggerExe></DebuggerExe>
+				<DebugSln></DebugSln>
+				<Defines></Defines>
+				<ForceIncludes></ForceIncludes>
+				<PrioritiseFiles></PrioritiseFiles>
+			</ConfigAndPlatform>
 			<Config>
 				<Name>Debug</Name>
+				<Defines></Defines>
+			</Config>
+			<Config>
+				<Name>Release</Name>
+				<Defines></Defines>
+			</Config>
+			<Config>
+				<Name>debug</Name>
+				<Defines></Defines>
+			</Config>
+			<Config>
+				<Name>release</Name>
 				<Defines></Defines>
 			</Config>
 			<Platform>
