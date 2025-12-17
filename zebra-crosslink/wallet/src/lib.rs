@@ -32,13 +32,13 @@ use zcash_primitives::transaction::components::TxOut;
 use zcash_primitives::transaction::fees::zip317::{self, MINIMUM_FEE};
 use zcash_primitives::transaction::sighash::{signature_hash, SignableInput};
 use zcash_primitives::transaction::txid::TxIdDigester;
-use zcash_primitives::transaction::{Transaction, TransactionData, TxVersion};
+use zcash_primitives::transaction::{Authorized, Unauthorized, Transaction, TransactionData, TxVersion};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::{ZatBalance, Zatoshis};
 use zcash_protocol::TxId;
 use zcash_transparent::{
-    builder::{TransparentBuilder, TransparentSigningSet, Unauthorized},
+    builder::{TransparentBuilder, TransparentSigningSet},
     bundle::OutPoint,
     keys::NonHardenedChildIndex,
 };
@@ -104,6 +104,33 @@ pub struct LEHash(pub [u8; 32]);
 impl std::fmt::Display for LEHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         LESlice(&self.0).fmt(f)
+    }
+}
+
+// if unspent, this is a UTXO; the notion of a "spent unspent transaction output" is slightly silly
+#[derive(Clone, Debug, PartialEq)]
+struct Txo {
+    pub spent_h: BlockHeight,
+    pub recv_h: BlockHeight,
+    pub id: OutPoint, // txid + index in tx
+    pub txout: TxOut,
+}
+
+pub struct Txos<'a>(pub &'a [Txo]);
+impl std::fmt::Debug for Txos<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut i = 0;
+        write!(f, "[")?;
+        for it in self.0 {
+            write!(f, "\n  {:?}", self.0[i])?;
+            i += 1;
+        }
+        if i > 0 {
+            write!(f, "\n]")?;
+        } else {
+            write!(f, "]")?;
+        }
+        Ok(())
     }
 }
 
@@ -346,6 +373,11 @@ pub struct ManualAccount {
     pub ufvk: UnifiedFullViewingKey,
     pub birthday: BlockHeight,
     pub balance_changes: Vec<(BlockHeight, data_api::AccountBalance)>, // TODO: account for mempool
+
+    // unspent: sorted by recv height
+    pub utxos: Vec<Txo>,
+    // spent: sorted by spend height
+    pub stxos: Vec<Txo>,
 }
 // NOTE: WalletDb doesn't store spending key, so we'll do the same here...
 #[derive(Clone, Debug)]
@@ -488,6 +520,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             balance_changes: vec![(BlockHeight::from_u32(0), data_api::AccountBalance::ZERO)],
             fully_decoded_height: BlockHeight::from_u32(0),
             fully_detected_height: BlockHeight::from_u32(0),
+            utxos: Vec::new(),
+            stxos: Vec::new(),
         };
 
         let wallet = ManualWallet {
@@ -1221,15 +1255,73 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
+        //-- REORG
+        if let Some(start_block_i) = sync_from_i {
+            let sync_start_h = <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above");
+            let block_h = BlockHeight::from_u32(sync_start_h);
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+            for (wallet_i, wallet) in [miner_wallet, user_wallet].into_iter().enumerate() {
+                //-- INVALIDATE TXS >= NEW BLOCKS HEIGHT
+                // the regime is basically "always reorg", but that's often a no-op
+                // truncate wallet for everything below height
+                for account in &mut wallet.accounts {
+                    account.fully_detected_height = account.fully_detected_height.min(block_h - 1);
+                    account.fully_decoded_height = account.fully_decoded_height.min(block_h - 1);
+
+                    // TODO: do we want to track balance changes or keep balances updated as chain changes occur?
+                    let truncate_to_i = account.balance_changes.partition_point(|(b,_)| *b < block_h);
+                    account.balance_changes.truncate(truncate_to_i);
+
+                    //- unreceive utxos
+                    let utxos_at_height_start = account.utxos.partition_point(|txo| txo.recv_h < block_h);
+                    account.utxos.truncate(utxos_at_height_start);
+
+                    //- unspend stxos
+                    let stxos_at_height_start = account.stxos.partition_point(|txo| txo.spent_h < block_h);
+                    for stxo in &account.stxos[stxos_at_height_start..] {
+                        if stxo.recv_h < block_h {
+                            account.utxos.push(Txo{ spent_h: BlockHeight::from_u32(0), ..stxo.clone() });
+                        }
+                    }
+                    account.stxos.truncate(stxos_at_height_start);
+                }
+
+                //  higher blocks & mempool
+                let invalidate_from_i = wallet.txs.partition_point(|tx|
+                    tx.0.mined_height.is_some() && <u32>::from(tx.0.mined_height.unwrap()) < sync_start_h
+                );
+                for tx in &mut wallet.txs[invalidate_from_i..] {
+                    // N.B. these may get revalidated later if the same txs are found in the new blocks
+                    tx.2 = true;
+                }
+            }
+        }
+
         fn update_insert_i(txs: &[WalletTx], insert_i: &mut usize, block_h: BlockHeight) {
+            // put at the *end* of txs at the same height
+            // i.e. primarily sorted by mined height, secondarily by discovered_time
             *insert_i += txs[*insert_i..].partition_point(|tx|
                 tx.0.mined_height.is_some() && tx.0.mined_height.unwrap() <= block_h
             );
         }
 
-        // TRANSPARENT TXS AT HEIGHT
+        //-- ADD/REVALIDATE TRANSPARENT TXS
         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
         {
+            fn utxo_position_at_height(utxos: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
+                let utxos_at_height_start = utxos.partition_point(|txo| txo.recv_h < block_h);
+                for utxo_i in utxos_at_height_start..utxos.len() {
+                    if utxos[utxo_i].recv_h > block_h {
+                        break;
+                    }
+                    if &utxos[utxo_i].id == utxo_id {
+                        return Some(utxo_i);
+                    }
+                }
+                None
+            }
+
+
             // see note above on transparent syncing
             // let sync_start_h = if let Some(start_block_i) = sync_from_i {
             //     <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above")
@@ -1248,16 +1340,57 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     expiry_height = None;
                 }
 
+                let txid = t_tx.txid();
+                // NOTE: these are only from *our* perspective
                 let mut total_received = 0;
+                let mut total_spent = 0;
+                let mut is_coinbase = false;
+                let account = &mut miner_wallet.accounts[0];
                 if let Some(t_bundle) = t_tx.transparent_bundle() {
                     // TODO: t_bundle.authorization
-                    for input in &t_bundle.vin {
-                        // TODO
+
+                    println!("t_bundle: {t_bundle:?}");
+                    is_coinbase = t_bundle.is_coinbase();
+                    if !is_coinbase {
+                        let mut input_i = 0;
+                        for input in &t_bundle.vin {
+                            // handle spent txids
+                            println!("input {input_i} {input:?}");
+                            input_i += 1;
+
+                            if let Some(utxo_i) = utxo_position_at_height(&account.utxos, block_h, &input.prevout) {
+                                let utxo = account.utxos.remove(utxo_i);
+                                let stxo = Txo { spent_h: block_h, ..utxo };
+                                if let Some(last_stxo) = account.stxos.last() {
+                                    if last_stxo.spent_h > stxo.spent_h {
+                                        println!("ERROR: out of sequence spent UTXO: {} > {}", last_stxo.spent_h, stxo.spent_h);
+                                    }
+                                }
+                                total_spent += stxo.txout.value().into_u64();
+                                account.stxos.push(stxo);
+                            } else {
+                                // not spent by us or already accounted for by moving it into stxos
+                            }
+                        }
                     }
-                    for output in &t_bundle.vout {
-                        if let Some(t_addr) = output.recipient_address() {
-                            if t_addr == miner_t_address {
-                                total_received += output.value().into_u64();
+
+                    // push new unspent utxos
+                    for (out_i, txout) in t_bundle.vout.iter().enumerate() {
+                        if let Some(t_addr) = txout.recipient_address() {
+                            let utxo = Txo {
+                                recv_h: block_h,
+                                spent_h: BlockHeight::from_u32(0),
+                                id: OutPoint::new(txid.into(), out_i.try_into().unwrap()),
+                                txout: txout.clone(),
+                            };
+                            total_received += utxo.txout.value().into_u64();
+
+                            if let Some(utxo_i) = utxo_position_at_height(&account.utxos, block_h, &utxo.id) {
+                                if account.utxos[utxo_i] != utxo {
+                                    println!("ERROR: UTXO mismatch: {:?} vs {:?}", account.utxos[utxo_i], &utxo);
+                                }
+                            } else {
+                                account.utxos.push(utxo);
                             }
                         }
                     }
@@ -1267,7 +1400,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 let new_wallet_tx = WalletTx(
                     TransactionSummary {
                         account_id: 0,
-                        txid: t_tx.txid(),
+                        txid,
                         expiry_height,
                         mined_height: Some(block_h),
                         account_value_delta: ZatBalance::from_i64(0).unwrap(),
@@ -1290,47 +1423,24 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 );
                 update_with_tx(miner_wallet, new_wallet_tx.0.txid, new_wallet_tx, block_h, &mut insert_i);
             }
+
+            println!("miner unspent UTXOs {:#?}", Txos(&*miner_wallet.accounts[0].utxos));
+            println!("miner spent   UTXOs {:#?}", Txos(&*miner_wallet.accounts[0].stxos));
         }
 
         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
 
-        // TODO: ideally the GUI won't see this intermediate state
+        //-- ADD/REVALIDATE SHIELDED TXS FROM NEW BLOCKS
         if let Some(start_block_i) = sync_from_i {
             let sync_start_h = <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above");
             println!("cache at {}, new blocks: {}-{}; updating wallets...",
                 pow_cache.next_tip_h-1, new_blocks.first().unwrap().height, new_blocks.last().unwrap().height);
 
+
             for (wallet_i, wallet) in [miner_wallet, user_wallet].into_iter().enumerate() {
-                // -- INVALIDATE TXS >= NEW BLOCKS HEIGHT
-                // the regime is basically "always reorg", but that's often a no-op
-                // truncate wallet for everything below height
-                for account in &mut wallet.accounts {
-                    let fully_detected_h = <u32>::from(account.fully_detected_height);
-                    account.fully_detected_height = BlockHeight::from(fully_detected_h.min(sync_start_h - 1));
-
-                    let fully_decoded_h = <u32>::from(account.fully_decoded_height);
-                    account.fully_decoded_height = BlockHeight::from(fully_decoded_h.min(sync_start_h - 1));
-
-                    let truncate_to_i = account.balance_changes.partition_point(|(b,_)| <u32>::from(*b) < sync_start_h);
-                    account.balance_changes.truncate(truncate_to_i);
-                }
-
-                //  higher blocks & mempool
-                let invalidate_from_i = wallet.txs.partition_point(|tx|
-                    tx.0.mined_height.is_some() && <u32>::from(tx.0.mined_height.unwrap()) < sync_start_h
-                );
-                for tx in &mut wallet.txs[invalidate_from_i..] {
-                    // N.B. these may get revalidated later if the same txs are found in the new blocks
-                    tx.2 = true;
-                }
-
-
-                // -- ADD/REVALIDATE TXS FROM NEW BLOCKS
                 let mut insert_i = 0;
                 for block in &new_blocks {
                     let block_h = BlockHeight::from_u32(block.height.try_into().unwrap());
-                    // put at the *end* of txs at the same height
-                    // i.e. primarily sorted by mined height, secondarily by discovered_time
                     update_insert_i(&wallet.txs, &mut insert_i, block_h);
 
 
