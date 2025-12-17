@@ -107,8 +107,8 @@ impl std::fmt::Display for LEHash {
 // if unspent, this is a UTXO; the notion of a "spent unspent transaction output" is slightly silly
 #[derive(Clone, Debug, PartialEq)]
 struct Txo {
-    pub spent_h: BlockHeight,
     pub recv_h: BlockHeight,
+    pub spent_h: BlockHeight,
     pub id: OutPoint, // txid + index in tx
     // both from TxOut
     pub value: Zatoshis,
@@ -379,6 +379,7 @@ pub struct ManualAccount {
     pub balance_changes: Vec<(BlockHeight, data_api::AccountBalance)>, // TODO: account for mempool
 
     // unspent: sorted by recv height
+    pub recv_txos: Vec<Txo>,
     pub utxos: Vec<Txo>,
     // TODO: handle partial spends i.e. spend created locally but not seen in block
     // spent: sorted by spend height
@@ -524,6 +525,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             balance_changes: vec![(BlockHeight::from_u32(0), data_api::AccountBalance::ZERO)],
             fully_decoded_height: BlockHeight::from_u32(0),
             fully_detected_height: BlockHeight::from_u32(0),
+            recv_txos: Vec::new(),
             utxos: Vec::new(),
             stxos: Vec::new(),
         };
@@ -1217,7 +1219,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             break (new_blocks, new_t_txs, sync_from_i, req_rng);
         };
 
-        fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_wallet_tx: WalletTx, insert_i: &mut usize) {
+        fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, insert_i: &mut usize) {
             // find if there's an existing height/transaction for this txid
             if let Some(tx_h) = wallet.tx_height_map.get_mut(&txid) {
                 let mut h_start_i = if let Some(tx_h) = tx_h {
@@ -1239,26 +1241,22 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
 
                 if let Some(tx_i) = found_idx {
-                    // overwrite existing tx
-                    // tx.0.mined_height = Some(block_h);
-                    // tx.2 = false;
-                    if wallet.txs[tx_i] != new_wallet_tx {
-                        println!("{} wallet updated existing transaction {txid} at {:?}", wallet.name, new_wallet_tx.0.mined_height);
-                    }
-                    wallet.txs.remove(tx_i);
                     if tx_i < *insert_i {
                         *insert_i -= 1;
                     }
-                    // TODO: update new_wallet_tx
+                    let old_tx = wallet.txs.remove(tx_i);
+                    if old_tx != new_tx {
+                        println!("{} wallet updated existing transaction {txid} {old_tx:?} => {new_tx:?}", wallet.name);
+                    }
                 } else {
                     println!("ERROR: {txid:?} not found at associated height {tx_h:?}");
                 }
-                *tx_h = new_wallet_tx.0.mined_height;
+                *tx_h = new_tx.0.mined_height;
             } else {
-                wallet.tx_height_map.insert(txid, new_wallet_tx.0.mined_height);
-                println!("{} wallet inserted unknown transaction {txid} at {:?}", wallet.name, new_wallet_tx.0.mined_height);
+                wallet.tx_height_map.insert(txid, new_tx.0.mined_height);
+                println!("{} wallet inserted unknown transaction {txid} at {:?}", wallet.name, new_tx.0.mined_height);
             }
-            wallet.txs.insert(*insert_i, new_wallet_tx);
+            wallet.txs.insert(*insert_i, new_tx);
             *insert_i += 1;
         }
 
@@ -1282,11 +1280,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     //- unreceive utxos
                     let utxos_at_height_start = account.utxos.partition_point(|txo| txo.recv_h < block_h);
                     account.utxos.truncate(utxos_at_height_start);
+                    let recv_txos_at_height_start = account.recv_txos.partition_point(|txo| txo.recv_h < block_h);
+                    account.recv_txos.truncate(recv_txos_at_height_start);
 
                     //- unspend stxos
                     let stxos_at_height_start = account.stxos.partition_point(|txo| txo.spent_h < block_h);
                     for stxo in &account.stxos[stxos_at_height_start..] {
                         if stxo.recv_h < block_h {
+                            if let Some(last_utxo) = account.utxos.last() {
+                                debug_assert!(last_utxo.recv_h <= stxo.recv_h, "{} <= {}", last_utxo.recv_h, stxo.recv_h);
+                            }
                             account.utxos.push(Txo{ spent_h: BlockHeight::from_u32(0), ..stxo.clone() });
                         }
                     }
@@ -1315,10 +1318,34 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         //-- ADD/REVALIDATE TRANSPARENT TXS
         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
         {
+            fn recv_txo_position_at_height(utxos: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
+                let utxos_at_height_start = utxos.partition_point(|txo| txo.recv_h < block_h);
+                for utxo_i in utxos_at_height_start..utxos.len() {
+                    if utxos[utxo_i].recv_h > block_h {
+                        break;
+                    }
+                    if &utxos[utxo_i].id == utxo_id {
+                        return Some(utxo_i);
+                    }
+                }
+                None
+            }
             fn utxo_position_at_height(utxos: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
                 let utxos_at_height_start = utxos.partition_point(|txo| txo.recv_h < block_h);
                 for utxo_i in utxos_at_height_start..utxos.len() {
                     if utxos[utxo_i].recv_h > block_h {
+                        break;
+                    }
+                    if &utxos[utxo_i].id == utxo_id {
+                        return Some(utxo_i);
+                    }
+                }
+                None
+            }
+            fn stxo_position_at_height(utxos: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
+                let utxos_at_height_start = utxos.partition_point(|txo| txo.spent_h < block_h);
+                for utxo_i in utxos_at_height_start..utxos.len() {
+                    if utxos[utxo_i].spent_h > block_h {
                         break;
                     }
                     if &utxos[utxo_i].id == utxo_id {
@@ -1375,6 +1402,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                         }
                                     }
                                     total_spent += stxo.value.into_u64();
+
+                                    if let Some(last_stxo) = account.stxos.last() {
+                                        debug_assert!(last_stxo.spent_h <= stxo.spent_h, "{} <= {}", last_stxo.spent_h, stxo.spent_h);
+                                    }
                                     account.stxos.push(stxo);
                                 } else {
                                     // accounted for by moving it into stxos(?)
@@ -1398,12 +1429,25 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 };
                                 total_received += utxo.value.into_u64();
 
-                                // block_h is a compression of wallet.tx_height_map.get(txid).unwrap_or...()
-                                if let Some(utxo_i) = utxo_position_at_height(&account.utxos, block_h, &utxo.id) {
+                                let txid_h = if let Some(&Some(txid_h)) = miner_wallet.tx_height_map.get(&txid) {
+                                    txid_h
+                                } else {
+                                    block_h
+                                };
+                                if let Some(utxo_i) = utxo_position_at_height(&account.utxos, txid_h, &utxo.id) {
                                     if account.utxos[utxo_i] != utxo {
                                         println!("ERROR: UTXO mismatch: {:?} vs {:?}", account.utxos[utxo_i], &utxo);
                                     }
-                                } else {
+                                } else if recv_txo_position_at_height(&account.recv_txos, txid_h, &utxo.id).is_none() {
+                                    // TODO: can we just check if we've seen the tx && tx.2 == false
+                                    if let Some(last_txo) = account.recv_txos.last() {
+                                        debug_assert!(last_txo.recv_h <= utxo.recv_h, "{} <= {}", last_txo.recv_h, utxo.recv_h);
+                                    }
+                                    account.recv_txos.push(utxo.clone());
+
+                                    if let Some(last_utxo) = account.utxos.last() {
+                                        debug_assert!(last_utxo.recv_h <= utxo.recv_h, "{} <= {}", last_utxo.recv_h, utxo.recv_h);
+                                    }
                                     account.utxos.push(utxo);
                                 }
                             }
