@@ -7,8 +7,8 @@ set "RUSTFLAGS=-Awarnings"
 set "PROTOC=C:\Work\ShieldedLabs\protoc-33.1-win64\bin\protoc.exe"
 set "SOURCE_DATE_EPOCH=0"
 
-REM set "project=zebra-crosslink"
-set "project=zebra-gui"
+set "project=zebra-crosslink"
+REM set "project=zebra-gui"
 
 set "config=%1"
 
