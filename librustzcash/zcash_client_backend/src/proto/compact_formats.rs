@@ -12,10 +12,9 @@ pub struct ChainMetadata {
 /// A compact representation of the shielded data in a Zcash block.
 ///
 /// CompactBlock is a packaging of ONLY the data from a block that's needed to:
-///
-/// 1. Detect a payment to your Shielded address
-/// 1. Detect a spend of your Shielded notes
-/// 1. Update your witnesses to generate new spend proofs.
+/// One. Detect a payment to your Shielded address
+/// Two. Detect a spend of your Shielded notes
+/// Three. Update your witnesses to generate new spend proofs.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompactBlock {
     /// the version of this wire format, for storage
