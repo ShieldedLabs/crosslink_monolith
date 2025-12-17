@@ -2111,7 +2111,7 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
             }) {
                 let text_h = ui.scale(10.0);
                 // Block Inspector Contents
-                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { wrap_chars: true, h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { font: Mono, wrap_chars: true, h: text_h, align: AlignX::Left, ..TextDecl });
 
                 let text = {
                     if let Some(text) = viz.inspect_block_json_text.as_ref() {
