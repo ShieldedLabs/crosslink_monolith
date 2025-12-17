@@ -23,7 +23,7 @@
 		<ConfigProperties>
 			<ConfigAndPlatform>
 				<Name>Debug:x64</Name>
-				<BuildCommand>C:\Work\ShieldedLabs\crosslink_monolith\local_testnet.bat</BuildCommand>
+				<BuildCommand>C:\Work\ShieldedLabs\crosslink_monolith\phillip_test.bat</BuildCommand>
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
 				<CleanCommand></CleanCommand>
@@ -31,10 +31,10 @@
 				<CancelBuild></CancelBuild>
 				<Exe></Exe>
 				<Args></Args>
-				<WorkingDirectory></WorkingDirectory>
-				<DebugCommand></DebugCommand>
+				<WorkingDirectory>C:\Work\ShieldedLabs\crosslink_monolith\zebra-gui</WorkingDirectory>
+				<DebugCommand>C:\Work\ShieldedLabs\crosslink_monolith\zebra-crosslink\zebrad.rdbg</DebugCommand>
 				<DebuggerExe></DebuggerExe>
-				<DebugSln></DebugSln>
+				<DebugSln>fake_file.sln</DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
 				<PrioritiseFiles></PrioritiseFiles>

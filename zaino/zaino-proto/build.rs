@@ -1,13 +1,13 @@
 #![allow(missing_docs)]
 
-use sha2::{Digest, Sha256};
+// use sha2::{Digest, Sha256};
 use std::{
     env,
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
 };
-use walkdir::WalkDir;
+// use walkdir::WalkDir;
 
 const PROTO_DIR: &str = "proto";
 const COMPACT: &str = "proto/compact_formats.proto";
@@ -25,7 +25,7 @@ fn main() -> io::Result<()> {
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
-    println!("cargo:warning=Protos changed; rebuilding…");
+    // println!("cargo:warning=Protos changed; rebuilding…");
     build(&out_dir)?;
     Ok(())
 }
@@ -46,12 +46,16 @@ fn emit_rerun_directives() {
 }
 
 fn build(out_dir: &Path) -> io::Result<()> {
+    // Build the compact format types.
     tonic_prost_build::compile_protos(COMPACT)?;
+
+    // Copy the generated types into the source tree so changes can be committed.
     fs::copy(
         out_dir.join("cash.z.wallet.sdk.rpc.rs"),
         "src/proto/compact_formats.rs",
     )?;
 
+    // Build the gRPC types and client.
     tonic_prost_build::configure()
         .build_server(true)
         .extern_path(
@@ -80,9 +84,15 @@ fn build(out_dir: &Path) -> io::Result<()> {
         )
         .compile_protos(&[SERVICE], &[PROTO_DIR])?;
 
+    // Copy the generated types into the source tree so changes can be committed.
+    //
+    //
     fs::copy(out_dir.join("cash.z.wallet.sdk.rpc.rs"), "src/proto/service.rs")?;
 
+    // Build the proposal types.
     tonic_prost_build::compile_protos(PROPOSAL)?;
+
+    // Copy the generated types into the source tree so changes can be committed.
     fs::copy(out_dir.join("cash.z.wallet.sdk.ffi.rs"), "src/proto/proposal.rs")?;
 
     Ok(())

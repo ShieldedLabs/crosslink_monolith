@@ -1,55 +1,63 @@
 #![allow(missing_docs)]
 
-use std::env;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+// use sha2::{Digest, Sha256};
+use std::{
+    env,
+    fs,
+    io::{self, Read},
+    path::{Path, PathBuf},
+};
+// use walkdir::WalkDir;
 
-const COMPACT_FORMATS_PROTO: &str = "proto/compact_formats.proto";
-
-const PROPOSAL_PROTO: &str = "proto/proposal.proto";
-
-const SERVICE_PROTO: &str = "proto/service.proto";
+const PROTO_DIR: &str = "proto";
+const COMPACT: &str = "proto/compact_formats.proto";
+const SERVICE: &str = "proto/service.proto";
+const PROPOSAL: &str = "proto/proposal.proto";
 
 fn main() -> io::Result<()> {
-    // - We don't include the proto files in releases so that downstreams do not need to
-    //  regenerate the bindings even if protoc is present.
-    // - We check for the existence of protoc in the same way as prost_build, so that
-    //   people building from source do not need to have protoc installed. If they make
-    //   changes to the proto files, the discrepancy will be caught by CI.
-    if Path::new(COMPACT_FORMATS_PROTO).exists()
-        && env::var_os("PROTOC")
-            .map(PathBuf::from)
-            .or_else(|| which::which("protoc").ok())
-            .is_some()
-    {
-        build()?;
+    emit_rerun_directives();
+
+    // Abort early if protoc is missing.
+    if !protoc_available() {
+        println!("cargo:warning=protoc not found; using committed proto output");
+        return Ok(());
     }
 
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+
+    // println!("cargo:warning=Protos changed; rebuilding…");
+    build(&out_dir)?;
     Ok(())
 }
 
-fn build() -> io::Result<()> {
-    let out: PathBuf = env::var_os("OUT_DIR")
-        .expect("Cannot find OUT_DIR environment variable")
-        .into();
+fn protoc_available() -> bool {
+    env::var_os("PROTOC")
+        .map(PathBuf::from)
+        .or_else(|| which::which("protoc").ok())
+        .is_some()
+}
 
+fn emit_rerun_directives() {
+    // Ensure Cargo reruns the script when proto files change.
+    println!("cargo:rerun-if-changed={PROTO_DIR}/");
+
+    // Optionally: rerun if build.rs itself changes.
+    println!("cargo:rerun-if-changed=build.rs");
+}
+
+fn build(out_dir: &Path) -> io::Result<()> {
     // Build the compact format types.
-    tonic_prost_build::compile_protos(COMPACT_FORMATS_PROTO)?;
+    tonic_prost_build::compile_protos(COMPACT)?;
 
     // Copy the generated types into the source tree so changes can be committed.
     fs::copy(
-        out.join("cash.z.wallet.sdk.rpc.rs"),
+        out_dir.join("cash.z.wallet.sdk.rpc.rs"),
         "src/proto/compact_formats.rs",
     )?;
 
     // Build the gRPC types and client.
     tonic_prost_build::configure()
-        .build_server(false)
-        .client_mod_attribute(
-            "cash.z.wallet.sdk.rpc",
-            r#"#[cfg(feature = "lightwalletd-tonic")]"#,
-        )
+        .build_server(false).client_mod_attribute("cash.z.wallet.sdk.rpc", r#"#[cfg(feature = "lightwalletd-tonic")]"#)
         .extern_path(
             ".cash.z.wallet.sdk.rpc.ChainMetadata",
             "crate::proto::compact_formats::ChainMetadata",
@@ -74,21 +82,18 @@ fn build() -> io::Result<()> {
             ".cash.z.wallet.sdk.rpc.CompactOrchardAction",
             "crate::proto::compact_formats::CompactOrchardAction",
         )
-        .compile_protos(&[SERVICE_PROTO], &["proto/"])?;
-
-    // Build the proposal types.
-    tonic_prost_build::compile_protos(PROPOSAL_PROTO)?;
-
-    // Copy the generated types into the source tree so changes can be committed.
-    fs::copy(
-        out.join("cash.z.wallet.sdk.ffi.rs"),
-        "src/proto/proposal.rs",
-    )?;
+        .compile_protos(&[SERVICE], &[PROTO_DIR])?;
 
     // Copy the generated types into the source tree so changes can be committed. The
     // file has the same name as for the compact format types because they have the
     // same package, but we've set things up so this only contains the service types.
-    fs::copy(out.join("cash.z.wallet.sdk.rpc.rs"), "src/proto/service.rs")?;
+    fs::copy(out_dir.join("cash.z.wallet.sdk.rpc.rs"), "src/proto/service.rs")?;
+
+    // Build the proposal types.
+    tonic_prost_build::compile_protos(PROPOSAL)?;
+
+    // Copy the generated types into the source tree so changes can be committed.
+    fs::copy(out_dir.join("cash.z.wallet.sdk.ffi.rs"), "src/proto/proposal.rs")?;
 
     Ok(())
 }
