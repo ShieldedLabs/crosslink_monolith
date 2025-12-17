@@ -38,9 +38,10 @@ use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::{ZatBalance, Zatoshis};
 use zcash_protocol::TxId;
 use zcash_transparent::{
+    address::TransparentAddress,
     builder::{TransparentBuilder, TransparentSigningSet},
     bundle::OutPoint,
-    keys::NonHardenedChildIndex,
+    keys::{IncomingViewingKey, TransparentKeyScope, NonHardenedChildIndex},
 };
 use zebra_chain::block::{Hash as BlockHash, Height, ZCASH_BLOCK_VERSION};
 use zebra_chain::parameters::NetworkUpgrade;
@@ -83,10 +84,6 @@ use zcash_client_backend::{
 };
 
 use zcash_protocol::consensus::{NetworkType, Parameters, MAIN_NETWORK, TEST_NETWORK};
-use zcash_transparent::{
-    address::TransparentAddress,
-    keys::{IncomingViewingKey, TransparentKeyScope},
-};
 use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 
 /// "little endian hash"
@@ -113,7 +110,14 @@ struct Txo {
     pub spent_h: BlockHeight,
     pub recv_h: BlockHeight,
     pub id: OutPoint, // txid + index in tx
-    pub txout: TxOut,
+    // both from TxOut
+    pub value: Zatoshis,
+    pub t_addr: TransparentAddress, // convertible to/from pubkey_script
+}
+impl Txo {
+    pub fn txout(&self) -> TxOut {
+        TxOut::new(self.value, self.t_addr.script().into())
+    }
 }
 
 pub struct Txos<'a>(pub &'a [Txo]);
@@ -376,6 +380,7 @@ pub struct ManualAccount {
 
     // unspent: sorted by recv height
     pub utxos: Vec<Txo>,
+    // TODO: handle partial spends i.e. spend created locally but not seen in block
     // spent: sorted by spend height
     pub stxos: Vec<Txo>,
 }
@@ -390,8 +395,7 @@ pub struct ManualWallet {
     // txid-linked, then reconstruct on request
     /// sorted by (mined_height, discovery_time)
     pub txs: Vec<WalletTx>,
-    pub tx_height_map: HashMap<TxId, BlockHeight>, // NOTE: not a direct index because txs get
-                                                   // inserted
+    pub tx_height_map: HashMap<TxId, Option<BlockHeight>>, // NOTE: not a direct index because txs get inserted
     // data_api has max_scanned in case they're scanned out of order
     // pub next_sapling_subtree_index: u64,
     // pub next_orchard_subtree_index: u64,
@@ -1213,24 +1217,25 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             break (new_blocks, new_t_txs, sync_from_i, req_rng);
         };
 
-        fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, new_wallet_tx: WalletTx, block_h: BlockHeight, insert_i: &mut usize) {
+        fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_wallet_tx: WalletTx, insert_i: &mut usize) {
             // find if there's an existing height/transaction for this txid
             if let Some(tx_h) = wallet.tx_height_map.get_mut(&txid) {
-                let mut find_i = wallet.txs.partition_point(|tx|
-                    tx.0.mined_height.is_some() && tx.0.mined_height.unwrap() < *tx_h
-                );
+                let mut h_start_i = if let Some(tx_h) = tx_h {
+                    wallet.txs.partition_point(|tx| tx.0.mined_height.is_some() && tx.0.mined_height.unwrap() < *tx_h)
+                } else {
+                    wallet.txs.partition_point(|tx| tx.0.mined_height.is_some())
+                };
                 let mut found_idx = None;
                 let txs_n = wallet.txs.len();
-                while find_i < txs_n {
+                for find_i in h_start_i..txs_n {
                     let tx = &mut wallet.txs[find_i];
-                    if tx.0.mined_height != Some(*tx_h) {
+                    if tx.0.mined_height != *tx_h {
                         break;
                     }
                     if tx.0.txid == txid {
                         found_idx = Some(find_i);
                         break;
                     }
-                    find_i += 1;
                 }
 
                 if let Some(tx_i) = found_idx {
@@ -1238,21 +1243,23 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     // tx.0.mined_height = Some(block_h);
                     // tx.2 = false;
                     if wallet.txs[tx_i] != new_wallet_tx {
-                        println!("{} wallet updated existing transaction {txid} at {block_h:?}", wallet.name);
+                        println!("{} wallet updated existing transaction {txid} at {:?}", wallet.name, new_wallet_tx.0.mined_height);
                     }
-                    wallet.txs[tx_i] = new_wallet_tx;
+                    wallet.txs.remove(tx_i);
+                    if tx_i < *insert_i {
+                        *insert_i -= 1;
+                    }
+                    // TODO: update new_wallet_tx
                 } else {
-                    wallet.txs.insert(*insert_i, new_wallet_tx);
-                    *insert_i += 1;
-                    println!("ERROR: {txid:?} not found at associated height {tx_h}");
+                    println!("ERROR: {txid:?} not found at associated height {tx_h:?}");
                 }
-                *tx_h = block_h;
+                *tx_h = new_wallet_tx.0.mined_height;
             } else {
-                wallet.tx_height_map.insert(txid, block_h);
-                wallet.txs.insert(*insert_i, new_wallet_tx);
-                *insert_i += 1;
-                println!("{} wallet inserted unknown transaction {txid} at {block_h:?}", wallet.name);
+                wallet.tx_height_map.insert(txid, new_wallet_tx.0.mined_height);
+                println!("{} wallet inserted unknown transaction {txid} at {:?}", wallet.name, new_wallet_tx.0.mined_height);
             }
+            wallet.txs.insert(*insert_i, new_wallet_tx);
+            *insert_i += 1;
         }
 
         //-- REORG
@@ -1349,7 +1356,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 if let Some(t_bundle) = t_tx.transparent_bundle() {
                     // TODO: t_bundle.authorization
 
-                    println!("t_bundle: {t_bundle:?}");
+                    // println!("t_bundle: {t_bundle:?}");
                     is_coinbase = t_bundle.is_coinbase();
                     if !is_coinbase {
                         let mut input_i = 0;
@@ -1358,18 +1365,22 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             println!("input {input_i} {input:?}");
                             input_i += 1;
 
-                            if let Some(utxo_i) = utxo_position_at_height(&account.utxos, block_h, &input.prevout) {
-                                let utxo = account.utxos.remove(utxo_i);
-                                let stxo = Txo { spent_h: block_h, ..utxo };
-                                if let Some(last_stxo) = account.stxos.last() {
-                                    if last_stxo.spent_h > stxo.spent_h {
-                                        println!("ERROR: out of sequence spent UTXO: {} > {}", last_stxo.spent_h, stxo.spent_h);
+                            if let Some(&Some(prevout_txid_h)) = miner_wallet.tx_height_map.get(input.prevout.txid()) {
+                                if let Some(utxo_i) = utxo_position_at_height(&account.utxos, prevout_txid_h, &input.prevout) {
+                                    let utxo = account.utxos.remove(utxo_i);
+                                    let stxo = Txo { spent_h: block_h, ..utxo };
+                                    if let Some(last_stxo) = account.stxos.last() {
+                                        if last_stxo.spent_h > stxo.spent_h {
+                                            println!("ERROR: out of sequence spent UTXO: {} > {}", last_stxo.spent_h, stxo.spent_h);
+                                        }
                                     }
+                                    total_spent += stxo.value.into_u64();
+                                    account.stxos.push(stxo);
+                                } else {
+                                    // accounted for by moving it into stxos(?)
                                 }
-                                total_spent += stxo.txout.value().into_u64();
-                                account.stxos.push(stxo);
                             } else {
-                                // not spent by us or already accounted for by moving it into stxos
+                                // not spent by us in a block(?)
                             }
                         }
                     }
@@ -1377,20 +1388,24 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     // push new unspent utxos
                     for (out_i, txout) in t_bundle.vout.iter().enumerate() {
                         if let Some(t_addr) = txout.recipient_address() {
-                            let utxo = Txo {
-                                recv_h: block_h,
-                                spent_h: BlockHeight::from_u32(0),
-                                id: OutPoint::new(txid.into(), out_i.try_into().unwrap()),
-                                txout: txout.clone(),
-                            };
-                            total_received += utxo.txout.value().into_u64();
+                            if t_addr == miner_t_address {
+                                let utxo = Txo {
+                                    recv_h: block_h,
+                                    spent_h: BlockHeight::from_u32(0),
+                                    id: OutPoint::new(txid.into(), out_i.try_into().unwrap()),
+                                    value: txout.value(),
+                                    t_addr,
+                                };
+                                total_received += utxo.value.into_u64();
 
-                            if let Some(utxo_i) = utxo_position_at_height(&account.utxos, block_h, &utxo.id) {
-                                if account.utxos[utxo_i] != utxo {
-                                    println!("ERROR: UTXO mismatch: {:?} vs {:?}", account.utxos[utxo_i], &utxo);
+                                // block_h is a compression of wallet.tx_height_map.get(txid).unwrap_or...()
+                                if let Some(utxo_i) = utxo_position_at_height(&account.utxos, block_h, &utxo.id) {
+                                    if account.utxos[utxo_i] != utxo {
+                                        println!("ERROR: UTXO mismatch: {:?} vs {:?}", account.utxos[utxo_i], &utxo);
+                                    }
+                                } else {
+                                    account.utxos.push(utxo);
                                 }
-                            } else {
-                                account.utxos.push(utxo);
                             }
                         }
                     }
@@ -1421,7 +1436,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     WalletTxKind::Receive,
                     false,
                 );
-                update_with_tx(miner_wallet, new_wallet_tx.0.txid, new_wallet_tx, block_h, &mut insert_i);
+                update_with_tx(miner_wallet, new_wallet_tx.0.txid, new_wallet_tx, &mut insert_i);
             }
 
             println!("miner unspent UTXOs {:#?}", Txos(&*miner_wallet.accounts[0].utxos));
@@ -1444,7 +1459,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     update_insert_i(&wallet.txs, &mut insert_i, block_h);
 
 
-                    // SHIELDED TRANSACTIONS AT HEIGHT
+                    //-- INCORPORATE SHIELDED TRANSACTIONS FROM COMPACT BLOCK
                     for tx in &block.vtx {
                         let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
 
@@ -1476,7 +1491,81 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             WalletTxKind::Receive,
                             false,
                         );
-                        update_with_tx(wallet, txid, new_wallet_tx, block_h, &mut insert_i);
+                        update_with_tx(wallet, txid, new_wallet_tx, &mut insert_i);
+                    }
+                }
+            }
+
+
+            // DEV: miner send tx to self
+            if let Some(miner_utxo) = miner_wallets[miner_use_i].accounts[0].utxos.first() {
+                let fee = MINIMUM_FEE;
+                if let Some(zats) = miner_utxo.value - fee {
+                    let block_h = BlockHeight::from_u32(new_blocks.last().unwrap().height.try_into().unwrap()) + 1;
+                    let mut signing_set = TransparentSigningSet::new();
+                    signing_set.add_key(miner_privkey);
+
+                    let prover = LocalTxProver::bundled();
+                    let extsk: &[ExtendedSpendingKey] = &[];
+                    let sak: &[SpendAuthorizingKey] = &[];
+
+                    let mut txb = TxBuilder::new(
+                        network,
+                        block_h,
+                        BuildConfig::Standard {
+                            sapling_anchor: None,
+                            orchard_anchor: None,
+                        },
+                    );
+
+                    txb.add_transparent_input(miner_pubkey, miner_utxo.id.clone(), miner_utxo.txout());
+                    txb.add_transparent_output(&miner_t_address, zats).unwrap();
+
+                    use rand_chacha::ChaCha20Rng;
+                    let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+                    let tx_res = txb.build(
+                        &signing_set,
+                        extsk,
+                        sak,
+                        rng,
+                        &prover,
+                        &prover,
+                        &zip317::FeeRule::standard(),
+                    ).unwrap();
+
+                    let tx = tx_res.transaction();
+                    let mut tx_bytes = vec![];
+                    tx.write(&mut tx_bytes).unwrap();
+
+                    let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
+                    println!("******* res for {:?}: {:?}", tx.txid(), res);
+                    if res.is_ok() {
+                        // TODO: complete
+                        let new_wallet_tx = WalletTx(
+                            TransactionSummary {
+                                account_id: 0,
+                                txid: tx.txid(),
+                                expiry_height: None,
+                                mined_height: Some(block_h),
+                                account_value_delta: ZatBalance::from_i64(0).unwrap(),
+                                total_spent: miner_utxo.value, // TODO: should this include
+                                total_received: Zatoshis::from_u64(0).unwrap(),
+                                fee_paid: Some(fee),
+                                spent_note_count: 1,
+                                has_change: false,
+                                sent_note_count: 1,
+                                received_note_count: 0,
+                                memo_count: 0,
+                                expired_unmined: false,
+                                is_shielding: false,
+                                memo: [0; 512],
+                            },
+                            WalletTxKind::Send,
+                            true,
+                        );
+                        let mut insert_i = 0;
+                        update_insert_i(&miner_wallets[miner_use_i].txs, &mut insert_i, block_h);
+                        update_with_tx(&mut miner_wallets[miner_use_i], tx.txid(), new_wallet_tx, &mut insert_i);
                     }
                 }
             }
