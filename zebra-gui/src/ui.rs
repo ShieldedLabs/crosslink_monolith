@@ -1358,11 +1358,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 let icon = match (tx.1, tx.0.mined_height) {
-                                    (wallet::WalletTxKind::Send, Some(_))    => ICON_UP_SMALL,
-                                    (wallet::WalletTxKind::Receive, Some(_)) => ICON_DOWN_SMALL,
-                                    (wallet::WalletTxKind::Shield, Some(_))  => ICON_SHIELD,
-                                    (wallet::WalletTxKind::Stake, Some(_))   => ICON_LINK_1,
-                                    (wallet::WalletTxKind::Unstake, Some(_)) => ICON_UNLINK,
+                                    (wallet::WalletTxKind::Send, Some(_))     => ICON_UP_SMALL,
+                                    (wallet::WalletTxKind::SelfSend, Some(_)) => ICON_DOWN_SMALL,
+                                    (wallet::WalletTxKind::Receive, Some(_))  => ICON_DOWN_SMALL,
+                                    (wallet::WalletTxKind::Shield, Some(_))   => ICON_SHIELD,
+                                    (wallet::WalletTxKind::Stake, Some(_))    => ICON_LINK_1,
+                                    (wallet::WalletTxKind::Unstake, Some(_))  => ICON_UNLINK,
                                     _ => {
                                         let timer = (ui.tx_loading_animation_timer * 3.0) as u64;
                                         if timer % 3 == 0 {
@@ -1394,11 +1395,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 let label = match tx.1 {
-                                    wallet::WalletTxKind::Send    => if tx.0.mined_height.is_some() { "Sent"     } else { "Sending"   },
-                                    wallet::WalletTxKind::Receive => if tx.0.mined_height.is_some() { "Received" } else { "Receiving" },
-                                    wallet::WalletTxKind::Shield  => if tx.0.mined_height.is_some() { "Shielded" } else { "Shielding" },
-                                    wallet::WalletTxKind::Stake   => if tx.0.mined_height.is_some() { "Staked"   } else { "Staking"   },
-                                    wallet::WalletTxKind::Unstake => if tx.0.mined_height.is_some() { "Unstaked" } else { "Unstaking" },
+                                    wallet::WalletTxKind::Send     => if tx.0.mined_height.is_some() { "Sent"     } else { "Sending"   },
+                                    wallet::WalletTxKind::Receive  => if tx.0.mined_height.is_some() { "Received" } else { "Receiving" },
+                                    wallet::WalletTxKind::SelfSend => if tx.0.mined_height.is_some() { "Returned" } else { "Returning" },
+                                    wallet::WalletTxKind::Shield   => if tx.0.mined_height.is_some() { "Shielded" } else { "Shielding" },
+                                    wallet::WalletTxKind::Stake    => if tx.0.mined_height.is_some() { "Staked"   } else { "Staking"   },
+                                    wallet::WalletTxKind::Unstake  => if tx.0.mined_height.is_some() { "Unstaked" } else { "Unstaking" },
                                 };
 
                                 let label_str = if let Some(mined_height) = tx.0.mined_height {
@@ -1451,7 +1453,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 };
 
                                 match tx.1 {
-                                    wallet::WalletTxKind::Send | wallet::WalletTxKind::Stake => {
+                                    wallet::WalletTxKind::Send | wallet::WalletTxKind::SelfSend | wallet::WalletTxKind::Stake => {
                                         let send_amount: i64 = tx.0.account_value_delta.into();
                                         let send_amount: u64 = send_amount.abs() as u64;
                                         let full = send_amount / 100_000_000;

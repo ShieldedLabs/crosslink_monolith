@@ -189,7 +189,8 @@ enum WalletAction {
 pub enum WalletTxKind {
     Send,
     Receive,
-    Shield,
+    SelfSend,
+    Shield, // a form of SelfSend
     Stake,
     Unstake,
 }
@@ -1399,6 +1400,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                         debug_assert!(last_stxo.spent_h <= stxo.spent_h, "{} <= {}", last_stxo.spent_h, stxo.spent_h);
                                     }
                                     account.stxos.push(stxo);
+                                } else if let Some(txo_i) = recv_h_position(&account.recv_txos, prevout_txid_h, &input.prevout) {
+                                    // ALT: test if we have the tx in bc & this is from us
+                                    total_spent += account.recv_txos[txo_i].value.into_u64();
                                 } else {
                                     // accounted for by moving it into stxos(?)
                                 }
@@ -1455,7 +1459,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         expiry_height,
                         mined_height: Some(block_h),
                         account_value_delta: ZatBalance::from_i64(0).unwrap(),
-                        total_spent: Zatoshis::from_u64(0).unwrap(),
+                        total_spent: Zatoshis::from_u64(total_spent).unwrap(),
                         total_received: Zatoshis::from_u64(total_received).unwrap(),
                         fee_paid: Some(Zatoshis::from_u64(0).unwrap()),
                         has_change: false,
@@ -1469,7 +1473,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         is_shielding: false,
                         memo: [0; 512],
                     },
-                    WalletTxKind::Receive,
+                    if total_spent > 0 {
+                        WalletTxKind::SelfSend
+                    } else {
+                        WalletTxKind::Receive
+                    },
                     false,
                 );
                 update_with_tx(miner_wallet, new_wallet_tx.0.txid, new_wallet_tx, &mut insert_i);
@@ -1554,8 +1562,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         },
                     );
 
+                    let total_spent = miner_utxo.value; // TODO: should this include fees?
                     txb.add_transparent_input(miner_pubkey, miner_utxo.id.clone(), miner_utxo.txout());
-                    txb.add_transparent_output(&miner_t_address, zats).unwrap();
+                    let send_addr = miner_t_address;
+                    txb.add_transparent_output(&send_addr, zats).unwrap();
+                    let total_received = if send_addr == miner_t_address {
+                        zats
+                    } else {
+                        Zatoshis::from_u64(0).unwrap()
+                    };
+
+                    // TODO: separate change outputs from intended outputs
 
                     use rand_chacha::ChaCha20Rng;
                     let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
@@ -1575,6 +1592,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
                     println!("******* res for {:?}: {:?}", tx.txid(), res);
+
+                    // TODO: shielding/determine without state
+                    let kind = if total_received.into_u64() > 0 {
+                        WalletTxKind::SelfSend
+                    } else {
+                        WalletTxKind::Send
+                    };
                     if res.is_ok() {
                         // TODO: complete
                         let new_wallet_tx = WalletTx(
@@ -1582,10 +1606,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 account_id: 0,
                                 txid: tx.txid(),
                                 expiry_height: None,
-                                mined_height: Some(block_h),
+                                mined_height: None,
                                 account_value_delta: ZatBalance::from_i64(0).unwrap(),
-                                total_spent: miner_utxo.value, // TODO: should this include
-                                total_received: Zatoshis::from_u64(0).unwrap(),
+                                total_spent,
+                                total_received,
                                 fee_paid: Some(fee),
                                 spent_note_count: 1,
                                 has_change: false,
@@ -1596,7 +1620,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 is_shielding: false,
                                 memo: [0; 512],
                             },
-                            WalletTxKind::Send,
+                            kind,
                             true,
                         );
                         let mut insert_i = 0;
