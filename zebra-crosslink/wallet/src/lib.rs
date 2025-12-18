@@ -96,6 +96,7 @@ impl BlockHeight {
     // the more sure we are about its continued existence
     pub const INVALID: Self = Self(u32::MAX); // NOTE: here for headroom for +1 to fake <= using <
     // ALT: maybe better to go the other way round: use <= and saturating_sub(1)
+    // TODO: creating (slow), sending, sent, mempool
     pub const INTERNAL: Self = Self(u32::MAX-1);
     pub const MEMPOOL: Self = Self(u32::MAX-2);
 
@@ -630,22 +631,23 @@ impl ManualWallet {
 
     // TODO: fee API
     pub async fn send_zats<P: Parameters>(
-        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
-        outputs: &[TxOutput], src_usk: &UnifiedSpendingKey, zats: Zatoshis, opts: &TxOptions
+        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>, outputs: &[TxOutput],
+        src_usk: &UnifiedSpendingKey, zats: Zatoshis, fee_zats: Zatoshis, opts: &TxOptions
     ) -> Option<TxId>
     {
         let tz = Timer::scope("send_zats");
         let block_h = self.chain_tip_h.0 + 1;
 
         let account = &self.accounts[0];
-        let (t_addr, _) = addrs_from_account(account, 0).unwrap(); // @Hack
+        let (t_addr, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
+        let orchard_addr = ua.orchard().unwrap();
 
         let mut txb = TxBuilder::new(
             network,
             LRZBlockHeight::from_u32(block_h),
             BuildConfig::Standard {
                 sapling_anchor: None,
-                orchard_anchor: None,
+                orchard_anchor: Some(orchard::Anchor::empty_tree()),
             },
         );
 
@@ -656,12 +658,18 @@ impl ManualWallet {
                 &TxOutput::Transparent{ dst, zats } => {
                     total_send += zats.into_u64();
                     total_recv += (dst == t_addr) as u64 * zats.into_u64();
-                    txb.add_transparent_output(&dst, zats).ok()?
+                    if let Err(err) = txb.add_transparent_output(&dst, zats) {
+                        println!("tx build error: {err:?}");
+                        return None;
+                    }
                 }
                 TxOutput::Orchard{ ovk, dst, zats, memo } => {
                     total_send += zats;
-                    // TODO: self-send
-                    txb.add_orchard_output::<zip317::FeeError>(ovk.clone(), dst.clone(), *zats, memo.clone()).ok()?
+                    total_recv += (dst == orchard_addr) as u64 * zats;
+                    if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(ovk.clone(), dst.clone(), *zats, memo.clone()) {
+                        println!("tx build error: {err:?}");
+                        return None;
+                    }
                 }
             }
         }
@@ -671,8 +679,7 @@ impl ManualWallet {
         let (pubkey, privkey) = transparent_keys_from_usk(&src_usk, 0).unwrap();
         signing_set.add_key(privkey);
 
-        let fee = MINIMUM_FEE;
-        let total_spend = total_send + fee.into_u64();
+        let total_spend = total_send + fee_zats.into_u64();
         let mut total_covered = 0;
         'src_pool: for pool in opts.src_pools {
             match pool {
@@ -709,7 +716,7 @@ impl ManualWallet {
         let extsk: &[ExtendedSpendingKey] = &[];
         let sak: &[SpendAuthorizingKey] = &[];
         let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
-        let tx_res = txb.build(
+        let tx_res = match txb.build(
             &signing_set,
             extsk,
             sak,
@@ -717,7 +724,13 @@ impl ManualWallet {
             &prover,
             &prover,
             &zip317::FeeRule::standard(),
-        ).unwrap();
+        ) {
+            Ok(tx_res) => tx_res,
+            Err(err) => {
+                println!("tx build error: {err:?}");
+                return None;
+            }
+        };
 
         let tx = tx_res.transaction();
         let mut tx_bytes = vec![];
@@ -743,7 +756,7 @@ impl ManualWallet {
                 account_value_delta: ZatBalance::from_i64(0).unwrap(),
                 total_spent: Zatoshis::from_u64(total_spend).unwrap(),
                 total_received: Zatoshis::from_u64(total_recv).unwrap(),
-                fee_paid: Some(fee),
+                fee_paid: Some(fee_zats),
                 spent_note_count: 1,
                 has_change: false,
                 sent_note_count: 1,
@@ -1769,8 +1782,32 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // DEV: miner send tx to self
             if let Some(miner_utxo) = miner_wallets[miner_use_i].accounts[0].utxos.first() {
                 if let Some(val_after_fees) = miner_utxo.value - MINIMUM_FEE {
-                    let dst = TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees};
-                    miner_wallets[miner_use_i].send_zats(network, &mut client, &[dst], &miner_usk, val_after_fees, &TxOptions {
+                    let (dst, fee) = if true {
+                        if let (Some(fvk), Some(&dst)) = (miner_wallets[miner_use_i].accounts[0].ufvk.orchard(), miner_ua.orchard()) {
+                            let fee = Zatoshis::from_u64(15_000).unwrap(); //MINIMUM_FEE;
+                            (
+                                TxOutput::Orchard{
+                                    dst,
+                                    ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
+                                    zats: miner_utxo.value.into_u64() - fee.into_u64(),
+                                    memo: MemoBytes::empty()
+                                },
+                                fee
+                            )
+                        } else {
+                            (
+                                TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees},
+                                MINIMUM_FEE
+                            )
+                        }
+                    } else {
+                        (
+                            TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees},
+                            MINIMUM_FEE
+                        )
+                    };
+
+                    miner_wallets[miner_use_i].send_zats(network, &mut client, &[dst], &miner_usk, val_after_fees, fee, &TxOptions {
                         src_pools: &[TxPool::Transparent],
                         ..TxOptions::default()
                     }).await;
