@@ -203,51 +203,68 @@ pub enum WalletTxLoc {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WalletTx(pub TransactionSummary<usize>, pub WalletTxKind, pub bool);
+pub struct WalletTx {
+    pub account_id: usize,
+    pub txid: zcash_protocol::TxId,
+    pub expiry_height: Option<BlockHeight>,
+    pub mined_height: Option<BlockHeight>, // ALT: treat mempool height as tip_h + 1 or u64::MAX
+    pub account_value_delta: ZatBalance,
+    pub total_spent: Zatoshis,
+    pub total_received: Zatoshis,
+    pub fee_paid: Option<Zatoshis>,
+    pub spent_note_count: usize,
+    pub has_change: bool,
+    pub sent_note_count: usize,
+    pub received_note_count: usize,
+    pub memo_count: usize,
+    pub expired_unmined: bool,
+    pub is_shielding: bool,
+    pub memo: [u8; 512],
+    pub kind: WalletTxKind,
+    pub is_outside_bc: bool,
+}
 
 impl WalletTx {
     pub fn with_fake_data(kind: WalletTxKind, sent: u64, received: u64, shielding: bool, memo: &str, mined_height: u32) -> Self {
         let mut memo_as_bytes = [0u8; 512];
         &memo_as_bytes[0..memo.len()].copy_from_slice(memo.as_bytes());
 
-        Self(
-            TransactionSummary{
-                account_id: 0,//AccountUuid::default(),
-                txid: TxId::from_bytes([0; 32]),
-                expiry_height: None,
-                mined_height: if mined_height != 0 { Some(BlockHeight::from_u32(mined_height)) } else { None },
-                account_value_delta: ZatBalance::from_i64(-(sent as i64)).unwrap(),
-                total_spent: Zatoshis::from_u64(sent).unwrap(),
-                total_received: Zatoshis::from_u64(received).unwrap(),
-                fee_paid: None,
-                spent_note_count: if kind == WalletTxKind::Send { 1 } else { 0 },
-                has_change: false,
-                sent_note_count: if kind == WalletTxKind::Send { 1 } else { 0 },
-                received_note_count: if kind == WalletTxKind::Receive { 1 } else { 0 },
-                memo_count: if memo_as_bytes.len() != 0 { 1 } else { 0 },
-                expired_unmined: false,
-                is_shielding: true,
-                memo: memo_as_bytes,
-            },
+        Self{
+            account_id: 0,//AccountUuid::default(),
+            txid: TxId::from_bytes([0; 32]),
+            expiry_height: None,
+            mined_height: if mined_height != 0 { Some(BlockHeight::from_u32(mined_height)) } else { None },
+            account_value_delta: ZatBalance::from_i64(-(sent as i64)).unwrap(),
+            total_spent: Zatoshis::from_u64(sent).unwrap(),
+            total_received: Zatoshis::from_u64(received).unwrap(),
+            fee_paid: None,
+            spent_note_count: if kind == WalletTxKind::Send { 1 } else { 0 },
+            has_change: false,
+            sent_note_count: if kind == WalletTxKind::Send { 1 } else { 0 },
+            received_note_count: if kind == WalletTxKind::Receive { 1 } else { 0 },
+            memo_count: if memo_as_bytes.len() != 0 { 1 } else { 0 },
+            expired_unmined: false,
+            is_shielding: true,
+            memo: memo_as_bytes,
             kind,
-            false,
-        )
+            is_outside_bc: false,
+        }
     }
 
     pub fn loc(&self, finalized_h: BlockHeight, bc_tip_h: BlockHeight) -> (WalletTxLoc, bool) {
-        if let Some(mined_h) = self.0.mined_height {
-            if self.2 {
-                (WalletTxLoc::Block(0), self.2)
+        if let Some(mined_h) = self.mined_height {
+            if self.is_outside_bc {
+                (WalletTxLoc::Block(0), self.is_outside_bc)
             } else if mined_h > bc_tip_h {
                 println!("ERROR: mined height on best chain ({}) higher than tip ({})", mined_h, bc_tip_h);
                 return (WalletTxLoc::Block(0), true);
             } else if mined_h <= finalized_h {
-                (WalletTxLoc::Finalized, self.2)
+                (WalletTxLoc::Finalized, self.is_outside_bc)
             } else {
-                (WalletTxLoc::Block(bc_tip_h - mined_h), self.2)
+                (WalletTxLoc::Block(bc_tip_h - mined_h), self.is_outside_bc)
             }
         } else {
-            (WalletTxLoc::Mempool, self.2)
+            (WalletTxLoc::Mempool, self.is_outside_bc)
         }
     }
 }
@@ -580,7 +597,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         Ok(wallet.txs.clone())
     }
 
-    async fn get_received_memos_and_actions<P: zcash_protocol::consensus::Parameters>(client: &mut CompactTxStreamerClient<Channel>, wallet: &ManualWallet, params: P, history: &[TransactionSummary<usize>])
+    async fn get_received_memos_and_actions<P: zcash_protocol::consensus::Parameters>(client: &mut CompactTxStreamerClient<Channel>, wallet: &ManualWallet, params: P, history: &[WalletTx])
         -> Option<(HashMap<TxId, (Option<StakingAction>, Vec<String>)>, HashMap<TxId, (Option<StakingAction>, Vec<String>)>)> {
         fn try_get_orchard_memos(tx: &TransactionData<zcash_primitives::transaction::Authorized>, ivk: &orchard::keys::PreparedIncomingViewingKey) -> Vec<String> {
             let mut memos = Vec::new();
@@ -1233,18 +1250,18 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // find if there's an existing height/transaction for this txid
             if let Some(tx_h) = wallet.tx_height_map.get_mut(&txid) {
                 let mut h_start_i = if let Some(tx_h) = tx_h {
-                    wallet.txs.partition_point(|tx| tx.0.mined_height.is_some() && tx.0.mined_height.unwrap() < *tx_h)
+                    wallet.txs.partition_point(|tx| tx.mined_height.is_some() && tx.mined_height.unwrap() < *tx_h)
                 } else {
-                    wallet.txs.partition_point(|tx| tx.0.mined_height.is_some())
+                    wallet.txs.partition_point(|tx| tx.mined_height.is_some())
                 };
                 let mut found_idx = None;
                 let txs_n = wallet.txs.len();
                 for find_i in h_start_i..txs_n {
                     let tx = &mut wallet.txs[find_i];
-                    if tx.0.mined_height != *tx_h {
+                    if tx.mined_height != *tx_h {
                         break;
                     }
-                    if tx.0.txid == txid {
+                    if tx.txid == txid {
                         found_idx = Some(find_i);
                         break;
                     }
@@ -1256,16 +1273,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                     let old_tx = wallet.txs.remove(tx_i);
                     if old_tx != new_tx {
-                        println!("{} wallet updated existing transaction {txid} {:?} => {:?}", wallet.name, old_tx.0.mined_height, new_tx.0.mined_height);
+                        println!("{} wallet updated existing transaction {txid} {:?} => {:?}", wallet.name, old_tx.mined_height, new_tx.mined_height);
                         // println!("{} wallet updated existing transaction {txid} {old_tx:?} => {new_tx:?}", wallet.name);
                     }
                 } else {
                     println!("ERROR: {txid:?} not found at associated height {tx_h:?}");
                 }
-                *tx_h = new_tx.0.mined_height;
+                *tx_h = new_tx.mined_height;
             } else {
-                wallet.tx_height_map.insert(txid, new_tx.0.mined_height);
-                println!("{} wallet inserted unknown transaction {txid} at {:?}", wallet.name, new_tx.0.mined_height);
+                wallet.tx_height_map.insert(txid, new_tx.mined_height);
+                println!("{} wallet inserted unknown transaction {txid} at {:?}", wallet.name, new_tx.mined_height);
             }
             wallet.txs.insert(*insert_i, new_tx);
             *insert_i += 1;
@@ -1338,11 +1355,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 //  higher blocks & mempool
                 let invalidate_from_i = wallet.txs.partition_point(|tx|
-                    tx.0.mined_height.is_some() && <u32>::from(tx.0.mined_height.unwrap()) < sync_start_h
+                    tx.mined_height.is_some() && <u32>::from(tx.mined_height.unwrap()) < sync_start_h
                 );
                 for tx in &mut wallet.txs[invalidate_from_i..] {
                     // N.B. these may get revalidated later if the same txs are found in the new blocks
-                    tx.2 = true;
+                    tx.is_outside_bc = true;
                 }
             }
         }
@@ -1351,7 +1368,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // put at the *end* of txs at the same height
             // i.e. primarily sorted by mined height, secondarily by discovered_time
             *insert_i += txs[*insert_i..].partition_point(|tx|
-                tx.0.mined_height.is_some() && tx.0.mined_height.unwrap() <= block_h
+                tx.mined_height.is_some() && tx.mined_height.unwrap() <= block_h
             );
         }
 
@@ -1461,35 +1478,33 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
 
                 // TODO: complete
-                let new_wallet_tx = WalletTx(
-                    TransactionSummary {
-                        account_id: 0,
-                        txid,
-                        expiry_height,
-                        mined_height: Some(block_h),
-                        account_value_delta: ZatBalance::from_i64(0).unwrap(),
-                        total_spent: Zatoshis::from_u64(total_spent).unwrap(),
-                        total_received: Zatoshis::from_u64(total_received).unwrap(),
-                        fee_paid: Some(Zatoshis::from_u64(0).unwrap()),
-                        has_change: false,
+                let new_wallet_tx = WalletTx{
+                    account_id: 0,
+                    txid,
+                    expiry_height,
+                    mined_height: Some(block_h),
+                    account_value_delta: ZatBalance::from_i64(0).unwrap(),
+                    total_spent: Zatoshis::from_u64(total_spent).unwrap(),
+                    total_received: Zatoshis::from_u64(total_received).unwrap(),
+                    fee_paid: Some(Zatoshis::from_u64(0).unwrap()),
+                    has_change: false,
 
-                        spent_note_count: 0,
-                        sent_note_count: 0,
-                        received_note_count: 0,
+                    spent_note_count: 0,
+                    sent_note_count: 0,
+                    received_note_count: 0,
 
-                        memo_count: 0,
-                        expired_unmined: false,
-                        is_shielding: false,
-                        memo: [0; 512],
-                    },
-                    if total_spent > 0 {
+                    memo_count: 0,
+                    expired_unmined: false,
+                    is_shielding: false,
+                    memo: [0; 512],
+                    kind: if total_spent > 0 {
                         WalletTxKind::SelfSend
                     } else {
                         WalletTxKind::Receive
                     },
-                    false,
-                );
-                update_with_tx(miner_wallet, new_wallet_tx.0.txid, new_wallet_tx, &mut insert_i);
+                    is_outside_bc: false,
+                };
+                update_with_tx(miner_wallet, new_wallet_tx.txid, new_wallet_tx, &mut insert_i);
             }
 
             println!("miner unspent UTXOs {:#?}", Txos(&*miner_wallet.accounts[0].utxos));
@@ -1522,28 +1537,26 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         // Conservative approach: always recompute
                         // TODO: decrypt our transactions & fill in actual data here
                         // TODO: get full info with memos
-                        let new_wallet_tx = WalletTx(
-                            TransactionSummary {
-                                account_id: 0,
-                                txid,
-                                expiry_height: None,
-                                mined_height: Some(block_h),
-                                account_value_delta: ZatBalance::from_i64(0).unwrap(),
-                                total_spent: Zatoshis::from_u64(0).unwrap(),
-                                total_received: Zatoshis::from_u64(0).unwrap(),
-                                fee_paid: Some(Zatoshis::from_u64(0).unwrap()),
-                                spent_note_count: 0,
-                                has_change: false,
-                                sent_note_count: 0,
-                                received_note_count: 0,
-                                memo_count: 0,
-                                expired_unmined: false,
-                                is_shielding: false,
-                                memo: [0; 512],
-                            },
-                            WalletTxKind::Receive,
-                            false,
-                        );
+                        let new_wallet_tx = WalletTx{
+                            account_id: 0,
+                            txid,
+                            expiry_height: None,
+                            mined_height: Some(block_h),
+                            account_value_delta: ZatBalance::from_i64(0).unwrap(),
+                            total_spent: Zatoshis::from_u64(0).unwrap(),
+                            total_received: Zatoshis::from_u64(0).unwrap(),
+                            fee_paid: Some(Zatoshis::from_u64(0).unwrap()),
+                            spent_note_count: 0,
+                            has_change: false,
+                            sent_note_count: 0,
+                            received_note_count: 0,
+                            memo_count: 0,
+                            expired_unmined: false,
+                            is_shielding: false,
+                            memo: [0; 512],
+                            kind: WalletTxKind::Receive,
+                            is_outside_bc: false,
+                        };
                         update_with_tx(wallet, txid, new_wallet_tx, &mut insert_i);
                     }
                 }
@@ -1610,28 +1623,26 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     };
                     if res.is_ok() {
                         // TODO: complete
-                        let new_wallet_tx = WalletTx(
-                            TransactionSummary {
-                                account_id: 0,
-                                txid: tx.txid(),
-                                expiry_height: None,
-                                mined_height: None,
-                                account_value_delta: ZatBalance::from_i64(0).unwrap(),
-                                total_spent,
-                                total_received,
-                                fee_paid: Some(fee),
-                                spent_note_count: 1,
-                                has_change: false,
-                                sent_note_count: 1,
-                                received_note_count: 0,
-                                memo_count: 0,
-                                expired_unmined: false,
-                                is_shielding: false,
-                                memo: [0; 512],
-                            },
+                        let new_wallet_tx = WalletTx{
+                            account_id: 0,
+                            txid: tx.txid(),
+                            expiry_height: None,
+                            mined_height: None,
+                            account_value_delta: ZatBalance::from_i64(0).unwrap(),
+                            total_spent,
+                            total_received,
+                            fee_paid: Some(fee),
+                            spent_note_count: 1,
+                            has_change: false,
+                            sent_note_count: 1,
+                            received_note_count: 0,
+                            memo_count: 0,
+                            expired_unmined: false,
+                            is_shielding: false,
+                            memo: [0; 512],
                             kind,
-                            true,
-                        );
+                            is_outside_bc: true,
+                        };
                         let mut insert_i = 0;
                         update_insert_i(&miner_wallets[miner_use_i].txs, &mut insert_i, block_h);
                         update_with_tx(&mut miner_wallets[miner_use_i], tx.txid(), new_wallet_tx, &mut insert_i);
@@ -1985,11 +1996,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         //                                 println!("received multiple memos in 1 transaction: {}", memos.len());
         //                             }
         //                             let bytes = memos[0].as_bytes();
-        //                             if bytes.len() > tx.0.memo.len() {
+        //                             if bytes.len() > tx.memo.len() {
         //                                 println!("memo too big ({}/{}):\"\"\"\n{}\n\"\"\"", bytes.len(), memos[0].len(), memos[0]);
         //                             }
-        //                             let len = bytes.len().min(tx.0.memo.len());
-        //                             tx.0.memo[..len].copy_from_slice(&bytes[..len]);
+        //                             let len = bytes.len().min(tx.memo.len());
+        //                             tx.memo[..len].copy_from_slice(&bytes[..len]);
         //                         }
         //                     }
 
@@ -2000,7 +2011,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         //                 // @todo(judah): because of the database, we can't differentiate regular receives
         //                 // and staking receives... This is how we do that for now.
         //                 for tx in &mut txs {
-        //                     if tx.0.memo.starts_with("@UNSTAKE_RECEIVE:".as_bytes()) {
+        //                     if tx.memo.starts_with("@UNSTAKE_RECEIVE:".as_bytes()) {
         //                         tx.1 = WalletTxKind::Unstake;
         //                     }
         //                 }
@@ -2378,68 +2389,3 @@ impl ServerCertVerifier for DerVerifier {
     }
 }
 */
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TransactionSummary<AccountId> {
-    pub account_id: AccountId,
-    pub txid: zcash_protocol::TxId,
-    pub expiry_height: Option<BlockHeight>,
-    pub mined_height: Option<BlockHeight>, // ALT: treat mempool height as tip_h + 1 or u64::MAX
-    pub account_value_delta: ZatBalance,
-    pub total_spent: Zatoshis,
-    pub total_received: Zatoshis,
-    pub fee_paid: Option<Zatoshis>,
-    pub spent_note_count: usize,
-    pub has_change: bool,
-    pub sent_note_count: usize,
-    pub received_note_count: usize,
-    pub memo_count: usize,
-    pub expired_unmined: bool,
-    pub is_shielding: bool,
-    pub memo: [u8; 512],
-}
-
-impl<AccountId> TransactionSummary<AccountId> {
-    /// Constructs a `TransactionSummary` from its parts.
-    ///
-    /// See the documentation for each getter method below to determine how each method
-    /// argument should be prepared.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_parts(
-        account_id: AccountId,
-        txid: zcash_protocol::TxId,
-        expiry_height: Option<BlockHeight>,
-        mined_height: Option<BlockHeight>,
-        account_value_delta: ZatBalance,
-        total_spent: Zatoshis,
-        total_received: Zatoshis,
-        fee_paid: Option<Zatoshis>,
-        spent_note_count: usize,
-        has_change: bool,
-        sent_note_count: usize,
-        received_note_count: usize,
-        memo_count: usize,
-        expired_unmined: bool,
-        is_shielding: bool,
-        memo: [u8; 512],
-    ) -> Self {
-        Self {
-            account_id,
-            txid,
-            expiry_height,
-            mined_height,
-            account_value_delta,
-            total_spent,
-            total_received,
-            fee_paid,
-            spent_note_count,
-            has_change,
-            sent_note_count,
-            received_note_count,
-            memo_count,
-            expired_unmined,
-            is_shielding,
-            memo,
-        }
-    }
-}
