@@ -35,6 +35,7 @@ use zcash_primitives::transaction::txid::TxIdDigester;
 use zcash_primitives::transaction::{Authorized, Unauthorized, Transaction, TransactionData, TxVersion};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight as LRZBlockHeight, BranchId};
+use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::{ZatBalance, Zatoshis};
 use zcash_protocol::TxId;
 use zcash_transparent::{
@@ -221,6 +222,22 @@ async fn wait_for_zainod() {
         interval.tick().await;
     }
 }
+
+struct Timer { t_bgn: std::time::Instant, name: &'static str }
+impl Timer {
+    pub fn scope(name: &'static str) -> Self {
+        println!("started {}", name);
+        Self {
+            name, t_bgn: std::time::Instant::now()
+        }
+    }
+}
+impl Drop for Timer {
+    fn drop(&mut self) {
+        println!("{} took {}ms", self.name, self.t_bgn.elapsed().as_millis());
+    }
+}
+
 
 fn block_policy_10() -> ConfirmationsPolicy { ConfirmationsPolicy::new(std::num::NonZeroU32::new(5).unwrap(), std::num::NonZeroU32::new(5).unwrap(), false).unwrap() }
 
@@ -423,18 +440,109 @@ pub fn str_from_ctaz(val: u64) -> String {
     format!("{full}.{}", &part_str[..trim_part.len().max(3)])
 }
 
+enum TxOutput {
+    Transparent {
+        dst: TransparentAddress,
+        zats: Zatoshis,
+    },
+    // TODO: sprout, sapling?
+    Orchard {
+        ovk: Option<orchard::keys::OutgoingViewingKey>,
+        dst: orchard::Address,
+        zats: u64,
+        memo: MemoBytes,
+    }
+}
+
 struct TxOptions {
-    memo: Option<zcash_protocol::memo::MemoBytes>,
+    src_pools: &'static [TxPool], // in descending preference order
     staking_action: Option<StakingAction>,
+}
+impl TxOptions {
+    // TODO: reconsider
+    // pub const DEFAULT_SRC_POOLS: [TxPool; 2] = [TxPool::Sapling, TxPool::Orchard];
+    pub const DEFAULT_SRC_POOLS: [TxPool; 1] = [TxPool::Orchard];
 }
 impl Default for TxOptions {
     fn default() -> Self {
         Self {
-            memo: None,
+            src_pools: &TxOptions::DEFAULT_SRC_POOLS,
             staking_action: None,
         }
     }
 }
+
+pub enum TxPool {
+    Transparent,
+    // Sprout,
+    // Sapling,
+    Orchard,
+}
+
+fn transparent_keys_from_usk(usk: &UnifiedSpendingKey, index: u32) -> Option<(secp256k1::PublicKey, secp256k1::SecretKey)> {
+    let transparent = usk.transparent();
+    let account_pubkey = transparent.to_account_pubkey();
+    let child_index = NonHardenedChildIndex::const_from_index(index);
+    let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).ok()?;
+    let address_privkey = transparent.derive_external_secret_key(child_index).ok()?;
+    Some((address_pubkey, address_privkey))
+}
+
+fn addrs_from_account(account: &ManualAccount, index: u32) -> Option<(TransparentAddress, UnifiedAddress)> {
+    // NOTE: the wallet auto-increments the child index so this isn't recognized
+    let ufvk = &account.ufvk;
+    let (ua, di_) = ufvk.find_address(orchard::keys::DiversifierIndex::new(), UnifiedAddressRequest::ORCHARD).ok()?;
+    let account_pubkey = ufvk.transparent()?;
+    let child_index = NonHardenedChildIndex::const_from_index(index);
+    let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).ok()?;
+    Some((TransparentAddress::from_pubkey(&address_pubkey), ua))
+        // Some(account.default_address().ok()??.0)
+}
+
+fn update_insert_i(txs: &[WalletTx], insert_i: &mut usize, block_h: BlockHeight) {
+    // put at the *end* of txs at the same height
+    // i.e. primarily sorted by mined height, secondarily by discovered_time
+    *insert_i += txs[*insert_i..].partition_point(|tx| tx.mined_h <= block_h);
+}
+
+fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, insert_i: &mut usize) {
+    // find if there's an existing height/transaction for this txid
+    if let Some(tx_h) = wallet.tx_h_map.get_mut(&txid) {
+        let mut h_start_i = wallet.txs.partition_point(|tx| tx.mined_h < *tx_h);
+        let mut found_idx = None;
+        let txs_n = wallet.txs.len();
+        for find_i in h_start_i..txs_n {
+            let tx = &mut wallet.txs[find_i];
+            if tx.mined_h != *tx_h {
+                break;
+            }
+            if tx.txid == txid {
+                found_idx = Some(find_i);
+                break;
+            }
+        }
+
+        if let Some(tx_i) = found_idx {
+            if tx_i < *insert_i {
+                *insert_i -= 1;
+            }
+            let old_tx = wallet.txs.remove(tx_i);
+            if old_tx != new_tx {
+                println!("{} wallet updated existing transaction {txid} {:?} => {:?}", wallet.name, old_tx.mined_h, new_tx.mined_h);
+                // println!("{} wallet updated existing transaction {txid} {old_tx:?} => {new_tx:?}", wallet.name);
+            }
+        } else {
+            println!("ERROR: {txid:?} not found at associated height {tx_h:?}");
+        }
+        *tx_h = new_tx.mined_h;
+    } else {
+        wallet.tx_h_map.insert(txid, new_tx.mined_h);
+        println!("{} wallet inserted unknown transaction {txid} at {:?}", wallet.name, new_tx.mined_h);
+    }
+    wallet.txs.insert(*insert_i, new_tx);
+    *insert_i += 1;
+}
+
 
 #[derive(Clone, Debug)]
 pub struct ManualAccount {
@@ -518,6 +626,142 @@ impl ManualWallet {
             0,// sapling subtree
             0,// orchard subtree
         )))
+    }
+
+    // TODO: fee API
+    pub async fn send_zats<P: Parameters>(
+        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
+        outputs: &[TxOutput], src_usk: &UnifiedSpendingKey, zats: Zatoshis, opts: &TxOptions
+    ) -> Option<TxId>
+    {
+        let tz = Timer::scope("send_zats");
+        let block_h = self.chain_tip_h.0 + 1;
+
+        let account = &self.accounts[0];
+        let (t_addr, _) = addrs_from_account(account, 0).unwrap(); // @Hack
+
+        let mut txb = TxBuilder::new(
+            network,
+            LRZBlockHeight::from_u32(block_h),
+            BuildConfig::Standard {
+                sapling_anchor: None,
+                orchard_anchor: None,
+            },
+        );
+
+        let mut total_send = 0; // TODO: is this supposed to exclude self-sends?
+        let mut total_recv = 0;
+        for output in outputs {
+            match output {
+                &TxOutput::Transparent{ dst, zats } => {
+                    total_send += zats.into_u64();
+                    total_recv += (dst == t_addr) as u64 * zats.into_u64();
+                    txb.add_transparent_output(&dst, zats).ok()?
+                }
+                TxOutput::Orchard{ ovk, dst, zats, memo } => {
+                    total_send += zats;
+                    // TODO: self-send
+                    txb.add_orchard_output::<zip317::FeeError>(ovk.clone(), dst.clone(), *zats, memo.clone()).ok()?
+                }
+            }
+        }
+
+
+        let mut signing_set = TransparentSigningSet::new();
+        let (pubkey, privkey) = transparent_keys_from_usk(&src_usk, 0).unwrap();
+        signing_set.add_key(privkey);
+
+        let fee = MINIMUM_FEE;
+        let total_spend = total_send + fee.into_u64();
+        let mut total_covered = 0;
+        'src_pool: for pool in opts.src_pools {
+            match pool {
+                TxPool::Transparent => {
+                    // "greedy strategy"
+                    for utxo in &account.utxos {
+                        txb.add_transparent_input(pubkey, utxo.id.clone(), utxo.txout());
+                        total_covered += utxo.value.into_u64();
+                        if (total_covered >= total_spend) {
+                            break 'src_pool;
+                        }
+                    }
+                }
+                TxPool::Orchard => {
+                    todo!("orchard inputs");
+                }
+            }
+        }
+
+        let change = match total_covered.cmp(&total_spend) {
+            std::cmp::Ordering::Less => return None, // can't afford
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => {
+                // TODO: prefer shielded output
+                let change = total_covered - total_spend;
+                txb.add_transparent_output(&t_addr, Zatoshis::from_u64(change).unwrap());
+                change
+            }
+        };
+        // TODO: separate change outputs from intended outputs
+
+        use rand_chacha::ChaCha20Rng;
+        let prover = LocalTxProver::bundled();
+        let extsk: &[ExtendedSpendingKey] = &[];
+        let sak: &[SpendAuthorizingKey] = &[];
+        let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+        let tx_res = txb.build(
+            &signing_set,
+            extsk,
+            sak,
+            rng,
+            &prover,
+            &prover,
+            &zip317::FeeRule::standard(),
+        ).unwrap();
+
+        let tx = tx_res.transaction();
+        let mut tx_bytes = vec![];
+        tx.write(&mut tx_bytes).unwrap();
+
+        // TODO: don't block, maybe return a future?
+        let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
+        println!("******* res for {:?}: {:?}", tx.txid(), res);
+
+        // TODO: shielding/determine without state
+        let kind = if total_recv > 0 {
+            WalletTxKind::SelfSend
+        } else {
+            WalletTxKind::Send
+        };
+        if res.is_ok() {
+            // TODO: complete
+            let new_wallet_tx = WalletTx{
+                account_id: 0,
+                txid: tx.txid(),
+                expiry_h: None,
+                mined_h: BlockHeight::INTERNAL,
+                account_value_delta: ZatBalance::from_i64(0).unwrap(),
+                total_spent: Zatoshis::from_u64(total_spend).unwrap(),
+                total_received: Zatoshis::from_u64(total_recv).unwrap(),
+                fee_paid: Some(fee),
+                spent_note_count: 1,
+                has_change: false,
+                sent_note_count: 1,
+                received_note_count: 0,
+                memo_count: 0,
+                expired_unmined: false,
+                is_shielding: false,
+                memo: [0; 512],
+                kind,
+                is_outside_bc: false,
+            };
+            let mut insert_i = 0;
+            update_insert_i(&self.txs, &mut insert_i, new_wallet_tx.mined_h);
+            update_with_tx(self, tx.txid(), new_wallet_tx, &mut insert_i);
+            Some(tx.txid())
+        } else {
+            None
+        }
     }
 }
 
@@ -613,30 +857,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         (wallet, account)
     }
 
-    fn addrs_from_account(account: &ManualAccount, index: u32) -> Option<(TransparentAddress, UnifiedAddress)> {
-        // NOTE: the wallet auto-increments the child index so this isn't recognized
-        let ufvk = &account.ufvk;
-        let (ua, di_) = ufvk.find_address(orchard::keys::DiversifierIndex::new(), UnifiedAddressRequest::ORCHARD).ok()?;
-        let account_pubkey = ufvk.transparent()?;
-        let child_index = NonHardenedChildIndex::const_from_index(index);
-        let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).ok()?;
-        Some((TransparentAddress::from_pubkey(&address_pubkey), ua))
-        // Some(account.default_address().ok()??.0)
-    }
-
     let addrs_from_wallet = |wallet: &ManualWallet| -> Option<(TransparentAddress, UnifiedAddress)> {
         let Some(account) = wallet.accounts.first() else { return None; };
         addrs_from_account(account, 0)
     };
-
-    fn transparent_keys_from_usk(usk: &UnifiedSpendingKey, index: u32) -> Option<(secp256k1::PublicKey, secp256k1::SecretKey)> {
-        let transparent = usk.transparent();
-        let account_pubkey = transparent.to_account_pubkey();
-        let child_index = NonHardenedChildIndex::const_from_index(index);
-        let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).ok()?;
-        let address_privkey = transparent.derive_external_secret_key(child_index).ok()?;
-        Some((address_pubkey, address_privkey))
-    }
 
     fn get_transaction_history(wallet: &ManualWallet) -> Result<Vec<WalletTx>, Infallible> {
         Ok(wallet.txs.clone())
@@ -751,21 +975,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         Some((txid_map, out_txid_map))
-    }
-
-    struct Timer { t_bgn: std::time::Instant, name: &'static str };
-    impl Timer {
-        pub fn scope(name: &'static str) -> Self {
-            println!("started {}", name);
-            Self {
-                name, t_bgn: std::time::Instant::now()
-            }
-        }
-    };
-    impl Drop for Timer {
-        fn drop(&mut self) {
-            println!("{} took {}ms", self.name, self.t_bgn.elapsed().as_millis());
-        }
     }
 
     // let send_zats = async |client: &mut CompactTxStreamerClient<_>, dst_ua: &UnifiedAddress, src_wallet: &mut ManualWallet, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params, opts: &TxOptions| -> Option<[u8;32]> {
@@ -1291,44 +1500,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             break (new_blocks, new_t_txs, sync_from_i, req_rng);
         };
 
-        fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, insert_i: &mut usize) {
-            // find if there's an existing height/transaction for this txid
-            if let Some(tx_h) = wallet.tx_h_map.get_mut(&txid) {
-                let mut h_start_i = wallet.txs.partition_point(|tx| tx.mined_h < *tx_h);
-                let mut found_idx = None;
-                let txs_n = wallet.txs.len();
-                for find_i in h_start_i..txs_n {
-                    let tx = &mut wallet.txs[find_i];
-                    if tx.mined_h != *tx_h {
-                        break;
-                    }
-                    if tx.txid == txid {
-                        found_idx = Some(find_i);
-                        break;
-                    }
-                }
-
-                if let Some(tx_i) = found_idx {
-                    if tx_i < *insert_i {
-                        *insert_i -= 1;
-                    }
-                    let old_tx = wallet.txs.remove(tx_i);
-                    if old_tx != new_tx {
-                        println!("{} wallet updated existing transaction {txid} {:?} => {:?}", wallet.name, old_tx.mined_h, new_tx.mined_h);
-                        // println!("{} wallet updated existing transaction {txid} {old_tx:?} => {new_tx:?}", wallet.name);
-                    }
-                } else {
-                    println!("ERROR: {txid:?} not found at associated height {tx_h:?}");
-                }
-                *tx_h = new_tx.mined_h;
-            } else {
-                wallet.tx_h_map.insert(txid, new_tx.mined_h);
-                println!("{} wallet inserted unknown transaction {txid} at {:?}", wallet.name, new_tx.mined_h);
-            }
-            wallet.txs.insert(*insert_i, new_tx);
-            *insert_i += 1;
-        }
-
         fn recv_h_position(utxos: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
             let utxos_at_h_start = utxos.partition_point(|txo| txo.recv_h < block_h);
             for utxo_i in utxos_at_h_start..utxos.len() {
@@ -1402,12 +1573,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     tx.is_outside_bc = true;
                 }
             }
-        }
-
-        fn update_insert_i(txs: &[WalletTx], insert_i: &mut usize, block_h: BlockHeight) {
-            // put at the *end* of txs at the same height
-            // i.e. primarily sorted by mined height, secondarily by discovered_time
-            *insert_i += txs[*insert_i..].partition_point(|tx| tx.mined_h <= block_h);
         }
 
         //-- ADD/REVALIDATE TRANSPARENT TXS
@@ -1603,88 +1768,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             // DEV: miner send tx to self
             if let Some(miner_utxo) = miner_wallets[miner_use_i].accounts[0].utxos.first() {
-                let fee = MINIMUM_FEE;
-                if let Some(zats) = miner_utxo.value - fee {
-                    let block_h = miner_wallets[miner_use_i].chain_tip_h.0 + 1;
-                    let mut signing_set = TransparentSigningSet::new();
-                    signing_set.add_key(miner_privkey);
-
-                    let prover = LocalTxProver::bundled();
-                    let extsk: &[ExtendedSpendingKey] = &[];
-                    let sak: &[SpendAuthorizingKey] = &[];
-
-                    let mut txb = TxBuilder::new(
-                        network,
-                        LRZBlockHeight::from_u32(block_h),
-                        BuildConfig::Standard {
-                            sapling_anchor: None,
-                            orchard_anchor: None,
-                        },
-                    );
-
-                    let total_spent = miner_utxo.value; // TODO: should this include fees?
-                    txb.add_transparent_input(miner_pubkey, miner_utxo.id.clone(), miner_utxo.txout());
-                    let send_addr = miner_t_address;
-                    txb.add_transparent_output(&send_addr, zats).unwrap();
-                    let total_received = if send_addr == miner_t_address {
-                        zats
-                    } else {
-                        Zatoshis::from_u64(0).unwrap()
-                    };
-
-                    // TODO: separate change outputs from intended outputs
-
-                    use rand_chacha::ChaCha20Rng;
-                    let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
-                    let tx_res = txb.build(
-                        &signing_set,
-                        extsk,
-                        sak,
-                        rng,
-                        &prover,
-                        &prover,
-                        &zip317::FeeRule::standard(),
-                    ).unwrap();
-
-                    let tx = tx_res.transaction();
-                    let mut tx_bytes = vec![];
-                    tx.write(&mut tx_bytes).unwrap();
-
-                    let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
-                    println!("******* res for {:?}: {:?}", tx.txid(), res);
-
-                    // TODO: shielding/determine without state
-                    let kind = if total_received.into_u64() > 0 {
-                        WalletTxKind::SelfSend
-                    } else {
-                        WalletTxKind::Send
-                    };
-                    if res.is_ok() {
-                        // TODO: complete
-                        let new_wallet_tx = WalletTx{
-                            account_id: 0,
-                            txid: tx.txid(),
-                            expiry_h: None,
-                            mined_h: BlockHeight::INTERNAL,
-                            account_value_delta: ZatBalance::from_i64(0).unwrap(),
-                            total_spent,
-                            total_received,
-                            fee_paid: Some(fee),
-                            spent_note_count: 1,
-                            has_change: false,
-                            sent_note_count: 1,
-                            received_note_count: 0,
-                            memo_count: 0,
-                            expired_unmined: false,
-                            is_shielding: false,
-                            memo: [0; 512],
-                            kind,
-                            is_outside_bc: true,
-                        };
-                        let mut insert_i = 0;
-                        update_insert_i(&miner_wallets[miner_use_i].txs, &mut insert_i, new_wallet_tx.mined_h);
-                        update_with_tx(&mut miner_wallets[miner_use_i], tx.txid(), new_wallet_tx, &mut insert_i);
-                    }
+                if let Some(val_after_fees) = miner_utxo.value - MINIMUM_FEE {
+                    let dst = TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees};
+                    miner_wallets[miner_use_i].send_zats(network, &mut client, &[dst], &miner_usk, val_after_fees, &TxOptions {
+                        src_pools: &[TxPool::Transparent],
+                        ..TxOptions::default()
+                    }).await;
                 }
             }
         }
