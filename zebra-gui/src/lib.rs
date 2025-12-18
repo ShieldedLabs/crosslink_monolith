@@ -297,6 +297,8 @@ impl DrawCtx {
     }
 
     pub fn text_line(&self, font_kind: FontKind, text_x: f32, text_y: f32, text_height: f32, text_line: &str, color: u32) {
+        if text_y + text_height <= 0.0 || text_y >= self.window_height as f32 { return; }
+
         unsafe {
             if text_height <= 0.0 || text_height.is_normal() == false { return; }
             let text_height = text_height.min(8192.0);
@@ -414,6 +416,9 @@ impl DrawCtx {
 
     // (x1, y1) and (x2, y2) can be in any order
     pub fn line(&self, mut x1: f32, mut y1: f32, mut x2: f32, mut y2: f32, thickness: f32, color: u32) {
+        if (x1.max(x2) + thickness < 0.0) || (x1.min(x2) - thickness > self.window_width as f32) { return; }
+        if (y1.max(y2) + thickness < 0.0) || (y1.min(y2) - thickness > self.window_height as f32) { return; }
+
         unsafe {
             if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
@@ -457,6 +462,9 @@ impl DrawCtx {
     }
 
     pub fn rounded_rectangle(&self, x1: isize, y1: isize, x2: isize, y2: isize, radius_tl: isize, radius_tr: isize, radius_bl: isize, radius_br: isize, color: u32) {
+        if x2 < 0 || x1 > self.window_width { return; }
+        if y2 < 0 || y1 > self.window_height { return; }
+
         unsafe {
             if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
@@ -477,6 +485,9 @@ impl DrawCtx {
     }
 
     pub fn circle(&self, x: f32, y: f32, radius: f32, color: u32) {
+        if x + radius < 0.0 || x - radius > self.window_width as f32 { return; }
+        if y + radius < 0.0 || y - radius > self.window_height as f32 { return; }
+
         unsafe {
             if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
@@ -496,6 +507,9 @@ impl DrawCtx {
         }
     }
     pub fn circle_square(&self, x: f32, y: f32, radius: f32, round_pixels: f32, color: u32) {
+        if x + radius < 0.0 || x - radius > self.window_width as f32 { return; }
+        if y + radius < 0.0 || y - radius > self.window_height as f32 { return; }
+
         unsafe {
             if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);

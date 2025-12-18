@@ -23,6 +23,8 @@ pub async fn service_viz_requests(
 ) {
     let call = tfl_handle.clone().call;
 
+    let mut bc_ack_height = 0;
+
     loop {
         let request_queue = visualizer_zcash::REQUESTS_TO_ZEBRA.lock().unwrap();
         let response_queue = visualizer_zcash::RESPONSES_FROM_ZEBRA.lock().unwrap();
@@ -51,7 +53,7 @@ pub async fn service_viz_requests(
             };
             let bc_tip_height: u64 = tip_height_hash.0.0 as u64;
 
-            let bc_req_h = (0, -1);
+            let bc_req_h = (bc_ack_height, -1);
 
             #[allow(clippy::never_loop)]
             let (lo_height, bc_tip, height_hashes, seq_blocks) = loop {
@@ -137,6 +139,10 @@ pub async fn service_viz_requests(
                     let mut response = visualizer_zcash::ResponseFromZebra::_0();
                     response.bc_tip_height = bc_tip_height;
                     response.bft_tip_height = (internal.bft_blocks.len() as u64).saturating_sub(1);
+
+                    response.start_bc_height = bc_ack_height as u64;
+                    bc_ack_height = bc_ack_height.max(request.bc_ack_height as i32);
+
                     for (i, bc) in seq_blocks.iter().enumerate() {
                         if let Some(bc) = bc {
                             let this_hash = Hash32::from_bytes(bc.header.hash().0);
@@ -155,7 +161,8 @@ pub async fn service_viz_requests(
                             });
                         }
                     }
-                    for (i, b) in internal.bft_blocks.iter().enumerate() {
+                    for i in request.bft_ack_height as usize..internal.bft_blocks.len() {
+                        let b = &internal.bft_blocks[i];
                         let this_hash = Hash32::from_bytes(b.blake3_hash().0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;
