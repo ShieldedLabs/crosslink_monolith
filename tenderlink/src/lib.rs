@@ -1905,7 +1905,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 }
             };
 
-            // eprintln!("\n\n\n\n\n\n\n\n@Phillip: PoW bytes obtained!!! :) Hash: {:?}\n\n\n\n\n\n\n\n", hash);
+            // eprintln!("PowLink: PoW bytes obtained. Hash: {:?}", hash);
 
             let chunks_n = powlink_chunks_n(bytes.len());
             if chunk_needed_i >= chunks_n {
@@ -2891,7 +2891,7 @@ const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES",     "STATUS+PRECOMMIT_SIGNATURES"];
     names[PACKET_TYPE_ROSTER_CMD           as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
-    names[PACKET_TYPE_POWLINK_CHUNK              as usize] = ["PACKET_TYPE_POWLINK_CHUNK",      "STATUS+PACKET_TYPE_POWLINK_CHUNK"];
+    names[PACKET_TYPE_POWLINK_CHUNK        as usize] = ["PACKET_TYPE_POWLINK_CHUNK","STATUS+PACKET_TYPE_POWLINK_CHUNK"];
     const_assert!(PACKET_TYPE_COUNT == 12); // keep names array updated when adding other tags
     names
 };
