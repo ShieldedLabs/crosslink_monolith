@@ -62,7 +62,7 @@ tracing.workspace = true
 # - Protobuf interfaces and gRPC bindings
 hex.workspace = true
 prost.workspace = true
-tonic = { workspace = true, optional = true, features = ["codegen"] }
+tonic = { workspace = true, optional = true, features = ["codegen", "transport"] }
 tonic-prost = { workspace = true, optional = true }
 
 # - Secret management
