@@ -368,6 +368,12 @@ impl Default for TxOptions {
     }
 }
 
+fn block_h_cmp(a: Option<BlockHeight>, b: Option<BlockHeight>) -> std::cmp::Ordering {
+    let a = (a.is_none(), a.unwrap_or(BlockHeight::from_u32(0)));
+    let b = (b.is_none(), b.unwrap_or(BlockHeight::from_u32(0)));
+    a.cmp(&b)
+}
+
 #[derive(Clone, Debug)]
 pub struct ManualAccount {
     // NOTE: this is per account so that you can scan historically for e.g. a new transparent address
@@ -380,6 +386,9 @@ pub struct ManualAccount {
     pub balance_changes: Vec<(BlockHeight, data_api::AccountBalance)>, // TODO: account for mempool
 
     // unspent: sorted by recv height
+    // ALT: store stxos by both recv & spend height
+    // ALT: hashmap txo to both heights
+    // ALT: utxos & stxos just store (height, index into recv_txos) (careful with stability)
     pub recv_txos: Vec<Txo>,
     pub utxos: Vec<Txo>,
     // TODO: handle partial spends i.e. spend created locally but not seen in block
@@ -1401,7 +1410,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                     }
                                     account.stxos.push(stxo);
                                 } else if let Some(txo_i) = recv_h_position(&account.recv_txos, prevout_txid_h, &input.prevout) {
-                                    // ALT: test if we have the tx in bc & this is from us
+                                    // NOTE: we need to use our own tracking of the TXO as otherwise we don't know the value
                                     total_spent += account.recv_txos[txo_i].value.into_u64();
                                 } else {
                                     // accounted for by moving it into stxos(?)
