@@ -8,7 +8,7 @@ use rand_chacha::rand_core::SeedableRng;
 use rand_core::OsRng;
 use sapling_crypto::zip32::ExtendedSpendingKey;
 use secrecy::{ExposeSecret,SecretVec,Secret};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::{identity, Infallible};
 use std::future::Future;
 use std::mem;
@@ -36,7 +36,7 @@ use zcash_primitives::transaction::{Transaction, TransactionData, TxVersion};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 use zcash_protocol::value::{ZatBalance, Zatoshis};
-use zcash_protocol::TxId;
+use zcash_protocol::{PoolType, ShieldedProtocol, TxId};
 use zcash_transparent::{
     builder::{TransparentBuilder, TransparentSigningSet, Unauthorized},
     bundle::OutPoint,
@@ -561,7 +561,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 println!("propose_transfer error: {err:?}");
                 None
             },
-            Ok(proposal) => {
+            Ok(mut proposal) => {
+                let mut different: Vec<_> = proposal.steps.clone().into_iter().map(|mut x| { if opts.staking_action.is_some() { x.payment_pools = BTreeMap::new(); } x }).collect();
+                proposal.steps.head = different.remove(0);
+                proposal.steps.tail = different;
                 let prover = LocalTxProver::bundled();
                 match wallet::create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
                     src_wallet,

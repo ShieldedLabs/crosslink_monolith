@@ -1,6 +1,6 @@
 //! Transactions and transaction-related structures.
 
-use std::{collections::HashMap, fmt, iter, sync::Arc};
+use std::{collections::HashMap, fmt, iter, ops::Neg, sync::Arc};
 
 use halo2::pasta::pallas;
 
@@ -37,6 +37,7 @@ pub use sighash::{HashType, SigHash, SigHasher};
 pub use unmined::{
     zip317, UnminedTx, UnminedTxId, VerifiedUnminedTx, MEMPOOL_TRANSACTION_COST_THRESHOLD,
 };
+use zcash_primitives::transaction::StakingActionKind;
 use zcash_protocol::consensus;
 
 #[cfg(feature = "tx_v6")]
@@ -1553,6 +1554,27 @@ impl Transaction {
         ValueBalance::from_orchard_amount(orchard_value_balance)
     }
 
+    /// Return the staking value balance.
+    pub fn staking_value_balance(&self) -> ValueBalance<NegativeAllowed> {
+        match self {
+            Self::VCrosslink {
+                staking_action,
+                ..
+            } => {
+                if let Some(staking_action) = staking_action {
+                    if staking_action.kind == StakingActionKind::Add {
+                        ValueBalance::from_orchard_amount(Amount::new(staking_action.val as i64).neg())
+                    } else {
+                        ValueBalance::zero()
+                    }
+                } else {
+                    ValueBalance::zero()
+                }
+            },
+            _ => ValueBalance::zero(),
+        }
+    }
+
     /// Returns the value balances for this transaction using the provided transparent outputs.
     pub(crate) fn value_balance_from_outputs(
         &self,
@@ -1562,6 +1584,7 @@ impl Transaction {
             + self.sprout_value_balance()?
             + self.sapling_value_balance()
             + self.orchard_value_balance()
+            + self.staking_value_balance()
     }
 
     /// Returns the value balances for this transaction.
