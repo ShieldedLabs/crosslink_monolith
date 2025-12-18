@@ -11,7 +11,7 @@ use clay::render_commands::RenderCommandConfig::{Rectangle, ScissorStart, Scisso
 use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 //use clay::*; // @Temporary
 
-use wallet::str_from_ctaz;
+use wallet::{ BlockHeight, str_from_ctaz };
 
 use super::*;
 
@@ -1357,13 +1357,14 @@ pub fn ui_left_pane(ui: &mut Context,
                                 align: Center,
                                 ..Decl
                             }) {
-                                let icon = match (tx.kind, tx.mined_height) {
-                                    (wallet::WalletTxKind::Send, Some(_))     => ICON_UP_SMALL,
-                                    (wallet::WalletTxKind::SelfSend, Some(_)) => ICON_DOWN_SMALL,
-                                    (wallet::WalletTxKind::Receive, Some(_))  => ICON_DOWN_SMALL,
-                                    (wallet::WalletTxKind::Shield, Some(_))   => ICON_SHIELD,
-                                    (wallet::WalletTxKind::Stake, Some(_))    => ICON_LINK_1,
-                                    (wallet::WalletTxKind::Unstake, Some(_))  => ICON_UNLINK,
+                                // TODO: account for mempool
+                                let icon = match (tx.kind, tx.mined_height.is_in_block()) {
+                                    (wallet::WalletTxKind::Send,     true) => ICON_UP_SMALL,
+                                    (wallet::WalletTxKind::SelfSend, true) => ICON_DOWN_SMALL,
+                                    (wallet::WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
+                                    (wallet::WalletTxKind::Shield,   true) => ICON_SHIELD,
+                                    (wallet::WalletTxKind::Stake,    true) => ICON_LINK_1,
+                                    (wallet::WalletTxKind::Unstake,  true) => ICON_UNLINK,
                                     _ => {
                                         let timer = (ui.tx_loading_animation_timer * 3.0) as u64;
                                         if timer % 3 == 0 {
@@ -1376,7 +1377,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     }
                                 };
 
-                                let colour = if tx.mined_height.is_some() {
+                                // TODO: account for mempool & confirmation level
+                                let colour = if tx.mined_height.is_in_block() {
                                     WHITE
                                 } else {
                                     (0x60, 0x60, 0x60, 0xff) /* @todo colors */
@@ -1395,16 +1397,16 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 let label = match tx.kind {
-                                    wallet::WalletTxKind::Send     => if tx.mined_height.is_some() { "Sent"     } else { "Sending"   },
-                                    wallet::WalletTxKind::Receive  => if tx.mined_height.is_some() { "Received" } else { "Receiving" },
-                                    wallet::WalletTxKind::SelfSend => if tx.mined_height.is_some() { "Returned" } else { "Returning" },
-                                    wallet::WalletTxKind::Shield   => if tx.mined_height.is_some() { "Shielded" } else { "Shielding" },
-                                    wallet::WalletTxKind::Stake    => if tx.mined_height.is_some() { "Staked"   } else { "Staking"   },
-                                    wallet::WalletTxKind::Unstake  => if tx.mined_height.is_some() { "Unstaked" } else { "Unstaking" },
+                                    wallet::WalletTxKind::Send     => if tx.mined_height.is_in_block() { "Sent"     } else { "Sending"   },
+                                    wallet::WalletTxKind::Receive  => if tx.mined_height.is_in_block() { "Received" } else { "Receiving" },
+                                    wallet::WalletTxKind::SelfSend => if tx.mined_height.is_in_block() { "Returned" } else { "Returning" },
+                                    wallet::WalletTxKind::Shield   => if tx.mined_height.is_in_block() { "Shielded" } else { "Shielding" },
+                                    wallet::WalletTxKind::Stake    => if tx.mined_height.is_in_block() { "Staked"   } else { "Staking"   },
+                                    wallet::WalletTxKind::Unstake  => if tx.mined_height.is_in_block() { "Unstaked" } else { "Unstaking" },
                                 };
 
-                                let label_str = if let Some(mined_height) = tx.mined_height {
-                                    frame_strf!(data, "{} @ {}", label, mined_height)
+                                let label_str = if tx.mined_height.is_in_block() {
+                                    frame_strf!(data, "{} @ {}", label, tx.mined_height.0)
                                 } else {
                                     frame_strf!(data, "{}", label)
                                 };
@@ -1458,13 +1460,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                         let send_amount: u64 = send_amount.abs() as u64;
                                         let full = send_amount / 100_000_000;
                                         let part = send_amount % 100_000_000;
-                                        let mut part_str = format!("{part}00");
-                                        if part_str.len() > 3 {
-                                            part_str = part_str[..3].to_string();
-                                        }
+                                        let part_str = format!("{part}000");
 
                                         let prefix = if tx.kind == wallet::WalletTxKind::Send { "-" } else { "" };
-                                        ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, part_str), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..4]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
                                     wallet::WalletTxKind::Receive | wallet::WalletTxKind::Unstake => {
                                         ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
@@ -1473,10 +1472,9 @@ pub fn ui_left_pane(ui: &mut Context,
                                         let shield_amount: i64 = tx.account_value_delta.into();
                                         let full = shield_amount / 100_000_000;
                                         let part = shield_amount % 100_000_000;
-                                        let part_str = format!("{part}00");
-                                        let trim_part = part_str.trim_end_matches("0");
+                                        let part_str = format!("{part}000");
 
-                                        ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..4]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
                                     _ => {
                                         ui.text("TODO cTAZ", TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
