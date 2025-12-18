@@ -255,8 +255,8 @@ pub enum WalletTxKind {
 pub struct WalletTx {
     pub account_id: usize,
     pub txid: zcash_protocol::TxId,
-    pub expiry_height: Option<BlockHeight>,
-    pub mined_height: BlockHeight,
+    pub expiry_h: Option<BlockHeight>,
+    pub mined_h: BlockHeight,
     pub account_value_delta: ZatBalance,
     pub total_spent: Zatoshis,
     pub total_received: Zatoshis,
@@ -274,15 +274,15 @@ pub struct WalletTx {
 }
 
 impl WalletTx {
-    pub fn with_fake_data(kind: WalletTxKind, sent: u64, received: u64, shielding: bool, memo: &str, mined_height: u32) -> Self {
+    pub fn with_fake_data(kind: WalletTxKind, sent: u64, received: u64, shielding: bool, memo: &str, mined_h: u32) -> Self {
         let mut memo_as_bytes = [0u8; 512];
         &memo_as_bytes[0..memo.len()].copy_from_slice(memo.as_bytes());
 
         Self{
             account_id: 0,//AccountUuid::default(),
             txid: TxId::from_bytes([0; 32]),
-            expiry_height: None,
-            mined_height: if mined_height != 0 { (BlockHeight(mined_height)) } else { BlockHeight::MEMPOOL },
+            expiry_h: None,
+            mined_h: if mined_h != 0 { (BlockHeight(mined_h)) } else { BlockHeight::MEMPOOL },
             account_value_delta: ZatBalance::from_i64(-(sent as i64)).unwrap(),
             total_spent: Zatoshis::from_u64(sent).unwrap(),
             total_received: Zatoshis::from_u64(received).unwrap(),
@@ -301,19 +301,19 @@ impl WalletTx {
     }
 
 //     pub fn loc(&self, finalized_h: BlockHeight, bc_tip_h: BlockHeight) -> (WalletTxLoc, u32, bool/*finalized*/, bool/*outside_bc*/) {
-//         match self.mined_height {
+//         match self.mined_h {
 //             BlockHeight::MEMPOOL  => (WalletTxLoc::Mempool,  falsself.is_outside_bc),
 //             BlockHeight::INTERNAL => (WalletTxLoc::Internal, falsself.is_outside_bc),
 //             _ => {
 //                 if self.is_outside_bc {
 //                     (WalletTxLoc::Block(0), self.is_outside_bc)
-//                 } else if self.mined_height > bc_tip_h {
-//                     println!("ERROR: mined height on best chain ({}) higher than tip ({})", self.mined_height, bc_tip_h);
+//                 } else if self.mined_h > bc_tip_h {
+//                     println!("ERROR: mined h on best chain ({}) higher than tip ({})", self.mined_h, bc_tip_h);
 //                     return (WalletTxLoc::Block(0), true);
-//                 } else if self.mined_height <= finalized_h {
+//                 } else if self.mined_h <= finalized_h {
 //                     (WalletTxLoc::Finalized, self.is_outside_bc)
 //                 } else {
-//                     (WalletTxLoc::Block(bc_tip_h - self.mined_height), self.is_outside_bc)
+//                     (WalletTxLoc::Block(bc_tip_h - self.mined_h), self.is_outside_bc)
 //                 }
 //             }
 //         }
@@ -352,7 +352,7 @@ pub struct WalletState {
     pub waiting_for_stake_to_finalizer: bool,
     pub waiting_for_send: bool,
 
-    pub miner_seen_height: u32,
+    pub miner_seen_h: u32,
     pub miner_unshielded_funds: u64,
     pub miner_shielded_pending_funds: u64,
     pub miner_shielded_spendable_funds: u64,
@@ -441,8 +441,8 @@ pub struct ManualAccount {
     // NOTE: this is per account so that you can scan historically for e.g. a new transparent address
     // without losing all the rest of your info
     // (if you add a new account with an earlier birthday, everything from then forward has to be rescanned)
-    pub fully_detected_height: BlockHeight,
-    pub fully_decoded_height: BlockHeight,
+    pub fully_detected_h: BlockHeight,
+    pub fully_decoded_h: BlockHeight,
     pub ufvk: UnifiedFullViewingKey,
     pub birthday: BlockHeight,
     pub balance_changes: Vec<(BlockHeight, data_api::AccountBalance)>, // TODO: account for mempool
@@ -462,13 +462,13 @@ pub struct ManualAccount {
 pub struct ManualWallet {
     pub name: &'static str,
     pub accounts: Vec<ManualAccount>,
-    pub chain_tip_height: BlockHeight,
+    pub chain_tip_h: BlockHeight,
     // TODO: change type
     // TODO: to avoid nested variably-sized data, we could split these into actions that are
     // txid-linked, then reconstruct on request
-    /// sorted by (mined_height, discovery_time)
+    /// sorted by (mined_h, discovery_time)
     pub txs: Vec<WalletTx>,
-    pub tx_height_map: HashMap<TxId, BlockHeight>, // NOTE: not a direct index because txs get inserted
+    pub tx_h_map: HashMap<TxId, BlockHeight>, // NOTE: not a direct index because txs get inserted
     // data_api has max_scanned in case they're scanned out of order
     // pub next_sapling_subtree_index: u64,
     // pub next_orchard_subtree_index: u64,
@@ -485,11 +485,11 @@ pub struct ManualWallet {
 }
 // N.B. using some of the same API as WalletDb to allow smooth transition/comparison
 impl ManualWallet {
-    pub fn chain_height(&self)          -> BlockHeight { self.chain_tip_height     }
+    pub fn chain_height(&self)          -> BlockHeight { self.chain_tip_h }
     pub fn fully_detected_height(&self) -> BlockHeight {
         let mut h = BlockHeight(0);
         for account in &self.accounts {
-            h = h.min(account.fully_detected_height);
+            h = h.min(account.fully_detected_h);
         }
         h
     }
@@ -497,7 +497,7 @@ impl ManualWallet {
     pub fn fully_decoded_height(&self) -> BlockHeight {
         let mut h = BlockHeight(0);
         for account in &self.accounts {
-            h = h.min(account.fully_decoded_height);
+            h = h.min(account.fully_decoded_h);
         }
         h
     }
@@ -511,7 +511,7 @@ impl ManualWallet {
 
         Ok(Some(data_api::WalletSummary::new(
             account_balances,
-            LRZBlockHeight::from_u32(self.chain_tip_height.0),
+            LRZBlockHeight::from_u32(self.chain_tip_h.0),
             LRZBlockHeight::from_u32(self.fully_decoded_height().0), // TODO: fully_detected_height?
             // ignored:
             data_api::Progress::new(data_api::Ratio::new(0,0), None),
@@ -524,33 +524,33 @@ impl ManualWallet {
 struct PoWCache {
     pub hashes: Vec<[u8; 32]>,
     // pub hashes: [[u8;32]; 512],
-    // pub height_o: usize, // trails tip
+    // pub h_o: usize, // trails tip
     /// ideally hashes.len() ahead of height_o, but not when initially syncing or after reorgs
     pub next_tip_h: u64,
 }
 impl PoWCache {
-    pub fn new(init_height: u64, init_hash: [u8; 32]) -> Self {
+    pub fn new(init_h: u64, init_hash: [u8; 32]) -> Self {
         Self {
             hashes: vec![init_hash],
             // hashes: [[0;32]; 512],
-            // height_o: 0,
-            next_tip_h: init_height + 1,
+            // h_o: 0,
+            next_tip_h: init_h + 1,
         }
     }
-    pub fn push_new_tip(&mut self, height: u64, hash: [u8; 32]) {
-        println!("pushed tip at {height}: {}", LEHash(hash));
-        assert!(height <= self.next_tip_h as u64);
-        if height < self.next_tip_h as u64 {
-            self.hashes.truncate(height as usize + 1);
-            self.hashes[height as usize] = hash;
+    pub fn push_new_tip(&mut self, h: u64, hash: [u8; 32]) {
+        println!("pushed tip at {h}: {}", LEHash(hash));
+        assert!(h <= self.next_tip_h as u64);
+        if h < self.next_tip_h as u64 {
+            self.hashes.truncate(h as usize + 1);
+            self.hashes[h as usize] = hash;
         } else {
             self.hashes.push(hash);
         }
-        self.next_tip_h = height + 1;
+        self.next_tip_h = h + 1;
     }
-    pub fn hash_at_height(&self, height: u64) -> Option<[u8;32]> {
-        if height < self.next_tip_h {
-            Some(self.hashes[height as usize])
+    pub fn hash_at_h(&self, h: u64) -> Option<[u8;32]> {
+        if h < self.next_tip_h {
+            Some(self.hashes[h as usize])
         } else {
             None
         }
@@ -595,8 +595,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             ufvk: usk.to_unified_full_viewing_key(),
             birthday: BlockHeight(0),
             balance_changes: vec![(BlockHeight(0), data_api::AccountBalance::ZERO)],
-            fully_decoded_height: BlockHeight(0),
-            fully_detected_height: BlockHeight(0),
+            fully_decoded_h: BlockHeight(0),
+            fully_detected_h: BlockHeight(0),
             recv_txos: Vec::new(),
             utxos: Vec::new(),
             stxos: Vec::new(),
@@ -605,9 +605,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let wallet = ManualWallet {
             name,
             accounts: vec![account.clone()],
-            chain_tip_height: BlockHeight(0),
+            chain_tip_h: BlockHeight(0),
             txs: Vec::new(),
-            tx_height_map: HashMap::new(),
+            tx_h_map: HashMap::new(),
         };
 
         (wallet, account)
@@ -704,8 +704,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let Ok(rawtx) = client.get_transaction(filter).await else { continue; };
             let rawtx = rawtx.into_inner();
 
-            let block_height = LRZBlockHeight::from_u32(rawtx.height as u32);
-            let Ok(tx) = Transaction::read(&*rawtx.data, BranchId::for_height(&params, block_height)) else {
+            let block_h = LRZBlockHeight::from_u32(rawtx.height as u32);
+            let Ok(tx) = Transaction::read(&*rawtx.data, BranchId::for_height(&params, block_h)) else {
                 continue;
             };
 
@@ -961,7 +961,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         // NOTE: this is desynced from local_tip because we need to speculatively request blocks
         // further back than the chain divergence on reorg to find out where it occurred
-        let mut req_start_height = pow_cache.next_tip_h-1;
+        let mut req_start_h = pow_cache.next_tip_h-1;
 
         // NOTE: if you're dealing with multiple wallets, you don't want to resync all blocks for each
         // of them. They can all sync from the same blocks.
@@ -983,7 +983,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         end:   Some(BlockId { height: heights.1, hash: Vec::new() }),
                     }
                 }
-                let req_rng = (req_start_height + 1, req_start_height + MAX_BLOCKS_TO_DOWNLOAD_AT_TIME);
+                let req_rng = (req_start_h + 1, req_start_h + MAX_BLOCKS_TO_DOWNLOAD_AT_TIME);
 
                 // ********************************************************************************
                 // TODO IMPORTANT: the indexer can "succeed" without actually giving us all the txs
@@ -997,7 +997,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 // println!("cache at {}, downloading blocks: {}-{}",
                 //     pow_cache.next_tip_h-1, block_range.start.clone().unwrap().height, block_range.end.clone().unwrap().height);
                 let (tree_state_res, lightd_res, block_range_res, t_txs_res) = tokio::join!(
-                    client.get_tree_state(BlockId {height: req_start_height, hash: Vec::new()}),
+                    client.get_tree_state(BlockId {height: req_start_h, hash: Vec::new()}),
                     client0.get_lightd_info(Empty {}),
                     client1.get_block_range(block_rng_from_heights(req_rng)),
                     client2.get_taddress_txids(TransparentAddressBlockFilter {
@@ -1013,7 +1013,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             match lightd_res {
                 Ok(info) => {
                     let h = info.into_inner().block_height;
-                    let Ok(network_tip_height) = <u32>::try_from(h) else {
+                    let Ok(network_tip_h) = <u32>::try_from(h) else {
                         println!("lightd network tip height not representable in 32 bits: {h}");
                         continue 'outer_sync; // TODO: don't continue if it's not actually critical
                     };
@@ -1021,7 +1021,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     // AFAICT there's no downside to updating these as frequently as possible, even if the
                     // rest of sync is lagging behind
                     for wallet in [&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]] {
-                        wallet.chain_tip_height = BlockHeight(network_tip_height);
+                        wallet.chain_tip_h = BlockHeight(network_tip_h);
                     }
                 },
                 Err(err) => {
@@ -1046,7 +1046,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 match tree_state.to_chain_state() {
                     Ok(chain_state) => chain_state,
                     Err(err) => {
-                        println!("Failed to convert tree state to chain state at {req_start_height:?}: {err:?}");
+                        println!("Failed to convert tree state to chain state at {req_start_h:?}: {err:?}");
                         continue 'outer_sync;
                     }
                 }
@@ -1096,17 +1096,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         continue 'outer_sync;
                     };
 
-                    let expected_prev_hash = pow_cache.hash_at_height(new_blocks[i].height-1);
+                    let expected_prev_hash = pow_cache.hash_at_h(new_blocks[i].height-1);
                     if i == 0 {
                         let mut needs_resync = false;
                         if prev_hash != prev_tip_chain_state.block_hash().0 {
                             println!("non-atomic API meant block range & chain-state are torn reads: {} vs {}", LEHash(prev_hash), LEHash(prev_tip_chain_state.block_hash().0));
-                            req_start_height = req_start_height.saturating_sub(MAX_BLOCKS_TO_DOWNLOAD_AT_TIME / 2);
+                            req_start_h = req_start_h.saturating_sub(MAX_BLOCKS_TO_DOWNLOAD_AT_TIME / 2);
                             needs_resync = true;
                         }
                         if Some(prev_hash) != expected_prev_hash {
                             println!("reorg occurred before height {}; hash mismatch {prev_hash:?} vs {expected_prev_hash:?}", new_blocks[0].height);
-                            req_start_height = req_start_height.saturating_sub(MAX_BLOCKS_TO_DOWNLOAD_AT_TIME);
+                            req_start_h = req_start_h.saturating_sub(MAX_BLOCKS_TO_DOWNLOAD_AT_TIME);
                             needs_resync = true;
                         }
                         if needs_resync {
@@ -1147,7 +1147,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
                     }
                     let new_tip_h = new_blocks[block_i].height;
-                    let cached_prev_hash = pow_cache.hash_at_height(new_tip_h-1);
+                    let cached_prev_hash = pow_cache.hash_at_h(new_tip_h-1);
                     let pre_new_tip_hash = <[u8;32]>::try_from(&new_blocks[block_i].prev_hash[..]).unwrap();
                     // println!("pushing {} at {new_tip_h}, prev hash {pre_new_tip_hash:?} vs cached prev {cached_prev_hash:?}", LEHash(hash));
                     if let Some(cached_prev_hash) = cached_prev_hash {
@@ -1182,7 +1182,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
             println!("downloaded compact blocks {}-{}", new_blocks.first().unwrap().height, new_blocks.last().unwrap().height);
 
-            let compact_block_max_height = new_blocks.last().expect("non-empty vector").height;
+            let compact_block_max_h = new_blocks.last().expect("non-empty vector").height;
 
             // TRANSPARENT TRANSACTIONS
             let mut t_failed_at_h = None;
@@ -1238,18 +1238,18 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     continue;
                 }
 
-                if raw_tx.height > compact_block_max_height {
+                if raw_tx.height > compact_block_max_h {
                     // @in_step_sync
                     break;
                 }
 
-                let Ok(h) = <u32>::try_from(raw_tx.height) else {
+                let Ok(height) = <u32>::try_from(raw_tx.height) else {
                     println!("transparent tx's height can't be represented in 32 bits: {}", raw_tx.height);
                     break;
                 };
 
-                let height = BlockHeight(h);
-                let tx = match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, LRZBlockHeight::from_u32(h))) {
+                let h = BlockHeight(height);
+                let tx = match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, LRZBlockHeight::from_u32(height))) {
                     Ok(tx) => tx,
                     Err(err) => {
                         println!("failed to read transparent tx at height {h}");
@@ -1257,7 +1257,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         // @in_step_sync
                         // remove everything at the failed height
                         while new_t_txs.len() > 0 {
-                            if new_t_txs.last().unwrap().0 != height {
+                            if new_t_txs.last().unwrap().0 != h {
                                 break;
                             }
                             new_t_txs.pop();
@@ -1265,7 +1265,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         break;
                     }
                 };
-                new_t_txs.push((height, tx));
+                new_t_txs.push((h, tx));
             }
 
             // truncate compact blocks to match transparent // @in_step_sync
@@ -1283,7 +1283,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     sync_from_i = None;
                 }
 
-                if let Some(hash) = pow_cache.hash_at_height(h) {
+                if let Some(hash) = pow_cache.hash_at_h(h) {
                     pow_cache.push_new_tip(h, hash);
                 }
             }
@@ -1293,13 +1293,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, insert_i: &mut usize) {
             // find if there's an existing height/transaction for this txid
-            if let Some(tx_h) = wallet.tx_height_map.get_mut(&txid) {
-                let mut h_start_i = wallet.txs.partition_point(|tx| tx.mined_height < *tx_h);
+            if let Some(tx_h) = wallet.tx_h_map.get_mut(&txid) {
+                let mut h_start_i = wallet.txs.partition_point(|tx| tx.mined_h < *tx_h);
                 let mut found_idx = None;
                 let txs_n = wallet.txs.len();
                 for find_i in h_start_i..txs_n {
                     let tx = &mut wallet.txs[find_i];
-                    if tx.mined_height != *tx_h {
+                    if tx.mined_h != *tx_h {
                         break;
                     }
                     if tx.txid == txid {
@@ -1314,24 +1314,24 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                     let old_tx = wallet.txs.remove(tx_i);
                     if old_tx != new_tx {
-                        println!("{} wallet updated existing transaction {txid} {:?} => {:?}", wallet.name, old_tx.mined_height, new_tx.mined_height);
+                        println!("{} wallet updated existing transaction {txid} {:?} => {:?}", wallet.name, old_tx.mined_h, new_tx.mined_h);
                         // println!("{} wallet updated existing transaction {txid} {old_tx:?} => {new_tx:?}", wallet.name);
                     }
                 } else {
                     println!("ERROR: {txid:?} not found at associated height {tx_h:?}");
                 }
-                *tx_h = new_tx.mined_height;
+                *tx_h = new_tx.mined_h;
             } else {
-                wallet.tx_height_map.insert(txid, new_tx.mined_height);
-                println!("{} wallet inserted unknown transaction {txid} at {:?}", wallet.name, new_tx.mined_height);
+                wallet.tx_h_map.insert(txid, new_tx.mined_h);
+                println!("{} wallet inserted unknown transaction {txid} at {:?}", wallet.name, new_tx.mined_h);
             }
             wallet.txs.insert(*insert_i, new_tx);
             *insert_i += 1;
         }
 
         fn recv_h_position(utxos: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
-            let utxos_at_height_start = utxos.partition_point(|txo| txo.recv_h < block_h);
-            for utxo_i in utxos_at_height_start..utxos.len() {
+            let utxos_at_h_start = utxos.partition_point(|txo| txo.recv_h < block_h);
+            for utxo_i in utxos_at_h_start..utxos.len() {
                 if utxos[utxo_i].recv_h > block_h {
                     break;
                 }
@@ -1342,8 +1342,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             None
         }
         fn spent_h_position(utxos: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
-            let utxos_at_height_start = utxos.partition_point(|txo| txo.spent_h < block_h);
-            for utxo_i in utxos_at_height_start..utxos.len() {
+            let utxos_at_h_start = utxos.partition_point(|txo| txo.spent_h < block_h);
+            for utxo_i in utxos_at_h_start..utxos.len() {
                 if utxos[utxo_i].spent_h > block_h {
                     break;
                 }
@@ -1365,22 +1365,22 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 // truncate wallet for everything below height
                 for account in &mut wallet.accounts {
                     let last_block_h = block_h.sat_sub(1);
-                    account.fully_detected_height = account.fully_detected_height.min(last_block_h);
-                    account.fully_decoded_height = account.fully_decoded_height.min(last_block_h);
+                    account.fully_detected_h = account.fully_detected_h.min(last_block_h);
+                    account.fully_decoded_h = account.fully_decoded_h.min(last_block_h);
 
                     // TODO: do we want to track balance changes or keep balances updated as chain changes occur?
                     let truncate_to_i = account.balance_changes.partition_point(|(b,_)| *b < block_h);
                     account.balance_changes.truncate(truncate_to_i);
 
                     //- unreceive utxos
-                    let utxos_at_height_start = account.utxos.partition_point(|txo| txo.recv_h < block_h);
-                    account.utxos.truncate(utxos_at_height_start);
-                    let recv_txos_at_height_start = account.recv_txos.partition_point(|txo| txo.recv_h < block_h);
-                    account.recv_txos.truncate(recv_txos_at_height_start);
+                    let utxos_at_h_start = account.utxos.partition_point(|txo| txo.recv_h < block_h);
+                    account.utxos.truncate(utxos_at_h_start);
+                    let recv_txos_at_h_start = account.recv_txos.partition_point(|txo| txo.recv_h < block_h);
+                    account.recv_txos.truncate(recv_txos_at_h_start);
 
                     //- unspend stxos
-                    let stxos_at_height_start = account.stxos.partition_point(|txo| txo.spent_h < block_h);
-                    for stxo in &account.stxos[stxos_at_height_start..] {
+                    let stxos_at_h_start = account.stxos.partition_point(|txo| txo.spent_h < block_h);
+                    for stxo in &account.stxos[stxos_at_h_start..] {
                         // TODO: these are NOT in order
                         if stxo.recv_h < block_h {
                             // reinsert at the end of that height
@@ -1392,11 +1392,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             account.utxos.insert(i, Txo{ spent_h: BlockHeight(0), ..stxo.clone() });
                         }
                     }
-                    account.stxos.truncate(stxos_at_height_start);
+                    account.stxos.truncate(stxos_at_h_start);
                 }
 
                 //  higher blocks & mempool
-                let invalidate_from_i = wallet.txs.partition_point(|tx| tx.mined_height < block_h);
+                let invalidate_from_i = wallet.txs.partition_point(|tx| tx.mined_h < block_h);
                 for tx in &mut wallet.txs[invalidate_from_i..] {
                     // N.B. these may get revalidated later if the same txs are found in the new blocks
                     tx.is_outside_bc = true;
@@ -1407,7 +1407,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         fn update_insert_i(txs: &[WalletTx], insert_i: &mut usize, block_h: BlockHeight) {
             // put at the *end* of txs at the same height
             // i.e. primarily sorted by mined height, secondarily by discovered_time
-            *insert_i += txs[*insert_i..].partition_point(|tx| tx.mined_height <= block_h);
+            *insert_i += txs[*insert_i..].partition_point(|tx| tx.mined_h <= block_h);
         }
 
         //-- ADD/REVALIDATE TRANSPARENT TXS
@@ -1426,9 +1426,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 let t_tx = &miner_t_txs[t_tx_i].1;
                 update_insert_i(&miner_wallet.txs, &mut insert_i, block_h);
 
-                let mut expiry_height = Some(BlockHeight::from(t_tx.expiry_height()));
-                if expiry_height.unwrap().0 == 0 {
-                    expiry_height = None;
+                let mut expiry_h = Some(BlockHeight::from(t_tx.expiry_height()));
+                if expiry_h.unwrap().0 == 0 {
+                    expiry_h = None;
                 }
 
                 let txid = t_tx.txid();
@@ -1449,7 +1449,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             println!("input {input_i} {input:?}");
                             input_i += 1;
 
-                            if let Some(&prevout_txid_h) = miner_wallet.tx_height_map.get(input.prevout.txid()) {
+                            if let Some(&prevout_txid_h) = miner_wallet.tx_h_map.get(input.prevout.txid()) {
                                 if let Some(utxo_i) = recv_h_position(&account.utxos, prevout_txid_h, &input.prevout) {
                                     let utxo = account.utxos.remove(utxo_i);
                                     let stxo = Txo { spent_h: block_h, ..utxo };
@@ -1489,7 +1489,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 };
                                 total_received += utxo.value.into_u64();
 
-                                let txid_h = if let Some(&txid_h) = miner_wallet.tx_height_map.get(&txid) {
+                                let txid_h = if let Some(&txid_h) = miner_wallet.tx_h_map.get(&txid) {
                                     txid_h
                                 } else {
                                     block_h
@@ -1519,8 +1519,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 let new_wallet_tx = WalletTx{
                     account_id: 0,
                     txid,
-                    expiry_height,
-                    mined_height: block_h,
+                    expiry_h,
+                    mined_h: block_h,
                     account_value_delta: ZatBalance::from_i64(0).unwrap(),
                     total_spent: Zatoshis::from_u64(total_spent).unwrap(),
                     total_received: Zatoshis::from_u64(total_received).unwrap(),
@@ -1578,8 +1578,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         let new_wallet_tx = WalletTx{
                             account_id: 0,
                             txid,
-                            expiry_height: None,
-                            mined_height: block_h,
+                            expiry_h: None,
+                            mined_h: block_h,
                             account_value_delta: ZatBalance::from_i64(0).unwrap(),
                             total_spent: Zatoshis::from_u64(0).unwrap(),
                             total_received: Zatoshis::from_u64(0).unwrap(),
@@ -1605,7 +1605,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             if let Some(miner_utxo) = miner_wallets[miner_use_i].accounts[0].utxos.first() {
                 let fee = MINIMUM_FEE;
                 if let Some(zats) = miner_utxo.value - fee {
-                    let block_h = miner_wallets[miner_use_i].chain_tip_height.0 + 1;
+                    let block_h = miner_wallets[miner_use_i].chain_tip_h.0 + 1;
                     let mut signing_set = TransparentSigningSet::new();
                     signing_set.add_key(miner_privkey);
 
@@ -1664,8 +1664,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         let new_wallet_tx = WalletTx{
                             account_id: 0,
                             txid: tx.txid(),
-                            expiry_height: None,
-                            mined_height: BlockHeight::INTERNAL,
+                            expiry_h: None,
+                            mined_h: BlockHeight::INTERNAL,
                             account_value_delta: ZatBalance::from_i64(0).unwrap(),
                             total_spent,
                             total_received,
@@ -1682,7 +1682,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             is_outside_bc: true,
                         };
                         let mut insert_i = 0;
-                        update_insert_i(&miner_wallets[miner_use_i].txs, &mut insert_i, new_wallet_tx.mined_height);
+                        update_insert_i(&miner_wallets[miner_use_i].txs, &mut insert_i, new_wallet_tx.mined_h);
                         update_with_tx(&mut miner_wallets[miner_use_i], tx.txid(), new_wallet_tx, &mut insert_i);
                     }
                 }

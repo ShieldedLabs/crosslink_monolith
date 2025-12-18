@@ -11,7 +11,7 @@ use clay::render_commands::RenderCommandConfig::{Rectangle, ScissorStart, Scisso
 use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 //use clay::*; // @Temporary
 
-use wallet::{ BlockHeight, str_from_ctaz };
+use wallet::{ BlockHeight, WalletState, WalletTxKind, str_from_ctaz };
 
 use super::*;
 
@@ -602,7 +602,7 @@ impl<A: Mul, B: Mul, C: Mul>         Mul for (A, B, C)    { #[inline(always)] fn
 impl<A: Mul, B: Mul, C: Mul, D: Mul> Mul for (A, B, C, D) { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f), self.3.mul(f)) } }
 
 pub fn ui_left_pane(ui: &mut Context,
-                wallet_state: Arc<Mutex<wallet::WalletState>>,
+                wallet_state: Arc<Mutex<WalletState>>,
                 data: &mut UiData,
                 viz: &mut VizState,
                 child_gap: f32,
@@ -1358,13 +1358,13 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 // TODO: account for mempool
-                                let icon = match (tx.kind, tx.mined_height.is_in_block()) {
-                                    (wallet::WalletTxKind::Send,     true) => ICON_UP_SMALL,
-                                    (wallet::WalletTxKind::SelfSend, true) => ICON_DOWN_SMALL,
-                                    (wallet::WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
-                                    (wallet::WalletTxKind::Shield,   true) => ICON_SHIELD,
-                                    (wallet::WalletTxKind::Stake,    true) => ICON_LINK_1,
-                                    (wallet::WalletTxKind::Unstake,  true) => ICON_UNLINK,
+                                let icon = match (tx.kind, tx.mined_h.is_in_block()) {
+                                    (WalletTxKind::Send,     true) => ICON_UP_SMALL,
+                                    (WalletTxKind::SelfSend, true) => ICON_DOWN_SMALL,
+                                    (WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
+                                    (WalletTxKind::Shield,   true) => ICON_SHIELD,
+                                    (WalletTxKind::Stake,    true) => ICON_LINK_1,
+                                    (WalletTxKind::Unstake,  true) => ICON_UNLINK,
                                     _ => {
                                         let timer = (ui.tx_loading_animation_timer * 3.0) as u64;
                                         if timer % 3 == 0 {
@@ -1378,7 +1378,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 };
 
                                 // TODO: account for mempool & confirmation level
-                                let colour = if tx.mined_height.is_in_block() {
+                                let colour = if tx.mined_h.is_in_block() {
                                     WHITE
                                 } else {
                                     (0x60, 0x60, 0x60, 0xff) /* @todo colors */
@@ -1397,16 +1397,16 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 let label = match tx.kind {
-                                    wallet::WalletTxKind::Send     => if tx.mined_height.is_in_block() { "Sent"     } else { "Sending"   },
-                                    wallet::WalletTxKind::Receive  => if tx.mined_height.is_in_block() { "Received" } else { "Receiving" },
-                                    wallet::WalletTxKind::SelfSend => if tx.mined_height.is_in_block() { "Returned" } else { "Returning" },
-                                    wallet::WalletTxKind::Shield   => if tx.mined_height.is_in_block() { "Shielded" } else { "Shielding" },
-                                    wallet::WalletTxKind::Stake    => if tx.mined_height.is_in_block() { "Staked"   } else { "Staking"   },
-                                    wallet::WalletTxKind::Unstake  => if tx.mined_height.is_in_block() { "Unstaked" } else { "Unstaking" },
+                                    WalletTxKind::Send     => if tx.mined_h.is_in_block() { "Sent"     } else { "Sending"   },
+                                    WalletTxKind::Receive  => if tx.mined_h.is_in_block() { "Received" } else { "Receiving" },
+                                    WalletTxKind::SelfSend => if tx.mined_h.is_in_block() { "Returned" } else { "Returning" },
+                                    WalletTxKind::Shield   => if tx.mined_h.is_in_block() { "Shielded" } else { "Shielding" },
+                                    WalletTxKind::Stake    => if tx.mined_h.is_in_block() { "Staked"   } else { "Staking"   },
+                                    WalletTxKind::Unstake  => if tx.mined_h.is_in_block() { "Unstaked" } else { "Unstaking" },
                                 };
 
-                                let label_str = if tx.mined_height.is_in_block() {
-                                    frame_strf!(data, "{} @ {}", label, tx.mined_height.0)
+                                let label_str = if tx.mined_h.is_in_block() {
+                                    frame_strf!(data, "{} @ {}", label, tx.mined_h.0)
                                 } else {
                                     frame_strf!(data, "{}", label)
                                 };
@@ -1447,28 +1447,28 @@ pub fn ui_left_pane(ui: &mut Context,
                             }) {
                                 // @todo colors
                                 let color = match tx.kind {
-                                    wallet::WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
-                                    wallet::WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
-                                    wallet::WalletTxKind::Receive | wallet::WalletTxKind::Unstake => (0x5a, 0xb5, 0x52, 0xff),
-                                    wallet::WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
+                                    WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
+                                    WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
+                                    WalletTxKind::Receive | WalletTxKind::Unstake => (0x5a, 0xb5, 0x52, 0xff),
+                                    WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
                                     _ => WHITE,
                                 };
 
                                 match tx.kind {
-                                    wallet::WalletTxKind::Send | wallet::WalletTxKind::SelfSend | wallet::WalletTxKind::Stake => {
+                                    WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake => {
                                         let send_amount: i64 = tx.account_value_delta.into();
                                         let send_amount: u64 = send_amount.abs() as u64;
                                         let full = send_amount / 100_000_000;
                                         let part = send_amount % 100_000_000;
                                         let part_str = format!("{part}000");
 
-                                        let prefix = if tx.kind == wallet::WalletTxKind::Send { "-" } else { "" };
+                                        let prefix = if tx.kind == WalletTxKind::Send { "-" } else { "" };
                                         ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..4]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
-                                    wallet::WalletTxKind::Receive | wallet::WalletTxKind::Unstake => {
+                                    WalletTxKind::Receive | WalletTxKind::Unstake => {
                                         ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
-                                    wallet::WalletTxKind::Shield => {
+                                    WalletTxKind::Shield => {
                                         let shield_amount: i64 = tx.account_value_delta.into();
                                         let full = shield_amount / 100_000_000;
                                         let part = shield_amount % 100_000_000;
@@ -1490,7 +1490,7 @@ pub fn ui_left_pane(ui: &mut Context,
 }
 
 pub fn ui_right_pane(ui: &mut Context,
-                 wallet_state: Arc<Mutex<wallet::WalletState>>,
+                 wallet_state: Arc<Mutex<WalletState>>,
                  viz: &mut VizState,
                  data: &mut UiData,
                  child_gap: f32,
@@ -1773,7 +1773,7 @@ pub fn ui_right_pane(ui: &mut Context,
         align: Center,
         ..Decl
     }) {
-        tab_id_faucet = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet (Height {})", &wallet_state.lock().unwrap().miner_seen_height));
+        tab_id_faucet = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet (Height {})", &wallet_state.lock().unwrap().miner_seen_h));
     }
     if let _ = elem().decl(Decl {
         id: id("Faucet Contents"),
@@ -1900,7 +1900,7 @@ pub fn ui_right_pane(ui: &mut Context,
 }
 
 
-pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
+pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
 data.per_frame_strs.clear();
 
 let mut result = false;
@@ -2201,7 +2201,7 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
     result
 }
 
-pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet_state: Arc<Mutex<wallet::WalletState>>) -> bool {
+pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet_state: Arc<Mutex<WalletState>>) -> bool {
     ui.tx_loading_animation_timer += ui.delta;
     if ui.tx_loading_animation_timer >= 1.0 {
         ui.tx_loading_animation_timer = 0.0;
