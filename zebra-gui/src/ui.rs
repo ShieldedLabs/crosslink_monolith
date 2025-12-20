@@ -9,6 +9,7 @@ use clay::{Clay, Declaration};
 use clay::render_commands::RenderCommandConfig;
 use clay::render_commands::RenderCommandConfig::{Rectangle, ScissorStart, ScissorEnd};
 use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
+use std::collections::HashMap;
 //use clay::*; // @Temporary
 
 use wallet::str_from_ctaz;
@@ -45,7 +46,7 @@ impl UiData {
 }
 
 pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
-    if ui.input().key_pressed(KeyCode::Tab) {
+    if ui.input().key_pressed(KeyCode::Backquote) {
         ui.debug = !ui.debug;
     }
     if ui.input().key_pressed(KeyCode::F5) {
@@ -87,14 +88,14 @@ pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
     return false;
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum Floating  { #[default] None, Parent, Root(f32, f32) }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum ClipMode  { #[default] None, Clip, Scroll(f32, f32) }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum AlignX    { #[default] Left, Right, Center }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum AlignY    { #[default] Top, Bottom, Center }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub struct Align   { x: AlignX, y: AlignY }
-#[derive(Debug,          Copy, Clone, PartialEq)] pub enum Sizing    { Fit(f32, f32), Grow(f32, f32), Fixed(f32), Percent(f32) }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub struct Id { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum Floating  { #[default] None, Parent, Root(f32, f32) }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum ClipMode  { #[default] None, Clip, Scroll(f32, f32) }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignX    { #[default] Left, Right, Center }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignY    { #[default] Top, Bottom, Center }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Align   { x: AlignX, y: AlignY }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]                         pub enum Sizing    { Fit(f32, f32), Grow(f32, f32), Fixed(f32), Percent(f32) }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Id { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
 impl Default for Sizing { fn default() -> Self { Self::Fit(0.0, f32::MAX) } }
 impl Align {
     pub const TopLeft:     Self = Self { y: AlignY::Top,    x: AlignX::Left };
@@ -298,7 +299,7 @@ impl Element {
             r: item.colour.0 as f32,
             g: item.colour.1 as f32,
             b: item.colour.2 as f32,
-            a: item.colour.3 as f32
+            a: (item.colour.3 | 0x01) as f32
         };
         decl.id = item.id.clay().id;
         let clipping = match item.clip { ClipMode::None => false, _ => true };
@@ -462,35 +463,40 @@ impl Context {
     pub fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
 
     pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: bool) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
-        let mouse_held     = self.input().mouse_held(winit::event::MouseButton::Left);
-        let mouse_pressed  = self.input().mouse_pressed(winit::event::MouseButton::Left);
-        let mouse_released = self.input().mouse_released(winit::event::MouseButton::Left);
 
-        let hover    = self.hovered(id);
-        let down     = hover && mouse_held;
-        let pressed  = hover && mouse_pressed;
-        let released = hover && mouse_released;
-        if pressed {
-            self.clicked_id = id;
-        }
+        let mouse_hover = self.hovered(id);
+        let key_hover   = self.nav_id == Some(id.id);
 
-        if hover && pointer_on_hover {
+        let mouse_held     = mouse_hover && self.input().mouse_held(winit::event::MouseButton::Left);
+        let mouse_pressed  = mouse_hover && self.input().mouse_pressed(winit::event::MouseButton::Left);
+        let mouse_released = mouse_hover && self.input().mouse_released(winit::event::MouseButton::Left);
+
+        let key_held     = key_hover && self.input().key_held(winit::keyboard::KeyCode::Enter);
+        let key_pressed  = key_hover && self.input().key_pressed(winit::keyboard::KeyCode::Enter);
+        let key_released = key_hover && self.input().key_released(winit::keyboard::KeyCode::Enter);
+
+        if mouse_pressed { self.mouse_pressed_id = id; }
+        if key_pressed   { self.key_pressed_id   = id; }
+        let mouse_activated  = enabled && self.mouse_pressed_id == id && if act_on_press { mouse_pressed } else { mouse_released };
+        let key_activated    = enabled && self.key_pressed_id   == id && if act_on_press { key_pressed   } else { key_released   };
+
+        if mouse_hover && pointer_on_hover {
             self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
         }
 
-        let activated = enabled && (self.clicked_id == id) && if act_on_press {
-            pressed
-        } else {
-            released
-        };
+        let held      = mouse_held      || key_held;
+        let hover     = mouse_hover     || key_hover;
+        let pressed   = mouse_pressed   || key_pressed;
+        let released  = mouse_released  || key_released;
+        let activated = mouse_activated || key_activated;
 
         let mut hsva = colour.hsva();
         if !enabled {
             hsva.2 = hsva.2.mul(0.75);
             hsva.1 = hsva.1.mul(0.75);
-        } else if !down && hover {
+        } else if !held && hover {
             hsva.2 = ((hsva.2 as f32) * 1.25).min(255.0) as u8;
-        } else if down && self.clicked_id.id == id.id {
+        } else if held && (self.mouse_pressed_id == id || self.key_pressed_id == id) {
             hsva.2 = hsva.2.mul(0.85);
         }
         let colour = hsva.rgba();
@@ -509,6 +515,13 @@ impl Context {
             text_hsva.2 = text_hsva.2.mul(0.5);
         }
         let text_colour = text_hsva.rgba();
+
+        if !self.nav_id_to_idx.contains_key(&id.id) {
+            let n = self.nav_id_to_idx.len();
+            assert!(n == self.nav_idx_to_id.len());
+            self.nav_id_to_idx.insert(id.id, n);
+            self.nav_idx_to_id.push(id.id);
+        }
 
         (activated, colour, text_colour)
     }
@@ -601,6 +614,8 @@ impl<A: Mul, B: Mul>                 Mul for (A, B)       { #[inline(always)] fn
 impl<A: Mul, B: Mul, C: Mul>         Mul for (A, B, C)    { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f)) } }
 impl<A: Mul, B: Mul, C: Mul, D: Mul> Mul for (A, B, C, D) { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f), self.3.mul(f)) } }
 
+static XXX_text: Mutex<String> = Mutex::new(String::new());
+
 pub fn ui_left_pane(ui: &mut Context,
                 wallet_state: Arc<Mutex<wallet::WalletState>>,
                 data: &mut UiData,
@@ -676,7 +691,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         // Click background to exit -- the code could be placed farther outside but it is here so it can be gated by `closeable`
                         if ui.hovered(container_id) && !ui.hovered(contents_id) && ui.input().mouse_pressed(winit::event::MouseButton::Left) {
                             ui.modal = Modal::None;
-                            ui.clicked_id = id;
+                            ui.mouse_pressed_id = id;
                         }
 
                         let radius = ui.scale(20.0);
@@ -1205,6 +1220,21 @@ pub fn ui_left_pane(ui: &mut Context,
             let suffix = if !show_staked_balance && staked_balance > 0 { "*" } else { "" };
             let balance_str = frame_strf!(data, "{} cTAZ{}", str_from_ctaz(balance.try_into().unwrap()), suffix);
             ui.text(&balance_str, TextDecl { colour, h: balance_text_h, align: AlignX::Center, ..TextDecl });
+        }
+
+        if false && let _ = elem().decl(Decl {
+            width: grow!(),
+            height: fit!(),
+            colour: (0, 0, 0, 0xff),
+            ..Decl
+        }) {
+            if let Some(input) = &ui.input().text_input {
+                for ch in input {
+                    XXX_text.lock().unwrap().push(*ch);
+                }
+            }
+            let str = frame_strf!(data, "{}:", XXX_text.lock().unwrap());
+            ui.text(&str, TextDecl { colour, h: balance_text_h, align: AlignX::Center, ..TextDecl });
         }
 
         // pending container
@@ -1901,43 +1931,47 @@ pub fn ui_right_pane(ui: &mut Context,
 
 
 pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
-data.per_frame_strs.clear();
 
-let mut result = false;
+    data.per_frame_strs.clear();
 
-const MIN_ZOOM: f32 = 0.5;
-const MAX_ZOOM: f32 = 1.65; // @PreventPanesColliding
+    let mut result = false;
 
-if ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight) {
-    if ui.input().key_pressed(KeyCode::Equal) {
-        let new_zoom = ui.zoom * (1.0f32 + 1.0f32 / 8f32);
-        if new_zoom <= MAX_ZOOM {
-            ui.zoom = new_zoom;
+    const MIN_ZOOM: f32 = 0.5;
+    const MAX_ZOOM: f32 = 1.65; // @PreventPanesColliding
+
+    if ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight) {
+        if ui.input().key_pressed(KeyCode::Equal) {
+            let new_zoom = ui.zoom * (1.0f32 + 1.0f32 / 8f32);
+            if new_zoom <= MAX_ZOOM {
+                ui.zoom = new_zoom;
+            }
+        }
+        if ui.input().key_pressed(KeyCode::Minus) {
+            let new_zoom = ui.zoom / (1.0f32 + 1.0f32 / 8f32);
+            if new_zoom >= MIN_ZOOM {
+                ui.zoom = new_zoom;
+            }
+        }
+        if ui.input().key_pressed(KeyCode::Digit0) {
+            ui.zoom = 1.0f32;
         }
     }
-    if ui.input().key_pressed(KeyCode::Minus) {
-        let new_zoom = ui.zoom / (1.0f32 + 1.0f32 / 8f32);
-        if new_zoom >= MIN_ZOOM {
-            ui.zoom = new_zoom;
-        }
+    if ui.zoom < MIN_ZOOM {
+        ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
     }
-    if ui.input().key_pressed(KeyCode::Digit0) {
-        ui.zoom = 1.0f32;
+    if ui.zoom > MAX_ZOOM {
+        ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
     }
-}
-if ui.zoom < MIN_ZOOM {
-    ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
-}
-if ui.zoom > MAX_ZOOM {
-    ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
-}
-ui.scale = ui.zoom * ui.dpi_scale;
+    ui.scale = ui.zoom * ui.dpi_scale;
 
-ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Default);
+    ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Default);
 
-ui.capture = false;
+    ui.capture = false;
+    let prev_nav_idx_to_id = ui.nav_idx_to_id.clone();
+    ui.nav_id_to_idx.clear();
+    ui.nav_idx_to_id.clear();
 
-let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_height as f32);
+    let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_height as f32);
     let mouse_pos = (ui.input().mouse_pos().0 as f32, ui.input().mouse_pos().1 as f32);
 
     let child_gap = ui.scale(12.0);
@@ -2127,20 +2161,43 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
 
 
     if !ui.input().mouse_held(winit::event::MouseButton::Left) {
-        ui.clicked_id = Id::default();
+        ui.mouse_pressed_id = Id::default();
     }
-    if ui.clicked_id != Id::default() {
+    if ui.mouse_pressed_id != Id::default() {
         ui.capture = true;
     }
 
-    if ui.clicked_id != Id::default() {
-        ui.most_recently_clicked_id = ui.clicked_id;
+    if ui.mouse_pressed_id != Id::default() {
+        ui.most_recent_mouse_pressed_id = ui.mouse_pressed_id;
+    }
+
+    if let Some(nav_id) = ui.nav_id && !ui.nav_id_to_idx.contains_key(&nav_id) {
+        ui.nav_id = None;
+    }
+    if ui.input().key_pressed(KeyCode::Escape) {
+        ui.nav_id = None;
+    }
+
+    if ui.input().key_pressed(KeyCode::Tab) && ui.nav_idx_to_id.len() > 0 {
+        let idx = if let Some(nav_id) = ui.nav_id {
+            let old_idx = ui.nav_id_to_idx[&nav_id] as isize;
+            if (ui.input().key_held(KeyCode::ShiftLeft) || ui.input().key_held(KeyCode::ShiftRight)) {
+                (old_idx - 1).rem_euclid(ui.nav_idx_to_id.len() as isize) as usize
+            } else {
+                (old_idx + 1).rem_euclid(ui.nav_idx_to_id.len() as isize) as usize
+            }
+        } else {
+            0
+        };
+        ui.nav_id = Some(ui.nav_idx_to_id[idx]);
     }
 
     // Return the list of render commands of your layout
     let render_commands = c.end();
 
     if is_rendering {
+        let mut nav_bbox: Option<(isize, isize, isize, isize)> = None;
+
         for command in render_commands {
             fn clay_color_to_u32(color: clay::Color) -> u32 {
                 let r = color.r as u32;
@@ -2156,6 +2213,21 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
             let x2 = (command.bounding_box.x + command.bounding_box.width)  as isize;
             let y2 = (command.bounding_box.y + command.bounding_box.height) as isize;
 
+            if ui.nav_id == Some(command.id) {
+                nav_bbox = Some((x1, y1, x2, y2));
+            }
+
+            let colour = match command.config {
+                Rectangle(ref config)                 => { clay_color_to_u32(config.color) }
+                RenderCommandConfig::Text(ref config) => { clay_color_to_u32(config.color) }
+                _ => { 0 }
+            };
+
+            // @Hack for generating nav highlight rectangle via draw commands.
+            if colour == 0x01000000 {
+                continue;
+            }
+
             match command.config {
                 Rectangle(config) => {
                     let radius_tl = config.corner_radii.top_left     as isize;
@@ -2167,11 +2239,11 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
                                                 radius_tr,
                                                 radius_bl,
                                                 radius_br,
-                                                clay_color_to_u32(config.color));
+                                                colour);
                 }
                 RenderCommandConfig::Text(config) => {
                     let font_kind = match config.font_id { 0 => FontKind::Normal, 1 => FontKind::Mono, 2 => FontKind::Icons, _ => todo!() };
-                    ui.draw().text_line(font_kind, x1 as f32, y1 as f32, config.font_size as f32, config.text, clay_color_to_u32(config.color));
+                    ui.draw().text_line(font_kind, x1 as f32, y1 as f32, config.font_size as f32, config.text, colour);
                 }
                 ScissorStart() => {
                     ui.draw().set_scissor(x1, y1, x2, y2);
@@ -2191,6 +2263,35 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
                 ui.draw().rectangle((x2-t) as f32, (y1-t) as f32, (x2+t) as f32, (y2+t) as f32, color);
                 ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x2-t) as f32, (y1+t) as f32, color);
                 ui.draw().rectangle((x1-t) as f32, (y2-t) as f32, (x2-t) as f32, (y2+t) as f32, color);
+            }
+        }
+
+        if let Some((x1, y1, x2, y2)) = nav_bbox {
+            let gap = ui.scale(1.0) as isize;
+
+            let x1 = x1 - gap;
+            let y1 = y1 - gap;
+            let x2 = x2 + gap;
+            let y2 = y2 + gap;
+
+            let black_t = ui.scale(2.0) as isize;
+            let white_t = black_t * 2;
+
+            {
+                let color = 0xffffffff;
+                let t = white_t;
+                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x1+0) as f32, (y2+t) as f32, color);
+                ui.draw().rectangle((x2-0) as f32, (y1-t) as f32, (x2+t) as f32, (y2+t) as f32, color);
+                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x2-0) as f32, (y1+0) as f32, color);
+                ui.draw().rectangle((x1-t) as f32, (y2-0) as f32, (x2-0) as f32, (y2+t) as f32, color);
+            }
+            {
+                let color = 0xff000000;
+                let t = black_t;
+                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x1+0) as f32, (y2+t) as f32, color);
+                ui.draw().rectangle((x2-0) as f32, (y1-t) as f32, (x2+t) as f32, (y2+t) as f32, color);
+                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x2-0) as f32, (y1+0) as f32, color);
+                ui.draw().rectangle((x1-t) as f32, (y2-0) as f32, (x2-0) as f32, (y2+t) as f32, color);
             }
         }
     }
@@ -2222,7 +2323,7 @@ pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet
     return result;
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Context {
     pub input: *const InputCtx,
     pub draw:  *const DrawCtx,
@@ -2243,9 +2344,13 @@ pub struct Context {
 
     pub capture: bool,
 
-    pub clicked_id:               Id,
-    pub focused_id:               Id,
-    pub most_recently_clicked_id: Id,
+    pub mouse_pressed_id:             Id,
+    pub key_pressed_id:               Id,
+    pub most_recent_mouse_pressed_id: Id,
+
+    pub nav_id_to_idx: HashMap<u32, usize>,
+    pub nav_idx_to_id: Vec<u32>,
+    pub nav_id: Option<u32>,
 
     pub pane_tab_l: Id,
     pub pane_tab_r: Id,

@@ -22,7 +22,7 @@
 		<ConfigProperties>
 			<ConfigAndPlatform>
 				<Name>Debug:x64</Name>
-				<BuildCommand>phuild.bat -$(Configuration)</BuildCommand>
+				<BuildCommand>C:\Work\ShieldedLabs\crosslink_monolith\phuild.bat -$(Configuration)</BuildCommand>
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
 				<CleanCommand></CleanCommand>
@@ -30,8 +30,8 @@
 				<CancelBuild></CancelBuild>
 				<Exe></Exe>
 				<Args></Args>
-				<WorkingDirectory>zebra-gui</WorkingDirectory>
-				<DebugCommand>zebra-crosslink\zebrad.rdbg</DebugCommand>
+				<WorkingDirectory>C:\Work\ShieldedLabs\crosslink_monolith</WorkingDirectory>
+				<DebugCommand>C:\Work\ShieldedLabs\crosslink_monolith\crosslink_monolith.rdbg</DebugCommand>
 				<DebuggerExe></DebuggerExe>
 				<DebugSln>fake_file.sln</DebugSln>
 				<Defines></Defines>
@@ -40,7 +40,7 @@
 			</ConfigAndPlatform>
 			<ConfigAndPlatform>
 				<Name>Release:x64</Name>
-				<BuildCommand>phuild.bat -$(Configuration) </BuildCommand>
+				<BuildCommand>C:\Work\ShieldedLabs\crosslink_monolith\phuild.bat -$(Configuration) </BuildCommand>
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
 				<CleanCommand></CleanCommand>
@@ -48,8 +48,8 @@
 				<CancelBuild></CancelBuild>
 				<Exe></Exe>
 				<Args></Args>
-				<WorkingDirectory>$(WorkspaceDirectory)/zebra-gui</WorkingDirectory>
-				<DebugCommand>$(WorkspaceDirectory)/crosslink_monolith.rdbg</DebugCommand>
+				<WorkingDirectory>C:\Work\ShieldedLabs\crosslink_monolith</WorkingDirectory>
+				<DebugCommand>C:\Work\ShieldedLabs\crosslink_monolith\crosslink_monolith.rdbg</DebugCommand>
 				<DebuggerExe></DebuggerExe>
 				<DebugSln>fake_file.sln</DebugSln>
 				<Defines></Defines>

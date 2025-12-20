@@ -394,10 +394,10 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     // origin
     let screen_unit = SCREEN_UNIT_CONST * zoom;
 
-    if !ui.capture && ui.clicked_id == ui::Id::default() && input_ctx.mouse_pressed(MouseButton::Left) {
-        ui.clicked_id = ui::Id::VIZ_GUI;
+    if !ui.capture && ui.mouse_pressed_id == ui::Id::default() && input_ctx.mouse_pressed(MouseButton::Left) {
+        ui.mouse_pressed_id = ui::Id::VIZ_GUI;
     }
-    if ui.clicked_id == ui::Id::VIZ_GUI && input_ctx.mouse_held(MouseButton::Left) {
+    if ui.mouse_pressed_id == ui::Id::VIZ_GUI && input_ctx.mouse_held(MouseButton::Left) {
         viz_state.camera_x -= input_ctx.mouse_delta().0 as f32 / screen_unit;
         viz_state.camera_y -= input_ctx.mouse_delta().1 as f32 / screen_unit;
     }
