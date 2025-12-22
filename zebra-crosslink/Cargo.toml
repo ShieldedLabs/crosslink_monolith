@@ -213,6 +213,10 @@ opt-level = 3
 [profile.release]
 panic = "abort"
 
+[profile.release-debug]
+inherits = "release"
+debug = true
+
 # Speed up release builds and sync tests using link-time optimization.
 # Some of Zebra's code is CPU-intensive, and needs extra optimizations for peak performance.
 #

@@ -63,7 +63,7 @@ pub struct CompactTx {
     /// stateless server and a transaction with transparent inputs, this will be
     /// unset because the calculation requires reference to prior transactions.
     /// If there are no transparent inputs, the fee will be calculable as:
-    ///     valueBalanceSapling + valueBalanceOrchard + sum(vPubNew) - sum(vPubOld) - sum(tOut)
+    /// valueBalanceSapling + valueBalanceOrchard + sum(vPubNew) - sum(vPubOld) - sum(tOut)
     #[prost(uint32, tag = "3")]
     pub fee: u32,
     #[prost(message, repeated, tag = "4")]

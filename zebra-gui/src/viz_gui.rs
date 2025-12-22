@@ -393,6 +393,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     let zoom = (ZOOM_FACTOR.powf(viz_state.zoom) * ui.scale);
     // origin
     let screen_unit = SCREEN_UNIT_CONST * zoom;
+    let very_zoom_out = screen_unit < 0.16;
 
     if !ui.capture && ui.mouse_pressed_id == ui::Id::default() && input_ctx.mouse_pressed(MouseButton::Left) {
         ui.mouse_pressed_id = ui::Id::VIZ_GUI;
@@ -482,6 +483,9 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         }
     }
 
+    let null_hash_display_string = Hash32::from_u64(0).display_str();
+    let null_hash_display_string_star = format!("{}*", &null_hash_display_string);
+    let null_hash_is_rectangle = draw_ctx.measure_text_line_is_rectangle(FontKind::Mono, screen_unit, &null_hash_display_string_star);
     {
         let mut working_map = HashMap::<Hash32, u16>::new();
         let mut width_map = HashMap::<u64, u16>::new();
@@ -524,7 +528,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             }
         }
 
-        let hash_text_line_w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &format!("{}*", Hash32::from_u64(0).display_str())) / screen_unit;
+        let hash_text_line_w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &null_hash_display_string_star) / screen_unit;
         for (hash, x_pos) in &working_map {
             viz_state.on_screen_bcs.get_mut(hash).unwrap().t_x = -5.0 - hash_text_line_w - 5.0*(1.0 + *x_pos as f32);
         }
@@ -568,54 +572,84 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             viz_state.inspecting_block_screen_x = origin_x + (x*screen_unit);
             viz_state.inspecting_block_screen_y = origin_y + (y*screen_unit);
         }
-        draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bc.roundness, color);
-        draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit / 2.0, (screen_unit / 2.0)*on_screen_bc.roundness, color_accent);
+        if very_zoom_out {
+            draw_ctx.rectangle(origin_x + (x*screen_unit) - screen_unit*30.0, origin_y + (y*screen_unit), origin_x + (x*screen_unit) + screen_unit*5.0, origin_y + (y*screen_unit) + screen_unit*2.0, (color&0xFFffFF) | ((color >> 26) << 24));
+        }
+        else {
+            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bc.roundness, color);
+            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit / 2.0, (screen_unit / 2.0)*on_screen_bc.roundness, color_accent);
+        }
 
         // @todo(judah): not sure what this circle is supposed to represent
         // draw_ctx.circle_square(origin_x + (x*screen_unit) + screen_unit / 3.0, origin_y + (y*screen_unit) - screen_unit / 3.0, screen_unit / 3.0, (screen_unit / 3.0), color_bft);
+        // Answer(Sam): It shows that the block is mentioned inside a BFT block. This is needed in some form so that people can see that sigma is not just 1.
 
-        if on_screen_bc.block.is_best_chain {
-            // hash
-            let text_line = &on_screen_bc.block.this_hash.display_str();
-            let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
-            draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &on_screen_bc.block.this_hash.display_str(), color);
+        if very_zoom_out == false {
+            let here_text_y = (origin_y + (y - 0.5)*screen_unit);
+            if here_text_y <= draw_ctx.window_height as f32 && here_text_y + screen_unit >= 0.0 {
+                if on_screen_bc.block.is_best_chain {
+                    // hash
+                    let text_line_buf;
+                    let text_line = if null_hash_is_rectangle {
+                        &null_hash_display_string
+                    } else {
+                        text_line_buf = on_screen_bc.block.this_hash.display_str();
+                        &text_line_buf
+                    };
+                    let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
+                    draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y as f32, screen_unit, &on_screen_bc.block.this_hash.display_str(), color);
 
-            // height
-            draw_ctx.text_line(FontKind::Mono, origin_x + (x + 1.5)*screen_unit, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &format!("{}", on_screen_bc.block.this_height), color);
-        } else {
-            // hash
-            let text_line = format!("{}*", &on_screen_bc.block.this_hash.display_str());
-            let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
-            draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &text_line, color);
-        }
+                    let height_text_buf;
+                    let height_text = if null_hash_is_rectangle {
+                        "12345"
+                    } else {
+                        height_text_buf = format!("{}", on_screen_bc.block.this_height);
+                        &height_text_buf
+                    };
+                    // height
+                    draw_ctx.text_line(FontKind::Mono, origin_x + (x + 1.5)*screen_unit, here_text_y as f32, screen_unit, height_text, color);
+                } else {
+                    // hash
+                    let text_line_buf;
+                    let text_line = if null_hash_is_rectangle {
+                        &null_hash_display_string_star
+                    } else {
+                        text_line_buf = format!("{}*", &on_screen_bc.block.this_hash.display_str());
+                        &text_line_buf
+                    };
+                    let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
+                    draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y as f32, screen_unit, &text_line, color);
+                }
+            }
 
-        if let Some(parent) = viz_state.on_screen_bcs.get(&on_screen_bc.block.parent_hash) {
-            let px = parent.x;
-            let py = parent.y;
-            let dx = px-x;
-            let dy = py-y;
-            let (dx, dy, l) = split_vector(dx, dy);
-            draw_ctx.line(
-                origin_x + (x + dx * 2.0) * screen_unit,
-                origin_y + (y + dy * 2.0) * screen_unit,
-                origin_x + (x + dx * (l - 2.0))*screen_unit,
-                origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                arrow_and_line_width, COLOR_BC_LINK | (((on_screen_bc.alpha*255.0) as u32) << 24),
-            );
-        }
-        if let Some(pointing_at_bft) = viz_state.on_screen_bfts.get(&on_screen_bc.block.points_at_bft_block) {
-            let px = pointing_at_bft.x;
-            let py = pointing_at_bft.y;
-            let dx = px-x;
-            let dy = py-y;
-            let (dx, dy, l) = split_vector(dx, dy);
-            draw_ctx.arrow(
-                origin_x + (x + dx * 2.0) * screen_unit,
-                origin_y + (y + dy * 2.0) * screen_unit,
-                origin_x + (x + dx * (l - 2.0))*screen_unit,
-                origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                arrow_and_line_width, COLOR_BFT_LINK | (((on_screen_bc.alpha*on_screen_bc.bft_arrow_alpha*255.0) as u32) << 24),
-            );
+            if let Some(parent) = viz_state.on_screen_bcs.get(&on_screen_bc.block.parent_hash) {
+                let px = parent.x;
+                let py = parent.y;
+                let dx = px-x;
+                let dy = py-y;
+                let (dx, dy, l) = split_vector(dx, dy);
+                draw_ctx.line(
+                    origin_x + (x + dx * 2.0) * screen_unit,
+                    origin_y + (y + dy * 2.0) * screen_unit,
+                    origin_x + (x + dx * (l - 2.0))*screen_unit,
+                    origin_y + (y + dy * (l - 2.0) )*screen_unit,
+                    arrow_and_line_width, COLOR_BC_LINK | (((on_screen_bc.alpha*255.0) as u32) << 24),
+                );
+            }
+            if let Some(pointing_at_bft) = viz_state.on_screen_bfts.get(&on_screen_bc.block.points_at_bft_block) {
+                let px = pointing_at_bft.x;
+                let py = pointing_at_bft.y;
+                let dx = px-x;
+                let dy = py-y;
+                let (dx, dy, l) = split_vector(dx, dy);
+                draw_ctx.arrow(
+                    origin_x + (x + dx * 2.0) * screen_unit,
+                    origin_y + (y + dy * 2.0) * screen_unit,
+                    origin_x + (x + dx * (l - 2.0))*screen_unit,
+                    origin_y + (y + dy * (l - 2.0) )*screen_unit,
+                    arrow_and_line_width, COLOR_BFT_LINK | (((on_screen_bc.alpha*on_screen_bc.bft_arrow_alpha*255.0) as u32) << 24),
+                );
+            }
         }
     }
 
@@ -632,43 +666,53 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             viz_state.inspecting_block_screen_x = origin_x + (x*screen_unit);
             viz_state.inspecting_block_screen_y = origin_y + (y*screen_unit);
         }
-        draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bft.roundness, color);
-
-        // hash
-        draw_ctx.text_line(FontKind::Mono, (origin_x + (x + 1.5)*screen_unit) as f32, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit as f32, &on_screen_bft.block.this_hash.display_str(), color);
-
-        // height
-        let text_line = format!("{}", on_screen_bft.block.this_height);
-        let text_line_w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line);
-        draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5)*screen_unit - text_line_w, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &text_line, color);
-
-        if let Some(parent) = viz_state.on_screen_bfts.get(&on_screen_bft.block.parent_hash) {
-            let px = parent.x;
-            let py = parent.y;
-            let dx = px-x;
-            let dy = py-y;
-            let (dx, dy, l) = split_vector(dx, dy);
-            draw_ctx.line(
-                origin_x + (x + dx * 2.0) * screen_unit,
-                origin_y + (y + dy * 2.0) * screen_unit,
-                origin_x + (x + dx * (l - 2.0))*screen_unit,
-                origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                arrow_and_line_width, COLOR_BFT_LINK | (((on_screen_bft.alpha*255.0) as u32) << 24),
-            );
+        if very_zoom_out {
+            draw_ctx.rectangle(origin_x + (x*screen_unit) - screen_unit*5.0, origin_y + (y*screen_unit), origin_x + (x*screen_unit) + screen_unit*30.0, origin_y + (y*screen_unit) + screen_unit*4.0, (color&0xFFffFF) | ((color >> 26) << 24));
         }
-        if let Some(pointing_at_bc) = viz_state.on_screen_bcs.get(&on_screen_bft.block.points_at_bc_block) {
-            let px = pointing_at_bc.x;
-            let py = pointing_at_bc.y;
-            let dx = px-x;
-            let dy = py-y;
-            let (dx, dy, l) = split_vector(dx, dy);
-            draw_ctx.arrow(
-                origin_x + (x + dx * 2.0) * screen_unit,
-                origin_y + (y + dy * 2.0) * screen_unit,
-                origin_x + (x + dx * (l - 2.0))*screen_unit,
-                origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                arrow_and_line_width, COLOR_CROSS_LINK | (((on_screen_bft.alpha*255.0) as u32) << 24),
-            );
+        else {
+            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bft.roundness, color);
+        }
+
+        if very_zoom_out == false {
+            let here_text_y = (origin_y + (y - 0.5)*screen_unit);
+            if here_text_y <= draw_ctx.window_height as f32 && here_text_y + screen_unit >= 0.0 {
+                // hash
+                draw_ctx.text_line(FontKind::Mono, (origin_x + (x + 1.5)*screen_unit) as f32, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit as f32, &on_screen_bft.block.this_hash.display_str(), color);
+
+                // height
+                let text_line = format!("{}", on_screen_bft.block.this_height);
+                let text_line_w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line);
+                draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5)*screen_unit - text_line_w, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &text_line, color);
+            }
+
+            if let Some(parent) = viz_state.on_screen_bfts.get(&on_screen_bft.block.parent_hash) {
+                let px = parent.x;
+                let py = parent.y;
+                let dx = px-x;
+                let dy = py-y;
+                let (dx, dy, l) = split_vector(dx, dy);
+                draw_ctx.line(
+                    origin_x + (x + dx * 2.0) * screen_unit,
+                    origin_y + (y + dy * 2.0) * screen_unit,
+                    origin_x + (x + dx * (l - 2.0))*screen_unit,
+                    origin_y + (y + dy * (l - 2.0) )*screen_unit,
+                    arrow_and_line_width, COLOR_BFT_LINK | (((on_screen_bft.alpha*255.0) as u32) << 24),
+                );
+            }
+            if let Some(pointing_at_bc) = viz_state.on_screen_bcs.get(&on_screen_bft.block.points_at_bc_block) {
+                let px = pointing_at_bc.x;
+                let py = pointing_at_bc.y;
+                let dx = px-x;
+                let dy = py-y;
+                let (dx, dy, l) = split_vector(dx, dy);
+                draw_ctx.arrow(
+                    origin_x + (x + dx * 2.0) * screen_unit,
+                    origin_y + (y + dy * 2.0) * screen_unit,
+                    origin_x + (x + dx * (l - 2.0))*screen_unit,
+                    origin_y + (y + dy * (l - 2.0) )*screen_unit,
+                    arrow_and_line_width, COLOR_CROSS_LINK | (((on_screen_bft.alpha*255.0) as u32) << 24),
+                );
+            }
         }
     }
 

@@ -259,6 +259,15 @@ impl DrawCtx {
         }
     }
 
+    pub fn measure_text_line_is_rectangle(&self, font_kind: FontKind, text_height: f32, text_line: &str) -> bool {
+        if text_height <= 0.0 || text_height.is_normal() == false { return true; }
+        let text_height = text_height.min(8192.0);
+
+        if text_height < 3.0 {
+            return true;
+        }
+        return false;
+    }
     pub fn measure_text_line(&self, font_kind: FontKind, text_height: f32, text_line: &str) -> f32 {
         if text_height <= 0.0 || text_height.is_normal() == false { return 0.0; }
         let text_height = text_height.min(8192.0);

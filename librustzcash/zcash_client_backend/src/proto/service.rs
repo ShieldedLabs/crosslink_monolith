@@ -57,10 +57,8 @@ pub struct RawTransaction {
     /// the `RawTransaction` type are as follows:
     ///
     /// * height 0: the transaction is in the mempool
-    /// * height 0xffffffffffffffff: the transaction has been mined on a fork that
-    ///    is not currently the main chain
-    /// * any other height: the transaction has been mined in the main chain at the
-    ///    given height
+    /// * height 0xffffffffffffffff: the transaction has been mined on a fork that is not currently the main chain
+    /// * any other height: the transaction has been mined in the main chain at the given height
     #[prost(uint64, tag = "2")]
     pub height: u64,
 }
@@ -299,6 +297,17 @@ pub mod compact_tx_streamer_client {
     #[derive(Debug, Clone)]
     pub struct CompactTxStreamerClient<T> {
         inner: tonic::client::Grpc<T>,
+    }
+    impl CompactTxStreamerClient<tonic::transport::Channel> {
+        /// Attempt to create a new client by connecting to a given endpoint.
+        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        where
+            D: TryInto<tonic::transport::Endpoint>,
+            D::Error: Into<StdError>,
+        {
+            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+            Ok(Self::new(conn))
+        }
     }
     impl<T> CompactTxStreamerClient<T>
     where
