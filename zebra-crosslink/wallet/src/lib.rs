@@ -269,30 +269,74 @@ pub enum WalletTxKind {
 //     Finalized, // by crosslink
 // }
 
+// NOTE: needed because we get shielded & transparent transactions at different times
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WalletTxPart {
+    // NOTE: spend is our UTXOs that we consume, sent is created from those & transferred
+    pub spent_note_count: usize,
+    pub spent_zats: Zatoshis,
+    pub sent_note_count: usize,
+    pub sent_zats: Zatoshis,
+    pub recv_note_count: usize,
+    pub recv_zats: Zatoshis,
+    // TODO: differentiate change?
+}
+impl WalletTxPart {
+    pub const TRANSPARENT: usize = 0;
+    pub const SHIELDED: usize = 1;
+    pub const ZERO: Self = Self {
+        spent_note_count: 0,
+        spent_zats: Zatoshis::ZERO,
+        sent_note_count: 0,
+        sent_zats: Zatoshis::ZERO,
+        recv_note_count: 0,
+        recv_zats: Zatoshis::ZERO,
+    };
+
+    pub fn checked_add(&self, rhs: &WalletTxPart) -> Option<WalletTxPart> {
+        Some(WalletTxPart {
+            spent_note_count: (self.spent_note_count + rhs.spent_note_count),
+            sent_note_count:  (self.sent_note_count  + rhs.sent_note_count),
+            recv_note_count:  (self.recv_note_count  + rhs.recv_note_count),
+            spent_zats:       (self.spent_zats       + rhs.spent_zats)?,
+            sent_zats:        (self.sent_zats        + rhs.sent_zats)?,
+            recv_zats:        (self.recv_zats        + rhs.recv_zats)?,
+        })
+    }
+
+    pub fn unchecked_add(&self, rhs: &WalletTxPart) -> WalletTxPart {
+        WalletTxPart {
+            spent_note_count: (self.spent_note_count + rhs.spent_note_count),
+            sent_note_count:  (self.sent_note_count  + rhs.sent_note_count),
+            recv_note_count:  (self.recv_note_count  + rhs.recv_note_count),
+            spent_zats:       (self.spent_zats       + rhs.spent_zats).expect("already checked"),
+            sent_zats:        (self.sent_zats        + rhs.sent_zats).expect("already checked"),
+            recv_zats:        (self.recv_zats        + rhs.recv_zats).expect("already checked"),
+        }
+    }
+}
+
+
+// NOTE: trying to not store data that can be computed directly
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WalletTx {
     pub account_id: usize,
     pub txid: zcash_protocol::TxId,
     pub expiry_h: Option<BlockHeight>,
     pub mined_h: BlockHeight,
-    pub account_value_delta: ZatBalance,
-    pub total_spent: Zatoshis,
-    pub total_received: Zatoshis,
-    pub fee_paid: Option<Zatoshis>,
-    pub spent_note_count: usize,
-    pub has_change: bool,
-    pub sent_note_count: usize,
-    pub received_note_count: usize,
+
+    pub is_coinbase: bool,
+    pub parts: [WalletTxPart; 2], // 0=>transparent, 1=>shielded
+
+    // TODO: keep all memos in single contiguous array as ((txid, index), memo)
     pub memo_count: usize,
-    pub expired_unmined: bool,
-    pub is_shielding: bool,
     pub memo: [u8; 512],
-    pub kind: WalletTxKind,
+
     pub is_outside_bc: bool,
 }
 
 impl WalletTx {
-    pub fn with_fake_data(kind: WalletTxKind, sent: u64, received: u64, shielding: bool, memo: &str, mined_h: u32) -> Self {
+    pub fn with_fake_data(kind: WalletTxKind, sent: u64, recv: u64, shielding: bool, memo: &str, mined_h: u32) -> Self {
         let mut memo_as_bytes = [0u8; 512];
         &memo_as_bytes[0..memo.len()].copy_from_slice(memo.as_bytes());
 
@@ -301,20 +345,66 @@ impl WalletTx {
             txid: TxId::from_bytes([0; 32]),
             expiry_h: None,
             mined_h: if mined_h != 0 { (BlockHeight(mined_h)) } else { BlockHeight::MEMPOOL },
-            account_value_delta: ZatBalance::from_i64(-(sent as i64)).unwrap(),
-            total_spent: Zatoshis::from_u64(sent).unwrap(),
-            total_received: Zatoshis::from_u64(received).unwrap(),
-            fee_paid: None,
-            spent_note_count: if kind == WalletTxKind::Send { 1 } else { 0 },
-            has_change: false,
-            sent_note_count: if kind == WalletTxKind::Send { 1 } else { 0 },
-            received_note_count: if kind == WalletTxKind::Receive { 1 } else { 0 },
-            memo_count: if memo_as_bytes.len() != 0 { 1 } else { 0 },
-            expired_unmined: false,
-            is_shielding: true,
+            parts: [
+                WalletTxPart { // Transparent
+                    spent_note_count: (sent > 0 && shielding) as usize,
+                    sent_note_count:  (sent > 0 && shielding) as usize,
+                    recv_note_count:  0,
+                    spent_zats: Zatoshis::from_u64(sent * shielding as u64).unwrap(),
+                    sent_zats:  Zatoshis::from_u64(sent * shielding as u64).unwrap(),
+                    recv_zats:  Zatoshis::ZERO,
+                },
+                WalletTxPart { // Shielded
+                    spent_note_count: (sent > 0 && !shielding) as usize,
+                    sent_note_count:  (sent > 0 && !shielding) as usize,
+                    recv_note_count:  (recv > 0) as usize,
+                    spent_zats: Zatoshis::from_u64(sent * !shielding as u64).unwrap(),
+                    sent_zats:  Zatoshis::from_u64(sent * !shielding as u64).unwrap(),
+                    recv_zats: Zatoshis::from_u64(if shielding { sent } else { recv }).unwrap(),
+                },
+            ],
+            memo_count: if memo.len() != 0 { 1 } else { 0 },
             memo: memo_as_bytes,
-            kind,
+            is_coinbase: false,
             is_outside_bc: false,
+        }
+    }
+
+    pub fn totals(&self) -> WalletTxPart {
+        self.parts[0].unchecked_add(&self.parts[1])
+    }
+
+    pub fn account_value_delta(&self) -> ZatBalance {
+        let all = self.totals();
+        // NOTE: into_i64 isn't pub...
+        ZatBalance::from_i64(all.recv_zats.into_u64() as i64 - all.spent_zats.into_u64() as i64).expect("checked before")
+    }
+
+    // TODO:
+    // pub fn expired_unmined() -> bool {}
+    // pub fn fee() -> Zatoshis {}
+
+    // TODO: split shielding/unshielding/shielded/transparent/mixed from
+    // send/recv/self-send/coinbase
+    // TODO: staking
+    pub fn kind(&self) -> WalletTxKind {
+        let all = self.totals();
+        // if *all* of the sent zats go to ourself we assume this was the purpose
+        // otherwise we assume the self-sent zats are change
+        // ALT: only consider it change if a single note is received (per pool?)
+        let is_self_send = all.sent_zats == all.recv_zats;
+        if is_self_send {
+            let all_spent_is_t     = self.parts[0].spent_zats == all.spent_zats;
+            let all_recv_is_shield = self.parts[1].recv_zats == all.recv_zats;
+            if all_spent_is_t && all_recv_is_shield && all.recv_zats > Zatoshis::ZERO {
+                WalletTxKind::Shield
+            } else {
+                WalletTxKind::SelfSend
+            }
+        } else if all.spent_zats > Zatoshis::ZERO {
+            WalletTxKind::Send
+        } else {
+            WalletTxKind::Receive
         }
     }
 
@@ -544,6 +634,15 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, i
     *insert_i += 1;
 }
 
+fn to_zats_or_dump_err(src: &str, z: u64) -> Option<Zatoshis> {
+    match Zatoshis::from_u64(z) {
+        Ok(zats) => Some(zats),
+        Err(err) => {
+            println!("{src} error: couldn't convert {z} to Zatoshis: {err:?}");
+            None
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ManualAccount {
@@ -651,21 +750,31 @@ impl ManualWallet {
             },
         );
 
-        let mut total_send = 0; // TODO: is this supposed to exclude self-sends?
-        let mut total_recv = 0;
+        let (mut t_send_z, mut t_recv_z, mut s_send_z, mut s_recv_z) = (0, 0, 0, 0);
+        let (mut t_send_c, mut t_recv_c, mut s_send_c, mut s_recv_c) = (0, 0, 0, 0);
         for output in outputs {
             match output {
                 &TxOutput::Transparent{ dst, zats } => {
-                    total_send += zats.into_u64();
-                    total_recv += (dst == t_addr) as u64 * zats.into_u64();
+                    t_send_c += 1;
+                    t_send_z += zats.into_u64();
+                    // TODO: more comprehensive address matching
+                    let is_to_me = (dst == t_addr);
+                    t_recv_c += is_to_me as usize;
+                    t_recv_z += is_to_me as u64 * zats.into_u64();
+
                     if let Err(err) = txb.add_transparent_output(&dst, zats) {
                         println!("tx build error: {err:?}");
                         return None;
                     }
                 }
                 TxOutput::Orchard{ ovk, dst, zats, memo } => {
-                    total_send += zats;
-                    total_recv += (dst == orchard_addr) as u64 * zats;
+                    s_send_c += 1;
+                    s_send_z += zats;
+                    // TODO: more comprehensive address matching
+                    let is_to_me = (dst == orchard_addr);
+                    s_recv_c += is_to_me as usize;
+                    s_recv_z += is_to_me as u64 * zats;
+
                     if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(ovk.clone(), dst.clone(), *zats, memo.clone()) {
                         println!("tx build error: {err:?}");
                         return None;
@@ -679,16 +788,22 @@ impl ManualWallet {
         let (pubkey, privkey) = transparent_keys_from_usk(&src_usk, 0).unwrap();
         signing_set.add_key(privkey);
 
-        let total_spend = total_send + fee_zats.into_u64();
-        let mut total_covered = 0;
+        let min_spend = t_send_z + s_send_z + fee_zats.into_u64();
+        let (mut t_spend_z, mut s_spend_z) = (0, 0);
+        let (mut t_spend_c, mut s_spend_c) = (0, 0);
         'src_pool: for pool in opts.src_pools {
             match pool {
+                // TODO: account for notes that shouldn't be spent yet
+                // - not enough confirmations
+                // - used in another transaction that we've built
+
                 TxPool::Transparent => {
                     // "greedy strategy"
                     for utxo in &account.utxos {
                         txb.add_transparent_input(pubkey, utxo.id.clone(), utxo.txout());
-                        total_covered += utxo.value.into_u64();
-                        if (total_covered >= total_spend) {
+                        t_spend_z += utxo.value.into_u64();
+                        t_spend_c += 1;
+                        if ((t_spend_z + s_spend_z) >= min_spend) {
                             break 'src_pool;
                         }
                     }
@@ -699,18 +814,51 @@ impl ManualWallet {
             }
         }
 
-        let change = match total_covered.cmp(&total_spend) {
-            std::cmp::Ordering::Less => return None, // can't afford
+        let spend_z = (t_spend_z + s_spend_z);
+        let change = match spend_z.cmp(&min_spend) {
+            std::cmp::Ordering::Less => {
+                println!("tx build error: can't afford {min_spend}; only {spend_z} available from given sources");
+                return None
+            }, // can't afford
             std::cmp::Ordering::Equal => 0,
             std::cmp::Ordering::Greater => {
                 // TODO: prefer shielded output
-                let change = total_covered - total_spend;
+                let change = spend_z - min_spend;
+                t_send_z += change;
+                t_recv_z += change;
                 txb.add_transparent_output(&t_addr, Zatoshis::from_u64(change).unwrap());
                 change
             }
         };
         // TODO: separate change outputs from intended outputs
 
+        //- TOTALS GATHERED; CHECK VALUES
+        let mut parts = [
+            WalletTxPart { // Transparent
+                spent_note_count: t_spend_c,
+                sent_note_count:  t_send_c,
+                recv_note_count:  t_recv_c,
+                spent_zats:       to_zats_or_dump_err("tx build", t_spend_z)?,
+                sent_zats:        to_zats_or_dump_err("tx build", t_send_z)?,
+                recv_zats:        to_zats_or_dump_err("tx build", t_recv_z)?,
+            },
+            WalletTxPart { // Shielded
+                spent_note_count: s_spend_c,
+                sent_note_count:  s_send_c,
+                recv_note_count:  s_recv_c,
+                spent_zats:       to_zats_or_dump_err("tx build", s_spend_z)?,
+                sent_zats:        to_zats_or_dump_err("tx build", s_send_z)?,
+                recv_zats:        to_zats_or_dump_err("tx build", s_recv_z)?,
+            },
+        ];
+
+        let Some(_totals) = parts[0].checked_add(&parts[1]) else {
+            println!("tx build error: total values are too large to be represented by Zatoshis");
+            return None;
+        };
+
+
+        //-- VERY EXPENSIVE TX CREATION (PARTICULARLY IF SHIELDED OUTPUT)
         use rand_chacha::ChaCha20Rng;
         let prover = LocalTxProver::bundled();
         let extsk: &[ExtendedSpendingKey] = &[];
@@ -736,16 +884,12 @@ impl ManualWallet {
         let mut tx_bytes = vec![];
         tx.write(&mut tx_bytes).unwrap();
 
+        //-- EXPENSIVE NETWORK SEND
         // TODO: don't block, maybe return a future?
         let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
         println!("******* res for {:?}: {:?}", tx.txid(), res);
 
-        // TODO: shielding/determine without state
-        let kind = if total_recv > 0 {
-            WalletTxKind::SelfSend
-        } else {
-            WalletTxKind::Send
-        };
+        //-- COMPLETION
         if res.is_ok() {
             // TODO: complete
             let new_wallet_tx = WalletTx{
@@ -753,19 +897,10 @@ impl ManualWallet {
                 txid: tx.txid(),
                 expiry_h: None,
                 mined_h: BlockHeight::INTERNAL,
-                account_value_delta: ZatBalance::from_i64(0).unwrap(),
-                total_spent: Zatoshis::from_u64(total_spend).unwrap(),
-                total_received: Zatoshis::from_u64(total_recv).unwrap(),
-                fee_paid: Some(fee_zats),
-                spent_note_count: 1,
-                has_change: false,
-                sent_note_count: 1,
-                received_note_count: 0,
+                parts,
                 memo_count: 0,
-                expired_unmined: false,
-                is_shielding: false,
                 memo: [0; 512],
-                kind,
+                is_coinbase: false,
                 is_outside_bc: false,
             };
             let mut insert_i = 0;
@@ -1613,6 +1748,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 // NOTE: these are only from *our* perspective
                 let mut total_received = 0;
                 let mut total_spent = 0;
+                let (mut t_send_z, mut t_spend_z, mut t_recv_z) = (0, 0, 0);
+                let (mut t_send_c, mut t_spend_c, mut t_recv_c) = (0, 0, 0);
                 let mut is_coinbase = false;
                 let account = &mut miner_wallet.accounts[0];
                 if let Some(t_bundle) = t_tx.transparent_bundle() {
@@ -1636,7 +1773,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                             println!("ERROR: out of sequence spent UTXO: {} > {}", last_stxo.spent_h, stxo.spent_h);
                                         }
                                     }
-                                    total_spent += stxo.value.into_u64();
+                                    t_spend_c += 1;
+                                    t_spend_z += stxo.value.into_u64();
 
                                     if let Some(last_stxo) = account.stxos.last() {
                                         debug_assert!(last_stxo.spent_h <= stxo.spent_h, "{} <= {}", last_stxo.spent_h, stxo.spent_h);
@@ -1644,7 +1782,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                     account.stxos.push(stxo);
                                 } else if let Some(txo_i) = recv_h_position(&account.recv_txos, prevout_txid_h, &input.prevout) {
                                     // NOTE: we need to use our own tracking of the TXO as otherwise we don't know the value
-                                    total_spent += account.recv_txos[txo_i].value.into_u64();
+                                    t_spend_c += 1;
+                                    t_spend_z += account.recv_txos[txo_i].value.into_u64();
                                 } else {
                                     // accounted for by moving it into stxos(?)
                                 }
@@ -1656,16 +1795,24 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     // push new unspent utxos
                     for (out_i, txout) in t_bundle.vout.iter().enumerate() {
+                        let value = txout.value();
+                        if t_spend_c > 0 {
+                            // we spent money in this TX, so we must be responsible for the sends as well
+                            t_send_c += 1;
+                            t_send_z += value.into_u64();
+                        }
+
                         if let Some(t_addr) = txout.recipient_address() {
                             if t_addr == miner_t_address {
                                 let utxo = Txo {
                                     recv_h: block_h,
                                     spent_h: BlockHeight(0),
                                     id: OutPoint::new(txid.into(), out_i.try_into().unwrap()),
-                                    value: txout.value(),
+                                    value,
                                     t_addr,
                                 };
-                                total_received += utxo.value.into_u64();
+                                t_recv_c += 1;
+                                t_recv_z += value.into_u64();
 
                                 let txid_h = if let Some(&txid_h) = miner_wallet.tx_h_map.get(&txid) {
                                     txid_h
@@ -1693,33 +1840,31 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                 }
 
-                // TODO: complete
-                let new_wallet_tx = WalletTx{
+                let Some(spent_zats) = to_zats_or_dump_err("t tx receive", t_spend_z) else { continue; };
+                let Some(sent_zats) = to_zats_or_dump_err("t tx receive", t_send_z) else { continue; };
+                let Some(recv_zats) = to_zats_or_dump_err("t tx receive", t_recv_z) else { continue; };
+                let parts = [
+                    WalletTxPart {
+                        spent_zats, sent_zats, recv_zats,
+                        spent_note_count: t_spend_c,
+                        sent_note_count: t_send_c,
+                        recv_note_count: t_recv_c,
+                    },
+                    WalletTxPart::ZERO,
+                ];
+
+                let new_wallet_tx = WalletTx {
                     account_id: 0,
                     txid,
                     expiry_h,
                     mined_h: block_h,
-                    account_value_delta: ZatBalance::from_i64(0).unwrap(),
-                    total_spent: Zatoshis::from_u64(total_spent).unwrap(),
-                    total_received: Zatoshis::from_u64(total_received).unwrap(),
-                    fee_paid: Some(Zatoshis::from_u64(0).unwrap()),
-                    has_change: false,
-
-                    spent_note_count: 0,
-                    sent_note_count: 0,
-                    received_note_count: 0,
-
+                    parts,
                     memo_count: 0,
-                    expired_unmined: false,
-                    is_shielding: false,
                     memo: [0; 512],
-                    kind: if total_spent > 0 {
-                        WalletTxKind::SelfSend
-                    } else {
-                        WalletTxKind::Receive
-                    },
+                    is_coinbase,
                     is_outside_bc: false,
                 };
+
                 update_with_tx(miner_wallet, new_wallet_tx.txid, new_wallet_tx, &mut insert_i);
             }
 
@@ -1753,26 +1898,32 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         // Conservative approach: always recompute
                         // TODO: decrypt our transactions & fill in actual data here
                         // TODO: get full info with memos
-                        let new_wallet_tx = WalletTx{
+
+                        let parts = [
+                            WalletTxPart::ZERO,
+                            WalletTxPart {
+                                spent_zats: Zatoshis::ZERO,
+                                sent_zats: Zatoshis::ZERO,
+                                recv_zats: Zatoshis::const_from_u64(1_234_567_890),
+                                spent_note_count: 0,
+                                sent_note_count: 0,
+                                recv_note_count: 1,
+                            },
+                        ];
+
+                        let new_wallet_tx = WalletTx {
                             account_id: 0,
                             txid,
-                            expiry_h: None,
+                            expiry_h: None, // TODO
                             mined_h: block_h,
-                            account_value_delta: ZatBalance::from_i64(0).unwrap(),
-                            total_spent: Zatoshis::from_u64(0).unwrap(),
-                            total_received: Zatoshis::from_u64(0).unwrap(),
-                            fee_paid: Some(Zatoshis::from_u64(0).unwrap()),
-                            spent_note_count: 0,
-                            has_change: false,
-                            sent_note_count: 0,
-                            received_note_count: 0,
+                            parts,
+                            // TODO: get memos
                             memo_count: 0,
-                            expired_unmined: false,
-                            is_shielding: false,
                             memo: [0; 512],
-                            kind: WalletTxKind::Receive,
+                            is_coinbase: false,
                             is_outside_bc: false,
                         };
+
                         update_with_tx(wallet, txid, new_wallet_tx, &mut insert_i);
                     }
                 }

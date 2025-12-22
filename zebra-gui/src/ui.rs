@@ -1358,7 +1358,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 // TODO: account for mempool
-                                let icon = match (tx.kind, tx.mined_h.is_in_block()) {
+                                let icon = match (tx.kind(), tx.mined_h.is_in_block()) {
                                     (WalletTxKind::Send,     true) => ICON_UP_SMALL,
                                     (WalletTxKind::SelfSend, true) => ICON_DOWN_SMALL,
                                     (WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
@@ -1396,7 +1396,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 align: Left,
                                 ..Decl
                             }) {
-                                let label = match tx.kind {
+                                let label = match tx.kind() {
                                     WalletTxKind::Send     => if tx.mined_h.is_in_block() { "Sent"     } else { "Sending"   },
                                     WalletTxKind::Receive  => if tx.mined_h.is_in_block() { "Received" } else { "Receiving" },
                                     WalletTxKind::SelfSend => if tx.mined_h.is_in_block() { "Returned" } else { "Returning" },
@@ -1446,7 +1446,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 // @todo colors
-                                let color = match tx.kind {
+                                let color = match tx.kind() {
                                     WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
                                     WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
                                     WalletTxKind::Receive | WalletTxKind::Unstake => (0x5a, 0xb5, 0x52, 0xff),
@@ -1454,22 +1454,24 @@ pub fn ui_left_pane(ui: &mut Context,
                                     _ => WHITE,
                                 };
 
-                                match tx.kind {
+                                let totals = tx.totals();
+                                match tx.kind() {
                                     WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake => {
-                                        let send_amount: i64 = tx.account_value_delta.into();
+                                        let send_amount: i64 = tx.account_value_delta().into();
                                         let send_amount: u64 = send_amount.abs() as u64;
                                         let full = send_amount / 100_000_000;
                                         let part = send_amount % 100_000_000;
                                         let part_str = format!("{part}000");
 
-                                        let prefix = if tx.kind == WalletTxKind::Send { "-" } else { "" };
+                                        let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
                                         ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..4]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
                                     WalletTxKind::Receive | WalletTxKind::Unstake => {
-                                        ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.totals().recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
                                     WalletTxKind::Shield => {
-                                        let shield_amount: i64 = tx.account_value_delta.into();
+                                        // TODO: (how) do we want to show the fee?
+                                        let shield_amount = totals.recv_zats.into_u64();
                                         let full = shield_amount / 100_000_000;
                                         let part = shield_amount % 100_000_000;
                                         let part_str = format!("{part}000");
