@@ -916,7 +916,7 @@ impl ManualWallet {
         //-- COMPLETION
         if res.is_ok() {
             // TODO: complete
-            let new_wallet_tx = WalletTx{
+            let new_tx = WalletTx{
                 account_id: 0,
                 txid: tx.txid(),
                 expiry_h: None,
@@ -928,9 +928,9 @@ impl ManualWallet {
                 is_outside_bc: false,
             };
             let mut insert_i = 0;
-            update_insert_i(&self.txs, &mut insert_i, new_wallet_tx.mined_h);
+            update_insert_i(&self.txs, &mut insert_i, new_tx.mined_h);
             let components = WalletTxPart::TRANSPARENT | WalletTxPart::SHIELDED;
-            update_with_tx(self, tx.txid(), new_wallet_tx, components, &mut insert_i);
+            update_with_tx(self, tx.txid(), new_tx, components, &mut insert_i);
             Some(tx.txid())
         } else {
             None
@@ -979,6 +979,176 @@ impl PoWCache {
 //     2                  1
 // #############-------------------
 //              ###################
+
+
+fn orchard_recv_h_position(notes: &[OrchardNote], block_h: BlockHeight, nf: &orchard::note::Nullifier) -> Option<usize> {
+    let mut i = notes.partition_point(|txo| txo.recv_h < block_h);
+    while i < notes.len() && notes[i].recv_h == block_h {
+        if &notes[i].nf == nf {
+            return Some(i);
+        }
+    }
+    None
+}
+fn txo_recv_h_position(notes: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
+    let mut i = notes.partition_point(|txo| txo.recv_h < block_h);
+    while i < notes.len() && notes[i].recv_h == block_h {
+        if &notes[i].id == utxo_id {
+            return Some(i);
+        }
+    }
+    None
+}
+fn txo_spent_h_position(notes: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
+    let mut i = notes.partition_point(|txo| txo.spent_h < block_h);
+    while i < notes.len() && notes[i].spent_h == block_h {
+        if &notes[i].id == utxo_id {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize) -> Option<()> {
+    update_insert_i(&wallet.txs, insert_i, block_h);
+
+    let mut expiry_h = Some(BlockHeight::from(tx.expiry_height()));
+    if expiry_h.unwrap().0 == 0 {
+        expiry_h = None;
+    }
+
+    // TODO IMPORTANT: this is just full-tx import
+
+    let txid = tx.txid();
+    println!("at h: {block_h}, transparent tx {txid} contains {} orchard actions", tx.orchard_bundle().map_or(0, |b| b.actions().len()));
+
+    // NOTE: these are only from *our* perspective
+    let mut total_received = 0;
+    let mut total_spent = 0;
+    let (mut t_send_z, mut t_spend_z, mut t_recv_z) = (0, 0, 0);
+    let (mut t_send_c, mut t_spend_c, mut t_recv_c) = (0, 0, 0);
+    let mut is_coinbase = false;
+    let account = &mut wallet.accounts[account_i];
+
+    // TODO: handle multiple addresses per account
+    let (account_t_addr, account_ua) = addrs_from_account(account, 0)?;
+
+    if let Some(t_bundle) = tx.transparent_bundle() {
+        // TODO: t_bundle.authorization
+
+        // println!("t_bundle: {t_bundle:?}");
+        is_coinbase = t_bundle.is_coinbase();
+        // HANDLE SPENT TXIDS
+        if !is_coinbase {
+            let mut input_i = 0;
+            for input in &t_bundle.vin {
+                println!("input {input_i} {input:?}");
+                input_i += 1;
+
+                if let Some(&prevout_txid_h) = wallet.tx_h_map.get(input.prevout.txid()) {
+                    if let Some(utxo_i) = txo_recv_h_position(&account.utxos, prevout_txid_h, &input.prevout) {
+                        let utxo = account.utxos.remove(utxo_i);
+                        let stxo = Txo { spent_h: block_h, ..utxo };
+                        if let Some(last_stxo) = account.stxos.last() {
+                            if last_stxo.spent_h > stxo.spent_h {
+                                println!("ERROR: out of sequence spent UTXO: {} > {}", last_stxo.spent_h, stxo.spent_h);
+                            }
+                        }
+                        t_spend_c += 1;
+                        t_spend_z += stxo.value.into_u64();
+
+                        if let Some(last_stxo) = account.stxos.last() {
+                            debug_assert!(last_stxo.spent_h <= stxo.spent_h, "{} <= {}", last_stxo.spent_h, stxo.spent_h);
+                        }
+                        account.stxos.push(stxo);
+                    } else if let Some(txo_i) = txo_recv_h_position(&account.recv_txos, prevout_txid_h, &input.prevout) {
+                        // NOTE: we need to use our own tracking of the TXO as otherwise we don't know the value
+                        t_spend_c += 1;
+                        t_spend_z += account.recv_txos[txo_i].value.into_u64();
+                    } else {
+                        // accounted for by moving it into stxos(?)
+                    }
+                } else {
+                    // not spent by us in a block(?)
+                }
+            }
+        }
+
+        // PUSH NEW UNSPENT UTXOS
+        for (out_i, txout) in t_bundle.vout.iter().enumerate() {
+            let value = txout.value();
+            if t_spend_c > 0 {
+                // we spent money in this TX, so we must be responsible for the sends as well
+                t_send_c += 1;
+                t_send_z += value.into_u64();
+            }
+
+            if let Some(t_addr) = txout.recipient_address() {
+                if t_addr == account_t_addr {
+                    let utxo = Txo {
+                        recv_h: block_h,
+                        spent_h: BlockHeight(0),
+                        id: OutPoint::new(txid.into(), out_i.try_into().unwrap()),
+                        value,
+                        t_addr,
+                    };
+                    t_recv_c += 1;
+                    t_recv_z += value.into_u64();
+
+                    let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(&txid) {
+                        txid_h
+                    } else {
+                        block_h
+                    };
+                    if let Some(utxo_i) = txo_recv_h_position(&account.utxos, txid_h, &utxo.id) {
+                        if account.utxos[utxo_i] != utxo {
+                            println!("ERROR: UTXO mismatch: {:?} vs {:?}", account.utxos[utxo_i], &utxo);
+                        }
+                    } else if txo_recv_h_position(&account.recv_txos, txid_h, &utxo.id).is_none() {
+                        // TODO: can we just check if we've seen the tx && tx.2 == false
+                        if let Some(last_txo) = account.recv_txos.last() {
+                            debug_assert!(last_txo.recv_h <= utxo.recv_h, "{} <= {}", last_txo.recv_h, utxo.recv_h);
+                        }
+                        account.recv_txos.push(utxo.clone());
+
+                        if let Some(last_utxo) = account.utxos.last() {
+                            debug_assert!(last_utxo.recv_h <= utxo.recv_h, "{} <= {}", last_utxo.recv_h, utxo.recv_h);
+                        }
+                        account.utxos.push(utxo);
+                    }
+                }
+            }
+        }
+    }
+
+    let parts = [
+        WalletTxPart {
+            spent_zats: to_zats_or_dump_err("t tx receive", t_spend_z)?,
+            sent_zats: to_zats_or_dump_err("t tx receive", t_send_z)?,
+            recv_zats: to_zats_or_dump_err("t tx receive", t_recv_z)?,
+            spent_note_count: t_spend_c,
+            sent_note_count: t_send_c,
+            recv_note_count: t_recv_c,
+        },
+        WalletTxPart::ZERO,
+    ];
+
+    let new_tx = WalletTx {
+        account_id: 0,
+        txid,
+        expiry_h,
+        mined_h: block_h,
+        parts,
+        memo_count: 0,
+        memo: [0; 512],
+        is_coinbase,
+        is_outside_bc: false,
+    };
+
+    update_with_tx(wallet, new_tx.txid, new_tx, WalletTxPart::TRANSPARENT, insert_i);
+    Some(())
+}
+
 
 pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     fn stuff_from_seed_phrase<P: Parameters + 'static>(params:P, phrase: &str) -> (
@@ -1676,33 +1846,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             break (new_blocks, new_t_txs, sync_from_i, req_rng);
         };
 
-        fn orchard_recv_h_position(notes: &[OrchardNote], block_h: BlockHeight, nf: &orchard::note::Nullifier) -> Option<usize> {
-            let mut i = notes.partition_point(|txo| txo.recv_h < block_h);
-            while i < notes.len() && notes[i].recv_h == block_h {
-                if &notes[i].nf == nf {
-                    return Some(i);
-                }
-            }
-            None
-        }
-        fn txo_recv_h_position(notes: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
-            let mut i = notes.partition_point(|txo| txo.recv_h < block_h);
-            while i < notes.len() && notes[i].recv_h == block_h {
-                if &notes[i].id == utxo_id {
-                    return Some(i);
-                }
-            }
-            None
-        }
-        fn txo_spent_h_position(notes: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
-            let mut i = notes.partition_point(|txo| txo.spent_h < block_h);
-            while i < notes.len() && notes[i].spent_h == block_h {
-                if &notes[i].id == utxo_id {
-                    return Some(i);
-                }
-            }
-            None
-        }
 
         //-- REORG
         if let Some(start_block_i) = sync_from_i {
@@ -1781,140 +1924,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             for t_tx_i in 0..miner_t_txs.len() {
                 // kinda @in_step_sync
                 let block_h = miner_t_txs[t_tx_i].0;
-                let t_tx = &miner_t_txs[t_tx_i].1;
-                update_insert_i(&miner_wallet.txs, &mut insert_i, block_h);
-
-                let mut expiry_h = Some(BlockHeight::from(t_tx.expiry_height()));
-                if expiry_h.unwrap().0 == 0 {
-                    expiry_h = None;
-                }
-
-                // TODO IMPORTANT: this is just full-tx import
-
-                let txid = t_tx.txid();
-                println!("at h: {block_h}, transparent tx {txid} contains {} orchard actions", t_tx.orchard_bundle().map_or(0, |b| b.actions().len()));
-
-                // NOTE: these are only from *our* perspective
-                let mut total_received = 0;
-                let mut total_spent = 0;
-                let (mut t_send_z, mut t_spend_z, mut t_recv_z) = (0, 0, 0);
-                let (mut t_send_c, mut t_spend_c, mut t_recv_c) = (0, 0, 0);
-                let mut is_coinbase = false;
-                let account = &mut miner_wallet.accounts[0];
-                if let Some(t_bundle) = t_tx.transparent_bundle() {
-                    // TODO: t_bundle.authorization
-
-                    // println!("t_bundle: {t_bundle:?}");
-                    is_coinbase = t_bundle.is_coinbase();
-                    // HANDLE SPENT TXIDS
-                    if !is_coinbase {
-                        let mut input_i = 0;
-                        for input in &t_bundle.vin {
-                            println!("input {input_i} {input:?}");
-                            input_i += 1;
-
-                            if let Some(&prevout_txid_h) = miner_wallet.tx_h_map.get(input.prevout.txid()) {
-                                if let Some(utxo_i) = txo_recv_h_position(&account.utxos, prevout_txid_h, &input.prevout) {
-                                    let utxo = account.utxos.remove(utxo_i);
-                                    let stxo = Txo { spent_h: block_h, ..utxo };
-                                    if let Some(last_stxo) = account.stxos.last() {
-                                        if last_stxo.spent_h > stxo.spent_h {
-                                            println!("ERROR: out of sequence spent UTXO: {} > {}", last_stxo.spent_h, stxo.spent_h);
-                                        }
-                                    }
-                                    t_spend_c += 1;
-                                    t_spend_z += stxo.value.into_u64();
-
-                                    if let Some(last_stxo) = account.stxos.last() {
-                                        debug_assert!(last_stxo.spent_h <= stxo.spent_h, "{} <= {}", last_stxo.spent_h, stxo.spent_h);
-                                    }
-                                    account.stxos.push(stxo);
-                                } else if let Some(txo_i) = txo_recv_h_position(&account.recv_txos, prevout_txid_h, &input.prevout) {
-                                    // NOTE: we need to use our own tracking of the TXO as otherwise we don't know the value
-                                    t_spend_c += 1;
-                                    t_spend_z += account.recv_txos[txo_i].value.into_u64();
-                                } else {
-                                    // accounted for by moving it into stxos(?)
-                                }
-                            } else {
-                                // not spent by us in a block(?)
-                            }
-                        }
-                    }
-
-                    // PUSH NEW UNSPENT UTXOS
-                    for (out_i, txout) in t_bundle.vout.iter().enumerate() {
-                        let value = txout.value();
-                        if t_spend_c > 0 {
-                            // we spent money in this TX, so we must be responsible for the sends as well
-                            t_send_c += 1;
-                            t_send_z += value.into_u64();
-                        }
-
-                        if let Some(t_addr) = txout.recipient_address() {
-                            if t_addr == miner_t_address {
-                                let utxo = Txo {
-                                    recv_h: block_h,
-                                    spent_h: BlockHeight(0),
-                                    id: OutPoint::new(txid.into(), out_i.try_into().unwrap()),
-                                    value,
-                                    t_addr,
-                                };
-                                t_recv_c += 1;
-                                t_recv_z += value.into_u64();
-
-                                let txid_h = if let Some(&txid_h) = miner_wallet.tx_h_map.get(&txid) {
-                                    txid_h
-                                } else {
-                                    block_h
-                                };
-                                if let Some(utxo_i) = txo_recv_h_position(&account.utxos, txid_h, &utxo.id) {
-                                    if account.utxos[utxo_i] != utxo {
-                                        println!("ERROR: UTXO mismatch: {:?} vs {:?}", account.utxos[utxo_i], &utxo);
-                                    }
-                                } else if txo_recv_h_position(&account.recv_txos, txid_h, &utxo.id).is_none() {
-                                    // TODO: can we just check if we've seen the tx && tx.2 == false
-                                    if let Some(last_txo) = account.recv_txos.last() {
-                                        debug_assert!(last_txo.recv_h <= utxo.recv_h, "{} <= {}", last_txo.recv_h, utxo.recv_h);
-                                    }
-                                    account.recv_txos.push(utxo.clone());
-
-                                    if let Some(last_utxo) = account.utxos.last() {
-                                        debug_assert!(last_utxo.recv_h <= utxo.recv_h, "{} <= {}", last_utxo.recv_h, utxo.recv_h);
-                                    }
-                                    account.utxos.push(utxo);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let Some(spent_zats) = to_zats_or_dump_err("t tx receive", t_spend_z) else { continue; };
-                let Some(sent_zats) = to_zats_or_dump_err("t tx receive", t_send_z) else { continue; };
-                let Some(recv_zats) = to_zats_or_dump_err("t tx receive", t_recv_z) else { continue; };
-                let parts = [
-                    WalletTxPart {
-                        spent_zats, sent_zats, recv_zats,
-                        spent_note_count: t_spend_c,
-                        sent_note_count: t_send_c,
-                        recv_note_count: t_recv_c,
-                    },
-                    WalletTxPart::ZERO,
-                ];
-
-                let new_wallet_tx = WalletTx {
-                    account_id: 0,
-                    txid,
-                    expiry_h,
-                    mined_h: block_h,
-                    parts,
-                    memo_count: 0,
-                    memo: [0; 512],
-                    is_coinbase,
-                    is_outside_bc: false,
-                };
-
-                update_with_tx(miner_wallet, new_wallet_tx.txid, new_wallet_tx, WalletTxPart::TRANSPARENT, &mut insert_i);
+                let tx = &miner_t_txs[t_tx_i].1;
+                read_full_tx(miner_wallet, 0, block_h, tx, &mut insert_i);
             }
         }
 
@@ -2036,7 +2047,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             },
                         ];
 
-                        let new_wallet_tx = WalletTx {
+                        let new_tx = WalletTx {
                             account_id: 0,
                             txid,
                             expiry_h: None, // TODO
@@ -2050,7 +2061,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         };
 
                         drop(account);
-                        update_with_tx(wallet, txid, new_wallet_tx, WalletTxPart::SHIELDED, &mut insert_i);
+                        update_with_tx(wallet, txid, new_tx, WalletTxPart::SHIELDED, &mut insert_i);
                     }
                 }
             }
