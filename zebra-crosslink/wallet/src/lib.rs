@@ -3,7 +3,7 @@
 
 use zcash_client_backend::data_api::WalletCommitmentTrees;
 use orchard::keys::SpendAuthorizingKey;
-use orchard::note_encryption::CompactAction;
+use orchard::note_encryption::{ CompactAction as OrchardCompactAction, OrchardDomain };
 use rand_chacha::rand_core::SeedableRng;
 use rand_core::OsRng;
 use sapling_crypto::zip32::ExtendedSpendingKey;
@@ -26,7 +26,7 @@ use zcash_client_memory::MemBlockCache;
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
-use zcash_note_encryption::{try_compact_note_decryption, try_note_decryption, try_output_recovery_with_ovk};
+use zcash_note_encryption::{try_compact_note_decryption, try_note_decryption, try_output_recovery_with_ovk, ShieldedOutput};
 use zcash_primitives::transaction::builder::{BuildConfig, Builder as TxBuilder};
 use zcash_primitives::transaction::components::TxOut;
 use zcash_primitives::transaction::fees::zip317::{self, MINIMUM_FEE};
@@ -76,7 +76,7 @@ use zcash_client_backend::{
         UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedIncomingViewingKey, UnifiedSpendingKey,
     },
     proto::{
-        compact_formats::{CompactBlock, CompactTx},
+        compact_formats::{CompactBlock, CompactTx, CompactSaplingSpend, CompactSaplingOutput, CompactOrchardAction},
         service::{
             compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
             Duration, Empty, GetAddressUtxosArg, LightdInfo, TransparentAddressBlockFilter,
@@ -159,7 +159,7 @@ impl std::fmt::Display for LEHash {
 struct Txo {
     pub recv_h: BlockHeight,
     pub spent_h: BlockHeight,
-    pub id: OutPoint, // txid + index in tx
+    pub id: OutPoint, // txid + index in tx // (kind of nullifier-like)
     // both from TxOut
     pub value: Zatoshis,
     pub t_addr: TransparentAddress, // convertible to/from pubkey_script
@@ -170,8 +170,8 @@ impl Txo {
     }
 }
 
-pub struct Txos<'a>(pub &'a [Txo]);
-impl std::fmt::Debug for Txos<'_> {
+pub struct NL<'a, T>(pub &'a [T]);
+impl<T: std::fmt::Debug> std::fmt::Debug for NL<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut i = 0;
         write!(f, "[")?;
@@ -187,6 +187,18 @@ impl std::fmt::Debug for Txos<'_> {
         Ok(())
     }
 }
+
+// ALT: collapse into Txo with internal enum(s)
+#[derive(Clone, Debug, PartialEq)]
+struct OrchardNote {
+    pub recv_h: BlockHeight,
+    pub spent_h: BlockHeight,
+    pub nf: orchard::note::Nullifier,
+    // TODO: could be compressed by decomposition
+    pub note: orchard::note::Note,
+    // TODO: commitment? ephemeralkey?
+}
+
 
 const CHEAT_UNSTAKING: bool = false;
 
@@ -325,6 +337,7 @@ pub struct WalletTx {
     pub expiry_h: Option<BlockHeight>,
     pub mined_h: BlockHeight,
 
+    // TODO: track whether full Transaction has been read
     pub is_coinbase: bool,
     pub parts: [WalletTxPart; 2], // 0=>transparent, 1=>shielded
 
@@ -671,6 +684,10 @@ pub struct ManualAccount {
     // TODO: handle partial spends i.e. spend created locally but not seen in block
     // spent: sorted by spend height
     pub stxos: Vec<Txo>,
+
+    pub recv_orchard_notes: Vec<OrchardNote>,
+    pub unspent_orchard_notes: Vec<OrchardNote>,
+    pub spent_orchard_notes: Vec<OrchardNote>,
 }
 // NOTE: WalletDb doesn't store spending key, so we'll do the same here...
 #[derive(Clone, Debug)]
@@ -1000,6 +1017,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             recv_txos: Vec::new(),
             utxos: Vec::new(),
             stxos: Vec::new(),
+            recv_orchard_notes: Vec::new(),
+            unspent_orchard_notes: Vec::new(),
+            spent_orchard_notes: Vec::new(),
         };
 
         let wallet = ManualWallet {
@@ -1656,26 +1676,29 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             break (new_blocks, new_t_txs, sync_from_i, req_rng);
         };
 
-        fn recv_h_position(utxos: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
-            let utxos_at_h_start = utxos.partition_point(|txo| txo.recv_h < block_h);
-            for utxo_i in utxos_at_h_start..utxos.len() {
-                if utxos[utxo_i].recv_h > block_h {
-                    break;
-                }
-                if &utxos[utxo_i].id == utxo_id {
-                    return Some(utxo_i);
+        fn orchard_recv_h_position(notes: &[OrchardNote], block_h: BlockHeight, nf: &orchard::note::Nullifier) -> Option<usize> {
+            let mut i = notes.partition_point(|txo| txo.recv_h < block_h);
+            while i < notes.len() && notes[i].recv_h == block_h {
+                if &notes[i].nf == nf {
+                    return Some(i);
                 }
             }
             None
         }
-        fn spent_h_position(utxos: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
-            let utxos_at_h_start = utxos.partition_point(|txo| txo.spent_h < block_h);
-            for utxo_i in utxos_at_h_start..utxos.len() {
-                if utxos[utxo_i].spent_h > block_h {
-                    break;
+        fn txo_recv_h_position(notes: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
+            let mut i = notes.partition_point(|txo| txo.recv_h < block_h);
+            while i < notes.len() && notes[i].recv_h == block_h {
+                if &notes[i].id == utxo_id {
+                    return Some(i);
                 }
-                if &utxos[utxo_i].id == utxo_id {
-                    return Some(utxo_i);
+            }
+            None
+        }
+        fn txo_spent_h_position(notes: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) -> Option<usize> {
+            let mut i = notes.partition_point(|txo| txo.spent_h < block_h);
+            while i < notes.len() && notes[i].spent_h == block_h {
+                if &notes[i].id == utxo_id {
+                    return Some(i);
                 }
             }
             None
@@ -1699,27 +1722,41 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     let truncate_to_i = account.balance_changes.partition_point(|(b,_)| *b < block_h);
                     account.balance_changes.truncate(truncate_to_i);
 
-                    //- unreceive utxos
+                    //- UNRECEIVE NOTES
                     let utxos_at_h_start = account.utxos.partition_point(|txo| txo.recv_h < block_h);
                     account.utxos.truncate(utxos_at_h_start);
                     let recv_txos_at_h_start = account.recv_txos.partition_point(|txo| txo.recv_h < block_h);
                     account.recv_txos.truncate(recv_txos_at_h_start);
 
-                    //- unspend stxos
+                    let unspent_orchard_notes_at_h_start = account.unspent_orchard_notes.partition_point(|txo| txo.recv_h < block_h);
+                    account.unspent_orchard_notes.truncate(unspent_orchard_notes_at_h_start);
+                    let recv_orchard_notes_at_h_start = account.recv_orchard_notes.partition_point(|txo| txo.recv_h < block_h);
+                    account.recv_orchard_notes.truncate(recv_orchard_notes_at_h_start);
+
+                    //- UNSPEND NOTES
                     let stxos_at_h_start = account.stxos.partition_point(|txo| txo.spent_h < block_h);
                     for stxo in &account.stxos[stxos_at_h_start..] {
                         // TODO: these are NOT in order
                         if stxo.recv_h < block_h {
                             // reinsert at the end of that height
-                            let i = recv_h_position(&account.utxos, BlockHeight(stxo.recv_h.0+1), &stxo.id).unwrap_or(account.utxos.len());
-                            if i > 0 {
-                                debug_assert!(account.utxos[i-1].recv_h <= stxo.recv_h, "{} <= {}", account.utxos[i-1].recv_h, stxo.recv_h);
-                            }
-
+                            let i = txo_recv_h_position(&account.utxos, BlockHeight(stxo.recv_h.0+1), &stxo.id).unwrap_or(account.utxos.len());
+                            debug_assert!(i == 0 || account.utxos[i-1].recv_h <= stxo.recv_h, "{} <= {}", account.utxos[i-1].recv_h, stxo.recv_h);
                             account.utxos.insert(i, Txo{ spent_h: BlockHeight(0), ..stxo.clone() });
                         }
                     }
                     account.stxos.truncate(stxos_at_h_start);
+
+                    let spent_orchard_notes_at_h_start = account.spent_orchard_notes.partition_point(|note| note.spent_h < block_h);
+                    for spent_orchard_note in &account.spent_orchard_notes[spent_orchard_notes_at_h_start..] {
+                        // TODO: these are NOT in order
+                        if spent_orchard_note.recv_h < block_h {
+                            // reinsert at the end of that height
+                            let i = orchard_recv_h_position(&account.unspent_orchard_notes, BlockHeight(spent_orchard_note.recv_h.0+1), &spent_orchard_note.nf).unwrap_or(account.unspent_orchard_notes.len());
+                            debug_assert!(i == 0 || account.unspent_orchard_notes[i-1].recv_h <= spent_orchard_note.recv_h, "{} <= {}", account.unspent_orchard_notes[i-1].recv_h, spent_orchard_note.recv_h);
+                            account.unspent_orchard_notes.insert(i, OrchardNote{ spent_h: BlockHeight(0), ..spent_orchard_note.clone() });
+                        }
+                    }
+                    account.spent_orchard_notes.truncate(spent_orchard_notes_at_h_start);
                 }
 
                 //  higher blocks & mempool
@@ -1752,7 +1789,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     expiry_h = None;
                 }
 
+                // TODO IMPORTANT: this is just full-tx import
+
                 let txid = t_tx.txid();
+                println!("at h: {block_h}, transparent tx {txid} contains {} orchard actions", t_tx.orchard_bundle().map_or(0, |b| b.actions().len()));
+
                 // NOTE: these are only from *our* perspective
                 let mut total_received = 0;
                 let mut total_spent = 0;
@@ -1765,15 +1806,15 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     // println!("t_bundle: {t_bundle:?}");
                     is_coinbase = t_bundle.is_coinbase();
+                    // HANDLE SPENT TXIDS
                     if !is_coinbase {
                         let mut input_i = 0;
                         for input in &t_bundle.vin {
-                            // handle spent txids
                             println!("input {input_i} {input:?}");
                             input_i += 1;
 
                             if let Some(&prevout_txid_h) = miner_wallet.tx_h_map.get(input.prevout.txid()) {
-                                if let Some(utxo_i) = recv_h_position(&account.utxos, prevout_txid_h, &input.prevout) {
+                                if let Some(utxo_i) = txo_recv_h_position(&account.utxos, prevout_txid_h, &input.prevout) {
                                     let utxo = account.utxos.remove(utxo_i);
                                     let stxo = Txo { spent_h: block_h, ..utxo };
                                     if let Some(last_stxo) = account.stxos.last() {
@@ -1788,7 +1829,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                         debug_assert!(last_stxo.spent_h <= stxo.spent_h, "{} <= {}", last_stxo.spent_h, stxo.spent_h);
                                     }
                                     account.stxos.push(stxo);
-                                } else if let Some(txo_i) = recv_h_position(&account.recv_txos, prevout_txid_h, &input.prevout) {
+                                } else if let Some(txo_i) = txo_recv_h_position(&account.recv_txos, prevout_txid_h, &input.prevout) {
                                     // NOTE: we need to use our own tracking of the TXO as otherwise we don't know the value
                                     t_spend_c += 1;
                                     t_spend_z += account.recv_txos[txo_i].value.into_u64();
@@ -1801,7 +1842,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
                     }
 
-                    // push new unspent utxos
+                    // PUSH NEW UNSPENT UTXOS
                     for (out_i, txout) in t_bundle.vout.iter().enumerate() {
                         let value = txout.value();
                         if t_spend_c > 0 {
@@ -1827,11 +1868,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 } else {
                                     block_h
                                 };
-                                if let Some(utxo_i) = recv_h_position(&account.utxos, txid_h, &utxo.id) {
+                                if let Some(utxo_i) = txo_recv_h_position(&account.utxos, txid_h, &utxo.id) {
                                     if account.utxos[utxo_i] != utxo {
                                         println!("ERROR: UTXO mismatch: {:?} vs {:?}", account.utxos[utxo_i], &utxo);
                                     }
-                                } else if recv_h_position(&account.recv_txos, txid_h, &utxo.id).is_none() {
+                                } else if txo_recv_h_position(&account.recv_txos, txid_h, &utxo.id).is_none() {
                                     // TODO: can we just check if we've seen the tx && tx.2 == false
                                     if let Some(last_txo) = account.recv_txos.last() {
                                         debug_assert!(last_txo.recv_h <= utxo.recv_h, "{} <= {}", last_txo.recv_h, utxo.recv_h);
@@ -1875,9 +1916,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 update_with_tx(miner_wallet, new_wallet_tx.txid, new_wallet_tx, WalletTxPart::TRANSPARENT, &mut insert_i);
             }
-
-            println!("miner unspent UTXOs {:#?}", Txos(&*miner_wallet.accounts[0].utxos));
-            println!("miner spent   UTXOs {:#?}", Txos(&*miner_wallet.accounts[0].stxos));
         }
 
         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
@@ -1890,6 +1928,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
 
             for (wallet_i, wallet) in [miner_wallet, user_wallet].into_iter().enumerate() {
+                let account = &mut wallet.accounts[0];
+                let ufvk = account.ufvk.clone();
+                let orchard_fvk = ufvk.orchard();
+                let (orchard_ivk, orchard_ovk) = if let Some(fvk) = ufvk.orchard() {
+                    // TODO: other scopes?
+                    (Some(fvk.to_ivk(orchard::keys::Scope::External).prepare()), Some(fvk.to_ovk(orchard::keys::Scope::External)))
+                } else {
+                    (None, None)
+                };
+                // TODO: sapling
+
                 let mut insert_i = 0;
                 for block in &new_blocks {
                     let block_h = BlockHeight(block.height.try_into().unwrap());
@@ -1897,8 +1946,52 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
 
                     //-- INCORPORATE SHIELDED TRANSACTIONS FROM COMPACT BLOCK
-                    for tx in &block.vtx {
+                    'tx_iter: for tx in &block.vtx {
+                        let account = &mut wallet.accounts[0];
                         let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
+
+                        for orchard_action in &tx.actions {
+                            let action = match OrchardCompactAction::try_from(orchard_action) {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    // TODO: should we fail validation for the entire block above if we can't do this?
+                                    println!("couldn't convert CompactOrchardAction to orchard::CompactAction: {err:?}");
+                                    continue;
+                                }
+                            };
+                            let domain = OrchardDomain::for_compact_action(&action);
+
+                            if let Some(ivk) = &orchard_ivk {
+                                let decrypt_res: Option<(orchard::note::Note, orchard::Address)> = try_compact_note_decryption(&domain, ivk, &action);
+                                if let Some((note, _recipient)) = decrypt_res {
+                                    account.unspent_orchard_notes.push(OrchardNote{
+                                        recv_h: block_h,
+                                        spent_h: BlockHeight(0),
+                                        note,
+                                        // in note:
+                                        // value: match Zatoshis::from_u64(note.value().inner()) {
+                                        //     Ok(v) => v,
+                                        //     Err(err) => {
+                                        //         println!("couldn't convert {:?} to Zatoshis: {err:?}", note.value());
+                                        //         continue 'tx_iter;
+                                        //     }
+                                        // },
+                                        nf: note.nullifier(orchard_fvk.unwrap()), // TODO: cache or recompute?
+                                    });
+                                }
+
+                                // NOTE: action.nullifier() is like prevout, it's the spent id (if
+                                // a recv action)
+                                // TODO: handle nullifier
+                            }
+
+                            // if let Some(ovk) = &orchard_ovk {
+                            //     if let Some((_note, _recipient, _no_memo)) = try_output_recovery_with_ovk(&domain, ovk, &action, action.cmstar_bytes(), action.enc_ciphertext()) {
+
+                            //     }
+                            // }
+                        }
+                        // TODO: sapling
 
                         // TODO: do we want to always recompute or can we assume data is constant
                         // if txid is the same? (N.B. the txid is a hash of some transaction data
@@ -1932,6 +2025,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             is_outside_bc: false,
                         };
 
+                        drop(account);
                         update_with_tx(wallet, txid, new_wallet_tx, WalletTxPart::SHIELDED, &mut insert_i);
                     }
                 }
@@ -1975,6 +2069,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+        println!("miner unspent UTXOs {:#?}", NL(&*miner_wallet.accounts[0].utxos));
+        println!("miner spent   UTXOs {:#?}", NL(&*miner_wallet.accounts[0].stxos));
+        println!("miner unspent notes {:#?}", NL(&*miner_wallet.accounts[0].unspent_orchard_notes));
+        println!("miner spent   notes {:#?}", NL(&*miner_wallet.accounts[0].spent_orchard_notes));
+
         let mut txs = miner_wallet.txs.clone();
         txs.reverse();
         wallet_state.lock().unwrap().txs = txs;
