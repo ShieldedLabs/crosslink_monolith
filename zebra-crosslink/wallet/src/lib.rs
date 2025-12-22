@@ -596,7 +596,7 @@ fn update_insert_i(txs: &[WalletTx], insert_i: &mut usize, block_h: BlockHeight)
     *insert_i += txs[*insert_i..].partition_point(|tx| tx.mined_h <= block_h);
 }
 
-fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, insert_i: &mut usize) {
+fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, components: usize, insert_i: &mut usize) {
     // find if there's an existing height/transaction for this txid
     if let Some(tx_h) = wallet.tx_h_map.get_mut(&txid) {
         let mut h_start_i = wallet.txs.partition_point(|tx| tx.mined_h < *tx_h);
@@ -621,6 +621,13 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, i
             if old_tx != new_tx {
                 println!("{} wallet updated existing transaction {txid} {:?} => {:?}", wallet.name, old_tx.mined_h, new_tx.mined_h);
                 // println!("{} wallet updated existing transaction {txid} {old_tx:?} => {new_tx:?}", wallet.name);
+
+                // leave the tx-parts from the components not provided here
+                for component in 0..new_tx.parts.len() {
+                    if (components & (1 << component)) == 0 {
+                        new_tx.parts[component] = old_tx.parts[component];
+                    }
+                }
             }
         } else {
             println!("ERROR: {txid:?} not found at associated height {tx_h:?}");
@@ -905,7 +912,8 @@ impl ManualWallet {
             };
             let mut insert_i = 0;
             update_insert_i(&self.txs, &mut insert_i, new_wallet_tx.mined_h);
-            update_with_tx(self, tx.txid(), new_wallet_tx, &mut insert_i);
+            let components = WalletTxPart::TRANSPARENT | WalletTxPart::SHIELDED;
+            update_with_tx(self, tx.txid(), new_wallet_tx, components, &mut insert_i);
             Some(tx.txid())
         } else {
             None
@@ -1865,7 +1873,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     is_outside_bc: false,
                 };
 
-                update_with_tx(miner_wallet, new_wallet_tx.txid, new_wallet_tx, &mut insert_i);
+                update_with_tx(miner_wallet, new_wallet_tx.txid, new_wallet_tx, WalletTxPart::TRANSPARENT, &mut insert_i);
             }
 
             println!("miner unspent UTXOs {:#?}", Txos(&*miner_wallet.accounts[0].utxos));
@@ -1924,7 +1932,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             is_outside_bc: false,
                         };
 
-                        update_with_tx(wallet, txid, new_wallet_tx, &mut insert_i);
+                        update_with_tx(wallet, txid, new_wallet_tx, WalletTxPart::SHIELDED, &mut insert_i);
                     }
                 }
             }
