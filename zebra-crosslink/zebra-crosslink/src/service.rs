@@ -6,6 +6,7 @@
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -115,6 +116,7 @@ impl fmt::Debug for TFLServiceCalls {
 pub fn spawn_new_tfl_service(
     is_regtest: bool,
     global_seed: [u8; 32],
+    path_to_pos_store_file: PathBuf,
     state_service_call: StateServiceProcedure,
     mempool_service_call: MempoolServiceProcedure,
     force_feed_pow_call: ForceFeedPoWBlockProcedure,
@@ -127,7 +129,7 @@ pub fn spawn_new_tfl_service(
 
         for (i, peer) in config.malachite_peers.iter().enumerate() {
             let (_, _, public_key) = rng_private_public_key_from_address(peer.as_bytes());
-            array.push(crate::MalValidator::new(public_key, vec![StakeTxId{ txid: [0;32], zats:1 }]));
+            array.push(crate::MalValidator::new(public_key.into(), vec![StakeTxId{ txid: [0;32], zats:1 }]));
             map.insert(public_key, peer.to_string());
         }
 
@@ -143,7 +145,7 @@ pub fn spawn_new_tfl_service(
             // .unwrap_or(String::from_str("tester").unwrap());
             info!("user_name: {}", user_name);
             let (_, _, public_key) = rng_private_public_key_from_address(&user_name.as_bytes());
-            array.push(crate::MalValidator::new(public_key, vec![StakeTxId{ txid: [0;32], zats:1 }]));
+            array.push(crate::MalValidator::new(public_key.into(), vec![StakeTxId{ txid: [0;32], zats:1 }]));
             map.insert(public_key, user_name);
         }
 
@@ -164,6 +166,7 @@ pub fn spawn_new_tfl_service(
         validators_at_current_height,
         validators_keys_to_names,
         current_bc_final: None,
+        path_to_pos_store_file: path_to_pos_store_file.clone(),
     }));
 
     let handle_mtx = Arc::new(std::sync::Mutex::new(None));
@@ -209,7 +212,7 @@ pub fn spawn_new_tfl_service(
     let handle2 = handle1.clone();
     (
         handle1,
-        tokio::spawn(async move { crate::tfl_service_main_loop(handle2, global_seed).await }),
+        tokio::spawn(async move { crate::tfl_service_main_loop(handle2, global_seed, path_to_pos_store_file).await }),
     )
 }
 

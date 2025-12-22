@@ -367,7 +367,7 @@ pub enum TMStatusReason {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct ValueId(pub [u8; 32]);
+pub struct ValueId(pub [u8; 32]);
 impl ValueId { const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
 impl std::fmt::Debug   for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "VId{", &self.0)?; write!(f, "}}") } }
@@ -379,7 +379,7 @@ impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<
 impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Pub{", &self.0[..2])?; write!(f, "}}") } }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct TMSig(pub [u8; 64]);
+pub struct TMSig(pub [u8; 64]);
 impl TMSig {
     const NIL: Self = Self([0; 64]);
     fn verify(&self, pub_key: PubKeyID, signed_data: &[u8]) -> Result<(), (ed25519_zebra::Error, &str)> {
@@ -391,32 +391,32 @@ impl TMSig {
 impl std::fmt::Debug for TMSig { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Sig{", &self.0[..2])?; write!(f, "}}") } }
 
 #[derive(Debug, Clone)]
-struct RoundData {
-    height: u64,
-    round: u32,
+pub struct RoundData {
+    pub height: u64,
+    pub round: u32,
     // parallel with sorted roster arrays
     // TODO: keep parallel with each other, but be sparse in members
-    proposal: BlockValue,
-    proposal_valid_round: i64,
-    proposal_sigs: Vec<TMSig>,
-    proposal_sigs_n: usize, // filling sigs with random-access
-    proposal_id: ValueId,
-    proposal_checked_validity: (TMStatus, TMStatusReason),
+    pub proposal: BlockValue,
+    pub proposal_valid_round: i64,
+    pub proposal_sigs: Vec<TMSig>,
+    pub proposal_sigs_n: usize, // filling sigs with random-access
+    pub proposal_id: ValueId,
+    pub proposal_checked_validity: (TMStatus, TMStatusReason),
     // TODO: handle early outs because of this
-    proposal_is_faulty: bool,
+    pub proposal_is_faulty: bool,
 
     // TODO: we may be able to compress valueid, but we do need to track it before we have the proposal
-    msg_val_sigs: Vec<[(ValueId, TMSig); 2]>, // prevote then precommit
-    roster: Vec<SortedRosterMember>,
+    pub msg_val_sigs: Vec<[(ValueId, TMSig); 2]>, // prevote then precommit
+    pub roster: Vec<SortedRosterMember>,
 
-    counts: ConsensusCounts,
+    pub counts: ConsensusCounts,
     // TODO: can probably do this from whether *our* node has a valid value
     // TODO: by round or for whole state?
-    active_timeout: Option<Timeout>,
-    timeout_triggered: [bool; 2],
+    pub active_timeout: Option<Timeout>,
+    pub timeout_triggered: [bool; 2],
 }
 impl RoundData {
-    const EMPTY: RoundData = RoundData {
+    pub const EMPTY: RoundData = RoundData {
         height: 0,
         round: 0,
         proposal: BlockValue(Vec::new()), // NOTE(azmr): don't alloc until we know the size (signed by proposer)
@@ -468,7 +468,7 @@ struct TMMsg {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-struct ConsensusCounts {
+pub struct ConsensusCounts {
     anys: u64,
     prevotes: u64,
     nil_prevotes: u64,
@@ -551,7 +551,7 @@ fn roster_i_from_pub_key(roster: &[SortedRosterMember], pub_key: PubKeyID) -> Op
 }
 
 #[derive(Debug, Clone)]
-struct Timeout { time: Instant, height: u64, round: u32, step: TMStep }
+pub struct Timeout { time: Instant, height: u64, round: u32, step: TMStep }
 impl Timeout {
     fn new(now: Instant, height: u64, round: u32, step: TMStep) -> Timeout {
         use std::time::Duration;
@@ -1651,6 +1651,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         ClosureToUpdateRosterCmd(Arc::new(move |_str| { Box::pin(async move {
             Some(format!("{:?}", pub_key))
         })})),
+        Vec::new(),
     ).await
 }
 
@@ -1669,6 +1670,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          is_pow_in_chain_closure: ClosureIsPoWInChain,
                          push_pow_closure: ClosureToPushPow,
                          roster_cmd_closure: ClosureToUpdateRosterCmd,
+                         ingest_startup_data: Vec<RoundData>,
                         ) -> std::io::Result<()> {
     hook_fail_on_panic();
     let mut base_rng = {
@@ -1715,6 +1717,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     // TODO: only convert private to public in 1 location
     let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_bft_key.into()), my_port, propose_closure, validate_closure, push_block_closure, get_block_closure, get_pow_closure, parse_pow_closure, is_pow_in_chain_closure, push_pow_closure, roster_cmd_closure); // TODO: double-check this is the right key
+
+    bft_state.height = ingest_startup_data.len() as u64;
+    bft_state.recent_commit_round_cache = ingest_startup_data;
+
     bft_state.start_round(&roster, Instant::now(), 0).await;
 
     let mut my_endpoint_evidence = if let Some(i) = roster_endpoint_evidence.iter().position(|e| &e.root_public_bft_key == my_root_public_bft_key.as_ref()) {

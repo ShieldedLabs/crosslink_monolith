@@ -182,6 +182,14 @@ impl StartCmd {
         };
         *wallet::GLOBAL_SEED.lock().unwrap() = Some(global_seed);
 
+        let path_to_pos_store_file = {
+            let mut key_path = config.state.cache_dir.clone();
+            let _ = std::fs::create_dir_all(key_path.clone());
+
+            key_path.push("pos.chain");
+            key_path
+        };
+
 
         info!("initializing node state");
         let (_, max_checkpoint_height) = zebra_consensus::router::init_checkpoint_list(
@@ -327,6 +335,7 @@ impl StartCmd {
             zebra_crosslink::service::spawn_new_tfl_service(
                 is_regtest,
                 global_seed,
+                path_to_pos_store_file,
                 Arc::new(move |req| {
                     let state = state.clone();
                     Box::pin(async move { state.clone().ready().await?.call(req).await })

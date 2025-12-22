@@ -14,6 +14,7 @@ use strum_macros::{EnumCount, EnumIter};
 
 use tenderlink::SortedRosterMember;
 use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
+use ed25519_zebra::VerificationKeyBytes;
 use zebra_chain::serialization::{
     SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
 };
@@ -23,7 +24,9 @@ use multiaddr::Multiaddr;
 use rand::{CryptoRng, RngCore};
 use rand::{Rng, SeedableRng};
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::hash::{DefaultHasher, Hasher};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -186,6 +189,7 @@ pub(crate) struct TFLServiceInternal {
     validators_at_current_height: Vec<MalValidator>,
 
     current_bc_final: Option<(BlockHeight, BlockHash)>,
+    path_to_pos_store_file: PathBuf,
 }
 
 fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: zebra_chain::block::FatPointerToBftBlock, child_fat_pointer: zebra_chain::block::FatPointerToBftBlock) -> bool {
@@ -512,46 +516,6 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
     }
 }
 
-async fn malachite_wants_to_know_what_the_current_validator_set_is(
-    tfl_handle: &TFLServiceHandle,
-) -> Vec<MalValidator> {
-    let internal = tfl_handle.internal.lock().await;
-
-    let mut return_validator_list_because_of_malachite_bug =
-        internal.validators_at_current_height.clone();
-    if return_validator_list_because_of_malachite_bug
-        .iter()
-        .position(|v| v.address.0 == internal.my_public_key)
-        .is_none()
-    {
-        return_validator_list_because_of_malachite_bug.push(MalValidator::new(
-            internal.my_public_key,
-            Vec::new()
-        ));
-    }
-    let finalizers = return_validator_list_because_of_malachite_bug;
-    if true {
-        let mut total_voting_power = 0;
-        let mut non_0_members = 0;
-        for finalizer_i in 0..finalizers.len() {
-            let finalizer = &finalizers[finalizer_i];
-            if finalizer.voting_power == 0 {
-                continue;
-            }
-
-            non_0_members += 1;
-            total_voting_power += finalizer.voting_power;
-        }
-
-        info!(
-            "Giving malachite roster with {} voting power between {} non-0 members",
-            total_voting_power, non_0_members
-        );
-    }
-
-    finalizers
-}
-
 async fn new_decided_bft_block_from_malachite(
     tfl_handle: &TFLServiceHandle,
     new_block: &BftBlock,
@@ -561,19 +525,6 @@ async fn new_decided_bft_block_from_malachite(
     let params = &PROTOTYPE_PARAMETERS;
 
     let mut internal = tfl_handle.internal.lock().await;
-
-    let mut return_validator_list_because_of_malachite_bug =
-        internal.validators_at_current_height.clone();
-    if return_validator_list_because_of_malachite_bug
-        .iter()
-        .position(|v| v.address.0 == internal.my_public_key)
-        .is_none()
-    {
-        return_validator_list_because_of_malachite_bug.push(MalValidator::new(
-            internal.my_public_key,
-            Vec::new()
-        ));
-    }
 
     if fat_pointer.points_at_block_hash() != new_block.blake3_hash() {
         error!(
@@ -702,6 +653,7 @@ async fn new_decided_bft_block_from_malachite(
                         continue;
                     }
                 }
+//println!("Applying height: {}", new_final_height_hash.0.0);
 
                 // Divide the reward between finalizers. Any rounding errors are intended to be
                 // accounted for here by giving those zats to the finalizer with the largest
@@ -812,6 +764,21 @@ async fn new_decided_bft_block_from_malachite(
             }
         }
         internal.current_bc_final = new_bc_final;
+    }
+
+
+//println!("Storing pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, internal.validators_at_current_height);
+    {
+        let mut append_bytes: Vec<u8> = Vec::new();
+        new_block.zcash_serialize(&mut append_bytes).unwrap();
+        fat_pointer.zcash_serialize(&mut append_bytes).unwrap();
+        append_bytes.extend_from_slice(&(internal.validators_at_current_height.len() as u64).to_le_bytes());
+        for v in &internal.validators_at_current_height {
+            v.write_to(&mut append_bytes).unwrap();
+        }
+        let mut file = OpenOptions::new().append(true).open(&internal.path_to_pos_store_file).unwrap();
+        file.write_all(&append_bytes).unwrap();
+        file.flush().unwrap();
     }
 
     tenderlink_roster_from_internal(&internal.validators_at_current_height)
@@ -1086,7 +1053,7 @@ fn update_roster_for_cmd(
     if let Some((sub_key, sub_name)) = sub_key_name {
         // error!("subtraction currently non-functional")
         let sub_key = MalPublicKey2(sub_key.into());
-        let Some(member) = roster.iter_mut().find(|cmp| cmp.public_key == sub_key.0) else {
+        let Some(member) = roster.iter_mut().find(|cmp| VerificationKeyBytes::from(cmp.public_key) == sub_key.0) else {
             warn!(
                 "Roster command invalid: can't subtract from non-present finalizer \"{}\"",
                 sub_key
@@ -1126,10 +1093,10 @@ fn update_roster_for_cmd(
         // NOTE: all adds are to action.target
         let add_key = MalPublicKey2(action.target.into());
         let stake = StakeTxId{ txid, zats };
-        let member = if let Some(mut member) = roster.iter_mut().find(|cmp| cmp.public_key == add_key.0) {
+        let member = if let Some(mut member) = roster.iter_mut().find(|cmp| VerificationKeyBytes::from(cmp.public_key) == add_key.0) {
             member.push_txid(stake);
         } else {
-            roster.push(MalValidator::new(add_key.0, vec![stake]));
+            roster.push(MalValidator::new(add_key.0.into(), vec![stake]));
         };
     }
 
@@ -1158,7 +1125,7 @@ fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> 
     cmd_c
 }
 
-async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [u8; 32]) -> Result<(), String> {
+async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [u8; 32], path_to_pos_store_file: PathBuf) -> Result<(), String> {
     let call = internal_handle.call.clone();
     let config = internal_handle.config.clone();
     let params = &PROTOTYPE_PARAMETERS;
@@ -1250,13 +1217,71 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             endpoint_maybe = Some(b);
         };
 
-        let unsorted_roster = internal_handle
+        let tfl_handle1 = internal_handle.clone();
+        let tfl_handle2 = internal_handle.clone();
+        let tfl_handle3 = internal_handle.clone();
+        let tfl_handle4 = internal_handle.clone();
+        let tfl_handle5 = internal_handle.clone();
+        let tfl_handle6 = internal_handle.clone();
+        let tfl_handle7 = internal_handle.clone();
+
+        use ed25519_zebra::VerificationKeyBytes;
+        let tender_pub = VerificationKeyBytes::from(&my_private_key);
+        *wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap() = tender_pub.into();
+
+        // TODO(Sam): Fill this out.
+        let mut ingest_data_for_tenderlink: Vec<tenderlink::RoundData> = Vec::new();
+
+        let mut i_bft_blocks: Vec<BftBlock> = Vec::new();
+        let mut fat_pointer_to_tip: FatPointerToBftBlock2 = FatPointerToBftBlock2::null();
+        let mut unsorted_roster = internal_handle
             .internal
             .lock()
             .await
             .validators_at_current_height
             .clone();
-        let roster = tenderlink_roster_from_internal(&unsorted_roster);
+
+        let mut pos_file = OpenOptions::new().read(true).write(true).create(true).open(&path_to_pos_store_file).unwrap();
+        let mut pos_file_bytes = Vec::new();
+        pos_file.read_to_end(&mut pos_file_bytes).unwrap();
+
+        let mut cursor = Cursor::new(pos_file_bytes);
+        let mut valid_byte_count = 0;
+        loop {
+            valid_byte_count = cursor.position();
+            let block = if let Ok(block) = BftBlock::zcash_deserialize(&mut cursor) { block } else { break; };
+            let fat_pointer = if let Ok(fat_pointer) = FatPointerToBftBlock2::zcash_deserialize(&mut cursor) { fat_pointer } else { break; };
+
+            let mut buf = [0u8; 8];
+            if cursor.read_exact(&mut buf).is_err() { break; }
+            let new_roster_count = u64::from_le_bytes(buf);
+            let mut new_roster = Vec::new();
+            for _ in 0..new_roster_count {
+                if let Ok(v) = MalValidator::read_from(&mut cursor) {
+                    new_roster.push(v);
+                } else { break; }
+            }
+
+            if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() { break; }
+            
+            let mut round_data = tenderlink::RoundData::EMPTY;
+            
+            ingest_data_for_tenderlink.push(round_data);
+            i_bft_blocks.push(block);
+            fat_pointer_to_tip = fat_pointer;
+            unsorted_roster = new_roster;
+        }
+        pos_file.set_len(valid_byte_count).unwrap();
+
+        let mut new_final_hash = BlockHash([0; 32]);
+        let mut new_final_height = BlockHeight(0);
+
+        if let Some(new_block) = i_bft_blocks.last() {
+            new_final_hash = new_block.headers.first().expect("at least 1 header").hash();
+            new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
+//println!("Loaded at pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, unsorted_roster);
+        }
+
 
         // Note(Sam): We do not support human names in the start config for now.
         let evidence = unsorted_roster
@@ -1279,17 +1304,19 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             })
             .collect();
 
-        let tfl_handle1 = internal_handle.clone();
-        let tfl_handle2 = internal_handle.clone();
-        let tfl_handle3 = internal_handle.clone();
-        let tfl_handle4 = internal_handle.clone();
-        let tfl_handle5 = internal_handle.clone();
-        let tfl_handle6 = internal_handle.clone();
-        let tfl_handle7 = internal_handle.clone();
+        let roster = {
+            let mut internal = internal_handle.internal.lock().await;
 
-        use ed25519_zebra::VerificationKeyBytes;
-        let tender_pub = VerificationKeyBytes::from(&my_private_key);
-        *wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap() = tender_pub.into();
+            let roster = tenderlink_roster_from_internal(&unsorted_roster);
+            internal.validators_at_current_height = unsorted_roster;
+            internal.bft_blocks = i_bft_blocks;
+            internal.fat_pointer_to_tip = fat_pointer_to_tip;
+            if new_final_hash != BlockHash([0; 32]) {
+                internal.current_bc_final = Some((new_final_height, new_final_hash));
+                internal.latest_final_block = Some((new_final_height, new_final_hash));
+            }
+            roster
+        };
 
         tokio::spawn(tenderlink::entry_point(
             my_private_key,
@@ -1402,6 +1429,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     }
                 })
             })),
+            ingest_data_for_tenderlink,
         ));
     }
 
@@ -1895,8 +1923,7 @@ async fn _tfl_dump_block_sequence(
 /// A validator is a public key and voting power
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MalValidator {
-    pub address: MalPublicKey2,
-    pub public_key: MalPublicKey,
+    pub public_key: [u8; 32],
     pub voting_power: u64,
 
     pub txids: Vec<StakeTxId>,
@@ -1904,9 +1931,8 @@ pub struct MalValidator {
 
 impl MalValidator {
     #[cfg_attr(coverage_nightly, coverage(off))]
-    pub fn new(public_key: MalPublicKey, initial_stakes: Vec<StakeTxId>) -> Self {
+    pub fn new(public_key: [u8; 32], initial_stakes: Vec<StakeTxId>) -> Self {
         Self {
-            address: MalPublicKey2(public_key),
             public_key,
             voting_power: Self::total_stake(&initial_stakes),
             txids: initial_stakes,
@@ -1928,6 +1954,59 @@ impl MalValidator {
         }
         zats
     }
+
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&self.public_key)?;
+        w.write_all(&self.voting_power.to_le_bytes())?;
+
+        let len: u32 = self
+            .txids
+            .len()
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "txids too large"))?;
+        w.write_all(&len.to_le_bytes())?;
+
+        for tx in &self.txids {
+            tx.write_to(w)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+        let mut public_key = [0u8; 32];
+        r.read_exact(&mut public_key)?;
+
+        let mut vp_bytes = [0u8; 8];
+        r.read_exact(&mut vp_bytes)?;
+        let voting_power = u64::from_le_bytes(vp_bytes);
+
+        let mut len_bytes = [0u8; 4];
+        r.read_exact(&mut len_bytes)?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+
+        let mut txids = Vec::with_capacity(len);
+        for _ in 0..len {
+            txids.push(StakeTxId::read_from(r)?);
+        }
+
+        // Optional consistency check: recompute and ensure it matches the stored voting_power.
+        // If you *don't* want voting_power stored on disk, you can drop it from the format
+        // and always compute it here.
+        let computed = Self::total_stake(&txids);
+        if computed != voting_power {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("voting_power mismatch: stored={voting_power}, computed={computed}"),
+            ));
+        }
+
+        Ok(Self {
+            public_key,
+            voting_power,
+            txids,
+        })
+    }
 }
 
 impl PartialOrd for MalValidator {
@@ -1938,7 +2017,7 @@ impl PartialOrd for MalValidator {
 
 impl Ord for MalValidator {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.address.cmp(&other.address)
+        self.public_key.cmp(&other.public_key)
     }
 }
 
@@ -2107,7 +2186,7 @@ impl FatPointerToBftBlock2 {
 }
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io;
+use std::io::{self, Cursor, Read, Write};
 
 impl ZcashSerialize for FatPointerToBftBlock2 {
     fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {

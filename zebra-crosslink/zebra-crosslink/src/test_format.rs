@@ -589,7 +589,7 @@ pub(crate) async fn handle_instr(
             let finalizer = internal
                 .validators_at_current_height
                 .iter()
-                .find(|x| x.public_key == key);
+                .find(|x| VerificationKeyBytes::from(x.public_key) == key);
 
             if let Some(finalizer) = finalizer {
                 test_check(

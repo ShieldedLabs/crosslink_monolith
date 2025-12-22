@@ -3934,10 +3934,10 @@ pub async fn viz_main(
 
             for val in &g.validators_at_current_height {
                 let string =
-                    if let Some(user_name) = g.validators_keys_to_names.get(&val.public_key) {
+                    if let Some(user_name) = g.validators_keys_to_names.get(&val.public_key.into()) {
                         user_name.clone()
                     } else {
-                        let mut string = format!("{:?}", MalPublicKey2(val.public_key));
+                        let mut string = format!("{:?}", MalPublicKey2(val.public_key.into()));
                         string.truncate(16);
                         string
                     };

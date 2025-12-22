@@ -1383,6 +1383,23 @@ pub struct StakeTxId {
     pub zats: u64, // accumulated, not initial
 }
 impl StakeTxId {
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&self.txid)?;
+        w.write_all(&self.zats.to_le_bytes())?;
+        Ok(())
+    }
+
+    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+        let mut txid = [0u8; 32];
+        r.read_exact(&mut txid)?;
+
+        let mut zats_bytes = [0u8; 8];
+        r.read_exact(&mut zats_bytes)?;
+        let zats = u64::from_le_bytes(zats_bytes);
+
+        Ok(Self { txid, zats })
+    }
+    
     pub fn write_to_vec(&self, data: &mut std::vec::Vec<u8>) {
         data.write_all(&self.txid).unwrap();
         data.write_all(&self.zats.to_le_bytes()).unwrap();
