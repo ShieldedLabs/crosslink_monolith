@@ -693,7 +693,7 @@ struct DrawCtx {
     debug_pixel_inspector_last_color: *mut u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum DrawCommand {
     ClearScreenToColor {
         color: u32,
@@ -741,6 +741,14 @@ enum DrawCommand {
         glyph_bitmap_run: *const (u16, i16),
         glyph_bitmap_run_len: usize,
     },
+}
+
+impl Default for DrawCommand {
+    fn default() -> Self {
+        Self::ClearScreenToColor {
+            color: 0
+        }
+    }
 }
 
 struct FrameStat {
@@ -1194,11 +1202,10 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 *draw_ctx.font_tracker_count = put;
                                             }
 
-                                            if input_ctx.key_pressed(KeyCode::Space) {
-                                                println!("woosh");
-
-                                                play_sound(SOUND_UI_WOOSH, 0.5+0.1*rand::random::<f32>(), 1.0+0.5*rand::random::<f32>());
-                                            }
+                                            // if input_ctx.key_pressed(KeyCode::Space) {
+                                            //     println!("woosh");
+                                            //     play_sound(SOUND_UI_WOOSH, 0.5+0.1*rand::random::<f32>(), 1.0+0.5*rand::random::<f32>());
+                                            // }
 
                                             // clear screen
                                             {

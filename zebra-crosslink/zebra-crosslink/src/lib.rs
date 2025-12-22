@@ -1375,11 +1375,11 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                             let bytes = serialized.to_vec();
                             Some(bytes)
                         } else {
-                            eprintln!("\n\n\n\n\n\n\n\n@Phillip: Serializing failed for PoW block with hash {:?}.\n\n\n\n\n\n\n\n", hash);
+                            eprintln!("PowLink: \x1b[93mSerializing failed\x1b[0m for PoW block with hash {:?}.", hash);
                             None
                         }
                     } else {
-                        eprintln!("\n\n\n\n\n\n\n\n@Phillip: Couldn't find PoW block for hash {:?}.\n\n\n\n\n\n\n\n", hash);
+                        eprintln!("PowLink: \x1b[93mCouldn't find PoW block\x1b[0m  for hash {:?}.", hash);
                         None
                     }
                 })
@@ -1393,11 +1393,11 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                         if check_hash.0 == hash {
                             Some(Arc::new(block))
                         } else {
-                            eprintln!("\n\n\n\n\n\n\n\n@Phillip: Serializing the bytes succeeded but the block hash was different.\n\n\n\n\n\n\n\n");
+                            eprintln!("PowLink: Serializing the bytes succeeded but the \x1b[93mblock hash was different\x1b[0m.");
                             None
                         }
                     } else {
-                        eprintln!("\n\n\n\n\n\n\n\n@Phillip: Deserializing the bytes failed.\n\n\n\n\n\n\n\n");
+                        eprintln!("PowLink: Deserializing the bytes \x1b[93mfailed\x1b[0m.");
                         None
                     }
                 })

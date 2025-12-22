@@ -7,7 +7,7 @@ fn main() {
     if true {
         let txs = vec![
             WalletTx::with_fake_data(WalletTxKind::Send, 100_000_000, 0, false, "Hello, world!", 0),
-            WalletTx::with_fake_data(WalletTxKind::Receive, 0, 100_000_000, false, "Other things", 10),
+            /* WalletTx::with_fake_data(WalletTxKind::Receive, 0, 100_000_000, false, "Other things", 10),
             WalletTx::with_fake_data(WalletTxKind::Send, 250_000_000, 0, true, "More things", 11),
             WalletTx::with_fake_data(WalletTxKind::Shield, 10_000_000_000, 0, true, "", 12),
             WalletTx::with_fake_data(WalletTxKind::Stake, 10_000_000_000, 0, false, "", 0),
@@ -41,7 +41,7 @@ fn main() {
             WalletTx::with_fake_data(WalletTxKind::Send, 250_000_000, 0, true, "More things", 0),
             WalletTx::with_fake_data(WalletTxKind::Shield, 10_000_000_000, 0, true, "", 0),
             WalletTx::with_fake_data(WalletTxKind::Stake, 10_000_000_000, 0, false, "", 0),
-            WalletTx::with_fake_data(WalletTxKind::Unstake, 10_000_000_000, 0, false, "", 0),
+            WalletTx::with_fake_data(WalletTxKind::Unstake, 10_000_000_000, 0, false, "", 0), */
         ];
 
         let mut pending: Vec<_> = txs.iter().filter(|tx| tx.0.mined_height.is_none()).map(|tx| tx.clone()).collect();
@@ -52,7 +52,7 @@ fn main() {
 
         wallet_state.lock().unwrap().txs = pending;
         wallet_state.lock().unwrap().roster = vec![
-            WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 25540_000_000, txids: vec![] },
+            /* WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 25540_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0xBBu8; 32], voting_power: 111000100_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0xCCu8; 32], voting_power: 250_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0xDDu8; 32], voting_power: 100_000_000, txids: vec![] },
@@ -67,15 +67,16 @@ fn main() {
             WalletRosterMember{ pub_key: [0x66u8; 32], voting_power: 250_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0x77u8; 32], voting_power: 100_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0x88u8; 32], voting_power: 250_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0x99u8; 32], voting_power: 100_000_000, txids: vec![] },
+            WalletRosterMember{ pub_key: [0x99u8; 32], voting_power: 100_000_000, txids: vec![] }, */
         ];
         wallet_state.lock().unwrap().staked_roster = vec![
-            ([0xAAu8; 32], [0x1u8; 32], 100_000_000, 250_000_000),
+            /* ([0xAAu8; 32], [0x1u8; 32], 100_000_000, 250_000_000),
             ([0xBBu8; 32], [0x1u8; 32], 100_000_000, 100_000_000),
             ([0xCCu8; 32], [0x1u8; 32], 100_000_000, 250_000_000),
-            ([0xDDu8; 32], [0x1u8; 32], 100_000_000, 100_000_000),
+            ([0xDDu8; 32], [0x1u8; 32], 100_000_000, 100_000_000), */
         ];
     }
 
-    visualizer_zcash::main_thread_run_program(wallet_state, true);
+    // visualizer_zcash::main_thread_run_program(wallet_state, true);
+    visualizer_zcash::main_thread_run_program(wallet_state, false);
 }
