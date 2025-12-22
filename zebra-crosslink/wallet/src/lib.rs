@@ -929,7 +929,7 @@ impl ManualWallet {
             };
             let mut insert_i = 0;
             update_insert_i(&self.txs, &mut insert_i, new_tx.mined_h);
-            let components = WalletTxPart::TRANSPARENT | WalletTxPart::SHIELDED;
+            let components = (1 << WalletTxPart::TRANSPARENT) | (1 << WalletTxPart::SHIELDED);
             update_with_tx(self, tx.txid(), new_tx, components, &mut insert_i);
             Some(tx.txid())
         } else {
@@ -1145,7 +1145,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, block_h: BlockHeigh
         is_outside_bc: false,
     };
 
-    update_with_tx(wallet, new_tx.txid, new_tx, WalletTxPart::TRANSPARENT, insert_i);
+    update_with_tx(wallet, new_tx.txid, new_tx, 1 << WalletTxPart::TRANSPARENT, insert_i);
     Some(())
 }
 
@@ -2061,7 +2061,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         };
 
                         drop(account);
-                        update_with_tx(wallet, txid, new_tx, WalletTxPart::SHIELDED, &mut insert_i);
+                        update_with_tx(wallet, txid, new_tx, 1 << WalletTxPart::SHIELDED, &mut insert_i);
                     }
                 }
             }
