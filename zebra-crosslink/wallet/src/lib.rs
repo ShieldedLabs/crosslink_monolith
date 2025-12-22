@@ -1964,7 +1964,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             if let Some(ivk) = &orchard_ivk {
                                 let decrypt_res: Option<(orchard::note::Note, orchard::Address)> = try_compact_note_decryption(&domain, ivk, &action);
                                 if let Some((note, _recipient)) = decrypt_res {
-                                    account.unspent_orchard_notes.push(OrchardNote{
+                                    let orchard_note = OrchardNote{
                                         recv_h: block_h,
                                         spent_h: BlockHeight(0),
                                         note,
@@ -1977,7 +1977,31 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                         //     }
                                         // },
                                         nf: note.nullifier(orchard_fvk.unwrap()), // TODO: cache or recompute?
-                                    });
+                                    };
+
+
+                                    let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(&txid) {
+                                        txid_h
+                                    } else {
+                                        block_h
+                                    };
+
+                                    if let Some(i) = orchard_recv_h_position(&account.unspent_orchard_notes, txid_h, &orchard_note.nf) {
+                                        if account.unspent_orchard_notes[i] != orchard_note {
+                                            println!("ERROR: orchard_note mismatch: {:?} vs {:?}", account.unspent_orchard_notes[i], &orchard_note);
+                                        }
+                                    } else if orchard_recv_h_position(&account.recv_orchard_notes, txid_h, &orchard_note.nf).is_none() {
+                                        // TODO: can we just check if we've seen the tx && tx.2 == false
+                                        if let Some(last_txo) = account.recv_orchard_notes.last() {
+                                            debug_assert!(last_txo.recv_h <= orchard_note.recv_h, "{} <= {}", last_txo.recv_h, orchard_note.recv_h);
+                                        }
+                                        account.recv_orchard_notes.push(orchard_note.clone());
+
+                                        if let Some(last_unspent_orchard_note) = account.unspent_orchard_notes.last() {
+                                            debug_assert!(last_unspent_orchard_note.recv_h <= orchard_note.recv_h, "{} <= {}", last_unspent_orchard_note.recv_h, orchard_note.recv_h);
+                                        }
+                                        account.unspent_orchard_notes.push(orchard_note);
+                                    }
                                 }
 
                                 // NOTE: action.nullifier() is like prevout, it's the spent id (if
