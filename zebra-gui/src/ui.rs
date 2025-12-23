@@ -465,7 +465,7 @@ impl Context {
     pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: bool) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
 
         let mouse_hover = self.hovered(id);
-        let key_hover   = self.nav_id == Some(id.id);
+        let key_hover   = self.nav_enable && self.nav_id == id.id;
 
         let mouse_held     = mouse_hover && self.input().mouse_held(winit::event::MouseButton::Left);
         let mouse_pressed  = mouse_hover && self.input().mouse_pressed(winit::event::MouseButton::Left);
@@ -1967,7 +1967,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
     ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Default);
 
     ui.capture = false;
-    let prev_nav_idx_to_id = ui.nav_idx_to_id.clone();
+    // let prev_nav_idx_to_id = ui.nav_idx_to_id.clone();
     ui.nav_id_to_idx.clear();
     ui.nav_idx_to_id.clear();
 
@@ -2163,24 +2163,30 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
     if !ui.input().mouse_held(winit::event::MouseButton::Left) {
         ui.mouse_pressed_id = Id::default();
     }
-    if ui.mouse_pressed_id != Id::default() {
+    if ui.mouse_pressed_id == Id::default() {
+        if ui.input().mouse_pressed(winit::event::MouseButton::Left) {
+            // ui.nav_enable = false;
+        }
+    } else {
+        // ui.most_recent_mouse_pressed_id = ui.mouse_pressed_id;
+        if ui.nav_id != ui.mouse_pressed_id.id {
+            ui.nav_enable = false;
+        }
+        ui.nav_id = ui.mouse_pressed_id.id;
         ui.capture = true;
     }
 
-    if ui.mouse_pressed_id != Id::default() {
-        ui.most_recent_mouse_pressed_id = ui.mouse_pressed_id;
+    if !ui.nav_id_to_idx.contains_key(&ui.nav_id) {
+        ui.nav_id = 0;
+        ui.nav_enable = false;
     }
-
-    if let Some(nav_id) = ui.nav_id && !ui.nav_id_to_idx.contains_key(&nav_id) {
-        ui.nav_id = None;
-    }
-    if ui.input().key_pressed(KeyCode::Escape) {
-        ui.nav_id = None;
-    }
+    // if ui.input().key_pressed(KeyCode::Escape) {
+    //     ui.nav_enable = false;
+    // }
 
     if ui.input().key_pressed(KeyCode::Tab) && ui.nav_idx_to_id.len() > 0 {
-        let idx = if let Some(nav_id) = ui.nav_id {
-            let old_idx = ui.nav_id_to_idx[&nav_id] as isize;
+        let idx = if ui.nav_id != 0 {
+            let old_idx = ui.nav_id_to_idx[&ui.nav_id] as isize;
             if (ui.input().key_held(KeyCode::ShiftLeft) || ui.input().key_held(KeyCode::ShiftRight)) {
                 (old_idx - 1).rem_euclid(ui.nav_idx_to_id.len() as isize) as usize
             } else {
@@ -2189,7 +2195,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
         } else {
             0
         };
-        ui.nav_id = Some(ui.nav_idx_to_id[idx]);
+        ui.nav_id = ui.nav_idx_to_id[idx];
+        ui.nav_enable = true;
     }
 
     // Return the list of render commands of your layout
@@ -2213,7 +2220,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             let x2 = (command.bounding_box.x + command.bounding_box.width)  as isize;
             let y2 = (command.bounding_box.y + command.bounding_box.height) as isize;
 
-            if ui.nav_id == Some(command.id) {
+            if ui.nav_id == command.id {
                 nav_bbox = Some((x1, y1, x2, y2));
             }
 
@@ -2266,7 +2273,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
             }
         }
 
-        if let Some((x1, y1, x2, y2)) = nav_bbox {
+        if ui.nav_enable && let Some((x1, y1, x2, y2)) = nav_bbox {
             let gap = ui.scale(1.0) as isize;
 
             let x1 = x1 - gap;
@@ -2346,11 +2353,12 @@ pub struct Context {
 
     pub mouse_pressed_id:             Id,
     pub key_pressed_id:               Id,
-    pub most_recent_mouse_pressed_id: Id,
+    // pub most_recent_mouse_pressed_id: Id,
 
     pub nav_id_to_idx: HashMap<u32, usize>,
     pub nav_idx_to_id: Vec<u32>,
-    pub nav_id: Option<u32>,
+    pub nav_id: u32,
+    pub nav_enable: bool,
 
     pub pane_tab_l: Id,
     pub pane_tab_r: Id,
