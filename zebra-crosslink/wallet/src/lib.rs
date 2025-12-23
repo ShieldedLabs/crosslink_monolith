@@ -1018,7 +1018,48 @@ fn txo_spent_h_position(notes: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint)
     None
 }
 
-fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize) -> Option<()> {
+struct PreparedKeys {
+    pub orchard_fvk: Option<orchard::keys::FullViewingKey>,
+    pub orchard_ivk: Option<orchard::keys::PreparedIncomingViewingKey>,
+    pub orchard_ovk: Option<orchard::keys::OutgoingViewingKey>,
+    // TODO: sapling
+}
+impl PreparedKeys {
+    pub fn from_ufvk_all(ufvk: &UnifiedFullViewingKey) -> Self {
+        let mut keys = PreparedKeys {
+            orchard_fvk: None,
+            orchard_ivk: None,
+            orchard_ovk: None,
+        };
+
+        if let Some(fvk) = ufvk.orchard() {
+            // TODO: other scopes?
+            keys.orchard_fvk = Some(fvk.clone());
+            keys.orchard_ivk = Some(fvk.to_ivk(orchard::keys::Scope::External).prepare());
+            keys.orchard_ovk = Some(fvk.to_ovk(orchard::keys::Scope::External));
+        };
+
+        keys
+    }
+
+    pub fn from_ufvk_ivks(ufvk: &UnifiedFullViewingKey) -> Self {
+        let mut keys = PreparedKeys {
+            orchard_fvk: None,
+            orchard_ivk: None,
+            orchard_ovk: None,
+        };
+
+        if let Some(fvk) = ufvk.orchard() {
+            // TODO: other scopes?
+            keys.orchard_fvk = Some(fvk.clone());
+            keys.orchard_ivk = Some(fvk.to_ivk(orchard::keys::Scope::External).prepare());
+        };
+
+        keys
+    }
+}
+
+fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize) -> Option<()> {
     update_insert_i(&wallet.txs, insert_i, block_h);
 
     let mut expiry_h = Some(BlockHeight::from(tx.expiry_height()));
@@ -1155,6 +1196,131 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, block_h: BlockHeigh
     };
 
     update_with_tx(wallet, new_tx.txid, new_tx, 1 << WalletTxPart::TRANSPARENT, insert_i);
+    Some(())
+}
+
+fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, insert_i: &mut usize) -> Option<()> {
+    let account = &mut wallet.accounts[account_i];
+    let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
+
+    let (mut s_send_z, mut s_spend_z, mut s_recv_z) = (0, 0, 0);
+    let (mut s_send_c, mut s_spend_c, mut s_recv_c) = (0, 0, 0);
+
+    for orchard_action in &tx.actions {
+        let action = match OrchardCompactAction::try_from(orchard_action) {
+            Ok(v) => v,
+            Err(err) => {
+                // TODO: should we fail validation for the entire block above if we can't do this?
+                println!("couldn't convert CompactOrchardAction to orchard::CompactAction: {err:?}");
+                continue;
+            }
+        };
+        let domain = OrchardDomain::for_compact_action(&action);
+
+        if let Some(ivk) = &keys.orchard_ivk {
+            let decrypt_res: Option<(orchard::note::Note, orchard::Address)> = try_compact_note_decryption(&domain, ivk, &action);
+            if let Some((note, _recipient)) = decrypt_res {
+                let orchard_note = OrchardNote{
+                    recv_h: block_h,
+                    spent_h: BlockHeight(0),
+                    txid,
+                    note,
+                    // in note:
+                    // value: match Zatoshis::from_u64(note.value().inner()) {
+                    //     Ok(v) => v,
+                    //     Err(err) => {
+                    //         println!("couldn't convert {:?} to Zatoshis: {err:?}", note.value());
+                    //         continue 'tx_iter;
+                    //     }
+                    // },
+                    nf: note.nullifier(keys.orchard_fvk.as_ref().expect("implied by ivk presence")), // TODO: cache or recompute?
+                };
+
+                s_recv_c += 1;
+                s_recv_z += note.value().inner();
+                // NOTE: s_send_c/s_send_z equivalent handled inside update_with_tx
+
+                let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(&txid) {
+                    txid_h
+                } else {
+                    block_h
+                };
+
+                if let Some(i) = orchard_recv_h_position(&account.unspent_orchard_notes, txid_h, &orchard_note.nf) {
+                    if account.unspent_orchard_notes[i] != orchard_note {
+                        println!("ERROR: orchard_note mismatch: {:?} vs {:?}", account.unspent_orchard_notes[i], &orchard_note);
+                    }
+                } else if orchard_recv_h_position(&account.recv_orchard_notes, txid_h, &orchard_note.nf).is_none() {
+                    // TODO: can we just check if we've seen the tx && tx.2 == false
+                    if let Some(last_txo) = account.recv_orchard_notes.last() {
+                        debug_assert!(last_txo.recv_h <= orchard_note.recv_h, "{} <= {}", last_txo.recv_h, orchard_note.recv_h);
+                    }
+                    account.recv_orchard_notes.push(orchard_note.clone());
+
+                    if let Some(last_unspent_orchard_note) = account.unspent_orchard_notes.last() {
+                        debug_assert!(last_unspent_orchard_note.recv_h <= orchard_note.recv_h, "{} <= {}", last_unspent_orchard_note.recv_h, orchard_note.recv_h);
+                    }
+                    account.unspent_orchard_notes.push(orchard_note);
+                }
+            }
+
+            // NOTE: action.nullifier() is like prevout, it's the spent id (if
+            // a recv action)
+            // TODO: handle nullifier
+        }
+
+        // if let Some(ovk) = &orchard_ovk {
+        //     if let Some((_note, _recipient, _no_memo)) = try_output_recovery_with_ovk(&domain, ovk, &action, action.cmstar_bytes(), action.enc_ciphertext()) {
+
+        //     }
+        // }
+    }
+    // TODO: sapling
+
+    // TODO: do we want to always recompute or can we assume data is constant
+    // if txid is the same? (N.B. the txid is a hash of some transaction data
+    // but not all)
+    // Conservative approach: always recompute
+    // TODO: decrypt our transactions & fill in actual data here
+    // TODO: get full info with memos
+
+    if (s_spend_c | s_send_c | s_recv_c) != 0 {
+        let (s_spent_zats, s_sent_zats, s_recv_zats) = match (Zatoshis::from_u64(s_spend_z), Zatoshis::from_u64(s_send_z), Zatoshis::from_u64(s_recv_z)) {
+            (Ok(s_spent_zats), Ok(s_sent_zats), Ok(s_recv_zats)) => (s_spent_zats, s_sent_zats, s_recv_zats),
+            (spent, sent, recv) => {
+                println!("couldn't convert all to Zats: ({spent:?}, {sent:?}, {recv:?})");
+                return None;
+            }
+        };
+
+        let parts = [
+            WalletTxPart::ZERO,
+            WalletTxPart {
+                spent_zats: s_spent_zats,
+                sent_zats: s_sent_zats,
+                recv_zats: s_recv_zats,
+                spent_note_count: s_spend_c,
+                sent_note_count: s_send_c,
+                recv_note_count: s_recv_c,
+            },
+        ];
+
+        let new_tx = WalletTx {
+            account_id: 0,
+            txid,
+            expiry_h: None, // TODO
+            mined_h: block_h,
+            parts,
+            // TODO: get memos
+            memo_count: 0,
+            memo: [0; 512],
+            is_coinbase: false,
+            is_outside_bc: false,
+        };
+
+        drop(account);
+        update_with_tx(wallet, txid, new_tx, 1 << WalletTxPart::SHIELDED, insert_i);
+    }
     Some(())
 }
 
@@ -1929,12 +2095,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // } else {
             //     req_rng.0.try_into.expect("fits in u32")
             // };
+            let keys = PreparedKeys::from_ufvk_all(&miner_wallet.accounts[0].ufvk);
             let mut insert_i = 0;
             for t_tx_i in 0..miner_t_txs.len() {
                 // kinda @in_step_sync
                 let block_h = miner_t_txs[t_tx_i].0;
                 let tx = &miner_t_txs[t_tx_i].1;
-                read_full_tx(miner_wallet, 0, block_h, tx, &mut insert_i);
+                read_full_tx(miner_wallet, 0, &keys, block_h, tx, &mut insert_i);
             }
         }
 
@@ -1948,17 +2115,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
 
             for (wallet_i, wallet) in [miner_wallet, user_wallet].into_iter().enumerate() {
-                let account = &mut wallet.accounts[0];
-                let ufvk = account.ufvk.clone();
-                let orchard_fvk = ufvk.orchard();
-                let (orchard_ivk, orchard_ovk) = if let Some(fvk) = ufvk.orchard() {
-                    // TODO: other scopes?
-                    (Some(fvk.to_ivk(orchard::keys::Scope::External).prepare()), Some(fvk.to_ovk(orchard::keys::Scope::External)))
-                } else {
-                    (None, None)
-                };
-                // TODO: sapling
-
+                let keys = PreparedKeys::from_ufvk_ivks(&wallet.accounts[0].ufvk); // NOTE: can't use ovk for CompactTx
                 let mut insert_i = 0;
                 for block in &new_blocks {
                     let block_h = BlockHeight(block.height.try_into().unwrap());
@@ -1967,127 +2124,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     //-- INCORPORATE SHIELDED TRANSACTIONS FROM COMPACT BLOCK
                     'tx_iter: for tx in &block.vtx {
-                        let account = &mut wallet.accounts[0];
-                        let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
-
-                        let (mut s_send_z, mut s_spend_z, mut s_recv_z) = (0, 0, 0);
-                        let (mut s_send_c, mut s_spend_c, mut s_recv_c) = (0, 0, 0);
-
-                        for orchard_action in &tx.actions {
-                            let action = match OrchardCompactAction::try_from(orchard_action) {
-                                Ok(v) => v,
-                                Err(err) => {
-                                    // TODO: should we fail validation for the entire block above if we can't do this?
-                                    println!("couldn't convert CompactOrchardAction to orchard::CompactAction: {err:?}");
-                                    continue;
-                                }
-                            };
-                            let domain = OrchardDomain::for_compact_action(&action);
-
-                            if let Some(ivk) = &orchard_ivk {
-                                let decrypt_res: Option<(orchard::note::Note, orchard::Address)> = try_compact_note_decryption(&domain, ivk, &action);
-                                if let Some((note, _recipient)) = decrypt_res {
-                                    let orchard_note = OrchardNote{
-                                        recv_h: block_h,
-                                        spent_h: BlockHeight(0),
-                                        txid,
-                                        note,
-                                        // in note:
-                                        // value: match Zatoshis::from_u64(note.value().inner()) {
-                                        //     Ok(v) => v,
-                                        //     Err(err) => {
-                                        //         println!("couldn't convert {:?} to Zatoshis: {err:?}", note.value());
-                                        //         continue 'tx_iter;
-                                        //     }
-                                        // },
-                                        nf: note.nullifier(orchard_fvk.unwrap()), // TODO: cache or recompute?
-                                    };
-
-                                    s_recv_c += 1;
-                                    s_recv_z += note.value().inner();
-                                    // NOTE: s_send_c/s_send_z equivalent handled inside update_with_tx
-
-                                    let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(&txid) {
-                                        txid_h
-                                    } else {
-                                        block_h
-                                    };
-
-                                    if let Some(i) = orchard_recv_h_position(&account.unspent_orchard_notes, txid_h, &orchard_note.nf) {
-                                        if account.unspent_orchard_notes[i] != orchard_note {
-                                            println!("ERROR: orchard_note mismatch: {:?} vs {:?}", account.unspent_orchard_notes[i], &orchard_note);
-                                        }
-                                    } else if orchard_recv_h_position(&account.recv_orchard_notes, txid_h, &orchard_note.nf).is_none() {
-                                        // TODO: can we just check if we've seen the tx && tx.2 == false
-                                        if let Some(last_txo) = account.recv_orchard_notes.last() {
-                                            debug_assert!(last_txo.recv_h <= orchard_note.recv_h, "{} <= {}", last_txo.recv_h, orchard_note.recv_h);
-                                        }
-                                        account.recv_orchard_notes.push(orchard_note.clone());
-
-                                        if let Some(last_unspent_orchard_note) = account.unspent_orchard_notes.last() {
-                                            debug_assert!(last_unspent_orchard_note.recv_h <= orchard_note.recv_h, "{} <= {}", last_unspent_orchard_note.recv_h, orchard_note.recv_h);
-                                        }
-                                        account.unspent_orchard_notes.push(orchard_note);
-                                    }
-                                }
-
-                                // NOTE: action.nullifier() is like prevout, it's the spent id (if
-                                // a recv action)
-                                // TODO: handle nullifier
-                            }
-
-                            // if let Some(ovk) = &orchard_ovk {
-                            //     if let Some((_note, _recipient, _no_memo)) = try_output_recovery_with_ovk(&domain, ovk, &action, action.cmstar_bytes(), action.enc_ciphertext()) {
-
-                            //     }
-                            // }
-                        }
-                        // TODO: sapling
-
-                        // TODO: do we want to always recompute or can we assume data is constant
-                        // if txid is the same? (N.B. the txid is a hash of some transaction data
-                        // but not all)
-                        // Conservative approach: always recompute
-                        // TODO: decrypt our transactions & fill in actual data here
-                        // TODO: get full info with memos
-
-                        if (s_spend_c | s_send_c | s_recv_c) != 0 {
-                            let (s_spent_zats, s_sent_zats, s_recv_zats) = match (Zatoshis::from_u64(s_spend_z), Zatoshis::from_u64(s_send_z), Zatoshis::from_u64(s_recv_z)) {
-                                (Ok(s_spent_zats), Ok(s_sent_zats), Ok(s_recv_zats)) => (s_spent_zats, s_sent_zats, s_recv_zats),
-                                (spent, sent, recv) => {
-                                    println!("couldn't convert all to Zats: ({spent:?}, {sent:?}, {recv:?})");
-                                    continue;
-                                }
-                            };
-
-                            let parts = [
-                                    WalletTxPart::ZERO,
-                                    WalletTxPart {
-                                        spent_zats: s_spent_zats,
-                                        sent_zats: s_sent_zats,
-                                        recv_zats: s_recv_zats,
-                                        spent_note_count: s_spend_c,
-                                        sent_note_count: s_send_c,
-                                        recv_note_count: s_recv_c,
-                                    },
-                                ];
-
-                                let new_tx = WalletTx {
-                                    account_id: 0,
-                                    txid,
-                                    expiry_h: None, // TODO
-                                    mined_h: block_h,
-                                    parts,
-                                    // TODO: get memos
-                                    memo_count: 0,
-                                    memo: [0; 512],
-                                    is_coinbase: false,
-                                    is_outside_bc: false,
-                                };
-
-                                drop(account);
-                                update_with_tx(wallet, txid, new_tx, 1 << WalletTxPart::SHIELDED, &mut insert_i);
-                        }
+                        read_compact_tx(wallet, 0, &keys, block_h, tx, &mut insert_i);
                     }
                 }
             }
