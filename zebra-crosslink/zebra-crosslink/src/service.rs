@@ -183,7 +183,7 @@ pub fn spawn_new_tfl_service(
             };
             if accepted {
                 info!("Successfully force-fed BFT block");
-                crate::new_decided_bft_block_from_malachite(&handle, block.as_ref(), &fat_pointer)
+                crate::new_decided_bft_block_from_malachite(&handle, block.as_ref(), &fat_pointer, Vec::new())
                     .await;
                 true
             } else {

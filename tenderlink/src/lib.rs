@@ -182,7 +182,7 @@ impl std::fmt::Debug for ClosureToValidateProposedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToValidateProposedBlock(..)") }
 }
 #[derive(Clone)]
-pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock3)-> core::pin::Pin<Box<dyn Future<Output = Vec<SortedRosterMember>> + Send>> + Send + Sync + 'static>);
+pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock3, Vec<TMSig>)-> core::pin::Pin<Box<dyn Future<Output = Vec<SortedRosterMember>> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToPushDecidedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushDecidedBlock(..)") }
 }
@@ -368,7 +368,7 @@ pub enum TMStatusReason {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ValueId(pub [u8; 32]);
-impl ValueId { const NIL: Self = Self([0; 32]); }
+impl ValueId { pub const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
 impl std::fmt::Debug   for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "VId{", &self.0)?; write!(f, "}}") } }
 
@@ -381,7 +381,7 @@ impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TMSig(pub [u8; 64]);
 impl TMSig {
-    const NIL: Self = Self([0; 64]);
+    pub const NIL: Self = Self([0; 64]);
     fn verify(&self, pub_key: PubKeyID, signed_data: &[u8]) -> Result<(), (ed25519_zebra::Error, &str)> {
         let signature = Signature::from_bytes(&self.0);
         let vk = match VerificationKey::try_from(pub_key.0) { Ok(v)=>v,       Err(err)=>{ return Err((err, "invalid public key")) }};
@@ -469,12 +469,12 @@ struct TMMsg {
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct ConsensusCounts {
-    anys: u64,
-    prevotes: u64,
-    nil_prevotes: u64,
-    yes_prevotes: u64,
-    precommits: u64,
-    yes_precommits: u64,
+    pub anys: u64,
+    pub prevotes: u64,
+    pub nil_prevotes: u64,
+    pub yes_prevotes: u64,
+    pub precommits: u64,
+    pub yes_precommits: u64,
 }
 impl ConsensusCounts {
     const ZERO: Self = Self {
@@ -1244,7 +1244,7 @@ impl TMState {
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
                 if PRINT_BFT_CONDITIONS { println!("{}: in condition 49: value decided", ctx_str); }
-                let new_roster = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster)).await;
+                let new_roster = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster), self.rounds_data[i].proposal_sigs.clone()).await;
                 if PRINT_ROSTER { println!("{} new roster: {:?}", ctx_str, new_roster); }
                 *roster = new_roster;
                 self.height += 1;
@@ -1613,7 +1613,7 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
                 else { (TMStatus::Fail, TMStatusReason::None) }
             })
         })),
-        ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer| {
+        ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, _tender_proposal_sigs| {
             let decisions = Arc::clone(&decisions);
             let roster2 = roster2.clone();
             Box::pin(async move {

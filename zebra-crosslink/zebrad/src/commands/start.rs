@@ -621,20 +621,21 @@ impl StartCmd {
         {
             let tmp_dir = tempfile::TempDir::new().unwrap();
             let _ = std::fs::remove_dir_all(tmp_dir.path());
+            let zebra_port_base = config.network.listen_addr.port();
 
             let zaino_config = zainodlib::config::ZainodConfig {
                 backend: zaino_state::BackendType::Fetch,
                 json_server_settings: Some(zaino_serve::server::config::JsonRpcServerConfig {
-                    json_rpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 18232),
+                    json_rpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), zebra_port_base + 10000),
                     cookie_dir: None,
                 }),
                 grpc_settings: zaino_serve::server::config::GrpcServerConfig {
-                    listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 18233),
+                    listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), zebra_port_base + 10001),
                     tls: None,
                 },
                 validator_settings: zaino_common::ValidatorConfig {
-                    validator_grpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8232),
-                    validator_jsonrpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8232),
+                    validator_grpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), zebra_port_base-1),
+                    validator_jsonrpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), zebra_port_base-1),
                     validator_cookie_path: None,
                     validator_user: Some("xxxxxx".to_owned()),
                     validator_password: Some("xxxxxx".to_owned()),
