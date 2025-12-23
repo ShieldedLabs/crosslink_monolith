@@ -642,6 +642,14 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, c
                         new_tx.parts[component] = old_tx.parts[component];
                     }
                 }
+                // if "shielding", we only see the incoming part in the compact blocks
+                if (components == (1 << WalletTxPart::SHIELDED) &&
+                    new_tx.parts[WalletTxPart::TRANSPARENT].spent_note_count > 0 &&
+                    new_tx.parts[WalletTxPart::SHIELDED].sent_note_count == 0)
+                {
+                    new_tx.parts[WalletTxPart::SHIELDED].sent_note_count = new_tx.parts[WalletTxPart::SHIELDED].recv_note_count;
+                    new_tx.parts[WalletTxPart::SHIELDED].sent_zats = new_tx.parts[WalletTxPart::SHIELDED].recv_zats;
+                }
             }
         } else {
             println!("ERROR: {txid:?} not found at associated height {tx_h:?}");
@@ -1997,7 +2005,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                                     s_recv_c += 1;
                                     s_recv_z += note.value().inner();
-                                    // TODO: s_send_c/s_send_z
+                                    // NOTE: s_send_c/s_send_z equivalent handled inside update_with_tx
 
                                     let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(&txid) {
                                         txid_h
