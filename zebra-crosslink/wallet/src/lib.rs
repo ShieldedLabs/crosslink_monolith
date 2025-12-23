@@ -194,6 +194,7 @@ struct OrchardNote {
     pub recv_h: BlockHeight,
     pub spent_h: BlockHeight,
     pub nf: orchard::note::Nullifier,
+    pub txid: TxId,
     // TODO: could be compressed by decomposition
     pub note: orchard::note::Note,
     // TODO: commitment? ephemeralkey?
@@ -1961,6 +1962,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         let account = &mut wallet.accounts[0];
                         let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
 
+                        let (mut s_send_z, mut s_spend_z, mut s_recv_z) = (0, 0, 0);
+                        let (mut s_send_c, mut s_spend_c, mut s_recv_c) = (0, 0, 0);
+
                         for orchard_action in &tx.actions {
                             let action = match OrchardCompactAction::try_from(orchard_action) {
                                 Ok(v) => v,
@@ -1978,6 +1982,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                     let orchard_note = OrchardNote{
                                         recv_h: block_h,
                                         spent_h: BlockHeight(0),
+                                        txid,
                                         note,
                                         // in note:
                                         // value: match Zatoshis::from_u64(note.value().inner()) {
@@ -1990,6 +1995,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                         nf: note.nullifier(orchard_fvk.unwrap()), // TODO: cache or recompute?
                                     };
 
+                                    s_recv_c += 1;
+                                    s_recv_z += note.value().inner();
+                                    // TODO: s_send_c/s_send_z
 
                                     let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(&txid) {
                                         txid_h
@@ -2035,70 +2043,44 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         // TODO: decrypt our transactions & fill in actual data here
                         // TODO: get full info with memos
 
-                        let parts = [
-                            WalletTxPart::ZERO,
-                            WalletTxPart {
-                                spent_zats: Zatoshis::ZERO,
-                                sent_zats: Zatoshis::ZERO,
-                                recv_zats: Zatoshis::const_from_u64(1_234_567_890),
-                                spent_note_count: 0,
-                                sent_note_count: 0,
-                                recv_note_count: 1,
-                            },
-                        ];
+                        if (s_spend_c | s_send_c | s_recv_c) != 0 {
+                            let (s_spent_zats, s_sent_zats, s_recv_zats) = match (Zatoshis::from_u64(s_spend_z), Zatoshis::from_u64(s_send_z), Zatoshis::from_u64(s_recv_z)) {
+                                (Ok(s_spent_zats), Ok(s_sent_zats), Ok(s_recv_zats)) => (s_spent_zats, s_sent_zats, s_recv_zats),
+                                (spent, sent, recv) => {
+                                    println!("couldn't convert all to Zats: ({spent:?}, {sent:?}, {recv:?})");
+                                    continue;
+                                }
+                            };
 
-                        let new_tx = WalletTx {
-                            account_id: 0,
-                            txid,
-                            expiry_h: None, // TODO
-                            mined_h: block_h,
-                            parts,
-                            // TODO: get memos
-                            memo_count: 0,
-                            memo: [0; 512],
-                            is_coinbase: false,
-                            is_outside_bc: false,
-                        };
+                            let parts = [
+                                    WalletTxPart::ZERO,
+                                    WalletTxPart {
+                                        spent_zats: s_spent_zats,
+                                        sent_zats: s_sent_zats,
+                                        recv_zats: s_recv_zats,
+                                        spent_note_count: s_spend_c,
+                                        sent_note_count: s_send_c,
+                                        recv_note_count: s_recv_c,
+                                    },
+                                ];
 
-                        drop(account);
-                        update_with_tx(wallet, txid, new_tx, 1 << WalletTxPart::SHIELDED, &mut insert_i);
-                    }
-                }
-            }
+                                let new_tx = WalletTx {
+                                    account_id: 0,
+                                    txid,
+                                    expiry_h: None, // TODO
+                                    mined_h: block_h,
+                                    parts,
+                                    // TODO: get memos
+                                    memo_count: 0,
+                                    memo: [0; 512],
+                                    is_coinbase: false,
+                                    is_outside_bc: false,
+                                };
 
-
-            // DEV: miner send tx to self
-            if let Some(miner_utxo) = miner_wallets[miner_use_i].accounts[0].utxos.first() {
-                if let Some(val_after_fees) = miner_utxo.value - MINIMUM_FEE {
-                    let (dst, fee) = if true {
-                        if let (Some(fvk), Some(&dst)) = (miner_wallets[miner_use_i].accounts[0].ufvk.orchard(), miner_ua.orchard()) {
-                            let fee = Zatoshis::from_u64(15_000).unwrap(); //MINIMUM_FEE;
-                            (
-                                TxOutput::Orchard{
-                                    dst,
-                                    ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
-                                    zats: miner_utxo.value.into_u64() - fee.into_u64(),
-                                    memo: MemoBytes::empty()
-                                },
-                                fee
-                            )
-                        } else {
-                            (
-                                TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees},
-                                MINIMUM_FEE
-                            )
+                                drop(account);
+                                update_with_tx(wallet, txid, new_tx, 1 << WalletTxPart::SHIELDED, &mut insert_i);
                         }
-                    } else {
-                        (
-                            TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees},
-                            MINIMUM_FEE
-                        )
-                    };
-
-                    miner_wallets[miner_use_i].send_zats(network, &mut client, &[dst], &miner_usk, val_after_fees, fee, &TxOptions {
-                        src_pools: &[TxPool::Transparent],
-                        ..TxOptions::default()
-                    }).await;
+                    }
                 }
             }
         }
@@ -2112,6 +2094,41 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let mut txs = miner_wallet.txs.clone();
         txs.reverse();
         wallet_state.lock().unwrap().txs = txs;
+
+        // DEV: miner send tx to self
+        if let (Some(miner_utxo), Some(start_block_i)) = (miner_wallets[miner_use_i].accounts[0].utxos.first(), sync_from_i) {
+            if let Some(val_after_fees) = miner_utxo.value - MINIMUM_FEE {
+                let (dst, fee) = if true {
+                    if let (Some(fvk), Some(&dst)) = (miner_wallets[miner_use_i].accounts[0].ufvk.orchard(), miner_ua.orchard()) {
+                        let fee = Zatoshis::from_u64(15_000).unwrap(); //MINIMUM_FEE;
+                        (
+                            TxOutput::Orchard{
+                                dst,
+                                ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
+                                zats: miner_utxo.value.into_u64() - fee.into_u64(),
+                                memo: MemoBytes::empty()
+                            },
+                            fee
+                        )
+                    } else {
+                        (
+                            TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees},
+                            MINIMUM_FEE
+                        )
+                    }
+                } else {
+                    (
+                        TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees},
+                        MINIMUM_FEE
+                    )
+                };
+
+                miner_wallets[miner_use_i].send_zats(network, &mut client, &[dst], &miner_usk, val_after_fees, fee, &TxOptions {
+                    src_pools: &[TxPool::Transparent],
+                    ..TxOptions::default()
+                }).await;
+            }
+        }
 
         // let (reorg_required) = 'process_blocks: {
         //     let mut reorg_required = false;
