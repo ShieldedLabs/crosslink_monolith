@@ -5151,6 +5151,7 @@ name = "wallet"
 version = "1.0.0-beta.1"
 dependencies = [
  "bip39",
+ "incrementalmerkletree",
  "orchard",
  "prost 0.13.5",
  "rand 0.8.5",

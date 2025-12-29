@@ -2,11 +2,9 @@
 #![allow(warnings)]
 
 use zcash_client_backend::data_api::WalletCommitmentTrees;
-use orchard::keys::SpendAuthorizingKey;
 use orchard::note_encryption::{ CompactAction as OrchardCompactAction, OrchardDomain };
 use rand_chacha::rand_core::SeedableRng;
 use rand_core::OsRng;
-use sapling_crypto::zip32::ExtendedSpendingKey;
 use secrecy::{ExposeSecret,SecretVec,Secret};
 use std::collections::{HashMap, VecDeque};
 use std::convert::{identity, Infallible};
@@ -22,7 +20,6 @@ use zcash_client_backend::data_api::wallet::{ConfirmationsPolicy, TargetHeight, 
 use zcash_client_backend::fees::{self, StandardFeeRule};
 use zcash_client_backend::proto::service::{GetSubtreeRootsArg, RawTransaction, TreeState, TxFilter};
 use zcash_client_backend::wallet::WalletTransparentOutput;
-use zcash_client_memory::MemBlockCache;
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
@@ -189,8 +186,9 @@ impl<T: std::fmt::Debug> std::fmt::Debug for NL<'_, T> {
 }
 
 // ALT: collapse into Txo with internal enum(s)
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 struct OrchardNote {
+    // NOTE: the reason we want to keep witnesses up-to-date is to increase the time-domain anonymity
     pub recv_h: BlockHeight,
     pub spent_h: BlockHeight,
     pub nf: orchard::note::Nullifier,
@@ -198,6 +196,7 @@ struct OrchardNote {
     // TODO: could be compressed by decomposition
     pub note: orchard::note::Note,
     // TODO: commitment? ephemeralkey?
+    pub witness: OrchardWitness, // includes position
 }
 
 
@@ -559,19 +558,20 @@ enum TxOutput {
     }
 }
 
-struct TxOptions {
-    src_pools: &'static [TxPool], // in descending preference order
+struct TxOptions<'a> {
+    src_pools: &'a [TxPool], // in descending preference order
     staking_action: Option<StakingAction>,
 }
-impl TxOptions {
+impl<'a> TxOptions<'a> {
     // TODO: reconsider
     // pub const DEFAULT_SRC_POOLS: [TxPool; 2] = [TxPool::Sapling, TxPool::Orchard];
-    pub const DEFAULT_SRC_POOLS: [TxPool; 1] = [TxPool::Orchard];
+    // pub const DEFAULT_SRC_POOLS: [TxPool; 1] = [TxPool::Orchard];
 }
-impl Default for TxOptions {
+impl<'a> Default for TxOptions<'a> {
     fn default() -> Self {
         Self {
-            src_pools: &TxOptions::DEFAULT_SRC_POOLS,
+            // TODO: does a default anchor make sense for shielded pools?
+            src_pools: &[], //TxOptions::DEFAULT_SRC_POOLS,
             staking_action: None,
         }
     }
@@ -581,7 +581,7 @@ pub enum TxPool {
     Transparent,
     // Sprout,
     // Sapling,
-    Orchard,
+    Orchard(orchard::Anchor),
 }
 
 fn transparent_keys_from_usk(usk: &UnifiedSpendingKey, index: u32) -> Option<(secp256k1::PublicKey, secp256k1::SecretKey)> {
@@ -764,23 +764,62 @@ impl ManualWallet {
     // TODO: fee API
     pub async fn send_zats<P: Parameters>(
         &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>, outputs: &[TxOutput],
-        src_usk: &UnifiedSpendingKey, zats: Zatoshis, fee_zats: Zatoshis, opts: &TxOptions
+        src_usk: &UnifiedSpendingKey, zats: Zatoshis, fee_zats: Zatoshis, opts: &TxOptions<'_>
     ) -> Option<TxId>
     {
         let tz = Timer::scope("send_zats");
         let block_h = self.chain_tip_h.0 + 1;
 
         let account = &self.accounts[0];
+        let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
         let (t_addr, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
         let orchard_addr = ua.orchard().unwrap();
+
+        //- CHECK SOURCES, FIND ANCHORS
+        let (mut sapling_anchor, mut orchard_anchor) = (None, orchard::Anchor::empty_tree());
+        let (mut has_transparent_src, mut has_orchard_src) = (false, false);
+        for pool in opts.src_pools {
+            match pool {
+                TxPool::Transparent => {
+                    if has_transparent_src {
+                        println!("build error: repeated transparent source pool (can only have 1)");
+                        // ALT: ignore the latter ones?
+                        return None;
+                    }
+                    has_transparent_src = true;
+                }
+
+                TxPool::Orchard(anchor) => {
+                    if has_orchard_src {
+                        println!("build error: repeated orchard source pool (can only have 1)");
+                        // ALT: ignore the latter ones (maybe iff they have the same anchor)?
+                        return None;
+                    }
+                    has_orchard_src = true;
+                    orchard_anchor = *anchor;
+                }
+            }
+        }
+
+        //- KEYS/SIGNING
+        let mut signing_set = TransparentSigningSet::new();
+        let mut t_pubkey = None;
+        if has_transparent_src {
+            let Some((pubkey, privkey)) = transparent_keys_from_usk(&src_usk, 0) else {
+                println!("tried to send from transparent source without available transparent keys");
+                return None;
+            };
+            signing_set.add_key(privkey);
+            t_pubkey = Some(pubkey);
+        }
+        let mut sapling_esk: &[sapling_crypto::zip32::ExtendedSpendingKey] = &[];
+        let mut orchard_sak = &[orchard::keys::SpendAuthorizingKey::from(src_usk.orchard())];
+
 
         let mut txb = TxBuilder::new(
             network,
             LRZBlockHeight::from_u32(block_h),
-            BuildConfig::Standard {
-                sapling_anchor: None,
-                orchard_anchor: Some(orchard::Anchor::empty_tree()),
-            },
+            BuildConfig::Standard { sapling_anchor, orchard_anchor: Some(orchard_anchor), },
         );
 
         let (mut t_send_z, mut t_recv_z, mut s_send_z, mut s_recv_z) = (0, 0, 0, 0);
@@ -817,9 +856,6 @@ impl ManualWallet {
         }
 
 
-        let mut signing_set = TransparentSigningSet::new();
-        let (pubkey, privkey) = transparent_keys_from_usk(&src_usk, 0).unwrap();
-        signing_set.add_key(privkey);
 
         let min_spend = t_send_z + s_send_z + fee_zats.into_u64();
         let (mut t_spend_z, mut s_spend_z) = (0, 0);
@@ -831,9 +867,13 @@ impl ManualWallet {
                 // - used in another transaction that we've built
 
                 TxPool::Transparent => {
+                    let t_pubkey = t_pubkey.expect("checked above");
                     // "greedy strategy"
                     for utxo in &account.utxos {
-                        txb.add_transparent_input(pubkey, utxo.id.clone(), utxo.txout());
+                        if let Err(err) = txb.add_transparent_input(t_pubkey, utxo.id.clone(), utxo.txout()) {
+                            println!("tx build: transparent/UTXO spend failed: {err:?}");
+                            continue;
+                        }
                         t_spend_z += utxo.value.into_u64();
                         t_spend_c += 1;
                         if ((t_spend_z + s_spend_z) >= min_spend) {
@@ -841,8 +881,22 @@ impl ManualWallet {
                         }
                     }
                 }
-                TxPool::Orchard => {
-                    todo!("orchard inputs");
+
+                TxPool::Orchard(_) => {
+                    if let Some(fvk) = &keys.orchard_fvk {
+                        for note in &account.unspent_orchard_notes {
+                            let merkle_path = orchard::tree::MerklePath::from(note.witness.path().expect("non-empty tree"));
+                            if let Err(err) = txb.add_orchard_spend::<zip317::FeeError>(fvk.clone(), note.note, merkle_path) {
+                                println!("tx build: orchard note spend failed: {err:?}");
+                                continue;
+                            }
+                            s_spend_z += note.note.value().inner();
+                            s_spend_c += 1;
+                            if ((t_spend_z + s_spend_z) >= min_spend) {
+                                break 'src_pool;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -894,13 +948,11 @@ impl ManualWallet {
         //-- VERY EXPENSIVE TX CREATION (PARTICULARLY IF SHIELDED OUTPUT)
         use rand_chacha::ChaCha20Rng;
         let prover = LocalTxProver::bundled();
-        let extsk: &[ExtendedSpendingKey] = &[];
-        let sak: &[SpendAuthorizingKey] = &[];
         let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
         let tx_res = match txb.build(
             &signing_set,
-            extsk,
-            sak,
+            sapling_esk,
+            orchard_sak,
             rng,
             &prover,
             &prover,
@@ -1199,7 +1251,11 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
     Some(())
 }
 
-fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, insert_i: &mut usize) -> Option<()> {
+type OrchardTree = incrementalmerkletree::frontier::CommitmentTree<orchard::tree::MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>;
+type OrchardFrontier = incrementalmerkletree::frontier::Frontier<orchard::tree::MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>;
+type OrchardWitness = incrementalmerkletree::witness::IncrementalWitness<orchard::tree::MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>;
+
+fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, insert_i: &mut usize, orchard_tree: &mut OrchardTree) -> Option<()> {
     let account = &mut wallet.accounts[account_i];
     let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
 
@@ -1210,12 +1266,16 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
         let action = match OrchardCompactAction::try_from(orchard_action) {
             Ok(v) => v,
             Err(err) => {
+                // TODO: we can't keep position updated if we fail here
                 // TODO: should we fail validation for the entire block above if we can't do this?
                 println!("couldn't convert CompactOrchardAction to orchard::CompactAction: {err:?}");
                 continue;
             }
         };
         let domain = OrchardDomain::for_compact_action(&action);
+
+        orchard_tree.append(orchard::tree::MerkleHashOrchard::from_cmx(&action.cmx()));
+        println!("after append, at {}  orchard_tree: {:?}", orchard_tree.size(), orchard_tree);
 
         if let Some(ivk) = &keys.orchard_ivk {
             let decrypt_res: Option<(orchard::note::Note, orchard::Address)> = try_compact_note_decryption(&domain, ivk, &action);
@@ -1225,6 +1285,7 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
                     spent_h: BlockHeight(0),
                     txid,
                     note,
+                    witness: OrchardWitness::from_tree(orchard_tree.clone()).expect("just appended"),
                     // in note:
                     // value: match Zatoshis::from_u64(note.value().inner()) {
                     //     Ok(v) => v,
@@ -1247,9 +1308,10 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
                 };
 
                 if let Some(i) = orchard_recv_h_position(&account.unspent_orchard_notes, txid_h, &orchard_note.nf) {
-                    if account.unspent_orchard_notes[i] != orchard_note {
-                        println!("ERROR: orchard_note mismatch: {:?} vs {:?}", account.unspent_orchard_notes[i], &orchard_note);
-                    }
+                    // TODO: witness doesn't have PartialEq
+                    // if account.unspent_orchard_notes[i] != orchard_note {
+                    //     println!("ERROR: orchard_note mismatch: {:?} vs {:?}", account.unspent_orchard_notes[i], &orchard_note);
+                    // }
                 } else if orchard_recv_h_position(&account.recv_orchard_notes, txid_h, &orchard_note.nf).is_none() {
                     // TODO: can we just check if we've seen the tx && tx.2 == false
                     if let Some(last_txo) = account.recv_orchard_notes.last() {
@@ -1275,6 +1337,7 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
         //     }
         // }
     }
+
     // TODO: sapling
 
     // TODO: do we want to always recompute or can we assume data is constant
@@ -1498,20 +1561,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         Some((txid_map, out_txid_map))
     }
 
-    // let send_zats = async |client: &mut CompactTxStreamerClient<_>, dst_ua: &UnifiedAddress, src_wallet: &mut ManualWallet, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params, opts: &TxOptions| -> Option<[u8;32]> {
-    //     let t = Timer::scope("send_zats");
-
-    //     // @todo(judah): handle multiple accounts?
-    //     todo!("send zats")
-    // };
-
-    // let send_zats_to_wallet = async |client: &mut CompactTxStreamerClient<_>, dst_wallet: &mut ManualWallet, src_wallet: &mut ManualWallet, src_usk: &UnifiedSpendingKey, zats: Zatoshis, params, opts: &TxOptions| -> Option<[u8;32]> {
-    //     match addrs_from_wallet(dst_wallet) {
-    //         Some((_, dst_ua)) => send_zats(client, &dst_ua, src_wallet, src_usk, zats, params, opts).await,
-    //         None => None,
-    //     }
-    // };
-
     // let send_unstake_reward = async |client: &mut CompactTxStreamerClient<_>, roster: &[RosterMember], txid_map: &HashMap<TxId, (Option<StakingAction>, Vec<String>)>, txid: &TxId, src_wallet: &mut ManualWallet, src_usk: &UnifiedSpendingKey, params, thing: &mut Vec::<TxId>| -> Option<[u8;32]> {
     //     println!("SENDING UNSTAKE REWARD");
 
@@ -1642,7 +1691,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     // TODO: use tenderlink types & printing routines
     let mut roster: Vec<RosterMember> = Vec::new();
-    let mut block_cache = MemBlockCache::new();
 
     // @todo(judah): investigate why requests get randomly dropped in a strange way:
     // transport error, service not ready, etc.
@@ -1696,8 +1744,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // NOTE: if you're dealing with multiple wallets, you don't want to resync all blocks for each
         // of them. They can all sync from the same blocks.
         // TODO: this needs to be a bit more complicated to handle arbitrarily many transparent addresses
-        let (new_blocks, miner_t_txs, mut sync_from_i, req_rng):
-            (Vec<CompactBlock>, Vec<(BlockHeight, Transaction)>, Option<usize>, (u64, u64)) =
+        let (new_blocks, miner_t_txs, mut sync_from_i, req_rng, prev_tip_chain_state):
+            (Vec<CompactBlock>, Vec<(BlockHeight, Transaction)>, Option<usize>, (u64, u64), ChainState) =
              'sync_find_continuation_point: loop
         {
             // GET THE CURRENT STATE OF THE WORLD ////////////////////
@@ -1908,7 +1956,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             if sync_from_i.is_none() {
                 // println!("nothing to sync");
-                break (Vec::new(), Vec::new(), None, req_rng);
+                break (Vec::new(), Vec::new(), None, req_rng, ChainState::empty(LRZBlockHeight::from_u32(0), zcash_primitives::block::BlockHash([0; 32])));
             }
             println!("downloaded compact blocks {}-{}", new_blocks.first().unwrap().height, new_blocks.last().unwrap().height);
 
@@ -2018,8 +2066,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
 
-            break (new_blocks, new_t_txs, sync_from_i, req_rng);
+            break (new_blocks, new_t_txs, sync_from_i, req_rng, prev_tip_chain_state);
         };
+        let mut orchard_frontier = prev_tip_chain_state.final_orchard_tree().clone();
+        let mut orchard_tree = incrementalmerkletree::frontier::CommitmentTree::from_frontier(&orchard_frontier);
+        println!("prev_tip_chain_state.final_orchard_tree frontier: {:?}", orchard_frontier);
+        println!("prev_tip_chain_state.final_orchard_tree tree: {:?}", orchard_tree);
 
 
         //-- REORG
@@ -2105,9 +2157,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
-        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-
         //-- ADD/REVALIDATE SHIELDED TXS FROM NEW BLOCKS
+        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
         if let Some(start_block_i) = sync_from_i {
             let sync_start_h = <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above");
             println!("cache at {}, new blocks: {}-{}; updating wallets...",
@@ -2124,7 +2175,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     //-- INCORPORATE SHIELDED TRANSACTIONS FROM COMPACT BLOCK
                     'tx_iter: for tx in &block.vtx {
-                        read_compact_tx(wallet, 0, &keys, block_h, tx, &mut insert_i);
+                        read_compact_tx(wallet, 0, &keys, block_h, tx, &mut insert_i, &mut orchard_tree);
                     }
                 }
             }
@@ -2141,37 +2192,61 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         wallet_state.lock().unwrap().txs = txs;
 
         // DEV: miner send tx to self
-        if let (Some(miner_utxo), Some(start_block_i)) = (miner_wallets[miner_use_i].accounts[0].utxos.first(), sync_from_i) {
+        if let (Some(miner_utxo), Some(start_block_i)) = (miner_wallet.accounts[0].utxos.first(), sync_from_i) {
             if let Some(val_after_fees) = miner_utxo.value - MINIMUM_FEE {
-                let (dst, fee) = if true {
-                    if let (Some(fvk), Some(&dst)) = (miner_wallets[miner_use_i].accounts[0].ufvk.orchard(), miner_ua.orchard()) {
-                        let fee = Zatoshis::from_u64(15_000).unwrap(); //MINIMUM_FEE;
-                        (
-                            TxOutput::Orchard{
-                                dst,
+                let mut dst = TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees};
+                let mut fee =  MINIMUM_FEE;
+                if true {
+                    if let (Some(fvk), Some(&dst_addr)) = (miner_wallet.accounts[0].ufvk.orchard(), miner_ua.orchard()) {
+                        let new_fee = Zatoshis::const_from_u64(15_000);
+                        if let Some(new_val_after_fees) = miner_utxo.value - new_fee {
+                            dst = TxOutput::Orchard {
+                                dst: dst_addr,
                                 ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
-                                zats: miner_utxo.value.into_u64() - fee.into_u64(),
+                                zats: new_val_after_fees.into_u64(),
                                 memo: MemoBytes::empty()
-                            },
-                            fee
-                        )
-                    } else {
-                        (
-                            TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees},
-                            MINIMUM_FEE
-                        )
+                            };
+                            fee = new_fee;
+                         }
                     }
-                } else {
-                    (
-                        TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees},
-                        MINIMUM_FEE
-                    )
                 };
 
-                miner_wallets[miner_use_i].send_zats(network, &mut client, &[dst], &miner_usk, val_after_fees, fee, &TxOptions {
+                miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, val_after_fees, fee, &TxOptions {
                     src_pools: &[TxPool::Transparent],
                     ..TxOptions::default()
                 }).await;
+            }
+        }
+        if let (Some(miner_note), Some(start_block_i), Some(fvk), Some(&dst_addr)) = (
+            miner_wallet.accounts[0].unspent_orchard_notes.first(),
+            sync_from_i,
+            miner_wallet.accounts[0].ufvk.orchard(),
+            miner_ua.orchard(),
+        )
+        {
+            let note_value: u64 = miner_note.note.value().inner();
+            let fee_z = MINIMUM_FEE;
+            let mut fee = fee_z.into_u64();
+            if note_value >= fee {
+                let val_after_fees = note_value - fee;
+                let dst = TxOutput::Orchard {
+                    dst: dst_addr,
+                    ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
+                    zats: val_after_fees,
+                    memo: MemoBytes::empty()
+                };
+
+                // let orchard_tree_root = orchard_tree.root();
+                let orchard_tree_root = miner_note.witness.root();
+                println!("anchor at {}: {orchard_tree_root:?}", orchard_tree.size());
+                let send_res = miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, Zatoshis::from_u64(val_after_fees).unwrap(), fee_z, &TxOptions {
+                    src_pools: &[TxPool::Orchard(orchard::Anchor::from(orchard_tree_root))],
+                    ..TxOptions::default()
+                }).await;
+
+                if let Some(txid) = send_res {
+                    println!("successfully sent orchard tx: {txid}");
+                }
             }
         }
 

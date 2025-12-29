@@ -1467,7 +1467,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                         ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..4]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
                                     WalletTxKind::Receive | WalletTxKind::Unstake => {
-                                        ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.totals().recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        if true { // total
+                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.totals().recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        } else { // transparent, shielded
+                                            let (t_z, s_z) = (tx.parts[0].recv_zats.into_u64(), tx.parts[1].recv_zats.into_u64());
+                                            ui.text(frame_strf!(data, "+{} | {} cTAZ", str_from_ctaz(t_z), str_from_ctaz(s_z)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        }
                                     },
                                     WalletTxKind::Shield => {
                                         // TODO: (how) do we want to show the fee?
