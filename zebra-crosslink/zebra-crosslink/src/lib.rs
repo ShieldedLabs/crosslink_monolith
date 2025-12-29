@@ -769,7 +769,7 @@ async fn new_decided_bft_block_from_malachite(
 
 
 //println!("Storing pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, internal.validators_at_current_height);
-    {
+    if internal.path_to_pos_store_file.to_str() != Some("") {
         let mut append_bytes: Vec<u8> = Vec::new();
         new_block.zcash_serialize(&mut append_bytes).unwrap();
         fat_pointer.zcash_serialize(&mut append_bytes).unwrap();
@@ -1267,57 +1267,59 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             })
             .collect();
 
-        let mut pos_file = OpenOptions::new().read(true).write(true).create(true).open(&path_to_pos_store_file).unwrap();
-        let mut pos_file_bytes = Vec::new();
-        pos_file.read_to_end(&mut pos_file_bytes).unwrap();
+        if path_to_pos_store_file.to_str() != Some("") {
+            let mut pos_file = OpenOptions::new().read(true).write(true).create(true).open(&path_to_pos_store_file).unwrap();
+            let mut pos_file_bytes = Vec::new();
+            pos_file.read_to_end(&mut pos_file_bytes).unwrap();
 
-        let mut cursor = Cursor::new(pos_file_bytes);
-        let mut valid_byte_count = 0;
-        'big_loop: loop {
-            valid_byte_count = cursor.position();
-            let block = if let Ok(block) = BftBlock::zcash_deserialize(&mut cursor) { block } else { break; };
-            let fat_pointer = if let Ok(fat_pointer) = FatPointerToBftBlock2::zcash_deserialize(&mut cursor) { fat_pointer } else { break; };
+            let mut cursor = Cursor::new(pos_file_bytes);
+            let mut valid_byte_count = 0;
+            'big_loop: loop {
+                valid_byte_count = cursor.position();
+                let block = if let Ok(block) = BftBlock::zcash_deserialize(&mut cursor) { block } else { break; };
+                let fat_pointer = if let Ok(fat_pointer) = FatPointerToBftBlock2::zcash_deserialize(&mut cursor) { fat_pointer } else { break; };
 
-            let mut buf = [0u8; 8];
-            if cursor.read_exact(&mut buf).is_err() { break; }
-            let new_roster_count = u64::from_le_bytes(buf);
-            let mut new_roster = Vec::new();
-            for _ in 0..new_roster_count {
-                if let Ok(v) = MalValidator::read_from(&mut cursor) {
-                    new_roster.push(v);
-                } else { break; }
+                let mut buf = [0u8; 8];
+                if cursor.read_exact(&mut buf).is_err() { break; }
+                let new_roster_count = u64::from_le_bytes(buf);
+                let mut new_roster = Vec::new();
+                for _ in 0..new_roster_count {
+                    if let Ok(v) = MalValidator::read_from(&mut cursor) {
+                        new_roster.push(v);
+                    } else { break; }
+                }
+
+                let mut buf = [0u8; 8];
+                if cursor.read_exact(&mut buf).is_err() { break; }
+                let proposal_sigs_n = u64::from_le_bytes(buf);
+                let mut proposal_sigs = Vec::new();
+                for _ in 0..proposal_sigs_n {
+                    let mut sig = tenderlink::TMSig::NIL;
+                    if cursor.read_exact(&mut sig.0).is_err() { break 'big_loop; }
+                    proposal_sigs.push(sig);
+                }
+
+                if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() { break; }
+                
+                let mut round_data = tenderlink::RoundData::EMPTY;
+                round_data.roster = tenderlink_roster_from_internal(&unsorted_roster);
+                round_data.msg_val_sigs = round_data.roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.public_key == v.pub_key.0).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, tenderlink::TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), tenderlink::TMSig(s))]).collect();
+                round_data.counts.precommits = fat_pointer.signatures.len() as u64;
+                round_data.counts.yes_precommits = fat_pointer.signatures.len() as u64;
+                round_data.proposal_sigs_n = proposal_sigs_n as usize;
+                round_data.proposal_sigs = proposal_sigs;
+                round_data.proposal = tenderlink::BlockValue(block.zcash_serialize_to_vec().unwrap());
+                round_data.proposal_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
+                round_data.height = ingest_data_for_tenderlink.len() as u64;
+                round_data.round = fat_pointer.get_vote_template().round as u32;
+                
+                ingest_data_for_tenderlink.push(round_data);
+                i_bft_blocks.push(block);
+                fat_pointer_to_tip = fat_pointer;
+                unsorted_roster = new_roster;
             }
-
-            let mut buf = [0u8; 8];
-            if cursor.read_exact(&mut buf).is_err() { break; }
-            let proposal_sigs_n = u64::from_le_bytes(buf);
-            let mut proposal_sigs = Vec::new();
-            for _ in 0..proposal_sigs_n {
-                let mut sig = tenderlink::TMSig::NIL;
-                if cursor.read_exact(&mut sig.0).is_err() { break 'big_loop; }
-                proposal_sigs.push(sig);
-            }
-
-            if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() { break; }
-            
-            let mut round_data = tenderlink::RoundData::EMPTY;
-            round_data.roster = tenderlink_roster_from_internal(&unsorted_roster);
-            round_data.msg_val_sigs = round_data.roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.public_key == v.pub_key.0).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, tenderlink::TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), tenderlink::TMSig(s))]).collect();
-            round_data.counts.precommits = fat_pointer.signatures.len() as u64;
-            round_data.counts.yes_precommits = fat_pointer.signatures.len() as u64;
-            round_data.proposal_sigs_n = proposal_sigs_n as usize;
-            round_data.proposal_sigs = proposal_sigs;
-            round_data.proposal = tenderlink::BlockValue(block.zcash_serialize_to_vec().unwrap());
-            round_data.proposal_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
-            round_data.height = ingest_data_for_tenderlink.len() as u64;
-            round_data.round = fat_pointer.get_vote_template().round as u32;
-            
-            ingest_data_for_tenderlink.push(round_data);
-            i_bft_blocks.push(block);
-            fat_pointer_to_tip = fat_pointer;
-            unsorted_roster = new_roster;
+            pos_file.set_len(valid_byte_count).unwrap();
         }
-        pos_file.set_len(valid_byte_count).unwrap();
 
         let mut new_final_hash = BlockHash([0; 32]);
         let mut new_final_height = BlockHeight(0);

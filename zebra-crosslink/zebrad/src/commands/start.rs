@@ -182,7 +182,7 @@ impl StartCmd {
         };
         *wallet::GLOBAL_SEED.lock().unwrap() = Some(global_seed);
 
-        let path_to_pos_store_file = {
+        let path_to_pos_store_file = if config.state.ephemeral { std::path::PathBuf::new() } else {
             let mut key_path = config.state.cache_dir.clone();
             let _ = std::fs::create_dir_all(key_path.clone());
 
@@ -670,6 +670,7 @@ impl StartCmd {
                     nu7: None,
                 }),
             };
+            *zebra_crosslink::wallet::wallet_main_zaino_port.lock().unwrap() = zebra_port_base + 10001;
 
             zainodlib::indexer::spawn_indexer(zaino_config).await.unwrap();
         }

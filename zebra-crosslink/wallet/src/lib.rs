@@ -291,6 +291,8 @@ impl Default for TxOptions {
     }
 }
 
+pub static wallet_main_zaino_port : Mutex<u16> = Mutex::new(0);
+
 pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     fn stuff_from_seed_phrase<P: Parameters + 'static>(params:P, phrase: &str) -> (
         SecretVec<u8>,
@@ -765,10 +767,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut roster: Vec<RosterMember> = Vec::new();
     let mut block_cache = MemBlockCache::new();
 
+    let mut zaino_port = 0;
+    loop {
+        zaino_port = *wallet_main_zaino_port.lock().unwrap();
+        if zaino_port != 0 { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
     // @todo(judah): investigate why requests get randomly dropped in a strange way:
     // transport error, service not ready, etc.
     let mut client = loop {
-        if let Ok(channel) = Channel::from_static("http://localhost:18233").connect().await {
+        if let Ok(channel) = Channel::from_shared(format!("http://localhost:{}", zaino_port)).unwrap().connect().await {
             break CompactTxStreamerClient::new(channel);
         }
 
@@ -865,7 +874,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         println!("*********** ROSTER: {roster:?}");
 
         let Ok(info) = client.get_lightd_info(Empty {}).await else {
-            println!("Failed to get lightd info");
+            println!("Failed to get lightd info. Sleeping to avoid spam.");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         };
         let network_tip_height = info.into_inner().block_height;
