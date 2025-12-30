@@ -186,7 +186,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for NL<'_, T> {
 }
 
 // ALT: collapse into Txo with internal enum(s)
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct OrchardNote {
     // NOTE: the reason we want to keep witnesses up-to-date is to increase the time-domain anonymity
     pub recv_h: BlockHeight,
@@ -197,6 +197,13 @@ struct OrchardNote {
     pub note: orchard::note::Note,
     // TODO: commitment? ephemeralkey?
     pub witness: OrchardWitness, // includes position
+}
+impl std::fmt::Debug for OrchardNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OrchardNote{{ recv:{:?}, spent:{:?}, txid:{}, nf:{:?}, value:{}, pos:{}, anchor: {:?}}}",
+            self.recv_h, self.spent_h, self.txid, self.nf, self.note.value().inner(),
+            u64::from(self.witness.witnessed_position()), self.witness.root())
+    }
 }
 
 
@@ -287,6 +294,7 @@ pub struct WalletTxPart {
     // NOTE: spend is our UTXOs that we consume, sent is created from those & transferred
     pub spent_note_count: usize,
     pub spent_zats: Zatoshis,
+    // TODO: calculate rather than store
     pub sent_note_count: usize,
     pub sent_zats: Zatoshis,
     pub recv_note_count: usize,
@@ -353,7 +361,7 @@ impl WalletTx {
         let mut memo_as_bytes = [0u8; 512];
         &memo_as_bytes[0..memo.len()].copy_from_slice(memo.as_bytes());
 
-        Self{
+        Self {
             account_id: 0,//AccountUuid::default(),
             txid: TxId::from_bytes([0; 32]),
             expiry_h: None,
@@ -838,6 +846,7 @@ impl ManualWallet {
                         println!("tx build error: {err:?}");
                         return None;
                     }
+                    println!("  added transparent output: {}", zats.into_u64());
                 }
                 TxOutput::Orchard{ ovk, dst, zats, memo } => {
                     s_send_c += 1;
@@ -851,6 +860,7 @@ impl ManualWallet {
                         println!("tx build error: {err:?}");
                         return None;
                     }
+                    println!("  added orchard output: {}", zats);
                 }
             }
         }
@@ -876,6 +886,7 @@ impl ManualWallet {
                         }
                         t_spend_z += utxo.value.into_u64();
                         t_spend_c += 1;
+                        println!("  added transparent spend: {}", utxo.value.into_u64());
                         if ((t_spend_z + s_spend_z) >= min_spend) {
                             break 'src_pool;
                         }
@@ -892,6 +903,7 @@ impl ManualWallet {
                             }
                             s_spend_z += note.note.value().inner();
                             s_spend_c += 1;
+                            println!("  added orchard spend: {}", note.note.value().inner());
                             if ((t_spend_z + s_spend_z) >= min_spend) {
                                 break 'src_pool;
                             }
@@ -913,7 +925,11 @@ impl ManualWallet {
                 let change = spend_z - min_spend;
                 t_send_z += change;
                 t_recv_z += change;
-                txb.add_transparent_output(&t_addr, Zatoshis::from_u64(change).unwrap());
+                if let Err(err) = txb.add_transparent_output(&t_addr, Zatoshis::from_u64(change).unwrap()) {
+                    println!("tx build: failed to add change: {err:?}");
+                    return None;
+                };
+                println!("  added transparent change: {}", change);
                 change
             }
         };
@@ -1122,7 +1138,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
     // TODO IMPORTANT: this is just full-tx import
 
     let txid = tx.txid();
-    println!("at h: {block_h}, transparent tx {txid} contains {} orchard actions", tx.orchard_bundle().map_or(0, |b| b.actions().len()));
+    // println!("at h: {block_h}, transparent tx {txid} contains {} orchard actions", tx.orchard_bundle().map_or(0, |b| b.actions().len()));
 
     // NOTE: these are only from *our* perspective
     let mut total_received = 0;
@@ -1274,9 +1290,11 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
         };
         let domain = OrchardDomain::for_compact_action(&action);
 
+        //- GLOBAL-VIEW UPDATES
         orchard_tree.append(orchard::tree::MerkleHashOrchard::from_cmx(&action.cmx()));
-        println!("after append, at {}  orchard_tree: {:?}", orchard_tree.size(), orchard_tree);
+        println!("orchard root at {:?} tree size={:02} {:?}", block_h, orchard_tree.size(), orchard_tree.root());
 
+        //- PUSH NEW RECEIVED/UNSPENT NOTES
         if let Some(ivk) = &keys.orchard_ivk {
             let decrypt_res: Option<(orchard::note::Note, orchard::Address)> = try_compact_note_decryption(&domain, ivk, &action);
             if let Some((note, _recipient)) = decrypt_res {
@@ -1296,6 +1314,7 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
                     // },
                     nf: note.nullifier(keys.orchard_fvk.as_ref().expect("implied by ivk presence")), // TODO: cache or recompute?
                 };
+                println!("got new note at {:?}, tree pos={:02} {:?}", block_h, u64::from(orchard_note.witness.witnessed_position()), orchard_note.witness.root());
 
                 s_recv_c += 1;
                 s_recv_z += note.value().inner();
@@ -2070,8 +2089,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         };
         let mut orchard_frontier = prev_tip_chain_state.final_orchard_tree().clone();
         let mut orchard_tree = incrementalmerkletree::frontier::CommitmentTree::from_frontier(&orchard_frontier);
-        println!("prev_tip_chain_state.final_orchard_tree frontier: {:?}", orchard_frontier);
-        println!("prev_tip_chain_state.final_orchard_tree tree: {:?}", orchard_tree);
+        println!("orchard root at {:?} tree: size={} {:?}", prev_tip_chain_state.block_height(), orchard_tree.size(), orchard_tree.root());
 
 
         //-- REORG
@@ -2177,6 +2195,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     'tx_iter: for tx in &block.vtx {
                         read_compact_tx(wallet, 0, &keys, block_h, tx, &mut insert_i, &mut orchard_tree);
                     }
+
+                    // println!("orchard root at {:?} tree: size={} {:?}", block_h, orchard_tree.size(), orchard_tree.root());
                 }
             }
         }
@@ -2211,6 +2231,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                 };
 
+                println!("shielding transparent funds");
                 miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, val_after_fees, fee, &TxOptions {
                     src_pools: &[TxPool::Transparent],
                     ..TxOptions::default()
@@ -2236,9 +2257,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     memo: MemoBytes::empty()
                 };
 
+                println!("orchard->orchard self-send");
                 // let orchard_tree_root = orchard_tree.root();
                 let orchard_tree_root = miner_note.witness.root();
-                println!("anchor at {}: {orchard_tree_root:?}", orchard_tree.size());
+                println!("anchor at {}/{}: {orchard_tree_root:?}", u64::from(miner_note.witness.witnessed_position()), u64::from(miner_note.witness.tip_position()));
                 let send_res = miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, Zatoshis::from_u64(val_after_fees).unwrap(), fee_z, &TxOptions {
                     src_pools: &[TxPool::Orchard(orchard::Anchor::from(orchard_tree_root))],
                     ..TxOptions::default()
