@@ -1294,6 +1294,32 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
         orchard_tree.append(orchard::tree::MerkleHashOrchard::from_cmx(&action.cmx()));
         println!("orchard root at {:?} tree size={:02} {:?}", block_h, orchard_tree.size(), orchard_tree.root());
 
+        //- HANDLE SPENT NOTES
+        let nf: orchard::note::Nullifier = action.nullifier();
+
+        // TODO: map/index
+        let mut found_nf = false;
+        for (note_i, note) in account.unspent_orchard_notes.iter().enumerate() {
+            if note.nf == nf {
+                // this action is a spend by us with this note/nullifier: move it to spent
+                let spent_note = account.unspent_orchard_notes.remove(note_i);
+                s_spend_c += 1;
+                s_spend_z += spent_note.note.value().inner();
+                account.spent_orchard_notes.push(OrchardNote { spent_h: block_h, ..spent_note });
+                found_nf = true;
+                break;
+            }
+        }
+        if ! found_nf {
+            for (note_i, note) in account.spent_orchard_notes.iter().enumerate() {
+                if note.nf == nf {
+                    s_spend_c += 1;
+                    s_spend_z += note.note.value().inner();
+                    break;
+                }
+            }
+        }
+
         //- PUSH NEW RECEIVED/UNSPENT NOTES
         if let Some(ivk) = &keys.orchard_ivk {
             let decrypt_res: Option<(orchard::note::Note, orchard::Address)> = try_compact_note_decryption(&domain, ivk, &action);
@@ -1318,6 +1344,10 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
 
                 s_recv_c += 1;
                 s_recv_z += note.value().inner();
+                if s_spend_c > 0 {
+                    s_send_c += 1;
+                    s_send_z += note.value().inner();
+                }
                 // NOTE: s_send_c/s_send_z equivalent handled inside update_with_tx
 
                 let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(&txid) {
