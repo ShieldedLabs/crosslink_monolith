@@ -5,6 +5,7 @@ use zcash_client_backend::data_api::WalletCommitmentTrees;
 use orchard::note_encryption::{ CompactAction as OrchardCompactAction, OrchardDomain };
 use rand_chacha::rand_core::SeedableRng;
 use rand_core::OsRng;
+use rand::Rng;
 use secrecy::{ExposeSecret,SecretVec,Secret};
 use std::collections::{HashMap, VecDeque};
 use std::convert::{identity, Infallible};
@@ -17,7 +18,6 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tonic::IntoRequest;
 use zcash_client_backend::data_api::chain::{BlockCache, CommitmentTreeRoot};
 use zcash_client_backend::data_api::wallet::{ConfirmationsPolicy, TargetHeight, create_proposed_transactions, propose_shielding, shield_transparent_funds};
-use zcash_client_backend::fees::{self, StandardFeeRule};
 use zcash_client_backend::proto::service::{GetSubtreeRootsArg, RawTransaction, TreeState, TxFilter};
 use zcash_client_backend::wallet::WalletTransparentOutput;
 use zcash_client_sqlite::error::SqliteClientError;
@@ -26,10 +26,15 @@ use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_note_encryption::{try_compact_note_decryption, try_note_decryption, try_output_recovery_with_ovk, ShieldedOutput};
 use zcash_primitives::transaction::builder::{BuildConfig, Builder as TxBuilder};
 use zcash_primitives::transaction::components::TxOut;
-use zcash_primitives::transaction::fees::zip317::{self, MINIMUM_FEE};
+use zcash_primitives::transaction::fees::{
+    self,
+    FeeRule,
+    zip317,
+};
 use zcash_primitives::transaction::sighash::{signature_hash, SignableInput};
 use zcash_primitives::transaction::txid::TxIdDigester;
 use zcash_primitives::transaction::{Authorized, Unauthorized, Transaction, TransactionData, TxVersion};
+use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight as LRZBlockHeight, BranchId};
 use zcash_protocol::memo::MemoBytes;
@@ -82,7 +87,6 @@ use zcash_client_backend::{
 };
 
 use zcash_protocol::consensus::{NetworkType, Parameters, MAIN_NETWORK, TEST_NETWORK};
-use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 
 // NOTE: this has slightly different semantics from the protocol version, hence the different type
 // TODO: some code becomes simpler with a u64, but I'm leaving this the same as default for now
@@ -774,6 +778,8 @@ impl ManualWallet {
     }
 
     // TODO: fee API
+    // TODO: allow one destination to have an empty value for "send the rest here" (this could be
+    // change or normal recipient)
     pub async fn send_zats<P: Parameters>(
         &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>, outputs: &[TxOutput],
         src_usk: &UnifiedSpendingKey, zats: Zatoshis, fee_zats: Zatoshis, opts: &TxOptions<'_>
@@ -926,7 +932,18 @@ impl ManualWallet {
                         // }
 
                         for note in &account.unspent_orchard_notes {
-                            let witness = tree.witness_at_checkpoint_id(note.position, &orchard_anchor_h).expect("Infallible MemoryShardStore")?;
+                            let witness = match tree.witness_at_checkpoint_id(note.position, &orchard_anchor_h) {
+                                // NOTE: presumably can fail from too-recent note
+                                Ok(Some(witness)) => witness,
+                                Ok(None) => {
+                                    println!("tx build: no orchard checkpoint exists at {orchard_anchor_h:?}");
+                                    return None;
+                                }
+                                Err(err) => {
+                                    println!("tx build: orchard witness error: {err:?}");
+                                    return None;
+                                }
+                            };
                             let merkle_path = orchard::tree::MerklePath::from(witness);
                             if let Err(err) = txb.add_orchard_spend::<zip317::FeeError>(fvk.clone(), note.note, merkle_path) {
                                 println!("tx build: orchard note spend failed: {err:?}");
@@ -2319,63 +2336,86 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         wallet_state.lock().unwrap().txs = txs;
 
         // DEV: miner send tx to self
-        if let (Some(miner_utxo), Some(start_block_i)) = (miner_wallet.accounts[0].utxos.first(), sync_from_i) {
-            if let Some(val_after_fees) = miner_utxo.value - MINIMUM_FEE {
-                let mut dst = TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees};
-                let mut fee =  MINIMUM_FEE;
-                if true {
+        if let Some(start_block_i) = sync_from_i {
+            let utxos = &miner_wallet.accounts[0].utxos;
+            let shield_n_notes = 5;//OsRng.gen_range(0..=utxos.len());
+
+            if shield_n_notes <= utxos.len() {
+                let mut t_spend_z = 0;
+                for t_i in 0..shield_n_notes {
+                    t_spend_z += utxos[t_i].value.into_u64();
+                }
+
+                let t_input_sizes = vec![fees::transparent::InputSize::STANDARD_P2PKH; shield_n_notes];
+                let calc_fee = zip317::FeeRule::standard().fee_required(
+                    network,
+                    LRZBlockHeight::from_u32(0), // TODO: this may become relevant at some point...
+                    t_input_sizes,
+                    [], // &[zip317::P2PKH_STANDARD_OUTPUT_SIZE],
+                    0, 0, // sapling in, out
+                    // NOTE: basically 0 or 2+ (1 is consensus-legal but doesn't match builder's fee calc)
+                    orchard::builder::BundleType::DEFAULT.num_actions(0, 1).expect("valid action") // orchard actions
+                ).expect("valid fee");
+                let mut fee = calc_fee; //zip317::MINIMUM_FEE;//Zatoshis::const_from_u64(50_000); // TODO: calculate
+                if let Some(val_after_fees) = Zatoshis::from_u64(t_spend_z).unwrap() - fee {
+                    let mut dst = TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees};
+
                     if let (Some(fvk), Some(&dst_addr)) = (miner_wallet.accounts[0].ufvk.orchard(), miner_ua.orchard()) {
-                        let new_fee = Zatoshis::const_from_u64(15_000);
-                        if let Some(new_val_after_fees) = miner_utxo.value - new_fee {
-                            dst = TxOutput::Orchard {
-                                dst: dst_addr,
-                                ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
-                                zats: new_val_after_fees.into_u64(),
-                                memo: MemoBytes::empty()
-                            };
-                            fee = new_fee;
-                         }
+                        dst = TxOutput::Orchard {
+                            dst: dst_addr,
+                            ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
+                            zats: val_after_fees.into_u64(),
+                            // memo: MemoBytes::empty(),
+                            // NOTE: MemoBytes::empty() != MemoBytes::from_bytes(&[])
+                            memo: MemoBytes::from_bytes("shielding notes".as_bytes()).unwrap(),
+                        };
                     }
-                };
 
-                println!("shielding transparent funds");
-                miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, val_after_fees, fee, &TxOptions {
-                    src_pools: &[TxPool::Transparent],
-                    ..TxOptions::default()
-                }).await;
+                    println!("shielding {shield_n_notes} transparent notes");
+                    miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, val_after_fees, fee, &TxOptions {
+                        src_pools: &[TxPool::Transparent],
+                        ..TxOptions::default()
+                    }).await;
+                }
             }
-        }
-        if let (Some(miner_note), Some(start_block_i), Some(fvk), Some(&dst_addr)) = (
-            miner_wallet.accounts[0].unspent_orchard_notes.first(),
-            sync_from_i,
-            miner_wallet.accounts[0].ufvk.orchard(),
-            miner_ua.orchard(),
-        )
-        {
-            let note_value: u64 = miner_note.note.value().inner();
-            let fee_z = MINIMUM_FEE;
-            let mut fee = fee_z.into_u64();
-            if note_value >= fee {
-                let val_after_fees = note_value - fee;
-                let dst = TxOutput::Orchard {
-                    dst: dst_addr,
-                    ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
-                    zats: val_after_fees,
-                    memo: MemoBytes::empty()
-                };
 
-                println!("orchard->orchard self-send");
-                // let orchard_tree_root = shard_tree_root(orchard_tree);
-                // let orchard_tree_root = miner_note.witness.root();
-                // println!("anchor at {}/{}: {orchard_tree_root:?}", u64::from(miner_note.witness.witnessed_position()), u64::from(miner_note.witness.tip_position()));
-                let send_res = miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, Zatoshis::from_u64(val_after_fees).unwrap(), fee_z, &TxOptions {
-                    // src_pools: &[TxPool::Orchard(orchard::Anchor::from(orchard_tree_root))],
-                    src_pools: &[TxPool::Orchard(&orchard_tree)],
-                    ..TxOptions::default()
-                }).await;
+            let orchard_notes = &miner_wallet.accounts[0].unspent_orchard_notes;
+            let send_n_notes = 3; //OsRng.gen_range(0..=orchard_notes.len());
+            if let (Some(fvk), Some(&dst_addr), true) = (
+                miner_wallet.accounts[0].ufvk.orchard(),
+                miner_ua.orchard(),
+                send_n_notes <= orchard_notes.len()
+                )
+            {
+                let mut spend = 0;
+                for note_i in 0..send_n_notes {
+                    spend += orchard_notes[note_i].note.value().inner();
+                }
 
-                if let Some(txid) = send_res {
-                    println!("successfully sent orchard tx: {txid}");
+                let mut fee_z = Zatoshis::const_from_u64(50_000); // TODO: calculate
+                let mut fee = fee_z.into_u64();
+                if spend >= fee {
+                    let val_after_fees = spend - fee;
+                    let dst = TxOutput::Orchard {
+                        dst: dst_addr,
+                        ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
+                        zats: val_after_fees,
+                        memo: MemoBytes::from_bytes("orchard->orchard send".as_bytes()).unwrap(),
+                    };
+
+                    println!("orchard ({send_n_notes}) -> orchard (1) self-send");
+                    // let orchard_tree_root = shard_tree_root(orchard_tree);
+                    // let orchard_tree_root = miner_note.witness.root();
+                    // println!("anchor at {}/{}: {orchard_tree_root:?}", u64::from(miner_note.witness.witnessed_position()), u64::from(miner_note.witness.tip_position()));
+                    let send_res = miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, Zatoshis::from_u64(val_after_fees).unwrap(), fee_z, &TxOptions {
+                        // src_pools: &[TxPool::Orchard(orchard::Anchor::from(orchard_tree_root))],
+                        src_pools: &[TxPool::Orchard(&orchard_tree)],
+                        ..TxOptions::default()
+                    }).await;
+
+                    if let Some(txid) = send_res {
+                        println!("successfully sent orchard tx: {txid}");
+                    }
                 }
             }
         }
