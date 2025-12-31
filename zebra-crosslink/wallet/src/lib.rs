@@ -2380,19 +2380,26 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
 
             let orchard_notes = &miner_wallet.accounts[0].unspent_orchard_notes;
-            let send_n_notes = 3; //OsRng.gen_range(0..=orchard_notes.len());
+            let spend_n_notes = 3; //OsRng.gen_range(0..=orchard_notes.len());
             if let (Some(fvk), Some(&dst_addr), true) = (
                 miner_wallet.accounts[0].ufvk.orchard(),
                 miner_ua.orchard(),
-                send_n_notes <= orchard_notes.len()
-                )
-            {
+                spend_n_notes <= orchard_notes.len()
+            ) {
                 let mut spend = 0;
-                for note_i in 0..send_n_notes {
+                for note_i in 0..spend_n_notes {
                     spend += orchard_notes[note_i].note.value().inner();
                 }
 
-                let mut fee_z = Zatoshis::const_from_u64(50_000); // TODO: calculate
+                let calc_fee = zip317::FeeRule::standard().fee_required(
+                    network,
+                    LRZBlockHeight::from_u32(0), // TODO: this may become relevant at some point...
+                    [], [],
+                    0, 0, // sapling in, out
+                    // NOTE: basically 0 or 2+ (1 is consensus-legal but doesn't match builder's fee calc)
+                    orchard::builder::BundleType::DEFAULT.num_actions(spend_n_notes, 1).expect("valid action") // orchard actions
+                ).expect("valid fee");
+                let mut fee_z = calc_fee;
                 let mut fee = fee_z.into_u64();
                 if spend >= fee {
                     let val_after_fees = spend - fee;
@@ -2403,7 +2410,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         memo: MemoBytes::from_bytes("orchard->orchard send".as_bytes()).unwrap(),
                     };
 
-                    println!("orchard ({send_n_notes}) -> orchard (1) self-send");
+                    println!("orchard ({spend_n_notes}) -> orchard (1) self-send");
                     // let orchard_tree_root = shard_tree_root(orchard_tree);
                     // let orchard_tree_root = miner_note.witness.root();
                     // println!("anchor at {}/{}: {orchard_tree_root:?}", u64::from(miner_note.witness.witnessed_position()), u64::from(miner_note.witness.tip_position()));
