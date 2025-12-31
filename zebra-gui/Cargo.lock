@@ -5164,6 +5164,7 @@ dependencies = [
  "sapling-crypto",
  "secp256k1",
  "secrecy",
+ "shardtree",
  "tokio",
  "tokio-rustls",
  "tokio-stream",

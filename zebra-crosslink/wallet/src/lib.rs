@@ -196,13 +196,16 @@ struct OrchardNote {
     // TODO: could be compressed by decomposition
     pub note: orchard::note::Note,
     // TODO: commitment? ephemeralkey?
-    pub witness: OrchardWitness, // includes position
+    pub position: incrementalmerkletree::Position,
+    // pub witness: OrchardWitness, // includes position
 }
 impl std::fmt::Debug for OrchardNote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OrchardNote{{ recv:{:?}, spent:{:?}, txid:{}, nf:{:?}, value:{}, pos:{}, anchor: {:?}}}",
+        write!(f, "OrchardNote{{ recv:{:?}, spent:{:?}, txid:{}, nf:{:?}, value:{}, pos:{}}}",
             self.recv_h, self.spent_h, self.txid, self.nf, self.note.value().inner(),
-            u64::from(self.witness.witnessed_position()), self.witness.root())
+            u64::from(self.position)
+            // u64::from(self.witness.witnessed_position()), self.witness.root()
+            )
     }
 }
 
@@ -567,7 +570,7 @@ enum TxOutput {
 }
 
 struct TxOptions<'a> {
-    src_pools: &'a [TxPool], // in descending preference order
+    src_pools: &'a [TxPool<'a>], // in descending preference order
     staking_action: Option<StakingAction>,
 }
 impl<'a> TxOptions<'a> {
@@ -585,11 +588,12 @@ impl<'a> Default for TxOptions<'a> {
     }
 }
 
-pub enum TxPool {
+pub enum TxPool<'a> {
     Transparent,
     // Sprout,
     // Sapling,
-    Orchard(orchard::Anchor),
+    // Orchard(orchard::Anchor),
+    Orchard(&'a OrchardShardTree),
 }
 
 fn transparent_keys_from_usk(usk: &UnifiedSpendingKey, index: u32) -> Option<(secp256k1::PublicKey, secp256k1::SecretKey)> {
@@ -786,6 +790,8 @@ impl ManualWallet {
         //- CHECK SOURCES, FIND ANCHORS
         let (mut sapling_anchor, mut orchard_anchor) = (None, orchard::Anchor::empty_tree());
         let (mut has_transparent_src, mut has_orchard_src) = (false, false);
+        let mut orchard_anchor_h = BlockHeight(0);
+
         for pool in opts.src_pools {
             match pool {
                 TxPool::Transparent => {
@@ -797,14 +803,26 @@ impl ManualWallet {
                     has_transparent_src = true;
                 }
 
-                TxPool::Orchard(anchor) => {
+                TxPool::Orchard(shardtree) => {
                     if has_orchard_src {
                         println!("build error: repeated orchard source pool (can only have 1)");
                         // ALT: ignore the latter ones (maybe iff they have the same anchor)?
                         return None;
                     }
                     has_orchard_src = true;
-                    orchard_anchor = *anchor;
+                    // TODO: balance:
+                    // - up-to-date anchor (privacy)
+                    // - not too close to tip (reduced probability of loss through reorg)
+                    // - spendable note heights (must be higher than all needed)
+                    //   - more notes needed if fees change -> change in anchor
+                    orchard_anchor_h = self.chain_tip_h.sat_sub(1);
+                    orchard_anchor = match shardtree.root_at_checkpoint_id(&orchard_anchor_h).expect("Infallible MemoryShardStore") {
+                        Some(root) => orchard::Anchor::from(root),
+                        None => {
+                            println!("tx build: couldn't get anchor at {orchard_anchor_h:?}");
+                            return None;
+                        }
+                    }
                 }
             }
         }
@@ -893,10 +911,23 @@ impl ManualWallet {
                     }
                 }
 
-                TxPool::Orchard(_) => {
+                TxPool::Orchard(tree) => {
                     if let Some(fvk) = &keys.orchard_fvk {
+                        // determine the anchor height
+                        // TODO: max this with tip_h - 10 or so
+                        // let mut max_note_h = BlockHeight(0);
+                        // let s_spend_z_check = 0;
+                        // for note in &account.unspent_orchard_notes {
+                        //     max_note_h = max_note_h.max(note.recv_h);
+                        //     s_spend_z_check += note.note.value().inner();
+                        //     if ((t_spend_z + s_spend_z_check) >= min_spend) {
+                        //         break;
+                        //     }
+                        // }
+
                         for note in &account.unspent_orchard_notes {
-                            let merkle_path = orchard::tree::MerklePath::from(note.witness.path().expect("non-empty tree"));
+                            let witness = tree.witness_at_checkpoint_id(note.position, &orchard_anchor_h).expect("Infallible MemoryShardStore")?;
+                            let merkle_path = orchard::tree::MerklePath::from(witness);
                             if let Err(err) = txb.add_orchard_spend::<zip317::FeeError>(fvk.clone(), note.note, merkle_path) {
                                 println!("tx build: orchard note spend failed: {err:?}");
                                 continue;
@@ -934,6 +965,7 @@ impl ManualWallet {
             }
         };
         // TODO: separate change outputs from intended outputs
+        // TODO: account for possible fee change with additional change
 
         //- TOTALS GATHERED; CHECK VALUES
         let mut parts = [
@@ -1270,8 +1302,30 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
 type OrchardTree = incrementalmerkletree::frontier::CommitmentTree<orchard::tree::MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>;
 type OrchardFrontier = incrementalmerkletree::frontier::Frontier<orchard::tree::MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>;
 type OrchardWitness = incrementalmerkletree::witness::IncrementalWitness<orchard::tree::MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>;
+const SHARD_HEIGHT: u8 = 16; // default => 65536 leaves per shard
+type OrchardShardTree = shardtree::ShardTree::<
+    shardtree::store::memory::MemoryShardStore::<
+        orchard::tree::MerkleHashOrchard,
+        // shardtree::Node<orchard::tree::MerkleHashOrchard, (), ()>,
+        BlockHeight
+    >,
+    { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 },
+    SHARD_HEIGHT
+>;
 
-fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, insert_i: &mut usize, orchard_tree: &mut OrchardTree) -> Option<()> {
+fn shard_tree_size(tree: &OrchardShardTree) -> u64 {
+    tree.max_leaf_position(None)
+        .expect("Infallible Memory Store")
+        .map_or(0, |pos| u64::from(pos)+1)
+}
+
+fn shard_tree_root(tree: &OrchardShardTree) -> orchard::tree::MerkleHashOrchard {
+    tree.root_at_checkpoint_depth(None)
+        .expect("Infallible Memory Store")
+        .unwrap()
+}
+
+fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, insert_i: &mut usize, orchard_tree: &mut OrchardShardTree) -> Option<()> {
     let account = &mut wallet.accounts[account_i];
     let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
 
@@ -1291,8 +1345,19 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
         let domain = OrchardDomain::for_compact_action(&action);
 
         //- GLOBAL-VIEW UPDATES
-        orchard_tree.append(orchard::tree::MerkleHashOrchard::from_cmx(&action.cmx()));
-        println!("orchard root at {:?} tree size={:02} {:?}", block_h, orchard_tree.size(), orchard_tree.root());
+        let decrypt_res: Option<(orchard::note::Note, orchard::Address)> = if let Some(ivk) = &keys.orchard_ivk {
+             try_compact_note_decryption(&domain, ivk, &action)
+        } else {
+            None
+        };
+        let retention = if decrypt_res.is_some() {
+            incrementalmerkletree::Retention::Marked
+        } else {
+            incrementalmerkletree::Retention::Ephemeral
+        };
+        // TODO: batch_insert
+        orchard_tree.append(orchard::tree::MerkleHashOrchard::from_cmx(&action.cmx()), retention).expect("Infallible Memory Store");
+        println!("orchard root at {:?} tree size={:02} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
 
         //- HANDLE SPENT NOTES
         let nf: orchard::note::Nullifier = action.nullifier();
@@ -1329,7 +1394,8 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
                     spent_h: BlockHeight(0),
                     txid,
                     note,
-                    witness: OrchardWitness::from_tree(orchard_tree.clone()).expect("just appended"),
+                    position: orchard_tree.max_leaf_position(None).expect("Infallible Memory Store").expect("just appended"),
+                    // witness: OrchardWitness::from_tree(orchard_tree.clone()).expect("just appended"),
                     // in note:
                     // value: match Zatoshis::from_u64(note.value().inner()) {
                     //     Ok(v) => v,
@@ -1340,7 +1406,7 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
                     // },
                     nf: note.nullifier(keys.orchard_fvk.as_ref().expect("implied by ivk presence")), // TODO: cache or recompute?
                 };
-                println!("got new note at {:?}, tree pos={:02} {:?}", block_h, u64::from(orchard_note.witness.witnessed_position()), orchard_note.witness.root());
+                // println!("got new note at {:?}, tree pos={:02} {:?}", block_h, u64::from(orchard_note.witness.witnessed_position()), orchard_note.witness.root());
 
                 s_recv_c += 1;
                 s_recv_z += note.value().inner();
@@ -1751,6 +1817,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     };
 
+    // NOTE: current model is to reorg this many blocks back
+    // ALT: have checkpoints every 16/32 blocks and always sync from the start of one of these
     const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u64 = 64;
     let mut time_since_last_transparent_shielded = std::time::Instant::now() - std::time::Duration::from_secs(1000);
 
@@ -1772,6 +1840,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     };
 
     let mut pow_cache = PoWCache::new(0, genesis_hash);
+    const CHECKPOINTS_N: usize = 100;
+    let mut orchard_tree = OrchardShardTree::new(shardtree::store::memory::MemoryShardStore::empty(), CHECKPOINTS_N);
 
     // TODO: full sync should have continously-full circular-buffer pipeline of requests for chunks
     // of increasing height that gets cleared when a reorg is found or we know we're at the tip.
@@ -2117,22 +2187,25 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             break (new_blocks, new_t_txs, sync_from_i, req_rng, prev_tip_chain_state);
         };
-        let mut orchard_frontier = prev_tip_chain_state.final_orchard_tree().clone();
-        let mut orchard_tree = incrementalmerkletree::frontier::CommitmentTree::from_frontier(&orchard_frontier);
-        println!("orchard root at {:?} tree: size={} {:?}", prev_tip_chain_state.block_height(), orchard_tree.size(), orchard_tree.root());
+        // let mut orchard_frontier = prev_tip_chain_state.final_orchard_tree().clone();
+        // let mut orchard_tree = incrementalmerkletree::frontier::CommitmentTree::from_frontier(&orchard_frontier);
+        // println!("orchard root at {:?} tree: size={} {:?}", prev_tip_chain_state.block_height(), shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
 
 
         //-- REORG
         if let Some(start_block_i) = sync_from_i {
             let sync_start_h = <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above");
             let block_h = BlockHeight(sync_start_h);
+            let last_block_h = block_h.sat_sub(1);
+
+            orchard_tree.truncate_to_checkpoint(&last_block_h);
+
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             for (wallet_i, wallet) in [miner_wallet, user_wallet].into_iter().enumerate() {
                 //-- INVALIDATE TXS >= NEW BLOCKS HEIGHT
                 // the regime is basically "always reorg", but that's often a no-op
                 // truncate wallet for everything below height
                 for account in &mut wallet.accounts {
-                    let last_block_h = block_h.sat_sub(1);
                     account.fully_detected_h = account.fully_detected_h.min(last_block_h);
                     account.fully_decoded_h = account.fully_decoded_h.min(last_block_h);
 
@@ -2226,7 +2299,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         read_compact_tx(wallet, 0, &keys, block_h, tx, &mut insert_i, &mut orchard_tree);
                     }
 
-                    // println!("orchard root at {:?} tree: size={} {:?}", block_h, orchard_tree.size(), orchard_tree.root());
+                    // NOTE: simple approach: checkpoint every block
+                    // => allows for easy reorgs & witnesses
+                    orchard_tree.checkpoint(block_h);
+                    // println!("orchard root at {:?} tree: size={} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
                 }
             }
         }
@@ -2288,11 +2364,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 };
 
                 println!("orchard->orchard self-send");
-                // let orchard_tree_root = orchard_tree.root();
-                let orchard_tree_root = miner_note.witness.root();
-                println!("anchor at {}/{}: {orchard_tree_root:?}", u64::from(miner_note.witness.witnessed_position()), u64::from(miner_note.witness.tip_position()));
+                // let orchard_tree_root = shard_tree_root(orchard_tree);
+                // let orchard_tree_root = miner_note.witness.root();
+                // println!("anchor at {}/{}: {orchard_tree_root:?}", u64::from(miner_note.witness.witnessed_position()), u64::from(miner_note.witness.tip_position()));
                 let send_res = miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, Zatoshis::from_u64(val_after_fees).unwrap(), fee_z, &TxOptions {
-                    src_pools: &[TxPool::Orchard(orchard::Anchor::from(orchard_tree_root))],
+                    // src_pools: &[TxPool::Orchard(orchard::Anchor::from(orchard_tree_root))],
+                    src_pools: &[TxPool::Orchard(&orchard_tree)],
                     ..TxOptions::default()
                 }).await;
 
