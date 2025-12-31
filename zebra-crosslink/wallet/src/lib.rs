@@ -343,6 +343,19 @@ impl WalletTxPart {
     }
 }
 
+type TxPartFlags = u8;
+struct TxParts(pub TxPartFlags);
+impl TxParts {
+    const NONE:          TxPartFlags = 0;
+    const TRANSPARENT:   TxPartFlags = 1 << WalletTxPart::TRANSPARENT;
+    const SHIELDED_RECV: TxPartFlags = 1 << WalletTxPart::SHIELDED;
+    const SHIELDED_SENT: TxPartFlags = 1 << 2;
+    const MEMO:          TxPartFlags = 1 << 3;
+
+    const FULL_TX: TxPartFlags = (
+        Self::TRANSPARENT | Self::SHIELDED_RECV | Self::SHIELDED_SENT | Self::MEMO
+    );
+}
 
 // NOTE: trying to not store data that can be computed directly
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -354,6 +367,7 @@ pub struct WalletTx {
 
     // TODO: track whether full Transaction has been read
     pub is_coinbase: bool,
+    pub part_flags: TxPartFlags,
     pub parts: [WalletTxPart; 2], // 0=>transparent, 1=>shielded
 
     // TODO: keep all memos in single contiguous array as ((txid, index), memo)
@@ -373,6 +387,7 @@ impl WalletTx {
             txid: TxId::from_bytes([0; 32]),
             expiry_h: None,
             mined_h: if mined_h != 0 { (BlockHeight(mined_h)) } else { BlockHeight::MEMPOOL },
+            part_flags: TxParts::FULL_TX,
             parts: [
                 WalletTxPart { // Transparent
                     spent_note_count: (sent > 0 && shielding) as usize,
@@ -626,7 +641,7 @@ fn update_insert_i(txs: &[WalletTx], insert_i: &mut usize, block_h: BlockHeight)
     *insert_i += txs[*insert_i..].partition_point(|tx| tx.mined_h <= block_h);
 }
 
-fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, components: usize, insert_i: &mut usize) {
+fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, insert_i: &mut usize) {
     // find if there's an existing height/transaction for this txid
     if let Some(tx_h) = wallet.tx_h_map.get_mut(&txid) {
         let mut h_start_i = wallet.txs.partition_point(|tx| tx.mined_h < *tx_h);
@@ -653,19 +668,34 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, c
                 // println!("{} wallet updated existing transaction {txid} {old_tx:?} => {new_tx:?}", wallet.name);
 
                 // leave the tx-parts from the components not provided here
-                for component in 0..new_tx.parts.len() {
-                    if (components & (1 << component)) == 0 {
-                        new_tx.parts[component] = old_tx.parts[component];
-                    }
+                if (new_tx.part_flags & TxParts::TRANSPARENT) == 0 {
+                    new_tx.parts[WalletTxPart::TRANSPARENT] = old_tx.parts[WalletTxPart::TRANSPARENT];
                 }
-                // if "shielding", we only see the incoming part in the compact blocks
-                if (components == (1 << WalletTxPart::SHIELDED) &&
-                    new_tx.parts[WalletTxPart::TRANSPARENT].spent_note_count > 0 &&
-                    new_tx.parts[WalletTxPart::SHIELDED].sent_note_count == 0)
-                {
-                    new_tx.parts[WalletTxPart::SHIELDED].sent_note_count = new_tx.parts[WalletTxPart::SHIELDED].recv_note_count;
-                    new_tx.parts[WalletTxPart::SHIELDED].sent_zats = new_tx.parts[WalletTxPart::SHIELDED].recv_zats;
+                if (new_tx.part_flags & TxParts::SHIELDED_RECV) == 0 {
+                    new_tx.parts[WalletTxPart::SHIELDED].recv_note_count = old_tx.parts[WalletTxPart::SHIELDED].recv_note_count;
+                    new_tx.parts[WalletTxPart::SHIELDED].recv_zats = old_tx.parts[WalletTxPart::SHIELDED].recv_zats;
                 }
+                if (new_tx.part_flags & TxParts::SHIELDED_SENT) == 0 {
+                    new_tx.parts[WalletTxPart::SHIELDED].spent_note_count = old_tx.parts[WalletTxPart::SHIELDED].spent_note_count;
+                    new_tx.parts[WalletTxPart::SHIELDED].spent_zats       = old_tx.parts[WalletTxPart::SHIELDED].spent_zats;
+                    new_tx.parts[WalletTxPart::SHIELDED].sent_note_count  = old_tx.parts[WalletTxPart::SHIELDED].sent_note_count;
+                    new_tx.parts[WalletTxPart::SHIELDED].sent_zats        = old_tx.parts[WalletTxPart::SHIELDED].sent_zats;
+                }
+                if (new_tx.part_flags & TxParts::MEMO) == 0 {
+                    new_tx.memo_count = old_tx.memo_count;
+                    new_tx.memo       = old_tx.memo;
+                }
+
+                // // if "shielding", we only see the incoming part in the compact blocks
+                // if (components == (1 << WalletTxPart::SHIELDED) &&
+                //     new_tx.parts[WalletTxPart::TRANSPARENT].spent_note_count > 0 &&
+                //     new_tx.parts[WalletTxPart::SHIELDED].sent_note_count == 0)
+                // {
+                //     new_tx.parts[WalletTxPart::SHIELDED].sent_note_count = new_tx.parts[WalletTxPart::SHIELDED].recv_note_count;
+                //     new_tx.parts[WalletTxPart::SHIELDED].sent_zats = new_tx.parts[WalletTxPart::SHIELDED].recv_zats;
+                // }
+
+                new_tx.part_flags |= old_tx.part_flags;
             }
         } else {
             println!("ERROR: {txid:?} not found at associated height {tx_h:?}");
@@ -687,6 +717,15 @@ fn to_zats_or_dump_err(src: &str, z: u64) -> Option<Zatoshis> {
             None
         }
     }
+}
+
+const EMPTY_MEMO_BYTES: [u8; 512] = {
+    let mut bytes = [0; 512];
+    bytes[0] = 0xf6;
+    bytes
+};
+fn memo_is_empty(memo_bytes: &[u8; 512]) -> bool {
+    memo_bytes[0] == 0xf6
 }
 
 #[derive(Clone, Debug)]
@@ -854,6 +893,7 @@ impl ManualWallet {
             BuildConfig::Standard { sapling_anchor, orchard_anchor: Some(orchard_anchor), },
         );
 
+        let mut memo_count = 0;
         let (mut t_send_z, mut t_recv_z, mut s_send_z, mut s_recv_z) = (0, 0, 0, 0);
         let (mut t_send_c, mut t_recv_c, mut s_send_c, mut s_recv_c) = (0, 0, 0, 0);
         for output in outputs {
@@ -879,6 +919,8 @@ impl ManualWallet {
                     let is_to_me = (dst == orchard_addr);
                     s_recv_c += is_to_me as usize;
                     s_recv_z += is_to_me as u64 * zats;
+
+                    memo_count += !memo_is_empty(memo.as_array()) as usize;
 
                     if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(ovk.clone(), dst.clone(), *zats, memo.clone()) {
                         println!("tx build error: {err:?}");
@@ -1047,16 +1089,16 @@ impl ManualWallet {
                 txid: tx.txid(),
                 expiry_h: None,
                 mined_h: BlockHeight::INTERNAL,
+                part_flags: TxParts::FULL_TX,
                 parts,
-                memo_count: 0,
-                memo: [0; 512],
+                memo_count,
+                memo: EMPTY_MEMO_BYTES,
                 is_coinbase: false,
                 is_outside_bc: false,
             };
             let mut insert_i = 0;
             update_insert_i(&self.txs, &mut insert_i, new_tx.mined_h);
-            let components = (1 << WalletTxPart::TRANSPARENT) | (1 << WalletTxPart::SHIELDED);
-            update_with_tx(self, tx.txid(), new_tx, components, &mut insert_i);
+            update_with_tx(self, tx.txid(), new_tx, &mut insert_i);
             Some(tx.txid())
         } else {
             None
@@ -1139,7 +1181,7 @@ struct PreparedKeys {
     pub orchard_fvk: Option<orchard::keys::FullViewingKey>,
     pub orchard_ivk: Option<orchard::keys::PreparedIncomingViewingKey>,
     pub orchard_ovk: Option<orchard::keys::OutgoingViewingKey>,
-    // TODO: sapling
+    // TODO: transparent, sapling
 }
 impl PreparedKeys {
     pub fn from_ufvk_all(ufvk: &UnifiedFullViewingKey) -> Self {
@@ -1288,6 +1330,34 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
         }
     }
 
+    let mut memo_count = 0;
+    let mut memo = EMPTY_MEMO_BYTES;
+
+    if let Some(bundle) = tx.orchard_bundle() {
+        for action in bundle.actions() {
+            let domain = orchard::note_encryption::OrchardDomain::for_action(action);
+
+            if let Some(ivk) = &keys.orchard_ivk {
+                if let Some((_, _, note_memo)) = try_note_decryption(&domain, ivk, action) {
+                    if !memo_is_empty(&note_memo) {
+                        memo_count += 1;
+                        memo = note_memo; // TODO: handle multiple memos
+                        // NOTE: I *think* we don't want to check sent if we know we received it
+                        // (i.e. avoid double-counting self-send memos)
+                        continue;
+                    }
+                }
+            }
+            if let Some(ovk) = &keys.orchard_ovk {
+                if let Some((_, _, note_memo)) = try_output_recovery_with_ovk(&domain, ovk, action, action.cv_net(), &action.encrypted_note().out_ciphertext) {
+                    if !memo_is_empty(&note_memo) {
+                        memo_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
     let parts = [
         WalletTxPart {
             spent_zats: to_zats_or_dump_err("t tx receive", t_spend_z)?,
@@ -1297,6 +1367,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
             sent_note_count: t_send_c,
             recv_note_count: t_recv_c,
         },
+        // TODO: handle shielded values
         WalletTxPart::ZERO,
     ];
 
@@ -1305,14 +1376,15 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
         txid,
         expiry_h,
         mined_h: block_h,
+        part_flags: TxParts::TRANSPARENT | TxParts::MEMO, // TODO: handle FULL_TX
         parts,
-        memo_count: 0,
-        memo: [0; 512],
+        memo_count,
+        memo,
         is_coinbase,
         is_outside_bc: false,
     };
 
-    update_with_tx(wallet, new_tx.txid, new_tx, 1 << WalletTxPart::TRANSPARENT, insert_i);
+    update_with_tx(wallet, new_tx.txid, new_tx, insert_i);
     Some(())
 }
 
@@ -1342,12 +1414,14 @@ fn shard_tree_root(tree: &OrchardShardTree) -> orchard::tree::MerkleHashOrchard 
         .unwrap()
 }
 
-fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, insert_i: &mut usize, orchard_tree: &mut OrchardShardTree) -> Option<()> {
+fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, insert_i: &mut usize, orchard_tree: &mut OrchardShardTree) -> (TxId, bool/*ours*/, bool/*ok*/) {
     let account = &mut wallet.accounts[account_i];
     let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
 
     let (mut s_send_z, mut s_spend_z, mut s_recv_z) = (0, 0, 0);
     let (mut s_send_c, mut s_spend_c, mut s_recv_c) = (0, 0, 0);
+
+    let mut ours = false;
 
     for orchard_action in &tx.actions {
         let action = match OrchardCompactAction::try_from(orchard_action) {
@@ -1401,11 +1475,14 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
                 }
             }
         }
+        ours |= found_nf;
 
         //- PUSH NEW RECEIVED/UNSPENT NOTES
         if let Some(ivk) = &keys.orchard_ivk {
             let decrypt_res: Option<(orchard::note::Note, orchard::Address)> = try_compact_note_decryption(&domain, ivk, &action);
             if let Some((note, _recipient)) = decrypt_res {
+                ours = true;
+
                 let orchard_note = OrchardNote{
                     recv_h: block_h,
                     spent_h: BlockHeight(0),
@@ -1484,7 +1561,7 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
             (Ok(s_spent_zats), Ok(s_sent_zats), Ok(s_recv_zats)) => (s_spent_zats, s_sent_zats, s_recv_zats),
             (spent, sent, recv) => {
                 println!("couldn't convert all to Zats: ({spent:?}, {sent:?}, {recv:?})");
-                return None;
+                return (txid, ours, false);
             }
         };
 
@@ -1505,18 +1582,19 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
             txid,
             expiry_h: None, // TODO
             mined_h: block_h,
+            part_flags: TxParts::SHIELDED_RECV,
             parts,
-            // TODO: get memos
             memo_count: 0,
-            memo: [0; 512],
+            memo: EMPTY_MEMO_BYTES,
             is_coinbase: false,
             is_outside_bc: false,
         };
 
         drop(account);
-        update_with_tx(wallet, txid, new_tx, 1 << WalletTxPart::SHIELDED, insert_i);
+        update_with_tx(wallet, txid, new_tx, insert_i);
     }
-    Some(())
+
+    (txid, ours, true)
 }
 
 
@@ -2314,7 +2392,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     //-- INCORPORATE SHIELDED TRANSACTIONS FROM COMPACT BLOCK
                     'tx_iter: for tx in &block.vtx {
-                        read_compact_tx(wallet, 0, &keys, block_h, tx, &mut insert_i, &mut orchard_tree);
+                        if let (txid, true, true) = read_compact_tx(wallet, 0, &keys, block_h, tx, &mut insert_i, &mut orchard_tree) {
+                            println!("found our compact tx: {txid:?}");
+                        }
                     }
 
                     // NOTE: simple approach: checkpoint every block
@@ -2346,6 +2426,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     t_spend_z += utxos[t_i].value.into_u64();
                 }
 
+                // TODO: this is conservative, could do actual sizes...
                 let t_input_sizes = vec![fees::transparent::InputSize::STANDARD_P2PKH; shield_n_notes];
                 let calc_fee = zip317::FeeRule::standard().fee_required(
                     network,
