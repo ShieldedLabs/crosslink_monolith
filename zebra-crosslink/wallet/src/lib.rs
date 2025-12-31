@@ -2225,12 +2225,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     account.recv_orchard_notes.truncate(recv_orchard_notes_at_h_start);
 
                     //- UNSPEND NOTES
+                    // NOTE: spent notes are in spend_h order, NOT recv_h order
                     let stxos_at_h_start = account.stxos.partition_point(|txo| txo.spent_h < block_h);
                     for stxo in &account.stxos[stxos_at_h_start..] {
-                        // TODO: these are NOT in order
                         if stxo.recv_h < block_h {
-                            // reinsert at the end of that height
-                            let i = txo_recv_h_position(&account.utxos, BlockHeight(stxo.recv_h.0+1), &stxo.id).unwrap_or(account.utxos.len());
+                            // reinsert at the end of that height // TODO: this makes notes within a height slightly unstable within a height
+                            let i = account.utxos.partition_point(|txo| txo.recv_h <= stxo.recv_h);
+                            // let i = txo_recv_h_position(&account.utxos, BlockHeight(stxo.recv_h.0+1), &stxo.id).unwrap_or(account.utxos.len());
                             debug_assert!(i == 0 || account.utxos[i-1].recv_h <= stxo.recv_h, "{} <= {}", account.utxos[i-1].recv_h, stxo.recv_h);
                             account.utxos.insert(i, Txo{ spent_h: BlockHeight(0), ..stxo.clone() });
                         }
@@ -2239,10 +2240,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     let spent_orchard_notes_at_h_start = account.spent_orchard_notes.partition_point(|note| note.spent_h < block_h);
                     for spent_orchard_note in &account.spent_orchard_notes[spent_orchard_notes_at_h_start..] {
-                        // TODO: these are NOT in order
                         if spent_orchard_note.recv_h < block_h {
                             // reinsert at the end of that height
-                            let i = orchard_recv_h_position(&account.unspent_orchard_notes, BlockHeight(spent_orchard_note.recv_h.0+1), &spent_orchard_note.nf).unwrap_or(account.unspent_orchard_notes.len());
+                            let i = account.unspent_orchard_notes.partition_point(|txo| txo.recv_h <= spent_orchard_note.recv_h);
+                            // let i = orchard_recv_h_position(&account.unspent_orchard_notes, BlockHeight(spent_orchard_note.recv_h.0+1), &spent_orchard_note.nf).unwrap_or(account.unspent_orchard_notes.len());
                             debug_assert!(i == 0 || account.unspent_orchard_notes[i-1].recv_h <= spent_orchard_note.recv_h, "{} <= {}", account.unspent_orchard_notes[i-1].recv_h, spent_orchard_note.recv_h);
                             account.unspent_orchard_notes.insert(i, OrchardNote{ spent_h: BlockHeight(0), ..spent_orchard_note.clone() });
                         }
