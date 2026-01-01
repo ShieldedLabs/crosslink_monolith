@@ -6152,6 +6152,7 @@ dependencies = [
  "sapling-crypto",
  "secp256k1",
  "serde",
+ "serde-big-array",
  "sha2 0.10.9",
  "subtle",
  "tracing",

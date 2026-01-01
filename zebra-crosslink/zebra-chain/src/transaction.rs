@@ -1555,17 +1555,19 @@ impl Transaction {
     }
 
     /// Return the staking value balance.
-    pub fn staking_value_balance(&self) -> ValueBalance<NegativeAllowed> {
+    pub fn staking_action_value_balance(&self) -> ValueBalance<NegativeAllowed> {
         match self {
             Self::VCrosslink {
                 staking_action,
                 ..
             } => {
                 if let Some(staking_action) = staking_action {
-                    if staking_action.kind == StakingActionKind::Add {
-                        ValueBalance::from_orchard_amount(Amount::new(staking_action.val as i64).neg())
+                    if staking_action.kind == StakingActionKind::CreateNewDelegationBond {
+                        ValueBalance::from_staking_bonded_amount(Amount::new(staking_action.amount_zats as i64).neg())
+                    } else if staking_action.kind == StakingActionKind::WithdrawDelegationBond {
+                        ValueBalance::from_staking_unbonded_amount(Amount::new(staking_action.amount_zats as i64).neg())
                     } else {
-                        ValueBalance::zero()
+                        ValueBalance::zero() // Note(Sam): I would have liked to have the transfer between bonded and unbonded pools to occur here but I do not think it is possible.
                     }
                 } else {
                     ValueBalance::zero()
@@ -1584,7 +1586,7 @@ impl Transaction {
             + self.sprout_value_balance()?
             + self.sapling_value_balance()
             + self.orchard_value_balance()
-            + self.staking_value_balance()
+            + self.staking_action_value_balance()
     }
 
     /// Returns the value balances for this transaction.

@@ -1092,10 +1092,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             let Some((action, memos)) = user_txid_map.get(&txid) else { continue; };
                             let Some(action) = action else { continue; };
                             match action.kind {
-                                StakingActionKind::Add => {
+                                StakingActionKind::CreateNewDelegationBond => {
                                     if !stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly.contains(&txid) {
                                         total_staked += mem_txid.zats;
-                                        user_staked_txids.push((mem.pub_key, *txid.as_ref(), action.val, mem_txid.zats))
+                                        user_staked_txids.push((mem.pub_key, *txid.as_ref(), action.amount_zats, mem_txid.zats))
                                     }
                                 }
 
@@ -1123,7 +1123,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
                         else if tx.account_value_delta.is_negative() {
                             let is_action_stake = if let &Some((Some(action), _)) = &maybe_action_memo {
-                                action.kind == StakingActionKind::Add
+                                action.kind == StakingActionKind::CreateNewDelegationBond
                             } else {
                                 false
                             };
@@ -1340,28 +1340,28 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     miner_txid_map = map;
                     miner_sent_txid_map = sent_map;
 
-                    if !CHEAT_UNSTAKING && *AM_I_THE_UNSTAKER.lock().unwrap() {
-                        // TODO: does this have a race condition with syncing?
-                        for (tx, (action, memos)) in &miner_txid_map {
-                            let Some(action) = action else { continue; };
-                            if action.kind != StakingActionKind::Sub { continue; }
+                    // if !CHEAT_UNSTAKING && *AM_I_THE_UNSTAKER.lock().unwrap() {
+                    //     // TODO: does this have a race condition with syncing?
+                    //     for (tx, (action, memos)) in &miner_txid_map {
+                    //         let Some(action) = action else { continue; };
+                    //         if action.kind != StakingActionKind::Sub { continue; }
 
-                            let mut handled = false;
-                            // got a request to unstake; have we already repaid it?
-                            for (sent_tx, (_action, sent_memos)) in &miner_sent_txid_map  {
-                                if sent_memos.len() == 0 { continue; }
-                                if sent_memos[0].len() < "@UNSTAKE_RECEIVE: ".len()+64 { continue; }
-                                if Some(action.source) == StakingAction::addr_from_str_bytes(&sent_memos[0].as_bytes()["@UNSTAKE_RECEIVE: ".len().."@UNSTAKE_RECEIVE: ".len()+64]) {
-                                    handled = true;
-                                    break;
-                                }
-                            }
+                    //         let mut handled = false;
+                    //         // got a request to unstake; have we already repaid it?
+                    //         for (sent_tx, (_action, sent_memos)) in &miner_sent_txid_map  {
+                    //             if sent_memos.len() == 0 { continue; }
+                    //             if sent_memos[0].len() < "@UNSTAKE_RECEIVE: ".len()+64 { continue; }
+                    //             if Some(action.source) == StakingAction::addr_from_str_bytes(&sent_memos[0].as_bytes()["@UNSTAKE_RECEIVE: ".len().."@UNSTAKE_RECEIVE: ".len()+64]) {
+                    //                 handled = true;
+                    //                 break;
+                    //             }
+                    //         }
                             
-                            if !handled {
-                                send_unstake_reward(&mut client, &roster, &miner_txid_map, &TxId::from_bytes(action.source), miner_wallet, miner_usk, network, &mut Vec::new()).await;
-                            }
-                        }
-                    }
+                    //         if !handled {
+                    //             send_unstake_reward(&mut client, &roster, &miner_txid_map, &TxId::from_bytes(action.source), miner_wallet, miner_usk, network, &mut Vec::new()).await;
+                    //         }
+                    //     }
+                    // }
                 }
             }
         })(miner_wallet, &miner_usk, network).await;
@@ -1432,12 +1432,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         println!("********** STAKING ZEC {:?} ({:?}) TO THE MINER but also to {:?}", amount, amount_with_fee, target_finalizer);
                         let opts = TxOptions {
                             staking_action: Some(StakingAction {
-                                kind: StakingActionKind::Add,
-                                val: amount_with_fee.into_u64(),
-                                target: *target_finalizer,
-                                source: [0_u8; 32],
-                                insecure_target_name: "".to_owned(),
-                                insecure_source_name: "".to_owned(),
+                                kind: StakingActionKind::CreateNewDelegationBond,
+                                amount_zats: amount_with_fee.into_u64(),
+                                // TODO pub_key, challenge, signature
+                                arg32_2: *target_finalizer,
+                                ..Default::default()
                             }),
                             memo: Some(zcash_protocol::memo::MemoBytes::from_bytes(user_ua.encode(network).to_string().as_bytes()).unwrap()),
                         };
@@ -1514,36 +1513,37 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                                 break 'process_action false;
                             };
 
-                            let opts = TxOptions {
-                                staking_action: Some(StakingAction {
-                                    kind: StakingActionKind::Sub, // @todo: clear?
-                                    val: staked_txid.zats,
-                                    target: member_pub_key,
-                                    source: *txid.as_ref(),
-                                    insecure_target_name: "".to_owned(),
-                                    insecure_source_name: "".to_owned(),
-                                }),
-                                memo: None,
-                            };
+                            // let opts = TxOptions {
+                            //     staking_action: Some(StakingAction {
+                            //         kind: StakingActionKind::Sub, // @todo: clear?
+                            //         val: staked_txid.zats,
+                            //         target: member_pub_key,
+                            //         source: *txid.as_ref(),
+                            //         insecure_target_name: "".to_owned(),
+                            //         insecure_source_name: "".to_owned(),
+                            //     }),
+                            //     memo: None,
+                            // };
 
-                            // @note(judah): the miner sends to its own address because if the user sends it,
-                            // the tx will appear as a regular send of -0.2 cTAZ....
-                            match send_zats(&mut client, &miner_ua, miner_wallet, &miner_usk, Zatoshis::from_u64(10_000).unwrap() /* @todo fees */, network, &opts).await {
-                                None => {
-                                    println!("Failed to send unstaking action to miner");
-                                    false
-                                }
-                                Some(_) => {
-                                    println!("Successfully sent unstaking action to miner");
-                                    true
-                                }
-                            }
+                            // // @note(judah): the miner sends to its own address because if the user sends it,
+                            // // the tx will appear as a regular send of -0.2 cTAZ....
+                            // match send_zats(&mut client, &miner_ua, miner_wallet, &miner_usk, Zatoshis::from_u64(10_000).unwrap() /* @todo fees */, network, &opts).await {
+                            //     None => {
+                            //         println!("Failed to send unstaking action to miner");
+                            //         false
+                            //     }
+                            //     Some(_) => {
+                            //         println!("Successfully sent unstaking action to miner");
+                            //         true
+                            //     }
+                            // }
+                            false
                         };
 
-                        // Miner sends reward back to user
-                        if CHEAT_UNSTAKING {
-                            ok &= send_unstake_reward(&mut client, &roster, &miner_txid_map, txid, miner_wallet, &miner_usk, network, &mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly).await.is_some();
-                        }
+                        // // Miner sends reward back to user
+                        // if CHEAT_UNSTAKING {
+                        //     ok &= send_unstake_reward(&mut client, &roster, &miner_txid_map, txid, miner_wallet, &miner_usk, network, &mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly).await.is_some();
+                        // }
 
                         ok
                     }

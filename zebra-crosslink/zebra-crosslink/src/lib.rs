@@ -981,133 +981,6 @@ pub fn run_tfl_test(internal_handle: TFLServiceHandle) {
     tokio::task::spawn(test_format::instr_reader(internal_handle));
 }
 
-async fn push_staking_action_from_cmd_str(
-    call: &TFLServiceCalls,
-    cmd_str: &str,
-) -> Result<(), String> {
-    use zebra_chain::transaction::{LockTime, Transaction, UnminedTx};
-    let staking_action = zcash_primitives::transaction::StakingAction::parse_from_cmd(cmd_str)?;
-    let tx: UnminedTx = Transaction::VCrosslink {
-        // TODO(@prod): determine from network/height
-        network_upgrade: zebra_chain::parameters::NetworkUpgrade::Nu6,
-        lock_time: LockTime::unlocked(),
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-        expiry_height: BlockHeight(0), // "don't expire"
-        staking_action,
-    }
-    .into();
-
-    if let Ok(MempoolResponse::Queued(receivers)) =
-        (call.mempool)(MempoolRequest::Queue(vec![tx.into()])).await
-    {
-        for receiver in receivers {
-            match receiver {
-                Err(err) => return Err(format!("tried to send command transaction: {err}")),
-                Ok(receiver) => match receiver.await {
-                    Err(err) => return Err(format!("tried to await command transaction: {err}")),
-                    Ok(result) => match result {
-                        Err(err) => {
-                            return Err(format!("unsuccessfully mempooled transaction: {err}"))
-                        }
-                        Ok(()) => {}
-                    },
-                },
-            }
-        }
-    }
-    Ok(())
-}
-
-fn update_roster_for_cmd(
-    roster: &mut Vec<MalValidator>,
-    txid: [u8; 32],
-    validators_keys_to_names: &mut HashMap<MalPublicKey, String>,
-    action: &StakingAction,
-) -> usize {
-    // TODO: what is allowed in terms of multiple staking action in 1 command?
-    // Any subtract is serially dependent
-
-    let (has_add, sub_key_name, is_clear) = match action.kind {
-        StakingActionKind::Add => (true, None, false),
-        StakingActionKind::Sub => (
-            false,
-            Some((action.target, &action.insecure_target_name)),
-            false,
-        ),
-        StakingActionKind::Clear => (
-            false,
-            Some((action.target, &action.insecure_target_name)),
-            true,
-        ),
-        StakingActionKind::Move => (
-            true,
-            Some((action.source, &action.insecure_source_name)),
-            false,
-        ),
-        StakingActionKind::MoveClear => (
-            true,
-            Some((action.source, &action.insecure_source_name)),
-            true,
-        ),
-    };
-
-    let mut zats = action.val;
-    if let Some((sub_key, sub_name)) = sub_key_name {
-        // error!("subtraction currently non-functional")
-        let sub_key = MalPublicKey2(sub_key.into());
-        let Some(member) = roster.iter_mut().find(|cmp| VerificationKeyBytes::from(cmp.public_key) == sub_key.0) else {
-            warn!(
-                "Roster command invalid: can't subtract from non-present finalizer \"{}\"",
-                sub_key
-            );
-            return 0;
-        };
-
-        let ref_txid = action.source;
-        let Some(stake_txid) = member.txids.iter().find(|cmp| cmp.txid == ref_txid) else {
-            warn!(
-                "Roster command invalid: can't unstake non-present TXID \"{}\"",
-                MalPublicKey2(ref_txid.into())
-            );
-            return 0;
-        };
-
-        if stake_txid.zats != action.val {
-            if is_clear {
-                // warn!("Roster command invalid: can't clear the finalizer to a higher current value \"{}\"/{}: {} => {}",
-                //     sub_name, sub_key, member.voting_power, action.val);
-                return 0;
-            } else {
-                warn!("Roster warning: removing staking TXID {} from {} with unexpected value {}; expected {}",
-                    MalPublicKey2(ref_txid.into()), sub_key, stake_txid.zats, action.val);
-            }
-        }
-
-        // if is_clear {
-        //     zats = member.voting_power - action.val
-        // };
-
-        member.voting_power -= stake_txid.zats;
-        member.txids.retain(|cmp| cmp.txid != ref_txid);
-    }
-
-    if has_add {
-        // NOTE: all adds are to action.target
-        let add_key = MalPublicKey2(action.target.into());
-        let stake = StakeTxId{ txid, zats };
-        let member = if let Some(mut member) = roster.iter_mut().find(|cmp| VerificationKeyBytes::from(cmp.public_key) == add_key.0) {
-            member.push_txid(stake);
-        } else {
-            roster.push(MalValidator::new(add_key.0.into(), vec![stake]));
-        };
-    }
-
-    1
-}
-
 fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> usize {
     let roster = &mut internal.validators_at_current_height;
     let validators_keys_to_names = &mut internal.validators_keys_to_names;
@@ -1121,7 +994,8 @@ fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> 
             if let Some(staking_action) = staking_action {
                 let txid = tx.unmined_id().mined_id();
                 info!("got staking action in txid: {}", StakingAction::str_from_addr(txid.0));
-                cmd_c += update_roster_for_cmd(roster, txid.0, validators_keys_to_names, &staking_action);
+                // TODO(Sam)
+                //cmd_c += update_roster_for_cmd(roster, txid.0, validators_keys_to_names, &staking_action);
             }
         };
     }
@@ -1640,13 +1514,6 @@ async fn tfl_service_incoming_request(
             Ok(TFLServiceResponse::FatPointerToBFTChainTip(
                 internal.fat_pointer_to_tip.clone().to_non_two(),
             ))
-        }
-
-        TFLServiceRequest::StakingCmd(cmd) => {
-            match push_staking_action_from_cmd_str(&internal_handle.call, &cmd).await {
-                Ok(()) => Ok(TFLServiceResponse::StakingCmd),
-                Err(err) => Err(TFLServiceError::Misc(format!("{err}"))),
-            }
         }
 
         _ => Err(TFLServiceError::NotImplemented),
