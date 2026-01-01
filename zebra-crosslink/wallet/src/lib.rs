@@ -7,7 +7,7 @@ use rand_chacha::rand_core::SeedableRng;
 use rand_core::OsRng;
 use rand::Rng;
 use secrecy::{ExposeSecret,SecretVec,Secret};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::{identity, Infallible};
 use std::future::Future;
 use std::mem;
@@ -250,16 +250,16 @@ async fn wait_for_zainod() {
     }
 }
 
-struct Timer { t_bgn: std::time::Instant, name: &'static str }
-impl Timer {
-    pub fn scope(name: &'static str) -> Self {
+struct Timer<'a> { t_bgn: std::time::Instant, name: &'a str }
+impl<'a> Timer<'a> {
+    pub fn scope(name: &'a str) -> Self {
         println!("started {}", name);
         Self {
             name, t_bgn: std::time::Instant::now()
         }
     }
 }
-impl Drop for Timer {
+impl Drop for Timer<'_> {
     fn drop(&mut self) {
         println!("{} took {}ms", self.name, self.t_bgn.elapsed().as_millis());
     }
@@ -367,6 +367,7 @@ pub struct WalletTx {
 
     // TODO: track whether full Transaction has been read
     pub is_coinbase: bool,
+    // NOTE: this is whether we have checked for parts, not whether we have any
     pub part_flags: TxPartFlags,
     pub parts: [WalletTxPart; 2], // 0=>transparent, 1=>shielded
 
@@ -894,6 +895,7 @@ impl ManualWallet {
         );
 
         let mut memo_count = 0;
+        let mut memo = EMPTY_MEMO_BYTES;
         let (mut t_send_z, mut t_recv_z, mut s_send_z, mut s_recv_z) = (0, 0, 0, 0);
         let (mut t_send_c, mut t_recv_c, mut s_send_c, mut s_recv_c) = (0, 0, 0, 0);
         for output in outputs {
@@ -912,7 +914,7 @@ impl ManualWallet {
                     }
                     println!("  added transparent output: {}", zats.into_u64());
                 }
-                TxOutput::Orchard{ ovk, dst, zats, memo } => {
+                TxOutput::Orchard{ ovk, dst, zats, memo: note_memo } => {
                     s_send_c += 1;
                     s_send_z += zats;
                     // TODO: more comprehensive address matching
@@ -920,9 +922,10 @@ impl ManualWallet {
                     s_recv_c += is_to_me as usize;
                     s_recv_z += is_to_me as u64 * zats;
 
-                    memo_count += !memo_is_empty(memo.as_array()) as usize;
+                    memo_count += !memo_is_empty(note_memo.as_array()) as usize;
+                    // memo = note_memo;
 
-                    if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(ovk.clone(), dst.clone(), *zats, memo.clone()) {
+                    if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(ovk.clone(), dst.clone(), *zats, note_memo.clone()) {
                         println!("tx build error: {err:?}");
                         return None;
                     }
@@ -1089,10 +1092,10 @@ impl ManualWallet {
                 txid: tx.txid(),
                 expiry_h: None,
                 mined_h: BlockHeight::INTERNAL,
-                part_flags: TxParts::FULL_TX,
+                part_flags: TxParts::FULL_TX &! TxParts::MEMO,
                 parts,
                 memo_count,
-                memo: EMPTY_MEMO_BYTES,
+                memo,
                 is_coinbase: false,
                 is_outside_bc: false,
             };
@@ -1218,7 +1221,29 @@ impl PreparedKeys {
     }
 }
 
+// Some(None) => sidechain
+// None => read error
+// may return BlockHeight::MEMPOOL
+fn bc_h_from_raw_tx_h(height: u64) -> Option<Option<BlockHeight>> {
+    // height can be 0 for mempool, 0xff..ff for sidechain
+    if height == u64::MAX {
+        return Some(None);
+    }
+    let Ok(height) = <u32>::try_from(height) else {
+        println!("transparent tx's height can't be represented in 32 bits: {}", height);
+        return None;
+    };
+
+    Some(Some(if height == 0 {
+        BlockHeight::MEMPOOL
+    } else {
+        BlockHeight(height)
+    }))
+}
+
 fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize) -> Option<()> {
+    // TODO: we probably want to early-out if our existing tx data is complete
+    // (after checking that this doesn't get modified)
     update_insert_i(&wallet.txs, insert_i, block_h);
 
     let mut expiry_h = Some(BlockHeight::from(tx.expiry_height()));
@@ -1251,7 +1276,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
         if !is_coinbase {
             let mut input_i = 0;
             for input in &t_bundle.vin {
-                println!("input {input_i} {input:?}");
+                // println!("input {input_i} {input:?}");
                 input_i += 1;
 
                 if let Some(&prevout_txid_h) = wallet.tx_h_map.get(input.prevout.txid()) {
@@ -1352,6 +1377,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                 if let Some((_, _, note_memo)) = try_output_recovery_with_ovk(&domain, ovk, action, action.cv_net(), &action.encrypted_note().out_ciphertext) {
                     if !memo_is_empty(&note_memo) {
                         memo_count += 1;
+                        memo = note_memo; // TODO: handle multiple memos
                     }
                 }
             }
@@ -1938,6 +1964,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     const CHECKPOINTS_N: usize = 100;
     let mut orchard_tree = OrchardShardTree::new(shardtree::store::memory::MemoryShardStore::empty(), CHECKPOINTS_N);
 
+    const MAX_TXS_TO_DOWNLOAD_AT_TIME: u64 = 64;
+    // TODO: this is bad and should be replaced
+    let mut in_flight_tx_requests = HashSet::<TxId>::new();
+    let mut in_flight_tx_join_set = tokio::task::JoinSet::new();
+
     // TODO: full sync should have continously-full circular-buffer pipeline of requests for chunks
     // of increasing height that gets cleared when a reorg is found or we know we're at the tip.
     // TODO: randomly sync from a list of multiple lightwalletd servers to reduce info leakage/blind trust.
@@ -2012,7 +2043,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     // AFAICT there's no downside to updating these as frequently as possible, even if the
                     // rest of sync is lagging behind
-                    for wallet in [&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]] {
+                    for wallet in [&mut miner_wallets[miner_use_i], &mut user_wallets[user_use_i]] {
                         wallet.chain_tip_h = BlockHeight(network_tip_h);
                     }
                 },
@@ -2043,6 +2074,46 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                 }
             };
+
+            // FULL TRANSACTIONS
+            // TODO: fairer requests
+            for (wallet_i, wallet) in [&mut miner_wallets[miner_use_i], &mut user_wallets[user_use_i]].into_iter().enumerate() {
+                for tx in &wallet.txs {
+                    // TODO: trigger whenever we see a tx we want more info on
+                    if in_flight_tx_requests.len() >= MAX_TXS_TO_DOWNLOAD_AT_TIME as usize {
+                        break;
+                    }
+
+                    if !tx.is_outside_bc &&
+                        // tx.part_flags != TxParts::FULL_TX &&
+                        (tx.part_flags & TxParts::MEMO) == 0 &&
+                        in_flight_tx_requests.get(&tx.txid).is_none()
+                    {
+                        in_flight_tx_requests.insert(tx.txid);
+
+                        let mut client = client.clone();
+                        let txid = tx.txid;
+                        let block_h = tx.mined_h;
+                        let filter = TxFilter{ hash: txid.as_ref().to_vec(), ..Default::default() };
+                        let _abort_handle = in_flight_tx_join_set.spawn(async move {
+                            let str = format!("download {txid:?}");
+                            let tz = Timer::scope(&str);
+                            (
+                                txid,
+                                block_h,
+                                wallet_i,
+                                match client.get_transaction(filter).await {
+                                    Err(err) => {
+                                        println!("get transaction: {err:?}");
+                                        None
+                                    }
+                                    Ok(v) => Some(v.into_inner())
+                                }
+                            )
+                        });
+                    }
+                }
+            }
 
             // COMPACT BLOCKS - DOWNLOAD
             let mut new_blocks: Vec<CompactBlock> = Vec::new();
@@ -2224,30 +2295,30 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 let raw_tx = &new_raw_t_txs[tx_i];
 
-                // height can be 0 for mempool, 0xff..ff for sidechain
-                if raw_tx.height == u64::MAX {
-                    println!("found sidechain transparent tx that we don't have height for, skipping...");
-                    continue;
-                }
+                let h = match bc_h_from_raw_tx_h(raw_tx.height) {
+                    Some(None) => {
+                        println!("found sidechain transparent tx that we don't have height for, skipping...");
+                        continue;
+                    }
+                    Some(Some(h)) => h,
+                    None => break, // read error
+                };
 
-                if raw_tx.height > compact_block_max_h {
+                if ! h.is_in_block() {
+                    break;
+                }
+                if u64::from(h.0) > compact_block_max_h {
                     // @in_step_sync
                     break;
                 }
 
-                let Ok(height) = <u32>::try_from(raw_tx.height) else {
-                    println!("transparent tx's height can't be represented in 32 bits: {}", raw_tx.height);
-                    break;
-                };
-
-                let h = BlockHeight(height);
-                let tx = match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, LRZBlockHeight::from_u32(height))) {
+                let tx = match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, LRZBlockHeight::from_u32(h.0))) {
                     Ok(tx) => tx,
                     Err(err) => {
                         println!("failed to read transparent tx at height {h}");
                         t_failed_at_h = Some(raw_tx.height); // this will be < the previous val
-                        // @in_step_sync
-                        // remove everything at the failed height
+                                                             // @in_step_sync
+                                                             // remove everything at the failed height
                         while new_t_txs.len() > 0 {
                             if new_t_txs.last().unwrap().0 != h {
                                 break;
@@ -2355,7 +2426,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
-        //-- ADD/REVALIDATE TRANSPARENT TXS
+        //-- ADD/REVALIDATE TRANSPARENT TXS (and attached shielded data)
         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
         {
             // see note above on transparent syncing
@@ -2403,6 +2474,52 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     // println!("orchard root at {:?} tree: size={} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
                 }
             }
+        }
+
+        //-- READ ANY DOWNLOADED FULL TXS
+        if in_flight_tx_requests.len() > 0 {
+            println!("before reading, there are {} in flight tx downloads", in_flight_tx_requests.len());
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+            let wallets = [miner_wallet, user_wallet];
+            while let Some(tx_completion) = in_flight_tx_join_set.try_join_next() {
+                let (txid, block_h, wallet_i, dl_result): (TxId, BlockHeight, usize, Option<RawTransaction>) = match tx_completion {
+                    Ok(v) => v,
+                    Err(err) => {
+                        println!("tx completion join error: {err:?}");
+                        continue
+                    }
+                };
+
+                // ALT: do (most of) this work in the task
+                println!("download finished for {txid:?}");
+                in_flight_tx_requests.remove(&txid);
+                if let Some(raw_tx) = dl_result {
+                    let block_h = match bc_h_from_raw_tx_h(raw_tx.height) {
+                        Some(None) => block_h, // on sidechain: use previously-spec'd height
+                        Some(Some(h)) => {
+                            if h != block_h {
+                                println!("requested tx {txid:?} has moved from {block_h:?} to {h:?}");
+                            }
+                            h // returned-height beats requested height
+                        },
+                        None => continue, // read error
+                    };
+
+                    let lrz_h = LRZBlockHeight::from_u32(if block_h.is_in_block() { block_h.0 } else { wallets[wallet_i].chain_tip_h.0 });
+                    let tx = match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, lrz_h)) {
+                        Ok(tx) => tx,
+                        Err(err) => {
+                            println!("failed to read tx at height {block_h:?}/{lrz_h:?}");
+                            continue;
+                        }
+                    };
+
+                    println!("reading downloaded full tx for {txid:?}");
+                    let keys = PreparedKeys::from_ufvk_all(&wallets[wallet_i].accounts[0].ufvk);
+                    read_full_tx(wallets[wallet_i], 0, &keys, block_h, &tx, &mut 0);
+                }
+            }
+            println!("after  reading, there are {} in flight tx downloads", in_flight_tx_requests.len());
         }
 
         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
@@ -2461,7 +2578,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
 
             let orchard_notes = &miner_wallet.accounts[0].unspent_orchard_notes;
-            let spend_n_notes = 3; //OsRng.gen_range(0..=orchard_notes.len());
+            let spend_n_notes = 1; //OsRng.gen_range(0..=orchard_notes.len());
             if let (Some(fvk), Some(&dst_addr), true) = (
                 miner_wallet.accounts[0].ufvk.orchard(),
                 miner_ua.orchard(),
