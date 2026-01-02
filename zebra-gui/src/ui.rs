@@ -12,7 +12,7 @@ use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 use std::collections::HashMap;
 //use clay::*; // @Temporary
 
-use wallet::str_from_ctaz;
+use wallet::{ BlockHeight, WalletState, WalletTxKind, str_from_ctaz };
 
 use super::*;
 
@@ -617,7 +617,7 @@ impl<A: Mul, B: Mul, C: Mul, D: Mul> Mul for (A, B, C, D) { #[inline(always)] fn
 static XXX_text: Mutex<String> = Mutex::new(String::new());
 
 pub fn ui_left_pane(ui: &mut Context,
-                wallet_state: Arc<Mutex<wallet::WalletState>>,
+                wallet_state: Arc<Mutex<WalletState>>,
                 data: &mut UiData,
                 viz: &mut VizState,
                 child_gap: f32,
@@ -1387,12 +1387,14 @@ pub fn ui_left_pane(ui: &mut Context,
                                 align: Center,
                                 ..Decl
                             }) {
-                                let icon = match (tx.1, tx.0.mined_height) {
-                                    (wallet::WalletTxKind::Send, Some(_))    => ICON_UP_SMALL,
-                                    (wallet::WalletTxKind::Receive, Some(_)) => ICON_DOWN_SMALL,
-                                    (wallet::WalletTxKind::Shield, Some(_))  => ICON_SHIELD,
-                                    (wallet::WalletTxKind::Stake, Some(_))   => ICON_LINK_1,
-                                    (wallet::WalletTxKind::Unstake, Some(_)) => ICON_UNLINK,
+                                // TODO: account for mempool
+                                let icon = match (tx.kind(), tx.mined_h.is_in_block()) {
+                                    (WalletTxKind::Send,     true) => ICON_UP_SMALL,
+                                    (WalletTxKind::SelfSend, true) => ICON_DOWN_SMALL,
+                                    (WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
+                                    (WalletTxKind::Shield,   true) => ICON_SHIELD,
+                                    (WalletTxKind::Stake,    true) => ICON_LINK_1,
+                                    (WalletTxKind::Unstake,  true) => ICON_UNLINK,
                                     _ => {
                                         let timer = (ui.tx_loading_animation_timer * 3.0) as u64;
                                         if timer % 3 == 0 {
@@ -1405,7 +1407,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     }
                                 };
 
-                                let colour = if tx.0.mined_height.is_some() {
+                                // TODO: account for mempool & confirmation level
+                                let colour = if tx.mined_h.is_in_block() {
                                     WHITE
                                 } else {
                                     (0x60, 0x60, 0x60, 0xff) /* @todo colors */
@@ -1423,16 +1426,17 @@ pub fn ui_left_pane(ui: &mut Context,
                                 align: Left,
                                 ..Decl
                             }) {
-                                let label = match tx.1 {
-                                    wallet::WalletTxKind::Send    => if tx.0.mined_height.is_some() { "Sent"     } else { "Sending"   },
-                                    wallet::WalletTxKind::Receive => if tx.0.mined_height.is_some() { "Received" } else { "Receiving" },
-                                    wallet::WalletTxKind::Shield  => if tx.0.mined_height.is_some() { "Shielded" } else { "Shielding" },
-                                    wallet::WalletTxKind::Stake   => if tx.0.mined_height.is_some() { "Staked"   } else { "Staking"   },
-                                    wallet::WalletTxKind::Unstake => if tx.0.mined_height.is_some() { "Unstaked" } else { "Unstaking" },
+                                let label = match tx.kind() {
+                                    WalletTxKind::Send     => if tx.mined_h.is_in_block() { "Sent"     } else { "Sending"   },
+                                    WalletTxKind::Receive  => if tx.mined_h.is_in_block() { "Received" } else { "Receiving" },
+                                    WalletTxKind::SelfSend => if tx.mined_h.is_in_block() { "Returned" } else { "Returning" },
+                                    WalletTxKind::Shield   => if tx.mined_h.is_in_block() { "Shielded" } else { "Shielding" },
+                                    WalletTxKind::Stake    => if tx.mined_h.is_in_block() { "Staked"   } else { "Staking"   },
+                                    WalletTxKind::Unstake  => if tx.mined_h.is_in_block() { "Unstaked" } else { "Unstaking" },
                                 };
 
-                                let label_str = if let Some(mined_height) = tx.0.mined_height {
-                                    frame_strf!(data, "{} @ {}", label, mined_height)
+                                let label_str = if tx.mined_h.is_in_block() {
+                                    frame_strf!(data, "{} @ {}", label, tx.mined_h.0)
                                 } else {
                                     frame_strf!(data, "{}", label)
                                 };
@@ -1442,13 +1446,13 @@ pub fn ui_left_pane(ui: &mut Context,
                                 // spacer
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                                let txid = tx.0.txid.to_string();
+                                let txid = tx.txid.to_string();
                                 ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { font: Mono, h: transaction_text_h, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, align: AlignX::Left, ..TextDecl });
 
                                 // spacer
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                                if let Ok(memo_str) = String::from_utf8(tx.0.memo.as_slice().to_vec()) {
+                                if let Ok(memo_str) = String::from_utf8(tx.memo.as_slice().to_vec()) {
                                     let mut memo_str = memo_str.chars().filter(|c| c.is_ascii()).collect::<String>().trim_end_matches(|c| c == '\0').to_string();
                                     if memo_str.len() != 0 {
                                         if memo_str.starts_with("@") {
@@ -1472,39 +1476,42 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 // @todo colors
-                                let color = match tx.1 {
-                                    wallet::WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
-                                    wallet::WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
-                                    wallet::WalletTxKind::Receive | wallet::WalletTxKind::Unstake => (0x5a, 0xb5, 0x52, 0xff),
-                                    wallet::WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
+                                let color = match tx.kind() {
+                                    WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
+                                    WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
+                                    WalletTxKind::Receive | WalletTxKind::Unstake => (0x5a, 0xb5, 0x52, 0xff),
+                                    WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
                                     _ => WHITE,
                                 };
 
-                                match tx.1 {
-                                    wallet::WalletTxKind::Send | wallet::WalletTxKind::Stake => {
-                                        let send_amount: i64 = tx.0.account_value_delta.into();
+                                let totals = tx.totals();
+                                match tx.kind() {
+                                    WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake => {
+                                        let send_amount: i64 = tx.account_value_delta().into();
                                         let send_amount: u64 = send_amount.abs() as u64;
                                         let full = send_amount / 100_000_000;
                                         let part = send_amount % 100_000_000;
-                                        let mut part_str = format!("{part}00");
-                                        if part_str.len() > 3 {
-                                            part_str = part_str[..3].to_string();
-                                        }
+                                        let part_str = format!("{part}000");
 
-                                        let prefix = if tx.1 == wallet::WalletTxKind::Send { "-" } else { "" };
-                                        ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, part_str), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
+                                        ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..4]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
-                                    wallet::WalletTxKind::Receive | wallet::WalletTxKind::Unstake => {
-                                        ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.0.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                    WalletTxKind::Receive | WalletTxKind::Unstake => {
+                                        if true { // total
+                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.totals().recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        } else { // transparent, shielded
+                                            let (t_z, s_z) = (tx.parts[0].recv_zats.into_u64(), tx.parts[1].recv_zats.into_u64());
+                                            ui.text(frame_strf!(data, "+{} | {} cTAZ", str_from_ctaz(t_z), str_from_ctaz(s_z)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        }
                                     },
-                                    wallet::WalletTxKind::Shield => {
-                                        let shield_amount: i64 = tx.0.account_value_delta.into();
+                                    WalletTxKind::Shield => {
+                                        // TODO: (how) do we want to show the fee?
+                                        let shield_amount = totals.recv_zats.into_u64();
                                         let full = shield_amount / 100_000_000;
                                         let part = shield_amount % 100_000_000;
-                                        let part_str = format!("{part}00");
-                                        let trim_part = part_str.trim_end_matches("0");
+                                        let part_str = format!("{part}000");
 
-                                        ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..4]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
                                     _ => {
                                         ui.text("TODO cTAZ", TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
@@ -1520,7 +1527,7 @@ pub fn ui_left_pane(ui: &mut Context,
 }
 
 pub fn ui_right_pane(ui: &mut Context,
-                 wallet_state: Arc<Mutex<wallet::WalletState>>,
+                 wallet_state: Arc<Mutex<WalletState>>,
                  viz: &mut VizState,
                  data: &mut UiData,
                  child_gap: f32,
@@ -1803,7 +1810,7 @@ pub fn ui_right_pane(ui: &mut Context,
         align: Center,
         ..Decl
     }) {
-        tab_id_faucet = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet (Height {})", &wallet_state.lock().unwrap().miner_seen_height));
+        tab_id_faucet = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet (Height {})", &wallet_state.lock().unwrap().miner_seen_h));
     }
     if let _ = elem().decl(Decl {
         id: id("Faucet Contents"),
@@ -1930,8 +1937,7 @@ pub fn ui_right_pane(ui: &mut Context,
 }
 
 
-pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
-
+pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
     data.per_frame_strs.clear();
 
     let mut result = false;
@@ -2311,7 +2317,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
     result
 }
 
-pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet_state: Arc<Mutex<wallet::WalletState>>) -> bool {
+pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet_state: Arc<Mutex<WalletState>>) -> bool {
     ui.tx_loading_animation_timer += ui.delta;
     if ui.tx_loading_animation_timer >= 1.0 {
         ui.tx_loading_animation_timer = 0.0;
