@@ -694,6 +694,8 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, i
     }
     wallet.txs.insert(*insert_i, new_tx);
     *insert_i += 1;
+
+    // wallet.audit_txs();
 }
 
 fn to_zats_or_dump_err(src: &str, z: u64) -> Option<Zatoshis> {
@@ -803,7 +805,7 @@ impl ManualWallet {
         )))
     }
 
-    // TODO: fee API
+    // TODO: fee API (need to account for paying for fee forcing more notes, changing the fee)
     // TODO: allow one destination to have an empty value for "send the rest here" (this could be
     // change or normal recipient)
     pub async fn send_zats<P: Parameters>(
@@ -880,6 +882,8 @@ impl ManualWallet {
             BuildConfig::Standard { sapling_anchor, orchard_anchor: Some(orchard_anchor), },
         );
 
+
+        //- OUTPUTS/SENDS
         let mut memo_count = 0;
         let mut memo = EMPTY_MEMO_BYTES;
         let (mut t_send_z, mut t_recv_z, mut s_send_z, mut s_recv_z) = (0, 0, 0, 0);
@@ -922,6 +926,7 @@ impl ManualWallet {
 
 
 
+        //- SPENDS
         let min_spend = t_send_z + s_send_z + fee_zats.into_u64();
         let (mut t_spend_z, mut s_spend_z) = (0, 0);
         let (mut t_spend_c, mut s_spend_c) = (0, 0);
@@ -1093,6 +1098,17 @@ impl ManualWallet {
             None
         }
     }
+
+    pub fn audit_txs(&self) {
+        for tx in &self.txs {
+            // if tx.parts[0].spent_note_count > 0 &&
+            //     tx.parts[1].sent_note_count == 0
+            // {
+            //     println!("invalid shield found: {tx:?}");
+            //     println!("all txs: {:?}", NL(&self.txs[..]));
+            // }
+        }
+    }
 }
 
 struct PoWCache {
@@ -1250,13 +1266,13 @@ fn bc_h_from_raw_tx_h(height: u64) -> Option<Option<BlockHeight>> {
     }))
 }
 
-fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, orchard_tree: &mut OrchardShardTree, block_h: BlockHeight, txid: &TxId, nf: &orchard::note::Nullifier, cmx: &orchard::note::ExtractedNoteCommitment, note_addr: Option<(orchard::note::Note, orchard::Address)>, memo: Option<&[u8; 512]>) -> Option<WalletTxPart> {
+// TODO: handle memo here instead of caller?
+fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, orchard_tree: &mut OrchardShardTree, block_h: BlockHeight, txid: &TxId, nf: &orchard::note::Nullifier, cmx: &orchard::note::ExtractedNoteCommitment, recv_note_addr: Option<(orchard::note::Note, orchard::Address)>, send_note_addr_memo: Option<(orchard::note::Note, orchard::Address, [u8; 512])>) -> Option<WalletTxPart> {
     let account = &mut wallet.accounts[account_i];
-    let (mut s_send_z, mut s_spend_z, mut s_recv_z) = (0, 0, 0);
-    let (mut s_send_c, mut s_spend_c, mut s_recv_c) = (0, 0, 0);
 
     //- GLOBAL-VIEW UPDATES
-    let retention = if note_addr.is_some() {
+    // NOTE: we don't care to mark our sent(-only) actions
+    let retention = if recv_note_addr.is_some() {
         incrementalmerkletree::Retention::Marked
     } else {
         incrementalmerkletree::Retention::Ephemeral
@@ -1266,32 +1282,38 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
     println!("orchard root at {:?} tree size={:02} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
 
     //- HANDLE SPENT NOTES
+    let (mut s_send_z, mut s_spend_z, mut s_recv_z) = (0, 0, 0);
+    let (mut s_send_c, mut s_spend_c, mut s_recv_c) = (0, 0, 0);
     // TODO: map/index acceleration
     // NOTE: action.nullifier() is like prevout, it's the spent id (if a recv action)
-    let mut found_nf = false;
     for (note_i, note) in account.unspent_orchard_notes.iter().enumerate() {
         if note.nf == *nf {
             // this action is a spend by us with this note/nullifier: move it to spent
             let spent_note = account.unspent_orchard_notes.remove(note_i);
-            s_spend_c += 1;
-            s_spend_z += spent_note.note.value().inner();
+            s_spend_c = 1;
+            s_spend_z = spent_note.note.value().inner();
             account.spent_orchard_notes.push(OrchardNote { spent_h: block_h, ..spent_note });
-            found_nf = true;
             break;
         }
     }
-    if ! found_nf {
-        for (note_i, note) in account.spent_orchard_notes.iter().enumerate() {
+    if s_spend_c == 0 {
+        for note in &account.spent_orchard_notes {
             if note.nf == *nf {
-                s_spend_c += 1;
-                s_spend_z += note.note.value().inner();
+                s_spend_c = 1;
+                s_spend_z = note.note.value().inner();
                 break;
             }
         }
     }
 
+    //- HANDLE KNOWN-SENT
+    if let Some((note, _addr, _memo)) = send_note_addr_memo {
+        s_send_c = 1;
+        s_send_z = note.value().inner();
+    }
+
     //- PUSH NEW RECEIVED/UNSPENT NOTES
-    if let Some((note, _recipient)) = note_addr {
+    if let Some((note, _recipient)) = recv_note_addr {
         let orchard_note = OrchardNote{
             recv_h: block_h,
             spent_h: BlockHeight(0),
@@ -1313,10 +1335,10 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
 
         s_recv_c += 1;
         s_recv_z += note.value().inner();
-        if s_spend_c > 0 {
-            s_send_c += 1;
-            s_send_z += note.value().inner();
-        }
+        // if s_spend_c > 0 && s_send_c  {
+        //     s_send_c += 1;
+        //     s_send_z += note.value().inner();
+        // }
         // NOTE: s_send_c/s_send_z equivalent handled inside update_with_tx
 
         let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(txid) {
@@ -1361,7 +1383,7 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
     }
 }
 
-fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize, is_outside_bc: bool) -> Option<()> {
+fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, orchard_tree: &mut OrchardShardTree, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize, is_outside_bc: bool) -> Option<()> {
     // TODO: we probably want to early-out if our existing tx data is complete
     // (after checking that this doesn't get modified)
     update_insert_i(&wallet.txs, insert_i, block_h);
@@ -1475,30 +1497,56 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
 
     let mut memo_count = 0;
     let mut memo = EMPTY_MEMO_BYTES;
+    let mut shielded_part = WalletTxPart::ZERO;
 
     if let Some(bundle) = tx.orchard_bundle() {
         for action in bundle.actions() {
+            let action: &orchard::Action<_> = action; // type-check
             let domain = orchard::note_encryption::OrchardDomain::for_action(action);
 
+            let (mut recv_note_addr, mut recv_memo) = (None, None);
             if let Some(ivk) = &keys.orchard_ivk {
-                if let Some((note, _recipient, note_memo)) = try_note_decryption(&domain, ivk, action) {
-                    if !memo_is_empty(&note_memo) {
-                        memo_count += 1;
-                        memo = note_memo; // TODO: handle multiple memos
-                        // NOTE: I *think* we don't want to check sent if we know we received it
-                        // (i.e. avoid double-counting self-send memos)
-                        continue;
-                    }
+                if let Some((note, addr, note_memo)) = try_note_decryption(&domain, ivk, action) {
+                    (recv_note_addr, recv_memo) = (Some((note, addr)), Some(note_memo));
                 }
             }
-            if let Some(ovk) = &keys.orchard_ovk {
-                if let Some((note, _recipient, note_memo)) = try_output_recovery_with_ovk(&domain, ovk, action, action.cv_net(), &action.encrypted_note().out_ciphertext) {
-                    if !memo_is_empty(&note_memo) {
-                        memo_count += 1;
-                        memo = note_memo; // TODO: handle multiple memos
-                    }
+
+            let send_res = if let Some(ovk) = &keys.orchard_ovk {
+                // TODO: do we get more useful info if we do both?
+                // we use the nullifier to detect spends anyway,
+                // and we've already got any memos from the above
+                try_output_recovery_with_ovk(&domain, ovk, action, action.cv_net(), &action.encrypted_note().out_ciphertext)
+            } else {
+                None
+            };
+
+            let note_memo = if recv_memo.is_some() {
+                recv_memo
+            } else if let Some((_note, _addr, send_memo)) = send_res {
+                Some(send_memo)
+            } else {
+                None
+            };
+            if let Some(note_memo) = note_memo {
+                if !memo_is_empty(&note_memo) {
+                    memo_count += 1;
+                    memo = note_memo; // TODO: handle multiple memos
                 }
             }
+
+            let Some(part) = handle_orchard_action(wallet, account_i, keys, orchard_tree, block_h, &txid, action.nullifier(), action.cmx(), recv_note_addr, send_res) else {
+                // error creating zats (already printed)
+                // TODO: can we validly continue at all?
+                continue;
+            };
+
+            shielded_part = if let Some(shielded_part) = shielded_part.checked_add(&part) {
+                shielded_part
+            } else {
+                println!("invalid addition in orchard action");
+                // TODO: can we validly continue at all?
+                continue;
+            };
         }
     }
 
@@ -1511,8 +1559,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
             sent_note_count: t_send_c,
             recv_note_count: t_recv_c,
         },
-        // TODO: handle shielded values
-        WalletTxPart::ZERO,
+        shielded_part,
     ];
 
     let new_tx = WalletTx {
@@ -1520,7 +1567,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
         txid,
         expiry_h,
         mined_h: block_h,
-        part_flags: TxParts::TRANSPARENT | TxParts::MEMO, // TODO: handle FULL_TX
+        part_flags: TxParts::FULL_TX,
         parts,
         memo_count,
         memo,
@@ -1588,12 +1635,13 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
             // TODO: can we validly continue at all?
             continue;
         };
-        let Some(new_part) = shielded_part.checked_add(&part) else {
+        shielded_part = if let Some(shielded_part) = shielded_part.checked_add(&part) {
+            shielded_part
+        } else {
             println!("invalid addition in orchard action");
             // TODO: can we validly continue at all?
             continue;
         };
-        shielded_part = new_part;
     }
 
     // TODO: sapling
@@ -2427,6 +2475,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
+
         //-- ADD/REVALIDATE TRANSPARENT TXS (and attached shielded data)
         {
             // see note above on transparent syncing
@@ -2442,9 +2491,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 // kinda @in_step_sync
                 let block_h = miner_t_txs[t_tx_i].0;
                 let tx = &miner_t_txs[t_tx_i].1;
-                read_full_tx(miner_wallet, 0, &keys, block_h, tx, &mut insert_i, false);
+                read_full_tx(miner_wallet, 0, &keys, &mut orchard_tree, block_h, tx, &mut insert_i, false);
             }
         }
+
 
         //-- ADD/REVALIDATE SHIELDED TXS FROM NEW BLOCKS
         if let Some(start_block_i) = sync_from_i {
@@ -2476,6 +2526,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
         }
+
 
         //-- READ ANY DOWNLOADED FULL TXS
         if in_flight_tx_requests.len() > 0 {
@@ -2529,7 +2580,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     println!("reading downloaded full tx for {txid:?}");
                     let keys = PreparedKeys::from_ufvk_all(&wallets[wallet_i].accounts[0].ufvk);
 
-                    read_full_tx(wallets[wallet_i], 0, &keys, existing_tx.mined_h, &tx, &mut 0, existing_tx.is_outside_bc);
+                    read_full_tx(wallets[wallet_i], 0, &keys, &mut orchard_tree, existing_tx.mined_h, &tx, &mut 0, existing_tx.is_outside_bc);
                 }
             }
             println!("after  reading, there are {} in flight tx downloads", in_flight_tx_requests.len());
