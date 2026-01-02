@@ -645,21 +645,7 @@ fn update_insert_i(txs: &[WalletTx], insert_i: &mut usize, block_h: BlockHeight)
 fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, insert_i: &mut usize) {
     // find if there's an existing height/transaction for this txid
     if let Some(tx_h) = wallet.tx_h_map.get_mut(&txid) {
-        let mut h_start_i = wallet.txs.partition_point(|tx| tx.mined_h < *tx_h);
-        let mut found_idx = None;
-        let txs_n = wallet.txs.len();
-        for find_i in h_start_i..txs_n {
-            let tx = &mut wallet.txs[find_i];
-            if tx.mined_h != *tx_h {
-                break;
-            }
-            if tx.txid == txid {
-                found_idx = Some(find_i);
-                break;
-            }
-        }
-
-        if let Some(tx_i) = found_idx {
+        if let Some(tx_i) = tx_mined_h_position(&wallet.txs, *tx_h, &txid) {
             if tx_i < *insert_i {
                 *insert_i -= 1;
             }
@@ -704,7 +690,7 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, i
         *tx_h = new_tx.mined_h;
     } else {
         wallet.tx_h_map.insert(txid, new_tx.mined_h);
-        println!("{} wallet inserted unknown transaction {txid} at {:?}", wallet.name, new_tx.mined_h);
+        println!("{} wallet inserted new transaction {txid} at {:?}", wallet.name, new_tx.mined_h);
     }
     wallet.txs.insert(*insert_i, new_tx);
     *insert_i += 1;
@@ -1152,12 +1138,14 @@ impl PoWCache {
 //              ###################
 
 
+/// GET NOTE/TX INDEXES WITH KNOWN HEIGHTS IN SORTED SLICES
 fn orchard_recv_h_position(notes: &[OrchardNote], block_h: BlockHeight, nf: &orchard::note::Nullifier) -> Option<usize> {
     let mut i = notes.partition_point(|txo| txo.recv_h < block_h);
     while i < notes.len() && notes[i].recv_h == block_h {
         if &notes[i].nf == nf {
             return Some(i);
         }
+        i += 1;
     }
     None
 }
@@ -1167,6 +1155,7 @@ fn txo_recv_h_position(notes: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint) 
         if &notes[i].id == utxo_id {
             return Some(i);
         }
+        i += 1;
     }
     None
 }
@@ -1176,8 +1165,28 @@ fn txo_spent_h_position(notes: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint)
         if &notes[i].id == utxo_id {
             return Some(i);
         }
+        i += 1;
     }
     None
+}
+fn tx_mined_h_position(txs: &[WalletTx], block_h: BlockHeight, txid: &TxId) -> Option<usize> {
+    let mut i = txs.partition_point(|tx| tx.mined_h < block_h);
+    while i < txs.len() && txs[i].mined_h == block_h {
+        if &txs[i].txid == txid {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+// GET NOTE/TX INDEXES WITH UNKNOWN HEIGHTS IN SORTED SLICES
+fn tx_position(wallet: &ManualWallet, txid: &TxId) -> Option<usize> {
+    if let Some(&tx_h) = wallet.tx_h_map.get(txid) {
+        tx_mined_h_position(&wallet.txs, tx_h, txid)
+    } else {
+        None
+    }
 }
 
 struct PreparedKeys {
@@ -1352,7 +1361,7 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
     }
 }
 
-fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize) -> Option<()> {
+fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize, is_outside_bc: bool) -> Option<()> {
     // TODO: we probably want to early-out if our existing tx data is complete
     // (after checking that this doesn't get modified)
     update_insert_i(&wallet.txs, insert_i, block_h);
@@ -1516,7 +1525,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
         memo_count,
         memo,
         is_coinbase,
-        is_outside_bc: false,
+        is_outside_bc,
     };
 
     update_with_tx(wallet, new_tx.txid, new_tx, insert_i);
@@ -2069,7 +2078,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             };
 
-            // FULL TRANSACTIONS
+            // START DOWNLOADS FOR FULL TRANSACTIONS
             // TODO: fairer requests
             for (wallet_i, wallet) in [&mut miner_wallets[miner_use_i], &mut user_wallets[user_use_i]].into_iter().enumerate() {
                 for tx in &wallet.txs {
@@ -2087,14 +2096,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                         let mut client = client.clone();
                         let txid = tx.txid;
-                        let block_h = tx.mined_h;
                         let filter = TxFilter{ hash: txid.as_ref().to_vec(), ..Default::default() };
                         let _abort_handle = in_flight_tx_join_set.spawn(async move {
                             let str = format!("download {txid:?}");
                             let tz = Timer::scope(&str);
                             (
                                 txid,
-                                block_h,
                                 wallet_i,
                                 match client.get_transaction(filter).await {
                                     Err(err) => {
@@ -2354,17 +2361,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         //-- REORG
         if let Some(start_block_i) = sync_from_i {
+            // the regime is basically "always reorg", but that's often a no-op
+            // truncate wallet for everything below height
             let sync_start_h = <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above");
             let block_h = BlockHeight(sync_start_h);
             let last_block_h = block_h.sat_sub(1);
 
-            orchard_tree.truncate_to_checkpoint(&last_block_h);
+            orchard_tree.truncate_to_checkpoint(&last_block_h); // N.B. checkpoints are at the *end* of their block
 
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             for (wallet_i, wallet) in [miner_wallet, user_wallet].into_iter().enumerate() {
                 //-- INVALIDATE TXS >= NEW BLOCKS HEIGHT
-                // the regime is basically "always reorg", but that's often a no-op
-                // truncate wallet for everything below height
                 for account in &mut wallet.accounts {
                     account.fully_detected_h = account.fully_detected_h.min(last_block_h);
                     account.fully_decoded_h = account.fully_decoded_h.min(last_block_h);
@@ -2421,7 +2428,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         //-- ADD/REVALIDATE TRANSPARENT TXS (and attached shielded data)
-        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
         {
             // see note above on transparent syncing
             // let sync_start_h = if let Some(start_block_i) = sync_from_i {
@@ -2429,19 +2435,20 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // } else {
             //     req_rng.0.try_into.expect("fits in u32")
             // };
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             let keys = PreparedKeys::from_ufvk_all(&miner_wallet.accounts[0].ufvk);
             let mut insert_i = 0;
             for t_tx_i in 0..miner_t_txs.len() {
                 // kinda @in_step_sync
                 let block_h = miner_t_txs[t_tx_i].0;
                 let tx = &miner_t_txs[t_tx_i].1;
-                read_full_tx(miner_wallet, 0, &keys, block_h, tx, &mut insert_i);
+                read_full_tx(miner_wallet, 0, &keys, block_h, tx, &mut insert_i, false);
             }
         }
 
         //-- ADD/REVALIDATE SHIELDED TXS FROM NEW BLOCKS
-        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
         if let Some(start_block_i) = sync_from_i {
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             let sync_start_h = <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above");
             println!("cache at {}, new blocks: {}-{}; updating wallets...",
                 pow_cache.next_tip_h-1, new_blocks.first().unwrap().height, new_blocks.last().unwrap().height);
@@ -2476,7 +2483,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             let wallets = [miner_wallet, user_wallet];
             while let Some(tx_completion) = in_flight_tx_join_set.try_join_next() {
-                let (txid, block_h, wallet_i, dl_result): (TxId, BlockHeight, usize, Option<RawTransaction>) = match tx_completion {
+                let (txid, wallet_i, dl_result): (TxId, usize, Option<RawTransaction>) = match tx_completion {
                     Ok(v) => v,
                     Err(err) => {
                         println!("tx completion join error: {err:?}");
@@ -2485,49 +2492,65 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 };
 
                 // ALT: do (most of) this work in the task
+                // ALT: we have the option for best-chain/height info of:
+                // - update individual transactions ASAP (-> use returned height & is_outside_bc)
+                // - try to keep all blocks self-consistent (-> use *current* height/is_outside_bc)
+                //   (this may be different from the requested height)
+                //   * Choosing this because currently block-reading is the only way we detect
+                //     inconsistency around reorg; we don't want to add stale data here that never
+                //     gets fixed
                 println!("download finished for {txid:?}");
                 in_flight_tx_requests.remove(&txid);
-                if let Some(raw_tx) = dl_result {
-                    let block_h = match bc_h_from_raw_tx_h(raw_tx.height) {
-                        Some(None) => block_h, // on sidechain: use previously-spec'd height
+                if let (Some(raw_tx), Some(existing_tx_i)) = (dl_result, tx_position(&wallets[wallet_i], &txid)) {
+                    let existing_tx = &wallets[wallet_i].txs[existing_tx_i];
+
+                    let found_h = match bc_h_from_raw_tx_h(raw_tx.height) {
+                        Some(None) => existing_tx.mined_h, // on sidechain: use previously-spec'd height
                         Some(Some(h)) => {
-                            if h != block_h {
-                                println!("requested tx {txid:?} has moved from {block_h:?} to {h:?}");
+                            if h != existing_tx.mined_h {
+                                println!("requested tx {txid:?} has moved from {:?} to {h:?}", existing_tx.mined_h);
                             }
-                            h // returned-height beats requested height
+                            h
                         },
                         None => continue, // read error
                     };
 
-                    let lrz_h = LRZBlockHeight::from_u32(if block_h.is_in_block() { block_h.0 } else { wallets[wallet_i].chain_tip_h.0 });
+                    // NOTE: there's a potential inconsistency here around branch id changes if we
+                    // see it both before and after the change
+                    let lrz_h = LRZBlockHeight::from_u32(if found_h.is_in_block() { found_h.0 } else { wallets[wallet_i].chain_tip_h.0 });
                     let tx = match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, lrz_h)) {
                         Ok(tx) => tx,
                         Err(err) => {
-                            println!("failed to read tx at height {block_h:?}/{lrz_h:?}");
+                            println!("failed to read tx at height {:?}/{found_h:?}/{lrz_h:?}", existing_tx.mined_h);
                             continue;
                         }
                     };
 
                     println!("reading downloaded full tx for {txid:?}");
                     let keys = PreparedKeys::from_ufvk_all(&wallets[wallet_i].accounts[0].ufvk);
-                    read_full_tx(wallets[wallet_i], 0, &keys, block_h, &tx, &mut 0);
+
+                    read_full_tx(wallets[wallet_i], 0, &keys, existing_tx.mined_h, &tx, &mut 0, existing_tx.is_outside_bc);
                 }
             }
             println!("after  reading, there are {} in flight tx downloads", in_flight_tx_requests.len());
         }
 
-        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-        println!("miner unspent UTXOs {:#?}", NL(&*miner_wallet.accounts[0].utxos));
-        println!("miner spent   UTXOs {:#?}", NL(&*miner_wallet.accounts[0].stxos));
-        println!("miner unspent notes {:#?}", NL(&*miner_wallet.accounts[0].unspent_orchard_notes));
-        println!("miner spent   notes {:#?}", NL(&*miner_wallet.accounts[0].spent_orchard_notes));
+        //-- SEND DATA TO UI
+        {
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+            println!("miner unspent UTXOs {:#?}", NL(&*miner_wallet.accounts[0].utxos));
+            println!("miner spent   UTXOs {:#?}", NL(&*miner_wallet.accounts[0].stxos));
+            println!("miner unspent notes {:#?}", NL(&*miner_wallet.accounts[0].unspent_orchard_notes));
+            println!("miner spent   notes {:#?}", NL(&*miner_wallet.accounts[0].spent_orchard_notes));
 
-        let mut txs = miner_wallet.txs.clone();
-        txs.reverse();
-        wallet_state.lock().unwrap().txs = txs;
+            let mut txs = miner_wallet.txs.clone();
+            txs.reverse(); // TODO: just read in reverse order
+            wallet_state.lock().unwrap().txs = txs;
+        }
 
         // DEV: miner send tx to self
         if let Some(start_block_i) = sync_from_i {
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             let utxos = &miner_wallet.accounts[0].utxos;
             let shield_n_notes = 5;//OsRng.gen_range(0..=utxos.len());
 
