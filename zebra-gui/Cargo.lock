@@ -5117,6 +5117,7 @@ name = "wallet"
 version = "1.0.0-beta.1"
 dependencies = [
  "bip39",
+ "incrementalmerkletree",
  "orchard",
  "prost",
  "rand 0.8.5",
@@ -5129,6 +5130,7 @@ dependencies = [
  "sapling-crypto",
  "secp256k1",
  "secrecy",
+ "shardtree",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
