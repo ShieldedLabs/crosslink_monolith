@@ -2056,6 +2056,9 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, d
                     // @todo: two vertical panes with right aligned label and left aligned height
                     ui.text(frame_strf!(data, "PoS Height: {}", viz.bft_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
                     ui.text(frame_strf!(data, "PoW Height: {}", viz.bc_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                    ui.text(frame_strf!(data, "Orchard Pool Zatoshis: {}", viz.orchard_pool_balance), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                    ui.text(frame_strf!(data, "Staking (Bonded) Pool Zatoshis: {}", viz.staking_bonded_pool_balance), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                    ui.text(frame_strf!(data, "Staking (Unbonded) Pool Zatoshis: {}", viz.staking_unbonded_pool_balance), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
                 }
             }
 

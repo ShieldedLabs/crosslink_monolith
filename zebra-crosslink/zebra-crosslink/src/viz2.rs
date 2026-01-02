@@ -1,5 +1,6 @@
 
 use visualizer_zcash::Hash32;
+use zebra_chain::value_balance::ValueBalance;
 use std::cmp::{max, min};
 
 use crate::*;
@@ -40,6 +41,16 @@ pub async fn service_viz_requests(
             } else {
                 Vec::new()
             };
+            let value_balance = if let Ok(StateReadResponse::TipPoolValues { value_balance, .. }) =
+                (call.read_state)(StateReadRequest::TipPoolValues).await
+            {
+                value_balance
+            } else {
+                ValueBalance::zero()
+            };
+            let orchard_pool_balance = value_balance.orchard_amount().zatoshis();
+            let staking_bonded_pool_balance = value_balance.staking_bonded_amount().zatoshis();
+            let staking_unbonded_pool_balance = value_balance.staking_unbonded_amount().zatoshis();
 
             let tip_height_hash: (BlockHeight, BlockHash) = {
                 if let Ok(StateResponse::Tip(Some(tip_height_hash))) =
@@ -139,6 +150,10 @@ pub async fn service_viz_requests(
                     let mut response = visualizer_zcash::ResponseFromZebra::_0();
                     response.bc_tip_height = bc_tip_height;
                     response.bft_tip_height = (internal.bft_blocks.len() as u64).saturating_sub(1);
+
+                    response.orchard_pool_balance = orchard_pool_balance;
+                    response.staking_bonded_pool_balance = staking_bonded_pool_balance;
+                    response.staking_unbonded_pool_balance = staking_unbonded_pool_balance;
 
                     response.start_bc_height = bc_ack_height as u64;
                     bc_ack_height = bc_ack_height.max(request.bc_ack_height as i32);

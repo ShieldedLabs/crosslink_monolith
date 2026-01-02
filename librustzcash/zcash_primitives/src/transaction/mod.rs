@@ -1340,6 +1340,7 @@ impl CommandBuf {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub enum StakingActionKind {
+    Null,
     CreateNewDelegationBond,
     BeginDelegationUnbonding,
     WithdrawDelegationBond,
@@ -1352,7 +1353,7 @@ pub enum StakingActionKind {
 impl From<StakingActionKind> for u8 {
     fn from(v: StakingActionKind) -> u8 {
         match v {
-            // 0 is reserved for None
+            StakingActionKind::Null => 0,
             StakingActionKind::CreateNewDelegationBond => 1,
             StakingActionKind::BeginDelegationUnbonding => 2,
             StakingActionKind::WithdrawDelegationBond => 3,
@@ -1367,6 +1368,7 @@ impl TryFrom<u8> for StakingActionKind {
     type Error = ();
     fn try_from(v: u8) -> Result<StakingActionKind, ()> {
         match v {
+            0 => Ok(StakingActionKind::Null),
             1 => Ok(StakingActionKind::CreateNewDelegationBond),
             2 => Ok(StakingActionKind::BeginDelegationUnbonding),
             3 => Ok(StakingActionKind::WithdrawDelegationBond),
@@ -1449,11 +1451,67 @@ impl Default for StakingAction {
 
 impl StakingAction {
     fn hash_to_state(&self, writer: &mut crate::encoding::StateWrite) -> Option<()> {
-        panic!();
-        // writer.write_all(&[u8::from(self.kind)]).ok()?;
-        // writer.write_all(&self.val.to_le_bytes()).ok()?;
-        // writer.write_all(&self.target).ok()?;
-        // writer.write_all(&self.source).ok()
+        if self.kind == StakingActionKind::CreateNewDelegationBond {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            writer.write_all(&self.arg32_2).ok()?; // target finalizer
+            writer.write_u64_le(self.amount_zats).ok()?;
+            return Some(());
+        }
+        if self.kind == StakingActionKind::BeginDelegationUnbonding {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            return Some(());
+        }
+        if self.kind == StakingActionKind::WithdrawDelegationBond {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            writer.write_u64_le(self.amount_zats).ok()?;
+            return Some(());
+        }
+        if self.kind == StakingActionKind::RetargetDelegationBond {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            writer.write_all(&self.arg32_2).ok()?; // target finalizer
+            return Some(());
+        }
+        if self.kind == StakingActionKind::RegisterFinalizer {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            return Some(());
+        }
+        if self.kind == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            writer.write_all(&self.arg32_2).ok()?; // this finalizer
+            writer.write_u64_le(self.amount_zats).ok()?;
+            writer.write_all(&self.arg32_3).ok()?; // second challenge
+            writer.write_all(&self.arg64_1).ok()?; // finalizer signature
+            return Some(());
+        }
+        if self.kind == StakingActionKind::UpdateFinalizerKey {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            writer.write_all(&self.arg32_2).ok()?; // this finalizer
+            writer.write_all(&self.arg32_3).ok()?; // second challenge
+            writer.write_all(&self.arg64_1).ok()?; // finalizer signature
+            return Some(());
+        }
+        None
     }
 
     // TODO: fold in existing
@@ -1669,6 +1727,7 @@ impl std::fmt::Display for StakingAction {
         let mut fmter = f.debug_struct("StakingAction");
 
         fmter.field("kind", match self.kind {
+            StakingActionKind::Null => &"Null",
             StakingActionKind::CreateNewDelegationBond => &"CreateNewDelegationBond",
             StakingActionKind::BeginDelegationUnbonding => &"BeginDelegationUnbonding",
             StakingActionKind::WithdrawDelegationBond => &"WithdrawDelegationBond",

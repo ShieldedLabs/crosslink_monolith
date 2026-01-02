@@ -40,6 +40,10 @@ pub struct ResponseFromZebra {
     pub json_dump_of_the_block: String, // @Todo: @Remove and replace with structured data.
     // @Todo: pub block_inspection: BlockInspection,
     pub start_bc_height: u64,
+
+    pub orchard_pool_balance: i64,
+    pub staking_bonded_pool_balance: i64,
+    pub staking_unbonded_pool_balance: i64,
 }
 impl ResponseFromZebra {
     pub fn _0() -> Self {
@@ -52,6 +56,9 @@ impl ResponseFromZebra {
             json_dump_of_the_block: "Data not available.".to_owned(),
             // @Todo: block_inspection: BlockInspection::None,
             start_bc_height: 0,
+            orchard_pool_balance: 0,
+            staking_bonded_pool_balance: 0,
+            staking_unbonded_pool_balance: 0,
         }
     }
 }
@@ -209,6 +216,10 @@ pub struct VizState {
 
     pub bft_ack_height: u64,
     pub bc_ack_height: u64,
+
+    pub orchard_pool_balance: i64,
+    pub staking_bonded_pool_balance: i64,
+    pub staking_unbonded_pool_balance: i64,
 }
 pub fn viz_gui_init(fake_data: bool) -> VizState {
     let (me_send, zebra_receive) = std::sync::mpsc::sync_channel(128);
@@ -242,6 +253,10 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 
         bft_ack_height: 0,
         bc_ack_height: 0,
+
+        orchard_pool_balance: 0,
+        staking_bonded_pool_balance: 0,
+        staking_unbonded_pool_balance: 0,
     };
     if fake_data {
         let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
@@ -282,6 +297,11 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         viz_state.bc_tip_height = message.bc_tip_height;
         anything_happened |= viz_state.bft_tip_height != message.bft_tip_height;
         viz_state.bft_tip_height = message.bft_tip_height;
+
+
+        viz_state.orchard_pool_balance = message.orchard_pool_balance;
+        viz_state.staking_bonded_pool_balance = message.staking_bonded_pool_balance;
+        viz_state.staking_unbonded_pool_balance = message.staking_unbonded_pool_balance;
 
         // @hack
         for bc in viz_state.on_screen_bcs.values_mut() {

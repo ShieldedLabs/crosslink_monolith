@@ -147,7 +147,7 @@ use zebra_chain::block::{
     Block, CountedHeader, Hash as BlockHash, Header as BlockHeader, Height as BlockHeight,
 };
 use zebra_node_services::mempool::{Request as MempoolRequest, Response as MempoolResponse};
-use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse};
+use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
 
 /// Placeholder activation height for Crosslink functionality
 pub const TFL_ACTIVATION_HEIGHT: BlockHeight = BlockHeight(2000);

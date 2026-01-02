@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 use zebra_chain::block::{Hash as BlockHash, Height as BlockHeight};
 use zebra_chain::transaction::Hash as TxHash;
 use zebra_node_services::mempool::{Request as MempoolRequest, Response as MempoolResponse};
-use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse};
+use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
 
 use crate::chain::BftBlock;
 use crate::FatPointerToBftBlock2;
@@ -63,6 +63,18 @@ pub(crate) type StateServiceProcedure = Arc<
         + Sync,
 >;
 
+pub(crate) type ReadStateServiceProcedure = Arc<
+    dyn Fn(
+            StateReadRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<StateReadResponse, Box<dyn std::error::Error + Send + Sync>>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 pub(crate) type MempoolServiceProcedure = Arc<
     dyn Fn(
             MempoolRequest,
@@ -97,6 +109,7 @@ pub(crate) type ForceFeedPoSBlockProcedure = Arc<
 #[derive(Clone)]
 pub struct TFLServiceCalls {
     pub(crate) state: StateServiceProcedure,
+    pub(crate) read_state: ReadStateServiceProcedure,
     pub(crate) mempool: MempoolServiceProcedure,
     pub(crate) force_feed_pow: ForceFeedPoWBlockProcedure,
     pub(crate) force_feed_pos: ForceFeedPoSBlockProcedure,
@@ -118,6 +131,7 @@ pub fn spawn_new_tfl_service(
     global_seed: [u8; 32],
     path_to_pos_store_file: PathBuf,
     state_service_call: StateServiceProcedure,
+    read_state_service_call: ReadStateServiceProcedure,
     mempool_service_call: MempoolServiceProcedure,
     force_feed_pow_call: ForceFeedPoWBlockProcedure,
     config: crate::config::Config,
@@ -198,6 +212,7 @@ pub fn spawn_new_tfl_service(
         internal,
         call: TFLServiceCalls {
             state: state_service_call,
+            read_state: read_state_service_call,
             mempool: mempool_service_call,
             force_feed_pow: force_feed_pow_call,
             force_feed_pos,

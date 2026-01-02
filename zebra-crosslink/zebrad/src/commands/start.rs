@@ -332,6 +332,7 @@ impl StartCmd {
         info!("spawning tfl service task");
         let (tfl, tfl_service_task_handle) = {
             let state = state.clone();
+            let read_only_state_service = read_only_state_service.clone();
             zebra_crosslink::service::spawn_new_tfl_service(
                 is_regtest,
                 global_seed,
@@ -339,6 +340,10 @@ impl StartCmd {
                 Arc::new(move |req| {
                     let state = state.clone();
                     Box::pin(async move { state.clone().ready().await?.call(req).await })
+                }),
+                Arc::new(move |req| {
+                    let read_only_state_service = read_only_state_service.clone();
+                    Box::pin(async move { read_only_state_service.clone().ready().await?.call(req).await })
                 }),
                 Arc::new(move |req| {
                     let mempool = mempool2.clone();
