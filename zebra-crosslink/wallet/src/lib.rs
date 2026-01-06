@@ -1268,8 +1268,10 @@ fn bc_h_from_raw_tx_h(height: u64) -> Option<Option<BlockHeight>> {
     }))
 }
 
+static debug_tree_appends : Mutex<Vec<orchard::tree::MerkleHashOrchard>> = Mutex::new(Vec::new());
+
 // TODO: handle memo here instead of caller?
-fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, orchard_tree: &mut OrchardShardTree, block_h: BlockHeight, txid: &TxId, nf: &orchard::note::Nullifier, cmx: &orchard::note::ExtractedNoteCommitment, recv_note_addr: Option<(orchard::note::Note, orchard::Address)>, send_note_addr_memo: Option<(orchard::note::Note, orchard::Address, [u8; 512])>) -> Option<WalletTxPart> {
+fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, orchard_tree: &mut OrchardShardTree, mut_orchard_tree: bool, block_h: BlockHeight, txid: &TxId, nf: &orchard::note::Nullifier, cmx: &orchard::note::ExtractedNoteCommitment, recv_note_addr: Option<(orchard::note::Note, orchard::Address)>, send_note_addr_memo: Option<(orchard::note::Note, orchard::Address, [u8; 512])>) -> Option<WalletTxPart> {
     let account = &mut wallet.accounts[account_i];
 
     //- GLOBAL-VIEW UPDATES
@@ -1280,8 +1282,11 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
         incrementalmerkletree::Retention::Ephemeral
     };
     // TODO: batch_insert
-    orchard_tree.append(orchard::tree::MerkleHashOrchard::from_cmx(cmx), retention).expect("Infallible Memory Store");
-    println!("orchard root at {:?} tree size={:02} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
+    if mut_orchard_tree {
+        orchard_tree.append(orchard::tree::MerkleHashOrchard::from_cmx(cmx), retention).expect("Infallible Memory Store");
+        debug_tree_appends.lock().unwrap().push(orchard::tree::MerkleHashOrchard::from_cmx(cmx));
+        println!("orchard root at {:?} tree size={:02} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
+    }
 
     //- HANDLE SPENT NOTES
     let (mut s_send_z, mut s_spend_z, mut s_recv_z) = (0, 0, 0);
@@ -1536,7 +1541,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                 }
             }
 
-            let Some(part) = handle_orchard_action(wallet, account_i, keys, orchard_tree, block_h, &txid, action.nullifier(), action.cmx(), recv_note_addr, send_res) else {
+            let Some(part) = handle_orchard_action(wallet, account_i, keys, orchard_tree, false, block_h, &txid, action.nullifier(), action.cmx(), recv_note_addr, send_res) else {
                 // error creating zats (already printed)
                 // TODO: can we validly continue at all?
                 continue;
@@ -1632,7 +1637,7 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
         let nf: orchard::note::Nullifier = action.nullifier();
         let cmx: orchard::note::ExtractedNoteCommitment = action.cmx();
 
-        let Some(part) = handle_orchard_action(wallet, account_i, keys, orchard_tree, block_h, &txid, &nf, &cmx, note_addr, None) else {
+        let Some(part) = handle_orchard_action(wallet, account_i, keys, orchard_tree, true, block_h, &txid, &nf, &cmx, note_addr, None) else {
             // error creating zats (already printed)
             // TODO: can we validly continue at all?
             continue;
@@ -2585,10 +2590,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             break (new_blocks, new_t_txs, sync_from_i, req_rng, prev_tip_chain_state);
         };
+
         // let mut orchard_frontier = prev_tip_chain_state.final_orchard_tree().clone();
         // let mut orchard_tree = incrementalmerkletree::frontier::CommitmentTree::from_frontier(&orchard_frontier);
         // println!("orchard root at {:?} tree: size={} {:?}", prev_tip_chain_state.block_height(), shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
-
 
         //-- REORG
         if let Some(start_block_i) = sync_from_i {
@@ -2658,27 +2663,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
-
-        //-- ADD/REVALIDATE TRANSPARENT TXS (and attached shielded data)
-        {
-            // see note above on transparent syncing
-            // let sync_start_h = if let Some(start_block_i) = sync_from_i {
-            //     <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above")
-            // } else {
-            //     req_rng.0.try_into.expect("fits in u32")
-            // };
-            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-            let keys = PreparedKeys::from_ufvk_all(&miner_wallet.accounts[0].ufvk);
-            let mut insert_i = 0;
-            for t_tx_i in 0..miner_t_txs.len() {
-                // kinda @in_step_sync
-                let block_h = miner_t_txs[t_tx_i].0;
-                let tx = &miner_t_txs[t_tx_i].1;
-                read_full_tx(miner_wallet, 0, &keys, &mut orchard_tree, block_h, tx, &mut insert_i, false);
-            }
-        }
-
-
         //-- ADD/REVALIDATE SHIELDED TXS FROM NEW BLOCKS
         if let Some(start_block_i) = sync_from_i {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
@@ -2710,6 +2694,25 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
+
+        //-- ADD/REVALIDATE TRANSPARENT TXS (and attached shielded data)
+        {
+            // see note above on transparent syncing
+            // let sync_start_h = if let Some(start_block_i) = sync_from_i {
+            //     <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above")
+            // } else {
+            //     req_rng.0.try_into.expect("fits in u32")
+            // };
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+            let keys = PreparedKeys::from_ufvk_all(&miner_wallet.accounts[0].ufvk);
+            let mut insert_i = 0;
+            for t_tx_i in 0..miner_t_txs.len() {
+                // kinda @in_step_sync
+                let block_h = miner_t_txs[t_tx_i].0;
+                let tx = &miner_t_txs[t_tx_i].1;
+                read_full_tx(miner_wallet, 0, &keys, &mut orchard_tree, block_h, tx, &mut insert_i, false);
+            }
+        }
 
         //-- READ ANY DOWNLOADED FULL TXS
         if in_flight_tx_requests.len() > 0 {
@@ -2780,6 +2783,27 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let mut txs = miner_wallet.txs.clone();
             txs.reverse(); // TODO: just read in reverse order
             wallet_state.lock().unwrap().txs = txs;
+        }
+
+
+        {
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+            let orchard_anchor_h = miner_wallet.chain_tip_h.sat_sub(1);
+            for i in 0..orchard_anchor_h.0 {
+                let orchard_anchor_h = BlockHeight(i);
+                let try_anchor = match orchard_tree.root_at_checkpoint_id(&orchard_anchor_h).expect("Infallible MemoryShardStore") {
+                    Some(root) => Some(orchard::Anchor::from(root)),
+                    None => {
+                        println!("tx build: couldn't get anchor at {orchard_anchor_h:?}");
+                        None
+                    }
+                };
+                println!("wallet compute anchor {} => {:?}", i, try_anchor);
+            }
+            let inspect = debug_tree_appends.lock().unwrap();
+            for t in inspect.iter() {
+                println!("debug pushed {:?}", t);
+            }
         }
 
         // DEV: miner send tx to self
