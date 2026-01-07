@@ -96,8 +96,6 @@ fn sapling_orchard_anchors_refer_to_final_treestates(
             "observed orchard anchor",
         );
 
-println!("zebra anchors: {:?}", parent_chain.map(|chain| chain.orchard_anchors.clone()));
-
         if !parent_chain
             .map(|chain| {
                 chain

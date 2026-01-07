@@ -1,11 +1,12 @@
 //! Internal wallet
 #![allow(warnings)]
 
+use rand::seq::SliceRandom;
 use zcash_client_backend::data_api::WalletCommitmentTrees;
 use orchard::note_encryption::{ CompactAction as OrchardCompactAction, OrchardDomain };
 use rand_chacha::rand_core::SeedableRng;
 use rand_core::OsRng;
-use rand::Rng;
+use rand::{Rng, thread_rng};
 use secrecy::{ExposeSecret,SecretVec,Secret};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::{identity, Infallible};
@@ -929,7 +930,7 @@ impl ManualWallet {
 
 
         //- SPENDS
-        let min_spend = t_send_z + s_send_z + fee_zats.into_u64();
+        let min_spend = t_send_z + s_send_z + fee_zats.into_u64() + 100000; // Sam: 0.001 cTAZ debug fee margin.
         let (mut t_spend_z, mut s_spend_z) = (0, 0);
         let (mut t_spend_c, mut s_spend_c) = (0, 0);
         'src_pool: for pool in opts.src_pools {
@@ -969,7 +970,12 @@ impl ManualWallet {
                         //     }
                         // }
 
-                        for note in &account.unspent_orchard_notes {
+                        let mut shuffled_notes = account.unspent_orchard_notes.clone();
+                        shuffled_notes.shuffle(&mut OsRng);
+
+                        for note in &shuffled_notes {
+                            if note.recv_h > orchard_anchor_h { continue; }
+
                             let witness = match tree.witness_at_checkpoint_id(note.position, &orchard_anchor_h) {
                                 // NOTE: presumably can fail from too-recent note
                                 Ok(Some(witness)) => witness,
@@ -1269,7 +1275,7 @@ fn bc_h_from_raw_tx_h(height: u64) -> Option<Option<BlockHeight>> {
 }
 
 // TODO: handle memo here instead of caller?
-fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, orchard_action_tree_position_by_cmx: &Vec<(orchard::note::ExtractedNoteCommitment, incrementalmerkletree::Position)>, block_h: BlockHeight, txid: &TxId, nf: &orchard::note::Nullifier, cmx: &orchard::note::ExtractedNoteCommitment, recv_note_addr: Option<(orchard::note::Note, orchard::Address)>, send_note_addr_memo: Option<(orchard::note::Note, orchard::Address, [u8; 512])>) -> Option<WalletTxPart> {
+fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, orchard_action_tree_position_by_cmx: &Vec<(orchard::note::ExtractedNoteCommitment, incrementalmerkletree::Position)>, block_h: BlockHeight, txid: &TxId, nf: &orchard::note::Nullifier, cmx: &orchard::note::ExtractedNoteCommitment, recv_note_addr: Option<(orchard::note::Note, orchard::Address)>, send_note_addr_memo: Option<(orchard::note::Note, orchard::Address, [u8; 512])>, bool_do_not_mutate_orchard_notes: bool) -> Option<WalletTxPart> {
     let account = &mut wallet.accounts[account_i];
 
     //- HANDLE SPENT NOTES
@@ -1338,22 +1344,24 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
             block_h
         };
 
-        if let Some(i) = orchard_recv_h_position(&account.unspent_orchard_notes, txid_h, &orchard_note.nf) {
-            // TODO: witness doesn't have PartialEq
-            // if account.unspent_orchard_notes[i] != orchard_note {
-            //     println!("ERROR: orchard_note mismatch: {:?} vs {:?}", account.unspent_orchard_notes[i], &orchard_note);
-            // }
-        } else if orchard_recv_h_position(&account.recv_orchard_notes, txid_h, &orchard_note.nf).is_none() {
-            // TODO: can we just check if we've seen the tx && tx.2 == false
-            if let Some(last_txo) = account.recv_orchard_notes.last() {
-                debug_assert!(last_txo.recv_h <= orchard_note.recv_h, "{} <= {}", last_txo.recv_h, orchard_note.recv_h);
-            }
-            account.recv_orchard_notes.push(orchard_note.clone());
+        if bool_do_not_mutate_orchard_notes == false {
+            if let Some(i) = orchard_recv_h_position(&account.unspent_orchard_notes, txid_h, &orchard_note.nf) {
+                // TODO: witness doesn't have PartialEq
+                // if account.unspent_orchard_notes[i] != orchard_note {
+                //     println!("ERROR: orchard_note mismatch: {:?} vs {:?}", account.unspent_orchard_notes[i], &orchard_note);
+                // }
+            } else if orchard_recv_h_position(&account.recv_orchard_notes, txid_h, &orchard_note.nf).is_none() {
+                // TODO: can we just check if we've seen the tx && tx.2 == false
+                if let Some(last_txo) = account.recv_orchard_notes.last() {
+                    debug_assert!(last_txo.recv_h <= orchard_note.recv_h, "{} <= {}", last_txo.recv_h, orchard_note.recv_h);
+                }
+                account.recv_orchard_notes.push(orchard_note.clone());
 
-            if let Some(last_unspent_orchard_note) = account.unspent_orchard_notes.last() {
-                debug_assert!(last_unspent_orchard_note.recv_h <= orchard_note.recv_h, "{} <= {}", last_unspent_orchard_note.recv_h, orchard_note.recv_h);
+                if let Some(last_unspent_orchard_note) = account.unspent_orchard_notes.last() {
+                    debug_assert!(last_unspent_orchard_note.recv_h <= orchard_note.recv_h, "{} <= {}", last_unspent_orchard_note.recv_h, orchard_note.recv_h);
+                }
+                account.unspent_orchard_notes.push(orchard_note);
             }
-            account.unspent_orchard_notes.push(orchard_note);
         }
     }
 
@@ -1525,7 +1533,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                 }
             }
 
-            let Some(part) = handle_orchard_action(wallet, account_i, keys, orchard_action_tree_position_by_cmx, block_h, &txid, action.nullifier(), action.cmx(), recv_note_addr, send_res) else {
+            let Some(part) = handle_orchard_action(wallet, account_i, keys, orchard_action_tree_position_by_cmx, block_h, &txid, action.nullifier(), action.cmx(), recv_note_addr, send_res, true) else {
                 // error creating zats (already printed)
                 // TODO: can we validly continue at all?
                 continue;
@@ -1621,7 +1629,7 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
         let nf: orchard::note::Nullifier = action.nullifier();
         let cmx: orchard::note::ExtractedNoteCommitment = action.cmx();
 
-        let Some(part) = handle_orchard_action(wallet, account_i, keys, orchard_action_tree_position_by_cmx, block_h, &txid, &nf, &cmx, note_addr, None) else {
+        let Some(part) = handle_orchard_action(wallet, account_i, keys, orchard_action_tree_position_by_cmx, block_h, &txid, &nf, &cmx, note_addr, None, false) else {
             // error creating zats (already printed)
             // TODO: can we validly continue at all?
             continue;
@@ -2869,17 +2877,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
 
-            let orchard_notes = &miner_wallet.accounts[0].unspent_orchard_notes;
-            let spend_n_notes = 1; //OsRng.gen_range(0..=orchard_notes.len());
-            if let (Some(fvk), Some(&dst_addr), true) = (
+            if let (Some(fvk), Some(&dst_addr)) = (
                 miner_wallet.accounts[0].ufvk.orchard(),
-                miner_ua.orchard(),
-                spend_n_notes <= orchard_notes.len()
+                user_ua.orchard(),
             ) {
-                let mut spend = 0;
-                for note_i in 0..spend_n_notes {
-                    spend += orchard_notes[note_i].note.value().inner();
-                }
+                let mut spend = 100000000; // 1 cTAZ
 
                 let calc_fee = zip317::FeeRule::standard().fee_required(
                     network,
@@ -2887,7 +2889,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     [], [],
                     0, 0, // sapling in, out
                           // NOTE: basically 0 or 2+ (1 is consensus-legal but doesn't match builder's fee calc)
-                    orchard::builder::BundleType::DEFAULT.num_actions(spend_n_notes, 1).expect("valid action") // orchard actions
+                    orchard::builder::BundleType::DEFAULT.num_actions(2, 1).expect("valid action") // orchard actions
                 ).expect("valid fee");
                 let mut fee_z = calc_fee;
                 let mut fee = fee_z.into_u64();
@@ -2900,7 +2902,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         memo: MemoBytes::from_bytes("orchard->orchard send".as_bytes()).unwrap(),
                     };
 
-                    println!("orchard ({spend_n_notes}) -> orchard (1) self-send");
+                    println!("orchard (2) -> orchard (1) self-send");
                     // let orchard_tree_root = shard_tree_root(orchard_tree);
                     // let orchard_tree_root = miner_note.witness.root();
                     // println!("anchor at {}/{}: {orchard_tree_root:?}", u64::from(miner_note.witness.witnessed_position()), u64::from(miner_note.witness.tip_position()));
