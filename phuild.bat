@@ -4,7 +4,7 @@
 set "root=C:\Work\ShieldedLabs\crosslink_monolith\"
 
 set "RUSTFLAGS=-Awarnings"
-set "PROTOC=C:\Work\ShieldedLabs\protoc-33.1-win64\bin\protoc.exe"
+set "PROTOC=C:\Work\ShieldedLabs\protoc\bin\protoc.exe"
 set "SOURCE_DATE_EPOCH=0"
 
 REM set "project=zebra-crosslink"
