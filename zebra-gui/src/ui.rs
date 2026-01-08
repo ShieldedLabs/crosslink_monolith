@@ -516,7 +516,7 @@ impl Context {
         }
         let text_colour = text_hsva.rgba();
 
-        if !self.nav_id_to_idx.contains_key(&id.id) {
+        if !self.nav_skip && !self.nav_id_to_idx.contains_key(&id.id) {
             let n = self.nav_id_to_idx.len();
             assert!(n == self.nav_idx_to_id.len());
             self.nav_id_to_idx.insert(id.id, n);
@@ -1150,6 +1150,10 @@ pub fn ui_left_pane(ui: &mut Context,
 
     let mut tab_id_wallet = Id::default();
 
+
+    // @Todo: How to avoid doing this? Clearing the nav array when there is a modal?
+    ui.nav_skip = (ui.modal != Modal::None);
+
     if let _ = elem().decl(Decl {
         id: id("Tab Bar"),
         child_gap,
@@ -1524,6 +1528,8 @@ pub fn ui_left_pane(ui: &mut Context,
             }
         }
     }
+
+    ui.nav_skip = false;
 }
 
 pub fn ui_right_pane(ui: &mut Context,
@@ -2368,6 +2374,7 @@ pub struct Context {
     pub nav_idx_to_id: Vec<u32>,
     pub nav_id: u32,
     pub nav_enable: bool,
+    pub nav_skip: bool,
 
     pub pane_tab_l: Id,
     pub pane_tab_r: Id,
