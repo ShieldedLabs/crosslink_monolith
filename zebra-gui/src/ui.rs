@@ -28,6 +28,8 @@ pub struct UiData {
     pub send_address:  String,
     pub stake_address: String,
     pub recv_address:  String,
+
+    pub textboxes: HashMap<Id, TextboxState>,
 }
 
 
@@ -585,6 +587,61 @@ impl Context {
         let id = id(label);
         self.tab_ex(radius, padding, tab_id, id, label)
     }
+
+    pub fn textbox<'a>(&mut self, data: &'a mut UiData, id: Id) -> &'a str {
+        let child_gap = self.scale(12.0); // @Duplicate
+        let padding   = child_gap.dup4(); // @Duplicate
+        let radius    = child_gap.dup4(); // @Duplicate
+
+        let (clicked, colour, text_colour) = self.button(id);
+
+        if clicked {
+            self.nav_id = id.id;
+            self.nav_enable = true;
+        }
+
+        let text_cloned = {
+            let mut textbox_state = &mut data.textboxes.entry(id).or_default();
+
+            if self.nav_id == id.id {
+                if let Some(input) = &self.input().text_input {
+                    for ch in input {
+                        textbox_state.text.push(*ch);
+                    }
+                }
+                if self.input().key_pressed(KeyCode::Backspace) {
+                    textbox_state.text.pop();
+                }
+                if self.input().key_pressed(KeyCode::Delete) {
+                    if let Some(c) = textbox_state.text.chars().next() {
+                        textbox_state.text.drain(..c.len_utf8());
+                    }
+                }
+            }
+
+            textbox_state.text.clone()
+        };
+        let str = frame_strf!(data, "{} ", text_cloned); // space character to force empty strings to have a height in clay
+
+        if let _ = elem().decl(Decl {
+            id,
+            padding, child_gap, radius,
+            width: grow!(),
+            height: fit!(),
+            colour,
+            ..Decl
+        }) {
+            self.text(&str, TextDecl {
+                colour: text_colour,
+                h: self.scale(16.0),
+                align: AlignX::Center,
+                ..TextDecl
+            });
+        }
+
+        &str[..str.len() - 1] // chop trailing space
+    }
+
 }
 
 pub trait     Dup2: Copy { fn dup2(self) -> (Self, Self); }
@@ -614,7 +671,11 @@ impl<A: Mul, B: Mul>                 Mul for (A, B)       { #[inline(always)] fn
 impl<A: Mul, B: Mul, C: Mul>         Mul for (A, B, C)    { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f)) } }
 impl<A: Mul, B: Mul, C: Mul, D: Mul> Mul for (A, B, C, D) { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f), self.3.mul(f)) } }
 
-static XXX_text: Mutex<String> = Mutex::new(String::new());
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TextboxState {
+    pub text: String,
+    pub selection: (usize, usize),
+}
 
 pub fn ui_left_pane(ui: &mut Context,
                 wallet_state: Arc<Mutex<WalletState>>,
@@ -1226,19 +1287,9 @@ pub fn ui_left_pane(ui: &mut Context,
             ui.text(&balance_str, TextDecl { colour, h: balance_text_h, align: AlignX::Center, ..TextDecl });
         }
 
-        if false && let _ = elem().decl(Decl {
-            width: grow!(),
-            height: fit!(),
-            colour: (0, 0, 0, 0xff),
-            ..Decl
-        }) {
-            if let Some(input) = &ui.input().text_input {
-                for ch in input {
-                    XXX_text.lock().unwrap().push(*ch);
-                }
-            }
-            let str = frame_strf!(data, "{}:", XXX_text.lock().unwrap());
-            ui.text(&str, TextDecl { colour, h: balance_text_h, align: AlignX::Center, ..TextDecl });
+        if let text = ui.textbox(data, id("This Text Box")) {
+        }
+        if let text = ui.textbox(data, id("This Other Text Box")) {
         }
 
         // pending container
