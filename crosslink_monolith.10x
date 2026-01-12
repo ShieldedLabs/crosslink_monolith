@@ -33,7 +33,7 @@
 				<WorkingDirectory>C:\Work\ShieldedLabs\crosslink_monolith</WorkingDirectory>
 				<DebugCommand>C:\Work\ShieldedLabs\crosslink_monolith\crosslink_monolith.rdbg</DebugCommand>
 				<DebuggerExe></DebuggerExe>
-				<DebugSln>C:\Work\ShieldedLabs\crosslink_monolith\zebra-gui\visualizer_zcash.sln</DebugSln>
+				<DebugSln>C:\Work\ShieldedLabs\crosslink_monolith\zebra-crosslink\zebra_crosslink.sln</DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
 				<PrioritiseFiles></PrioritiseFiles>
@@ -51,7 +51,7 @@
 				<WorkingDirectory>C:\Work\ShieldedLabs\crosslink_monolith</WorkingDirectory>
 				<DebugCommand>C:\Work\ShieldedLabs\crosslink_monolith\crosslink_monolith.rdbg</DebugCommand>
 				<DebuggerExe></DebuggerExe>
-				<DebugSln>C:\Work\ShieldedLabs\crosslink_monolith\zebra-gui\visualizer_zcash.sln</DebugSln>
+				<DebugSln>C:\Work\ShieldedLabs\crosslink_monolith\zebra-crosslink\zebra_crosslink.sln</DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
 				<PrioritiseFiles></PrioritiseFiles>
