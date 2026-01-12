@@ -1977,13 +1977,12 @@ pub fn ui_right_pane(ui: &mut Context,
         }) {
             let title_h = ui.scale(28.0);
             let text_h = ui.scale(22.0);
-            let (un, sh_p, sh_s, fc) = {
+            let (un, sh_p, sh_s) = {
                 let w = wallet_state.lock().unwrap();
                 (
                     w.miner_unshielded_funds,
                     w.miner_shielded_pending_funds,
                     w.miner_shielded_spendable_funds,
-                    w.faucet_funds_available,
                 )
             };
 
@@ -1995,10 +1994,6 @@ pub fn ui_right_pane(ui: &mut Context,
             let left_text  = TextDecl { h: text_h,  align: AlignX::Left,  ..TextDecl  };
             let right_text = TextDecl { font: Mono, align: AlignX::Right, ..left_text };
 
-            if let _ = elem().decl(row) {
-                if let _ = elem().decl(left)  { ui.text("Available:", left_text); }
-                if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(fc)), right_text); }
-            }
             if let _ = elem().decl(row) {
                 if let _ = elem().decl(left)  { ui.text("Unshielded:", left_text); }
                 if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(un)), right_text); }
