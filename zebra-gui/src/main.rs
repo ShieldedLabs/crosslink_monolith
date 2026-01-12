@@ -44,13 +44,13 @@ fn main() {
             WalletTx::with_fake_data(WalletTxKind::Unstake, 10_000_000_000, 0, false, "", 0), */
         ];
 
-        let mut pending: Vec<_> = txs.iter().filter(|tx| tx.0.mined_height.is_none()).map(|tx| tx.clone()).collect();
-        let mut mined:   Vec<_> = txs.iter().filter(|tx| tx.0.mined_height.is_some()).map(|tx| tx.clone()).collect();
-        pending.sort_by(| a, b | a.0.txid.cmp(&b.0.txid));
-        mined.sort_by(|a, b| b.0.mined_height.unwrap().cmp(&a.0.mined_height.unwrap()));
-        pending.extend_from_slice(&mined);
+        // let mut pending: Vec<_> = txs.iter().filter(|tx| tx.0.mined_height.is_none()).map(|tx| tx.clone()).collect();
+        // let mut mined:   Vec<_> = txs.iter().filter(|tx| tx.0.mined_height.is_some()).map(|tx| tx.clone()).collect();
+        // pending.sort_by(| a, b | a.0.txid.cmp(&b.0.txid));
+        // mined.sort_by(|a, b| b.0.mined_height.unwrap().cmp(&a.0.mined_height.unwrap()));
+        // pending.extend_from_slice(&mined);
 
-        wallet_state.lock().unwrap().txs = pending;
+        // wallet_state.lock().unwrap().txs = pending;
         wallet_state.lock().unwrap().roster = vec![
             /* WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 25540_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0xBBu8; 32], voting_power: 111000100_000_000, txids: vec![] },

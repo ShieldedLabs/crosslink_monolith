@@ -29,7 +29,7 @@ pub struct UiData {
     pub stake_address: String,
     pub recv_address:  String,
 
-    pub textboxes: HashMap<Id, TextboxState>,
+    pub textboxes: HashMap<u32, TextboxState>,
 }
 
 
@@ -464,7 +464,7 @@ impl Context {
 
     pub fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
 
-    pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: bool) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
+    pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: winit::window::CursorIcon) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
 
         let mouse_hover = self.hovered(id);
         let key_hover   = self.nav_enable && self.nav_id == id.id;
@@ -482,8 +482,8 @@ impl Context {
         let mouse_activated  = enabled && self.mouse_pressed_id == id && if act_on_press { mouse_pressed } else { mouse_released };
         let key_activated    = enabled && self.key_pressed_id   == id && if act_on_press { key_pressed   } else { key_released   };
 
-        if mouse_hover && pointer_on_hover {
-            self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
+        if mouse_hover && pointer_on_hover != winit::window::CursorIcon::Default {
+            self.cursor = winit::window::Cursor::Icon(pointer_on_hover);
         }
 
         let held      = mouse_held      || key_held;
@@ -528,7 +528,7 @@ impl Context {
         (activated, colour, text_colour)
     }
 
-    pub fn button(&mut self, id: Id) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) { return self.button_ex(true, BUTTON_GREY, id, true, false); }
+    pub fn button(&mut self, id: Id) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) { return self.button_ex(true, BUTTON_GREY, id, true, winit::window::CursorIcon::Default); }
 
     pub fn text(&self, label: &str, decl: TextDecl) {
         let config = clay::text::TextConfig::new()
@@ -588,40 +588,121 @@ impl Context {
         self.tab_ex(radius, padding, tab_id, id, label)
     }
 
-    pub fn textbox<'a>(&mut self, data: &'a mut UiData, id: Id) -> &'a str {
-        let child_gap = self.scale(12.0); // @Duplicate
-        let padding   = child_gap.dup4(); // @Duplicate
-        let radius    = child_gap.dup4(); // @Duplicate
+    pub fn textbox(&mut self, data: &mut UiData, id: Id) -> String {
+        let child_gap = self.scale(12.0); // @Duplicate :TextBox
+        let padding   = child_gap.dup4(); // @Duplicate :TextBox
+        let radius    = child_gap.dup4(); // @Duplicate :TextBox
 
-        let (clicked, colour, text_colour) = self.button(id);
+        let (clicked, colour, text_colour) = self.button_ex(true, BUTTON_GREY, id, true, winit::window::CursorIcon::Text);
 
         if clicked {
             self.nav_id = id.id;
             self.nav_enable = true;
         }
 
-        let text_cloned = {
-            let mut textbox_state = &mut data.textboxes.entry(id).or_default();
+        let h = self.scale(16.0);
+
+        let text = {
+            let mut textbox_state = &mut data.textboxes.entry(id.id).or_default();
+
+            textbox_state.h = h;
 
             if self.nav_id == id.id {
-                if let Some(input) = &self.input().text_input {
-                    for ch in input {
-                        textbox_state.text.push(*ch);
-                    }
+                let mut moved = false;
+
+                let shift = (self.input().key_held(KeyCode::ShiftLeft)   || self.input().key_held(KeyCode::ShiftRight));
+                let ctrl  = (self.input().key_held(KeyCode::ControlLeft) || self.input().key_held(KeyCode::ControlRight));
+
+                if !shift && textbox_state.selection.1 != textbox_state.selection.0 {
+                    let (min, max) = (textbox_state.selection.0.min(textbox_state.selection.1),
+                                      textbox_state.selection.0.max(textbox_state.selection.1));
+                    if self.input().key_pressed(KeyCode::ArrowRight) { moved = true; textbox_state.selection.0 = max; }
+                    if self.input().key_pressed(KeyCode::ArrowLeft)  { moved = true; textbox_state.selection.0 = min; }
+                } else {
+                    if self.input().key_pressed(KeyCode::ArrowRight) { moved = true;                                      { textbox_state.selection.0 += 1; }   }
+                    if self.input().key_pressed(KeyCode::ArrowLeft)  { moved = true; { if (textbox_state.selection.0 > 0) { textbox_state.selection.0 -= 1; } } }
                 }
-                if self.input().key_pressed(KeyCode::Backspace) {
-                    textbox_state.text.pop();
+
+                if self.input().key_pressed(KeyCode::Home)       { moved = true; textbox_state.selection.0 = 0; }
+                if self.input().key_pressed(KeyCode::ArrowUp)    { moved = true; textbox_state.selection.0 = 0; }
+
+                if self.input().key_pressed(KeyCode::End)        { moved = true; textbox_state.selection.0 = textbox_state.text_buf.len(); }
+                if self.input().key_pressed(KeyCode::ArrowDown)  { moved = true; textbox_state.selection.0 = textbox_state.text_buf.len(); }
+
+                textbox_state.selection.0 = textbox_state.selection.0.min(textbox_state.text_buf.len());
+                textbox_state.selection.1 = textbox_state.selection.1.min(textbox_state.text_buf.len());
+
+                if moved && !shift {
+                    textbox_state.selection.1 = textbox_state.selection.0;
                 }
-                if self.input().key_pressed(KeyCode::Delete) {
-                    if let Some(c) = textbox_state.text.chars().next() {
-                        textbox_state.text.drain(..c.len_utf8());
+
+                let has_selection = (textbox_state.selection.1 != textbox_state.selection.0);
+
+                let select_all = (ctrl && self.input().key_pressed(KeyCode::KeyA));
+                let copy       = (ctrl && self.input().key_pressed(KeyCode::KeyC));
+                let cut        = (ctrl && self.input().key_pressed(KeyCode::KeyX)) || (shift && self.input().key_pressed(KeyCode::Delete));
+
+                let backspace = self.input().key_pressed(KeyCode::Backspace);
+                let delete    = self.input().key_pressed(KeyCode::Delete);
+                let has_input = self.input().text_input.is_some();
+
+                let should_copy = has_selection && (copy || cut);
+                let should_cut  = has_selection && cut;
+
+                if select_all {
+                    textbox_state.selection.1 = 0;
+                    textbox_state.selection.0 = textbox_state.text_buf.len();
+                }
+
+                // Sort selection
+                let (mut min, mut max) = (textbox_state.selection.0.min(textbox_state.selection.1),
+                                          textbox_state.selection.0.max(textbox_state.selection.1));
+
+                if min == max {
+                    if backspace   { min = min.saturating_sub(1); }
+                    else if delete { max = max.saturating_add(1); }
+                }
+
+                min = min.min(textbox_state.text_buf.len());
+                max = max.min(textbox_state.text_buf.len());
+
+                if should_copy {
+                    // Send text at selection to clipboard
+                    let slice = &textbox_state.text_buf[min..max];
+
+                    let mut text = String::with_capacity(slice.len() * 4);
+                    text.extend(slice.iter().copied());
+                    self.input().send_to_clipboard(&text);
+                }
+
+                if (backspace || delete || should_cut || has_input) {
+                    // Replace text at selection with text input
+                    let pre_slice = &textbox_state.text_buf[..min];
+                    let pst_slice = &textbox_state.text_buf[max..];
+
+                    let input_len = if let Some(input) = &self.input().text_input { input.len() } else { 0 };
+
+                    let mut new_buf = Vec::with_capacity(pre_slice.len() + input_len + pst_slice.len());
+                    new_buf.extend_from_slice(pre_slice);
+                    if let Some(input) = &self.input().text_input {
+                        new_buf.extend_from_slice(input);
                     }
+                    new_buf.extend_from_slice(pst_slice);
+
+                    textbox_state.text_buf = new_buf;
+                    textbox_state.selection.0 = min + input_len;
+
+                    textbox_state.selection.1 = textbox_state.selection.0;
                 }
             }
 
-            textbox_state.text.clone()
+            let mut text = String::with_capacity(textbox_state.text_buf.len() * 4);
+            text.extend(textbox_state.text_buf.iter().copied());
+
+            text
         };
-        let str = frame_strf!(data, "{} ", text_cloned); // space character to force empty strings to have a height in clay
+
+        let str = frame_strf!(data, "{} ", text); // space character to force empty strings to have a height in clay
 
         if let _ = elem().decl(Decl {
             id,
@@ -633,13 +714,13 @@ impl Context {
         }) {
             self.text(&str, TextDecl {
                 colour: text_colour,
-                h: self.scale(16.0),
+                h,
                 align: AlignX::Center,
                 ..TextDecl
             });
         }
 
-        &str[..str.len() - 1] // chop trailing space
+        text
     }
 
 }
@@ -673,8 +754,10 @@ impl<A: Mul, B: Mul, C: Mul, D: Mul> Mul for (A, B, C, D) { #[inline(always)] fn
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TextboxState {
-    pub text: String,
+    pub text_buf: Vec<char>,
     pub selection: (usize, usize),
+    pub bbox: (isize, isize, isize, isize),
+    pub h: f32,
 }
 
 pub fn ui_left_pane(ui: &mut Context,
@@ -744,7 +827,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Right, ..Decl }) && closeable {
                         let id = id("Close This Modal");
 
-                        let (clicked, colour, _) = ui.button_ex(false, BUTTON_GREY, id, true, false);
+                        let (clicked, colour, _) = ui.button_ex(false, BUTTON_GREY, id, true, winit::window::CursorIcon::Default);
                         if clicked || ui.input().key_pressed(KeyCode::Escape) {
                             ui.modal = Modal::None;
                         }
@@ -778,7 +861,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     hsva.2 = ((hsva.2 as f32) * 1.25).min(255.0) as u8;
                     hsva.rgba()
                 };
-                let (clicked, colour, text_colour) = ui.button_ex(false, colour, id, enabled, false);
+                let (clicked, colour, text_colour) = ui.button_ex(false, colour, id, enabled, winit::window::CursorIcon::Default);
                 let radius = ui.scale(24.0);
                 if let _ = elem().decl(Decl {
                     id,
@@ -816,15 +899,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                        let mut send_address = "0000000000000000";
-                        if data.send_address.len() >= 16 {
-                            send_address = &data.send_address;
-                        }
-
-                        ui.text(frame_strf!(data, "[{}..{}]", &send_address[..8], &send_address[send_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                        if button_ex(ui, "Paste Address", true) {
-                            data.send_address = ui.input().get_from_clipboard().trim().to_string();
-                        }
+                        data.send_address = ui.textbox(data, id("Send Address Textbox"));
 
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
@@ -858,7 +933,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             };
 
                             let can = !waiting_for_send && data.send_address.len() != 0;
-                            if button_ex(ui,   "1 cTAZ", can && (balance as u64) >= ONE_cTAZ)        { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ);       }
+                            if button_ex(ui,    "1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ);       }
                             if button_ex(ui,   "10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ * 10);  }
                         }
                     }
@@ -997,7 +1072,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                     let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
                         let id = id(label);
-                        let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, false);
+                        let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
                         if let _ = elem().decl(Decl {
                             id,
                             child_gap,
@@ -1029,7 +1104,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     };
 
                     let mut clickable_icon = |ui: &mut Context, id, icon, icon_hovered, enabled | {
-                        let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, true);
+                        let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
 
                         let icon = if ui.hovered(id) { icon_hovered } else { icon };
                         if let _ = elem().decl(Decl{
@@ -1269,7 +1344,7 @@ pub fn ui_left_pane(ui: &mut Context,
         }
 
         let balance_id = id("Balance Text");
-        let (clicked, colour, _) = ui.button_ex(true, colour, balance_id, true, true);
+        let (clicked, colour, _) = ui.button_ex(true, colour, balance_id, true, winit::window::CursorIcon::Pointer);
         if clicked {
             wallet_state.lock().unwrap().show_staked_balance = !show_staked_balance;
         }
@@ -1285,11 +1360,6 @@ pub fn ui_left_pane(ui: &mut Context,
             let suffix = if !show_staked_balance && staked_balance > 0 { "*" } else { "" };
             let balance_str = frame_strf!(data, "{} cTAZ{}", str_from_ctaz(balance.try_into().unwrap()), suffix);
             ui.text(&balance_str, TextDecl { colour, h: balance_text_h, align: AlignX::Center, ..TextDecl });
-        }
-
-        if let text = ui.textbox(data, id("This Text Box")) {
-        }
-        if let text = ui.textbox(data, id("This Other Text Box")) {
         }
 
         // pending container
@@ -1323,7 +1393,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
             let mut button = |ui: &mut Context, icon: &'static str, label: &'static str| {
                 let id = id(label);
-                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, true, false);
+                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, true, winit::window::CursorIcon::Default);
                 if let _ = elem().decl(Decl {
                     id, child_gap, align: Center,
                     direction: TopToBottom,
@@ -1645,7 +1715,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
         let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
             let id = id(label);
-            let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, false);
+            let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
             if let _ = elem().decl(Decl {
                 id,
                 child_gap,
@@ -1677,7 +1747,7 @@ pub fn ui_right_pane(ui: &mut Context,
         };
 
         let mut clickable_icon = |ui: &mut Context, id, icon, enabled | {
-            let (clicked, colour, _) = ui.button_ex(false, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, true);
+            let (clicked, colour, _) = ui.button_ex(false, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
             if let _ = elem().decl(Decl{
                 id,
                 child_gap,
@@ -1955,7 +2025,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
             let mut button_ex = |label, act_on_press, enabled: bool| {
                 let id = id(label);
-                let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, false);
+                let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
                 if let _ = elem().decl(Decl {
                     id,
                     child_gap,
@@ -2135,7 +2205,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 let enabled = viz.camera_x != 0.0 || viz.camera_y != viz.bc_tip_y || viz.zoom != 0.0;
 
                 let id = id(label);
-                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, id, enabled, false);
+                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
                 let radius = ui.scale(20.0);
 
                 if ui.hovered(id) {
@@ -2263,6 +2333,11 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         };
         ui.nav_id = ui.nav_idx_to_id[idx];
         ui.nav_enable = true;
+
+        if let Some(textbox_state) = data.textboxes.get_mut(&ui.nav_id) {
+            textbox_state.selection.1 = 0;
+            textbox_state.selection.0 = textbox_state.text_buf.len();
+        }
     }
 
     // Return the list of render commands of your layout
@@ -2286,8 +2361,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             let x2 = (command.bounding_box.x + command.bounding_box.width)  as isize;
             let y2 = (command.bounding_box.y + command.bounding_box.height) as isize;
 
+            let bbox = (x1, y1, x2, y2);
+
             if ui.nav_id == command.id {
-                nav_bbox = Some((x1, y1, x2, y2));
+                nav_bbox = Some(bbox);
             }
 
             let colour = match command.config {
@@ -2316,6 +2393,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 }
                 RenderCommandConfig::Text(config) => {
                     let font_kind = match config.font_id { 0 => FontKind::Normal, 1 => FontKind::Mono, 2 => FontKind::Icons, _ => todo!() };
+
+                    // let text = frame_strf!(data, "{} ", command.id);
+                    // ui.draw().text_line(font_kind, x1 as f32, y1 as f32, config.font_size as f32, text, colour);
+
                     ui.draw().text_line(font_kind, x1 as f32, y1 as f32, config.font_size as f32, config.text, colour);
                 }
                 ScissorStart() => {
@@ -2325,6 +2406,46 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     ui.draw().clear_scissor();
                 }
                 misc => { todo!("Unsupported clay render command: {:?}", misc) }
+            }
+
+            if let Some(textbox_state) = data.textboxes.get_mut(&command.id) && ui.nav_id == command.id {
+                textbox_state.bbox = bbox;
+
+                let h = textbox_state.h;
+
+                let padding = ui.scale(12.0); // @Duplicate :TextBox
+
+                let compute_x = |idx: usize| {
+                    let n = idx.min(textbox_state.text_buf.len());
+                    let mut str = String::with_capacity(n * 4);
+                    str.extend(textbox_state.text_buf[..n].iter().copied());
+                    let xoff = ui.draw().measure_text_line(FontKind::Normal, textbox_state.h, &str);
+                    x1 + padding as isize + xoff as isize
+                };
+
+                let head_x = compute_x(textbox_state.selection.0);
+                let tail_x = compute_x(textbox_state.selection.1);
+
+                let y_centre = (y1 + y2) / 2;
+                let y1 = y_centre - (h * 0.5).ceil() as isize;
+                let y2 = y_centre + (h * 0.5).ceil() as isize;
+
+                if textbox_state.selection.1 == textbox_state.selection.0 {
+                    let x1    = head_x;
+                    let color = 0xc0ffffff;
+                    let t     = (ui.scale * 1.0).ceil() as isize;
+
+                    ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x1+t) as f32, (y2+t) as f32, color);
+                } else {
+                    let (min, max) = (head_x.min(tail_x),
+                                      head_x.max(tail_x));
+
+                    let x1    = min;
+                    let x2    = max;
+                    let color = 0xc00000ff;
+
+                    ui.draw().rectangle(x1 as f32, y1 as f32, x2 as f32, y2 as f32, color);
+                }
             }
 
             if ui.debug {
@@ -2339,7 +2460,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             }
         }
 
-        if ui.nav_enable && let Some((x1, y1, x2, y2)) = nav_bbox {
+        if ui.nav_enable && let Some((x1, y1, x2, y2)) = nav_bbox && !data.textboxes.contains_key(&ui.nav_id) {
             let gap = ui.scale(1.0) as isize;
 
             let x1 = x1 - gap;

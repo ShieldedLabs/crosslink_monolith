@@ -282,6 +282,8 @@ impl DrawCtx {
         }
         let text_height = text_height.floor() as usize;
 
+        // TODO: hash parameters right here, use result as key into memoization cache/hashmap
+
         let (tracker, _) = self._find_or_create_font_tracker(text_height, font_kind);
         tracker.how_many_times_was_i_used += 1;
 
@@ -963,6 +965,9 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
     let mut window: Option<Rc<winit::window::Window>> = None;
     let mut softbuffer_context: Option<softbuffer::Context<Rc<winit::window::Window>>> = None;
     let mut softbuffer_surface: Option<softbuffer::Surface<Rc<winit::window::Window>, Rc<winit::window::Window>>> = None;
+
+    let mut modifiers = winit::keyboard::ModifiersState::default();
+
     #[allow(deprecated)]
     event_loop.run(move |event, elwt: &winit::event_loop::ActiveEventLoop| {
         match event {
@@ -1031,11 +1036,30 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                         input_ctx.inflight_mouse_events.push((button, state));
                                     }
                                 },
+                                winit::event::WindowEvent::ModifiersChanged(m) => {
+                                    modifiers = m.state();
+                                },
                                 winit::event::WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
-                                    if event.state.is_pressed() && event.repeat == false && event.physical_key == winit::keyboard::PhysicalKey::Code(KeyCode::KeyV) && (input_ctx.key_held(KeyCode::ControlLeft) || input_ctx.key_held(KeyCode::ControlRight))  {
+
+                                    let ctrl  = modifiers.control_key() || modifiers.super_key();
+
+                                    let is_paste = {
+
+                                        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+                                        let key   = event.key_without_modifiers();
+
+                                        let shift = modifiers.shift_key();
+
+                                        let ctrl_v       = ctrl  && matches!(key, winit::keyboard::Key::Character(ref s) if s.eq_ignore_ascii_case("v"));
+                                        let shift_insert = shift && (key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Insert));
+
+                                        ctrl_v || shift_insert
+                                    };
+
+                                    if event.state.is_pressed() && is_paste {
                                         input_ctx.inflight_text_input.extend(&arboard::Clipboard::new().ok().map(|mut c| c.get_text().ok()).flatten().map(|s| s.chars().collect::<Vec<char>>()).unwrap_or_default());
                                     } else {
-                                        if let Some(text) = event.text && event.state.is_pressed() {
+                                        if !ctrl && let Some(text) = event.text && event.state.is_pressed() {
                                             input_ctx.inflight_text_input.extend(text.chars().filter(|c| *c >= ' ' && *c != 0x7f as char));
                                         }
 
@@ -1122,6 +1146,8 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             } else {
                                                 Some(input_ctx.inflight_text_input.clone())
                                             };
+
+                                            is_anything_happening_at_all_in_any_way |= !input_ctx.inflight_text_input.is_empty();
 
                                          // is_anything_happening_at_all_in_any_way |= input_ctx.mouse_down     != 0;
                                             is_anything_happening_at_all_in_any_way |= input_ctx.mouse_pressed  != 0;
