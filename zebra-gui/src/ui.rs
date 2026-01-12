@@ -593,9 +593,9 @@ impl Context {
         let padding   = child_gap.dup4(); // @Duplicate :TextBox
         let radius    = child_gap.dup4(); // @Duplicate :TextBox
 
-        let (clicked, colour, text_colour) = self.button_ex(true, BUTTON_GREY, id, true, winit::window::CursorIcon::Text);
+        let (activated, colour, text_colour) = self.button_ex(true, BUTTON_GREY, id, true, winit::window::CursorIcon::Text);
 
-        if clicked {
+        if activated {
             self.nav_id = id.id;
             self.nav_enable = true;
         }
@@ -638,7 +638,7 @@ impl Context {
 
                 let has_selection = (textbox_state.selection.1 != textbox_state.selection.0);
 
-                let select_all = (ctrl && self.input().key_pressed(KeyCode::KeyA));
+                let select_all = (ctrl && self.input().key_pressed(KeyCode::KeyA)) || activated;
                 let copy       = (ctrl && self.input().key_pressed(KeyCode::KeyC));
                 let cut        = (ctrl && self.input().key_pressed(KeyCode::KeyX)) || (shift && self.input().key_pressed(KeyCode::Delete));
 
@@ -828,7 +828,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         let id = id("Close This Modal");
 
                         let (clicked, colour, _) = ui.button_ex(false, BUTTON_GREY, id, true, winit::window::CursorIcon::Default);
-                        if clicked || ui.input().key_pressed(KeyCode::Escape) {
+                        if clicked || (ui.input().key_pressed(KeyCode::Escape) && !ui.nav_enable) {
                             ui.modal = Modal::None;
                         }
 
