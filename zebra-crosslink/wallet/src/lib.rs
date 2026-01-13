@@ -191,8 +191,13 @@ impl<T: std::fmt::Debug> std::fmt::Debug for NL<'_, T> {
     }
 }
 
+// NOTE: only a function because from() isn't const
+// This is u64::MAX in large part to operate correctly on anchor comparison
+// ALT: Option
+fn unknown_tree_position() -> incrementalmerkletree::Position { incrementalmerkletree::Position::from(u64::MAX) }
+
 // ALT: collapse into Txo with internal enum(s)
-#[derive(Clone)]
+#[derive(Clone, Copy, PartialEq)]
 struct OrchardNote {
     // NOTE: the reason we want to keep witnesses up-to-date is to increase the time-domain anonymity
     pub recv_h: BlockHeight,
@@ -212,6 +217,25 @@ impl std::fmt::Debug for OrchardNote {
             u64::from(self.position)
             // u64::from(self.witness.witnessed_position()), self.witness.root()
             )
+    }
+}
+
+impl OrchardNote {
+    fn monotonically_update(&mut self, mut new_note: OrchardNote) {
+        if new_note.position < unknown_tree_position() {
+            if (self.position < unknown_tree_position() &&
+                self.position != new_note.position)
+            {
+                println!("ERROR: orchard note has 2 different valid positions: {:?} vs {:?}", self.position, new_note.position);
+            }
+            self.position = new_note.position;
+        } else {
+            new_note.position = self.position; // NOTE: just for cmp
+        }
+
+        if self != &new_note {
+            println!("ERROR: orchard_note mismatch: {:?} vs {:?}", self, new_note);
+        }
     }
 }
 
@@ -1533,6 +1557,19 @@ impl PoWCache {
 // #############-------------------
 //              ###################
 
+/// PUSH NOTE/TXS IN HEIGHT ORDER
+fn orchard_recv_h_push(notes: &mut Vec<OrchardNote>, note: OrchardNote) {
+    // ALT: dump non mempool
+    // ALT: linear search backwards
+    let mut insert_i = notes.len(); // common case append
+    if let Some(last) = notes.last() {
+        if last.recv_h > note.recv_h {
+            insert_i = notes.partition_point(|n| n.recv_h <= note.recv_h);
+        }
+    }
+
+    notes.insert(insert_i, note);
+}
 
 /// GET NOTE/TX INDEXES WITH KNOWN HEIGHTS IN SORTED SLICES
 fn orchard_recv_h_position(notes: &[OrchardNote], block_h: BlockHeight, nf: &orchard::note::Nullifier) -> Option<usize> {
@@ -1648,7 +1685,7 @@ fn bc_h_from_raw_tx_h(height: u64) -> Option<Option<BlockHeight>> {
 
 // TODO: handle memo here instead of caller?
 // TODO: replace orchard_action_tree_position_by_cmx with position
-fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, orchard_action_tree_position_by_cmx: &Vec<(orchard::note::ExtractedNoteCommitment, incrementalmerkletree::Position)>, block_h: BlockHeight, txid: &TxId, nf: &orchard::note::Nullifier, cmx: &orchard::note::ExtractedNoteCommitment, recv_note_addr: Option<(orchard::note::Note, orchard::Address)>, send_note_addr_memo: Option<(orchard::note::Note, orchard::Address, [u8; 512])>, bool_do_not_mutate_orchard_notes: bool) -> Option<WalletTxPart> {
+fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, position: incrementalmerkletree::Position, block_h: BlockHeight, txid: &TxId, nf: &orchard::note::Nullifier, recv_note_addr: Option<(orchard::note::Note, orchard::Address)>, send_note_addr_memo: Option<(orchard::note::Note, orchard::Address, [u8; 512])>) -> Option<WalletTxPart> {
     let account = &mut wallet.accounts[account_i];
 
     //- HANDLE SPENT NOTES
@@ -1692,52 +1729,46 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
         // }
         // NOTE: s_send_c/s_send_z equivalent handled inside update_with_tx
 
-        if block_h < BlockHeight::MEMPOOL {
-            let orchard_note = OrchardNote{
-                recv_h: block_h,
-                spent_h: BlockHeight(0),
-                txid: *txid,
-                note,
-                position: orchard_action_tree_position_by_cmx.iter().find(|(cmp_cmx, pos)| cmp_cmx == cmx).unwrap().1, // Note(Sam): Observed a crash on this unwrap.
-                // witness: OrchardWitness::from_tree(orchard_tree.clone()).expect("just appended"),
-                // in note:
-                // value: match Zatoshis::from_u64(note.value().inner()) {
-                //     Ok(v) => v,
-                //     Err(err) => {
-                //         println!("couldn't convert {:?} to Zatoshis: {err:?}", note.value());
-                //         continue 'tx_iter;
-                //     }
-                // },
-                nf: note.nullifier(keys.orchard_fvk.as_ref().expect("implied by ivk presence")), // TODO: cache or recompute?
-            };
-            // println!("got new note at {:?}, tree pos={:02} {:?}", block_h, u64::from(orchard_note.witness.witnessed_position()), orchard_note.witness.root());
+        let orchard_note = OrchardNote{
+            recv_h: block_h,
+            spent_h: BlockHeight(0),
+            txid: *txid,
+            note,
+            position,
+            // witness: OrchardWitness::from_tree(orchard_tree.clone()).expect("just appended"),
+            // in note:
+            // value: match Zatoshis::from_u64(note.value().inner()) {
+            //     Ok(v) => v,
+            //     Err(err) => {
+            //         println!("couldn't convert {:?} to Zatoshis: {err:?}", note.value());
+            //         continue 'tx_iter;
+            //     }
+            // },
+            nf: note.nullifier(keys.orchard_fvk.as_ref().expect("implied by ivk presence")), // TODO: cache or recompute?
+        };
+        // println!("got new note at {:?}, tree pos={:02} {:?}", block_h, u64::from(orchard_note.witness.witnessed_position()), orchard_note.witness.root());
 
-            let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(txid) {
-                txid_h
-            } else {
-                block_h
-            };
+        let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(txid) {
+            txid_h
+        } else {
+            block_h
+        };
 
-            if bool_do_not_mutate_orchard_notes == false {
-                if let Some(i) = orchard_recv_h_position(&account.unspent_orchard_notes, txid_h, &orchard_note.nf) {
-                    // TODO: witness doesn't have PartialEq
-                    // if account.unspent_orchard_notes[i] != orchard_note {
-                    //     println!("ERROR: orchard_note mismatch: {:?} vs {:?}", account.unspent_orchard_notes[i], &orchard_note);
-                    // }
-                } else if orchard_recv_h_position(&account.recv_orchard_notes, txid_h, &orchard_note.nf).is_none() {
-                    // TODO: can we just check if we've seen the tx && tx.2 == false
-                    if let Some(last_txo) = account.recv_orchard_notes.last() {
-                        debug_assert!(last_txo.recv_h <= orchard_note.recv_h, "{} <= {}", last_txo.recv_h, orchard_note.recv_h);
-                    }
-                    account.recv_orchard_notes.push(orchard_note.clone());
+        // TODO: can we just check if we've seen the tx && tx.is_outside_bc == false
+        let have_seen = if let Some(i) = orchard_recv_h_position(&account.recv_orchard_notes, txid_h, &orchard_note.nf) {
+            account.recv_orchard_notes[i].monotonically_update(orchard_note);
+            true
+        } else {
+            orchard_recv_h_push(&mut account.recv_orchard_notes, orchard_note.clone());
+            false
+        };
 
-                    if let Some(last_unspent_orchard_note) = account.unspent_orchard_notes.last() {
-                        debug_assert!(last_unspent_orchard_note.recv_h <= orchard_note.recv_h, "{} <= {}", last_unspent_orchard_note.recv_h, orchard_note.recv_h);
-                    }
-                    account.unspent_orchard_notes.push(orchard_note);
-                }
-            }
+        if let Some(i) = orchard_recv_h_position(&account.unspent_orchard_notes, txid_h, &orchard_note.nf) {
+            account.unspent_orchard_notes[i].monotonically_update(orchard_note);
+        } else if !have_seen {
+            orchard_recv_h_push(&mut account.unspent_orchard_notes, orchard_note);
         }
+        // NOTE: don't update spent notes because we can't spend notes without a position
     }
 
     match (Zatoshis::from_u64(s_spend_z), Zatoshis::from_u64(s_send_z), Zatoshis::from_u64(s_recv_z)) {
@@ -1757,7 +1788,7 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
     }
 }
 
-fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, orchard_action_tree_position_by_cmx: &Vec<(orchard::note::ExtractedNoteCommitment, incrementalmerkletree::Position)>, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize, is_outside_bc: bool) -> Option<()> {
+fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize, is_outside_bc: bool) -> Option<()> {
     // TODO: we probably want to early-out if our existing tx data is complete
     // (after checking that this doesn't get modified)
     update_insert_i(&wallet.txs, insert_i, block_h);
@@ -1908,7 +1939,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                 }
             }
 
-            let Some(part) = handle_orchard_action(wallet, account_i, keys, orchard_action_tree_position_by_cmx, block_h, &txid, action.nullifier(), action.cmx(), recv_note_addr, send_res, true) else {
+            let Some(part) = handle_orchard_action(wallet, account_i, keys, unknown_tree_position(), block_h, &txid, action.nullifier(), recv_note_addr, send_res) else {
                 // error creating zats (already printed)
                 // TODO: can we validly continue at all?
                 continue;
@@ -2003,8 +2034,9 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
         };
         let nf: orchard::note::Nullifier = action.nullifier();
         let cmx: orchard::note::ExtractedNoteCommitment = action.cmx();
+        let position = orchard_action_tree_position_by_cmx.iter().find(|(cmp_cmx, pos)| cmp_cmx == &cmx).unwrap().1;
 
-        let Some(part) = handle_orchard_action(wallet, account_i, keys, orchard_action_tree_position_by_cmx, block_h, &txid, &nf, &cmx, note_addr, None, false) else {
+        let Some(part) = handle_orchard_action(wallet, account_i, keys, position, block_h, &txid, &nf, note_addr, None) else {
             // error creating zats (already printed)
             // TODO: can we validly continue at all?
             continue;
@@ -3129,7 +3161,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 // kinda @in_step_sync
                 let block_h = miner_t_txs[t_tx_i].0;
                 let tx = &miner_t_txs[t_tx_i].1;
-                read_full_tx(miner_wallet, 0, &keys, &orchard_action_tree_position_by_cmx, block_h, tx, &mut insert_i, false);
+                read_full_tx(miner_wallet, 0, &keys, block_h, tx, &mut insert_i, false);
             }
         }
 
@@ -3154,7 +3186,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                     Ok(tx) => {
                         for i in 0..2 {
-                            read_full_tx(wallets[i], 0, &keys[i], &orchard_action_tree_position_by_cmx, BlockHeight::MEMPOOL, &tx, insert_idxs[i], false);
+                            read_full_tx(wallets[i], 0, &keys[i], BlockHeight::MEMPOOL, &tx, insert_idxs[i], false);
                         }
                     }
                 }
@@ -3240,7 +3272,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     println!("reading downloaded full tx for {txid:?}");
                     let keys = PreparedKeys::from_ufvk_all(&wallets[wallet_i].accounts[0].ufvk);
 
-                    read_full_tx(wallets[wallet_i], 0, &keys, &orchard_action_tree_position_by_cmx, existing_tx.mined_h, &tx, &mut 0, existing_tx.is_outside_bc);
+                    read_full_tx(wallets[wallet_i], 0, &keys, existing_tx.mined_h, &tx, &mut 0, existing_tx.is_outside_bc);
                 }
             }
             println!("after  reading, there are {} in flight tx downloads", in_flight_tx_requests.len());
