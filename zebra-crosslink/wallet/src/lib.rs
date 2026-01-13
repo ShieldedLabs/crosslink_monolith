@@ -2051,7 +2051,8 @@ fn shard_tree_root(tree: &OrchardShardTree) -> orchard::tree::MerkleHashOrchard 
         .unwrap()
 }
 
-fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, insert_i: &mut usize, orchard_action_tree_position_by_cmx: &Vec<(orchard::note::ExtractedNoteCommitment, incrementalmerkletree::Position)>) -> (TxId, bool/*ours*/, bool/*ok*/) {
+/// NOTE: this *must* only be called in sequential order without gaps (including after reorg/truncate)
+fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, insert_i: &mut usize, orchard_tree: &mut OrchardShardTree) -> (TxId, bool/*ours*/, bool/*ok*/) {
     let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
 
     let mut shielded_part = WalletTxPart::ZERO;
@@ -2075,7 +2076,23 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
         };
         let nf: orchard::note::Nullifier = action.nullifier();
         let cmx: orchard::note::ExtractedNoteCommitment = action.cmx();
-        let position = orchard_action_tree_position_by_cmx.iter().find(|(cmp_cmx, pos)| cmp_cmx == &cmx).unwrap().1;
+
+        //- GLOBAL-VIEW UPDATES
+        // NOTE: we don't care to mark our sent(-only) actions
+        let retention = if note_addr.is_some() {
+            incrementalmerkletree::Retention::Marked
+        } else {
+            incrementalmerkletree::Retention::Ephemeral
+        };
+        // TODO: batch_insert
+        // Some kind of problem with batch insert. TODO for later / Sam
+        // let position = orchard_tree.max_leaf_position(None).unwrap().unwrap_or(incrementalmerkletree::Position::from(0));
+        // let res = orchard_tree.batch_insert(position, append_iter).expect("Infallible Memory Store");
+        // println!("****** orchard_tree.batch_insert result {:?}", res);
+        orchard_tree.append(orchard::tree::MerkleHashOrchard::from_cmx(&cmx), retention).expect("Infallible Memory Store");
+        println!("orchard root at {:?} tree size={:02} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
+
+        let position = orchard_tree.max_leaf_position(None).expect("Infallible Memory Store").expect("just appended");
 
         let Some(part) = handle_orchard_action(wallet, account_i, keys, position, block_h, &txid, &nf, note_addr, None) else {
             // error creating zats (already printed)
@@ -2561,7 +2578,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     const CHECKPOINTS_N: usize = 100;
     let mut orchard_tree = OrchardShardTree::new(shardtree::store::memory::MemoryShardStore::empty(), CHECKPOINTS_N);
     orchard_tree.checkpoint(BlockHeight(0)).unwrap();
-    let mut orchard_action_tree_position_by_cmx = Vec::new();
 
     const MAX_TXS_TO_DOWNLOAD_AT_TIME: u64 = 64;
     // TODO: this is bad and should be replaced
@@ -3078,6 +3094,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // let mut orchard_tree = incrementalmerkletree::frontier::CommitmentTree::from_frontier(&orchard_frontier);
         // println!("orchard root at {:?} tree: size={} {:?}", prev_tip_chain_state.block_height(), shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
 
+
         //-- REORG
         if let Some(start_block_i) = sync_from_i {
             // the regime is basically "always reorg", but that's often a no-op
@@ -3087,47 +3104,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let last_block_h = block_h.sat_sub(1);
 
             orchard_tree.truncate_to_checkpoint(&last_block_h); // N.B. checkpoints are at the *end* of their block
-
-            for (new_block_i, block) in new_blocks.iter().enumerate() {
-                let append_iter = block.vtx.iter().flat_map(
-                    |tx| tx.actions.iter().filter_map(
-                        |a| {
-                            match OrchardCompactAction::try_from(a) {
-                                Ok(v) => Some(v),
-                                Err(err) => {
-                                    println!("couldn't convert CompactOrchardAction to orchard::CompactAction: {err:?}");
-                                    None
-                                },
-                            }
-                        })
-                    ).map(|a| (a.cmx(), incrementalmerkletree::Retention::Marked));
-
-                // TODO: Only mark/store the notes we intend to spend later. Right now we mark all of them so we are basically storing the entire blockchain.
-                // let retention = if recv_note_addr.is_some() {
-                //     incrementalmerkletree::Retention::Marked
-                // } else {
-                //     incrementalmerkletree::Retention::Ephemeral
-                // };
-
-                // Some kind of problem with batch insert. TODO for later / Sam
-                // let position = orchard_tree.max_leaf_position(None).unwrap().unwrap_or(incrementalmerkletree::Position::from(0));
-                // let res = orchard_tree.batch_insert(position, append_iter).expect("Infallible Memory Store");
-                // println!("****** orchard_tree.batch_insert result {:?}", res);
-                for (cmx, r) in append_iter {
-                    let h = orchard::tree::MerkleHashOrchard::from_cmx(&cmx);
-                    orchard_tree.append(h, r);
-
-                    if let Some(index) = orchard_action_tree_position_by_cmx.iter().position(|(cmp_cmx, pos)| cmp_cmx == &cmx) {
-                        orchard_action_tree_position_by_cmx.remove(index);
-                    }
-                    orchard_action_tree_position_by_cmx.push((cmx, orchard_tree.max_leaf_position(None).expect("Infallible Memory Store").expect("just appended")));
-                }
-
-                // NOTE: simple approach: checkpoint every block
-                // => allows for easy reorgs & witnesses
-                orchard_tree.checkpoint(block_h.sat_add(new_block_i as u32));
-                // println!("orchard root at {:?} tree: size={} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
-            }
 
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             for (wallet_i, wallet) in [miner_wallet, user_wallet].into_iter().enumerate() {
@@ -3178,6 +3154,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
         }
+
 
         //-- ADD/REVALIDATE TRANSPARENT TXS (and attached shielded data)
         {
@@ -3245,13 +3222,19 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     //-- INCORPORATE SHIELDED TRANSACTIONS FROM COMPACT BLOCK
                     'tx_iter: for tx in &block.vtx {
-                        if let (txid, true, true) = read_compact_tx(wallet, 0, &keys, block_h, tx, &mut insert_i, &orchard_action_tree_position_by_cmx) {
+                        if let (txid, true, true) = read_compact_tx(wallet, 0, &keys, block_h, tx, &mut insert_i, &mut orchard_tree) {
                             println!("found our compact tx: {txid:?}");
                         }
                     }
+
+                    // NOTE: simple approach: checkpoint every block
+                    // => allows for easy reorgs & witnesses
+                    orchard_tree.checkpoint(block_h);
+                    // println!("orchard root at {:?} tree: size={} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
                 }
             }
         }
+
 
         //-- READ ANY DOWNLOADED FULL TXS
         if in_flight_tx_requests.len() > 0 {
