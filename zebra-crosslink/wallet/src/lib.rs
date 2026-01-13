@@ -648,6 +648,15 @@ fn update_insert_i(txs: &[WalletTx], insert_i: &mut usize, block_h: BlockHeight)
 
 fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, insert_i: &mut usize) {
     // find if there's an existing height/transaction for this txid
+    let new_totals = new_tx.totals();
+    if (new_totals.spent_note_count == 0 &&
+        new_totals.recv_note_count == 0 &&
+        new_totals.sent_note_count == 0)
+    {
+        // not our transaction; ignore
+        return;
+    }
+
     if let Some(tx_h) = wallet.tx_h_map.get_mut(&txid) {
         if let Some(tx_i) = tx_mined_h_position(&wallet.txs, *tx_h, &txid) {
             let old_tx = &wallet.txs[tx_i];
@@ -2502,14 +2511,14 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     loop {
                         match strm.message().await {
                             Ok(Some(tx)) => {
-                                println!("MEMPOOL: got new message");
+                                // println!("MEMPOOL: got new message");
                                 if let Err(err) = mempool_send.send(tx).await {
                                     println!("MEMPOOL ERROR: can't send message to channel: {err:?}");
                                     break;
                                 }
                             }
                             Ok(None) => {
-                                println!("MEMPOOL: no more messages (will reconnect shortly)");
+                                // println!("MEMPOOL: no more messages (will reconnect shortly)");
                                 break;
                             }
                             Err(err) => {
@@ -2525,6 +2534,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
         }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     });
 
     let mut faucet_shield_cooldown_instant = Instant::now() - Duration::from_secs(1000);
