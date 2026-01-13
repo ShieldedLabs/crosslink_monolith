@@ -1671,7 +1671,7 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
             spent_h: BlockHeight(0),
             txid: *txid,
             note,
-            position: orchard_action_tree_position_by_cmx.iter().find(|(cmp_cmx, pos)| cmp_cmx == cmx).unwrap().1,
+            position: orchard_action_tree_position_by_cmx.iter().find(|(cmp_cmx, pos)| cmp_cmx == cmx).unwrap().1, // Note(Sam): Observed a crash on this unwrap.
             // witness: OrchardWitness::from_tree(orchard_tree.clone()).expect("just appended"),
             // in note:
             // value: match Zatoshis::from_u64(note.value().inner()) {
@@ -3181,6 +3181,21 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
 
+            let mut user_balance = 0;
+            let mut user_pending_balance = 0;
+            for txo in &user_wallet.accounts[0].utxos {
+                user_balance += txo.value.into_u64();
+            }
+            for note in &user_wallet.accounts[0].unspent_orchard_notes {
+                let val = note.note.value().inner();
+                if note.recv_h < user_wallet.chain_tip_h.sat_sub(5) {
+                    user_balance += val;
+                } else {
+                    user_balance += val;
+                    user_pending_balance += val;
+                }
+            }
+
             let mut txs = user_wallet.txs.clone();
             txs.reverse(); // TODO: just read in reverse order
             let mut lock = wallet_state.lock().unwrap();
@@ -3189,6 +3204,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             lock.miner_shielded_pending_funds = miner_shielded_pending_funds;
             lock.miner_shielded_spendable_funds = miner_shielded_spendable_funds;
             lock.miner_seen_h = miner_wallet.chain_tip_h.0;
+
+            lock.balance = user_balance as i64;
+            lock.pending_balance = user_pending_balance as i64;
         }
 
 
