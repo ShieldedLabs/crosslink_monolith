@@ -571,7 +571,7 @@ impl WalletState {
 pub fn str_from_ctaz(val: u64) -> String {
     let full = val / 100_000_000;
     let part = val % 100_000_000;
-    let part_str = format!("{part}00");
+    let part_str = format!("{:08}", part);
     let trim_part = part_str.trim_end_matches("0");
     format!("{full}.{}", &part_str[..trim_part.len().max(3)])
 }
@@ -3252,7 +3252,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let maybe_shield_txid = miner_wallet.shield_transparent_zats(network, &mut client, &miner_usk, 1000000000, &orchard_tree).await;
             println!("Try miner shield txid: {:?}", maybe_shield_txid);
 
-            let maybe_send_txid = miner_wallet.send_orchard_to_orchard_zats(network, &mut client, &miner_usk, 10000000, &orchard_tree, user_ua.orchard().unwrap()).await;
+            let maybe_send_txid = miner_wallet.send_orchard_to_orchard_zats(network, &mut client, &miner_usk, 100_000_000, &orchard_tree, user_ua.orchard().unwrap()).await;
             println!("Try miner send txid: {:?}", maybe_send_txid);
 
             // if let (Some(fvk), Some(&dst_addr)) = (
