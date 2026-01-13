@@ -1429,8 +1429,23 @@ impl RosterMember {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct StakingAction_CreateNewDelegationBond {
+    pub amount_zats: u64,
+    pub unique_pubkey: [u8; 32],
+    pub challenge: [u8; 32],
+    pub target_finalizer: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl StakingAction_CreateNewDelegationBond {
+    pub fn to_union(self) -> StakingAction {
+        StakingAction { kind: StakingActionKind::CreateNewDelegationBond, amount_zats: self.amount_zats, arg32_0: self.unique_pubkey, arg32_1: self.challenge, arg32_2: self.target_finalizer, arg64_0: self.signature, ..Default::default() }
+    }
+}
+
 // TODO(code org): should this be under zcash_protocol?
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct StakingAction {
     pub kind: StakingActionKind,
     pub amount_zats: u64,
@@ -1577,6 +1592,7 @@ impl StakingAction {
 
         if kind == StakingActionKind::CreateNewDelegationBond {
             let mut ret = StakingAction::default();
+            ret.kind = kind;
             reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
             reader.read_exact(&mut ret.arg32_1)?; // challenge
             reader.read_exact(&mut ret.arg64_0)?; // signature
@@ -1588,6 +1604,7 @@ impl StakingAction {
         }
         if kind == StakingActionKind::BeginDelegationUnbonding {
             let mut ret = StakingAction::default();
+            ret.kind = kind;
             reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
             reader.read_exact(&mut ret.arg32_1)?; // challenge
             reader.read_exact(&mut ret.arg64_0)?; // signature
@@ -1595,6 +1612,7 @@ impl StakingAction {
         }
         if kind == StakingActionKind::WithdrawDelegationBond {
             let mut ret = StakingAction::default();
+            ret.kind = kind;
             reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
             reader.read_exact(&mut ret.arg32_1)?; // challenge
             reader.read_exact(&mut ret.arg64_0)?; // signature
@@ -1605,6 +1623,7 @@ impl StakingAction {
         }
         if kind == StakingActionKind::RetargetDelegationBond {
             let mut ret = StakingAction::default();
+            ret.kind = kind;
             reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
             reader.read_exact(&mut ret.arg32_1)?; // challenge
             reader.read_exact(&mut ret.arg64_0)?; // signature
@@ -1613,6 +1632,7 @@ impl StakingAction {
         }
         if kind == StakingActionKind::RegisterFinalizer {
             let mut ret = StakingAction::default();
+            ret.kind = kind;
             reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
             reader.read_exact(&mut ret.arg32_1)?; // challenge
             reader.read_exact(&mut ret.arg64_0)?; // signature
@@ -1620,6 +1640,7 @@ impl StakingAction {
         }
         if kind == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
             let mut ret = StakingAction::default();
+            ret.kind = kind;
             reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
             reader.read_exact(&mut ret.arg32_1)?; // challenge
             reader.read_exact(&mut ret.arg64_0)?; // signature
@@ -1633,6 +1654,7 @@ impl StakingAction {
         }
         if kind == StakingActionKind::UpdateFinalizerKey {
             let mut ret = StakingAction::default();
+            ret.kind = kind;
             reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
             reader.read_exact(&mut ret.arg32_1)?; // challenge
             reader.read_exact(&mut ret.arg64_0)?; // signature

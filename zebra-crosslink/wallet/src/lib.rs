@@ -35,7 +35,7 @@ use zcash_primitives::transaction::fees::{
 };
 use zcash_primitives::transaction::sighash::{signature_hash, SignableInput};
 use zcash_primitives::transaction::txid::TxIdDigester;
-use zcash_primitives::transaction::{Authorized, Unauthorized, Transaction, TransactionData, TxVersion};
+use zcash_primitives::transaction::{Authorized, StakingAction_CreateNewDelegationBond, Transaction, TransactionData, TxVersion, Unauthorized};
 use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight as LRZBlockHeight, BranchId};
@@ -377,9 +377,10 @@ impl TxParts {
     const SHIELDED_RECV: TxPartFlags = 1 << WalletTxPart::SHIELDED;
     const SHIELDED_SENT: TxPartFlags = 1 << 2;
     const MEMO:          TxPartFlags = 1 << 3;
+    const STAKING_ACTION: TxPartFlags = 1 << 4;
 
     const FULL_TX: TxPartFlags = (
-        Self::TRANSPARENT | Self::SHIELDED_RECV | Self::SHIELDED_SENT | Self::MEMO
+        Self::TRANSPARENT | Self::SHIELDED_RECV | Self::SHIELDED_SENT | Self::MEMO | Self::STAKING_ACTION
     );
 }
 
@@ -402,6 +403,8 @@ pub struct WalletTx {
     pub memo: [u8; 512],
 
     pub is_outside_bc: bool,
+
+    pub staking_action: Option<StakingAction>,
 }
 
 impl WalletTx {
@@ -437,6 +440,7 @@ impl WalletTx {
                 memo: memo_as_bytes,
             is_coinbase: false,
             is_outside_bc: false,
+            staking_action: None,
     }
 }
 
@@ -458,6 +462,12 @@ impl WalletTx {
     // send/recv/self-send/coinbase
     // TODO: staking
     pub fn kind(&self) -> WalletTxKind {
+        if let Some(staking_action) = &self.staking_action {
+            if staking_action.kind == StakingActionKind::CreateNewDelegationBond {
+                return WalletTxKind::Stake;
+            }
+            return WalletTxKind::Unstake;
+        }
         let all = self.totals();
         // if *all* of the sent zats go to ourself we assume this was the purpose
         // otherwise we assume the self-sent zats are change
@@ -711,6 +721,9 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, i
                 if (new_tx.part_flags & TxParts::MEMO) == 0 {
                     new_tx.memo_count = old_tx.memo_count;
                     new_tx.memo       = old_tx.memo;
+                }
+                if (new_tx.part_flags & TxParts::STAKING_ACTION) == 0 {
+                    new_tx.staking_action = old_tx.staking_action;
                 }
 
                 // // if "shielding", we only see the incoming part in the compact blocks
@@ -1139,6 +1152,7 @@ impl ManualWallet {
                 memo,
                 is_coinbase: false,
                 is_outside_bc: false,
+                staking_action: None,
             };
             let mut insert_i = 0;
             update_insert_i(&self.txs, &mut insert_i, new_tx.mined_h);
@@ -1303,6 +1317,7 @@ impl ManualWallet {
                 memo,
                 is_coinbase: false,
                 is_outside_bc: false,
+                staking_action: None,
             };
             let mut insert_i = 0;
             update_insert_i(&self.txs, &mut insert_i, new_tx.mined_h);
@@ -1356,7 +1371,7 @@ impl ManualWallet {
         let t_pubkey = t_pubkey.expect("checked above");
         // "greedy strategy"
 
-        let mut rolling_fee_estimate: u64 = 5000 * (2 + s_spend_c as u64);
+        let mut rolling_fee_estimate: u64 = 5000 * (s_spend_c as u64).max(2);
         rolling_fee_estimate = rolling_fee_estimate.max(10_000);
 
         let mut shuffled_notes = account.unspent_orchard_notes.clone();
@@ -1384,7 +1399,7 @@ impl ManualWallet {
             s_spend_c += 1;
             println!("  added orchard spend: {}", note.note.value().inner());
 
-            rolling_fee_estimate = 5000 * (2 + s_spend_c as u64 + 1) & 0u64.wrapping_sub(2);
+            rolling_fee_estimate = 5000 * (s_spend_c as u64).max(2);
             rolling_fee_estimate = rolling_fee_estimate.max(10_000);
             if s_spend_z >= exact_amount_to_send + rolling_fee_estimate {
                 break;
@@ -1417,6 +1432,200 @@ impl ManualWallet {
 
         let (my_t_addr, my_ua) = addrs_from_account(&account, 0).unwrap();
 
+        // Note(Sam): Omg wow this is actually kind of gnarly. We get two grace outputs always.
+        s_recv_z = s_send_z - exact_amount_to_send;
+        s_recv_c = 1;
+        if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(account.ufvk.orchard().cloned().map(|fvk| fvk.to_ovk(orchard::keys::Scope::External)), my_ua.orchard().unwrap().clone(), s_recv_z, MemoBytes::from_bytes(&EMPTY_MEMO_BYTES).unwrap()) {
+            println!("tx build error: {err:?}");
+            return None;
+        }
+        println!("  added orchard change: {}", s_send_z - exact_amount_to_send);
+
+        //- TOTALS GATHERED; CHECK VALUES
+        let mut parts = [
+            WalletTxPart { // Transparent
+                spent_note_count: t_spend_c,
+                sent_note_count:  t_send_c,
+                recv_note_count:  t_recv_c,
+                spent_zats:       to_zats_or_dump_err("tx build", t_spend_z)?,
+                sent_zats:        to_zats_or_dump_err("tx build", t_send_z)?,
+                recv_zats:        to_zats_or_dump_err("tx build", t_recv_z)?,
+            },
+            WalletTxPart { // Shielded
+                spent_note_count: s_spend_c,
+                sent_note_count:  s_send_c,
+                recv_note_count:  s_recv_c,
+                spent_zats:       to_zats_or_dump_err("tx build", s_spend_z)?,
+                sent_zats:        to_zats_or_dump_err("tx build", s_send_z)?,
+                recv_zats:        to_zats_or_dump_err("tx build", s_recv_z)?,
+            },
+        ];
+
+        let Some(_totals) = parts[0].checked_add(&parts[1]) else {
+            println!("tx build error: total values are too large to be represented by Zatoshis");
+            return None;
+        };
+
+        //-- VERY EXPENSIVE TX CREATION (PARTICULARLY IF SHIELDED OUTPUT)
+        use rand_chacha::ChaCha20Rng;
+        let prover = LocalTxProver::bundled();
+        let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+        let tx_res = match txb.build(
+            &signing_set,
+            &[],
+            &[src_usk.orchard().into()],
+            rng,
+            &prover,
+            &prover,
+            &zip317::FeeRule::standard(),
+        ) {
+            Ok(tx_res) => tx_res,
+            Err(err) => {
+                println!("tx build error: {err:?}");
+                return None;
+            }
+        };
+
+        let tx = tx_res.transaction();
+        let mut tx_bytes = vec![];
+        tx.write(&mut tx_bytes).unwrap();
+
+        //-- EXPENSIVE NETWORK SEND
+        // TODO: don't block, maybe return a future?
+        let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
+        println!("******* res for {:?}: {:?}", tx.txid(), res);
+
+        //-- COMPLETION
+        if res.is_ok() {
+            // TODO: complete
+            let new_tx = WalletTx{
+                account_id: 0,
+                txid: tx.txid(),
+                expiry_h: None,
+                mined_h: BlockHeight::INTERNAL,
+                part_flags: TxParts::FULL_TX,
+                parts,
+                memo_count,
+                memo,
+                is_coinbase: false,
+                is_outside_bc: false,
+                staking_action: None,
+            };
+            let mut insert_i = 0;
+            update_insert_i(&self.txs, &mut insert_i, new_tx.mined_h);
+            update_with_tx(self, tx.txid(), new_tx, &mut insert_i);
+            Some(tx.txid())
+        } else {
+            None
+        }
+    }
+
+
+    pub async fn stake_orchard_to_finalizer<P: Parameters>(
+        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
+        src_usk: &UnifiedSpendingKey, exact_amount_to_send: u64, orchard_tree: &OrchardShardTree, target_finalizer: &[u8; 32],
+    ) -> Option<TxId>
+    {
+        let tz = Timer::scope("stake_orchard_to_finalizer");
+        let block_h = self.chain_tip_h.0 + 1;
+
+        let account = &self.accounts[0];
+        let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
+
+        let orchard_anchor_h = self.chain_tip_h.sat_sub(5);
+        let orchard_anchor = match orchard_tree.root_at_checkpoint_id(&orchard_anchor_h).expect("Infallible MemoryShardStore") {
+            Some(root) => orchard::Anchor::from(root),
+            None => {
+                println!("tx build: couldn't get anchor at {orchard_anchor_h:?}");
+                return None;
+            }
+        };
+
+        //- KEYS/SIGNING
+        let mut signing_set = TransparentSigningSet::new();
+        let mut t_pubkey = None;
+        let Some((pubkey, privkey)) = transparent_keys_from_usk(&src_usk, 0) else {
+            println!("tried to send from transparent source without available transparent keys");
+            return None;
+        };
+        signing_set.add_key(privkey);
+        t_pubkey = Some(pubkey);
+
+        let mut txb = TxBuilder::new(
+            network,
+            LRZBlockHeight::from_u32(block_h),
+            BuildConfig::Standard { sapling_anchor: None, orchard_anchor: Some(orchard_anchor), },
+        );
+
+        //- SPENDS
+        let (mut t_spend_z, mut s_spend_z) = (0, 0);
+        let (mut t_spend_c, mut s_spend_c) = (0, 0usize);
+        let t_pubkey = t_pubkey.expect("checked above");
+        // "greedy strategy"
+
+        let mut rolling_fee_estimate: u64 = 5000 * (s_spend_c as u64).max(2);
+        rolling_fee_estimate = rolling_fee_estimate.max(10_000);
+
+        let mut shuffled_notes = account.unspent_orchard_notes.clone();
+        shuffled_notes.shuffle(&mut OsRng);
+        for note in &shuffled_notes {
+            if note.recv_h > orchard_anchor_h { continue; }
+            let witness = match orchard_tree.witness_at_checkpoint_id(note.position, &orchard_anchor_h) {
+                // NOTE: presumably can fail from too-recent note
+                Ok(Some(witness)) => witness,
+                Ok(None) => {
+                    println!("tx build: no orchard checkpoint exists at {orchard_anchor_h:?}");
+                    return None;
+                }
+                Err(err) => {
+                    println!("tx build: orchard witness error: {err:?}");
+                    return None;
+                }
+            };
+            let merkle_path = orchard::tree::MerklePath::from(witness);
+            if let Err(err) = txb.add_orchard_spend::<zip317::FeeError>(keys.orchard_fvk.clone().unwrap(), note.note, merkle_path) {
+                println!("tx build: orchard note spend failed: {err:?}");
+                continue;
+            }
+            s_spend_z += note.note.value().inner();
+            s_spend_c += 1;
+            println!("  added orchard spend: {}", note.note.value().inner());
+
+            rolling_fee_estimate = 5000 * (s_spend_c as u64).max(2);
+            rolling_fee_estimate = rolling_fee_estimate.max(10_000);
+            if s_spend_z >= exact_amount_to_send + rolling_fee_estimate {
+                break;
+            }
+        }
+
+        if s_spend_z < exact_amount_to_send + rolling_fee_estimate {
+            println!("tx build error: not enough unspent orchard notes, got {} zats needed {}", s_spend_z, exact_amount_to_send + rolling_fee_estimate);
+            return None;
+        }
+
+        //- OUTPUTS/SENDS
+        let mut memo_count = 0;
+        let mut memo = EMPTY_MEMO_BYTES;
+        let (mut t_send_z, mut t_recv_z, mut s_send_z, mut s_recv_z) = (0, 0, 0, 0);
+        let (mut t_send_c, mut t_recv_c, mut s_send_c, mut s_recv_c) = (0, 0, 0, 0);
+
+        s_send_z = s_spend_z - rolling_fee_estimate;
+        s_send_c = 2;
+
+
+        use rand::RngCore;
+        let mut pretend_pub_key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut pretend_pub_key);
+
+        if let Err(err) = txb.put_staking_action(StakingAction_CreateNewDelegationBond { amount_zats: exact_amount_to_send, unique_pubkey: pretend_pub_key, challenge: [0u8; 32], target_finalizer: *target_finalizer, signature: [0u8; 64] }.to_union()) {
+            println!("tx build error: {err:?}");
+            return None;
+        }
+        println!("  TODO added stake output: {}", exact_amount_to_send);
+
+        let (my_t_addr, my_ua) = addrs_from_account(&account, 0).unwrap();
+
+        // Change is free.
         s_recv_z = s_send_z - exact_amount_to_send;
         s_recv_c = 1;
         if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(account.ufvk.orchard().cloned().map(|fvk| fvk.to_ovk(orchard::keys::Scope::External)), my_ua.orchard().unwrap().clone(), s_recv_z, MemoBytes::from_bytes(&EMPTY_MEMO_BYTES).unwrap()) {
@@ -1493,6 +1702,7 @@ impl ManualWallet {
                 memo,
                 is_coinbase: false,
                 is_outside_bc: false,
+                staking_action: None,
             };
             let mut insert_i = 0;
             update_insert_i(&self.txs, &mut insert_i, new_tx.mined_h);
@@ -1502,6 +1712,7 @@ impl ManualWallet {
             None
         }
     }
+
 
     pub fn audit_txs(&self) {
         for tx in &self.txs {
@@ -2019,6 +2230,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
         memo,
         is_coinbase,
         is_outside_bc,
+        staking_action: tx.staking_action(),
     };
 
     update_with_tx(wallet, new_tx.txid, new_tx, insert_i);
@@ -2129,6 +2341,7 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
             memo: EMPTY_MEMO_BYTES,
             is_coinbase: false,
             is_outside_bc: false,
+            staking_action: None,
         };
 
         update_with_tx(wallet, txid, new_tx, insert_i);
@@ -2821,8 +3034,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
 
                     if !tx.is_outside_bc &&
-                        // tx.part_flags != TxParts::FULL_TX &&
-                        (tx.part_flags & TxParts::MEMO) == 0 &&
+                        tx.part_flags != TxParts::FULL_TX &&
+                        // (tx.part_flags & TxParts::MEMO) == 0 &&
                             in_flight_tx_requests.get(&tx.txid).is_none()
                     {
                         in_flight_tx_requests.insert(tx.txid);
@@ -3896,49 +4109,20 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
                     }
 
-                    WalletAction::StakeToFinalizer(amount, target_finalizer) => { true
-                        // let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
-                        //     println!("Failed to get wallet summary");
-                        //     break 'process_action false;
-                        // };
-
-                        // let mut spendable = 0;
-                        // let balances = wallet_summary.account_balances();
-                        // for (_, b) in balances {
-                        //     spendable += b.spendable_value().into_u64();
-                        // }
-
-                        // // @todo(judah): better check?
-                        // let amount_with_fee = (*amount - MINIMUM_FEE).unwrap();
-                        // if spendable < amount.into_u64() {
-                        //     println!("Not enough spendable zats to stake, will try again later...");
-                        //     break 'process_action false;
-                        // }
-
-                        // println!("********** STAKING ZEC {:?} ({:?}) TO THE MINER but also to {:?}", amount, amount_with_fee, target_finalizer);
-                        // let opts = TxOptions {
-                        //     staking_action: Some(StakingAction {
-                        //         kind: StakingActionKind::Add,
-                        //         val: amount_with_fee.into_u64(),
-                        //         target: *target_finalizer,
-                        //         source: [0_u8; 32],
-                        //         insecure_target_name: "".to_owned(),
-                        //         insecure_source_name: "".to_owned(),
-                        //     }),
-                        //     memo: Some(zcash_protocol::memo::MemoBytes::from_bytes(user_ua.encode(network).to_string().as_bytes()).unwrap()),
-                        // };
-
-                        // match send_zats_to_wallet(&mut client, miner_wallet, user_wallet, &user_usk, amount_with_fee, network, &opts).await {
-                        //     None => {
-                        //         println!("Failed to send ZEC to miner");
-                        //         wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
-                        //         false
-                        //     }
-                        //     Some(_) => {
-                        //         wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
-                        //         true
-                        //     }
-                        // }
+                    WalletAction::StakeToFinalizer(amount, target_finalizer) => {
+                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+                        let maybe_send_txid = user_wallet.stake_orchard_to_finalizer(network, &mut client, &user_usk, amount.into_u64(), &orchard_tree, target_finalizer).await;
+                        println!("Try miner send txid: {:?}", maybe_send_txid);
+                        match maybe_send_txid {
+                            None => {
+                                wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
+                                false
+                            }
+                            Some(_) => {
+                                wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
+                                true
+                            },
+                        }
                     }
 
                     WalletAction::SendToAddress(address, amount) => { true
