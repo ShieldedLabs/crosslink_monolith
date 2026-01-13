@@ -556,7 +556,6 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
     /// Adds a transparent address to send funds to.
     pub fn put_staking_action(
         &mut self,
-        //to: &TransparentAddress,
         staking_action: StakingAction,
     ) -> Result<(), transparent::builder::Error> {
         self.staking_action = Some(staking_action);
