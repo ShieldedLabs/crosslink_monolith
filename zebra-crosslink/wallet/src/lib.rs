@@ -1558,23 +1558,65 @@ impl PoWCache {
 //              ###################
 
 /// PUSH NOTE/TXS IN HEIGHT ORDER
-fn orchard_recv_h_push(notes: &mut Vec<OrchardNote>, note: OrchardNote) {
-    // ALT: dump non mempool
-    // ALT: linear search backwards
-    let mut insert_i = notes.len(); // common case append
+// ALT: dump non mempool
+// ALT: linear search backwards
+// TODO: this makes notes within a height slightly unstable within a height, could sub-sort by nf,
+// then we can binary search exactly
+fn orchard_recv_h_insert(notes: &mut Vec<OrchardNote>, note: OrchardNote) {
+    let mut i = notes.len(); // common case append
     if let Some(last) = notes.last() {
         if last.recv_h > note.recv_h {
-            insert_i = notes.partition_point(|n| n.recv_h <= note.recv_h);
+            i = notes.partition_point(|n| n.recv_h <= note.recv_h);
         }
     }
-
-    notes.insert(insert_i, note);
+    debug_assert!(i == 0 || notes[i-1].recv_h <= note.recv_h, "{} <= {}", notes[i-1].recv_h, note.recv_h);
+    notes.insert(i, note);
+}
+fn orchard_spent_h_insert(notes: &mut Vec<OrchardNote>, note: OrchardNote) {
+    let mut i = notes.len(); // common case append
+    if let Some(last) = notes.last() {
+        if last.spent_h > note.spent_h {
+            i = notes.partition_point(|n| n.spent_h <= note.spent_h);
+        }
+    }
+    debug_assert!(i == 0 || notes[i-1].spent_h <= note.spent_h, "{} <= {}", notes[i-1].spent_h, note.spent_h);
+    notes.insert(i, note);
+}
+fn txo_recv_h_insert(notes: &mut Vec<Txo>, note: Txo) {
+    let mut i = notes.len(); // common case append
+    if let Some(last) = notes.last() {
+        if last.recv_h > note.recv_h {
+            i = notes.partition_point(|n| n.recv_h <= note.recv_h);
+        }
+    }
+    debug_assert!(i == 0 || notes[i-1].recv_h <= note.recv_h, "{} <= {}", notes[i-1].recv_h, note.recv_h);
+    notes.insert(i, note);
+}
+fn txo_spent_h_insert(notes: &mut Vec<Txo>, note: Txo) {
+    let mut i = notes.len(); // common case append
+    if let Some(last) = notes.last() {
+        if last.spent_h > note.spent_h {
+            i = notes.partition_point(|n| n.spent_h <= note.spent_h);
+        }
+    }
+    debug_assert!(i == 0 || notes[i-1].spent_h <= note.spent_h, "{} <= {}", notes[i-1].spent_h, note.spent_h);
+    notes.insert(i, note);
 }
 
 /// GET NOTE/TX INDEXES WITH KNOWN HEIGHTS IN SORTED SLICES
 fn orchard_recv_h_position(notes: &[OrchardNote], block_h: BlockHeight, nf: &orchard::note::Nullifier) -> Option<usize> {
     let mut i = notes.partition_point(|txo| txo.recv_h < block_h);
     while i < notes.len() && notes[i].recv_h == block_h {
+        if &notes[i].nf == nf {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+fn orchard_spent_h_position(notes: &[OrchardNote], block_h: BlockHeight, nf: &orchard::note::Nullifier) -> Option<usize> {
+    let mut i = notes.partition_point(|txo| txo.spent_h < block_h);
+    while i < notes.len() && notes[i].spent_h == block_h {
         if &notes[i].nf == nf {
             return Some(i);
         }
@@ -1699,7 +1741,7 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
             let spent_note = account.unspent_orchard_notes.remove(note_i);
             s_spend_c = 1;
             s_spend_z = spent_note.note.value().inner();
-            account.spent_orchard_notes.push(OrchardNote { spent_h: block_h, ..spent_note });
+            orchard_spent_h_insert(&mut account.spent_orchard_notes, OrchardNote { spent_h: block_h, ..spent_note });
             break;
         }
     }
@@ -1759,16 +1801,15 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
             account.recv_orchard_notes[i].monotonically_update(orchard_note);
             true
         } else {
-            orchard_recv_h_push(&mut account.recv_orchard_notes, orchard_note.clone());
+            orchard_recv_h_insert(&mut account.recv_orchard_notes, orchard_note.clone());
             false
         };
 
         if let Some(i) = orchard_recv_h_position(&account.unspent_orchard_notes, txid_h, &orchard_note.nf) {
             account.unspent_orchard_notes[i].monotonically_update(orchard_note);
         } else if !have_seen {
-            orchard_recv_h_push(&mut account.unspent_orchard_notes, orchard_note);
+            orchard_recv_h_insert(&mut account.unspent_orchard_notes, orchard_note);
         }
-        // NOTE: don't update spent notes because we can't spend notes without a position
     }
 
     match (Zatoshis::from_u64(s_spend_z), Zatoshis::from_u64(s_send_z), Zatoshis::from_u64(s_recv_z)) {
@@ -3115,11 +3156,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     let stxos_at_h_start = account.stxos.partition_point(|txo| txo.spent_h < block_h);
                     for stxo in &account.stxos[stxos_at_h_start..] {
                         if stxo.recv_h < block_h {
-                            // reinsert at the end of that height // TODO: this makes notes within a height slightly unstable within a height
-                            let i = account.utxos.partition_point(|txo| txo.recv_h <= stxo.recv_h);
-                            // let i = txo_recv_h_position(&account.utxos, BlockHeight(stxo.recv_h.0+1), &stxo.id).unwrap_or(account.utxos.len());
-                            debug_assert!(i == 0 || account.utxos[i-1].recv_h <= stxo.recv_h, "{} <= {}", account.utxos[i-1].recv_h, stxo.recv_h);
-                            account.utxos.insert(i, Txo{ spent_h: BlockHeight(0), ..stxo.clone() });
+                            txo_recv_h_insert(&mut account.utxos, Txo{ spent_h: BlockHeight(0), ..stxo.clone() });
                         }
                     }
                     account.stxos.truncate(stxos_at_h_start);
@@ -3127,11 +3164,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     let spent_orchard_notes_at_h_start = account.spent_orchard_notes.partition_point(|note| note.spent_h < block_h);
                     for spent_orchard_note in &account.spent_orchard_notes[spent_orchard_notes_at_h_start..] {
                         if spent_orchard_note.recv_h < block_h {
-                            // reinsert at the end of that height
-                            let i = account.unspent_orchard_notes.partition_point(|txo| txo.recv_h <= spent_orchard_note.recv_h);
-                            // let i = orchard_recv_h_position(&account.unspent_orchard_notes, BlockHeight(spent_orchard_note.recv_h.0+1), &spent_orchard_note.nf).unwrap_or(account.unspent_orchard_notes.len());
-                            debug_assert!(i == 0 || account.unspent_orchard_notes[i-1].recv_h <= spent_orchard_note.recv_h, "{} <= {}", account.unspent_orchard_notes[i-1].recv_h, spent_orchard_note.recv_h);
-                            account.unspent_orchard_notes.insert(i, OrchardNote{ spent_h: BlockHeight(0), ..spent_orchard_note.clone() });
+                            orchard_recv_h_insert(&mut account.unspent_orchard_notes, OrchardNote{ spent_h: BlockHeight(0), ..spent_orchard_note.clone() });
                         }
                     }
                     account.spent_orchard_notes.truncate(spent_orchard_notes_at_h_start);
