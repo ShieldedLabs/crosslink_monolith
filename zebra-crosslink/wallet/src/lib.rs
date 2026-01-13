@@ -649,11 +649,14 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, i
     // find if there's an existing height/transaction for this txid
     if let Some(tx_h) = wallet.tx_h_map.get_mut(&txid) {
         if let Some(tx_i) = tx_mined_h_position(&wallet.txs, *tx_h, &txid) {
-            if tx_i < *insert_i {
-                *insert_i -= 1;
-            }
-            let old_tx = wallet.txs.remove(tx_i);
-            if old_tx != new_tx {
+            let old_tx = &wallet.txs[tx_i];
+            if old_tx != &new_tx {
+                if new_tx.mined_h == BlockHeight::MEMPOOL && old_tx.mined_h.is_in_block() && !old_tx.is_outside_bc {
+                    // NOTE: mempool fetch is not synced to chain reading
+                    println!("mempool tx already in best chain; skipping");
+                    return;
+                }
+
                 println!("{} wallet updated existing transaction {txid} {:?} => {:?}", wallet.name, old_tx.mined_h, new_tx.mined_h);
                 // println!("{} wallet updated existing transaction {txid} {old_tx:?} => {new_tx:?}", wallet.name);
 
@@ -687,6 +690,11 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, i
 
                 new_tx.part_flags |= old_tx.part_flags;
             }
+
+            if tx_i < *insert_i {
+                *insert_i -= 1;
+            }
+            wallet.txs.remove(tx_i);
         } else {
             println!("ERROR: {txid:?} not found at associated height {tx_h:?}");
         }
@@ -1275,6 +1283,7 @@ fn bc_h_from_raw_tx_h(height: u64) -> Option<Option<BlockHeight>> {
 }
 
 // TODO: handle memo here instead of caller?
+// TODO: replace orchard_action_tree_position_by_cmx with position
 fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, orchard_action_tree_position_by_cmx: &Vec<(orchard::note::ExtractedNoteCommitment, incrementalmerkletree::Position)>, block_h: BlockHeight, txid: &TxId, nf: &orchard::note::Nullifier, cmx: &orchard::note::ExtractedNoteCommitment, recv_note_addr: Option<(orchard::note::Note, orchard::Address)>, send_note_addr_memo: Option<(orchard::note::Note, orchard::Address, [u8; 512])>, bool_do_not_mutate_orchard_notes: bool) -> Option<WalletTxPart> {
     let account = &mut wallet.accounts[account_i];
 
@@ -1311,25 +1320,6 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
 
     //- PUSH NEW RECEIVED/UNSPENT NOTES
     if let Some((note, _recipient)) = recv_note_addr {
-        let orchard_note = OrchardNote{
-            recv_h: block_h,
-            spent_h: BlockHeight(0),
-            txid: *txid,
-            note,
-            position: orchard_action_tree_position_by_cmx.iter().find(|(cmp_cmx, pos)| cmp_cmx == cmx).unwrap().1,
-            // witness: OrchardWitness::from_tree(orchard_tree.clone()).expect("just appended"),
-            // in note:
-            // value: match Zatoshis::from_u64(note.value().inner()) {
-            //     Ok(v) => v,
-            //     Err(err) => {
-            //         println!("couldn't convert {:?} to Zatoshis: {err:?}", note.value());
-            //         continue 'tx_iter;
-            //     }
-            // },
-            nf: note.nullifier(keys.orchard_fvk.as_ref().expect("implied by ivk presence")), // TODO: cache or recompute?
-        };
-        // println!("got new note at {:?}, tree pos={:02} {:?}", block_h, u64::from(orchard_note.witness.witnessed_position()), orchard_note.witness.root());
-
         s_recv_c += 1;
         s_recv_z += note.value().inner();
         // if s_spend_c > 0 && s_send_c  {
@@ -1338,29 +1328,50 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
         // }
         // NOTE: s_send_c/s_send_z equivalent handled inside update_with_tx
 
-        let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(txid) {
-            txid_h
-        } else {
-            block_h
-        };
+        if block_h < BlockHeight::MEMPOOL {
+            let orchard_note = OrchardNote{
+                recv_h: block_h,
+                spent_h: BlockHeight(0),
+                txid: *txid,
+                note,
+                position: orchard_action_tree_position_by_cmx.iter().find(|(cmp_cmx, pos)| cmp_cmx == cmx).unwrap().1,
+                // witness: OrchardWitness::from_tree(orchard_tree.clone()).expect("just appended"),
+                // in note:
+                // value: match Zatoshis::from_u64(note.value().inner()) {
+                //     Ok(v) => v,
+                //     Err(err) => {
+                //         println!("couldn't convert {:?} to Zatoshis: {err:?}", note.value());
+                //         continue 'tx_iter;
+                //     }
+                // },
+                nf: note.nullifier(keys.orchard_fvk.as_ref().expect("implied by ivk presence")), // TODO: cache or recompute?
+            };
+            // println!("got new note at {:?}, tree pos={:02} {:?}", block_h, u64::from(orchard_note.witness.witnessed_position()), orchard_note.witness.root());
 
-        if bool_do_not_mutate_orchard_notes == false {
-            if let Some(i) = orchard_recv_h_position(&account.unspent_orchard_notes, txid_h, &orchard_note.nf) {
-                // TODO: witness doesn't have PartialEq
-                // if account.unspent_orchard_notes[i] != orchard_note {
-                //     println!("ERROR: orchard_note mismatch: {:?} vs {:?}", account.unspent_orchard_notes[i], &orchard_note);
-                // }
-            } else if orchard_recv_h_position(&account.recv_orchard_notes, txid_h, &orchard_note.nf).is_none() {
-                // TODO: can we just check if we've seen the tx && tx.2 == false
-                if let Some(last_txo) = account.recv_orchard_notes.last() {
-                    debug_assert!(last_txo.recv_h <= orchard_note.recv_h, "{} <= {}", last_txo.recv_h, orchard_note.recv_h);
-                }
-                account.recv_orchard_notes.push(orchard_note.clone());
+            let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(txid) {
+                txid_h
+            } else {
+                block_h
+            };
 
-                if let Some(last_unspent_orchard_note) = account.unspent_orchard_notes.last() {
-                    debug_assert!(last_unspent_orchard_note.recv_h <= orchard_note.recv_h, "{} <= {}", last_unspent_orchard_note.recv_h, orchard_note.recv_h);
+            if bool_do_not_mutate_orchard_notes == false {
+                if let Some(i) = orchard_recv_h_position(&account.unspent_orchard_notes, txid_h, &orchard_note.nf) {
+                    // TODO: witness doesn't have PartialEq
+                    // if account.unspent_orchard_notes[i] != orchard_note {
+                    //     println!("ERROR: orchard_note mismatch: {:?} vs {:?}", account.unspent_orchard_notes[i], &orchard_note);
+                    // }
+                } else if orchard_recv_h_position(&account.recv_orchard_notes, txid_h, &orchard_note.nf).is_none() {
+                    // TODO: can we just check if we've seen the tx && tx.2 == false
+                    if let Some(last_txo) = account.recv_orchard_notes.last() {
+                        debug_assert!(last_txo.recv_h <= orchard_note.recv_h, "{} <= {}", last_txo.recv_h, orchard_note.recv_h);
+                    }
+                    account.recv_orchard_notes.push(orchard_note.clone());
+
+                    if let Some(last_unspent_orchard_note) = account.unspent_orchard_notes.last() {
+                        debug_assert!(last_unspent_orchard_note.recv_h <= orchard_note.recv_h, "{} <= {}", last_unspent_orchard_note.recv_h, orchard_note.recv_h);
+                    }
+                    account.unspent_orchard_notes.push(orchard_note);
                 }
-                account.unspent_orchard_notes.push(orchard_note);
             }
         }
     }
@@ -2124,13 +2135,49 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     // TODO: randomly sync from a list of multiple lightwalletd servers to reduce info leakage/blind trust.
     //       difficulty: handling discrepancies between them
 
+    let mut mempool_client = client.clone();
+    // NOTE: having a channel/queue that we push into async lets us do reasonable sync event reading
+    let (mempool_send, mut mempool_recv) = tokio::sync::mpsc::channel::<RawTransaction>(512);
+    tokio::spawn(async move {
+        'mempool_reconnect: loop {
+            match mempool_client.get_mempool_stream(Empty {}).await {
+                Ok(s) => {
+                    let mut strm = s.into_inner();
+                    loop {
+                        match strm.message().await {
+                            Ok(Some(tx)) => {
+                                println!("MEMPOOL: got new message");
+                                if let Err(err) = mempool_send.send(tx).await {
+                                    println!("MEMPOOL ERROR: can't send message to channel: {err:?}");
+                                    break;
+                                }
+                            }
+                            Ok(None) => {
+                                println!("MEMPOOL: no more messages (will reconnect shortly)");
+                                break;
+                            }
+                            Err(err) => {
+                                println!("MEMPOOL: failed to get message tx: {err:?} (will reconnect shortly)");
+                                break; // we can still update with the blocks we got, we don't need to fully reset
+                            }
+                        }
+                    }
+                }
+
+                Err(err) => {
+                    println!("MEMPOOL stream connection error: {err:?}");
+                }
+            }
+        }
+    });
+
+
     let mut resync_c = 0;
     'outer_sync: loop {
         if resync_c > 0 {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
         resync_c += 1;
-
 
         // NOTE: this is desynced from local_tip because we need to speculatively request blocks
         // further back than the chain divergence on reorg to find out where it occurred
@@ -2283,7 +2330,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     println!("Failed to get lightd info: {err:?}");
                     continue 'outer_sync; // TODO: don't continue if it's not actually critical
                 }
-            };
+            }
 
 
             // PREV CHAIN STATE
@@ -2584,6 +2631,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             break (new_blocks, new_t_txs, sync_from_i, req_rng, prev_tip_chain_state);
         };
 
+        let network_tip_h = user_wallets[user_use_i].chain_tip_h;
+
         // let mut orchard_frontier = prev_tip_chain_state.final_orchard_tree().clone();
         // let mut orchard_tree = incrementalmerkletree::frontier::CommitmentTree::from_frontier(&orchard_frontier);
         // println!("orchard root at {:?} tree: size={} {:?}", prev_tip_chain_state.block_height(), shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
@@ -2597,7 +2646,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let last_block_h = block_h.sat_sub(1);
 
             orchard_tree.truncate_to_checkpoint(&last_block_h); // N.B. checkpoints are at the *end* of their block
-            
+
             for (new_block_i, block) in new_blocks.iter().enumerate() {
                 let append_iter = block.vtx.iter().flat_map(
                     |tx| tx.actions.iter().filter_map(
@@ -2715,7 +2764,36 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 read_full_tx(miner_wallet, 0, &keys, &orchard_action_tree_position_by_cmx, block_h, tx, &mut insert_i, false);
             }
         }
-        
+
+        //-- READ DOWNLOADED MEMPOOL TXS
+        {
+            // TODO: maybe wait until we're ~block-synced before doing this
+            // NOTE: assumes we can keep up... maybe dropping with some feedback about that is better?
+            let wallets = [&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]];
+            let keys = [
+                PreparedKeys::from_ufvk_all(&wallets[0].accounts[0].ufvk),
+                PreparedKeys::from_ufvk_all(&wallets[1].accounts[0].ufvk),
+            ];
+            let insert_idxs = [&mut 0, &mut 0];
+
+            while let Ok(raw_tx) = mempool_recv.try_recv() {
+                // NOTE: expected LRZ height different from abstract mempool height
+                match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, LRZBlockHeight::from_u32(network_tip_h.0 + 1))) {
+                    Err(err) => {
+                        println!("invalid mempool tx: {err:?}");
+                        // NOTE: as mempool txs are not sequenced, it seems reasonable to just ignore
+                        // invalid ones without skipping the rest
+                    }
+                    Ok(tx) => {
+                        for i in 0..2 {
+                            read_full_tx(wallets[i], 0, &keys[i], &orchard_action_tree_position_by_cmx, BlockHeight::MEMPOOL, &tx, insert_idxs[i], false);
+                        }
+                    }
+                }
+            }
+        }
+
+
         //-- ADD/REVALIDATE SHIELDED TXS FROM NEW BLOCKS
         if let Some(start_block_i) = sync_from_i {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
@@ -2782,7 +2860,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     // NOTE: there's a potential inconsistency here around branch id changes if we
                     // see it both before and after the change
-                    let lrz_h = LRZBlockHeight::from_u32(if found_h.is_in_block() { found_h.0 } else { wallets[wallet_i].chain_tip_h.0 });
+                    let lrz_h = LRZBlockHeight::from_u32(if found_h.is_in_block() { found_h.0 } else { network_tip_h.0 });
                     let tx = match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, lrz_h)) {
                         Ok(tx) => tx,
                         Err(err) => {
