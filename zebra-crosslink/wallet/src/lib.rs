@@ -13,6 +13,7 @@ use std::convert::{identity, Infallible};
 use std::future::Future;
 use std::mem;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio_rustls::rustls;
 use tonic::client::GrpcService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
@@ -82,7 +83,7 @@ use zcash_client_backend::{
         compact_formats::{CompactBlock, CompactTx, CompactSaplingSpend, CompactSaplingOutput, CompactOrchardAction},
         service::{
             compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
-            Duration, Empty, GetAddressUtxosArg, LightdInfo, TransparentAddressBlockFilter,
+            Empty, GetAddressUtxosArg, LightdInfo, TransparentAddressBlockFilter,
         },
     },
 };
@@ -1165,6 +1166,9 @@ impl ManualWallet {
             if (t_spend_z + s_spend_z) >= min_zats_to_shield {
                 break;
             }
+        }
+        if (t_spend_z + s_spend_z) < min_zats_to_shield {
+            return None;
         }
 
         let fee = (((t_spend_c + 2) * 5000) as u64).max(10_000);
@@ -2476,6 +2480,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     // TODO: randomly sync from a list of multiple lightwalletd servers to reduce info leakage/blind trust.
     //       difficulty: handling discrepancies between them
 
+    let mut faucet_shield_cooldown_instant = Instant::now() - Duration::from_secs(1000);
+
     let mut resync_c = 0;
     'outer_sync: loop {
         if resync_c > 0 {
@@ -3175,7 +3181,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
 
-            let mut txs = miner_wallet.txs.clone();
+            let mut txs = user_wallet.txs.clone();
             txs.reverse(); // TODO: just read in reverse order
             let mut lock = wallet_state.lock().unwrap();
             lock.txs = txs;
@@ -3203,98 +3209,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         //     }
         // }
 
-        // // DEV: miner send tx to self
-        if let Some(start_block_i) = sync_from_i {
+        if faucet_shield_cooldown_instant.elapsed().as_secs() > 5 {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-        //     let utxos = &miner_wallet.accounts[0].utxos;
-        //     let shield_n_notes = 5;//OsRng.gen_range(0..=utxos.len());
-
-        //     if shield_n_notes <= utxos.len() {
-        //         let mut t_spend_z = 0;
-        //         for t_i in 0..shield_n_notes {
-        //             t_spend_z += utxos[t_i].value.into_u64();
-        //         }
-
-        //         // TODO: this is conservative, could do actual sizes...
-        //         let t_input_sizes = vec![fees::transparent::InputSize::STANDARD_P2PKH; shield_n_notes];
-        //         let calc_fee = zip317::FeeRule::standard().fee_required(
-        //             network,
-        //             LRZBlockHeight::from_u32(0), // TODO: this may become relevant at some point...
-        //             t_input_sizes,
-        //             [], // &[zip317::P2PKH_STANDARD_OUTPUT_SIZE],
-        //             0, 0, // sapling in, out
-        //                   // NOTE: basically 0 or 2+ (1 is consensus-legal but doesn't match builder's fee calc)
-        //             orchard::builder::BundleType::DEFAULT.num_actions(0, 1).expect("valid action") // orchard actions
-        //         ).expect("valid fee");
-        //         let mut fee = calc_fee; //zip317::MINIMUM_FEE;//Zatoshis::const_from_u64(50_000); // TODO: calculate
-        //         if let Some(val_after_fees) = Zatoshis::from_u64(t_spend_z).unwrap() - fee {
-        //             let mut dst = TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees};
-
-        //             if let (Some(fvk), Some(&dst_addr)) = (miner_wallet.accounts[0].ufvk.orchard(), miner_ua.orchard()) {
-        //                 dst = TxOutput::Orchard {
-        //                     dst: dst_addr,
-        //                     ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
-        //                     zats: val_after_fees.into_u64(),
-        //                     // memo: MemoBytes::empty(),
-        //                     // NOTE: MemoBytes::empty() != MemoBytes::from_bytes(&[])
-        //                     memo: MemoBytes::from_bytes("shielding notes".as_bytes()).unwrap(),
-        //                 };
-        //             }
-
-        //             println!("shielding {shield_n_notes} transparent notes");
-        //             miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, val_after_fees, fee, &TxOptions {
-        //                 src_pools: &[TxPool::Transparent],
-        //                 ..TxOptions::default()
-        //             }).await;
-        //         }
-        //     }
 
             let maybe_shield_txid = miner_wallet.shield_transparent_zats(network, &mut client, &miner_usk, 1000000000, &orchard_tree).await;
             println!("Try miner shield txid: {:?}", maybe_shield_txid);
-
-            let maybe_send_txid = miner_wallet.send_orchard_to_orchard_zats(network, &mut client, &miner_usk, 100_000_000, &orchard_tree, user_ua.orchard().unwrap()).await;
-            println!("Try miner send txid: {:?}", maybe_send_txid);
-
-            // if let (Some(fvk), Some(&dst_addr)) = (
-            //     miner_wallet.accounts[0].ufvk.orchard(),
-            //     user_ua.orchard(),
-            // ) {
-            //     let mut spend = 100000000; // 1 cTAZ
-
-            //     let calc_fee = zip317::FeeRule::standard().fee_required(
-            //         network,
-            //         LRZBlockHeight::from_u32(0), // TODO: this may become relevant at some point...
-            //         [], [],
-            //         0, 0, // sapling in, out
-            //               // NOTE: basically 0 or 2+ (1 is consensus-legal but doesn't match builder's fee calc)
-            //         orchard::builder::BundleType::DEFAULT.num_actions(2, 1).expect("valid action") // orchard actions
-            //     ).expect("valid fee");
-            //     let mut fee_z = calc_fee;
-            //     let mut fee = fee_z.into_u64();
-            //     if spend >= fee {
-            //         let val_after_fees = spend - fee;
-            //         let dst = TxOutput::Orchard {
-            //             dst: dst_addr,
-            //             ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
-            //             zats: val_after_fees,
-            //             memo: MemoBytes::from_bytes("orchard->orchard send".as_bytes()).unwrap(),
-            //         };
-
-            //         println!("orchard (2) -> orchard (1) self-send");
-            //         // let orchard_tree_root = shard_tree_root(orchard_tree);
-            //         // let orchard_tree_root = miner_note.witness.root();
-            //         // println!("anchor at {}/{}: {orchard_tree_root:?}", u64::from(miner_note.witness.witnessed_position()), u64::from(miner_note.witness.tip_position()));
-            //         let send_res = miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, Zatoshis::from_u64(val_after_fees).unwrap(), fee_z, &TxOptions {
-            //             // src_pools: &[TxPool::Orchard(orchard::Anchor::from(orchard_tree_root))],
-            //             src_pools: &[TxPool::Orchard(&orchard_tree)],
-            //             ..TxOptions::default()
-            //         }).await;
-
-            //         if let Some(txid) = send_res {
-            //             println!("successfully sent orchard tx: {txid}");
-            //         }
-            //     }
-            // }
+            faucet_shield_cooldown_instant = Instant::now();
         }
 
         // let (reorg_required) = 'process_blocks: {
@@ -3806,23 +3726,20 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             let ok: bool = 'process_action: {
                 match &action {
-                    WalletAction::RequestFromFaucet => { true
-                        // // NOTE: we can't send transparent->transparent through the high-level API, we
-                        // // have to propose_shielding first, then send in a later block
-                        // let zats = (Zatoshis::from_nonnegative_i64(500_000_000).unwrap() - MINIMUM_FEE).unwrap();
-                        // match send_zats_to_wallet(&mut client, user_wallet, miner_wallet, &miner_usk, zats, network, &TxOptions{
-                        //     memo: Some(zcash_protocol::memo::MemoBytes::from_bytes("Happy spending, with love from your favourite faucet".as_bytes()).unwrap()),
-                        //     ..TxOptions::default()
-                        // }).await {
-                        //     None => {
-                        //         wallet_state.lock().unwrap().waiting_for_faucet = false;
-                        //         true
-                        //     }
-                        //     Some(_) => {
-                        //         wallet_state.lock().unwrap().waiting_for_faucet = false;
-                        //         true
-                        //     },
-                        // }
+                    WalletAction::RequestFromFaucet => {
+                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+                        let maybe_send_txid = miner_wallet.send_orchard_to_orchard_zats(network, &mut client, &miner_usk, 500_000_000, &orchard_tree, user_ua.orchard().unwrap()).await;
+                        println!("Try miner send txid: {:?}", maybe_send_txid);
+                        match maybe_send_txid {
+                            None => {
+                                wallet_state.lock().unwrap().waiting_for_faucet = false;
+                                true
+                            }
+                            Some(_) => {
+                                wallet_state.lock().unwrap().waiting_for_faucet = false;
+                                true
+                            },
+                        }
                     }
 
                     WalletAction::StakeToFinalizer(amount, target_finalizer) => { true
