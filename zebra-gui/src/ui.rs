@@ -1614,12 +1614,9 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake => {
                                         let send_amount: i64 = tx.account_value_delta().into();
                                         let send_amount: u64 = send_amount.abs() as u64;
-                                        let full = send_amount / 100_000_000;
-                                        let part = send_amount % 100_000_000;
-                                        let part_str = format!("{part}000");
 
                                         let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
-                                        ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, &part_str[..4]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        ui.text(frame_strf!(data, "{}{} cTAZ", prefix, str_from_ctaz(send_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
                                     WalletTxKind::Receive | WalletTxKind::Unstake => {
                                         if true { // total
@@ -1632,11 +1629,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::Shield => {
                                         // TODO: (how) do we want to show the fee?
                                         let shield_amount = totals.recv_zats.into_u64();
-                                        let full = shield_amount / 100_000_000;
-                                        let part = shield_amount % 100_000_000;
-                                        let part_str = format!("{part}000");
 
-                                        ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..4]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(shield_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
                                     _ => {
                                         ui.text("TODO cTAZ", TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
@@ -1977,13 +1971,12 @@ pub fn ui_right_pane(ui: &mut Context,
         }) {
             let title_h = ui.scale(28.0);
             let text_h = ui.scale(22.0);
-            let (un, sh_p, sh_s, fc) = {
+            let (un, sh_p, sh_s) = {
                 let w = wallet_state.lock().unwrap();
                 (
                     w.miner_unshielded_funds,
                     w.miner_shielded_pending_funds,
                     w.miner_shielded_spendable_funds,
-                    w.faucet_funds_available,
                 )
             };
 
@@ -1995,10 +1988,6 @@ pub fn ui_right_pane(ui: &mut Context,
             let left_text  = TextDecl { h: text_h,  align: AlignX::Left,  ..TextDecl  };
             let right_text = TextDecl { font: Mono, align: AlignX::Right, ..left_text };
 
-            if let _ = elem().decl(row) {
-                if let _ = elem().decl(left)  { ui.text("Available:", left_text); }
-                if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(fc)), right_text); }
-            }
             if let _ = elem().decl(row) {
                 if let _ = elem().decl(left)  { ui.text("Unshielded:", left_text); }
                 if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(un)), right_text); }

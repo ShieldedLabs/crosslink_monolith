@@ -13,6 +13,7 @@ use std::convert::{identity, Infallible};
 use std::future::Future;
 use std::mem;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio_rustls::rustls;
 use tonic::client::GrpcService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
@@ -82,7 +83,7 @@ use zcash_client_backend::{
         compact_formats::{CompactBlock, CompactTx, CompactSaplingSpend, CompactSaplingOutput, CompactOrchardAction},
         service::{
             compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
-            Duration, Empty, GetAddressUtxosArg, LightdInfo, TransparentAddressBlockFilter,
+            Empty, GetAddressUtxosArg, LightdInfo, TransparentAddressBlockFilter,
         },
     },
 };
@@ -571,7 +572,7 @@ impl WalletState {
 pub fn str_from_ctaz(val: u64) -> String {
     let full = val / 100_000_000;
     let part = val % 100_000_000;
-    let part_str = format!("{part}00");
+    let part_str = format!("{:08}", part);
     let trim_part = part_str.trim_end_matches("0");
     format!("{full}.{}", &part_str[..trim_part.len().max(3)])
 }
@@ -938,7 +939,7 @@ impl ManualWallet {
 
 
         //- SPENDS
-        let min_spend = t_send_z + s_send_z + fee_zats.into_u64() + 100000; // Sam: 0.001 cTAZ debug fee margin.
+        let min_spend = t_send_z + s_send_z + fee_zats.into_u64();
         let (mut t_spend_z, mut s_spend_z) = (0, 0);
         let (mut t_spend_c, mut s_spend_c) = (0, 0);
         'src_pool: for pool in opts.src_pools {
@@ -1070,6 +1071,360 @@ impl ManualWallet {
             &signing_set,
             sapling_esk,
             orchard_sak,
+            rng,
+            &prover,
+            &prover,
+            &zip317::FeeRule::standard(),
+        ) {
+            Ok(tx_res) => tx_res,
+            Err(err) => {
+                println!("tx build error: {err:?}");
+                return None;
+            }
+        };
+
+        let tx = tx_res.transaction();
+        let mut tx_bytes = vec![];
+        tx.write(&mut tx_bytes).unwrap();
+
+        //-- EXPENSIVE NETWORK SEND
+        // TODO: don't block, maybe return a future?
+        let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
+        println!("******* res for {:?}: {:?}", tx.txid(), res);
+
+        //-- COMPLETION
+        if res.is_ok() {
+            // TODO: complete
+            let new_tx = WalletTx{
+                account_id: 0,
+                txid: tx.txid(),
+                expiry_h: None,
+                mined_h: BlockHeight::INTERNAL,
+                part_flags: TxParts::FULL_TX,
+                parts,
+                memo_count,
+                memo,
+                is_coinbase: false,
+                is_outside_bc: false,
+            };
+            let mut insert_i = 0;
+            update_insert_i(&self.txs, &mut insert_i, new_tx.mined_h);
+            update_with_tx(self, tx.txid(), new_tx, &mut insert_i);
+            Some(tx.txid())
+        } else {
+            None
+        }
+    }
+
+
+    pub async fn shield_transparent_zats<P: Parameters>(
+        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
+        src_usk: &UnifiedSpendingKey, min_zats_to_shield: u64, orchard_tree: &OrchardShardTree,
+    ) -> Option<TxId>
+    {
+        let tz = Timer::scope("shield_transparent_zats");
+        let block_h = self.chain_tip_h.0 + 1;
+
+        let account = &self.accounts[0];
+        let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
+        let (t_addr, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
+        let orchard_addr = ua.orchard().unwrap();
+
+        let orchard_anchor_h = self.chain_tip_h.sat_sub(5);
+        let orchard_anchor = match orchard_tree.root_at_checkpoint_id(&orchard_anchor_h).expect("Infallible MemoryShardStore") {
+            Some(root) => orchard::Anchor::from(root),
+            None => {
+                println!("tx build: couldn't get anchor at {orchard_anchor_h:?}");
+                return None;
+            }
+        };
+
+        //- KEYS/SIGNING
+        let mut signing_set = TransparentSigningSet::new();
+        let mut t_pubkey = None;
+        let Some((pubkey, privkey)) = transparent_keys_from_usk(&src_usk, 0) else {
+            println!("tried to send from transparent source without available transparent keys");
+            return None;
+        };
+        signing_set.add_key(privkey);
+        t_pubkey = Some(pubkey);
+
+        let mut txb = TxBuilder::new(
+            network,
+            LRZBlockHeight::from_u32(block_h),
+            BuildConfig::Standard { sapling_anchor: None, orchard_anchor: Some(orchard_anchor), },
+        );
+
+        //- SPENDS
+        let (mut t_spend_z, mut s_spend_z) = (0, 0);
+        let (mut t_spend_c, mut s_spend_c) = (0, 0);
+        let t_pubkey = t_pubkey.expect("checked above");
+        // "greedy strategy"
+
+        let mut shuffled_notes = account.utxos.clone();
+        shuffled_notes.shuffle(&mut OsRng);
+        for utxo in &shuffled_notes {
+            if let Err(err) = txb.add_transparent_input(t_pubkey, utxo.id.clone(), utxo.txout()) {
+                println!("tx build: transparent/UTXO spend failed: {err:?}");
+                continue;
+            }
+            t_spend_z += utxo.value.into_u64();
+            t_spend_c += 1;
+            println!("  added transparent spend: {}", utxo.value.into_u64());
+            if (t_spend_z + s_spend_z) >= min_zats_to_shield {
+                break;
+            }
+        }
+        if (t_spend_z + s_spend_z) < min_zats_to_shield {
+            return None;
+        }
+
+        let fee = (((t_spend_c + 2) * 5000) as u64).max(10_000);
+
+        //- OUTPUTS/SENDS
+        let mut memo_count = 0;
+        let mut memo = EMPTY_MEMO_BYTES;
+        let (mut t_send_z, mut t_recv_z, mut s_send_z, mut s_recv_z) = (0, 0, 0, 0);
+        let (mut t_send_c, mut t_recv_c, mut s_send_c, mut s_recv_c) = (0, 0, 0, 0);
+
+        s_send_z += (t_spend_z - fee);
+        s_recv_z += (t_spend_z - fee);
+        s_send_c = 1;
+        s_recv_c = 1;
+
+        let memo_bytes = MemoBytes::from_bytes("shielding notes (fn sheild_transparent_zats)".as_bytes()).unwrap();
+        memo_count = 1;
+        memo = *memo_bytes.as_array();
+
+        if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(account.ufvk.orchard().cloned().map(|fvk| fvk.to_ovk(orchard::keys::Scope::External)), orchard_addr.clone(), s_send_z, memo_bytes) {
+            println!("tx build error: {err:?}");
+            return None;
+        }
+        println!("  added orchard output: {}", s_send_z);
+
+        //- TOTALS GATHERED; CHECK VALUES
+        let mut parts = [
+            WalletTxPart { // Transparent
+                spent_note_count: t_spend_c,
+                sent_note_count:  t_send_c,
+                recv_note_count:  t_recv_c,
+                spent_zats:       to_zats_or_dump_err("tx build", t_spend_z)?,
+                sent_zats:        to_zats_or_dump_err("tx build", t_send_z)?,
+                recv_zats:        to_zats_or_dump_err("tx build", t_recv_z)?,
+            },
+            WalletTxPart { // Shielded
+                spent_note_count: s_spend_c,
+                sent_note_count:  s_send_c,
+                recv_note_count:  s_recv_c,
+                spent_zats:       to_zats_or_dump_err("tx build", s_spend_z)?,
+                sent_zats:        to_zats_or_dump_err("tx build", s_send_z)?,
+                recv_zats:        to_zats_or_dump_err("tx build", s_recv_z)?,
+            },
+        ];
+
+        let Some(_totals) = parts[0].checked_add(&parts[1]) else {
+            println!("tx build error: total values are too large to be represented by Zatoshis");
+            return None;
+        };
+
+        //-- VERY EXPENSIVE TX CREATION (PARTICULARLY IF SHIELDED OUTPUT)
+        use rand_chacha::ChaCha20Rng;
+        let prover = LocalTxProver::bundled();
+        let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+        let tx_res = match txb.build(
+            &signing_set,
+            &[],
+            &[],
+            rng,
+            &prover,
+            &prover,
+            &zip317::FeeRule::standard(),
+        ) {
+            Ok(tx_res) => tx_res,
+            Err(err) => {
+                println!("tx build error: {err:?}");
+                return None;
+            }
+        };
+
+        let tx = tx_res.transaction();
+        let mut tx_bytes = vec![];
+        tx.write(&mut tx_bytes).unwrap();
+
+        //-- EXPENSIVE NETWORK SEND
+        // TODO: don't block, maybe return a future?
+        let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
+        println!("******* res for {:?}: {:?}", tx.txid(), res);
+
+        //-- COMPLETION
+        if res.is_ok() {
+            // TODO: complete
+            let new_tx = WalletTx{
+                account_id: 0,
+                txid: tx.txid(),
+                expiry_h: None,
+                mined_h: BlockHeight::INTERNAL,
+                part_flags: TxParts::FULL_TX,
+                parts,
+                memo_count,
+                memo,
+                is_coinbase: false,
+                is_outside_bc: false,
+            };
+            let mut insert_i = 0;
+            update_insert_i(&self.txs, &mut insert_i, new_tx.mined_h);
+            update_with_tx(self, tx.txid(), new_tx, &mut insert_i);
+            Some(tx.txid())
+        } else {
+            None
+        }
+    }
+
+
+    pub async fn send_orchard_to_orchard_zats<P: Parameters>(
+        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
+        src_usk: &UnifiedSpendingKey, exact_amount_to_send: u64, orchard_tree: &OrchardShardTree, orchard_addr: &orchard::Address
+    ) -> Option<TxId>
+    {
+        let tz = Timer::scope("send_orchard_to_orchard_zats");
+        let block_h = self.chain_tip_h.0 + 1;
+
+        let account = &self.accounts[0];
+        let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
+
+        let orchard_anchor_h = self.chain_tip_h.sat_sub(5);
+        let orchard_anchor = match orchard_tree.root_at_checkpoint_id(&orchard_anchor_h).expect("Infallible MemoryShardStore") {
+            Some(root) => orchard::Anchor::from(root),
+            None => {
+                println!("tx build: couldn't get anchor at {orchard_anchor_h:?}");
+                return None;
+            }
+        };
+
+        //- KEYS/SIGNING
+        let mut signing_set = TransparentSigningSet::new();
+        let mut t_pubkey = None;
+        let Some((pubkey, privkey)) = transparent_keys_from_usk(&src_usk, 0) else {
+            println!("tried to send from transparent source without available transparent keys");
+            return None;
+        };
+        signing_set.add_key(privkey);
+        t_pubkey = Some(pubkey);
+
+        let mut txb = TxBuilder::new(
+            network,
+            LRZBlockHeight::from_u32(block_h),
+            BuildConfig::Standard { sapling_anchor: None, orchard_anchor: Some(orchard_anchor), },
+        );
+
+        //- SPENDS
+        let (mut t_spend_z, mut s_spend_z) = (0, 0);
+        let (mut t_spend_c, mut s_spend_c) = (0, 0usize);
+        let t_pubkey = t_pubkey.expect("checked above");
+        // "greedy strategy"
+
+        let mut rolling_fee_estimate: u64 = 5000 * (2 + s_spend_c as u64);
+        rolling_fee_estimate = rolling_fee_estimate.max(10_000);
+
+        let mut shuffled_notes = account.unspent_orchard_notes.clone();
+        shuffled_notes.shuffle(&mut OsRng);
+        for note in &shuffled_notes {
+            if note.recv_h > orchard_anchor_h { continue; }
+            let witness = match orchard_tree.witness_at_checkpoint_id(note.position, &orchard_anchor_h) {
+                // NOTE: presumably can fail from too-recent note
+                Ok(Some(witness)) => witness,
+                Ok(None) => {
+                    println!("tx build: no orchard checkpoint exists at {orchard_anchor_h:?}");
+                    return None;
+                }
+                Err(err) => {
+                    println!("tx build: orchard witness error: {err:?}");
+                    return None;
+                }
+            };
+            let merkle_path = orchard::tree::MerklePath::from(witness);
+            if let Err(err) = txb.add_orchard_spend::<zip317::FeeError>(keys.orchard_fvk.clone().unwrap(), note.note, merkle_path) {
+                println!("tx build: orchard note spend failed: {err:?}");
+                continue;
+            }
+            s_spend_z += note.note.value().inner();
+            s_spend_c += 1;
+            println!("  added orchard spend: {}", note.note.value().inner());
+
+            rolling_fee_estimate = 5000 * (2 + s_spend_c as u64 + 1) & 0u64.wrapping_sub(2);
+            rolling_fee_estimate = rolling_fee_estimate.max(10_000);
+            if s_spend_z >= exact_amount_to_send + rolling_fee_estimate {
+                break;
+            }
+        }
+
+        if s_spend_z < exact_amount_to_send + rolling_fee_estimate {
+            println!("tx build error: not enough unspent orchard notes, got {} zats needed {}", s_spend_z, exact_amount_to_send + rolling_fee_estimate);
+            return None;
+        }
+
+        //- OUTPUTS/SENDS
+        let mut memo_count = 0;
+        let mut memo = EMPTY_MEMO_BYTES;
+        let (mut t_send_z, mut t_recv_z, mut s_send_z, mut s_recv_z) = (0, 0, 0, 0);
+        let (mut t_send_c, mut t_recv_c, mut s_send_c, mut s_recv_c) = (0, 0, 0, 0);
+
+        s_send_z = s_spend_z - rolling_fee_estimate;
+        s_send_c = 2;
+
+        let memo_bytes = MemoBytes::from_bytes("orchard send (fn send_orchard_to_orchard_zats)".as_bytes()).unwrap();
+        memo_count = 1;
+        memo = *memo_bytes.as_array();
+
+        if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(account.ufvk.orchard().cloned().map(|fvk| fvk.to_ovk(orchard::keys::Scope::External)), orchard_addr.clone(), exact_amount_to_send, memo_bytes) {
+            println!("tx build error: {err:?}");
+            return None;
+        }
+        println!("  added orchard output: {}", exact_amount_to_send);
+
+        let (my_t_addr, my_ua) = addrs_from_account(&account, 0).unwrap();
+
+        s_recv_z = s_send_z - exact_amount_to_send;
+        s_recv_c = 1;
+        if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(account.ufvk.orchard().cloned().map(|fvk| fvk.to_ovk(orchard::keys::Scope::External)), my_ua.orchard().unwrap().clone(), s_recv_z, MemoBytes::from_bytes(&EMPTY_MEMO_BYTES).unwrap()) {
+            println!("tx build error: {err:?}");
+            return None;
+        }
+        println!("  added orchard change: {}", exact_amount_to_send);
+
+        //- TOTALS GATHERED; CHECK VALUES
+        let mut parts = [
+            WalletTxPart { // Transparent
+                spent_note_count: t_spend_c,
+                sent_note_count:  t_send_c,
+                recv_note_count:  t_recv_c,
+                spent_zats:       to_zats_or_dump_err("tx build", t_spend_z)?,
+                sent_zats:        to_zats_or_dump_err("tx build", t_send_z)?,
+                recv_zats:        to_zats_or_dump_err("tx build", t_recv_z)?,
+            },
+            WalletTxPart { // Shielded
+                spent_note_count: s_spend_c,
+                sent_note_count:  s_send_c,
+                recv_note_count:  s_recv_c,
+                spent_zats:       to_zats_or_dump_err("tx build", s_spend_z)?,
+                sent_zats:        to_zats_or_dump_err("tx build", s_send_z)?,
+                recv_zats:        to_zats_or_dump_err("tx build", s_recv_z)?,
+            },
+        ];
+
+        let Some(_totals) = parts[0].checked_add(&parts[1]) else {
+            println!("tx build error: total values are too large to be represented by Zatoshis");
+            return None;
+        };
+
+        //-- VERY EXPENSIVE TX CREATION (PARTICULARLY IF SHIELDED OUTPUT)
+        use rand_chacha::ChaCha20Rng;
+        let prover = LocalTxProver::bundled();
+        let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+        let tx_res = match txb.build(
+            &signing_set,
+            &[],
+            &[src_usk.orchard().into()],
             rng,
             &prover,
             &prover,
@@ -1334,7 +1689,7 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
                 spent_h: BlockHeight(0),
                 txid: *txid,
                 note,
-                position: orchard_action_tree_position_by_cmx.iter().find(|(cmp_cmx, pos)| cmp_cmx == cmx).unwrap().1,
+                position: orchard_action_tree_position_by_cmx.iter().find(|(cmp_cmx, pos)| cmp_cmx == cmx).unwrap().1, // Note(Sam): Observed a crash on this unwrap.
                 // witness: OrchardWitness::from_tree(orchard_tree.clone()).expect("just appended"),
                 // in note:
                 // value: match Zatoshis::from_u64(note.value().inner()) {
@@ -2123,6 +2478,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     // NOTE: checkpoints allow us to reset the tree after a reorg & also create spend anchors
     const CHECKPOINTS_N: usize = 100;
     let mut orchard_tree = OrchardShardTree::new(shardtree::store::memory::MemoryShardStore::empty(), CHECKPOINTS_N);
+    orchard_tree.checkpoint(BlockHeight(0)).unwrap();
     let mut orchard_action_tree_position_by_cmx = Vec::new();
 
     const MAX_TXS_TO_DOWNLOAD_AT_TIME: u64 = 64;
@@ -2171,6 +2527,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
     });
 
+    let mut faucet_shield_cooldown_instant = Instant::now() - Duration::from_secs(1000);
 
     let mut resync_c = 0;
     'outer_sync: loop {
@@ -2886,9 +3243,47 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             println!("miner unspent notes {:#?}", NL(&*miner_wallet.accounts[0].unspent_orchard_notes));
             println!("miner spent   notes {:#?}", NL(&*miner_wallet.accounts[0].spent_orchard_notes));
 
-            let mut txs = miner_wallet.txs.clone();
+            let mut miner_unshielded_funds = 0;
+            let mut miner_shielded_pending_funds = 0;
+            let mut miner_shielded_spendable_funds = 0;
+            for txo in &miner_wallet.accounts[0].utxos {
+                miner_unshielded_funds += txo.value.into_u64();
+            }
+            for note in &miner_wallet.accounts[0].unspent_orchard_notes {
+                let val = note.note.value().inner();
+                if note.recv_h < miner_wallet.chain_tip_h.sat_sub(5) {
+                    miner_shielded_spendable_funds += val;
+                } else {
+                    miner_shielded_pending_funds += val;
+                }
+            }
+
+            let mut user_balance = 0;
+            let mut user_pending_balance = 0;
+            for txo in &user_wallet.accounts[0].utxos {
+                user_balance += txo.value.into_u64();
+            }
+            for note in &user_wallet.accounts[0].unspent_orchard_notes {
+                let val = note.note.value().inner();
+                if note.recv_h < user_wallet.chain_tip_h.sat_sub(5) {
+                    user_balance += val;
+                } else {
+                    user_balance += val;
+                    user_pending_balance += val;
+                }
+            }
+
+            let mut txs = user_wallet.txs.clone();
             txs.reverse(); // TODO: just read in reverse order
-            wallet_state.lock().unwrap().txs = txs;
+            let mut lock = wallet_state.lock().unwrap();
+            lock.txs = txs;
+            lock.miner_unshielded_funds = miner_unshielded_funds;
+            lock.miner_shielded_pending_funds = miner_shielded_pending_funds;
+            lock.miner_shielded_spendable_funds = miner_shielded_spendable_funds;
+            lock.miner_seen_h = miner_wallet.chain_tip_h.0;
+
+            lock.balance = user_balance as i64;
+            lock.pending_balance = user_pending_balance as i64;
         }
 
 
@@ -2909,92 +3304,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         //     }
         // }
 
-        // DEV: miner send tx to self
-        if let Some(start_block_i) = sync_from_i {
+        if faucet_shield_cooldown_instant.elapsed().as_secs() > 5 {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-            let utxos = &miner_wallet.accounts[0].utxos;
-            let shield_n_notes = 5;//OsRng.gen_range(0..=utxos.len());
 
-            if shield_n_notes <= utxos.len() {
-                let mut t_spend_z = 0;
-                for t_i in 0..shield_n_notes {
-                    t_spend_z += utxos[t_i].value.into_u64();
-                }
-
-                // TODO: this is conservative, could do actual sizes...
-                let t_input_sizes = vec![fees::transparent::InputSize::STANDARD_P2PKH; shield_n_notes];
-                let calc_fee = zip317::FeeRule::standard().fee_required(
-                    network,
-                    LRZBlockHeight::from_u32(0), // TODO: this may become relevant at some point...
-                    t_input_sizes,
-                    [], // &[zip317::P2PKH_STANDARD_OUTPUT_SIZE],
-                    0, 0, // sapling in, out
-                          // NOTE: basically 0 or 2+ (1 is consensus-legal but doesn't match builder's fee calc)
-                    orchard::builder::BundleType::DEFAULT.num_actions(0, 1).expect("valid action") // orchard actions
-                ).expect("valid fee");
-                let mut fee = calc_fee; //zip317::MINIMUM_FEE;//Zatoshis::const_from_u64(50_000); // TODO: calculate
-                if let Some(val_after_fees) = Zatoshis::from_u64(t_spend_z).unwrap() - fee {
-                    let mut dst = TxOutput::Transparent{dst: miner_t_address, zats: val_after_fees};
-
-                    if let (Some(fvk), Some(&dst_addr)) = (miner_wallet.accounts[0].ufvk.orchard(), miner_ua.orchard()) {
-                        dst = TxOutput::Orchard {
-                            dst: dst_addr,
-                            ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
-                            zats: val_after_fees.into_u64(),
-                            // memo: MemoBytes::empty(),
-                            // NOTE: MemoBytes::empty() != MemoBytes::from_bytes(&[])
-                            memo: MemoBytes::from_bytes("shielding notes".as_bytes()).unwrap(),
-                        };
-                    }
-
-                    println!("shielding {shield_n_notes} transparent notes");
-                    miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, val_after_fees, fee, &TxOptions {
-                        src_pools: &[TxPool::Transparent],
-                        ..TxOptions::default()
-                    }).await;
-                }
-            }
-
-            if let (Some(fvk), Some(&dst_addr)) = (
-                miner_wallet.accounts[0].ufvk.orchard(),
-                user_ua.orchard(),
-            ) {
-                let mut spend = 100000000; // 1 cTAZ
-
-                let calc_fee = zip317::FeeRule::standard().fee_required(
-                    network,
-                    LRZBlockHeight::from_u32(0), // TODO: this may become relevant at some point...
-                    [], [],
-                    0, 0, // sapling in, out
-                          // NOTE: basically 0 or 2+ (1 is consensus-legal but doesn't match builder's fee calc)
-                    orchard::builder::BundleType::DEFAULT.num_actions(2, 1).expect("valid action") // orchard actions
-                ).expect("valid fee");
-                let mut fee_z = calc_fee;
-                let mut fee = fee_z.into_u64();
-                if spend >= fee {
-                    let val_after_fees = spend - fee;
-                    let dst = TxOutput::Orchard {
-                        dst: dst_addr,
-                        ovk: Some(fvk.to_ovk(orchard::keys::Scope::External)),
-                        zats: val_after_fees,
-                        memo: MemoBytes::from_bytes("orchard->orchard send".as_bytes()).unwrap(),
-                    };
-
-                    println!("orchard (2) -> orchard (1) self-send");
-                    // let orchard_tree_root = shard_tree_root(orchard_tree);
-                    // let orchard_tree_root = miner_note.witness.root();
-                    // println!("anchor at {}/{}: {orchard_tree_root:?}", u64::from(miner_note.witness.witnessed_position()), u64::from(miner_note.witness.tip_position()));
-                    let send_res = miner_wallet.send_zats(network, &mut client, &[dst], &miner_usk, Zatoshis::from_u64(val_after_fees).unwrap(), fee_z, &TxOptions {
-                        // src_pools: &[TxPool::Orchard(orchard::Anchor::from(orchard_tree_root))],
-                        src_pools: &[TxPool::Orchard(&orchard_tree)],
-                        ..TxOptions::default()
-                    }).await;
-
-                    if let Some(txid) = send_res {
-                        println!("successfully sent orchard tx: {txid}");
-                    }
-                }
-            }
+            let maybe_shield_txid = miner_wallet.shield_transparent_zats(network, &mut client, &miner_usk, 1000000000, &orchard_tree).await;
+            println!("Try miner shield txid: {:?}", maybe_shield_txid);
+            faucet_shield_cooldown_instant = Instant::now();
         }
 
         // let (reorg_required) = 'process_blocks: {
@@ -3482,197 +3797,194 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         //     })(miner_wallet, &miner_usk, network).await;
         //     // Process gui wallet actions
 
-        //     // @todo(judah): I'm thinking the weird frame hitch we get in the UI is caused by this loop,
-        //     // since it's probably waiting for the wallet_state mutex to unlock.
-        //     let mut retries_this_round = 6;
-        //     loop {
-        //         let action: WalletAction = {
-        //             let mut wallet_lock = wallet_state.try_lock();
-        //             let Ok(wallet_state) = &mut wallet_lock else {
-        //                 if retries_this_round > 0 {
-        //                     retries_this_round -= 1;
-        //                     println!("wallet lock retry ({retries_this_round} attempts remaining)");
-        //                     tokio::time::sleep(tokio::time::Duration::from_millis(9)).await;
-        //                     continue;
-        //                 } else {
-        //                     break;
-        //                 }
-        //             };
+        // @todo(judah): I'm thinking the weird frame hitch we get in the UI is caused by this loop,
+        // since it's probably waiting for the wallet_state mutex to unlock.
+        let mut retries_this_round = 6;
+        loop {
+            let action: WalletAction = {
+                let mut wallet_lock = wallet_state.try_lock();
+                let Ok(wallet_state) = &mut wallet_lock else {
+                    if retries_this_round > 0 {
+                        retries_this_round -= 1;
+                        println!("wallet lock retry ({retries_this_round} attempts remaining)");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(9)).await;
+                        continue;
+                    } else {
+                        break;
+                    }
+                };
 
-        //             println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len());
-        //             let Some(action) = wallet_state.actions_in_flight.front() else { break; };
-        //             action.clone()
-        //         };
+                println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len());
+                let Some(action) = wallet_state.actions_in_flight.front() else { break; };
+                action.clone()
+            };
 
-        //         let ok: bool = 'process_action: {
-        //             match &action {
-        //                 WalletAction::RequestFromFaucet => {
-        //                     // NOTE: we can't send transparent->transparent through the high-level API, we
-        //                     // have to propose_shielding first, then send in a later block
-        //                     let zats = (Zatoshis::from_nonnegative_i64(500_000_000).unwrap() - MINIMUM_FEE).unwrap();
-        //                     match send_zats_to_wallet(&mut client, user_wallet, miner_wallet, &miner_usk, zats, network, &TxOptions{
-        //                         memo: Some(zcash_protocol::memo::MemoBytes::from_bytes("Happy spending, with love from your favourite faucet".as_bytes()).unwrap()),
-        //                         ..TxOptions::default()
-        //                     }).await {
-        //                         None => {
-        //                             wallet_state.lock().unwrap().waiting_for_faucet = false;
-        //                             true
-        //                         }
-        //                         Some(_) => {
-        //                             wallet_state.lock().unwrap().waiting_for_faucet = false;
-        //                             true
-        //                         },
-        //                     }
-        //                 }
+            let ok: bool = 'process_action: {
+                match &action {
+                    WalletAction::RequestFromFaucet => {
+                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+                        let maybe_send_txid = miner_wallet.send_orchard_to_orchard_zats(network, &mut client, &miner_usk, 500_000_000, &orchard_tree, user_ua.orchard().unwrap()).await;
+                        println!("Try miner send txid: {:?}", maybe_send_txid);
+                        match maybe_send_txid {
+                            None => {
+                                wallet_state.lock().unwrap().waiting_for_faucet = false;
+                                true
+                            }
+                            Some(_) => {
+                                wallet_state.lock().unwrap().waiting_for_faucet = false;
+                                true
+                            },
+                        }
+                    }
 
-        //                 WalletAction::StakeToFinalizer(amount, target_finalizer) => {
-        //                     let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
-        //                         println!("Failed to get wallet summary");
-        //                         break 'process_action false;
-        //                     };
+                    WalletAction::StakeToFinalizer(amount, target_finalizer) => { true
+                        // let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
+                        //     println!("Failed to get wallet summary");
+                        //     break 'process_action false;
+                        // };
 
-        //                     let mut spendable = 0;
-        //                     let balances = wallet_summary.account_balances();
-        //                     for (_, b) in balances {
-        //                         spendable += b.spendable_value().into_u64();
-        //                     }
+                        // let mut spendable = 0;
+                        // let balances = wallet_summary.account_balances();
+                        // for (_, b) in balances {
+                        //     spendable += b.spendable_value().into_u64();
+                        // }
 
-        //                     // @todo(judah): better check?
-        //                     let amount_with_fee = (*amount - MINIMUM_FEE).unwrap();
-        //                     if spendable < amount.into_u64() {
-        //                         println!("Not enough spendable zats to stake, will try again later...");
-        //                         break 'process_action false;
-        //                     }
+                        // // @todo(judah): better check?
+                        // let amount_with_fee = (*amount - MINIMUM_FEE).unwrap();
+                        // if spendable < amount.into_u64() {
+                        //     println!("Not enough spendable zats to stake, will try again later...");
+                        //     break 'process_action false;
+                        // }
 
-        //                     println!("********** STAKING ZEC {:?} ({:?}) TO THE MINER but also to {:?}", amount, amount_with_fee, target_finalizer);
-        //                     let opts = TxOptions {
-        //                         staking_action: Some(StakingAction {
-        //                             kind: StakingActionKind::Add,
-        //                             val: amount_with_fee.into_u64(),
-        //                             target: *target_finalizer,
-        //                             source: [0_u8; 32],
-        //                             insecure_target_name: "".to_owned(),
-        //                             insecure_source_name: "".to_owned(),
-        //                         }),
-        //                         memo: Some(zcash_protocol::memo::MemoBytes::from_bytes(user_ua.encode(network).to_string().as_bytes()).unwrap()),
-        //                     };
+                        // println!("********** STAKING ZEC {:?} ({:?}) TO THE MINER but also to {:?}", amount, amount_with_fee, target_finalizer);
+                        // let opts = TxOptions {
+                        //     staking_action: Some(StakingAction {
+                        //         kind: StakingActionKind::Add,
+                        //         val: amount_with_fee.into_u64(),
+                        //         target: *target_finalizer,
+                        //         source: [0_u8; 32],
+                        //         insecure_target_name: "".to_owned(),
+                        //         insecure_source_name: "".to_owned(),
+                        //     }),
+                        //     memo: Some(zcash_protocol::memo::MemoBytes::from_bytes(user_ua.encode(network).to_string().as_bytes()).unwrap()),
+                        // };
 
-        //                     match send_zats_to_wallet(&mut client, miner_wallet, user_wallet, &user_usk, amount_with_fee, network, &opts).await {
-        //                         None => {
-        //                             println!("Failed to send ZEC to miner");
-        //                             wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
-        //                             false
-        //                         }
-        //                         Some(_) => {
-        //                             wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
-        //                             true
-        //                         }
-        //                     }
-        //                 }
+                        // match send_zats_to_wallet(&mut client, miner_wallet, user_wallet, &user_usk, amount_with_fee, network, &opts).await {
+                        //     None => {
+                        //         println!("Failed to send ZEC to miner");
+                        //         wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
+                        //         false
+                        //     }
+                        //     Some(_) => {
+                        //         wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
+                        //         true
+                        //     }
+                        // }
+                    }
 
-        //                 WalletAction::SendToAddress(address, amount) => {
-        //                     let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
-        //                         println!("Failed to get wallet summary");
-        //                         break 'process_action false;
-        //                     };
+                    WalletAction::SendToAddress(address, amount) => { true
+                        // let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
+                        //     println!("Failed to get wallet summary");
+                        //     break 'process_action false;
+                        // };
 
-        //                     let mut spendable = 0;
-        //                     let balances = wallet_summary.account_balances();
-        //                     for (_, b) in balances {
-        //                         spendable += b.spendable_value().into_u64();
-        //                     }
+                        // let mut spendable = 0;
+                        // let balances = wallet_summary.account_balances();
+                        // for (_, b) in balances {
+                        //     spendable += b.spendable_value().into_u64();
+                        // }
 
-        //                     // @todo(judah): better check?
-        //                     let amount_with_fee = (*amount - MINIMUM_FEE).unwrap();
-        //                     if spendable < amount.into_u64() {
-        //                         println!("Not enough spendable zats to send!");
-        //                         break 'process_action false;
-        //                     }
+                        // // @todo(judah): better check?
+                        // let amount_with_fee = (*amount - MINIMUM_FEE).unwrap();
+                        // if spendable < amount.into_u64() {
+                        //     println!("Not enough spendable zats to send!");
+                        //     break 'process_action false;
+                        // }
 
-        //                     println!("*********** SEND ZEC {:?} ({:?}) TO {}", amount, amount_with_fee, &address.encode(network));
-        //                     match send_zats(&mut client, &address, user_wallet, &user_usk, amount_with_fee, network, &TxOptions::default()).await {
-        //                         None => {
-        //                             println!("Failed to send ZEC to {}", address.encode(network));
-        //                             wallet_state.lock().unwrap().waiting_for_send = false;
-        //                             false
-        //                         }
-        //                         Some(_) => {
-        //                             wallet_state.lock().unwrap().waiting_for_send = false;
-        //                             true
-        //                         }
-        //                     }
-        //                 }
+                        // println!("*********** SEND ZEC {:?} ({:?}) TO {}", amount, amount_with_fee, &address.encode(network));
+                        // match send_zats(&mut client, &address, user_wallet, &user_usk, amount_with_fee, network, &TxOptions::default()).await {
+                        //     None => {
+                        //         println!("Failed to send ZEC to {}", address.encode(network));
+                        //         wallet_state.lock().unwrap().waiting_for_send = false;
+                        //         false
+                        //     }
+                        //     Some(_) => {
+                        //         wallet_state.lock().unwrap().waiting_for_send = false;
+                        //         true
+                        //     }
+                        // }
+                    }
 
-        //                 WalletAction::UnstakeFromFinalizer(txid) => {
-        //                     let mut ok = { // User sends unstaking action
-        //                         let Some((member_pub_key, staked_txid)) = ('find_txid: {
-        //                             for mem in &roster {
-        //                                 for mem_txid in &mem.txids {
-        //                                     if TxId::from_bytes(mem_txid.txid) == *txid {
-        //                                         break 'find_txid Some((mem.pub_key, mem_txid.clone()));
-        //                                     }
-        //                                 }
-        //                             }
-        //                             None
-        //                         }) else {
-        //                             println!("*** Failed to find member with txid: {:?}", txid);
-        //                             break 'process_action false;
-        //                         };
+                    WalletAction::UnstakeFromFinalizer(txid) => { true
+                        // let mut ok = { // User sends unstaking action
+                        //     let Some((member_pub_key, staked_txid)) = ('find_txid: {
+                        //         for mem in &roster {
+                        //             for mem_txid in &mem.txids {
+                        //                 if TxId::from_bytes(mem_txid.txid) == *txid {
+                        //                     break 'find_txid Some((mem.pub_key, mem_txid.clone()));
+                        //                 }
+                        //             }
+                        //         }
+                        //         None
+                        //     }) else {
+                        //         println!("*** Failed to find member with txid: {:?}", txid);
+                        //         break 'process_action false;
+                        //     };
 
-        //                         let Some((action, _)) = user_txid_map.get(&txid) else {
-        //                             println!("*** Failed to find user staking transaction via txid {:?}", txid);
-        //                             break 'process_action false;
-        //                         };
+                        //     let Some((action, _)) = user_txid_map.get(&txid) else {
+                        //         println!("*** Failed to find user staking transaction via txid {:?}", txid);
+                        //         break 'process_action false;
+                        //     };
 
-        //                         let Some(action) = action else {
-        //                             println!("*** Staking action was unset in txid {:?}", txid);
-        //                             break 'process_action false;
-        //                         };
+                        //     let Some(action) = action else {
+                        //         println!("*** Staking action was unset in txid {:?}", txid);
+                        //         break 'process_action false;
+                        //     };
 
-        //                         let opts = TxOptions {
-        //                             staking_action: Some(StakingAction {
-        //                                 kind: StakingActionKind::Sub, // @todo: clear?
-        //                                 val: staked_txid.zats,
-        //                                 target: member_pub_key,
-        //                                 source: *txid.as_ref(),
-        //                                 insecure_target_name: "".to_owned(),
-        //                                 insecure_source_name: "".to_owned(),
-        //                             }),
-        //                             memo: None,
-        //                         };
+                        //     let opts = TxOptions {
+                        //         staking_action: Some(StakingAction {
+                        //             kind: StakingActionKind::Sub, // @todo: clear?
+                        //             val: staked_txid.zats,
+                        //             target: member_pub_key,
+                        //             source: *txid.as_ref(),
+                        //             insecure_target_name: "".to_owned(),
+                        //             insecure_source_name: "".to_owned(),
+                        //         }),
+                        //         memo: None,
+                        //     };
 
-        //                         // @note(judah): the miner sends to its own address because if the user sends it,
-        //                         // the tx will appear as a regular send of -0.2 cTAZ....
-        //                         match send_zats(&mut client, &miner_ua, miner_wallet, &miner_usk, Zatoshis::from_u64(10_000).unwrap() /* @todo fees */, network, &opts).await {
-        //                             None => {
-        //                                 println!("Failed to send unstaking action to miner");
-        //                                 false
-        //                             }
-        //                             Some(_) => {
-        //                                 println!("Successfully sent unstaking action to miner");
-        //                                 true
-        //                             }
-        //                         }
-        //                     };
+                        //     // @note(judah): the miner sends to its own address because if the user sends it,
+                        //     // the tx will appear as a regular send of -0.2 cTAZ....
+                        //     match send_zats(&mut client, &miner_ua, miner_wallet, &miner_usk, Zatoshis::from_u64(10_000).unwrap() /* @todo fees */, network, &opts).await {
+                        //         None => {
+                        //             println!("Failed to send unstaking action to miner");
+                        //             false
+                        //         }
+                        //         Some(_) => {
+                        //             println!("Successfully sent unstaking action to miner");
+                        //             true
+                        //         }
+                        //     }
+                        // };
 
-        //                     // Miner sends reward back to user
-        //                     if CHEAT_UNSTAKING {
-        //                         ok &= send_unstake_reward(&mut client, &roster, &miner_txid_map, txid, miner_wallet, &miner_usk, network, &mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly).await.is_some();
-        //                     }
+                        // // Miner sends reward back to user
+                        // if CHEAT_UNSTAKING {
+                        //     ok &= send_unstake_reward(&mut client, &roster, &miner_txid_map, txid, miner_wallet, &miner_usk, network, &mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly).await.is_some();
+                        // }
 
-        //                     ok
-        //                 }
+                        // ok
+                    }
 
-        //                 _ => { true }
-        //             }
-        //         };
+                    _ => { true }
+                }
+            };
 
-        //         if !ok {
-        //             println!("** Failed to process action: {:?}", &action);
-        //         }
+            if !ok {
+                println!("** Failed to process action: {:?}", &action);
+            }
 
-        //         wallet_state.lock().unwrap().actions_in_flight.pop_front();
-        //     }
+            wallet_state.lock().unwrap().actions_in_flight.pop_front();
+        }
 
         //     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
