@@ -768,6 +768,29 @@ pub fn ui_left_pane(ui: &mut Context,
                 radius:  (f32, f32, f32, f32),
                 tab_id: &mut Id) {
 
+    let mut tab_id_user_wallet  = Id::default();
+    let mut tab_id_miner_wallet = Id::default();
+
+    // @Hack.
+    ui.nav_skip = (ui.modal != Modal::None);
+    if let _ = elem().decl(Decl {
+        id: id("Tab Bar"),
+        child_gap,
+        width: percent!(1.0),
+        height: fit!(),
+        align: Center,
+        ..Decl
+    }) {
+        tab_id_user_wallet  = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Your Wallet");
+        tab_id_miner_wallet = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Miner Wallet");
+    }
+    ui.nav_skip = false;
+
+    // You can't operate on the miner, so you can't open any modals. // @Todo: maybe you can open Receive?
+    if *tab_id == tab_id_miner_wallet {
+        ui.modal = Modal::None;
+    }
+
     if ui.modal != Modal::None && let _elem = elem().decl(Decl {
         child_gap,
         id: id("Modal Container"),
@@ -802,6 +825,11 @@ pub fn ui_left_pane(ui: &mut Context,
             direction: TopToBottom,
             ..Decl
         }) {
+
+            let balance = {
+                let state = wallet_state.lock().unwrap();
+                if *tab_id == tab_id_user_wallet { state.user_balance() } else { state.miner_balance() }
+            };
 
             let contents_id = _elem.decl.id;
             let contents_hovered = ui.hovered(contents_id);
@@ -906,7 +934,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
-                        if (wallet_state.lock().unwrap().balance as u64) < ONE_cTAZ / 100 {
+                        if (balance as u64) < ONE_cTAZ / 100 {
                             let colour = (0xff, 0xaf, 0x0e, 0xff);
                             ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                         }
@@ -929,7 +957,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             ) = {
                                 let wallet_state = wallet_state.lock().unwrap();
                                 (
-                                    wallet_state.balance,
+                                    wallet_state.user_balance(),
                                     wallet_state.waiting_for_send,
                                 )
                             };
@@ -981,7 +1009,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     // spacer
                     if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
-                    if (wallet_state.lock().unwrap().balance as u64) < ONE_cTAZ / 100 {
+                    if (balance as u64) < ONE_cTAZ / 100 {
                         let colour = (0xff, 0xaf, 0x0e, 0xff);
                         ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                     }
@@ -990,8 +1018,6 @@ pub fn ui_left_pane(ui: &mut Context,
                     let waiting_for_stake_to_finalizer = wallet_state.lock().unwrap().waiting_for_stake_to_finalizer;
 
                     {
-                        let balance = wallet_state.lock().unwrap().balance;
-
                         // if (balance as u64) < ONE_cTAZ / 100 {
                         //     let colour = (0xff, 0xaf, 0x0e, 0xff);
                         //     ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
@@ -1284,24 +1310,11 @@ pub fn ui_left_pane(ui: &mut Context,
         }
     }
 
-    // @TODO: MAKE THESE NOT USE TABS, JUST USE HEADERS
-
-    let mut tab_id_wallet = Id::default();
+    // @TODO: MAKE SOME OF THESE NOT USE TABS, JUST USE HEADERS
 
 
     // @Todo: How to avoid doing this? Clearing the nav array when there is a modal?
     ui.nav_skip = (ui.modal != Modal::None);
-
-    if let _ = elem().decl(Decl {
-        id: id("Tab Bar"),
-        child_gap,
-        width: percent!(1.0),
-        height: fit!(),
-        align: Center,
-        ..Decl
-    }) {
-        tab_id_wallet = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Wallet");
-    }
 
     // Main contents
     if let _ = elem().decl(Decl {
@@ -1329,12 +1342,17 @@ pub fn ui_left_pane(ui: &mut Context,
             show_staked_balance,
         ) = {
             let wallet_state = wallet_state.lock().unwrap();
-            (
-                wallet_state.balance,
-                wallet_state.pending_balance,
+            if *tab_id == tab_id_user_wallet {(
+                wallet_state.user_balance(),
+                wallet_state.user_pending_balance(),
                 wallet_state.staked_balance,
                 wallet_state.show_staked_balance,
-            )
+            )} else {(
+                wallet_state.miner_balance(),
+                wallet_state.miner_pending_balance(),
+                0u64,
+                wallet_state.show_staked_balance,
+            )}
         };
 
         // balance container
@@ -1393,9 +1411,9 @@ pub fn ui_left_pane(ui: &mut Context,
             ..Decl
         }) {
 
-            let mut button = |ui: &mut Context, icon: &'static str, label: &'static str| {
+            let mut button = |ui: &mut Context, enabled: bool, icon: &'static str, label: &'static str| {
                 let id = id(label);
-                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, true, winit::window::CursorIcon::Default);
+                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, enabled, winit::window::CursorIcon::Default);
                 if let _ = elem().decl(Decl {
                     id, child_gap, align: Center,
                     direction: TopToBottom,
@@ -1423,16 +1441,24 @@ pub fn ui_left_pane(ui: &mut Context,
                 clicked
             };
 
-            if button(ui, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
-            if button(ui, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
-            if button(ui, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
-            if button(ui, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
+            let can = (*tab_id == tab_id_user_wallet);
+            if button(ui, can, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
+            if button(ui, can, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
+            if button(ui, can, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
+            if button(ui, can, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
         }
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
         {
-            let txs = &wallet_state.lock().unwrap().txs;
+            let txs = {
+                let state = wallet_state.lock().unwrap();
+                if *tab_id == tab_id_user_wallet {
+                    state.user_txs.clone()
+                } else {
+                    state.miner_txs.clone()
+                }
+            };
 
             if txs.len() == 0 {
                 ui.history_scroll = 0.0;

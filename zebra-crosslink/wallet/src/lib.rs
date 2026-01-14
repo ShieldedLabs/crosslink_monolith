@@ -533,24 +533,27 @@ fn w_flip(use_i: &mut usize, update_i: &mut usize) {
 
 #[derive(Default, Debug, Clone)]
 pub struct WalletState {
-    pub balance:         i64, // in zats
-    pub pending_balance: i64, // in zats
-    pub staked_balance:  i64, // in zats
+    pub miner_seen_h: u32,
+    pub miner_unshielded_funds: u64,
+    pub miner_shielded_pending_funds: u64,
+    pub miner_shielded_spendable_funds: u64,
+    // pub faucet_funds_available: u64,
+
+    pub user_unshielded_funds: u64,
+    pub user_shielded_pending_funds: u64,
+    pub user_shielded_spendable_funds: u64,
+
+    pub staked_balance:  u64, // in zats
     pub show_staked_balance: bool,
 
-    pub txs:           Vec<WalletTx>,
+    pub user_txs:      Vec<WalletTx>,
+    pub miner_txs:     Vec<WalletTx>,
     pub roster:        Vec<WalletRosterMember>,
     pub staked_roster: Vec<([u8; 32] /* pub key */, [u8; 32] /* txid */, u64 /* initial */, u64 /* accumulated */)>,
 
     pub waiting_for_faucet: bool,
     pub waiting_for_stake_to_finalizer: bool,
     pub waiting_for_send: bool,
-
-    pub miner_seen_h: u32,
-    pub miner_unshielded_funds: u64,
-    pub miner_shielded_pending_funds: u64,
-    pub miner_shielded_spendable_funds: u64,
-    pub faucet_funds_available: u64,
 
     pub user_recv_ua: String,
 
@@ -563,6 +566,11 @@ impl WalletState {
             ..Default::default()
         }
     }
+
+    pub fn user_balance(&self)          -> u64 { self.user_unshielded_funds + self.user_shielded_spendable_funds + self.user_shielded_pending_funds }
+    pub fn user_pending_balance(&self)  -> u64 { self.user_shielded_pending_funds }
+    pub fn miner_balance(&self)         -> u64 { self.miner_unshielded_funds + self.miner_shielded_spendable_funds + self.miner_shielded_pending_funds }
+    pub fn miner_pending_balance(&self) -> u64 { self.miner_shielded_pending_funds }
 
     pub fn request_from_faucet(&mut self) {
         self.waiting_for_faucet = true;
@@ -3536,32 +3544,37 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
 
-            let mut user_balance = 0;
-            let mut user_pending_balance = 0;
+            let mut user_unshielded_funds = 0;
+            let mut user_shielded_pending_funds = 0;
+            let mut user_shielded_spendable_funds = 0;
             for txo in &user_wallet.accounts[0].utxos {
-                user_balance += txo.value.into_u64();
+                user_unshielded_funds += txo.value.into_u64();
             }
             for note in &user_wallet.accounts[0].unspent_orchard_notes {
                 let val = note.note.value().inner();
                 if note.recv_h < user_wallet.chain_tip_h.sat_sub(5) {
-                    user_balance += val;
+                    user_shielded_spendable_funds += val;
                 } else {
-                    user_balance += val;
-                    user_pending_balance += val;
+                    user_shielded_pending_funds += val;
                 }
             }
 
-            let mut txs = user_wallet.txs.clone();
-            txs.reverse(); // TODO: just read in reverse order
+            let mut user_txs = user_wallet.txs.clone();
+            user_txs.reverse(); // TODO: just read in reverse order
+            let mut miner_txs = miner_wallet.txs.clone();
+            miner_txs.reverse(); // TODO: just read in reverse order
+
             let mut lock = wallet_state.lock().unwrap();
-            lock.txs = txs;
+            lock.user_txs = user_txs;
+            lock.miner_txs = miner_txs;
             lock.miner_unshielded_funds = miner_unshielded_funds;
             lock.miner_shielded_pending_funds = miner_shielded_pending_funds;
             lock.miner_shielded_spendable_funds = miner_shielded_spendable_funds;
             lock.miner_seen_h = miner_wallet.chain_tip_h.0;
 
-            lock.balance = user_balance as i64;
-            lock.pending_balance = user_pending_balance as i64;
+            lock.user_unshielded_funds = user_unshielded_funds;
+            lock.user_shielded_pending_funds = user_shielded_pending_funds;
+            lock.user_shielded_spendable_funds = user_shielded_spendable_funds;
         }
 
 
