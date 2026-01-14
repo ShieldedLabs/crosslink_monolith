@@ -454,15 +454,15 @@ impl WalletTx {
         ZatBalance::from_i64(all.recv_zats.into_u64() as i64 - all.spent_zats.into_u64() as i64).expect("checked before")
     }
 
-    pub fn fee(&self) -> ZatBalance {
+    pub fn fee(&self) -> Zatoshis {
         let all = self.totals();
         // NOTE: into_i64 isn't pub...
-        ZatBalance::from_i64(all.spent_zats.into_u64() as i64 - all.sent_zats.into_u64() as i64).expect("checked before")
+        let fee: u64 = (all.spent_zats.into_u64() as i64 - all.sent_zats.into_u64() as i64).try_into().expect("fee cannot be negative");
+        Zatoshis::from_u64(fee).expect("fee cannot be unrepresentable")
     }
 
     // TODO:
     // pub fn expired_unmined() -> bool {}
-    // pub fn fee() -> Zatoshis {}
 
     // TODO: split shielding/unshielding/shielded/transparent/mixed from
     // send/recv/self-send/coinbase

@@ -1498,8 +1498,6 @@ pub fn ui_left_pane(ui: &mut Context,
 
                         let tx_is_on_best_chain = tx.mined_h.is_in_block() && !tx.is_outside_bc;
 
-                        let tx_totals = tx.totals();
-
                         if let _ = elem().decl(Decl{
                             id: id_index("Transaction", index as u32),
                             padding,
@@ -1627,7 +1625,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     },
                                     WalletTxKind::Receive | WalletTxKind::Unstake => {
                                         if true { // total
-                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.totals().recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
+                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(totals.recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                         } else { // transparent, shielded
                                             let (t_z, s_z) = (tx.parts[0].recv_zats.into_u64(), tx.parts[1].recv_zats.into_u64());
                                             ui.text(frame_strf!(data, "+{} | {} cTAZ", str_from_ctaz(t_z), str_from_ctaz(s_z)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
@@ -1644,8 +1642,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     },
                                 }
 
-                                let fee: i64 = tx.fee().into();
-                                let fee: u64 = fee.abs() as u64;
+                                let fee: u64 = tx.fee().into_u64();
                                 if tx.kind() != WalletTxKind::Receive &&
                                    tx.kind() != WalletTxKind::Unstake {
                                     ui.text(frame_strf!(data, "Fee: {} cTAZ", str_from_ctaz(fee)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
