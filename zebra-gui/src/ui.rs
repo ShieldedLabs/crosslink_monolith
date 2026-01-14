@@ -1495,6 +1495,9 @@ pub fn ui_left_pane(ui: &mut Context,
 
                             let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
                         }
+
+                        let tx_is_on_best_chain = tx.mined_h.is_in_block() && !tx.is_outside_bc;
+
                         if let _ = elem().decl(Decl{
                             id: id_index("Transaction", index as u32),
                             padding,
@@ -1515,7 +1518,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 // TODO: account for mempool
-                                let icon = match (tx.kind(), tx.mined_h.is_in_block()) {
+                                let icon = match (tx.kind(), tx_is_on_best_chain) {
                                     (WalletTxKind::Send,     true) => ICON_UP_SMALL,
                                     (WalletTxKind::SelfSend, true) => ICON_DOWN_SMALL,
                                     (WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
@@ -1535,7 +1538,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 };
 
                                 // TODO: account for mempool & confirmation level
-                                let colour = if tx.mined_h.is_in_block() {
+                                let colour = if tx_is_on_best_chain {
                                     WHITE
                                 } else {
                                     (0x60, 0x60, 0x60, 0xff) /* @todo colors */
@@ -1554,12 +1557,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 let label = match tx.kind() {
-                                    WalletTxKind::Send     => if tx.mined_h.is_in_block() { "Sent"     } else { "Sending"   },
-                                    WalletTxKind::Receive  => if tx.mined_h.is_in_block() { "Received" } else { "Receiving" },
-                                    WalletTxKind::SelfSend => if tx.mined_h.is_in_block() { "Returned" } else { "Returning" },
-                                    WalletTxKind::Shield   => if tx.mined_h.is_in_block() { "Shielded" } else { "Shielding" },
-                                    WalletTxKind::Stake    => if tx.mined_h.is_in_block() { "Staked"   } else { "Staking"   },
-                                    WalletTxKind::Unstake  => if tx.mined_h.is_in_block() { "Unstaked" } else { "Unstaking" },
+                                    WalletTxKind::Send     => if tx_is_on_best_chain { "Sent"     } else { "Sending"   },
+                                    WalletTxKind::Receive  => if tx_is_on_best_chain { "Received" } else { "Receiving" },
+                                    WalletTxKind::SelfSend => if tx_is_on_best_chain { "Returned" } else { "Returning" },
+                                    WalletTxKind::Shield   => if tx_is_on_best_chain { "Shielded" } else { "Shielding" },
+                                    WalletTxKind::Stake    => if tx_is_on_best_chain { "Staked"   } else { "Staking"   },
+                                    WalletTxKind::Unstake  => if tx_is_on_best_chain { "Unstaked" } else { "Unstaking" },
                                 };
 
                                 let label_str = if tx.mined_h.is_in_block() {
