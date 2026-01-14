@@ -2,6 +2,7 @@
 #![allow(warnings)]
 
 use rand::seq::SliceRandom;
+use tokio::task::futures;
 use zcash_client_backend::data_api::WalletCommitmentTrees;
 use orchard::note_encryption::{ CompactAction as OrchardCompactAction, OrchardDomain };
 use rand_chacha::rand_core::SeedableRng;
@@ -11,7 +12,8 @@ use secrecy::{ExposeSecret,SecretVec,Secret};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::{identity, Infallible};
 use std::future::Future;
-use std::mem;
+use std::{mem, slice};
+use std::ptr::null;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_rustls::rustls;
@@ -2365,6 +2367,27 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
     }
 }
 
+const JUDAHS_NETWORK_TESTS: bool = true;
+
+#[derive(Debug, Default)]
+struct IndirectState {
+    pub network_handle: *mut std::ffi::c_void,
+}
+
+#[allow(unsafe_code)]
+impl IndirectState {
+    fn connect(
+        &mut self,
+        address: *const u8,
+        address_len: usize,
+        connect_cb: unsafe extern "C" fn(*const u8, usize, *mut std::ffi::c_void) -> *mut std::ffi::c_void,
+        userdata: *mut std::ffi::c_void)
+    {
+        unsafe { self.network_handle = connect_cb(address, address_len, userdata); }
+    }
+
+}
+
 
 pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     fn stuff_from_seed_phrase<P: Parameters + 'static>(params:P, phrase: &str) -> (
@@ -2767,15 +2790,56 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 
-    // @todo(judah): investigate why requests get randomly dropped in a strange way:
-    // transport error, service not ready, etc.
-    let mut client = loop {
-        if let Ok(channel) = Channel::from_shared(format!("http://localhost:{}", zaino_port)).unwrap().connect().await {
-            break CompactTxStreamerClient::new(channel);
-        }
+    let mut indirect_state = IndirectState::default();
 
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    async fn rust_connect(address: String) -> Option<CompactTxStreamerClient<Channel>> {
+        loop {
+            if let Ok(channel) = Channel::from_shared(address.clone()).unwrap().connect().await {
+                return Some(CompactTxStreamerClient::new(channel));
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    #[allow(unsafe_code)]
+    unsafe extern "C" fn c_connect(address: *const u8, address_len: usize, user_data: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+        let handle = unsafe { &*(user_data as *const tokio::runtime::Handle) };
+        let address = unsafe { String::from_utf8_lossy(slice::from_raw_parts(address, address_len)) }.to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        handle.spawn(async move {
+            tx.send(rust_connect(address).await);
+        });
+
+        tokio::task::block_in_place(move || {
+            match rx.recv() {
+                Ok(Some(client)) => {
+                    return Box::into_raw(Box::new(client)) as *mut std::ffi::c_void;
+                }
+
+                _ => std::ptr::null_mut()
+            }
+        })
+    }
+
+    #[allow(unsafe_code)]
+    let mut connect = async | address: String | {
+        if JUDAHS_NETWORK_TESTS {
+            let mut handle = tokio::runtime::Handle::current();
+            indirect_state.connect(address.as_ptr(), address.len(), c_connect, &mut handle as *mut _ as *mut std::ffi::c_void);
+
+            if indirect_state.network_handle == std::ptr::null_mut() {
+                return None;
+            } else {
+                return Some(unsafe { Box::from_raw(indirect_state.network_handle as *mut CompactTxStreamerClient<Channel>) });
+            }
+        } else {
+            return rust_connect(address).await.map(|client| Box::new(client));
+        }
     };
+
+    let mut client = connect(format!("http://localhost:{}", zaino_port)).await.expect("failed to connect!");
 
     // NOTE: current model is to reorg this many blocks back
     // ALT: have checkpoints every 16/32 blocks and always sync from the start of one of these
