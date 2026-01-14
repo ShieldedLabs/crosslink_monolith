@@ -1498,6 +1498,8 @@ pub fn ui_left_pane(ui: &mut Context,
 
                         let tx_is_on_best_chain = tx.mined_h.is_in_block() && !tx.is_outside_bc;
 
+                        let tx_totals = tx.totals();
+
                         if let _ = elem().decl(Decl{
                             id: id_index("Transaction", index as u32),
                             padding,
@@ -1606,7 +1608,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 // @todo colors
-                                let color = match tx.kind() {
+                                let colour = match tx.kind() {
                                     WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
                                     WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
                                     WalletTxKind::Receive | WalletTxKind::Unstake => (0x5a, 0xb5, 0x52, 0xff),
@@ -1621,25 +1623,32 @@ pub fn ui_left_pane(ui: &mut Context,
                                         let send_amount: u64 = send_amount.abs() as u64;
 
                                         let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
-                                        ui.text(frame_strf!(data, "{}{} cTAZ", prefix, str_from_ctaz(send_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        ui.text(frame_strf!(data, "{}{} cTAZ", prefix, str_from_ctaz(send_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                     },
                                     WalletTxKind::Receive | WalletTxKind::Unstake => {
                                         if true { // total
-                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.totals().recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.totals().recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                         } else { // transparent, shielded
                                             let (t_z, s_z) = (tx.parts[0].recv_zats.into_u64(), tx.parts[1].recv_zats.into_u64());
-                                            ui.text(frame_strf!(data, "+{} | {} cTAZ", str_from_ctaz(t_z), str_from_ctaz(s_z)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                            ui.text(frame_strf!(data, "+{} | {} cTAZ", str_from_ctaz(t_z), str_from_ctaz(s_z)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                         }
                                     },
                                     WalletTxKind::Shield => {
                                         // TODO: (how) do we want to show the fee?
                                         let shield_amount = totals.recv_zats.into_u64();
 
-                                        ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(shield_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(shield_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                     },
                                     _ => {
-                                        ui.text("TODO cTAZ", TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        ui.text("TODO cTAZ", TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                     },
+                                }
+
+                                let fee: i64 = tx.fee().into();
+                                let fee: u64 = fee.abs() as u64;
+                                if tx.kind() != WalletTxKind::Receive &&
+                                   tx.kind() != WalletTxKind::Unstake {
+                                    ui.text(frame_strf!(data, "Fee: {} cTAZ", str_from_ctaz(fee)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                 }
                             }
                         }

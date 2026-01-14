@@ -454,6 +454,12 @@ impl WalletTx {
         ZatBalance::from_i64(all.recv_zats.into_u64() as i64 - all.spent_zats.into_u64() as i64).expect("checked before")
     }
 
+    pub fn fee(&self) -> ZatBalance {
+        let all = self.totals();
+        // NOTE: into_i64 isn't pub...
+        ZatBalance::from_i64(all.spent_zats.into_u64() as i64 - all.sent_zats.into_u64() as i64).expect("checked before")
+    }
+
     // TODO:
     // pub fn expired_unmined() -> bool {}
     // pub fn fee() -> Zatoshis {}
