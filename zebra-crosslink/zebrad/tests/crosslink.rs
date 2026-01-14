@@ -19,7 +19,7 @@ use zebra_chain::{
     serialization::*,
     work::{self, difficulty::CompactDifficulty},
 };
-use zebra_crosslink::chain::*;
+use zebra_crosslink::{FatPointerToBftBlock2, chain::*};
 use zebra_crosslink::test_format::*;
 use zebra_state::crosslink::*;
 use zebrad::application::CROSSLINK_TEST_CONFIG_OVERRIDE;
@@ -444,7 +444,6 @@ fn crosslink_test_pow_to_pos_link() {
     pow_5.header = Arc::new(BlockHeader {
         version: 5,
         fat_pointer_to_bft_block: pos_0_fat_ptr.clone(),
-        temp_command_buf: CommandBuf::empty(),
         ..*pow_5.header
     });
     // let pow_5_hash = pow_5.hash();
@@ -592,7 +591,6 @@ impl BlockGen {
                 nonce: HexDebug([0; 32]),
                 solution: work::equihash::Solution::Regtest([0; 36]),
                 fat_pointer_to_bft_block: FatPointerToBftBlock::null(),
-                temp_command_buf: CommandBuf::empty(),
             }),
 
             transactions: vec![coinbase_tx.into()],
@@ -698,17 +696,18 @@ fn create_pos_and_ptr_to_finalize_pow(
     )
     .expect("valid PoS block");
 
-    let cert = MalCommitCertificate {
-        height: MalHeight::new(bft_height.into()),
-        round: MalRound::new(1),
-        value_id: MalValue::new_block(&block).id(),
-        commit_signatures: Vec::new(), // TODO
-    };
+    // let cert = MalCommitCertificate {
+    //     height: MalHeight::new(bft_height.into()),
+    //     round: MalRound::new(1),
+    //     value_id: MalValue::new_block(&block).id(),
+    //     commit_signatures: Vec::new(), // TODO
+    // };
 
-    BftBlockAndFatPointerToIt {
-        block,
-        fat_ptr: (&cert).into(),
-    }
+    // BftBlockAndFatPointerToIt {
+    //     block,
+    //     fat_ptr: (&cert).into(),
+    // }
+    panic!();
 }
 
 #[test]
@@ -774,7 +773,6 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
 
     gen.tip = Arc::new(Block {
         header: Arc::new(BlockHeader {
-            temp_command_buf: CommandBuf::from_str("ADD|1234|some_pub_key"),
             ..gen.tip.header.as_ref().clone()
         }),
         ..gen.tip.as_ref().clone()

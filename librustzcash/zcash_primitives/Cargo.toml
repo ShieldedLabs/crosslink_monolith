@@ -21,6 +21,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 # TODO(@Prod): remove as soon as longer needed for crosslink shim
 ed25519-zebra = "4.0.3"
+serde-big-array = "0.5.1"
 
 equihash.workspace = true
 zcash_address.workspace = true

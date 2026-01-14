@@ -182,6 +182,14 @@ impl StartCmd {
         };
         *wallet::GLOBAL_SEED.lock().unwrap() = Some(global_seed);
 
+        let path_to_pos_store_file = if config.state.ephemeral { std::path::PathBuf::new() } else {
+            let mut key_path = config.state.cache_dir.clone();
+            let _ = std::fs::create_dir_all(key_path.clone());
+
+            key_path.push("pos.chain");
+            key_path
+        };
+
 
         info!("initializing node state");
         let (_, max_checkpoint_height) = zebra_consensus::router::init_checkpoint_list(
@@ -324,12 +332,18 @@ impl StartCmd {
         info!("spawning tfl service task");
         let (tfl, tfl_service_task_handle) = {
             let state = state.clone();
+            let read_only_state_service = read_only_state_service.clone();
             zebra_crosslink::service::spawn_new_tfl_service(
                 is_regtest,
                 global_seed,
+                path_to_pos_store_file,
                 Arc::new(move |req| {
                     let state = state.clone();
                     Box::pin(async move { state.clone().ready().await?.call(req).await })
+                }),
+                Arc::new(move |req| {
+                    let read_only_state_service = read_only_state_service.clone();
+                    Box::pin(async move { read_only_state_service.clone().ready().await?.call(req).await })
                 }),
                 Arc::new(move |req| {
                     let mempool = mempool2.clone();
@@ -609,23 +623,26 @@ impl StartCmd {
         let old_databases_task_handle_fused = (&mut old_databases_task_handle).fuse();
         pin!(old_databases_task_handle_fused);
 
+        if true
+        // if false // @Phillip @Testing
         {
             let tmp_dir = tempfile::TempDir::new().unwrap();
             let _ = std::fs::remove_dir_all(tmp_dir.path());
+            let zebra_port_base = config.network.listen_addr.port();
 
             let zaino_config = zainodlib::config::ZainodConfig {
                 backend: zaino_state::BackendType::Fetch,
                 json_server_settings: Some(zaino_serve::server::config::JsonRpcServerConfig {
-                    json_rpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 18232),
+                    json_rpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), zebra_port_base + 10000),
                     cookie_dir: None,
                 }),
                 grpc_settings: zaino_serve::server::config::GrpcServerConfig {
-                    listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 18233),
+                    listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), zebra_port_base + 10001),
                     tls: None,
                 },
                 validator_settings: zaino_common::ValidatorConfig {
-                    validator_grpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8232),
-                    validator_jsonrpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8232),
+                    validator_grpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), zebra_port_base-1),
+                    validator_jsonrpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), zebra_port_base-1),
                     validator_cookie_path: None,
                     validator_user: Some("xxxxxx".to_owned()),
                     validator_password: Some("xxxxxx".to_owned()),
@@ -658,6 +675,7 @@ impl StartCmd {
                     nu7: None,
                 }),
             };
+            *zebra_crosslink::wallet::wallet_main_zaino_port.lock().unwrap() = zebra_port_base + 10001;
 
             zainodlib::indexer::spawn_indexer(zaino_config).await.unwrap();
         }

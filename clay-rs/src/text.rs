@@ -9,7 +9,7 @@ pub enum TextElementConfigWrapMode {
     Newline = Clay_TextElementConfigWrapMode_CLAY_TEXT_WRAP_NEWLINES,
     /// Never wraps, can overflow of parent layout
     None = Clay_TextElementConfigWrapMode_CLAY_TEXT_WRAP_NONE,
-    BreakWord = Clay_TextElementConfigWrapMode_CLAY_TEXT_WRAP_BREAK_WORD,
+    Chars = Clay_TextElementConfigWrapMode_CLAY_TEXT_WRAP_CHARS,
 }
 
 #[derive(Debug, Clone, Copy)]

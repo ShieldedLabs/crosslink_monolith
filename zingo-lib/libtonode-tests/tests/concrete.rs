@@ -141,9 +141,9 @@ mod fast {
         zip321::{Payment, TransactionRequest},
     };
     use zcash_local_net::validator::Validator;
-    use zcash_primitives::{
-        consensus::BlockHeight, legacy::keys::NonHardenedChildIndex, memo::Memo,
-    };
+    use zcash_protocol::consensus::BlockHeight;
+    use zcash_transparent::keys::NonHardenedChildIndex;
+    use zcash_protocol::memo::Memo;
     use zcash_protocol::{PoolType, ShieldedProtocol, value::Zatoshis};
     use zingo_status::confirmation_status::ConfirmationStatus;
     use zingolib::{
@@ -978,7 +978,8 @@ mod fast {
     pub mod tex {
         use pepper_sync::keys::decode_address;
         use zcash_client_backend::address::Address;
-        use zcash_primitives::{legacy::TransparentAddress, transaction::TxId};
+        use zcash_primitives::transaction::TxId;
+        use zcash_transparent::address::TransparentAddress;
         use zingolib::{testutils, wallet::LightWallet};
 
         use super::*;
@@ -1427,8 +1428,8 @@ mod slow {
         TransparentCoin,
     };
     use zcash_local_net::validator::Validator;
-    use zcash_primitives::consensus::BlockHeight;
-    use zcash_primitives::memo::Memo;
+    use zcash_protocol::consensus::BlockHeight;
+    use zcash_protocol::memo::Memo;
     use zcash_primitives::transaction::fees::zip317::MARGINAL_FEE;
     use zcash_protocol::value::Zatoshis;
     use zcash_protocol::{PoolType, ShieldedProtocol};

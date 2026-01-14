@@ -622,12 +622,12 @@ pub async fn service_viz_requests(
             internal.our_set_bft_string = Some(bft_string.clone());
             internal.active_bft_string = Some(bft_string.clone());
 
-            if !had_bft_string {
-                match push_staking_action_from_cmd_str(&call, &bft_string).await {
-                    Ok(()) => info!("successfully mempooled transaction"),
-                    Err(err) => warn!("staking command \"{bft_string}\" failed: {err}"),
-                }
-            }
+            // if !had_bft_string {
+            //     match push_staking_action_from_cmd_str(&call, &bft_string).await {
+            //         Ok(()) => info!("successfully mempooled transaction"),
+            //         Err(err) => warn!("staking command \"{bft_string}\" failed: {err}"),
+            //     }
+            // }
         }
         had_bft_string = old_g.proposed_bft_string.is_some();
 
@@ -3362,9 +3362,9 @@ pub async fn viz_main(
                                     &skin,
                                     BLACK,
                                     &format!(
-                                        " - {}: {}",
+                                        " - {}: DISABLED",
                                         tx.hash(),
-                                        staking_action.to_cmd_string()
+                                        //staking_action.to_cmd_string()
                                     ),
                                     0.5 * font_size,
                                 );
@@ -3934,10 +3934,10 @@ pub async fn viz_main(
 
             for val in &g.validators_at_current_height {
                 let string =
-                    if let Some(user_name) = g.validators_keys_to_names.get(&val.public_key) {
+                    if let Some(user_name) = g.validators_keys_to_names.get(&val.public_key.into()) {
                         user_name.clone()
                     } else {
-                        let mut string = format!("{:?}", MalPublicKey2(val.public_key));
+                        let mut string = format!("{:?}", MalPublicKey2(val.public_key.into()));
                         string.truncate(16);
                         string
                     };

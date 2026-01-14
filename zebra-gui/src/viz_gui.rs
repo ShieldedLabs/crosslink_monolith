@@ -12,21 +12,38 @@ pub static RESPONSES_FROM_ZEBRA: Mutex<Option<std::sync::mpsc::SyncSender<Respon
 
 pub struct RequestToZebra {
     pub want_to_inspect_block: Hash32,
+    pub bft_ack_height: u64,
+    pub bc_ack_height: u64,
 }
 impl RequestToZebra {
     pub fn _0() -> Self {
         RequestToZebra {
             want_to_inspect_block: Hash32::from_u64(0),
+            bft_ack_height: 0,
+            bc_ack_height: 0,
         }
     }
 }
+
+// @Todo: enum BlockInspection {
+//     None,
+//     PoW(Arc<zebra_chain::Block>),
+//     PoS(Arc<zebra_chain::block::BftBlock>)
+// }
+
 pub struct ResponseFromZebra {
     pub bc_tip_height: u64,
     pub bft_tip_height: u64,
     pub bc_blocks: Vec<BcBlock>,
     pub bft_blocks: Vec<BftBlock>,
     pub what_block_it_is: Hash32,
-    pub json_dump_of_the_block: String,
+    pub json_dump_of_the_block: String, // @Todo: @Remove and replace with structured data.
+    // @Todo: pub block_inspection: BlockInspection,
+    pub start_bc_height: u64,
+
+    pub orchard_pool_balance: i64,
+    pub staking_bonded_pool_balance: i64,
+    pub staking_unbonded_pool_balance: i64,
 }
 impl ResponseFromZebra {
     pub fn _0() -> Self {
@@ -37,6 +54,11 @@ impl ResponseFromZebra {
             bft_blocks: Vec::new(),
             what_block_it_is: Hash32::from_u64(0),
             json_dump_of_the_block: "Data not available.".to_owned(),
+            // @Todo: block_inspection: BlockInspection::None,
+            start_bc_height: 0,
+            orchard_pool_balance: 0,
+            staking_bonded_pool_balance: 0,
+            staking_unbonded_pool_balance: 0,
         }
     }
 }
@@ -191,6 +213,13 @@ pub struct VizState {
 
     pub inspecting_block_screen_x: f32,
     pub inspecting_block_screen_y: f32,
+
+    pub bft_ack_height: u64,
+    pub bc_ack_height: u64,
+
+    pub orchard_pool_balance: i64,
+    pub staking_bonded_pool_balance: i64,
+    pub staking_unbonded_pool_balance: i64,
 }
 pub fn viz_gui_init(fake_data: bool) -> VizState {
     let (me_send, zebra_receive) = std::sync::mpsc::sync_channel(128);
@@ -221,6 +250,13 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         inspecting_block_screen_y: 0.0,
 
         time_since_last_animation: Instant::now(),
+
+        bft_ack_height: 0,
+        bc_ack_height: 0,
+
+        orchard_pool_balance: 0,
+        staking_bonded_pool_balance: 0,
+        staking_unbonded_pool_balance: 0,
     };
     if fake_data {
         let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
@@ -262,9 +298,16 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         anything_happened |= viz_state.bft_tip_height != message.bft_tip_height;
         viz_state.bft_tip_height = message.bft_tip_height;
 
+
+        viz_state.orchard_pool_balance = message.orchard_pool_balance;
+        viz_state.staking_bonded_pool_balance = message.staking_bonded_pool_balance;
+        viz_state.staking_unbonded_pool_balance = message.staking_unbonded_pool_balance;
+
         // @hack
         for bc in viz_state.on_screen_bcs.values_mut() {
-            bc.block.is_best_chain = false;
+            if bc.block.this_height >= message.start_bc_height {
+                bc.block.is_best_chain = false;
+            }
         }
 
         if message.what_block_it_is == viz_state.inspecting_block_hash {
@@ -288,7 +331,10 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
             }
         }
         for bft in message.bft_blocks {
+            let mut missing = true;
             if let Some(bc) = viz_state.on_screen_bcs.get_mut(&bft.points_at_bc_block) {
+                missing = false;
+                viz_state.bc_ack_height = viz_state.bc_ack_height.max(bc.block.this_height);
                 bc.block.is_implicated_by_bft = true;
 
                 let mut prev = bft.points_at_bc_block;
@@ -306,6 +352,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                 anything_happened |= r.block != bft;
                 r.block = bft;
             } else {
+                if missing == false { viz_state.bft_ack_height = viz_state.bft_ack_height.max(bft.this_height); }
                 anything_happened |= true;
                 viz_state.on_screen_bfts.insert(bft.this_hash, OnScreenBft { block: bft, alpha: 0.0, y: spawn_y, ..Default::default() });
             }
@@ -313,7 +360,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
     }
 
     if anything_happened == false {
-        let _ = viz_state.send_to_zebra.try_send(RequestToZebra { want_to_inspect_block: viz_state.inspecting_block_hash, });
+        let _ = viz_state.send_to_zebra.try_send(RequestToZebra { want_to_inspect_block: viz_state.inspecting_block_hash, bft_ack_height: viz_state.bft_ack_height, bc_ack_height: viz_state.bc_ack_height, });
     }
 
     // animations
@@ -366,11 +413,12 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     let zoom = (ZOOM_FACTOR.powf(viz_state.zoom) * ui.scale);
     // origin
     let screen_unit = SCREEN_UNIT_CONST * zoom;
+    let very_zoom_out = screen_unit < 0.16;
 
-    if !ui.capture && ui.clicked_id == ui::Id::default() && input_ctx.mouse_pressed(MouseButton::Left) {
-        ui.clicked_id = ui::Id::VIZ_GUI;
+    if !ui.capture && ui.mouse_pressed_id == ui::Id::default() && input_ctx.mouse_pressed(MouseButton::Left) {
+        ui.mouse_pressed_id = ui::Id::VIZ_GUI;
     }
-    if ui.clicked_id == ui::Id::VIZ_GUI && input_ctx.mouse_held(MouseButton::Left) {
+    if ui.mouse_pressed_id == ui::Id::VIZ_GUI && input_ctx.mouse_held(MouseButton::Left) {
         viz_state.camera_x -= input_ctx.mouse_delta().0 as f32 / screen_unit;
         viz_state.camera_y -= input_ctx.mouse_delta().1 as f32 / screen_unit;
     }
@@ -455,6 +503,9 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         }
     }
 
+    let null_hash_display_string = Hash32::from_u64(0).display_str();
+    let null_hash_display_string_star = format!("{}*", &null_hash_display_string);
+    let null_hash_is_rectangle = draw_ctx.measure_text_line_is_rectangle(FontKind::Mono, screen_unit, &null_hash_display_string_star);
     {
         let mut working_map = HashMap::<Hash32, u16>::new();
         let mut width_map = HashMap::<u64, u16>::new();
@@ -497,7 +548,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             }
         }
 
-        let hash_text_line_w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &format!("{}*", Hash32::from_u64(0).display_str())) / screen_unit;
+        let hash_text_line_w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &null_hash_display_string_star) / screen_unit;
         for (hash, x_pos) in &working_map {
             viz_state.on_screen_bcs.get_mut(hash).unwrap().t_x = -5.0 - hash_text_line_w - 5.0*(1.0 + *x_pos as f32);
         }
@@ -541,54 +592,84 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             viz_state.inspecting_block_screen_x = origin_x + (x*screen_unit);
             viz_state.inspecting_block_screen_y = origin_y + (y*screen_unit);
         }
-        draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bc.roundness, color);
-        draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit / 2.0, (screen_unit / 2.0)*on_screen_bc.roundness, color_accent);
+        if very_zoom_out {
+            draw_ctx.rectangle(origin_x + (x*screen_unit) - screen_unit*30.0, origin_y + (y*screen_unit), origin_x + (x*screen_unit) + screen_unit*5.0, origin_y + (y*screen_unit) + screen_unit*2.0, (color&0xFFffFF) | ((color >> 26) << 24));
+        }
+        else {
+            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bc.roundness, color);
+            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit / 2.0, (screen_unit / 2.0)*on_screen_bc.roundness, color_accent);
+        }
 
         // @todo(judah): not sure what this circle is supposed to represent
         // draw_ctx.circle_square(origin_x + (x*screen_unit) + screen_unit / 3.0, origin_y + (y*screen_unit) - screen_unit / 3.0, screen_unit / 3.0, (screen_unit / 3.0), color_bft);
+        // Answer(Sam): It shows that the block is mentioned inside a BFT block. This is needed in some form so that people can see that sigma is not just 1.
 
-        if on_screen_bc.block.is_best_chain {
-            // hash
-            let text_line = &on_screen_bc.block.this_hash.display_str();
-            let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
-            draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &on_screen_bc.block.this_hash.display_str(), color);
+        if very_zoom_out == false {
+            let here_text_y = (origin_y + (y - 0.5)*screen_unit);
+            if here_text_y <= draw_ctx.window_height as f32 && here_text_y + screen_unit >= 0.0 {
+                if on_screen_bc.block.is_best_chain {
+                    // hash
+                    let text_line_buf;
+                    let text_line = if null_hash_is_rectangle {
+                        &null_hash_display_string
+                    } else {
+                        text_line_buf = on_screen_bc.block.this_hash.display_str();
+                        &text_line_buf
+                    };
+                    let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
+                    draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y as f32, screen_unit, &on_screen_bc.block.this_hash.display_str(), color);
 
-            // height
-            draw_ctx.text_line(FontKind::Mono, origin_x + (x + 1.5)*screen_unit, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &format!("{}", on_screen_bc.block.this_height), color);
-        } else {
-            // hash
-            let text_line = format!("{}*", &on_screen_bc.block.this_hash.display_str());
-            let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
-            draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &text_line, color);
-        }
+                    let height_text_buf;
+                    let height_text = if null_hash_is_rectangle {
+                        "12345"
+                    } else {
+                        height_text_buf = format!("{}", on_screen_bc.block.this_height);
+                        &height_text_buf
+                    };
+                    // height
+                    draw_ctx.text_line(FontKind::Mono, origin_x + (x + 1.5)*screen_unit, here_text_y as f32, screen_unit, height_text, color);
+                } else {
+                    // hash
+                    let text_line_buf;
+                    let text_line = if null_hash_is_rectangle {
+                        &null_hash_display_string_star
+                    } else {
+                        text_line_buf = format!("{}*", &on_screen_bc.block.this_hash.display_str());
+                        &text_line_buf
+                    };
+                    let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
+                    draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y as f32, screen_unit, &text_line, color);
+                }
+            }
 
-        if let Some(parent) = viz_state.on_screen_bcs.get(&on_screen_bc.block.parent_hash) {
-            let px = parent.x;
-            let py = parent.y;
-            let dx = px-x;
-            let dy = py-y;
-            let (dx, dy, l) = split_vector(dx, dy);
-            draw_ctx.line(
-                origin_x + (x + dx * 2.0) * screen_unit,
-                origin_y + (y + dy * 2.0) * screen_unit,
-                origin_x + (x + dx * (l - 2.0))*screen_unit,
-                origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                arrow_and_line_width, COLOR_BC_LINK | (((on_screen_bc.alpha*255.0) as u32) << 24),
-            );
-        }
-        if let Some(pointing_at_bft) = viz_state.on_screen_bfts.get(&on_screen_bc.block.points_at_bft_block) {
-            let px = pointing_at_bft.x;
-            let py = pointing_at_bft.y;
-            let dx = px-x;
-            let dy = py-y;
-            let (dx, dy, l) = split_vector(dx, dy);
-            draw_ctx.arrow(
-                origin_x + (x + dx * 2.0) * screen_unit,
-                origin_y + (y + dy * 2.0) * screen_unit,
-                origin_x + (x + dx * (l - 2.0))*screen_unit,
-                origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                arrow_and_line_width, COLOR_BFT_LINK | (((on_screen_bc.alpha*on_screen_bc.bft_arrow_alpha*255.0) as u32) << 24),
-            );
+            if let Some(parent) = viz_state.on_screen_bcs.get(&on_screen_bc.block.parent_hash) {
+                let px = parent.x;
+                let py = parent.y;
+                let dx = px-x;
+                let dy = py-y;
+                let (dx, dy, l) = split_vector(dx, dy);
+                draw_ctx.line(
+                    origin_x + (x + dx * 2.0) * screen_unit,
+                    origin_y + (y + dy * 2.0) * screen_unit,
+                    origin_x + (x + dx * (l - 2.0))*screen_unit,
+                    origin_y + (y + dy * (l - 2.0) )*screen_unit,
+                    arrow_and_line_width, COLOR_BC_LINK | (((on_screen_bc.alpha*255.0) as u32) << 24),
+                );
+            }
+            if let Some(pointing_at_bft) = viz_state.on_screen_bfts.get(&on_screen_bc.block.points_at_bft_block) {
+                let px = pointing_at_bft.x;
+                let py = pointing_at_bft.y;
+                let dx = px-x;
+                let dy = py-y;
+                let (dx, dy, l) = split_vector(dx, dy);
+                draw_ctx.arrow(
+                    origin_x + (x + dx * 2.0) * screen_unit,
+                    origin_y + (y + dy * 2.0) * screen_unit,
+                    origin_x + (x + dx * (l - 2.0))*screen_unit,
+                    origin_y + (y + dy * (l - 2.0) )*screen_unit,
+                    arrow_and_line_width, COLOR_BFT_LINK | (((on_screen_bc.alpha*on_screen_bc.bft_arrow_alpha*255.0) as u32) << 24),
+                );
+            }
         }
     }
 
@@ -605,43 +686,53 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             viz_state.inspecting_block_screen_x = origin_x + (x*screen_unit);
             viz_state.inspecting_block_screen_y = origin_y + (y*screen_unit);
         }
-        draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bft.roundness, color);
-
-        // hash
-        draw_ctx.text_line(FontKind::Mono, (origin_x + (x + 1.5)*screen_unit) as f32, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit as f32, &on_screen_bft.block.this_hash.display_str(), color);
-
-        // height
-        let text_line = format!("{}", on_screen_bft.block.this_height);
-        let text_line_w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line);
-        draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5)*screen_unit - text_line_w, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &text_line, color);
-
-        if let Some(parent) = viz_state.on_screen_bfts.get(&on_screen_bft.block.parent_hash) {
-            let px = parent.x;
-            let py = parent.y;
-            let dx = px-x;
-            let dy = py-y;
-            let (dx, dy, l) = split_vector(dx, dy);
-            draw_ctx.line(
-                origin_x + (x + dx * 2.0) * screen_unit,
-                origin_y + (y + dy * 2.0) * screen_unit,
-                origin_x + (x + dx * (l - 2.0))*screen_unit,
-                origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                arrow_and_line_width, COLOR_BFT_LINK | (((on_screen_bft.alpha*255.0) as u32) << 24),
-            );
+        if very_zoom_out {
+            draw_ctx.rectangle(origin_x + (x*screen_unit) - screen_unit*5.0, origin_y + (y*screen_unit), origin_x + (x*screen_unit) + screen_unit*30.0, origin_y + (y*screen_unit) + screen_unit*4.0, (color&0xFFffFF) | ((color >> 26) << 24));
         }
-        if let Some(pointing_at_bc) = viz_state.on_screen_bcs.get(&on_screen_bft.block.points_at_bc_block) {
-            let px = pointing_at_bc.x;
-            let py = pointing_at_bc.y;
-            let dx = px-x;
-            let dy = py-y;
-            let (dx, dy, l) = split_vector(dx, dy);
-            draw_ctx.arrow(
-                origin_x + (x + dx * 2.0) * screen_unit,
-                origin_y + (y + dy * 2.0) * screen_unit,
-                origin_x + (x + dx * (l - 2.0))*screen_unit,
-                origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                arrow_and_line_width, COLOR_CROSS_LINK | (((on_screen_bft.alpha*255.0) as u32) << 24),
-            );
+        else {
+            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bft.roundness, color);
+        }
+
+        if very_zoom_out == false {
+            let here_text_y = (origin_y + (y - 0.5)*screen_unit);
+            if here_text_y <= draw_ctx.window_height as f32 && here_text_y + screen_unit >= 0.0 {
+                // hash
+                draw_ctx.text_line(FontKind::Mono, (origin_x + (x + 1.5)*screen_unit) as f32, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit as f32, &on_screen_bft.block.this_hash.display_str(), color);
+
+                // height
+                let text_line = format!("{}", on_screen_bft.block.this_height);
+                let text_line_w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line);
+                draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5)*screen_unit - text_line_w, (origin_y + (y - 0.5)*screen_unit) as f32, screen_unit, &text_line, color);
+            }
+
+            if let Some(parent) = viz_state.on_screen_bfts.get(&on_screen_bft.block.parent_hash) {
+                let px = parent.x;
+                let py = parent.y;
+                let dx = px-x;
+                let dy = py-y;
+                let (dx, dy, l) = split_vector(dx, dy);
+                draw_ctx.line(
+                    origin_x + (x + dx * 2.0) * screen_unit,
+                    origin_y + (y + dy * 2.0) * screen_unit,
+                    origin_x + (x + dx * (l - 2.0))*screen_unit,
+                    origin_y + (y + dy * (l - 2.0) )*screen_unit,
+                    arrow_and_line_width, COLOR_BFT_LINK | (((on_screen_bft.alpha*255.0) as u32) << 24),
+                );
+            }
+            if let Some(pointing_at_bc) = viz_state.on_screen_bcs.get(&on_screen_bft.block.points_at_bc_block) {
+                let px = pointing_at_bc.x;
+                let py = pointing_at_bc.y;
+                let dx = px-x;
+                let dy = py-y;
+                let (dx, dy, l) = split_vector(dx, dy);
+                draw_ctx.arrow(
+                    origin_x + (x + dx * 2.0) * screen_unit,
+                    origin_y + (y + dy * 2.0) * screen_unit,
+                    origin_x + (x + dx * (l - 2.0))*screen_unit,
+                    origin_y + (y + dy * (l - 2.0) )*screen_unit,
+                    arrow_and_line_width, COLOR_CROSS_LINK | (((on_screen_bft.alpha*255.0) as u32) << 24),
+                );
+            }
         }
     }
 

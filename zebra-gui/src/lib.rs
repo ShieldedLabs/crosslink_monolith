@@ -259,6 +259,15 @@ impl DrawCtx {
         }
     }
 
+    pub fn measure_text_line_is_rectangle(&self, font_kind: FontKind, text_height: f32, text_line: &str) -> bool {
+        if text_height <= 0.0 || text_height.is_normal() == false { return true; }
+        let text_height = text_height.min(8192.0);
+
+        if text_height < 3.0 {
+            return true;
+        }
+        return false;
+    }
     pub fn measure_text_line(&self, font_kind: FontKind, text_height: f32, text_line: &str) -> f32 {
         if text_height <= 0.0 || text_height.is_normal() == false { return 0.0; }
         let text_height = text_height.min(8192.0);
@@ -272,6 +281,8 @@ impl DrawCtx {
             return (factor * text_height * text_line.len() as f32) / 3.0;
         }
         let text_height = text_height.floor() as usize;
+
+        // TODO: hash parameters right here, use result as key into memoization cache/hashmap
 
         let (tracker, _) = self._find_or_create_font_tracker(text_height, font_kind);
         tracker.how_many_times_was_i_used += 1;
@@ -297,6 +308,8 @@ impl DrawCtx {
     }
 
     pub fn text_line(&self, font_kind: FontKind, text_x: f32, text_y: f32, text_height: f32, text_line: &str, color: u32) {
+        if text_y + text_height <= 0.0 || text_y >= self.window_height as f32 { return; }
+
         unsafe {
             if text_height <= 0.0 || text_height.is_normal() == false { return; }
             let text_height = text_height.min(8192.0);
@@ -414,6 +427,9 @@ impl DrawCtx {
 
     // (x1, y1) and (x2, y2) can be in any order
     pub fn line(&self, mut x1: f32, mut y1: f32, mut x2: f32, mut y2: f32, thickness: f32, color: u32) {
+        if (x1.max(x2) + thickness < 0.0) || (x1.min(x2) - thickness > self.window_width as f32) { return; }
+        if (y1.max(y2) + thickness < 0.0) || (y1.min(y2) - thickness > self.window_height as f32) { return; }
+
         unsafe {
             if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
@@ -457,6 +473,9 @@ impl DrawCtx {
     }
 
     pub fn rounded_rectangle(&self, x1: isize, y1: isize, x2: isize, y2: isize, radius_tl: isize, radius_tr: isize, radius_bl: isize, radius_br: isize, color: u32) {
+        if x2 < 0 || x1 > self.window_width { return; }
+        if y2 < 0 || y1 > self.window_height { return; }
+
         unsafe {
             if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
@@ -477,6 +496,9 @@ impl DrawCtx {
     }
 
     pub fn circle(&self, x: f32, y: f32, radius: f32, color: u32) {
+        if x + radius < 0.0 || x - radius > self.window_width as f32 { return; }
+        if y + radius < 0.0 || y - radius > self.window_height as f32 { return; }
+
         unsafe {
             if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
@@ -496,6 +518,9 @@ impl DrawCtx {
         }
     }
     pub fn circle_square(&self, x: f32, y: f32, radius: f32, round_pixels: f32, color: u32) {
+        if x + radius < 0.0 || x - radius > self.window_width as f32 { return; }
+        if y + radius < 0.0 || y - radius > self.window_height as f32 { return; }
+
         unsafe {
             if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
                 let put = self.draw_command_buffer.add(*self.draw_command_count);
@@ -679,7 +704,7 @@ struct DrawCtx {
     debug_pixel_inspector_last_color: *mut u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum DrawCommand {
     ClearScreenToColor {
         color: u32,
@@ -727,6 +752,14 @@ enum DrawCommand {
         glyph_bitmap_run: *const (u16, i16),
         glyph_bitmap_run_len: usize,
     },
+}
+
+impl Default for DrawCommand {
+    fn default() -> Self {
+        Self::ClearScreenToColor {
+            color: 0
+        }
+    }
 }
 
 struct FrameStat {
@@ -932,6 +965,9 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
     let mut window: Option<Rc<winit::window::Window>> = None;
     let mut softbuffer_context: Option<softbuffer::Context<Rc<winit::window::Window>>> = None;
     let mut softbuffer_surface: Option<softbuffer::Surface<Rc<winit::window::Window>, Rc<winit::window::Window>>> = None;
+
+    let mut modifiers = winit::keyboard::ModifiersState::default();
+
     #[allow(deprecated)]
     event_loop.run(move |event, elwt: &winit::event_loop::ActiveEventLoop| {
         match event {
@@ -1000,11 +1036,30 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                         input_ctx.inflight_mouse_events.push((button, state));
                                     }
                                 },
+                                winit::event::WindowEvent::ModifiersChanged(m) => {
+                                    modifiers = m.state();
+                                },
                                 winit::event::WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
-                                    if event.state.is_pressed() && event.repeat == false && event.physical_key == winit::keyboard::PhysicalKey::Code(KeyCode::KeyV) && (input_ctx.key_held(KeyCode::ControlLeft) || input_ctx.key_held(KeyCode::ControlRight))  {
+
+                                    let ctrl  = modifiers.control_key() || modifiers.super_key();
+
+                                    let is_paste = {
+
+                                        use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+                                        let key   = event.key_without_modifiers();
+
+                                        let shift = modifiers.shift_key();
+
+                                        let ctrl_v       = ctrl  && matches!(key, winit::keyboard::Key::Character(ref s) if s.eq_ignore_ascii_case("v"));
+                                        let shift_insert = shift && (key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Insert));
+
+                                        ctrl_v || shift_insert
+                                    };
+
+                                    if event.state.is_pressed() && is_paste {
                                         input_ctx.inflight_text_input.extend(&arboard::Clipboard::new().ok().map(|mut c| c.get_text().ok()).flatten().map(|s| s.chars().collect::<Vec<char>>()).unwrap_or_default());
                                     } else {
-                                        if let Some(text) = event.text && event.state.is_pressed() {
+                                        if !ctrl && let Some(text) = event.text && event.state.is_pressed() {
                                             input_ctx.inflight_text_input.extend(text.chars().filter(|c| *c >= ' ' && *c != 0x7f as char));
                                         }
 
@@ -1091,6 +1146,8 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             } else {
                                                 Some(input_ctx.inflight_text_input.clone())
                                             };
+
+                                            is_anything_happening_at_all_in_any_way |= !input_ctx.inflight_text_input.is_empty();
 
                                          // is_anything_happening_at_all_in_any_way |= input_ctx.mouse_down     != 0;
                                             is_anything_happening_at_all_in_any_way |= input_ctx.mouse_pressed  != 0;
@@ -1180,11 +1237,10 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 *draw_ctx.font_tracker_count = put;
                                             }
 
-                                            if input_ctx.key_pressed(KeyCode::Space) {
-                                                println!("woosh");
-
-                                                play_sound(SOUND_UI_WOOSH, 0.5+0.1*rand::random::<f32>(), 1.0+0.5*rand::random::<f32>());
-                                            }
+                                            // if input_ctx.key_pressed(KeyCode::Space) {
+                                            //     println!("woosh");
+                                            //     play_sound(SOUND_UI_WOOSH, 0.5+0.1*rand::random::<f32>(), 1.0+0.5*rand::random::<f32>());
+                                            // }
 
                                             // clear screen
                                             {

@@ -15,11 +15,9 @@ use sapling_crypto::{
 };
 use zcash_keys::{address::UnifiedAddress, keys::UnifiedFullViewingKey};
 use zcash_note_encryption::{BatchDomain, Domain, ENC_CIPHERTEXT_SIZE, ShieldedOutput};
-use zcash_primitives::{
-    memo::Memo,
-    transaction::{Transaction, TxId},
-    zip32::AccountId,
-};
+use zcash_protocol::memo::Memo;
+use zcash_primitives::transaction::{Transaction, TxId};
+use zip32::AccountId;
 use zcash_protocol::{
     ShieldedProtocol,
     consensus::{self, BlockHeight, NetworkConstants},

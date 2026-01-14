@@ -57,10 +57,8 @@ pub struct RawTransaction {
     /// the `RawTransaction` type are as follows:
     ///
     /// * height 0: the transaction is in the mempool
-    /// * height 0xffffffffffffffff: the transaction has been mined on a fork that
-    ///   is not currently the main chain
-    /// * any other height: the transaction has been mined in the main chain at the
-    ///   given height
+    /// * height 0xffffffffffffffff: the transaction has been mined on a fork that is not currently the main chain
+    /// * any other height: the transaction has been mined in the main chain at the given height
     #[prost(uint64, tag = "2")]
     pub height: u64,
 }

@@ -300,7 +300,7 @@ fn check_funding_stream_address_period(funding_streams: &FundingStreams, network
 }
 
 /// Configurable activation heights for Regtest and configured Testnets.
-#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct ConfiguredActivationHeights {
     /// Activation height for `BeforeOverwinter` network upgrade.

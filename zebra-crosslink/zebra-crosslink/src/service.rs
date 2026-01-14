@@ -6,6 +6,7 @@
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -20,7 +21,7 @@ use tracing::{error, info, warn};
 use zebra_chain::block::{Hash as BlockHash, Height as BlockHeight};
 use zebra_chain::transaction::Hash as TxHash;
 use zebra_node_services::mempool::{Request as MempoolRequest, Response as MempoolResponse};
-use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse};
+use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
 
 use crate::chain::BftBlock;
 use crate::FatPointerToBftBlock2;
@@ -62,6 +63,18 @@ pub(crate) type StateServiceProcedure = Arc<
         + Sync,
 >;
 
+pub(crate) type ReadStateServiceProcedure = Arc<
+    dyn Fn(
+            StateReadRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<StateReadResponse, Box<dyn std::error::Error + Send + Sync>>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 pub(crate) type MempoolServiceProcedure = Arc<
     dyn Fn(
             MempoolRequest,
@@ -96,6 +109,7 @@ pub(crate) type ForceFeedPoSBlockProcedure = Arc<
 #[derive(Clone)]
 pub struct TFLServiceCalls {
     pub(crate) state: StateServiceProcedure,
+    pub(crate) read_state: ReadStateServiceProcedure,
     pub(crate) mempool: MempoolServiceProcedure,
     pub(crate) force_feed_pow: ForceFeedPoWBlockProcedure,
     pub(crate) force_feed_pos: ForceFeedPoSBlockProcedure,
@@ -115,7 +129,9 @@ impl fmt::Debug for TFLServiceCalls {
 pub fn spawn_new_tfl_service(
     is_regtest: bool,
     global_seed: [u8; 32],
+    path_to_pos_store_file: PathBuf,
     state_service_call: StateServiceProcedure,
+    read_state_service_call: ReadStateServiceProcedure,
     mempool_service_call: MempoolServiceProcedure,
     force_feed_pow_call: ForceFeedPoWBlockProcedure,
     config: crate::config::Config,
@@ -127,7 +143,8 @@ pub fn spawn_new_tfl_service(
 
         for (i, peer) in config.malachite_peers.iter().enumerate() {
             let (_, _, public_key) = rng_private_public_key_from_address(peer.as_bytes());
-            array.push(crate::MalValidator::new(public_key, vec![StakeTxId{ txid: [0;32], zats:1 }]));
+            array.push(crate::MalValidator::new(public_key.into(), vec![StakeTxId{ txid: [0;32], zats:1 }]));
+            // array.push(crate::MalValidator::new(public_key, vec![StakeTxId{ txid: [0;32], zats:((i as u64) * 5) + 1 }])); // @Phillip @Testing
             map.insert(public_key, peer.to_string());
         }
 
@@ -143,7 +160,7 @@ pub fn spawn_new_tfl_service(
             // .unwrap_or(String::from_str("tester").unwrap());
             info!("user_name: {}", user_name);
             let (_, _, public_key) = rng_private_public_key_from_address(&user_name.as_bytes());
-            array.push(crate::MalValidator::new(public_key, vec![StakeTxId{ txid: [0;32], zats:1 }]));
+            array.push(crate::MalValidator::new(public_key.into(), vec![StakeTxId{ txid: [0;32], zats:1 }]));
             map.insert(public_key, user_name);
         }
 
@@ -164,6 +181,7 @@ pub fn spawn_new_tfl_service(
         validators_at_current_height,
         validators_keys_to_names,
         current_bc_final: None,
+        path_to_pos_store_file: path_to_pos_store_file.clone(),
     }));
 
     let handle_mtx = Arc::new(std::sync::Mutex::new(None));
@@ -180,7 +198,7 @@ pub fn spawn_new_tfl_service(
             };
             if accepted {
                 info!("Successfully force-fed BFT block");
-                crate::new_decided_bft_block_from_malachite(&handle, block.as_ref(), &fat_pointer)
+                crate::new_decided_bft_block_from_malachite(&handle, block.as_ref(), &fat_pointer, Vec::new())
                     .await;
                 true
             } else {
@@ -194,6 +212,7 @@ pub fn spawn_new_tfl_service(
         internal,
         call: TFLServiceCalls {
             state: state_service_call,
+            read_state: read_state_service_call,
             mempool: mempool_service_call,
             force_feed_pow: force_feed_pow_call,
             force_feed_pos,
@@ -209,7 +228,7 @@ pub fn spawn_new_tfl_service(
     let handle2 = handle1.clone();
     (
         handle1,
-        tokio::spawn(async move { crate::tfl_service_main_loop(handle2, global_seed).await }),
+        tokio::spawn(async move { crate::tfl_service_main_loop(handle2, global_seed, path_to_pos_store_file).await }),
     )
 }
 

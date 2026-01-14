@@ -16,7 +16,7 @@ use crate::constants::{mainnet, regtest, testnet};
 /// provided.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BlockHeight(u32);
+pub struct BlockHeight(pub u32);
 
 #[cfg(feature = "std")]
 memuse::impl_no_dynamic_usage!(BlockHeight);
