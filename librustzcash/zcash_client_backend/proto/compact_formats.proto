@@ -19,9 +19,9 @@ message ChainMetadata {
 // A compact representation of the shielded data in a Zcash block.
 //
 // CompactBlock is a packaging of ONLY the data from a block that's needed to:
-//   1. Detect a payment to your Shielded address
-//   2. Detect a spend of your Shielded notes
-//   3. Update your witnesses to generate new spend proofs.
+// One. Detect a payment to your Shielded address
+// Two. Detect a spend of your Shielded notes
+// Three. Update your witnesses to generate new spend proofs.
 message CompactBlock {
     uint32 protoVersion = 1;         // the version of this wire format, for storage
     uint64 height = 2;               // the height of this block
@@ -49,7 +49,7 @@ message CompactTx {
     // stateless server and a transaction with transparent inputs, this will be
     // unset because the calculation requires reference to prior transactions.
     // If there are no transparent inputs, the fee will be calculable as:
-    //    valueBalanceSapling + valueBalanceOrchard + sum(vPubNew) - sum(vPubOld) - sum(tOut)
+    // valueBalanceSapling + valueBalanceOrchard + sum(vPubNew) - sum(vPubOld) - sum(tOut)
     uint32 fee = 3;
 
     repeated CompactSaplingSpend spends = 4;

@@ -819,9 +819,9 @@ checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 
 [[package]]
 name = "bytes"
-version = "1.10.1"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
+checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
 
 [[package]]
 name = "bzip2-sys"
@@ -2117,6 +2117,7 @@ version = "0.2.2"
 dependencies = [
  "blake2b_simd",
  "core2 0.3.3",
+ "document-features",
 ]
 
 [[package]]
@@ -7444,10 +7445,8 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost 0.13.5",
- "rustls-pemfile",
  "socket2 0.5.10",
  "tokio",
- "tokio-rustls",
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",
@@ -7488,32 +7487,6 @@ dependencies = [
 
 [[package]]
 name = "tonic-build"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9557ce109ea773b399c9b9e5dca39294110b74f1f342cb347a80d1fce8c26a11"
-dependencies = [
- "prettyplease",
- "proc-macro2",
- "prost-build 0.13.5",
- "prost-types 0.13.5",
- "quote",
- "syn 2.0.106",
-]
-
-[[package]]
-name = "tonic-build"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eac6f67be712d12f0b41328db3137e0d0757645d8904b4cb7d51cd9c2279e847"
-dependencies = [
- "prettyplease",
- "proc-macro2",
- "quote",
- "syn 2.0.106",
-]
-
-[[package]]
-name = "tonic-build"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c40aaccc9f9eccf2cd82ebc111adc13030d23e887244bc9cfa5d1d636049de3"
@@ -7548,7 +7521,7 @@ dependencies = [
  "quote",
  "syn 2.0.106",
  "tempfile",
- "tonic-build 0.14.2",
+ "tonic-build",
 ]
 
 [[package]]
@@ -8264,8 +8237,9 @@ name = "wallet"
 version = "1.0.0-beta.1"
 dependencies = [
  "bip39",
+ "incrementalmerkletree",
  "orchard",
- "prost 0.13.5",
+ "prost 0.14.1",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
@@ -8276,11 +8250,12 @@ dependencies = [
  "sapling-crypto",
  "secp256k1",
  "secrecy",
+ "shardtree",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
  "tonic 0.14.2",
- "tonic-build 0.13.1",
+ "tonic-build",
  "zcash_client_backend",
  "zcash_client_memory",
  "zcash_client_sqlite",
@@ -9178,14 +9153,14 @@ dependencies = [
  "http",
  "indexmap 2.11.0",
  "jsonrpsee-types",
- "prost 0.13.5",
+ "prost 0.14.1",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
- "tonic 0.12.3",
+ "tonic 0.14.2",
  "tracing",
  "url",
  "zaino-proto",
@@ -9199,9 +9174,13 @@ dependencies = [
 name = "zaino-proto"
 version = "0.1.2"
 dependencies = [
- "prost 0.13.5",
- "tonic 0.12.3",
- "tonic-build 0.12.3",
+ "prost 0.14.1",
+ "sha2 0.10.9",
+ "tonic 0.14.2",
+ "tonic-build",
+ "tonic-prost",
+ "tonic-prost-build",
+ "walkdir",
  "which 4.4.2",
 ]
 
@@ -9209,12 +9188,13 @@ dependencies = [
 name = "zaino-serve"
 version = "0.1.2"
 dependencies = [
+ "bytes",
  "futures",
  "jsonrpsee",
  "serde",
  "thiserror 1.0.69",
  "tokio",
- "tonic 0.12.3",
+ "tonic 0.14.2",
  "tower 0.4.13",
  "tracing",
  "whoami",
@@ -9234,6 +9214,7 @@ dependencies = [
  "bitflags 2.9.4",
  "blake2",
  "bs58",
+ "bytes",
  "cargo-lock",
  "chrono",
  "core2 0.4.0",
@@ -9246,7 +9227,7 @@ dependencies = [
  "lmdb-sys",
  "nonempty",
  "primitive-types 0.13.1",
- "prost 0.13.5",
+ "prost 0.14.1",
  "reqwest",
  "serde",
  "serde_json",
@@ -9254,7 +9235,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
- "tonic 0.12.3",
+ "tonic 0.14.2",
  "tower 0.4.13",
  "tracing",
  "whoami",
@@ -9528,6 +9509,7 @@ dependencies = [
  "sapling-crypto",
  "secp256k1",
  "serde",
+ "serde-big-array",
  "sha2 0.10.9",
  "subtle",
  "tracing",
@@ -9761,7 +9743,7 @@ dependencies = [
  "miniquad",
  "multiaddr",
  "pin-project",
- "prost 0.13.5",
+ "prost 0.14.1",
  "prost-build 0.13.5",
  "rand 0.8.5",
  "rayon",
@@ -10203,10 +10185,11 @@ dependencies = [
 
 [[package]]
 name = "zip32"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13ff9ea444cdbce820211f91e6aa3d3a56bde7202d3c0961b7c38f793abf5637"
+checksum = "b64bf5186a8916f7a48f2a98ef599bf9c099e2458b36b819e393db1c0e768c4b"
 dependencies = [
+ "bech32",
  "blake2b_simd",
  "memuse",
  "subtle",

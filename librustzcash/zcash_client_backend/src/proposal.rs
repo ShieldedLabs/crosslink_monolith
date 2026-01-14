@@ -184,7 +184,7 @@ impl<NoteRef> ShieldedInputs<NoteRef> {
 pub struct Proposal<FeeRuleT, NoteRef> {
     fee_rule: FeeRuleT,
     min_target_height: TargetHeight,
-    steps: NonEmpty<Step<NoteRef>>,
+    pub steps: NonEmpty<Step<NoteRef>>,
 }
 
 impl<FeeRuleT, NoteRef> Proposal<FeeRuleT, NoteRef> {
@@ -378,7 +378,7 @@ impl StepOutput {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Step<NoteRef> {
     transaction_request: TransactionRequest,
-    payment_pools: BTreeMap<usize, PoolType>,
+    pub payment_pools: BTreeMap<usize, PoolType>,
     transparent_inputs: Vec<WalletTransparentOutput>,
     shielded_inputs: Option<ShieldedInputs<NoteRef>>,
     prior_step_inputs: Vec<StepOutput>,

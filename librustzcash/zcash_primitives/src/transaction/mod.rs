@@ -1340,25 +1340,27 @@ impl CommandBuf {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub enum StakingActionKind {
-    Add,
-    Sub,
-
-    /// "clear" to a given amount <= current voting power, probably 0
-    /// This exists alongside SUB because it's awkward to predict in advance the exact
-    /// voting power after block rewards have been accounted for.
-    Clear,
-    Move,
-    MoveClear,
+    Null,
+    CreateNewDelegationBond,
+    BeginDelegationUnbonding,
+    WithdrawDelegationBond,
+    RetargetDelegationBond,
+    
+    RegisterFinalizer,
+    ConvertFinalizerRewardToDelegationBond,
+    UpdateFinalizerKey,
 }
 impl From<StakingActionKind> for u8 {
     fn from(v: StakingActionKind) -> u8 {
         match v {
-            // 0 is reserved for None
-            StakingActionKind::Add       => 1,
-            StakingActionKind::Sub       => 2,
-            StakingActionKind::Clear     => 3,
-            StakingActionKind::Move      => 4,
-            StakingActionKind::MoveClear => 5,
+            StakingActionKind::Null => 0,
+            StakingActionKind::CreateNewDelegationBond => 1,
+            StakingActionKind::BeginDelegationUnbonding => 2,
+            StakingActionKind::WithdrawDelegationBond => 3,
+            StakingActionKind::RetargetDelegationBond => 4,
+            StakingActionKind::RegisterFinalizer => 5,
+            StakingActionKind::ConvertFinalizerRewardToDelegationBond => 6,
+            StakingActionKind::UpdateFinalizerKey => 7,
         }
     }
 }
@@ -1366,11 +1368,14 @@ impl TryFrom<u8> for StakingActionKind {
     type Error = ();
     fn try_from(v: u8) -> Result<StakingActionKind, ()> {
         match v {
-            1 => Ok(StakingActionKind::Add),
-            2 => Ok(StakingActionKind::Sub),
-            3 => Ok(StakingActionKind::Clear),
-            4 => Ok(StakingActionKind::Move),
-            5 => Ok(StakingActionKind::MoveClear),
+            0 => Ok(StakingActionKind::Null),
+            1 => Ok(StakingActionKind::CreateNewDelegationBond),
+            2 => Ok(StakingActionKind::BeginDelegationUnbonding),
+            3 => Ok(StakingActionKind::WithdrawDelegationBond),
+            4 => Ok(StakingActionKind::RetargetDelegationBond),
+            5 => Ok(StakingActionKind::RegisterFinalizer),
+            6 => Ok(StakingActionKind::ConvertFinalizerRewardToDelegationBond),
+            7 => Ok(StakingActionKind::UpdateFinalizerKey),
             _ => Err(()),
         }
     }
@@ -1383,6 +1388,23 @@ pub struct StakeTxId {
     pub zats: u64, // accumulated, not initial
 }
 impl StakeTxId {
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&self.txid)?;
+        w.write_all(&self.zats.to_le_bytes())?;
+        Ok(())
+    }
+
+    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+        let mut txid = [0u8; 32];
+        r.read_exact(&mut txid)?;
+
+        let mut zats_bytes = [0u8; 8];
+        r.read_exact(&mut zats_bytes)?;
+        let zats = u64::from_le_bytes(zats_bytes);
+
+        Ok(Self { txid, zats })
+    }
+    
     pub fn write_to_vec(&self, data: &mut std::vec::Vec<u8>) {
         data.write_all(&self.txid).unwrap();
         data.write_all(&self.zats.to_le_bytes()).unwrap();
@@ -1407,23 +1429,104 @@ impl RosterMember {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct StakingAction_CreateNewDelegationBond {
+    pub amount_zats: u64,
+    pub unique_pubkey: [u8; 32],
+    pub challenge: [u8; 32],
+    pub target_finalizer: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl StakingAction_CreateNewDelegationBond {
+    pub fn to_union(self) -> StakingAction {
+        StakingAction { kind: StakingActionKind::CreateNewDelegationBond, amount_zats: self.amount_zats, arg32_0: self.unique_pubkey, arg32_1: self.challenge, arg32_2: self.target_finalizer, arg64_0: self.signature, ..Default::default() }
+    }
+}
+
 // TODO(code org): should this be under zcash_protocol?
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct StakingAction {
     pub kind: StakingActionKind,
-    pub val: u64,
-    pub target: [u8; 32],
-    pub source: [u8; 32],
-    // temporary
-    pub insecure_target_name: std::string::String,
-    pub insecure_source_name: std::string::String,
+    pub amount_zats: u64,
+    pub arg32_0: [u8; 32],
+    pub arg32_1: [u8; 32],
+    pub arg32_2: [u8; 32],
+    pub arg32_3: [u8; 32],
+    #[serde(with = "serde_big_array::BigArray")]
+    pub arg64_0: [u8; 64],
+    #[serde(with = "serde_big_array::BigArray")]
+    pub arg64_1: [u8; 64],
 }
+impl Default for StakingAction {
+    fn default() -> Self {
+        StakingAction { kind: 0u8.try_into().unwrap(), amount_zats: 0, arg32_0: [0; 32], arg32_1: [0; 32], arg32_2: [0; 32], arg32_3: [0; 32], arg64_0: [0; 64], arg64_1: [0; 64] }
+    }
+}
+
 impl StakingAction {
     fn hash_to_state(&self, writer: &mut crate::encoding::StateWrite) -> Option<()> {
-        writer.write_all(&[u8::from(self.kind)]).ok()?;
-        writer.write_all(&self.val.to_le_bytes()).ok()?;
-        writer.write_all(&self.target).ok()?;
-        writer.write_all(&self.source).ok()
+        if self.kind == StakingActionKind::CreateNewDelegationBond {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            writer.write_all(&self.arg32_2).ok()?; // target finalizer
+            writer.write_u64_le(self.amount_zats).ok()?;
+            return Some(());
+        }
+        if self.kind == StakingActionKind::BeginDelegationUnbonding {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            return Some(());
+        }
+        if self.kind == StakingActionKind::WithdrawDelegationBond {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            writer.write_u64_le(self.amount_zats).ok()?;
+            return Some(());
+        }
+        if self.kind == StakingActionKind::RetargetDelegationBond {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            writer.write_all(&self.arg32_2).ok()?; // target finalizer
+            return Some(());
+        }
+        if self.kind == StakingActionKind::RegisterFinalizer {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            return Some(());
+        }
+        if self.kind == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            writer.write_all(&self.arg32_2).ok()?; // this finalizer
+            writer.write_u64_le(self.amount_zats).ok()?;
+            writer.write_all(&self.arg32_3).ok()?; // second challenge
+            writer.write_all(&self.arg64_1).ok()?; // finalizer signature
+            return Some(());
+        }
+        if self.kind == StakingActionKind::UpdateFinalizerKey {
+            writer.write_u8(u8::from(self.kind)).ok()?;
+            writer.write_all(&self.arg32_0).ok()?; // unique pubkey
+            writer.write_all(&self.arg32_1).ok()?; // challenge
+            writer.write_all(&self.arg64_0).ok()?; // signature
+            writer.write_all(&self.arg32_2).ok()?; // this finalizer
+            writer.write_all(&self.arg32_3).ok()?; // second challenge
+            writer.write_all(&self.arg64_1).ok()?; // finalizer signature
+            return Some(());
+        }
+        None
     }
 
     // TODO: fold in existing
@@ -1472,133 +1575,6 @@ impl StakingAction {
         Some(buf)
     }
 
-
-    pub fn to_cmd_string(&self) -> std::string::String {
-        let kind_str = match self.kind {
-            StakingActionKind::Add       => &"ADD",
-            StakingActionKind::Sub       => &"SUB",
-            StakingActionKind::Clear     => &"CLR",
-            StakingActionKind::Move      => &"MOV",
-            StakingActionKind::MoveClear => &"MCL",
-        };
-        let mut str = format!("{kind_str}|{}|{}", self.val, self.insecure_target_name);
-        if self.kind == StakingActionKind::Move || self.kind == StakingActionKind::MoveClear {
-            str.push_str(&format!("|{}", self.insecure_source_name));
-        }
-        str
-    }
-
-    pub fn parse_from_cmd(cmd_str: &str) -> Result<Option<StakingAction>, std::string::String> {
-        // @Dup
-        fn rng_private_public_key_from_address(
-            addr: &[u8],
-        ) -> (rand::rngs::StdRng, ed25519_zebra::SigningKey, ed25519_zebra::VerificationKey) {
-            use std::hash::{DefaultHasher, Hasher};
-            use rand::SeedableRng;
-            let mut hasher = DefaultHasher::new();
-            hasher.write(addr);
-            let seed = hasher.finish();
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            let private_key = ed25519_zebra::SigningKey::new(&mut rng);
-            let public_key = (&private_key).into();
-            (rng, private_key, public_key)
-        }
-
-        let cmd = cmd_str.as_bytes();
-
-        if cmd.len() == 0 {
-            // valid no-op
-            Ok(None)
-        } else if !(cmd.len() >= 4 && cmd[3] == b'|') {
-            Err(format!(
-                    "Roster command invalid: expected initial instruction\nCMD: \"{}\"",
-                    cmd_str
-            ))
-        } else {
-            let mut val_end = 4;
-            while val_end < cmd.len() && cmd[val_end] != b'|' {
-                val_end += 1;
-            }
-
-            let val_str = &cmd_str[4..val_end];
-            let maybe_val = str::parse::<u64>(val_str.trim());
-            // TODO (if this were anything close to production code): move these to before accepting them
-            if val_end + 1 >= cmd.len() {
-                Err(format!(
-                        "Roster command invalid: expected public address\nCMD: \"{}\"",
-                        cmd_str
-                ))
-            } else if let Err(err) = maybe_val {
-                Err(format!(
-                        "Roster command invalid: expected u64, received \"{}\" ({})\nCMD: \"{}\"",
-                        val_str, err, cmd_str
-                ))
-            } else {
-                let val = maybe_val.expect("already checked above");
-
-                let addr0_bgn = val_end + 1;
-
-                let mut addr0_end = addr0_bgn;
-                while addr0_end < cmd.len() && cmd[addr0_end] != b'|' {
-                    addr0_end += 1;
-                }
-
-                let (_, _, pub_key) =
-                    rng_private_public_key_from_address(&cmd[addr0_bgn..addr0_end]);
-
-                let (addr1_bgn, public_key1) = if addr0_end + 1 < cmd.len() {
-                    let addr1_bgn = addr0_end + 1;
-                    let (_, _, public_key1) = rng_private_public_key_from_address(&cmd[addr1_bgn..]);
-                    (Some(addr1_bgn), Some(public_key1))
-                } else {
-                    (None, None)
-                };
-
-                let insecure_target_name = std::string::String::from(&cmd_str[addr0_bgn..addr0_end]);
-                let mut insecure_source_name = std::string::String::new();
-                let mut source = [0u8; 32];
-
-                let kind = match cmd[..3] {
-                    [b'A', b'D', b'D'] => StakingActionKind::Add,
-                    [b'S', b'U', b'B'] => StakingActionKind::Sub,
-                    [b'C', b'L', b'R'] => StakingActionKind::Clear,
-
-                    [b'M', b'O', b'V'] => {
-                        let Some(pk) = public_key1 else {
-                            return Err(format!("Roster command invalid: can't move from non-present finalizer \"{}\"\nCMD: \"{}\"", insecure_source_name, cmd_str));
-                        };
-                        source = pk.into();
-                        insecure_source_name = std::string::String::from(&cmd_str[addr1_bgn.unwrap_or(cmd_str.len())..]);
-                        StakingActionKind::Move
-                    }
-
-                    [b'M', b'C', b'L'] => {
-                        let Some(pk) = public_key1 else {
-                            return Err(format!("Roster command invalid: can't clear from non-present finalizer \"{}\"\nCMD: \"{}\"", insecure_source_name, cmd_str));
-                        };
-                        source = pk.into();
-                        insecure_source_name = std::string::String::from(&cmd_str[addr1_bgn.unwrap_or(cmd_str.len())..]);
-                        StakingActionKind::MoveClear
-                    }
-
-                    _ => return Err(format!(
-                            "Roster command invalid: unrecognized instruction:\nCMD: \"{}\"",
-                            cmd_str
-                    )),
-                };
-
-                Ok(Some(StakingAction{
-                    kind,
-                    val,
-                    target: pub_key.into(),
-                    source,
-                    insecure_target_name,
-                    insecure_source_name,
-                }))
-            }
-        }
-    }
-
     pub fn read<R: Read>(
         mut reader: R,
     ) -> io::Result<Option<StakingAction>> {
@@ -1614,33 +1590,83 @@ impl StakingAction {
             ));
         };
 
-        let mut buf = [0u8; 8];
-        reader.read_exact(&mut buf)?;
-        let val = u64::from_le_bytes(buf);
-
-        // TODO: check against 0 in a way that doesn't break the rest of the block?
-        let mut target = [0u8; 32];
-        reader.read_exact(&mut target)?;
-
-        let mut source = [0u8; 32];
-        reader.read_exact(&mut source)?;
-
-        // TODO(@Prod): remove all of the following once we no longer have insecure user names
-        use std::string::ToString;
-
-        let target_name_len = reader.read_u8()? as usize;
-        let mut target_name_buf = vec![0u8; target_name_len];
-        reader.read_exact(&mut target_name_buf)?;
-        let insecure_target_name = std::string::String::from_utf8_lossy(&target_name_buf).to_string();
-
-        let source_name_len = reader.read_u8()? as usize;
-        let mut source_name_buf = vec![0u8; source_name_len];
-        reader.read_exact(&mut source_name_buf)?;
-        let insecure_source_name = std::string::String::from_utf8_lossy(&source_name_buf).to_string();
-
-        Ok(Some(StakingAction {
-            kind, val, source, target, insecure_target_name, insecure_source_name
-        }))
+        if kind == StakingActionKind::CreateNewDelegationBond {
+            let mut ret = StakingAction::default();
+            ret.kind = kind;
+            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
+            reader.read_exact(&mut ret.arg32_1)?; // challenge
+            reader.read_exact(&mut ret.arg64_0)?; // signature
+            reader.read_exact(&mut ret.arg32_2)?; // target finalizer
+            let mut buf = [0u8; 8];
+            reader.read_exact(&mut buf)?;
+            ret.amount_zats = u64::from_le_bytes(buf);
+            return Ok(Some(ret));
+        }
+        if kind == StakingActionKind::BeginDelegationUnbonding {
+            let mut ret = StakingAction::default();
+            ret.kind = kind;
+            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
+            reader.read_exact(&mut ret.arg32_1)?; // challenge
+            reader.read_exact(&mut ret.arg64_0)?; // signature
+            return Ok(Some(ret));
+        }
+        if kind == StakingActionKind::WithdrawDelegationBond {
+            let mut ret = StakingAction::default();
+            ret.kind = kind;
+            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
+            reader.read_exact(&mut ret.arg32_1)?; // challenge
+            reader.read_exact(&mut ret.arg64_0)?; // signature
+            let mut buf = [0u8; 8];
+            reader.read_exact(&mut buf)?;
+            ret.amount_zats = u64::from_le_bytes(buf);
+            return Ok(Some(ret));
+        }
+        if kind == StakingActionKind::RetargetDelegationBond {
+            let mut ret = StakingAction::default();
+            ret.kind = kind;
+            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
+            reader.read_exact(&mut ret.arg32_1)?; // challenge
+            reader.read_exact(&mut ret.arg64_0)?; // signature
+            reader.read_exact(&mut ret.arg32_2)?; // target finalizer
+            return Ok(Some(ret));
+        }
+        if kind == StakingActionKind::RegisterFinalizer {
+            let mut ret = StakingAction::default();
+            ret.kind = kind;
+            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
+            reader.read_exact(&mut ret.arg32_1)?; // challenge
+            reader.read_exact(&mut ret.arg64_0)?; // signature
+            return Ok(Some(ret));
+        }
+        if kind == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
+            let mut ret = StakingAction::default();
+            ret.kind = kind;
+            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
+            reader.read_exact(&mut ret.arg32_1)?; // challenge
+            reader.read_exact(&mut ret.arg64_0)?; // signature
+            reader.read_exact(&mut ret.arg32_2)?; // this finalizer
+            let mut buf = [0u8; 8];
+            reader.read_exact(&mut buf)?;
+            ret.amount_zats = u64::from_le_bytes(buf);
+            reader.read_exact(&mut ret.arg32_3)?; // second challenge
+            reader.read_exact(&mut ret.arg64_1)?; // finalizer signature
+            return Ok(Some(ret));
+        }
+        if kind == StakingActionKind::UpdateFinalizerKey {
+            let mut ret = StakingAction::default();
+            ret.kind = kind;
+            reader.read_exact(&mut ret.arg32_0)?; // unique pubkey
+            reader.read_exact(&mut ret.arg32_1)?; // challenge
+            reader.read_exact(&mut ret.arg64_0)?; // signature
+            reader.read_exact(&mut ret.arg32_2)?; // this finalizer
+            reader.read_exact(&mut ret.arg32_3)?; // second challenge
+            reader.read_exact(&mut ret.arg64_1)?; // finalizer signature
+            return Ok(Some(ret));
+        }
+        return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Kind is not implemented: {:?}", kind),
+        ));
     }
 
     pub fn write<W: Write>(
@@ -1648,19 +1674,71 @@ impl StakingAction {
         mut writer: W,
     ) -> io::Result<()> {
         if let Some(staking_action) = staking_action {
-            writer.write_u8(u8::from(staking_action.kind))?;
-            writer.write_u64_le(staking_action.val)?;
-            writer.write_all(&staking_action.target)?;
-            writer.write_all(&staking_action.source)?;
+            if staking_action.kind == StakingActionKind::CreateNewDelegationBond {
+                writer.write_u8(u8::from(staking_action.kind))?;
+                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
+                writer.write_all(&staking_action.arg32_1)?; // challenge
+                writer.write_all(&staking_action.arg64_0)?; // signature
+                writer.write_all(&staking_action.arg32_2)?; // target finalizer
+                writer.write_u64_le(staking_action.amount_zats)?;
+                return Ok(());
+            }
+            if staking_action.kind == StakingActionKind::BeginDelegationUnbonding {
+                writer.write_u8(u8::from(staking_action.kind))?;
+                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
+                writer.write_all(&staking_action.arg32_1)?; // challenge
+                writer.write_all(&staking_action.arg64_0)?; // signature
+                return Ok(());
+            }
+            if staking_action.kind == StakingActionKind::WithdrawDelegationBond {
+                writer.write_u8(u8::from(staking_action.kind))?;
+                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
+                writer.write_all(&staking_action.arg32_1)?; // challenge
+                writer.write_all(&staking_action.arg64_0)?; // signature
+                writer.write_u64_le(staking_action.amount_zats)?;
+                return Ok(());
+            }
+            if staking_action.kind == StakingActionKind::RetargetDelegationBond {
+                writer.write_u8(u8::from(staking_action.kind))?;
+                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
+                writer.write_all(&staking_action.arg32_1)?; // challenge
+                writer.write_all(&staking_action.arg64_0)?; // signature
+                writer.write_all(&staking_action.arg32_2)?; // target finalizer
+                return Ok(());
+            }
+            if staking_action.kind == StakingActionKind::RegisterFinalizer {
+                writer.write_u8(u8::from(staking_action.kind))?;
+                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
+                writer.write_all(&staking_action.arg32_1)?; // challenge
+                writer.write_all(&staking_action.arg64_0)?; // signature
+                return Ok(());
+            }
+            if staking_action.kind == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
+                writer.write_u8(u8::from(staking_action.kind))?;
+                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
+                writer.write_all(&staking_action.arg32_1)?; // challenge
+                writer.write_all(&staking_action.arg64_0)?; // signature
+                writer.write_all(&staking_action.arg32_2)?; // this finalizer
+                writer.write_u64_le(staking_action.amount_zats)?;
+                writer.write_all(&staking_action.arg32_3)?; // second challenge
+                writer.write_all(&staking_action.arg64_1)?; // finalizer signature
+                return Ok(());
+            }
+            if staking_action.kind == StakingActionKind::UpdateFinalizerKey {
+                writer.write_u8(u8::from(staking_action.kind))?;
+                writer.write_all(&staking_action.arg32_0)?; // unique pubkey
+                writer.write_all(&staking_action.arg32_1)?; // challenge
+                writer.write_all(&staking_action.arg64_0)?; // signature
+                writer.write_all(&staking_action.arg32_2)?; // this finalizer
+                writer.write_all(&staking_action.arg32_3)?; // second challenge
+                writer.write_all(&staking_action.arg64_1)?; // finalizer signature
+                return Ok(());
+            }
 
-            // TODO(@Prod): remove all of the following once we no longer have insecure user names
-            let target_len = usize::min(u8::MAX as usize, staking_action.insecure_target_name.len());
-            writer.write_u8(target_len as u8)?;
-            writer.write_all(&staking_action.insecure_target_name.as_bytes()[..target_len])?;
-
-            let source_len = usize::min(u8::MAX as usize, staking_action.insecure_source_name.len());
-            writer.write_u8(source_len as u8)?;
-            writer.write_all(&staking_action.insecure_source_name.as_bytes()[..source_len])
+            return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("Kind is not implemented: {:?}", staking_action.kind),
+            ));
         } else {
             writer.write_u8(0)
         }
@@ -1671,23 +1749,62 @@ impl std::fmt::Display for StakingAction {
         let mut fmter = f.debug_struct("StakingAction");
 
         fmter.field("kind", match self.kind {
-            StakingActionKind::Add       => &"Add",
-            StakingActionKind::Sub       => &"Sub",
-            StakingActionKind::Clear     => &"Clear",
-            StakingActionKind::Move      => &"Move",
-            StakingActionKind::MoveClear => &"MoveClear",
+            StakingActionKind::Null => &"Null",
+            StakingActionKind::CreateNewDelegationBond => &"CreateNewDelegationBond",
+            StakingActionKind::BeginDelegationUnbonding => &"BeginDelegationUnbonding",
+            StakingActionKind::WithdrawDelegationBond => &"WithdrawDelegationBond",
+            StakingActionKind::RetargetDelegationBond => &"RetargetDelegationBond",
+            StakingActionKind::RegisterFinalizer => &"RegisterFinalizer",
+            StakingActionKind::ConvertFinalizerRewardToDelegationBond => &"ConvertFinalizerRewardToDelegationBond",
+            StakingActionKind::UpdateFinalizerKey => &"UpdateFinalizerKey",
         });
 
-        fmter.field("val", &self.val);
-
-        fmter.field("target", &self.target);
-        fmter.field("insecure_target_name", &self.insecure_target_name);
-
-        if self.kind == StakingActionKind::Move || self.kind == StakingActionKind::MoveClear {
-            fmter.field("source", &self.source);
-            fmter.field("insecure_source_name", &self.insecure_source_name);
+        if self.kind == StakingActionKind::CreateNewDelegationBond {
+            fmter.field("unique_public_key", &self.arg32_0);
+            fmter.field("challenge", &self.arg32_1);
+            fmter.field("signature", &self.arg64_0);
+            fmter.field("target_finalizer", &self.arg32_2);
+            fmter.field("amount_zats", &self.amount_zats);
         }
-
+        if self.kind == StakingActionKind::BeginDelegationUnbonding {
+            fmter.field("unique_public_key", &self.arg32_0);
+            fmter.field("challenge", &self.arg32_1);
+            fmter.field("signature", &self.arg64_0);
+        }
+        if self.kind == StakingActionKind::WithdrawDelegationBond {
+            fmter.field("unique_public_key", &self.arg32_0);
+            fmter.field("challenge", &self.arg32_1);
+            fmter.field("signature", &self.arg64_0);
+            fmter.field("amount_zats", &self.amount_zats);
+        }
+        if self.kind == StakingActionKind::RetargetDelegationBond {
+            fmter.field("unique_public_key", &self.arg32_0);
+            fmter.field("challenge", &self.arg32_1);
+            fmter.field("signature", &self.arg64_0);
+            fmter.field("target_finalizer", &self.arg32_2);
+        }
+        if self.kind == StakingActionKind::RegisterFinalizer {
+            fmter.field("unique_public_key", &self.arg32_0);
+            fmter.field("challenge", &self.arg32_1);
+            fmter.field("signature", &self.arg64_0);
+        }
+        if self.kind == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
+            fmter.field("unique_public_key", &self.arg32_0);
+            fmter.field("challenge", &self.arg32_1);
+            fmter.field("signature", &self.arg64_0);
+            fmter.field("this_finalizer", &self.arg32_2);
+            fmter.field("amount_zats", &self.amount_zats);
+            fmter.field("second_challenge", &self.arg32_3);
+            fmter.field("finalizer_signature", &self.arg64_1);
+        }
+        if self.kind == StakingActionKind::UpdateFinalizerKey {
+            fmter.field("unique_public_key", &self.arg32_0);
+            fmter.field("challenge", &self.arg32_1);
+            fmter.field("signature", &self.arg64_0);
+            fmter.field("this_finalizer", &self.arg32_2);
+            fmter.field("second_challenge", &self.arg32_3);
+            fmter.field("finalizer_signature", &self.arg64_1);
+        }
         fmter.finish()
     }
 }

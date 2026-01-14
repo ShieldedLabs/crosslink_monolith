@@ -10,7 +10,8 @@ use tokio::sync::mpsc;
 use incrementalmerkletree::Position;
 use zcash_client_backend::proto::compact_formats::{CompactBlock, CompactTx};
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_primitives::{transaction::TxId, zip32::AccountId};
+use zcash_primitives::transaction::TxId;
+use zip32::AccountId;
 use zcash_protocol::consensus::{self, BlockHeight};
 
 use crate::{

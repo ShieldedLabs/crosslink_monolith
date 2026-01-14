@@ -9,7 +9,7 @@ use pepper_sync::sync::ScanRange;
 use pepper_sync::wallet::NoteInterface;
 use zcash_client_backend::data_api::wallet::SpendingKeys;
 use zcash_client_backend::proposal::Proposal;
-use zcash_primitives::consensus::BlockHeight;
+use zcash_protocol::consensus::BlockHeight;
 use zcash_primitives::transaction::Transaction;
 use zcash_primitives::transaction::TxId;
 use zcash_primitives::transaction::fees::zip317;
@@ -145,6 +145,7 @@ impl LightWallet {
             &SpendingKeys::new(usk),
             zcash_client_backend::wallet::OvkPolicy::Sender,
             proposal,
+            None,
         )
         .map_err(CalculateTransactionError::Calculation)
     }
@@ -353,7 +354,7 @@ mod tests {
 
     use zcash_address::ZcashAddress;
     use zcash_client_backend::zip321::TransactionRequest;
-    use zcash_primitives::memo::{Memo, MemoBytes};
+    use zcash_protocol::memo::{Memo, MemoBytes};
     use zcash_protocol::value::Zatoshis;
 
     use crate::data::receivers::{Receivers, transaction_request_from_receivers};

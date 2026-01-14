@@ -56,12 +56,13 @@ impl fmt::Display for BuildInfo {
 
 /// Returns build info for Zingo-Indexer.
 pub(crate) fn get_build_info() -> BuildInfo {
+    // Note(Sam): Including git info in the build is cool but causes a huge amount of issues when using it as a library.
     BuildInfo {
-        commit_hash: env!("GIT_COMMIT").to_string(),
-        branch: env!("BRANCH").to_string(),
-        build_date: env!("BUILD_DATE").to_string(),
-        build_user: env!("BUILD_USER").to_string(),
-        version: env!("VERSION").to_string(),
+        commit_hash: "GIT_COMMIT".to_owned(),
+        branch: "BRANCH".to_owned(),
+        build_date: "BUILD_DATE".to_owned(),
+        build_user: "BUILD_USER".to_owned(),
+        version: "VERSION".to_owned(),
     }
 }
 

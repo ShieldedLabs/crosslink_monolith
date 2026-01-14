@@ -1,0 +1,34 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug zebrad (viz_gui)",
+      "type": "lldb",
+      "request": "launch",
+
+      "cargo": {
+        "args": [
+          "run",
+          "--manifest-path",
+          "${workspaceFolder}/zebra-crosslink/Cargo.toml",
+          "--features",
+          "viz_gui",
+          "--bin",
+          "zebrad"
+        ]
+      },
+
+      "args": [
+        "-c",
+        "${workspaceFolder}/../regtest.toml"
+      ],
+
+      "env": {
+        "RUSTFLAGS": "-Awarnings"
+      },
+
+      "cwd": "${workspaceFolder}/zebra-crosslink",
+      "sourceLanguages": ["rust"]
+    }
+  ]
+}

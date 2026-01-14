@@ -16,9 +16,11 @@ use zcash_client_backend::{
     proto::compact_formats::CompactBlock, serialization::shardtree::read_shard,
 };
 use zcash_encoding::{CompactSize, Optional, Vector};
-use zcash_primitives::{
+use zcash_protocol::{
     consensus::BlockHeight,
     memo::{Memo, MemoBytes},
+};
+use zcash_primitives::{
     merkle_tree::{HashSer, read_commitment_tree, read_incremental_witness},
     transaction::TxId,
 };

@@ -9,7 +9,7 @@ use pepper_sync::{
 };
 use unified::{ReceiverSelection, UnifiedAddressId};
 use zcash_keys::address::UnifiedAddress;
-use zcash_primitives::legacy::{TransparentAddress, keys::NonHardenedChildIndex};
+use zcash_transparent::{address::TransparentAddress, keys::NonHardenedChildIndex};
 use zip32::DiversifierIndex;
 
 use super::{LightWallet, error::KeyError};

@@ -10,4 +10,5 @@ license = "MIT"
 
 [dependencies]
 zcash_primitives = { workspace = true }
+zcash_protocol = { workspace = true }
 byteorder = { workspace = true }

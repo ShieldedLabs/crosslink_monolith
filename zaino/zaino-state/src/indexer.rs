@@ -614,6 +614,12 @@ pub trait LightWalletIndexer: Send + Sync + Clone + ZcashIndexer + 'static {
         request: TransparentAddressBlockFilter,
     ) -> Result<RawTransactionStream, Self::Error>;
 
+    /// Return the transactions corresponding to the given t-address within the given block range
+    async fn get_taddress_transactions(
+        &self,
+        request: TransparentAddressBlockFilter,
+    ) -> Result<RawTransactionStream, Self::Error>;
+
     /// Returns the total balance for a list of taddrs
     async fn get_taddress_balance(&self, request: AddressList) -> Result<Balance, Self::Error>;
 

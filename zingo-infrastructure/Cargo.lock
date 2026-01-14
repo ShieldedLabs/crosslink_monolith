@@ -1458,6 +1458,7 @@ version = "0.2.2"
 dependencies = [
  "blake2b_simd",
  "core2 0.3.3",
+ "document-features",
 ]
 
 [[package]]
@@ -5396,6 +5397,7 @@ dependencies = [
  "socket2",
  "static_assertions",
  "tokio",
+ "zebra-chain",
 ]
 
 [[package]]
@@ -5703,18 +5705,6 @@ dependencies = [
 
 [[package]]
 name = "tonic-build"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eac6f67be712d12f0b41328db3137e0d0757645d8904b4cb7d51cd9c2279e847"
-dependencies = [
- "prettyplease",
- "proc-macro2",
- "quote",
- "syn 2.0.110",
-]
-
-[[package]]
-name = "tonic-build"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c40aaccc9f9eccf2cd82ebc111adc13030d23e887244bc9cfa5d1d636049de3"
@@ -5749,7 +5739,7 @@ dependencies = [
  "quote",
  "syn 2.0.110",
  "tempfile",
- "tonic-build 0.14.2",
+ "tonic-build",
 ]
 
 [[package]]
@@ -6225,8 +6215,9 @@ name = "wallet"
 version = "1.0.0-beta.1"
 dependencies = [
  "bip39",
+ "incrementalmerkletree",
  "orchard",
- "prost 0.13.5",
+ "prost 0.14.1",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
@@ -6237,11 +6228,12 @@ dependencies = [
  "sapling-crypto",
  "secp256k1",
  "secrecy",
+ "shardtree",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
  "tonic",
- "tonic-build 0.13.1",
+ "tonic-build",
  "zcash_client_backend",
  "zcash_client_memory",
  "zcash_client_sqlite",
@@ -7289,6 +7281,7 @@ dependencies = [
  "sapling-crypto",
  "secp256k1",
  "serde",
+ "serde-big-array",
  "sha2 0.10.9",
  "subtle",
  "tracing",
@@ -7498,7 +7491,7 @@ dependencies = [
  "libp2p-identity",
  "multiaddr",
  "pin-project",
- "prost 0.13.5",
+ "prost 0.14.1",
  "prost-build 0.13.5",
  "rand 0.8.5",
  "rayon",
@@ -7667,6 +7660,7 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "tracing",
+ "zcash_primitives",
  "zebra-chain",
 ]
 

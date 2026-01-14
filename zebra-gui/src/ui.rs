@@ -9,9 +9,10 @@ use clay::{Clay, Declaration};
 use clay::render_commands::RenderCommandConfig;
 use clay::render_commands::RenderCommandConfig::{Rectangle, ScissorStart, ScissorEnd};
 use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
+use std::collections::HashMap;
 //use clay::*; // @Temporary
 
-use wallet::str_from_ctaz;
+use wallet::{ BlockHeight, WalletState, WalletTxKind, str_from_ctaz };
 
 use super::*;
 
@@ -27,6 +28,8 @@ pub struct UiData {
     pub send_address:  String,
     pub stake_address: String,
     pub recv_address:  String,
+
+    pub textboxes: HashMap<u32, TextboxState>,
 }
 
 
@@ -45,7 +48,7 @@ impl UiData {
 }
 
 pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
-    if ui.input().key_pressed(KeyCode::Tab) {
+    if ui.input().key_pressed(KeyCode::Backquote) {
         ui.debug = !ui.debug;
     }
     if ui.input().key_pressed(KeyCode::F5) {
@@ -87,14 +90,14 @@ pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
     return false;
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum Floating  { #[default] None, Parent, Root(f32, f32) }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum ClipMode  { #[default] None, Clip, Scroll(f32, f32) }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum AlignX    { #[default] Left, Right, Center }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum AlignY    { #[default] Top, Bottom, Center }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub struct Align   { x: AlignX, y: AlignY }
-#[derive(Debug,          Copy, Clone, PartialEq)] pub enum Sizing    { Fit(f32, f32), Grow(f32, f32), Fixed(f32), Percent(f32) }
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub struct Id { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum Floating  { #[default] None, Parent, Root(f32, f32) }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum ClipMode  { #[default] None, Clip, Scroll(f32, f32) }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignX    { #[default] Left, Right, Center }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignY    { #[default] Top, Bottom, Center }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Align   { x: AlignX, y: AlignY }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]                         pub enum Sizing    { Fit(f32, f32), Grow(f32, f32), Fixed(f32), Percent(f32) }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Id { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
 impl Default for Sizing { fn default() -> Self { Self::Fit(0.0, f32::MAX) } }
 impl Align {
     pub const TopLeft:     Self = Self { y: AlignY::Top,    x: AlignX::Left };
@@ -180,14 +183,14 @@ pub struct TextDecl {
     h: f32,
     colour: (u8, u8, u8, u8),
     align: AlignX,
-    break_word: bool,
+    wrap_chars: bool,
 }
 pub const TextDecl: TextDecl = TextDecl {
     font: FontKind::Normal,
     h: 0.0,
     colour: WHITE,
     align: AlignX::Left,
-    break_word: false,
+    wrap_chars: false,
 };
 
 
@@ -298,7 +301,7 @@ impl Element {
             r: item.colour.0 as f32,
             g: item.colour.1 as f32,
             b: item.colour.2 as f32,
-            a: item.colour.3 as f32
+            a: (item.colour.3 | 0x01) as f32
         };
         decl.id = item.id.clay().id;
         let clipping = match item.clip { ClipMode::None => false, _ => true };
@@ -461,36 +464,41 @@ impl Context {
 
     pub fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
 
-    pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: bool) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
-        let mouse_held     = self.input().mouse_held(winit::event::MouseButton::Left);
-        let mouse_pressed  = self.input().mouse_pressed(winit::event::MouseButton::Left);
-        let mouse_released = self.input().mouse_released(winit::event::MouseButton::Left);
+    pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: winit::window::CursorIcon) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
 
-        let hover    = self.hovered(id);
-        let down     = hover && mouse_held;
-        let pressed  = hover && mouse_pressed;
-        let released = hover && mouse_released;
-        if pressed {
-            self.clicked_id = id;
+        let mouse_hover = self.hovered(id);
+        let key_hover   = self.nav_enable && self.nav_id == id.id;
+
+        let mouse_held     = mouse_hover && self.input().mouse_held(winit::event::MouseButton::Left);
+        let mouse_pressed  = mouse_hover && self.input().mouse_pressed(winit::event::MouseButton::Left);
+        let mouse_released = mouse_hover && self.input().mouse_released(winit::event::MouseButton::Left);
+
+        let key_held     = key_hover && self.input().key_held(winit::keyboard::KeyCode::Enter);
+        let key_pressed  = key_hover && self.input().key_pressed(winit::keyboard::KeyCode::Enter);
+        let key_released = key_hover && self.input().key_released(winit::keyboard::KeyCode::Enter);
+
+        if mouse_pressed { self.mouse_pressed_id = id; }
+        if key_pressed   { self.key_pressed_id   = id; }
+        let mouse_activated  = enabled && self.mouse_pressed_id == id && if act_on_press { mouse_pressed } else { mouse_released };
+        let key_activated    = enabled && self.key_pressed_id   == id && if act_on_press { key_pressed   } else { key_released   };
+
+        if mouse_hover && pointer_on_hover != winit::window::CursorIcon::Default {
+            self.cursor = winit::window::Cursor::Icon(pointer_on_hover);
         }
 
-        if hover && pointer_on_hover {
-            self.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Pointer);
-        }
-
-        let activated = enabled && (self.clicked_id == id) && if act_on_press {
-            pressed
-        } else {
-            released
-        };
+        let held      = mouse_held      || key_held;
+        let hover     = mouse_hover     || key_hover;
+        let pressed   = mouse_pressed   || key_pressed;
+        let released  = mouse_released  || key_released;
+        let activated = mouse_activated || key_activated;
 
         let mut hsva = colour.hsva();
         if !enabled {
             hsva.2 = hsva.2.mul(0.75);
             hsva.1 = hsva.1.mul(0.75);
-        } else if !down && hover {
+        } else if !held && hover {
             hsva.2 = ((hsva.2 as f32) * 1.25).min(255.0) as u8;
-        } else if down && self.clicked_id.id == id.id {
+        } else if held && (self.mouse_pressed_id == id || self.key_pressed_id == id) {
             hsva.2 = hsva.2.mul(0.85);
         }
         let colour = hsva.rgba();
@@ -510,10 +518,17 @@ impl Context {
         }
         let text_colour = text_hsva.rgba();
 
+        if !self.nav_skip && !self.nav_id_to_idx.contains_key(&id.id) {
+            let n = self.nav_id_to_idx.len();
+            assert!(n == self.nav_idx_to_id.len());
+            self.nav_id_to_idx.insert(id.id, n);
+            self.nav_idx_to_id.push(id.id);
+        }
+
         (activated, colour, text_colour)
     }
 
-    pub fn button(&mut self, id: Id) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) { return self.button_ex(true, BUTTON_GREY, id, true, false); }
+    pub fn button(&mut self, id: Id) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) { return self.button_ex(true, BUTTON_GREY, id, true, winit::window::CursorIcon::Default); }
 
     pub fn text(&self, label: &str, decl: TextDecl) {
         let config = clay::text::TextConfig::new()
@@ -525,11 +540,11 @@ impl Context {
                 AlignX::Right  => clay::text::TextAlignment::Right,
                 AlignX::Center => clay::text::TextAlignment::Center,
             })
-            // .wrap_mode(if decl.break_word {
-            //     clay::text::TextElementConfigWrapMode::BreakWord
-            // } else {
-            //     clay::text::TextElementConfigWrapMode::Words
-            // })
+            .wrap_mode(if decl.wrap_chars {
+                clay::text::TextElementConfigWrapMode::Chars
+            } else {
+                clay::text::TextElementConfigWrapMode::Words
+            })
             .end();
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
     }
@@ -572,6 +587,141 @@ impl Context {
         let id = id(label);
         self.tab_ex(radius, padding, tab_id, id, label)
     }
+
+    pub fn textbox(&mut self, data: &mut UiData, id: Id, hint: &str, text_decl: TextDecl) -> String {
+        let child_gap = self.scale(12.0); // @Duplicate :TextBox
+        let padding   = child_gap.dup4(); // @Duplicate :TextBox
+        let radius    = child_gap.dup4(); // @Duplicate :TextBox
+
+        let (activated, colour, text_colour) = self.button_ex(true, BUTTON_GREY, id, true, winit::window::CursorIcon::Text);
+
+        if activated {
+            self.nav_id = id.id;
+            self.nav_enable = true;
+        }
+
+        let text = {
+            let mut textbox_state = &mut data.textboxes.entry(id.id).or_default();
+
+            textbox_state.h = text_decl.h;
+
+            if self.nav_id == id.id {
+                let mut moved = false;
+
+                let shift = (self.input().key_held(KeyCode::ShiftLeft)   || self.input().key_held(KeyCode::ShiftRight));
+                let ctrl  = (self.input().key_held(KeyCode::ControlLeft) || self.input().key_held(KeyCode::ControlRight));
+
+                if !shift && textbox_state.selection.1 != textbox_state.selection.0 {
+                    let (min, max) = (textbox_state.selection.0.min(textbox_state.selection.1),
+                                      textbox_state.selection.0.max(textbox_state.selection.1));
+                    if self.input().key_pressed(KeyCode::ArrowRight) { moved = true; textbox_state.selection.0 = max; }
+                    if self.input().key_pressed(KeyCode::ArrowLeft)  { moved = true; textbox_state.selection.0 = min; }
+                } else {
+                    if self.input().key_pressed(KeyCode::ArrowRight) { moved = true;                                      { textbox_state.selection.0 += 1; }   }
+                    if self.input().key_pressed(KeyCode::ArrowLeft)  { moved = true; { if (textbox_state.selection.0 > 0) { textbox_state.selection.0 -= 1; } } }
+                }
+
+                if self.input().key_pressed(KeyCode::Home)       { moved = true; textbox_state.selection.0 = 0; }
+                if self.input().key_pressed(KeyCode::ArrowUp)    { moved = true; textbox_state.selection.0 = 0; }
+
+                if self.input().key_pressed(KeyCode::End)        { moved = true; textbox_state.selection.0 = textbox_state.text_buf.len(); }
+                if self.input().key_pressed(KeyCode::ArrowDown)  { moved = true; textbox_state.selection.0 = textbox_state.text_buf.len(); }
+
+                textbox_state.selection.0 = textbox_state.selection.0.min(textbox_state.text_buf.len());
+                textbox_state.selection.1 = textbox_state.selection.1.min(textbox_state.text_buf.len());
+
+                if moved && !shift {
+                    textbox_state.selection.1 = textbox_state.selection.0;
+                }
+
+                let has_selection = (textbox_state.selection.1 != textbox_state.selection.0);
+
+                let select_all = (ctrl && self.input().key_pressed(KeyCode::KeyA)) || activated;
+                let copy       = (ctrl && self.input().key_pressed(KeyCode::KeyC));
+                let cut        = (ctrl && self.input().key_pressed(KeyCode::KeyX)) || (shift && self.input().key_pressed(KeyCode::Delete));
+
+                let backspace = self.input().key_pressed(KeyCode::Backspace);
+                let delete    = self.input().key_pressed(KeyCode::Delete);
+                let has_input = self.input().text_input.is_some();
+
+                let should_copy = has_selection && (copy || cut);
+                let should_cut  = has_selection && cut;
+
+                if select_all {
+                    textbox_state.selection.1 = 0;
+                    textbox_state.selection.0 = textbox_state.text_buf.len();
+                }
+
+                // Sort selection
+                let (mut min, mut max) = (textbox_state.selection.0.min(textbox_state.selection.1),
+                                          textbox_state.selection.0.max(textbox_state.selection.1));
+
+                if min == max {
+                    if backspace   { min = min.saturating_sub(1); }
+                    else if delete { max = max.saturating_add(1); }
+                }
+
+                min = min.min(textbox_state.text_buf.len());
+                max = max.min(textbox_state.text_buf.len());
+
+                if should_copy {
+                    // Send text at selection to clipboard
+                    let slice = &textbox_state.text_buf[min..max];
+
+                    let mut text = String::with_capacity(slice.len() * 4);
+                    text.extend(slice.iter().copied());
+                    self.input().send_to_clipboard(&text);
+                }
+
+                if (backspace || delete || should_cut || has_input) {
+                    // Replace text at selection with text input
+                    let pre_slice = &textbox_state.text_buf[..min];
+                    let pst_slice = &textbox_state.text_buf[max..];
+
+                    let input_len = if let Some(input) = &self.input().text_input { input.len() } else { 0 };
+
+                    let mut new_buf = Vec::with_capacity(pre_slice.len() + input_len + pst_slice.len());
+                    new_buf.extend_from_slice(pre_slice);
+                    if let Some(input) = &self.input().text_input {
+                        new_buf.extend_from_slice(input);
+                    }
+                    new_buf.extend_from_slice(pst_slice);
+
+                    textbox_state.text_buf = new_buf;
+                    textbox_state.selection.0 = min + input_len;
+
+                    textbox_state.selection.1 = textbox_state.selection.0;
+                }
+            }
+
+            let mut text = String::with_capacity(textbox_state.text_buf.len() * 4);
+            text.extend(textbox_state.text_buf.iter().copied());
+
+            text
+        };
+
+        let str = frame_strf!(data, "{} ", text); // space character to force empty strings to have a height in clay
+
+        if let _ = elem().decl(Decl {
+            id,
+            padding, child_gap, radius,
+            width: grow!(),
+            height: fit!(),
+            colour,
+            ..Decl
+        }) {
+
+            let use_hint  = text.len() <= 0;
+            let str       = if use_hint { hint } else { str };
+            let colour    = if use_hint { let mut hsva = text_colour.hsva(); hsva.2 /= 2; hsva.rgba() } else { text_colour };
+            let text_decl = TextDecl { colour, ..text_decl };
+
+            self.text(&str, text_decl);
+        }
+
+        text
+    }
+
 }
 
 pub trait     Dup2: Copy { fn dup2(self) -> (Self, Self); }
@@ -601,14 +751,45 @@ impl<A: Mul, B: Mul>                 Mul for (A, B)       { #[inline(always)] fn
 impl<A: Mul, B: Mul, C: Mul>         Mul for (A, B, C)    { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f)) } }
 impl<A: Mul, B: Mul, C: Mul, D: Mul> Mul for (A, B, C, D) { #[inline(always)] fn mul(self, f: f32) -> Self { (self.0.mul(f), self.1.mul(f), self.2.mul(f), self.3.mul(f)) } }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TextboxState {
+    pub text_buf: Vec<char>,
+    pub selection: (usize, usize),
+    pub bbox: (isize, isize, isize, isize),
+    pub h: f32,
+}
+
 pub fn ui_left_pane(ui: &mut Context,
-                wallet_state: Arc<Mutex<wallet::WalletState>>,
+                wallet_state: Arc<Mutex<WalletState>>,
                 data: &mut UiData,
                 viz: &mut VizState,
                 child_gap: f32,
                 padding: (f32, f32, f32, f32),
                 radius:  (f32, f32, f32, f32),
                 tab_id: &mut Id) {
+
+    let mut tab_id_user_wallet  = Id::default();
+    let mut tab_id_miner_wallet = Id::default();
+
+    // @Hack.
+    ui.nav_skip = (ui.modal != Modal::None);
+    if let _ = elem().decl(Decl {
+        id: id("Tab Bar"),
+        child_gap,
+        width: percent!(1.0),
+        height: fit!(),
+        align: Center,
+        ..Decl
+    }) {
+        tab_id_user_wallet  = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Your Wallet");
+        tab_id_miner_wallet = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Miner Wallet");
+    }
+    ui.nav_skip = false;
+
+    // You can't operate on the miner, so you can't open any modals. // @Todo: maybe you can open Receive?
+    if *tab_id == tab_id_miner_wallet {
+        ui.modal = Modal::None;
+    }
 
     if ui.modal != Modal::None && let _elem = elem().decl(Decl {
         child_gap,
@@ -645,6 +826,11 @@ pub fn ui_left_pane(ui: &mut Context,
             ..Decl
         }) {
 
+            let balance = {
+                let state = wallet_state.lock().unwrap();
+                if *tab_id == tab_id_user_wallet { state.user_balance() } else { state.miner_balance() }
+            };
+
             let contents_id = _elem.decl.id;
             let contents_hovered = ui.hovered(contents_id);
 
@@ -668,15 +854,15 @@ pub fn ui_left_pane(ui: &mut Context,
                     if let _ = elem().decl(Decl { id: id("Title Bar Right Side"), width: grow!(), align: Right, ..Decl }) && closeable {
                         let id = id("Close This Modal");
 
-                        let (clicked, colour, _) = ui.button_ex(false, BUTTON_GREY, id, true, false);
-                        if clicked || ui.input().key_pressed(KeyCode::Escape) {
+                        let (clicked, colour, _) = ui.button_ex(false, BUTTON_GREY, id, true, winit::window::CursorIcon::Default);
+                        if clicked || (ui.input().key_pressed(KeyCode::Escape) && !ui.nav_enable) {
                             ui.modal = Modal::None;
                         }
 
                         // Click background to exit -- the code could be placed farther outside but it is here so it can be gated by `closeable`
                         if ui.hovered(container_id) && !ui.hovered(contents_id) && ui.input().mouse_pressed(winit::event::MouseButton::Left) {
                             ui.modal = Modal::None;
-                            ui.clicked_id = id;
+                            ui.mouse_pressed_id = id;
                         }
 
                         let radius = ui.scale(20.0);
@@ -702,7 +888,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     hsva.2 = ((hsva.2 as f32) * 1.25).min(255.0) as u8;
                     hsva.rgba()
                 };
-                let (clicked, colour, text_colour) = ui.button_ex(false, colour, id, enabled, false);
+                let (clicked, colour, text_colour) = ui.button_ex(false, colour, id, enabled, winit::window::CursorIcon::Default);
                 let radius = ui.scale(24.0);
                 if let _ = elem().decl(Decl {
                     id,
@@ -740,20 +926,15 @@ pub fn ui_left_pane(ui: &mut Context,
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                        let mut send_address = "0000000000000000";
-                        if data.send_address.len() >= 16 {
-                            send_address = &data.send_address;
-                        }
-
-                        ui.text(frame_strf!(data, "[{}..{}]", &send_address[..8], &send_address[send_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                        if button_ex(ui, "Paste Address", true) {
-                            data.send_address = ui.input().get_from_clipboard().trim().to_string();
-                        }
+                        data.send_address = ui.textbox(data, id("Send Address Textbox"), "Destination address...", TextDecl {
+                            h: ui.scale(16.0),
+                            ..TextDecl
+                        });
 
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
-                        if (wallet_state.lock().unwrap().balance as u64) < ONE_cTAZ / 100 {
+                        if (balance as u64) < ONE_cTAZ / 100 {
                             let colour = (0xff, 0xaf, 0x0e, 0xff);
                             ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                         }
@@ -776,13 +957,13 @@ pub fn ui_left_pane(ui: &mut Context,
                             ) = {
                                 let wallet_state = wallet_state.lock().unwrap();
                                 (
-                                    wallet_state.balance,
+                                    wallet_state.user_balance(),
                                     wallet_state.waiting_for_send,
                                 )
                             };
 
                             let can = !waiting_for_send && data.send_address.len() != 0;
-                            if button_ex(ui,   "1 cTAZ", can && (balance as u64) >= ONE_cTAZ)        { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ);       }
+                            if button_ex(ui,    "1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ);       }
                             if button_ex(ui,   "10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ * 10);  }
                         }
                     }
@@ -828,7 +1009,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     // spacer
                     if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
 
-                    if (wallet_state.lock().unwrap().balance as u64) < ONE_cTAZ / 100 {
+                    if (balance as u64) < ONE_cTAZ / 100 {
                         let colour = (0xff, 0xaf, 0x0e, 0xff);
                         ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                     }
@@ -837,8 +1018,6 @@ pub fn ui_left_pane(ui: &mut Context,
                     let waiting_for_stake_to_finalizer = wallet_state.lock().unwrap().waiting_for_stake_to_finalizer;
 
                     {
-                        let balance = wallet_state.lock().unwrap().balance;
-
                         // if (balance as u64) < ONE_cTAZ / 100 {
                         //     let colour = (0xff, 0xaf, 0x0e, 0xff);
                         //     ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
@@ -921,7 +1100,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                     let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
                         let id = id(label);
-                        let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, false);
+                        let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
                         if let _ = elem().decl(Decl {
                             id,
                             child_gap,
@@ -953,7 +1132,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     };
 
                     let mut clickable_icon = |ui: &mut Context, id, icon, icon_hovered, enabled | {
-                        let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, true);
+                        let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
 
                         let icon = if ui.hovered(id) { icon_hovered } else { icon };
                         if let _ = elem().decl(Decl{
@@ -1131,20 +1310,11 @@ pub fn ui_left_pane(ui: &mut Context,
         }
     }
 
-    // @TODO: MAKE THESE NOT USE TABS, JUST USE HEADERS
+    // @TODO: MAKE SOME OF THESE NOT USE TABS, JUST USE HEADERS
 
-    let mut tab_id_wallet = Id::default();
 
-    if let _ = elem().decl(Decl {
-        id: id("Tab Bar"),
-        child_gap,
-        width: percent!(1.0),
-        height: fit!(),
-        align: Center,
-        ..Decl
-    }) {
-        tab_id_wallet = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Wallet");
-    }
+    // @Todo: How to avoid doing this? Clearing the nav array when there is a modal?
+    ui.nav_skip = (ui.modal != Modal::None);
 
     // Main contents
     if let _ = elem().decl(Decl {
@@ -1172,12 +1342,17 @@ pub fn ui_left_pane(ui: &mut Context,
             show_staked_balance,
         ) = {
             let wallet_state = wallet_state.lock().unwrap();
-            (
-                wallet_state.balance,
-                wallet_state.pending_balance,
+            if *tab_id == tab_id_user_wallet {(
+                wallet_state.user_balance(),
+                wallet_state.user_pending_balance(),
                 wallet_state.staked_balance,
                 wallet_state.show_staked_balance,
-            )
+            )} else {(
+                wallet_state.miner_balance(),
+                wallet_state.miner_pending_balance(),
+                0u64,
+                wallet_state.show_staked_balance,
+            )}
         };
 
         // balance container
@@ -1189,7 +1364,7 @@ pub fn ui_left_pane(ui: &mut Context,
         }
 
         let balance_id = id("Balance Text");
-        let (clicked, colour, _) = ui.button_ex(true, colour, balance_id, true, true);
+        let (clicked, colour, _) = ui.button_ex(true, colour, balance_id, true, winit::window::CursorIcon::Pointer);
         if clicked {
             wallet_state.lock().unwrap().show_staked_balance = !show_staked_balance;
         }
@@ -1236,9 +1411,9 @@ pub fn ui_left_pane(ui: &mut Context,
             ..Decl
         }) {
 
-            let mut button = |ui: &mut Context, icon: &'static str, label: &'static str| {
+            let mut button = |ui: &mut Context, enabled: bool, icon: &'static str, label: &'static str| {
                 let id = id(label);
-                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, true, false);
+                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, enabled, winit::window::CursorIcon::Default);
                 if let _ = elem().decl(Decl {
                     id, child_gap, align: Center,
                     direction: TopToBottom,
@@ -1266,16 +1441,24 @@ pub fn ui_left_pane(ui: &mut Context,
                 clicked
             };
 
-            if button(ui, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
-            if button(ui, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
-            if button(ui, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
-            if button(ui, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
+            let can = (*tab_id == tab_id_user_wallet);
+            if button(ui, can, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
+            if button(ui, can, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
+            if button(ui, can, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
+            if button(ui, can, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
         }
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
         {
-            let txs = &wallet_state.lock().unwrap().txs;
+            let txs = {
+                let state = wallet_state.lock().unwrap();
+                if *tab_id == tab_id_user_wallet {
+                    state.user_txs.clone()
+                } else {
+                    state.miner_txs.clone()
+                }
+            };
 
             if txs.len() == 0 {
                 ui.history_scroll = 0.0;
@@ -1338,6 +1521,9 @@ pub fn ui_left_pane(ui: &mut Context,
 
                             let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
                         }
+
+                        let tx_is_on_best_chain = tx.mined_h.is_in_block() && !tx.is_outside_bc;
+
                         if let _ = elem().decl(Decl{
                             id: id_index("Transaction", index as u32),
                             padding,
@@ -1357,12 +1543,14 @@ pub fn ui_left_pane(ui: &mut Context,
                                 align: Center,
                                 ..Decl
                             }) {
-                                let icon = match (tx.1, tx.0.mined_height) {
-                                    (wallet::WalletTxKind::Send, Some(_))    => ICON_UP_SMALL,
-                                    (wallet::WalletTxKind::Receive, Some(_)) => ICON_DOWN_SMALL,
-                                    (wallet::WalletTxKind::Shield, Some(_))  => ICON_SHIELD,
-                                    (wallet::WalletTxKind::Stake, Some(_))   => ICON_LINK_1,
-                                    (wallet::WalletTxKind::Unstake, Some(_)) => ICON_UNLINK,
+                                // TODO: account for mempool
+                                let icon = match (tx.kind(), tx_is_on_best_chain) {
+                                    (WalletTxKind::Send,     true) => ICON_UP_SMALL,
+                                    (WalletTxKind::SelfSend, true) => ICON_DOWN_SMALL,
+                                    (WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
+                                    (WalletTxKind::Shield,   true) => ICON_SHIELD,
+                                    (WalletTxKind::Stake,    true) => ICON_LINK_1,
+                                    (WalletTxKind::Unstake,  true) => ICON_UNLINK,
                                     _ => {
                                         let timer = (ui.tx_loading_animation_timer * 3.0) as u64;
                                         if timer % 3 == 0 {
@@ -1375,7 +1563,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     }
                                 };
 
-                                let colour = if tx.0.mined_height.is_some() {
+                                // TODO: account for mempool & confirmation level
+                                let colour = if tx_is_on_best_chain {
                                     WHITE
                                 } else {
                                     (0x60, 0x60, 0x60, 0xff) /* @todo colors */
@@ -1393,16 +1582,17 @@ pub fn ui_left_pane(ui: &mut Context,
                                 align: Left,
                                 ..Decl
                             }) {
-                                let label = match tx.1 {
-                                    wallet::WalletTxKind::Send    => if tx.0.mined_height.is_some() { "Sent"     } else { "Sending"   },
-                                    wallet::WalletTxKind::Receive => if tx.0.mined_height.is_some() { "Received" } else { "Receiving" },
-                                    wallet::WalletTxKind::Shield  => if tx.0.mined_height.is_some() { "Shielded" } else { "Shielding" },
-                                    wallet::WalletTxKind::Stake   => if tx.0.mined_height.is_some() { "Staked"   } else { "Staking"   },
-                                    wallet::WalletTxKind::Unstake => if tx.0.mined_height.is_some() { "Unstaked" } else { "Unstaking" },
+                                let label = match tx.kind() {
+                                    WalletTxKind::Send     => if tx_is_on_best_chain { "Sent"     } else { "Sending"   },
+                                    WalletTxKind::Receive  => if tx_is_on_best_chain { "Received" } else { "Receiving" },
+                                    WalletTxKind::SelfSend => if tx_is_on_best_chain { "Returned" } else { "Returning" },
+                                    WalletTxKind::Shield   => if tx_is_on_best_chain { "Shielded" } else { "Shielding" },
+                                    WalletTxKind::Stake    => if tx_is_on_best_chain { "Staked"   } else { "Staking"   },
+                                    WalletTxKind::Unstake  => if tx_is_on_best_chain { "Unstaked" } else { "Unstaking" },
                                 };
 
-                                let label_str = if let Some(mined_height) = tx.0.mined_height {
-                                    frame_strf!(data, "{} @ {}", label, mined_height)
+                                let label_str = if tx.mined_h.is_in_block() {
+                                    frame_strf!(data, "{} @ {}", label, tx.mined_h.0)
                                 } else {
                                     frame_strf!(data, "{}", label)
                                 };
@@ -1412,13 +1602,13 @@ pub fn ui_left_pane(ui: &mut Context,
                                 // spacer
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                                let txid = tx.0.txid.to_string();
+                                let txid = tx.txid.to_string();
                                 ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { font: Mono, h: transaction_text_h, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, align: AlignX::Left, ..TextDecl });
 
                                 // spacer
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                                if let Ok(memo_str) = String::from_utf8(tx.0.memo.as_slice().to_vec()) {
+                                if let Ok(memo_str) = String::from_utf8(tx.memo.as_slice().to_vec()) {
                                     let mut memo_str = memo_str.chars().filter(|c| c.is_ascii()).collect::<String>().trim_end_matches(|c| c == '\0').to_string();
                                     if memo_str.len() != 0 {
                                         if memo_str.starts_with("@") {
@@ -1442,43 +1632,46 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 // @todo colors
-                                let color = match tx.1 {
-                                    wallet::WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
-                                    wallet::WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
-                                    wallet::WalletTxKind::Receive | wallet::WalletTxKind::Unstake => (0x5a, 0xb5, 0x52, 0xff),
-                                    wallet::WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
+                                let colour = match tx.kind() {
+                                    WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
+                                    WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
+                                    WalletTxKind::Receive | WalletTxKind::Unstake => (0x5a, 0xb5, 0x52, 0xff),
+                                    WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
                                     _ => WHITE,
                                 };
 
-                                match tx.1 {
-                                    wallet::WalletTxKind::Send | wallet::WalletTxKind::Stake => {
-                                        let send_amount: i64 = tx.0.account_value_delta.into();
+                                let totals = tx.totals();
+                                match tx.kind() {
+                                    WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake => {
+                                        let send_amount: i64 = tx.account_value_delta().into();
                                         let send_amount: u64 = send_amount.abs() as u64;
-                                        let full = send_amount / 100_000_000;
-                                        let part = send_amount % 100_000_000;
-                                        let mut part_str = format!("{part}00");
-                                        if part_str.len() > 3 {
-                                            part_str = part_str[..3].to_string();
+
+                                        let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
+                                        ui.text(frame_strf!(data, "{}{} cTAZ", prefix, str_from_ctaz(send_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
+                                    },
+                                    WalletTxKind::Receive | WalletTxKind::Unstake => {
+                                        if true { // total
+                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(totals.recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
+                                        } else { // transparent, shielded
+                                            let (t_z, s_z) = (tx.parts[0].recv_zats.into_u64(), tx.parts[1].recv_zats.into_u64());
+                                            ui.text(frame_strf!(data, "+{} | {} cTAZ", str_from_ctaz(t_z), str_from_ctaz(s_z)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                         }
-
-                                        let prefix = if tx.1 == wallet::WalletTxKind::Send { "-" } else { "" };
-                                        ui.text(frame_strf!(data, "{}{}.{} cTAZ", prefix, full, part_str), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
-                                    wallet::WalletTxKind::Receive | wallet::WalletTxKind::Unstake => {
-                                        ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.0.total_received.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
-                                    },
-                                    wallet::WalletTxKind::Shield => {
-                                        let shield_amount: i64 = tx.0.account_value_delta.into();
-                                        let full = shield_amount / 100_000_000;
-                                        let part = shield_amount % 100_000_000;
-                                        let part_str = format!("{part}00");
-                                        let trim_part = part_str.trim_end_matches("0");
+                                    WalletTxKind::Shield => {
+                                        // TODO: (how) do we want to show the fee?
+                                        let shield_amount = totals.recv_zats.into_u64();
 
-                                        ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(shield_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                     },
                                     _ => {
-                                        ui.text("TODO cTAZ", TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
+                                        ui.text("TODO cTAZ", TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                     },
+                                }
+
+                                let fee: u64 = tx.fee().into_u64();
+                                if tx.kind() != WalletTxKind::Receive &&
+                                   tx.kind() != WalletTxKind::Unstake {
+                                    ui.text(frame_strf!(data, "Fee: {} cTAZ", str_from_ctaz(fee)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                 }
                             }
                         }
@@ -1487,10 +1680,12 @@ pub fn ui_left_pane(ui: &mut Context,
             }
         }
     }
+
+    ui.nav_skip = false;
 }
 
 pub fn ui_right_pane(ui: &mut Context,
-                 wallet_state: Arc<Mutex<wallet::WalletState>>,
+                 wallet_state: Arc<Mutex<WalletState>>,
                  viz: &mut VizState,
                  data: &mut UiData,
                  child_gap: f32,
@@ -1551,7 +1746,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
         let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
             let id = id(label);
-            let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, false);
+            let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
             if let _ = elem().decl(Decl {
                 id,
                 child_gap,
@@ -1583,7 +1778,7 @@ pub fn ui_right_pane(ui: &mut Context,
         };
 
         let mut clickable_icon = |ui: &mut Context, id, icon, enabled | {
-            let (clicked, colour, _) = ui.button_ex(false, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, true);
+            let (clicked, colour, _) = ui.button_ex(false, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
             if let _ = elem().decl(Decl{
                 id,
                 child_gap,
@@ -1773,7 +1968,7 @@ pub fn ui_right_pane(ui: &mut Context,
         align: Center,
         ..Decl
     }) {
-        tab_id_faucet = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet (Height {})", &wallet_state.lock().unwrap().miner_seen_height));
+        tab_id_faucet = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet (Height {})", &wallet_state.lock().unwrap().miner_seen_h));
     }
     if let _ = elem().decl(Decl {
         id: id("Faucet Contents"),
@@ -1813,13 +2008,12 @@ pub fn ui_right_pane(ui: &mut Context,
         }) {
             let title_h = ui.scale(28.0);
             let text_h = ui.scale(22.0);
-            let (un, sh_p, sh_s, fc) = {
+            let (un, sh_p, sh_s) = {
                 let w = wallet_state.lock().unwrap();
                 (
                     w.miner_unshielded_funds,
                     w.miner_shielded_pending_funds,
                     w.miner_shielded_spendable_funds,
-                    w.faucet_funds_available,
                 )
             };
 
@@ -1831,10 +2025,6 @@ pub fn ui_right_pane(ui: &mut Context,
             let left_text  = TextDecl { h: text_h,  align: AlignX::Left,  ..TextDecl  };
             let right_text = TextDecl { font: Mono, align: AlignX::Right, ..left_text };
 
-            if let _ = elem().decl(row) {
-                if let _ = elem().decl(left)  { ui.text("Available:", left_text); }
-                if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(fc)), right_text); }
-            }
             if let _ = elem().decl(row) {
                 if let _ = elem().decl(left)  { ui.text("Unshielded:", left_text); }
                 if let _ = elem().decl(right) { ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(un)), right_text); }
@@ -1861,7 +2051,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
             let mut button_ex = |label, act_on_press, enabled: bool| {
                 let id = id(label);
-                let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, false);
+                let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
                 if let _ = elem().decl(Decl {
                     id,
                     child_gap,
@@ -1900,44 +2090,47 @@ pub fn ui_right_pane(ui: &mut Context,
 }
 
 
-pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<wallet::WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
-data.per_frame_strs.clear();
+pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
+    data.per_frame_strs.clear();
 
-let mut result = false;
+    let mut result = false;
 
-const MIN_ZOOM: f32 = 0.5;
-const MAX_ZOOM: f32 = 1.65; // @PreventPanesColliding
+    const MIN_ZOOM: f32 = 0.5;
+    const MAX_ZOOM: f32 = 1.65; // @PreventPanesColliding
 
-if ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight) {
-    if ui.input().key_pressed(KeyCode::Equal) {
-        let new_zoom = ui.zoom * (1.0f32 + 1.0f32 / 8f32);
-        if new_zoom <= MAX_ZOOM {
-            ui.zoom = new_zoom;
+    if ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight) {
+        if ui.input().key_pressed(KeyCode::Equal) {
+            let new_zoom = ui.zoom * (1.0f32 + 1.0f32 / 8f32);
+            if new_zoom <= MAX_ZOOM {
+                ui.zoom = new_zoom;
+            }
+        }
+        if ui.input().key_pressed(KeyCode::Minus) {
+            let new_zoom = ui.zoom / (1.0f32 + 1.0f32 / 8f32);
+            if new_zoom >= MIN_ZOOM {
+                ui.zoom = new_zoom;
+            }
+        }
+        if ui.input().key_pressed(KeyCode::Digit0) {
+            ui.zoom = 1.0f32;
         }
     }
-    if ui.input().key_pressed(KeyCode::Minus) {
-        let new_zoom = ui.zoom / (1.0f32 + 1.0f32 / 8f32);
-        if new_zoom >= MIN_ZOOM {
-            ui.zoom = new_zoom;
-        }
+    if ui.zoom < MIN_ZOOM {
+        ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
     }
-    if ui.input().key_pressed(KeyCode::Digit0) {
-        ui.zoom = 1.0f32;
+    if ui.zoom > MAX_ZOOM {
+        ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
     }
-}
-if ui.zoom < MIN_ZOOM {
-    ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
-}
-if ui.zoom > MAX_ZOOM {
-    ui.zoom = 1.0f32; // reset instead of clamp to prevent user from shifting "off-grid" of the exponential steps
-}
-ui.scale = ui.zoom * ui.dpi_scale;
+    ui.scale = ui.zoom * ui.dpi_scale;
 
-ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Default);
+    ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Default);
 
-ui.capture = false;
+    ui.capture = false;
+    // let prev_nav_idx_to_id = ui.nav_idx_to_id.clone();
+    ui.nav_id_to_idx.clear();
+    ui.nav_idx_to_id.clear();
 
-let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_height as f32);
+    let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_height as f32);
     let mouse_pos = (ui.input().mouse_pos().0 as f32, ui.input().mouse_pos().1 as f32);
 
     let child_gap = ui.scale(12.0);
@@ -1962,7 +2155,6 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
     let mut c = clay.begin::<(), ()>();
 
     unsafe { clay::Clay_SetCurrentContext(c.clay.context); }
-    unsafe { clay::Clay_SetMaxMeasureTextCacheWordCount(262144); }
 
     // c.set_debug_mode(true);
 
@@ -2023,6 +2215,9 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
                     // @todo: two vertical panes with right aligned label and left aligned height
                     ui.text(frame_strf!(data, "PoS Height: {}", viz.bft_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
                     ui.text(frame_strf!(data, "PoW Height: {}", viz.bc_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                    ui.text(frame_strf!(data, "Orchard Pool Zatoshis: {}", viz.orchard_pool_balance), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                    ui.text(frame_strf!(data, "Staking (Bonded) Pool Zatoshis: {}", viz.staking_bonded_pool_balance), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                    ui.text(frame_strf!(data, "Staking (Unbonded) Pool Zatoshis: {}", viz.staking_unbonded_pool_balance), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
                 }
             }
 
@@ -2036,7 +2231,7 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
                 let enabled = viz.camera_x != 0.0 || viz.camera_y != viz.bc_tip_y || viz.zoom != 0.0;
 
                 let id = id(label);
-                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, id, enabled, false);
+                let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
                 let radius = ui.scale(20.0);
 
                 if ui.hovered(id) {
@@ -2112,36 +2307,71 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
             }) {
                 let text_h = ui.scale(10.0);
                 // Block Inspector Contents
-                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { font: Mono, wrap_chars: true, h: text_h, align: AlignX::Left, ..TextDecl });
 
                 let text = {
                     if let Some(text) = viz.inspect_block_json_text.as_ref() {
                         text.to_string()
                     } else {
-                        "Loading...".to_string()
+                        frame_strf!(data, "Loading info for block {}...", viz.inspecting_block_hash).to_string()
                     }
                 };
-                ui.text(frame_strf!(data, "{}", text), TextDecl { font: Mono, break_word: true, h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "{}", text), TextDecl { font: Mono, wrap_chars: true, h: text_h, align: AlignX::Left, ..TextDecl });
             }
         }
     }
 
 
     if !ui.input().mouse_held(winit::event::MouseButton::Left) {
-        ui.clicked_id = Id::default();
+        ui.mouse_pressed_id = Id::default();
     }
-    if ui.clicked_id != Id::default() {
+    if ui.mouse_pressed_id == Id::default() {
+        if ui.input().mouse_pressed(winit::event::MouseButton::Left) {
+            // ui.nav_enable = false;
+        }
+    } else {
+        // ui.most_recent_mouse_pressed_id = ui.mouse_pressed_id;
+        if ui.nav_id != ui.mouse_pressed_id.id {
+            ui.nav_enable = false;
+        }
+        ui.nav_id = ui.mouse_pressed_id.id;
         ui.capture = true;
     }
 
-    if ui.clicked_id != Id::default() {
-        ui.most_recently_clicked_id = ui.clicked_id;
+    if !ui.nav_id_to_idx.contains_key(&ui.nav_id) {
+        ui.nav_id = 0;
+        ui.nav_enable = false;
+    }
+    // if ui.input().key_pressed(KeyCode::Escape) {
+    //     ui.nav_enable = false;
+    // }
+
+    if ui.input().key_pressed(KeyCode::Tab) && ui.nav_idx_to_id.len() > 0 {
+        let idx = if ui.nav_id != 0 {
+            let old_idx = ui.nav_id_to_idx[&ui.nav_id] as isize;
+            if (ui.input().key_held(KeyCode::ShiftLeft) || ui.input().key_held(KeyCode::ShiftRight)) {
+                (old_idx - 1).rem_euclid(ui.nav_idx_to_id.len() as isize) as usize
+            } else {
+                (old_idx + 1).rem_euclid(ui.nav_idx_to_id.len() as isize) as usize
+            }
+        } else {
+            0
+        };
+        ui.nav_id = ui.nav_idx_to_id[idx];
+        ui.nav_enable = true;
+
+        if let Some(textbox_state) = data.textboxes.get_mut(&ui.nav_id) {
+            textbox_state.selection.1 = 0;
+            textbox_state.selection.0 = textbox_state.text_buf.len();
+        }
     }
 
     // Return the list of render commands of your layout
     let render_commands = c.end();
 
     if is_rendering {
+        let mut nav_bbox: Option<(isize, isize, isize, isize)> = None;
+
         for command in render_commands {
             fn clay_color_to_u32(color: clay::Color) -> u32 {
                 let r = color.r as u32;
@@ -2157,6 +2387,23 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
             let x2 = (command.bounding_box.x + command.bounding_box.width)  as isize;
             let y2 = (command.bounding_box.y + command.bounding_box.height) as isize;
 
+            let bbox = (x1, y1, x2, y2);
+
+            if ui.nav_id == command.id {
+                nav_bbox = Some(bbox);
+            }
+
+            let colour = match command.config {
+                Rectangle(ref config)                 => { clay_color_to_u32(config.color) }
+                RenderCommandConfig::Text(ref config) => { clay_color_to_u32(config.color) }
+                _ => { 0 }
+            };
+
+            // @Hack for generating nav highlight rectangle via draw commands.
+            if colour == 0x01000000 {
+                continue;
+            }
+
             match command.config {
                 Rectangle(config) => {
                     let radius_tl = config.corner_radii.top_left     as isize;
@@ -2168,11 +2415,15 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
                                                 radius_tr,
                                                 radius_bl,
                                                 radius_br,
-                                                clay_color_to_u32(config.color));
+                                                colour);
                 }
                 RenderCommandConfig::Text(config) => {
                     let font_kind = match config.font_id { 0 => FontKind::Normal, 1 => FontKind::Mono, 2 => FontKind::Icons, _ => todo!() };
-                    ui.draw().text_line(font_kind, x1 as f32, y1 as f32, config.font_size as f32, config.text, clay_color_to_u32(config.color));
+
+                    // let text = frame_strf!(data, "{} ", command.id);
+                    // ui.draw().text_line(font_kind, x1 as f32, y1 as f32, config.font_size as f32, text, colour);
+
+                    ui.draw().text_line(font_kind, x1 as f32, y1 as f32, config.font_size as f32, config.text, colour);
                 }
                 ScissorStart() => {
                     ui.draw().set_scissor(x1, y1, x2, y2);
@@ -2181,6 +2432,46 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
                     ui.draw().clear_scissor();
                 }
                 misc => { todo!("Unsupported clay render command: {:?}", misc) }
+            }
+
+            if let Some(textbox_state) = data.textboxes.get_mut(&command.id) && ui.nav_id == command.id {
+                textbox_state.bbox = bbox;
+
+                let h = textbox_state.h;
+
+                let padding = ui.scale(12.0); // @Duplicate :TextBox
+
+                let compute_x = |idx: usize| {
+                    let n = idx.min(textbox_state.text_buf.len());
+                    let mut str = String::with_capacity(n * 4);
+                    str.extend(textbox_state.text_buf[..n].iter().copied());
+                    let xoff = ui.draw().measure_text_line(FontKind::Normal, textbox_state.h, &str);
+                    x1 + padding as isize + xoff as isize
+                };
+
+                let head_x = compute_x(textbox_state.selection.0);
+                let tail_x = compute_x(textbox_state.selection.1);
+
+                let y_centre = (y1 + y2) / 2;
+                let y1 = y_centre - (h * 0.5).ceil() as isize;
+                let y2 = y_centre + (h * 0.5).ceil() as isize;
+
+                if textbox_state.selection.1 == textbox_state.selection.0 {
+                    let x1    = head_x;
+                    let color = 0xc0ffffff;
+                    let t     = (ui.scale * 1.0).ceil() as isize;
+
+                    ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x1+t) as f32, (y2+t) as f32, color);
+                } else {
+                    let (min, max) = (head_x.min(tail_x),
+                                      head_x.max(tail_x));
+
+                    let x1    = min;
+                    let x2    = max;
+                    let color = 0xc00000ff;
+
+                    ui.draw().rectangle(x1 as f32, y1 as f32, x2 as f32, y2 as f32, color);
+                }
             }
 
             if ui.debug {
@@ -2194,6 +2485,35 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
                 ui.draw().rectangle((x1-t) as f32, (y2-t) as f32, (x2-t) as f32, (y2+t) as f32, color);
             }
         }
+
+        if ui.nav_enable && let Some((x1, y1, x2, y2)) = nav_bbox && !data.textboxes.contains_key(&ui.nav_id) {
+            let gap = ui.scale(1.0) as isize;
+
+            let x1 = x1 - gap;
+            let y1 = y1 - gap;
+            let x2 = x2 + gap;
+            let y2 = y2 + gap;
+
+            let black_t = ui.scale(2.0) as isize;
+            let white_t = black_t * 2;
+
+            {
+                let color = 0xffffffff;
+                let t = white_t;
+                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x1+0) as f32, (y2+t) as f32, color);
+                ui.draw().rectangle((x2-0) as f32, (y1-t) as f32, (x2+t) as f32, (y2+t) as f32, color);
+                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x2-0) as f32, (y1+0) as f32, color);
+                ui.draw().rectangle((x1-t) as f32, (y2-0) as f32, (x2-0) as f32, (y2+t) as f32, color);
+            }
+            {
+                let color = 0xff000000;
+                let t = black_t;
+                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x1+0) as f32, (y2+t) as f32, color);
+                ui.draw().rectangle((x2-0) as f32, (y1-t) as f32, (x2+t) as f32, (y2+t) as f32, color);
+                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x2-0) as f32, (y1+0) as f32, color);
+                ui.draw().rectangle((x1-t) as f32, (y2-0) as f32, (x2-0) as f32, (y2+t) as f32, color);
+            }
+        }
     }
 
     result |= dbg_ui(ui, is_rendering);
@@ -2201,7 +2521,7 @@ let (window_w, window_h) = (ui.draw().window_width as f32, ui.draw().window_heig
     result
 }
 
-pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet_state: Arc<Mutex<wallet::WalletState>>) -> bool {
+pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet_state: Arc<Mutex<WalletState>>) -> bool {
     ui.tx_loading_animation_timer += ui.delta;
     if ui.tx_loading_animation_timer >= 1.0 {
         ui.tx_loading_animation_timer = 0.0;
@@ -2223,7 +2543,7 @@ pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet
     return result;
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Context {
     pub input: *const InputCtx,
     pub draw:  *const DrawCtx,
@@ -2244,9 +2564,15 @@ pub struct Context {
 
     pub capture: bool,
 
-    pub clicked_id:               Id,
-    pub focused_id:               Id,
-    pub most_recently_clicked_id: Id,
+    pub mouse_pressed_id:             Id,
+    pub key_pressed_id:               Id,
+    // pub most_recent_mouse_pressed_id: Id,
+
+    pub nav_id_to_idx: HashMap<u32, usize>,
+    pub nav_idx_to_id: Vec<u32>,
+    pub nav_id: u32,
+    pub nav_enable: bool,
+    pub nav_skip: bool,
 
     pub pane_tab_l: Id,
     pub pane_tab_r: Id,

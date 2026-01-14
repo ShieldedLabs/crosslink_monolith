@@ -1226,6 +1226,7 @@ version = "0.2.2"
 dependencies = [
  "blake2b_simd",
  "core2",
+ "document-features",
 ]
 
 [[package]]
@@ -3196,22 +3197,12 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
-dependencies = [
- "bytes",
- "prost-derive 0.13.5",
-]
-
-[[package]]
-name = "prost"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7231bd9b3d3d33c86b58adbac74b5ec0ad9f496b19d22801d773636feaa95f3d"
 dependencies = [
  "bytes",
- "prost-derive 0.14.1",
+ "prost-derive",
 ]
 
 [[package]]
@@ -3227,24 +3218,11 @@ dependencies = [
  "once_cell",
  "petgraph",
  "prettyplease",
- "prost 0.14.1",
+ "prost",
  "prost-types",
  "regex",
  "syn",
  "tempfile",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
-dependencies = [
- "anyhow",
- "itertools",
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -3266,7 +3244,7 @@ version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9b4db3d6da204ed77bb26ba83b6122a73aeb2e87e25fbf7ad2e84c4ccbf8f72"
 dependencies = [
- "prost 0.14.1",
+ "prost",
 ]
 
 [[package]]
@@ -4767,18 +4745,6 @@ dependencies = [
 
 [[package]]
 name = "tonic-build"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eac6f67be712d12f0b41328db3137e0d0757645d8904b4cb7d51cd9c2279e847"
-dependencies = [
- "prettyplease",
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "tonic-build"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c40aaccc9f9eccf2cd82ebc111adc13030d23e887244bc9cfa5d1d636049de3"
@@ -4796,7 +4762,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66bd50ad6ce1252d87ef024b3d64fe4c3cf54a86fb9ef4c631fdd0ded7aeaa67"
 dependencies = [
  "bytes",
- "prost 0.14.1",
+ "prost",
  "tonic",
 ]
 
@@ -4813,7 +4779,7 @@ dependencies = [
  "quote",
  "syn",
  "tempfile",
- "tonic-build 0.14.2",
+ "tonic-build",
 ]
 
 [[package]]
@@ -5151,8 +5117,9 @@ name = "wallet"
 version = "1.0.0-beta.1"
 dependencies = [
  "bip39",
+ "incrementalmerkletree",
  "orchard",
- "prost 0.13.5",
+ "prost",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
@@ -5163,11 +5130,12 @@ dependencies = [
  "sapling-crypto",
  "secp256k1",
  "secrecy",
+ "shardtree",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
  "tonic",
- "tonic-build 0.13.1",
+ "tonic-build",
  "zcash_client_backend",
  "zcash_client_memory",
  "zcash_client_sqlite",
@@ -5986,7 +5954,7 @@ dependencies = [
  "orchard",
  "pasta_curves",
  "percent-encoding",
- "prost 0.14.1",
+ "prost",
  "rand_core 0.6.4",
  "rayon",
  "sapling-crypto",
@@ -6027,7 +5995,7 @@ dependencies = [
  "jubjub",
  "nonempty",
  "orchard",
- "prost 0.14.1",
+ "prost",
  "prost-build",
  "rayon",
  "sapling-crypto",
@@ -6070,7 +6038,7 @@ dependencies = [
  "maybe-rayon",
  "nonempty",
  "orchard",
- "prost 0.14.1",
+ "prost",
  "rand 0.8.5",
  "rand_core 0.6.4",
  "rand_distr",
@@ -6186,6 +6154,7 @@ dependencies = [
  "sapling-crypto",
  "secp256k1",
  "serde",
+ "serde-big-array",
  "sha2 0.10.9",
  "subtle",
  "tracing",

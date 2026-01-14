@@ -26,6 +26,8 @@ pub struct ValueBalance<C> {
     sapling: Amount<C>,
     orchard: Amount<C>,
     deferred: Amount<C>,
+    staking_bonded: Amount<C>,
+    staking_unbonded: Amount<C>,
 }
 
 impl<C> ValueBalance<C>
@@ -60,6 +62,22 @@ where
     pub fn from_orchard_amount(orchard_amount: Amount<C>) -> Self {
         ValueBalance {
             orchard: orchard_amount,
+            ..ValueBalance::zero()
+        }
+    }
+
+    /// Creates a [`ValueBalance`] from the given staking_bonded amount.
+    pub fn from_staking_bonded_amount(staking_bonded_amount: Amount<C>) -> Self {
+        ValueBalance {
+            staking_bonded: staking_bonded_amount,
+            ..ValueBalance::zero()
+        }
+    }
+
+    /// Creates a [`ValueBalance`] from the given staking_unbonded amount.
+    pub fn from_staking_unbonded_amount(staking_unbonded_amount: Amount<C>) -> Self {
+        ValueBalance {
+            staking_unbonded: staking_unbonded_amount,
             ..ValueBalance::zero()
         }
     }
@@ -126,6 +144,28 @@ where
         self
     }
 
+    /// Returns the staking_bonded amount.
+    pub fn staking_bonded_amount(&self) -> Amount<C> {
+        self.staking_bonded
+    }
+
+    /// Sets the staking_bonded amount without affecting other amounts.
+    pub fn set_staking_bonded_amount(&mut self, staking_bonded_amount: Amount<C>) -> &Self {
+        self.staking_bonded = staking_bonded_amount;
+        self
+    }
+
+    /// Returns the staking_unbonded amount.
+    pub fn staking_unbonded_amount(&self) -> Amount<C> {
+        self.staking_unbonded
+    }
+
+    /// Sets the staking_unbonded amount without affecting other amounts.
+    pub fn set_staking_unbonded_amount(&mut self, staking_unbonded_amount: Amount<C>) -> &Self {
+        self.staking_unbonded = staking_unbonded_amount;
+        self
+    }
+
     /// Creates a [`ValueBalance`] where all the pools are zero.
     pub fn zero() -> Self {
         let zero = Amount::zero();
@@ -135,6 +175,8 @@ where
             sapling: zero,
             orchard: zero,
             deferred: zero,
+            staking_bonded: zero,
+            staking_unbonded: zero,
         }
     }
 
@@ -150,6 +192,8 @@ where
             sapling: self.sapling.constrain().map_err(Sapling)?,
             orchard: self.orchard.constrain().map_err(Orchard)?,
             deferred: self.deferred.constrain().map_err(Deferred)?,
+            staking_bonded: self.staking_bonded.constrain().map_err(StakingBonded)?,
+            staking_unbonded: self.staking_unbonded.constrain().map_err(StakingUnbonded)?,
         })
     }
 }
@@ -173,7 +217,7 @@ impl ValueBalance<NegativeAllowed> {
         // https://zebra.zfnd.org/dev/rfcs/0012-value-pools.html#definitions
         //
         // This will error if the remaining value in the transaction value pool is negative.
-        (self.transparent + self.sprout + self.sapling + self.orchard)?.constrain::<NonNegative>()
+        (self.transparent + self.sprout + self.sapling + self.orchard + self.staking_bonded + self.staking_unbonded)?.constrain::<NonNegative>()
     }
 }
 
@@ -309,30 +353,38 @@ impl ValueBalance<NonNegative> {
             ValueBalance::from_sapling_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
         let fake_orchard_value_balance =
             ValueBalance::from_orchard_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
+        let fake_staking_bonded_value_balance =
+            ValueBalance::from_orchard_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
+        let fake_staking_unbonded_value_balance =
+            ValueBalance::from_orchard_amount(Amount::try_from(MAX_MONEY / 2).unwrap());
 
         fake_value_pool.set_transparent_value_balance(fake_transparent_value_balance);
         fake_value_pool.set_sprout_value_balance(fake_sprout_value_balance);
         fake_value_pool.set_sapling_value_balance(fake_sapling_value_balance);
         fake_value_pool.set_orchard_value_balance(fake_orchard_value_balance);
+        fake_value_pool.set_orchard_value_balance(fake_staking_bonded_value_balance);
+        fake_value_pool.set_orchard_value_balance(fake_staking_unbonded_value_balance);
 
         fake_value_pool
     }
 
     /// To byte array
-    pub fn to_bytes(self) -> [u8; 40] {
+    pub fn to_bytes(self) -> [u8; 56] {
         match [
             self.transparent.to_bytes(),
             self.sprout.to_bytes(),
             self.sapling.to_bytes(),
             self.orchard.to_bytes(),
             self.deferred.to_bytes(),
+            self.staking_bonded.to_bytes(),
+            self.staking_unbonded.to_bytes(),
         ]
         .concat()
         .try_into()
         {
             Ok(bytes) => bytes,
             _ => unreachable!(
-                "five [u8; 8] should always concat with no error into a single [u8; 40]"
+                "seven [u8; 8] should always concat with no error into a single [u8; 56]"
             ),
         }
     }
@@ -344,7 +396,7 @@ impl ValueBalance<NonNegative> {
 
         // Return an error early if bytes don't have the right length instead of panicking later.
         match bytes_length {
-            32 | 40 => {}
+            32 | 40 | 56 => {}
             _ => return Err(Unparsable),
         };
 
@@ -378,12 +430,36 @@ impl ValueBalance<NonNegative> {
 
         let deferred = match bytes_length {
             32 => Amount::zero(),
-            40 => Amount::from_bytes(
+            40 | 56 => Amount::from_bytes(
                 bytes[32..40]
                     .try_into()
                     .expect("deferred amount should be parsable"),
             )
             .map_err(Deferred)?,
+            _ => return Err(Unparsable),
+        };
+
+        let staking_bonded = match bytes_length {
+            32 => Amount::zero(),
+            40 => Amount::zero(),
+            56 => Amount::from_bytes(
+                bytes[40..48]
+                    .try_into()
+                    .expect("staking_bonded amount should be parsable"),
+            )
+            .map_err(StakingBonded)?,
+            _ => return Err(Unparsable),
+        };
+
+        let staking_unbonded = match bytes_length {
+            32 => Amount::zero(),
+            40 => Amount::zero(),
+            56 => Amount::from_bytes(
+                bytes[40..48]
+                    .try_into()
+                    .expect("staking_unbonded amount should be parsable"),
+            )
+            .map_err(StakingUnbonded)?,
             _ => return Err(Unparsable),
         };
 
@@ -393,6 +469,8 @@ impl ValueBalance<NonNegative> {
             sapling,
             orchard,
             deferred,
+            staking_bonded,
+            staking_unbonded,
         })
     }
 }
@@ -415,6 +493,12 @@ pub enum ValueBalanceError {
     /// deferred amount error {0}
     Deferred(amount::Error),
 
+    /// staking_bonded amount error {0}
+    StakingBonded(amount::Error),
+
+    /// staking_unbonded amount error {0}
+    StakingUnbonded(amount::Error),
+
     /// ValueBalance is unparsable
     Unparsable,
 }
@@ -427,6 +511,8 @@ impl fmt::Display for ValueBalanceError {
             Sapling(e) => format!("sapling amount err: {e}"),
             Orchard(e) => format!("orchard amount err: {e}"),
             Deferred(e) => format!("deferred amount err: {e}"),
+            StakingBonded(e) => format!("staking_bonded amount err: {e}"),
+            StakingUnbonded(e) => format!("staking_unbonded amount err: {e}"),
             Unparsable => "value balance is unparsable".to_string(),
         })
     }
@@ -444,6 +530,8 @@ where
             sapling: (self.sapling + rhs.sapling).map_err(Sapling)?,
             orchard: (self.orchard + rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred + rhs.deferred).map_err(Deferred)?,
+            staking_bonded: (self.staking_bonded + rhs.staking_bonded).map_err(StakingBonded)?,
+            staking_unbonded: (self.staking_unbonded + rhs.staking_unbonded).map_err(StakingUnbonded)?,
         })
     }
 }
@@ -493,6 +581,8 @@ where
             sapling: (self.sapling - rhs.sapling).map_err(Sapling)?,
             orchard: (self.orchard - rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred - rhs.deferred).map_err(Deferred)?,
+            staking_bonded: (self.staking_bonded - rhs.staking_bonded).map_err(StakingBonded)?,
+            staking_unbonded: (self.staking_unbonded - rhs.staking_unbonded).map_err(StakingUnbonded)?,
         })
     }
 }
@@ -562,6 +652,8 @@ where
             sapling: self.sapling.neg(),
             orchard: self.orchard.neg(),
             deferred: self.deferred.neg(),
+            staking_bonded: self.staking_bonded.neg(),
+            staking_unbonded: self.staking_unbonded.neg(),
         }
     }
 }

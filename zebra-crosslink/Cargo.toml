@@ -46,6 +46,7 @@ tenderlink = { path = "../tenderlink" }
 visualizer_zcash = { path = "../zebra-gui" }
 
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
+shardtree = "0.6.1"
 orchard = "0.11"
 sapling-crypto = "0.5"
 abscissa_core = "0.7"
@@ -113,7 +114,7 @@ pin-project = "1.1.10"
 primitive-types = "0.12"
 proptest = "1.6"
 proptest-derive = "0.5"
-prost = "0.14"
+prost = "0.14.1"
 quote = "1.0.40"
 rand = "0.8.5"
 rand_chacha = "0.3"
@@ -148,9 +149,10 @@ tokio-stream = "0.1.17"
 tokio-test = "0.4"
 tokio-util = "0.7.14"
 toml = "0.9.5"
-tonic = "0.14"
-tonic-prost = "0.14"
-tonic-prost-build = "0.14"
+tonic = "0.14.2"
+tonic-prost = "0.14.2"
+tonic-build = "0.14.2"
+tonic-prost-build = "0.14.2"
 tonic-reflection = "0.14"
 tower = "0.4.13"
 tower-test = "0.4"
@@ -167,7 +169,7 @@ vergen-git2 = { version = "1.0", default-features = false }
 x25519-dalek = "2.0.1"
 zcash_note_encryption = "0.4.1"
 zcash_script = "0.4"
-zip32 = { version = "0.2", default-features = false }
+zip32 = { version = "0.2.1", default-features = false }
 config = { version = "0.15.14", features = ["toml"] }
 
 [workspace.metadata.release]
@@ -179,6 +181,10 @@ allow-branch = ["main"]
 
 [profile.dev]
 panic = "abort"
+
+# Optimise all non-workspace dependencies (crates.io deps)
+[profile.dev.package."*"]
+opt-level = 1
 
 # Speed up tests by optimizing performance-critical crates
 
@@ -208,9 +214,35 @@ opt-level = 3
 [profile.dev.package.visualizer_zcash]
 opt-level = 3
 
+[profile.dev.package.orchard]
+opt-level = 3
+
+[profile.dev.package.softbuffer]
+opt-level = 3
+
+[profile.dev.package.swash]
+opt-level = 3
+
+[profile.dev.package.winit]
+opt-level = 3
+
+[profile.dev.package.rustybuzz]
+opt-level = 3
+codegen-units = 1
+
+[profile.dev.package.clay-layout]
+opt-level = 3
+codegen-units = 1
+
+[profile.dev.build-override]
+opt-level = 3
 
 [profile.release]
 panic = "abort"
+
+[profile.release-debug]
+inherits = "release"
+debug = true
 
 # Speed up release builds and sync tests using link-time optimization.
 # Some of Zebra's code is CPU-intensive, and needs extra optimizations for peak performance.

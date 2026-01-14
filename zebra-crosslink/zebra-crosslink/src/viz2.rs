@@ -1,5 +1,6 @@
 
 use visualizer_zcash::Hash32;
+use zebra_chain::value_balance::ValueBalance;
 use std::cmp::{max, min};
 
 use crate::*;
@@ -23,6 +24,8 @@ pub async fn service_viz_requests(
 ) {
     let call = tfl_handle.clone().call;
 
+    let mut bc_ack_height = 0;
+
     loop {
         let request_queue = visualizer_zcash::REQUESTS_TO_ZEBRA.lock().unwrap();
         let response_queue = visualizer_zcash::RESPONSES_FROM_ZEBRA.lock().unwrap();
@@ -38,6 +41,16 @@ pub async fn service_viz_requests(
             } else {
                 Vec::new()
             };
+            let value_balance = if let Ok(StateReadResponse::TipPoolValues { value_balance, .. }) =
+                (call.read_state)(StateReadRequest::TipPoolValues).await
+            {
+                value_balance
+            } else {
+                ValueBalance::zero()
+            };
+            let orchard_pool_balance = value_balance.orchard_amount().zatoshis();
+            let staking_bonded_pool_balance = value_balance.staking_bonded_amount().zatoshis();
+            let staking_unbonded_pool_balance = value_balance.staking_unbonded_amount().zatoshis();
 
             let tip_height_hash: (BlockHeight, BlockHash) = {
                 if let Ok(StateResponse::Tip(Some(tip_height_hash))) =
@@ -51,7 +64,7 @@ pub async fn service_viz_requests(
             };
             let bc_tip_height: u64 = tip_height_hash.0.0 as u64;
 
-            let bc_req_h = (0, -1);
+            let bc_req_h = (bc_ack_height, -1);
 
             #[allow(clippy::never_loop)]
             let (lo_height, bc_tip, height_hashes, seq_blocks) = loop {
@@ -137,12 +150,20 @@ pub async fn service_viz_requests(
                     let mut response = visualizer_zcash::ResponseFromZebra::_0();
                     response.bc_tip_height = bc_tip_height;
                     response.bft_tip_height = (internal.bft_blocks.len() as u64).saturating_sub(1);
+
+                    response.orchard_pool_balance = orchard_pool_balance;
+                    response.staking_bonded_pool_balance = staking_bonded_pool_balance;
+                    response.staking_unbonded_pool_balance = staking_unbonded_pool_balance;
+
+                    response.start_bc_height = bc_ack_height as u64;
+                    bc_ack_height = bc_ack_height.max(request.bc_ack_height as i32);
+
                     for (i, bc) in seq_blocks.iter().enumerate() {
                         if let Some(bc) = bc {
                             let this_hash = Hash32::from_bytes(bc.header.hash().0);
                             if request.want_to_inspect_block == this_hash {
                                 response.what_block_it_is = this_hash;
-                                response.json_dump_of_the_block = format!("{:?}", bc);
+                                response.json_dump_of_the_block = format!("{:#?}", bc);
                             }
                             response.bc_blocks.push(visualizer_zcash::BcBlock {
                                 this_hash: this_hash,
@@ -155,11 +176,12 @@ pub async fn service_viz_requests(
                             });
                         }
                     }
-                    for (i, b) in internal.bft_blocks.iter().enumerate() {
+                    for i in request.bft_ack_height as usize..internal.bft_blocks.len() {
+                        let b = &internal.bft_blocks[i];
                         let this_hash = Hash32::from_bytes(b.blake3_hash().0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;
-                            response.json_dump_of_the_block = format!("{:?}", b);
+                            response.json_dump_of_the_block = format!("{:#?}", b);
                         }
                         response.bft_blocks.push(visualizer_zcash::BftBlock {
                             this_hash: this_hash,
