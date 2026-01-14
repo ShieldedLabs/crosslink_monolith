@@ -146,9 +146,9 @@ rayon = "1.5"
 # Protobuf and gRPC
 prost = "0.14.1"
 prost-build = "0.14"
-tonic = { version = "0.14", default-features = false, features = ["channel"] }
-tonic-prost = { version = "0.14", default-features = false }
-tonic-prost-build = { version = "0.14", default-features = false }
+tonic = { version = "0.14.2", default-features = false }
+tonic-prost = { version = "0.14.2", default-features = false }
+tonic-prost-build = { version = "0.14.2", default-features = false }
 which = "8"
 
 # Secret management
