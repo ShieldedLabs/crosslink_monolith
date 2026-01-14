@@ -588,7 +588,7 @@ impl Context {
         self.tab_ex(radius, padding, tab_id, id, label)
     }
 
-    pub fn textbox(&mut self, data: &mut UiData, id: Id) -> String {
+    pub fn textbox(&mut self, data: &mut UiData, id: Id, hint: &str, text_decl: TextDecl) -> String {
         let child_gap = self.scale(12.0); // @Duplicate :TextBox
         let padding   = child_gap.dup4(); // @Duplicate :TextBox
         let radius    = child_gap.dup4(); // @Duplicate :TextBox
@@ -600,12 +600,10 @@ impl Context {
             self.nav_enable = true;
         }
 
-        let h = self.scale(16.0);
-
         let text = {
             let mut textbox_state = &mut data.textboxes.entry(id.id).or_default();
 
-            textbox_state.h = h;
+            textbox_state.h = text_decl.h;
 
             if self.nav_id == id.id {
                 let mut moved = false;
@@ -712,12 +710,13 @@ impl Context {
             colour,
             ..Decl
         }) {
-            self.text(&str, TextDecl {
-                colour: text_colour,
-                h,
-                align: AlignX::Center,
-                ..TextDecl
-            });
+
+            let use_hint  = text.len() <= 0;
+            let str       = if use_hint { hint } else { str };
+            let colour    = if use_hint { let mut hsva = text_colour.hsva(); hsva.2 /= 2; hsva.rgba() } else { text_colour };
+            let text_decl = TextDecl { colour, ..text_decl };
+
+            self.text(&str, text_decl);
         }
 
         text
@@ -899,7 +898,10 @@ pub fn ui_left_pane(ui: &mut Context,
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                        data.send_address = ui.textbox(data, id("Send Address Textbox"));
+                        data.send_address = ui.textbox(data, id("Send Address Textbox"), "Destination address...", TextDecl {
+                            h: ui.scale(16.0),
+                            ..TextDecl
+                        });
 
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
