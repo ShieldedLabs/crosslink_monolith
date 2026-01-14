@@ -22,7 +22,7 @@
 		<ConfigProperties>
 			<ConfigAndPlatform>
 				<Name>Debug:x64</Name>
-				<BuildCommand>C:\Work\ShieldedLabs\crosslink_monolith\phuild.bat -$(Configuration)</BuildCommand>
+				<BuildCommand>C:\Work\ShieldedLabs\crosslink_monolith\remote_phuild.bat -$(Configuration)</BuildCommand>
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
 				<CleanCommand></CleanCommand>
@@ -33,7 +33,7 @@
 				<WorkingDirectory>C:\Work\ShieldedLabs\crosslink_monolith</WorkingDirectory>
 				<DebugCommand>C:\Work\ShieldedLabs\crosslink_monolith\crosslink_monolith.rdbg</DebugCommand>
 				<DebuggerExe></DebuggerExe>
-				<DebugSln>C:\Work\ShieldedLabs\crosslink_monolith\zebra-crosslink\zebra_crosslink.sln</DebugSln>
+				<DebugSln>\\madina-a16.shire-lydian.ts.net\ShieldedLabs\crosslink_monolith\zebra-crosslink\zebra_crosslink.sln</DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
 				<PrioritiseFiles></PrioritiseFiles>
