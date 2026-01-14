@@ -12,9 +12,9 @@ use async_trait::async_trait;
 use strum::{EnumCount, IntoEnumIterator};
 use strum_macros::{EnumCount, EnumIter};
 
-use tenderlink::SortedRosterMember;
-use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 use ed25519_zebra::VerificationKeyBytes;
+use tenderlink::SortedRosterMember;
+use zcash_primitives::transaction::{RosterMember, StakeTxId, StakingAction, StakingActionKind};
 use zebra_chain::serialization::{
     SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
 };
@@ -147,7 +147,10 @@ use zebra_chain::block::{
     Block, CountedHeader, Hash as BlockHash, Header as BlockHeader, Height as BlockHeight,
 };
 use zebra_node_services::mempool::{Request as MempoolRequest, Response as MempoolResponse};
-use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
+use zebra_state::{
+    crosslink::*, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse,
+    Request as StateRequest, Response as StateResponse,
+};
 
 /// Placeholder activation height for Crosslink functionality
 pub const TFL_ACTIVATION_HEIGHT: BlockHeight = BlockHeight(2000);
@@ -192,12 +195,20 @@ pub(crate) struct TFLServiceInternal {
     path_to_pos_store_file: PathBuf,
 }
 
-fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: zebra_chain::block::FatPointerToBftBlock, child_fat_pointer: zebra_chain::block::FatPointerToBftBlock) -> bool {
+fn call_from_state_to_crosslink_to_ask_about_fat_pointers(
+    internal_handle: &TFLServiceHandle,
+    parent_fat_pointer: zebra_chain::block::FatPointerToBftBlock,
+    child_fat_pointer: zebra_chain::block::FatPointerToBftBlock,
+) -> bool {
     let mut internal = internal_handle.internal.blocking_lock();
     let parent_height = if parent_fat_pointer == zebra_chain::block::FatPointerToBftBlock::null() {
         0
     } else {
-        if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash().0 == parent_fat_pointer.points_at_block_hash()) {
+        if let Some(h) = internal
+            .bft_blocks
+            .iter()
+            .position(|b| b.blake3_hash().0 == parent_fat_pointer.points_at_block_hash())
+        {
             h
         } else {
             return false;
@@ -206,7 +217,11 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     let child_height = if child_fat_pointer == zebra_chain::block::FatPointerToBftBlock::null() {
         0
     } else {
-        if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash().0 == child_fat_pointer.points_at_block_hash()) {
+        if let Some(h) = internal
+            .bft_blocks
+            .iter()
+            .position(|b| b.blake3_hash().0 == child_fat_pointer.points_at_block_hash())
+        {
             h
         } else {
             return false;
@@ -243,11 +258,16 @@ async fn block_height_hash_from_hash(
     }
 }
 
-async fn block_from_hash( // @Phillip
+async fn block_from_hash(
+    // @Phillip
     call: &TFLServiceCalls,
     hash: BlockHash,
 ) -> Option<Arc<Block>> {
-    if let Ok(StateResponse::Block(Some(block))) = (call.state)(StateRequest::Block(zebra_state::HashOrHeight::Hash(hash.into()))).await {
+    if let Ok(StateResponse::Block(Some(block))) = (call.state)(StateRequest::Block(
+        zebra_state::HashOrHeight::Hash(hash.into()),
+    ))
+    .await
+    {
         let check_hash = block.as_ref().hash();
         assert_eq!(hash, check_hash);
         Some(block)
@@ -256,12 +276,16 @@ async fn block_from_hash( // @Phillip
     }
 }
 
-async fn is_block_known( // @Phillip
+async fn is_block_known(
+    // @Phillip
     call: &TFLServiceCalls,
     hash: BlockHash,
 ) -> bool {
-    if let Ok(StateResponse::KnownBlock(Some(known_block))) = (call.state)(StateRequest::KnownBlock(hash.into())).await {
-        known_block.location == zebra_state::KnownBlockLocation::BestChain || known_block.location == zebra_state::KnownBlockLocation::SideChain
+    if let Ok(StateResponse::KnownBlock(Some(known_block))) =
+        (call.state)(StateRequest::KnownBlock(hash.into())).await
+    {
+        known_block.location == zebra_state::KnownBlockLocation::BestChain
+            || known_block.location == zebra_state::KnownBlockLocation::SideChain
     } else {
         false
     }
@@ -469,7 +493,13 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
         return None;
     }
 
-    let finality_candidate_height = BlockHeight(finality_candidate_height.0.min(if let Some(v) = latest_final_block { v.0.0+10 } else { u32::MAX }));
+    let finality_candidate_height = BlockHeight(finality_candidate_height.0.min(
+        if let Some(v) = latest_final_block {
+            v.0 .0 + 10
+        } else {
+            u32::MAX
+        },
+    ));
 
     let resp = (call.state)(StateRequest::BlockHeader(finality_candidate_height.into())).await;
 
@@ -543,8 +573,7 @@ async fn new_decided_bft_block_from_malachite(
 
     drop(internal);
     assert_eq!(
-        validate_bft_block_from_malachite(&tfl_handle, new_block)
-            .await,
+        validate_bft_block_from_malachite(&tfl_handle, new_block).await,
         (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None)
     );
 
@@ -654,7 +683,7 @@ async fn new_decided_bft_block_from_malachite(
                         continue;
                     }
                 }
-//println!("Applying height: {}", new_final_height_hash.0.0);
+                //println!("Applying height: {}", new_final_height_hash.0.0);
 
                 // Divide the reward between finalizers. Any rounding errors are intended to be
                 // accounted for here by giving those zats to the finalizer with the largest
@@ -680,7 +709,9 @@ async fn new_decided_bft_block_from_malachite(
 
                         for txid_i in 0..finalizer.txids.len() {
                             if max_power_idxs.is_none()
-                                || finalizers[max_power_idxs.unwrap().0].txids[max_power_idxs.unwrap().1].zats
+                                || finalizers[max_power_idxs.unwrap().0].txids
+                                    [max_power_idxs.unwrap().1]
+                                    .zats
                                     < finalizer.voting_power
                             {
                                 max_power_idxs = Some((finalizer_i, txid_i));
@@ -702,7 +733,10 @@ async fn new_decided_bft_block_from_malachite(
                         }
 
                         for txid_i in 0..finalizer.txids.len() {
-                            if (finalizer_i, txid_i) == max_power_idxs.expect("there must be a max finalizer if at least 1 is non-0") {
+                            if (finalizer_i, txid_i)
+                                == max_power_idxs
+                                    .expect("there must be a max finalizer if at least 1 is non-0")
+                            {
                                 continue;
                             }
 
@@ -767,13 +801,13 @@ async fn new_decided_bft_block_from_malachite(
         internal.current_bc_final = new_bc_final;
     }
 
-
-//println!("Storing pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, internal.validators_at_current_height);
+    //println!("Storing pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, internal.validators_at_current_height);
     if internal.path_to_pos_store_file.to_str() != Some("") {
         let mut append_bytes: Vec<u8> = Vec::new();
         new_block.zcash_serialize(&mut append_bytes).unwrap();
         fat_pointer.zcash_serialize(&mut append_bytes).unwrap();
-        append_bytes.extend_from_slice(&(internal.validators_at_current_height.len() as u64).to_le_bytes());
+        append_bytes
+            .extend_from_slice(&(internal.validators_at_current_height.len() as u64).to_le_bytes());
         for v in &internal.validators_at_current_height {
             v.write_to(&mut append_bytes).unwrap();
         }
@@ -781,7 +815,10 @@ async fn new_decided_bft_block_from_malachite(
         for sig in tender_proposal_sigs {
             append_bytes.extend_from_slice(&sig.0);
         }
-        let mut file = OpenOptions::new().append(true).open(&internal.path_to_pos_store_file).unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&internal.path_to_pos_store_file)
+            .unwrap();
         file.write_all(&append_bytes).unwrap();
         file.flush().unwrap();
     }
@@ -851,7 +888,12 @@ async fn validate_bft_block_from_malachite(
                 "Didn't have hash available for confirmation: {}",
                 new_final_hash
             );
-            return (tenderlink::TMStatus::Indeterminate, tenderlink::TMStatusReason::NeedsBlock { hash: new_final_hash.0 });
+            return (
+                tenderlink::TMStatus::Indeterminate,
+                tenderlink::TMStatusReason::NeedsBlock {
+                    hash: new_final_hash.0,
+                },
+            );
         };
     return (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None);
 }
@@ -993,7 +1035,10 @@ fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> 
         {
             if let Some(staking_action) = staking_action {
                 let txid = tx.unmined_id().mined_id();
-                info!("got staking action in txid: {}", StakingAction::str_from_addr(txid.0));
+                info!(
+                    "got staking action in txid: {}",
+                    StakingAction::str_from_addr(txid.0)
+                );
                 // TODO(Sam)
                 //cmd_c += update_roster_for_cmd(roster, txid.0, validators_keys_to_names, &staking_action);
             }
@@ -1004,7 +1049,11 @@ fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> 
     cmd_c
 }
 
-async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [u8; 32], path_to_pos_store_file: PathBuf) -> Result<(), String> {
+async fn tfl_service_main_loop(
+    internal_handle: TFLServiceHandle,
+    global_seed: [u8; 32],
+    path_to_pos_store_file: PathBuf,
+) -> Result<(), String> {
     let call = internal_handle.call.clone();
     let config = internal_handle.config.clone();
     let params = &PROTOTYPE_PARAMETERS;
@@ -1142,7 +1191,12 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             .collect();
 
         if path_to_pos_store_file.to_str() != Some("") {
-            let mut pos_file = OpenOptions::new().read(true).write(true).create(true).open(&path_to_pos_store_file).unwrap();
+            let mut pos_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&path_to_pos_store_file)
+                .unwrap();
             let mut pos_file_bytes = Vec::new();
             pos_file.read_to_end(&mut pos_file_bytes).unwrap();
 
@@ -1150,43 +1204,86 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             let mut valid_byte_count = 0;
             'big_loop: loop {
                 valid_byte_count = cursor.position();
-                let block = if let Ok(block) = BftBlock::zcash_deserialize(&mut cursor) { block } else { break; };
-                let fat_pointer = if let Ok(fat_pointer) = FatPointerToBftBlock2::zcash_deserialize(&mut cursor) { fat_pointer } else { break; };
+                let block = if let Ok(block) = BftBlock::zcash_deserialize(&mut cursor) {
+                    block
+                } else {
+                    break;
+                };
+                let fat_pointer = if let Ok(fat_pointer) =
+                    FatPointerToBftBlock2::zcash_deserialize(&mut cursor)
+                {
+                    fat_pointer
+                } else {
+                    break;
+                };
 
                 let mut buf = [0u8; 8];
-                if cursor.read_exact(&mut buf).is_err() { break; }
+                if cursor.read_exact(&mut buf).is_err() {
+                    break;
+                }
                 let new_roster_count = u64::from_le_bytes(buf);
                 let mut new_roster = Vec::new();
                 for _ in 0..new_roster_count {
                     if let Ok(v) = MalValidator::read_from(&mut cursor) {
                         new_roster.push(v);
-                    } else { break; }
+                    } else {
+                        break;
+                    }
                 }
 
                 let mut buf = [0u8; 8];
-                if cursor.read_exact(&mut buf).is_err() { break; }
+                if cursor.read_exact(&mut buf).is_err() {
+                    break;
+                }
                 let proposal_sigs_n = u64::from_le_bytes(buf);
                 let mut proposal_sigs = Vec::new();
                 for _ in 0..proposal_sigs_n {
                     let mut sig = tenderlink::TMSig::NIL;
-                    if cursor.read_exact(&mut sig.0).is_err() { break 'big_loop; }
+                    if cursor.read_exact(&mut sig.0).is_err() {
+                        break 'big_loop;
+                    }
                     proposal_sigs.push(sig);
                 }
 
-                if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() { break; }
-                
+                if block.previous_block_fat_ptr.points_at_block_hash()
+                    != fat_pointer_to_tip.points_at_block_hash()
+                {
+                    break;
+                }
+
                 let mut round_data = tenderlink::RoundData::EMPTY;
                 round_data.roster = tenderlink_roster_from_internal(&unsorted_roster);
-                round_data.msg_val_sigs = round_data.roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.public_key == v.pub_key.0).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, tenderlink::TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), tenderlink::TMSig(s))]).collect();
+                round_data.msg_val_sigs = round_data
+                    .roster
+                    .iter()
+                    .map(|v| {
+                        fat_pointer
+                            .signatures
+                            .iter()
+                            .find(|s| s.public_key == v.pub_key.0)
+                            .map(|s| s.vote_signature)
+                            .unwrap_or([0u8; 64])
+                    })
+                    .map(|s| {
+                        [
+                            (tenderlink::ValueId::NIL, tenderlink::TMSig::NIL),
+                            (
+                                tenderlink::ValueId(fat_pointer.points_at_block_hash().0),
+                                tenderlink::TMSig(s),
+                            ),
+                        ]
+                    })
+                    .collect();
                 round_data.counts.precommits = fat_pointer.signatures.len() as u64;
                 round_data.counts.yes_precommits = fat_pointer.signatures.len() as u64;
                 round_data.proposal_sigs_n = proposal_sigs_n as usize;
                 round_data.proposal_sigs = proposal_sigs;
-                round_data.proposal = tenderlink::BlockValue(block.zcash_serialize_to_vec().unwrap());
+                round_data.proposal =
+                    tenderlink::BlockValue(block.zcash_serialize_to_vec().unwrap());
                 round_data.proposal_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
                 round_data.height = ingest_data_for_tenderlink.len() as u64;
                 round_data.round = fat_pointer.get_vote_template().round as u32;
-                
+
                 ingest_data_for_tenderlink.push(round_data);
                 i_bft_blocks.push(block);
                 fat_pointer_to_tip = fat_pointer;
@@ -1201,7 +1298,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         if let Some(new_block) = i_bft_blocks.last() {
             new_final_hash = new_block.headers.first().expect("at least 1 header").hash();
             new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
-//println!("Loaded at pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, unsorted_roster);
+            //println!("Loaded at pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, unsorted_roster);
         }
 
         let roster = {
@@ -1247,27 +1344,30 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     }
                 })
             })),
-            tenderlink::ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, tender_proposal_sigs| {
-                let tfl_handle3 = tfl_handle3.clone();
-                Box::pin(async move {
-                    use bytes::Buf;
-                    use zebra_chain::serialization::ZcashDeserialize;
+            tenderlink::ClosureToPushDecidedBlock(Arc::new(
+                move |block, fat_pointer, tender_proposal_sigs| {
+                    let tfl_handle3 = tfl_handle3.clone();
+                    Box::pin(async move {
+                        use bytes::Buf;
+                        use zebra_chain::serialization::ZcashDeserialize;
 
-                    new_decided_bft_block_from_malachite(
-                        &tfl_handle3,
-                        &BftBlock::zcash_deserialize(block.0.reader()).unwrap(),
-                        &fat_pointer.into(),
-                        tender_proposal_sigs,
-                    )
-                    .await
-                })
-            })),
+                        new_decided_bft_block_from_malachite(
+                            &tfl_handle3,
+                            &BftBlock::zcash_deserialize(block.0.reader()).unwrap(),
+                            &fat_pointer.into(),
+                            tender_proposal_sigs,
+                        )
+                        .await
+                    })
+                },
+            )),
             tenderlink::ClosureToGetHistoricalBlock(Arc::new(move |height| {
                 Box::pin(async move {
                     panic!();
                 })
             })),
-            tenderlink::ClosureToGetPow(Arc::new(move |hash| { // @Phillip
+            tenderlink::ClosureToGetPow(Arc::new(move |hash| {
+                // @Phillip
                 let tfl_handle5 = tfl_handle5.clone();
                 Box::pin(async move {
                     if let Some(block) = block_from_hash(&tfl_handle5.call, hash.into()).await {
@@ -1280,12 +1380,16 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                             None
                         }
                     } else {
-                        eprintln!("PowLink: \x1b[93mCouldn't find PoW block\x1b[0m  for hash {:?}.", hash);
+                        eprintln!(
+                            "PowLink: \x1b[93mCouldn't find PoW block\x1b[0m  for hash {:?}.",
+                            hash
+                        );
                         None
                     }
                 })
             })),
-            tenderlink::ClosureToParsePow(Arc::new(move |hash, bytes| { // @Phillip
+            tenderlink::ClosureToParsePow(Arc::new(move |hash, bytes| {
+                // @Phillip
                 Box::pin(async move {
                     let mut slice = &bytes[..];
                     // let slice_ref = &mut slice;
@@ -1303,13 +1407,13 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     }
                 })
             })),
-            tenderlink::ClosureIsPoWInChain(Arc::new(move |hash| { // @Phillip
+            tenderlink::ClosureIsPoWInChain(Arc::new(move |hash| {
+                // @Phillip
                 let tfl_handle6 = tfl_handle6.clone();
-                Box::pin(async move {
-                    is_block_known(&tfl_handle6.call, BlockHash(hash)).await
-                })
+                Box::pin(async move { is_block_known(&tfl_handle6.call, BlockHash(hash)).await })
             })),
-            tenderlink::ClosureToPushPow(Arc::new(move |block| { // @Phillip
+            tenderlink::ClosureToPushPow(Arc::new(move |block| {
+                // @Phillip
                 let tfl_handle7 = tfl_handle7.clone();
                 Box::pin(async move {
                     (tfl_handle7.call.force_feed_pow)(block.clone()).await;
@@ -1505,7 +1609,11 @@ async fn tfl_service_incoming_request(
             internal
                 .validators_at_current_height
                 .iter()
-                .map(|v| RosterMember{ pub_key:<[u8; 32]>::from(v.public_key), voting_power: v.voting_power, txids:v.txids.clone() })
+                .map(|v| RosterMember {
+                    pub_key: <[u8; 32]>::from(v.public_key),
+                    voting_power: v.voting_power,
+                    txids: v.txids.clone(),
+                })
                 .collect()
         })),
 
@@ -1834,7 +1942,12 @@ impl MalValidator {
     }
 
     pub fn push_txid(&mut self, txid: StakeTxId) {
-        if self.txids.iter().find(|cmp| cmp.txid == txid.txid).is_some() {
+        if self
+            .txids
+            .iter()
+            .find(|cmp| cmp.txid == txid.txid)
+            .is_some()
+        {
             return;
         }
         self.voting_power += txid.zats;
