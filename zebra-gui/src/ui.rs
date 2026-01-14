@@ -1122,8 +1122,14 @@ pub fn ui_left_pane(ui: &mut Context,
                         clicked
                     };
 
-
-                    let staked_roster = wallet_state.lock().unwrap().staked_roster.clone();
+                    // pub staked_roster: Vec<([u8; 32] /* pub key */, [u8; 32] /* txid */, u64 /* initial */, u64 /* accumulated */)>,
+                    let mut staked_roster = Vec::new();
+                    {
+                        let lock = wallet_state.lock().unwrap();
+                        for p in &lock.stake_positions_bonded {
+                            staked_roster.push((p.0, p.0, p.1, p.1));
+                        }
+                    }
                     if staked_roster.len() == 0 {
                         ui.unstake_scroll = 0.0;
                     }
@@ -1519,7 +1525,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     (WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
                                     (WalletTxKind::Shield,   true) => ICON_SHIELD,
                                     (WalletTxKind::Stake,    true) => ICON_LINK_1,
-                                    (WalletTxKind::Unstake,  true) => ICON_UNLINK,
+                                    (WalletTxKind::BeginUnstake,  true) => ICON_LINK_EXT_ALT,
+                                    (WalletTxKind::ClaimUnstake,  true) => ICON_UNLINK,
                                     _ => {
                                         let timer = (ui.tx_loading_animation_timer * 3.0) as u64;
                                         if timer % 3 == 0 {
@@ -1557,7 +1564,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::SelfSend => if tx.mined_h.is_in_block() { "Returned" } else { "Returning" },
                                     WalletTxKind::Shield   => if tx.mined_h.is_in_block() { "Shielded" } else { "Shielding" },
                                     WalletTxKind::Stake    => if tx.mined_h.is_in_block() { "Staked"   } else { "Staking"   },
-                                    WalletTxKind::Unstake  => if tx.mined_h.is_in_block() { "Unstaked" } else { "Unstaking" },
+                                    WalletTxKind::BeginUnstake  => if tx.mined_h.is_in_block() { "Unbonding" } else { "Unbonding" },
+                                    WalletTxKind::ClaimUnstake  => if tx.mined_h.is_in_block() { "Unstaked" } else { "Unstaking" },
                                 };
 
                                 let label_str = if tx.mined_h.is_in_block() {
@@ -1604,21 +1612,22 @@ pub fn ui_left_pane(ui: &mut Context,
                                 let color = match tx.kind() {
                                     WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
                                     WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
-                                    WalletTxKind::Receive | WalletTxKind::Unstake => (0x5a, 0xb5, 0x52, 0xff),
+                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake => (0x5a, 0xb5, 0x52, 0xff),
                                     WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
+                                    WalletTxKind::BeginUnstake => WHITE,
                                     _ => WHITE,
                                 };
 
                                 let totals = tx.totals();
                                 match tx.kind() {
-                                    WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake => {
+                                    WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake | WalletTxKind::BeginUnstake => {
                                         let send_amount: i64 = tx.account_value_delta().into();
                                         let send_amount: u64 = send_amount.abs() as u64;
 
                                         let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
                                         ui.text(frame_strf!(data, "{}{} cTAZ", prefix, str_from_ctaz(send_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                     },
-                                    WalletTxKind::Receive | WalletTxKind::Unstake => {
+                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake => {
                                         if true { // total
                                             ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(tx.totals().recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour: color, ..TextDecl });
                                         } else { // transparent, shielded
