@@ -104,6 +104,11 @@ sha2 = { version = "0.10", default-features = false }
 document-features = "0.2"
 
 # Encodings
+
+hex = { version = "0.4", default-features = false, features = [
+  "alloc",
+  "serde",
+] }
 base64 = "0.22"
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
 bitflags = "2"
@@ -112,7 +117,7 @@ bs58 = { version = "0.5", default-features = false, features = [
   "check",
 ] }
 byteorder = "1"
-hex = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
+
 percent-encoding = "2.1.0"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", default-features = false, features = ["derive"] }
