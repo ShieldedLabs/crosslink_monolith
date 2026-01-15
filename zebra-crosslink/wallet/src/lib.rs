@@ -3997,18 +3997,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let user_txs = user_wallet.txs.clone();
             let miner_txs = miner_wallet.txs.clone();
 
-            let mut lock = wallet_state.lock().unwrap();
-            lock.user_txs = user_txs;
-            lock.miner_txs = miner_txs;
-            lock.miner_unshielded_funds = miner_unshielded_funds;
-            lock.miner_shielded_pending_funds = miner_shielded_pending_funds;
-            lock.miner_shielded_spendable_funds = miner_shielded_spendable_funds;
-            lock.miner_seen_h = miner_wallet.chain_tip_h.0;
-
-            lock.user_unshielded_funds = user_unshielded_funds;
-            lock.user_shielded_pending_funds = user_shielded_pending_funds;
-            lock.user_shielded_spendable_funds = user_shielded_spendable_funds;
-
             let mut stake_positions_bonded = Vec::new();
             let mut stake_positions_unbonded = Vec::new();
             for tx in &user_wallet.txs {
@@ -4031,6 +4019,20 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                 }
             }
+
+            // DO NOT DO ANY WORK AFTER THIS LOCK IS TAKEN
+            let mut lock = wallet_state.lock().unwrap();
+            lock.user_txs = user_txs;
+            lock.miner_txs = miner_txs;
+            lock.miner_unshielded_funds = miner_unshielded_funds;
+            lock.miner_shielded_pending_funds = miner_shielded_pending_funds;
+            lock.miner_shielded_spendable_funds = miner_shielded_spendable_funds;
+            lock.miner_seen_h = miner_wallet.chain_tip_h.0;
+
+            lock.user_unshielded_funds = user_unshielded_funds;
+            lock.user_shielded_pending_funds = user_shielded_pending_funds;
+            lock.user_shielded_spendable_funds = user_shielded_spendable_funds;
+
             lock.stake_positions_bonded = stake_positions_bonded;
             lock.stake_positions_unbonded = stake_positions_unbonded;
         }
