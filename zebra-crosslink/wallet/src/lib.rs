@@ -1282,7 +1282,7 @@ impl ManualWallet {
         s_send_c = 1;
         s_recv_c = 1;
 
-        let memo_bytes = MemoBytes::from_bytes("shielding notes (fn sheild_transparent_zats)".as_bytes()).unwrap();
+        let memo_bytes = MemoBytes::from_bytes("shielding notes (fn shield_transparent_zats)".as_bytes()).unwrap();
         memo_count = 1;
         memo = *memo_bytes.as_array();
 
