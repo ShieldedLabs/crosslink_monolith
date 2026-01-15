@@ -50,13 +50,6 @@ use zcash_transparent::{
     bundle::OutPoint,
     keys::{IncomingViewingKey, TransparentKeyScope, NonHardenedChildIndex},
 };
-use zebra_chain::block::{Hash as BlockHash, Height, ZCASH_BLOCK_VERSION};
-use zebra_chain::parameters::NetworkUpgrade;
-use zebra_chain::sapling;
-use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
-use zebra_chain::sprout::commitment;
-use zebra_chain::transaction::LockTime;
-use zebra_chain::transparent::{self, Input, Utxo, MIN_TRANSPARENT_COINBASE_MATURITY};
 
 use rustls::client::danger::ServerCertVerified;
 use rustls::client::danger::ServerCertVerifier;
