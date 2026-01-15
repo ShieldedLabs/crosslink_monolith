@@ -1,6 +1,8 @@
 //! Internal wallet
 #![allow(warnings)]
 
+const AUTO_SPEND: u8 = 0; // automatically make spends without requiring GUI interaction
+
 use rand::seq::SliceRandom;
 use zcash_client_backend::data_api::WalletCommitmentTrees;
 use orchard::note_encryption::{ CompactAction as OrchardCompactAction, OrchardDomain };
@@ -92,7 +94,7 @@ use zcash_protocol::consensus::{NetworkType, Parameters, MAIN_NETWORK, TEST_NETW
 
 // NOTE: this has slightly different semantics from the protocol version, hence the different type
 // TODO: some code becomes simpler with a u64, but I'm leaving this the same as default for now
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockHeight(pub u32);
 impl BlockHeight {
     // NOTE: these constants corresponds to the semantic that the lower-down it is,
@@ -128,6 +130,18 @@ impl From<LRZBlockHeight> for BlockHeight {
     }
 }
 
+impl std::fmt::Debug for BlockHeight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BlockHeight(")?;
+        match *self {
+            Self::INVALID => write!(f, "<invalid>"),
+            Self::INTERNAL => write!(f, "<internal>"),
+            Self::MEMPOOL => write!(f, "<mempool>"),
+            _ => self.0.fmt(f)
+        }?;
+        write!(f, ")")
+    }
+}
 impl std::fmt::Display for BlockHeight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
@@ -228,6 +242,7 @@ impl OrchardNote {
             {
                 println!("ERROR: orchard note has 2 different valid positions: {:?} vs {:?}", self.position, new_note.position);
             }
+            // println!("updating note position at {:?} {:?} => {:?}", self.recv_h, self.position, new_note.position);
             self.position = new_note.position;
         } else {
             new_note.position = self.position; // NOTE: just for cmp
@@ -704,6 +719,7 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, i
         // not our transaction; ignore
         return;
     }
+    debug_assert!(new_totals.sent_zats == Zatoshis::const_from_u64(0) || new_totals.sent_zats < new_totals.spent_zats, "must spend for send");
 
     if let Some(tx_h) = wallet.tx_h_map.get_mut(&txid) {
         if let Some(tx_i) = tx_mined_h_position(&wallet.txs, *tx_h, &txid) {
@@ -882,11 +898,13 @@ impl ManualWallet {
     // change or normal recipient)
     pub async fn send_zats<P: Parameters>(
         &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>, outputs: &[TxOutput],
-        src_usk: &UnifiedSpendingKey, zats: Zatoshis, fee_zats: Zatoshis, opts: &TxOptions<'_>
+        src_usk: &UnifiedSpendingKey, opts: &TxOptions<'_>
     ) -> Option<TxId>
     {
         let tz = Timer::scope("send_zats");
         let block_h = self.chain_tip_h.0 + 1;
+
+        let fee_zats = 5 * zip317::MARGINAL_FEE.into_u64(); // NOTE: has headroom; TODO: actually calculate
 
         let account = &self.accounts[0];
         let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
@@ -999,7 +1017,7 @@ impl ManualWallet {
 
 
         //- SPENDS
-        let min_spend = t_send_z + s_send_z + fee_zats.into_u64();
+        let min_spend = t_send_z + s_send_z + fee_zats;
         let (mut t_spend_z, mut s_spend_z) = (0, 0);
         let (mut t_spend_c, mut s_spend_c) = (0, 0);
         'src_pool: for pool in opts.src_pools {
@@ -1059,7 +1077,7 @@ impl ManualWallet {
                             };
                             let merkle_path = orchard::tree::MerklePath::from(witness);
                             if let Err(err) = txb.add_orchard_spend::<zip317::FeeError>(fvk.clone(), note.note, merkle_path) {
-                                println!("tx build: orchard note spend failed: {err:?}");
+                                println!("tx build: orchard note spend failed: {err:?} ({note:?})");
                                 continue;
                             }
                             s_spend_z += note.note.value().inner();
@@ -1406,7 +1424,7 @@ impl ManualWallet {
             };
             let merkle_path = orchard::tree::MerklePath::from(witness);
             if let Err(err) = txb.add_orchard_spend::<zip317::FeeError>(keys.orchard_fvk.clone().unwrap(), note.note, merkle_path) {
-                println!("tx build: orchard note spend failed: {err:?}");
+                println!("tx build: orchard note spend failed: {err:?} ({note:?})");
                 continue;
             }
             s_spend_z += note.note.value().inner();
@@ -1554,6 +1572,7 @@ impl ManualWallet {
                 return None;
             }
         };
+        println!("staking with orchard anchor at {orchard_anchor_h:?}: {orchard_anchor:?}");
 
         //- KEYS/SIGNING
         let mut signing_set = TransparentSigningSet::new();
@@ -1598,7 +1617,7 @@ impl ManualWallet {
             };
             let merkle_path = orchard::tree::MerklePath::from(witness);
             if let Err(err) = txb.add_orchard_spend::<zip317::FeeError>(keys.orchard_fvk.clone().unwrap(), note.note, merkle_path) {
-                println!("tx build: orchard note spend failed: {err:?}");
+                println!("tx build: orchard note spend failed: {err:?} ({note:?})");
                 continue;
             }
             s_spend_z += note.note.value().inner();
@@ -1952,7 +1971,7 @@ fn bc_h_from_raw_tx_h(height: u64) -> Option<Option<BlockHeight>> {
 
 // TODO: handle memo here instead of caller?
 // TODO: replace orchard_action_tree_position_by_cmx with position
-fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, position: incrementalmerkletree::Position, block_h: BlockHeight, txid: &TxId, nf: &orchard::note::Nullifier, recv_note_addr: Option<(orchard::note::Note, orchard::Address)>, send_note_addr_memo: Option<(orchard::note::Note, orchard::Address, [u8; 512])>) -> Option<WalletTxPart> {
+fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, position: incrementalmerkletree::Position, block_h: BlockHeight, txid: &TxId, spent_nf: &orchard::note::Nullifier, recv_note_addr: Option<(orchard::note::Note, orchard::Address)>, send_note_addr_memo: Option<(orchard::note::Note, orchard::Address, [u8; 512])>) -> Option<WalletTxPart> {
     let account = &mut wallet.accounts[account_i];
 
     //- HANDLE SPENT NOTES
@@ -1961,20 +1980,22 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
     // TODO: map/index acceleration
     // NOTE: action.nullifier() is like prevout, it's the spent id (if a recv action)
     for (note_i, note) in account.unspent_orchard_notes.iter().enumerate() {
-        if note.nf == *nf {
+        if note.nf == *spent_nf {
             // this action is a spend by us with this note/nullifier: move it to spent
             let spent_note = account.unspent_orchard_notes.remove(note_i);
             s_spend_c = 1;
             s_spend_z = spent_note.note.value().inner();
             orchard_spent_h_insert(&mut account.spent_orchard_notes, OrchardNote { spent_h: block_h, ..spent_note });
+            // println!("{} found new spent note at {block_h:?}, tree pos={:02}: spent_nf:{:?}", wallet.name, u64::from(position), *spent_nf);
             break;
         }
     }
     if s_spend_c == 0 {
         for note in &account.spent_orchard_notes {
-            if note.nf == *nf {
+            if note.nf == *spent_nf {
                 s_spend_c = 1;
                 s_spend_z = note.note.value().inner();
+                // println!("{} found old spent note at {block_h:?}, tree pos={:02}", wallet.name, u64::from(position));
                 break;
             }
         }
@@ -2013,7 +2034,7 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
             // },
             nf: note.nullifier(keys.orchard_fvk.as_ref().expect("implied by ivk presence")), // TODO: cache or recompute?
         };
-        // println!("got new note at {:?}, tree pos={:02} {:?}", block_h, u64::from(orchard_note.witness.witnessed_position()), orchard_note.witness.root());
+        // println!("{} got new note at {block_h:?}, tree pos={:02}: {orchard_note:?}", wallet.name, u64::from(position));
 
         let txid_h = if let Some(&txid_h) = wallet.tx_h_map.get(txid) {
             txid_h
@@ -2085,11 +2106,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
         is_coinbase = t_bundle.is_coinbase();
         // HANDLE SPENT TXIDS
         if !is_coinbase {
-            let mut input_i = 0;
             for input in &t_bundle.vin {
-                // println!("input {input_i} {input:?}");
-                input_i += 1;
-
                 if let Some(&prevout_txid_h) = wallet.tx_h_map.get(input.prevout.txid()) {
                     if let Some(utxo_i) = txo_recv_h_position(&account.utxos, prevout_txid_h, &input.prevout) {
                         let utxo = account.utxos.remove(utxo_i);
@@ -2278,7 +2295,7 @@ fn shard_tree_root(tree: &OrchardShardTree) -> orchard::tree::MerkleHashOrchard 
 }
 
 /// NOTE: this *must* only be called in sequential order without gaps (including after reorg/truncate)
-fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, insert_i: &mut usize, orchard_tree: &mut OrchardShardTree) -> (TxId, bool/*ours*/, bool/*ok*/) {
+fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, next_orchard_pos: &mut u64, insert_i: &mut usize, orchard_tree: &mut OrchardShardTree) -> (TxId, bool/*ours*/, bool/*ok*/) {
     let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
 
     let mut shielded_part = WalletTxPart::ZERO;
@@ -2300,27 +2317,35 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
         } else {
             None
         };
-        let nf: orchard::note::Nullifier = action.nullifier();
-        let cmx: orchard::note::ExtractedNoteCommitment = action.cmx();
 
+        let orchard_pos = incrementalmerkletree::Position::from(*next_orchard_pos);
         //- GLOBAL-VIEW UPDATES
+        // TODO: we want to mark if *any* of the wallets care about this.
+        let retention = incrementalmerkletree::Retention::Marked;
         // NOTE: we don't care to mark our sent(-only) actions
-        let retention = if note_addr.is_some() {
-            incrementalmerkletree::Retention::Marked
-        } else {
-            incrementalmerkletree::Retention::Ephemeral
-        };
+        // Track a frontier & insert_frontier[_nodes] if its ours & behind
+        // let retention = if note_addr.is_some() {
+        //     incrementalmerkletree::Retention::Marked
+        // let retention = if note_addr.is_some() {
+        //     incrementalmerkletree::Retention::Marked
+        // } else {
+        //     incrementalmerkletree::Retention::Ephemeral
+        // };
+        //
         // TODO: batch_insert
         // Some kind of problem with batch insert. TODO for later / Sam
         // let position = orchard_tree.max_leaf_position(None).unwrap().unwrap_or(incrementalmerkletree::Position::from(0));
         // let res = orchard_tree.batch_insert(position, append_iter).expect("Infallible Memory Store");
         // println!("****** orchard_tree.batch_insert result {:?}", res);
-        orchard_tree.append(orchard::tree::MerkleHashOrchard::from_cmx(&cmx), retention).expect("Infallible Memory Store");
-        println!("orchard root at {:?} tree size={:02} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
+        if *next_orchard_pos >= shard_tree_size(&orchard_tree) {
+            assert_eq!(*next_orchard_pos, shard_tree_size(&orchard_tree), "should be appending sequentially");
+            orchard_tree.append(orchard::tree::MerkleHashOrchard::from_cmx(&action.cmx()), retention).expect("Infallible Memory Store");
+            println!("new orchard root at {:?} tree size={:02} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
+            // let position = orchard_tree.max_leaf_position(None).expect("Infallible Memory Store").expect("just appended");
+        }
+        *next_orchard_pos += 1;
 
-        let position = orchard_tree.max_leaf_position(None).expect("Infallible Memory Store").expect("just appended");
-
-        let Some(part) = handle_orchard_action(wallet, account_i, keys, position, block_h, &txid, &nf, note_addr, None) else {
+        let Some(part) = handle_orchard_action(wallet, account_i, keys, orchard_pos, block_h, &txid, &action.nullifier(), note_addr, None) else {
             // error creating zats (already printed)
             // TODO: can we validly continue at all?
             continue;
@@ -2987,11 +3012,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         })
                     .collect::<Vec<WalletRosterMember>>()
                         .clone();
-                    println!("*********** WALLET ROSTER: {wallet_roster:?}");
+                    // println!("*********** WALLET ROSTER: {wallet_roster:?}");
                     wallet_state.lock().unwrap().roster = wallet_roster;
                 }
             }
-            println!("*********** ROSTER: {roster:?}");
+            // println!("*********** ROSTER: {roster:?}");
 
 
             // NETWORK TIP HEIGHT
@@ -3323,6 +3348,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
 
         //-- REORG
+        // TODO: double check mempool invalidation sequences correctly with async read (account for tip height on downloaded tx)
         if let Some(start_block_i) = sync_from_i {
             // the regime is basically "always reorg", but that's often a no-op
             // truncate wallet for everything below height
@@ -3414,6 +3440,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let insert_idxs = [&mut 0, &mut 0];
 
             while let Ok(raw_tx) = mempool_recv.try_recv() {
+                println!("got mempool tx with tip height: {}", raw_tx.height);
                 // NOTE: expected LRZ height different from abstract mempool height
                 match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, LRZBlockHeight::from_u32(network_tip_h.0 + 1))) {
                     Err(err) => {
@@ -3431,15 +3458,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
 
-        //-- ADD/REVALIDATE SHIELDED TXS FROM NEW BLOCKS
+        //-- ADD/REVALIDATE SHIELDED TXS FROM NEW BLOCKS -- CANONICAL "SPINE"
         if let Some(start_block_i) = sync_from_i {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             let sync_start_h = <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above");
             println!("cache at {}, new blocks: {}-{}; updating wallets...",
                 pow_cache.next_tip_h-1, new_blocks.first().unwrap().height, new_blocks.last().unwrap().height);
 
+            let rng_start_orchard_tree_size = shard_tree_size(&orchard_tree);
 
             for (wallet_i, wallet) in [miner_wallet, user_wallet].into_iter().enumerate() {
+                let mut next_orchard_pos = rng_start_orchard_tree_size;
                 let keys = PreparedKeys::from_ufvk_ivks(&wallet.accounts[0].ufvk); // NOTE: can't use ovk for CompactTx
                 let mut insert_i = 0;
                 for block in &new_blocks {
@@ -3449,15 +3478,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     //-- INCORPORATE SHIELDED TRANSACTIONS FROM COMPACT BLOCK
                     'tx_iter: for tx in &block.vtx {
-                        if let (txid, true, true) = read_compact_tx(wallet, 0, &keys, block_h, tx, &mut insert_i, &mut orchard_tree) {
-                            println!("found our compact tx: {txid:?}");
+                        if let (txid, true, true) = read_compact_tx(wallet, 0, &keys, block_h, tx, &mut next_orchard_pos, &mut insert_i, &mut orchard_tree) {
+                            // println!("found our compact tx: {txid:?}");
                         }
                     }
 
                     // NOTE: simple approach: checkpoint every block
                     // => allows for easy reorgs & witnesses
-                    orchard_tree.checkpoint(block_h);
-                    // println!("orchard root at {:?} tree: size={} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
+                    if next_orchard_pos == shard_tree_size(&orchard_tree) {
+                        orchard_tree.checkpoint(block_h);
+                        // println!("checkpoint: orchard root at {:?} tree: size={} {:?}", block_h, shard_tree_size(&orchard_tree), shard_tree_root(&orchard_tree));
+                    }
                 }
             }
         }
@@ -3524,10 +3555,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         //-- SEND DATA TO UI
         {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-            println!("miner unspent UTXOs {:#?}", NL(&*miner_wallet.accounts[0].utxos));
-            println!("miner spent   UTXOs {:#?}", NL(&*miner_wallet.accounts[0].stxos));
+            // println!("miner unspent UTXOs {:#?}", NL(&*miner_wallet.accounts[0].utxos));
+            // println!("miner spent   UTXOs {:#?}", NL(&*miner_wallet.accounts[0].stxos));
             println!("miner unspent notes {:#?}", NL(&*miner_wallet.accounts[0].unspent_orchard_notes));
             println!("miner spent   notes {:#?}", NL(&*miner_wallet.accounts[0].spent_orchard_notes));
+            println!("user  unspent notes {:#?}", NL(&*user_wallet.accounts[0].unspent_orchard_notes));
+            println!("user  spent   notes {:#?}", NL(&*user_wallet.accounts[0].spent_orchard_notes));
 
             let mut miner_unshielded_funds = 0;
             let mut miner_shielded_pending_funds = 0;
@@ -3581,8 +3614,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // Anchor debugging
         // {
         //     let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-        //     let orchard_anchor_h = miner_wallet.chain_tip_h.sat_sub(1);
-        //     for i in 0..orchard_anchor_h.0 {
+        //     for i in 0..miner_wallet.chain_tip_h.0 {
         //         let orchard_anchor_h = BlockHeight(i);
         //         let try_anchor = match orchard_tree.root_at_checkpoint_id(&orchard_anchor_h).expect("Infallible MemoryShardStore") {
         //             Some(root) => Some(orchard::Anchor::from(root)),
@@ -3601,6 +3633,27 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let maybe_shield_txid = miner_wallet.shield_transparent_zats(network, &mut client, &miner_usk, 1000000000, &orchard_tree).await;
             println!("Try miner shield txid: {:?}", maybe_shield_txid);
             faucet_shield_cooldown_instant = Instant::now();
+        }
+
+        if AUTO_SPEND != 0 {
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+            if user_wallet.accounts[0].unspent_orchard_notes.len() == 0 {
+                // the user needs money, try to send some (doesn't matter if we fail until we've mined some)
+                let keys = PreparedKeys::from_ufvk_all(&miner_wallet.accounts[0].ufvk);
+                let output = &[TxOutput::Orchard{
+                    ovk: Some(keys.orchard_ovk.unwrap()), // TODO: allow default of sender ovk
+                    dst: *user_ua.orchard().unwrap(),
+                    memo: MemoBytes::empty(),
+                    zats: 500_000_000,
+                }];
+                miner_wallet.send_zats(network, &mut client, output, &miner_usk, &TxOptions{
+                    src_pools: &[TxPool::Orchard(&orchard_tree)],
+                    ..Default::default()
+                }).await;
+
+            } else {
+                user_wallet.stake_orchard_to_finalizer(network, &mut client, &user_usk, 100_000_000, &orchard_tree, &[0xcd;32]).await;
+            }
         }
 
         // let (reorg_required) = 'process_blocks: {
@@ -4131,7 +4184,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     WalletAction::StakeToFinalizer(amount, target_finalizer) => {
                         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
                         let maybe_send_txid = user_wallet.stake_orchard_to_finalizer(network, &mut client, &user_usk, amount.into_u64(), &orchard_tree, target_finalizer).await;
-                        println!("Try miner send txid: {:?}", maybe_send_txid);
+                        println!("Try stake txid: {:?}", maybe_send_txid);
                         match maybe_send_txid {
                             None => {
                                 wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
