@@ -6244,7 +6244,6 @@ dependencies = [
  "zcash_protocol",
  "zcash_script",
  "zcash_transparent",
- "zebra-chain",
  "zip32",
 ]
 
