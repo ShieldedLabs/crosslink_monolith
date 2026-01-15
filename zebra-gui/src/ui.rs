@@ -1526,7 +1526,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     let kind_text_h = ui.scale(18.0);
                     let transaction_text_h = ui.scale(16.0);
 
-                    for (index, tx) in txs.iter().enumerate() {
+                    for (index, tx) in txs.iter().rev().enumerate() {
                         if index > 0 { // separator
                             let colour = {
                                 let mut col = TRANSACTION_HISTORY_CONTAINER_COL;

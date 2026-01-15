@@ -3994,10 +3994,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
 
-            let mut user_txs = user_wallet.txs.clone();
-            user_txs.reverse(); // TODO: just read in reverse order
-            let mut miner_txs = miner_wallet.txs.clone();
-            miner_txs.reverse(); // TODO: just read in reverse order
+            let user_txs = user_wallet.txs.clone();
+            let miner_txs = miner_wallet.txs.clone();
 
             let mut lock = wallet_state.lock().unwrap();
             lock.user_txs = user_txs;
@@ -4672,7 +4670,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             },
                         }
                     }
-                    
+
                     WalletAction::ClaimBond(txid) => {
                         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
                         let maybe_send_txid = user_wallet.claim_bond_using_orchard(network, &mut client, &user_usk, &orchard_tree, txid.as_ref()).await;
