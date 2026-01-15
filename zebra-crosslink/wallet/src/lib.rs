@@ -2839,12 +2839,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
     };
 
-    let mut get_lightd_info = async || {
-        if JUDAHS_NETWORK_TESTS {
-        } else {
-        }
-    };
-
     let mut client = connect(format!("http://localhost:{}", zaino_port)).await.expect("failed to connect!");
 
     // NOTE: current model is to reorg this many blocks back
@@ -2972,7 +2966,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 //     pow_cache.next_tip_h-1, block_range.start.clone().unwrap().height, block_range.end.clone().unwrap().height);
                 let (tree_state_res, lightd_res, block_range_res, t_txs_res) = tokio::join!(
                     client.get_tree_state(BlockId {height: req_start_h, hash: Vec::new()}),
-                    get_lightd_info(),
+                    client0.get_lightd_info(Empty{}),
                     client1.get_block_range(block_rng_from_heights(req_rng)),
                     client2.get_taddress_txids(TransparentAddressBlockFilter {
                         address: miner_t_address.encode(network),
