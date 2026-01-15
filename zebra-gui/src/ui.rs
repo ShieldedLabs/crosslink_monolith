@@ -1150,8 +1150,17 @@ pub fn ui_left_pane(ui: &mut Context,
                         clicked
                     };
 
-
-                    let staked_roster = wallet_state.lock().unwrap().staked_roster.clone();
+                    // pub staked_roster: Vec<([u8; 32] /* pub key */, [u8; 32] /* txid */, u64 /* initial */, u64 /* accumulated */)>,
+                    let mut staked_roster = Vec::new();
+                    {
+                        let lock = wallet_state.lock().unwrap();
+                        for p in &lock.stake_positions_unbonded {
+                            staked_roster.push((true, p.0, p.0, p.1, p.1));
+                        }
+                        for p in &lock.stake_positions_bonded {
+                            staked_roster.push((false, p.0, p.0, p.1, p.1));
+                        }
+                    }
                     if staked_roster.len() == 0 {
                         ui.unstake_scroll = 0.0;
                     }
@@ -1232,8 +1241,15 @@ pub fn ui_left_pane(ui: &mut Context,
                                         align: Center,
                                         ..Decl
                                     }) {
-                                        if clickable_icon(ui, id_index("Unstake Button", index as u32), ICON_LINK_1, ICON_UNLINK, true) {
-                                            wallet_state.lock().unwrap().unstake_from_finalizer(member.1);
+                                        if member.0 {
+                                            if clickable_icon(ui, id_index("Unstake Button", index as u32), ICON_MONEY, ICON_WALLET, true) {
+                                                wallet_state.lock().unwrap().claim_bond(member.1);
+                                            }
+                                        }
+                                        else {
+                                            if clickable_icon(ui, id_index("Unstake Button", index as u32), ICON_LINK_1, ICON_UNLINK, true) {
+                                                wallet_state.lock().unwrap().unstake_from_finalizer(member.1);
+                                            }
                                         }
                                     }
 
@@ -1246,7 +1262,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                         align: Left,
                                         ..Decl
                                     }) {
-                                        let bytes = member.0;
+                                        let bytes = member.1;
                                         let chunks = {
                                             let mut chunks = [0u64; 4];
                                             for i in 0..4 {
@@ -1272,7 +1288,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                         align: Right,
                                         ..Decl
                                     }) {
-                                        let stake_amount: i64 = member.3 as i64;
+                                        let stake_amount: i64 = member.4 as i64;
                                         let full = stake_amount / 100_000_000;
                                         let part = stake_amount % 100_000_000;
                                         let part_str = format!("{part}00");
@@ -1282,7 +1298,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                         let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
                                         let mut str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
                                         if ui.hovered(id) {
-                                            let stake_amount: i64 = member.2 as i64;
+                                            let stake_amount: i64 = member.3 as i64;
                                             let full = stake_amount / 100_000_000;
                                             let part = stake_amount % 100_000_000;
                                             let part_str = format!("{part}00");
@@ -1550,7 +1566,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     (WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
                                     (WalletTxKind::Shield,   true) => ICON_SHIELD,
                                     (WalletTxKind::Stake,    true) => ICON_LINK_1,
-                                    (WalletTxKind::Unstake,  true) => ICON_UNLINK,
+                                    (WalletTxKind::BeginUnstake,  true) => ICON_LINK_EXT_ALT,
+                                    (WalletTxKind::ClaimUnstake,  true) => ICON_UNLINK,
                                     _ => {
                                         let timer = (ui.tx_loading_animation_timer * 3.0) as u64;
                                         if timer % 3 == 0 {
@@ -1588,7 +1605,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::SelfSend => if tx_is_on_best_chain { "Returned" } else { "Returning" },
                                     WalletTxKind::Shield   => if tx_is_on_best_chain { "Shielded" } else { "Shielding" },
                                     WalletTxKind::Stake    => if tx_is_on_best_chain { "Staked"   } else { "Staking"   },
-                                    WalletTxKind::Unstake  => if tx_is_on_best_chain { "Unstaked" } else { "Unstaking" },
+                                    WalletTxKind::BeginUnstake  => if tx_is_on_best_chain { "Unbonding" } else { "Unbonding" },
+                                    WalletTxKind::ClaimUnstake  => if tx_is_on_best_chain { "Unstaked" } else { "Unstaking" },
                                 };
 
                                 let label_str = if tx.mined_h.is_in_block() {
@@ -1635,21 +1653,22 @@ pub fn ui_left_pane(ui: &mut Context,
                                 let colour = match tx.kind() {
                                     WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
                                     WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
-                                    WalletTxKind::Receive | WalletTxKind::Unstake => (0x5a, 0xb5, 0x52, 0xff),
+                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake => (0x5a, 0xb5, 0x52, 0xff),
                                     WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
+                                    WalletTxKind::BeginUnstake => WHITE,
                                     _ => WHITE,
                                 };
 
                                 let totals = tx.totals();
                                 match tx.kind() {
-                                    WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake => {
+                                    WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake | WalletTxKind::BeginUnstake => {
                                         let send_amount: i64 = tx.account_value_delta().into();
                                         let send_amount: u64 = send_amount.abs() as u64;
 
                                         let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
                                         ui.text(frame_strf!(data, "{}{} cTAZ", prefix, str_from_ctaz(send_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                     },
-                                    WalletTxKind::Receive | WalletTxKind::Unstake => {
+                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake => {
                                         if true { // total
                                             ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(totals.recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                         } else { // transparent, shielded
@@ -1670,7 +1689,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                 let fee: u64 = tx.fee().into_u64();
                                 if tx.kind() != WalletTxKind::Receive &&
-                                   tx.kind() != WalletTxKind::Unstake {
+                                   tx.kind() != WalletTxKind::BeginUnstake {
                                     ui.text(frame_strf!(data, "Fee: {} cTAZ", str_from_ctaz(fee)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                 }
                             }

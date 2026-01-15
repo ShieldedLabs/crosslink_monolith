@@ -147,6 +147,7 @@ pub fn conventional_actions(transaction: &Transaction) -> u32 {
             1
         };
     }
+    // TODO(Sam): FIX FEES
 
     let tx_in_total_size: usize = transaction
         .inputs()

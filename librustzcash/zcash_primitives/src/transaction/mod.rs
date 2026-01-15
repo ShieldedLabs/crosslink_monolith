@@ -1439,8 +1439,71 @@ pub struct StakingAction_CreateNewDelegationBond {
 }
 
 impl StakingAction_CreateNewDelegationBond {
-    pub fn to_union(self) -> StakingAction {
+    pub fn to_union(&self) -> StakingAction {
         StakingAction { kind: StakingActionKind::CreateNewDelegationBond, amount_zats: self.amount_zats, arg32_0: self.unique_pubkey, arg32_1: self.challenge, arg32_2: self.target_finalizer, arg64_0: self.signature, ..Default::default() }
+    }
+    pub fn try_from_union(union: &StakingAction) -> Option<StakingAction_CreateNewDelegationBond> {
+        if union.kind == StakingActionKind::CreateNewDelegationBond {
+            Some(StakingAction_CreateNewDelegationBond {
+                amount_zats: union.amount_zats,
+                unique_pubkey: union.arg32_0,
+                challenge: union.arg32_1,
+                target_finalizer: union.arg32_2,
+                signature: union.arg64_0,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct StakingAction_BeginDelegationUnbonding {
+    pub unique_pubkey: [u8; 32],
+    pub challenge: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl StakingAction_BeginDelegationUnbonding {
+    pub fn to_union(&self) -> StakingAction {
+        StakingAction { kind: StakingActionKind::BeginDelegationUnbonding, arg32_0: self.unique_pubkey, arg32_1: self.challenge, arg64_0: self.signature, ..Default::default() }
+    }
+    pub fn try_from_union(union: &StakingAction) -> Option<StakingAction_BeginDelegationUnbonding> {
+        if union.kind == StakingActionKind::BeginDelegationUnbonding {
+            Some(StakingAction_BeginDelegationUnbonding {
+                unique_pubkey: union.arg32_0,
+                challenge: union.arg32_1,
+                signature: union.arg64_0,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct StakingAction_WithdrawDelegationBond {
+    pub amount_zats: u64,
+    pub unique_pubkey: [u8; 32],
+    pub challenge: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl StakingAction_WithdrawDelegationBond {
+    pub fn to_union(&self) -> StakingAction {
+        StakingAction { kind: StakingActionKind::WithdrawDelegationBond, amount_zats: self.amount_zats, arg32_0: self.unique_pubkey, arg32_1: self.challenge, arg64_0: self.signature, ..Default::default() }
+    }
+    pub fn try_from_union(union: &StakingAction) -> Option<StakingAction_WithdrawDelegationBond> {
+        if union.kind == StakingActionKind::WithdrawDelegationBond {
+            Some(StakingAction_WithdrawDelegationBond {
+                amount_zats: union.amount_zats,
+                unique_pubkey: union.arg32_0,
+                challenge: union.arg32_1,
+                signature: union.arg64_0,
+            })
+        } else {
+            None
+        }
     }
 }
 

@@ -69,7 +69,7 @@ fn main() {
             WalletRosterMember{ pub_key: [0x88u8; 32], voting_power: 250_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0x99u8; 32], voting_power: 100_000_000, txids: vec![] }, */
         ];
-        wallet_state.lock().unwrap().staked_roster = vec![
+        wallet_state.lock().unwrap().stake_positions_bonded = vec![
             /* ([0xAAu8; 32], [0x1u8; 32], 100_000_000, 250_000_000),
             ([0xBBu8; 32], [0x1u8; 32], 100_000_000, 100_000_000),
             ([0xCCu8; 32], [0x1u8; 32], 100_000_000, 250_000_000),
