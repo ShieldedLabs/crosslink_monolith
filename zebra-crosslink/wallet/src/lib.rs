@@ -2369,25 +2369,27 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
 
 const JUDAHS_NETWORK_TESTS: bool = true;
 
-#[derive(Debug, Default)]
-struct IndirectState {
-    pub network_handle: *mut std::ffi::c_void,
+#[allow(unsafe_code)]
+fn indirect_connect(
+    address: *const u8,
+    address_len: usize,
+    connect_cb: unsafe extern "C" fn(address: *const u8, address_len: usize, user_data: *mut std::ffi::c_void) -> *mut std::ffi::c_void,
+    user_data: *mut std::ffi::c_void) -> *mut std::ffi::c_void
+{
+    unsafe { connect_cb(address, address_len, user_data) }
 }
 
 #[allow(unsafe_code)]
-impl IndirectState {
-    fn connect(
-        &mut self,
-        address: *const u8,
-        address_len: usize,
-        connect_cb: unsafe extern "C" fn(*const u8, usize, *mut std::ffi::c_void) -> *mut std::ffi::c_void,
-        userdata: *mut std::ffi::c_void)
-    {
-        unsafe { self.network_handle = connect_cb(address, address_len, userdata); }
-    }
-
+fn indirect_send(
+    endpoint: *const u8,
+    endpoint_len: usize,
+    payload: *const u8,
+    payload_len: usize,
+    send_cb: unsafe extern "C" fn(endpoint: *const u8, endpoint_len: usize, payload: *const u8, payload_len: usize, user_data: *mut std::ffi::c_void) -> bool,
+    user_data: *mut std::ffi::c_void) -> bool
+{
+    unsafe { send_cb(endpoint, endpoint_len, payload, payload_len, user_data) }
 }
-
 
 pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     fn stuff_from_seed_phrase<P: Parameters + 'static>(params:P, phrase: &str) -> (
@@ -2790,8 +2792,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 
-    let mut indirect_state = IndirectState::default();
-
     async fn rust_connect(address: String) -> Option<CompactTxStreamerClient<Channel>> {
         loop {
             if let Ok(channel) = Channel::from_shared(address.clone()).unwrap().connect().await {
@@ -2823,19 +2823,25 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         })
     }
 
-    #[allow(unsafe_code)]
     let mut connect = async | address: String | {
         if JUDAHS_NETWORK_TESTS {
             let mut handle = tokio::runtime::Handle::current();
-            indirect_state.connect(address.as_ptr(), address.len(), c_connect, &mut handle as *mut _ as *mut std::ffi::c_void);
 
-            if indirect_state.network_handle == std::ptr::null_mut() {
+            let client = indirect_connect(address.as_ptr(), address.len(), c_connect, &mut handle as *mut _ as *mut std::ffi::c_void);
+            if client == std::ptr::null_mut() {
                 return None;
             } else {
-                return Some(unsafe { Box::from_raw(indirect_state.network_handle as *mut CompactTxStreamerClient<Channel>) });
+                #[allow(unsafe_code)]
+                return Some(unsafe { Box::from_raw(client as *mut CompactTxStreamerClient<Channel>) });
             }
         } else {
             return rust_connect(address).await.map(|client| Box::new(client));
+        }
+    };
+
+    let mut get_lightd_info = async || {
+        if JUDAHS_NETWORK_TESTS {
+        } else {
         }
     };
 
@@ -2966,7 +2972,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 //     pow_cache.next_tip_h-1, block_range.start.clone().unwrap().height, block_range.end.clone().unwrap().height);
                 let (tree_state_res, lightd_res, block_range_res, t_txs_res) = tokio::join!(
                     client.get_tree_state(BlockId {height: req_start_h, hash: Vec::new()}),
-                    client0.get_lightd_info(Empty {}),
+                    get_lightd_info(),
                     client1.get_block_range(block_rng_from_heights(req_rng)),
                     client2.get_taddress_txids(TransparentAddressBlockFilter {
                         address: miner_t_address.encode(network),
