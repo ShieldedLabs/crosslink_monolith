@@ -13,12 +13,10 @@ use zcash_protocol::{
 };
 
 use crate::transaction::{
-    Transaction, TxVersion,
-    fees::{
+    StakingAction, StakingActionKind, Transaction, TxVersion, fees::{
         FeeRule,
         transparent::{InputView, OutputView},
-    },
-    StakingAction,
+    }
 };
 
 #[cfg(feature = "std")]
@@ -586,6 +584,8 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
                         .map_err(|_| BalanceError::Overflow)
                 },
             )?,
+            -self.staking_action.filter(|s| s.kind == StakingActionKind::CreateNewDelegationBond).map_or_else(|| ZatBalance::zero(), |s| ZatBalance::from_u64(s.amount_zats).unwrap()),
+            self.staking_action.filter(|s| s.kind == StakingActionKind::WithdrawDelegationBond).map_or_else(|| ZatBalance::zero(), |s| ZatBalance::from_u64(s.amount_zats).unwrap()),
             #[cfg(all(
                 any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
                 feature = "zip-233"
@@ -783,8 +783,8 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
         //
         // Consistency checks
         //
-
         let fee = if self.staking_action.is_none() { fee } else { version = TxVersion::VCrosslink; Zatoshis::const_from_u64(0) };
+        //// TODO(Sam): FIX FEES
 
         // After fees are accounted for, the value balance of the transaction must be zero.
         let balance_after_fees = (self.value_balance()? - fee).ok_or(BalanceError::Underflow)?;
@@ -794,10 +794,8 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
                 return Err(Error::InsufficientFunds(-balance_after_fees));
             }
             Ordering::Greater => {
-                // Note(Sam): There seems to be a librustzcash bug where the fee was calculated incorrectly. Let us ignore that.
-                //if self.staking_action.is_none() {
-                //    return Err(Error::ChangeRequired(balance_after_fees));
-                //}
+                //// TODO(Sam): FIX FEES
+                //return Err(Error::ChangeRequired(balance_after_fees));
             }
             Ordering::Equal => (),
         };

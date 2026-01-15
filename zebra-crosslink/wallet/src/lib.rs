@@ -35,7 +35,7 @@ use zcash_primitives::transaction::fees::{
 };
 use zcash_primitives::transaction::sighash::{signature_hash, SignableInput};
 use zcash_primitives::transaction::txid::TxIdDigester;
-use zcash_primitives::transaction::{Authorized, StakingAction_BeginDelegationUnbonding, StakingAction_CreateNewDelegationBond, Transaction, TransactionData, TxVersion, Unauthorized};
+use zcash_primitives::transaction::{Authorized, StakingAction_BeginDelegationUnbonding, StakingAction_CreateNewDelegationBond, StakingAction_WithdrawDelegationBond, Transaction, TransactionData, TxVersion, Unauthorized};
 use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight as LRZBlockHeight, BranchId};
@@ -276,6 +276,7 @@ enum WalletAction {
     TestStakeAction,
     StakeToFinalizer(Zatoshis, [u8; 32]),
     UnstakeFromFinalizer(TxId),
+    ClaimBond(TxId),
     SendToAddress(UnifiedAddress, Zatoshis),
 }
 
@@ -533,6 +534,7 @@ pub struct WalletState {
     pub actions_in_flight: VecDeque<WalletAction>,
 
     pub stake_positions_bonded: Vec<([u8; 32] /* bond key */, u64 /* initial */)>,
+    pub stake_positions_unbonded: Vec<([u8; 32] /* bond key */, u64 /* initial */)>,
 }
 
 impl WalletState {
@@ -567,6 +569,14 @@ impl WalletState {
             return;
         }
         self.actions_in_flight.push_back(WalletAction::UnstakeFromFinalizer(txid));
+    }
+
+    pub fn claim_bond(&mut self, txid: [u8; 32]) {
+        let txid = TxId::from_bytes(txid);
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::ClaimBond(id) if id.eq(&txid) => true, _ => false }).count() != 0 {
+            return;
+        }
+        self.actions_in_flight.push_back(WalletAction::ClaimBond(txid));
     }
 
     pub fn send_to_address(&mut self, address: String, amount: u64) {
@@ -1884,6 +1894,201 @@ impl ManualWallet {
         }
     }
 
+
+    pub async fn claim_bond_using_orchard<P: Parameters>(
+        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
+        src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, bond_key: &[u8; 32],
+    ) -> Option<TxId>
+    {
+        let tz = Timer::scope("claim_bond_using_orchard");
+        let block_h = self.chain_tip_h.0 + 1;
+
+        let account = &self.accounts[0];
+        let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
+
+        let orchard_anchor_h = self.chain_tip_h.sat_sub(5);
+        let orchard_anchor = match orchard_tree.root_at_checkpoint_id(&orchard_anchor_h).expect("Infallible MemoryShardStore") {
+            Some(root) => orchard::Anchor::from(root),
+            None => {
+                println!("tx build: couldn't get anchor at {orchard_anchor_h:?}");
+                return None;
+            }
+        };
+
+        //- KEYS/SIGNING
+        let mut signing_set = TransparentSigningSet::new();
+        let mut t_pubkey = None;
+        let Some((pubkey, privkey)) = transparent_keys_from_usk(&src_usk, 0) else {
+            println!("tried to send from transparent source without available transparent keys");
+            return None;
+        };
+        signing_set.add_key(privkey);
+        t_pubkey = Some(pubkey);
+
+        let mut txb = TxBuilder::new(
+            network,
+            LRZBlockHeight::from_u32(block_h),
+            BuildConfig::Standard { sapling_anchor: None, orchard_anchor: Some(orchard_anchor), },
+        );
+
+        //- SPENDS
+        let (mut t_spend_z, mut s_spend_z) = (0, 0);
+        let (mut t_spend_c, mut s_spend_c) = (0, 0usize);
+        let t_pubkey = t_pubkey.expect("checked above");
+        // "greedy strategy"
+
+        let Some(bond_tx) = self.txs.iter().find(|t| t.staking_action.filter(|s| s.kind == StakingActionKind::BeginDelegationUnbonding).map(|s| s.arg32_0).unwrap_or_default() == *bond_key) else {
+            println!("Could not find bond {:?} that was ready to claim.", bond_key);
+            return None;
+        };
+
+        // TODO look up bond value properly.
+        let bond_value = self.txs.iter().find(|t| t.staking_action.filter(|s| s.kind == StakingActionKind::CreateNewDelegationBond).map(|s| s.arg32_0).unwrap_or_default() == *bond_key).unwrap().staking_action.unwrap().amount_zats;
+        s_spend_z += bond_value;
+
+        let mut rolling_fee_estimate: u64 = 5000 * (s_spend_c as u64).max(2);
+        rolling_fee_estimate = rolling_fee_estimate.max(10_000);
+
+        let mut shuffled_notes = account.unspent_orchard_notes.clone();
+        shuffled_notes.shuffle(&mut OsRng);
+        for note in &shuffled_notes {
+            rolling_fee_estimate = 5000 * (s_spend_c as u64).max(2);
+            rolling_fee_estimate = rolling_fee_estimate.max(10_000);
+            if s_spend_z >= rolling_fee_estimate {
+                break;
+            }
+
+            if note.recv_h > orchard_anchor_h { continue; }
+            let witness = match orchard_tree.witness_at_checkpoint_id(note.position, &orchard_anchor_h) {
+                // NOTE: presumably can fail from too-recent note
+                Ok(Some(witness)) => witness,
+                Ok(None) => {
+                    println!("tx build: no orchard checkpoint exists at {orchard_anchor_h:?}");
+                    return None;
+                }
+                Err(err) => {
+                    println!("tx build: orchard witness error: {err:?}");
+                    return None;
+                }
+            };
+            let merkle_path = orchard::tree::MerklePath::from(witness);
+            if let Err(err) = txb.add_orchard_spend::<zip317::FeeError>(keys.orchard_fvk.clone().unwrap(), note.note, merkle_path) {
+                println!("tx build: orchard note spend failed: {err:?}");
+                continue;
+            }
+            s_spend_z += note.note.value().inner();
+            s_spend_c += 1;
+            println!("  added orchard spend: {}", note.note.value().inner());
+        }
+
+        if s_spend_z < rolling_fee_estimate {
+            println!("tx build error: not enough unspent orchard notes, got {} zats needed {}", s_spend_z, rolling_fee_estimate);
+            return None;
+        }
+
+        //- OUTPUTS/SENDS
+        let mut memo_count = 0;
+        let mut memo = EMPTY_MEMO_BYTES;
+        let (mut t_send_z, mut t_recv_z, mut s_send_z, mut s_recv_z) = (0, 0, 0, 0);
+        let (mut t_send_c, mut t_recv_c, mut s_send_c, mut s_recv_c) = (0, 0, 0, 0);
+
+        s_send_z = s_spend_z - rolling_fee_estimate;
+        s_send_c = 2;
+
+        if let Err(err) = txb.put_staking_action(StakingAction_WithdrawDelegationBond { amount_zats: bond_value, unique_pubkey: *bond_key, challenge: [0u8; 32], signature: [0u8; 64] }.to_union()) {
+            println!("tx build error: {err:?}");
+            return None;
+        }
+
+        let (my_t_addr, my_ua) = addrs_from_account(&account, 0).unwrap();
+
+        // Change is free.
+        s_recv_z = s_send_z;
+        s_recv_c = 1;
+        if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(account.ufvk.orchard().cloned().map(|fvk| fvk.to_ovk(orchard::keys::Scope::External)), my_ua.orchard().unwrap().clone(), s_recv_z, MemoBytes::from_bytes(&EMPTY_MEMO_BYTES).unwrap()) {
+            println!("tx build error: {err:?}");
+            return None;
+        }
+        println!("  added orchard change: {}", s_recv_z);
+
+        //- TOTALS GATHERED; CHECK VALUES
+        let mut parts = [
+            WalletTxPart { // Transparent
+                spent_note_count: t_spend_c,
+                sent_note_count:  t_send_c,
+                recv_note_count:  t_recv_c,
+                spent_zats:       to_zats_or_dump_err("tx build", t_spend_z)?,
+                sent_zats:        to_zats_or_dump_err("tx build", t_send_z)?,
+                recv_zats:        to_zats_or_dump_err("tx build", t_recv_z)?,
+            },
+            WalletTxPart { // Shielded
+                spent_note_count: s_spend_c,
+                sent_note_count:  s_send_c,
+                recv_note_count:  s_recv_c,
+                spent_zats:       to_zats_or_dump_err("tx build", s_spend_z)?,
+                sent_zats:        to_zats_or_dump_err("tx build", s_send_z)?,
+                recv_zats:        to_zats_or_dump_err("tx build", s_recv_z)?,
+            },
+        ];
+
+        let Some(_totals) = parts[0].checked_add(&parts[1]) else {
+            println!("tx build error: total values are too large to be represented by Zatoshis");
+            return None;
+        };
+
+        //-- VERY EXPENSIVE TX CREATION (PARTICULARLY IF SHIELDED OUTPUT)
+        use rand_chacha::ChaCha20Rng;
+        let prover = LocalTxProver::bundled();
+        let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+        let tx_res = match txb.build(
+            &signing_set,
+            &[],
+            &[src_usk.orchard().into()],
+            rng,
+            &prover,
+            &prover,
+            &zip317::FeeRule::standard(),
+        ) {
+            Ok(tx_res) => tx_res,
+            Err(err) => {
+                println!("tx build error: {err:?}");
+                return None;
+            }
+        };
+
+        let tx = tx_res.transaction();
+        let mut tx_bytes = vec![];
+        tx.write(&mut tx_bytes).unwrap();
+
+        //-- EXPENSIVE NETWORK SEND
+        // TODO: don't block, maybe return a future?
+        let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
+        println!("******* res for {:?}: {:?}", tx.txid(), res);
+
+        //-- COMPLETION
+        if res.is_ok() {
+            // TODO: complete
+            let new_tx = WalletTx{
+                account_id: 0,
+                txid: tx.txid(),
+                expiry_h: None,
+                mined_h: BlockHeight::INTERNAL,
+                part_flags: TxParts::FULL_TX,
+                parts,
+                memo_count,
+                memo,
+                is_coinbase: false,
+                is_outside_bc: false,
+                staking_action: None,
+            };
+            let mut insert_i = 0;
+            update_insert_i(&self.txs, &mut insert_i, new_tx.mined_h);
+            update_with_tx(self, tx.txid(), new_tx, &mut insert_i);
+            Some(tx.txid())
+        } else {
+            None
+        }
+    }
 
     pub fn audit_txs(&self) {
         for tx in &self.txs {
@@ -3705,14 +3910,29 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             lock.pending_balance = user_pending_balance as i64;
 
             let mut stake_positions_bonded = Vec::new();
+            let mut stake_positions_unbonded = Vec::new();
             for tx in &user_wallet.txs {
                 if let Some(staking_action) = (&tx.staking_action) {
                     if let Some(create_bond) = StakingAction_CreateNewDelegationBond::try_from_union(staking_action) {
                         stake_positions_bonded.push((create_bond.unique_pubkey, create_bond.amount_zats));
                     }
+                    if let Some(unbond) = StakingAction_BeginDelegationUnbonding::try_from_union(staking_action) {
+                        if let Some(existing_i) = stake_positions_bonded.iter().position(|p| p.0 == unbond.unique_pubkey) {
+                            stake_positions_unbonded.push((unbond.unique_pubkey, stake_positions_bonded[existing_i].1));
+                            stake_positions_bonded.remove(existing_i);
+                        } else {
+                            stake_positions_unbonded.push((unbond.unique_pubkey, u64::MAX));
+                        }
+                    }
+                    if let Some(unbond) = StakingAction_WithdrawDelegationBond::try_from_union(staking_action) {
+                        if let Some(existing_i) = stake_positions_unbonded.iter().position(|p| p.0 == unbond.unique_pubkey) {
+                            stake_positions_unbonded.remove(existing_i);
+                        }
+                    }
                 }
             }
             lock.stake_positions_bonded = stake_positions_bonded;
+            lock.stake_positions_unbonded = stake_positions_unbonded;
         }
 
 
@@ -4318,6 +4538,22 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     WalletAction::UnstakeFromFinalizer(txid) => {
                         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
                         let maybe_send_txid = user_wallet.begin_unbonding_using_orchard(network, &mut client, &user_usk, &orchard_tree, txid.as_ref()).await;
+                        println!("Try miner send txid: {:?}", maybe_send_txid);
+                        match maybe_send_txid {
+                            None => {
+                                wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
+                                false
+                            }
+                            Some(_) => {
+                                wallet_state.lock().unwrap().waiting_for_stake_to_finalizer = false;
+                                true
+                            },
+                        }
+                    }
+                    
+                    WalletAction::ClaimBond(txid) => {
+                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+                        let maybe_send_txid = user_wallet.claim_bond_using_orchard(network, &mut client, &user_usk, &orchard_tree, txid.as_ref()).await;
                         println!("Try miner send txid: {:?}", maybe_send_txid);
                         match maybe_send_txid {
                             None => {

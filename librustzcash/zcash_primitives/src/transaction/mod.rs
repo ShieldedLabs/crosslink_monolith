@@ -1481,6 +1481,32 @@ impl StakingAction_BeginDelegationUnbonding {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct StakingAction_WithdrawDelegationBond {
+    pub amount_zats: u64,
+    pub unique_pubkey: [u8; 32],
+    pub challenge: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl StakingAction_WithdrawDelegationBond {
+    pub fn to_union(&self) -> StakingAction {
+        StakingAction { kind: StakingActionKind::WithdrawDelegationBond, amount_zats: self.amount_zats, arg32_0: self.unique_pubkey, arg32_1: self.challenge, arg64_0: self.signature, ..Default::default() }
+    }
+    pub fn try_from_union(union: &StakingAction) -> Option<StakingAction_WithdrawDelegationBond> {
+        if union.kind == StakingActionKind::WithdrawDelegationBond {
+            Some(StakingAction_WithdrawDelegationBond {
+                amount_zats: union.amount_zats,
+                unique_pubkey: union.arg32_0,
+                challenge: union.arg32_1,
+                signature: union.arg64_0,
+            })
+        } else {
+            None
+        }
+    }
+}
+
 // TODO(code org): should this be under zcash_protocol?
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct StakingAction {
