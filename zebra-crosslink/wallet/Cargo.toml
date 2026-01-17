@@ -12,7 +12,7 @@ zcash_client_backend = { path = "../../librustzcash/zcash_client_backend", featu
 zcash_client_memory = { path = "../../librustzcash/zcash_client_memory", features = ["orchard", "transparent-inputs"] }
 zcash_client_sqlite = { path = "../../librustzcash/zcash_client_sqlite", features = ["orchard", "transparent-inputs"] } # version = "0.19.0"
 zcash_keys = { workspace = true, features=["transparent-inputs"] }
-zcash_protocol = { workspace = true } # version = "0.7.1"
+zcash_protocol = { workspace = true, features = ["local-consensus"]} # version = "0.7.1"
 zcash_transparent = { workspace = true } # version = "0.6.1"
 zcash_note_encryption = { workspace = true } # version = "0.4.1"
 zcash_proofs = { workspace = true, features = ["bundled-prover"] }
