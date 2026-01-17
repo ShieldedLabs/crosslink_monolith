@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 pub mod block;
 pub mod chain;
+pub mod delegation;
 pub mod shielded;
 pub mod transparent;
 pub mod upgrade;
@@ -17,6 +18,7 @@ pub mod upgrade;
 mod tests;
 
 pub use block::{TransactionIndex, TransactionLocation, MAX_ON_DISK_HEIGHT};
+pub use delegation::{BondKey, BondStatus, DelegationBond};
 pub use transparent::OutputLocation;
 
 #[cfg(any(test, feature = "proptest-impl"))]

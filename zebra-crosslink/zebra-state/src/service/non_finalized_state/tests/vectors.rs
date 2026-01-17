@@ -33,6 +33,7 @@ fn construct_empty() {
         Default::default(),
         Default::default(),
         ValueBalance::zero(),
+        std::iter::empty(),
     );
 }
 
@@ -50,6 +51,7 @@ fn construct_single() -> Result<()> {
         Default::default(),
         Default::default(),
         ValueBalance::fake_populated_pool(),
+        std::iter::empty(),
     );
 
     chain = chain.push(block.prepare().test_with_zero_spent_utxos())?;
@@ -84,6 +86,7 @@ fn construct_many() -> Result<()> {
         Default::default(),
         Default::default(),
         ValueBalance::fake_populated_pool(),
+        std::iter::empty(),
     );
 
     for block in blocks {
@@ -111,6 +114,7 @@ fn ord_matches_work() -> Result<()> {
         Default::default(),
         Default::default(),
         ValueBalance::fake_populated_pool(),
+        std::iter::empty(),
     );
     lesser_chain = lesser_chain.push(less_block.prepare().test_with_zero_spent_utxos())?;
 
@@ -122,6 +126,7 @@ fn ord_matches_work() -> Result<()> {
         Default::default(),
         Default::default(),
         ValueBalance::zero(),
+        std::iter::empty(),
     );
     bigger_chain = bigger_chain.push(more_block.prepare().test_with_zero_spent_utxos())?;
 

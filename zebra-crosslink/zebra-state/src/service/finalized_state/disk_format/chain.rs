@@ -112,12 +112,13 @@ impl FromDisk for BlockInfo {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         // We want to be forward-compatible, so this must work even if the
         // size of the buffer is larger than expected.
+        // ValueBalance is 56 bytes (7 pools * 8 bytes each), plus 4 bytes for size = 60 bytes total.
         match bytes.as_ref().len() {
-            44.. => {
-                let value_pools = ValueBalance::<NonNegative>::from_bytes(&bytes.as_ref()[0..40])
-                    .expect("must work for 40 bytes");
+            60.. => {
+                let value_pools = ValueBalance::<NonNegative>::from_bytes(&bytes.as_ref()[0..56])
+                    .expect("must work for 56 bytes");
                 let size =
-                    u32::from_le_bytes(bytes.as_ref()[40..44].try_into().expect("must be 4 bytes"));
+                    u32::from_le_bytes(bytes.as_ref()[56..60].try_into().expect("must be 4 bytes"));
                 BlockInfo::new(value_pools, size)
             }
             _ => panic!("invalid format"),

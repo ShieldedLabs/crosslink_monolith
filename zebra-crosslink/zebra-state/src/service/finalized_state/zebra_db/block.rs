@@ -643,6 +643,9 @@ impl DiskWriteBatch {
                 &out_loc_by_outpoint,
                 address_balances,
             )?;
+
+            // Commit delegation bonds
+            self.prepare_delegation_bonds_batch(zebra_db, finalized, &finalized.height)?;
         }
         // Commit UTXOs and value pools
         self.prepare_chain_value_pools_batch(

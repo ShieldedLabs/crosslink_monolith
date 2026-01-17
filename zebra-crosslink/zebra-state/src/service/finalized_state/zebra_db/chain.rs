@@ -16,16 +16,23 @@ use std::{
     sync::Arc,
 };
 
+use zcash_primitives::transaction::StakingActionKind;
+
 use zebra_chain::{
-    amount::NonNegative, block::Height, block_info::BlockInfo, history_tree::HistoryTree,
-    serialization::ZcashSerialize as _, transparent, value_balance::ValueBalance,
+    amount::{Amount, NegativeAllowed, NonNegative},
+    block::Height,
+    block_info::BlockInfo,
+    history_tree::HistoryTree,
+    serialization::ZcashSerialize as _,
+    transparent,
+    value_balance::ValueBalance,
 };
 
 use crate::{
     request::FinalizedBlock,
     service::finalized_state::{
         disk_db::DiskWriteBatch,
-        disk_format::{chain::HistoryTreeParts, RawBytes},
+        disk_format::{chain::HistoryTreeParts, BondKey, RawBytes},
         zebra_db::ZebraDb,
         TypedColumnFamily,
     },
@@ -253,11 +260,36 @@ impl DiskWriteBatch {
         utxos_spent_by_block: HashMap<transparent::OutPoint, transparent::Utxo>,
         value_pool: ValueBalance<NonNegative>,
     ) -> Result<(), BoxError> {
-        let new_value_pool =
+        let mut new_value_pool =
             value_pool.add_chain_value_pool_change(finalized.block.chain_value_pool_change(
                 &utxos_spent_by_block,
                 finalized.deferred_pool_balance_change,
             )?)?;
+
+        // Handle BeginDelegationUnbonding staking actions.
+        // These move value from staking_bonded to staking_unbonded, but this transfer
+        // is not captured by chain_value_pool_change (which only handles value entering/leaving pools).
+        for tx in finalized.block.transactions.iter() {
+            if let Some(staking_action) = tx.staking_action() {
+                if staking_action.kind == StakingActionKind::BeginDelegationUnbonding {
+                    let bond_key: BondKey = staking_action.arg32_0;
+                    let bond = db.delegation_bond(&bond_key)
+                        .expect("bond must exist when unbonding (should have been validated)");
+
+                    // Move value from staking_bonded to staking_unbonded
+                    let current_bonded = new_value_pool.staking_bonded_amount();
+                    let new_bonded: Amount<NonNegative> = (current_bonded - bond.amount)
+                        .expect("staking_bonded pool should not underflow");
+                    new_value_pool.set_staking_bonded_amount(new_bonded);
+
+                    let current_unbonded = new_value_pool.staking_unbonded_amount();
+                    let new_unbonded: Amount<NonNegative> = (current_unbonded + bond.amount)
+                        .expect("staking_unbonded pool should not overflow");
+                    new_value_pool.set_staking_unbonded_amount(new_unbonded);
+                }
+            }
+        }
+
         let _ = db
             .chain_value_pools_cf()
             .with_batch_for_writing(self)
