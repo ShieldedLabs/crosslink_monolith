@@ -17,8 +17,13 @@ use std::{
 };
 
 use zebra_chain::{
-    amount::NonNegative, block::Height, block_info::BlockInfo, history_tree::HistoryTree,
-    serialization::ZcashSerialize as _, transparent, value_balance::ValueBalance,
+    amount::{Amount, NegativeAllowed, NonNegative},
+    block::Height,
+    block_info::BlockInfo,
+    history_tree::HistoryTree,
+    serialization::ZcashSerialize as _,
+    transparent,
+    value_balance::ValueBalance,
 };
 
 use crate::{

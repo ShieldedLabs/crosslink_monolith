@@ -29,7 +29,7 @@ mod chain;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use chain::{Chain, SpendingTransactionId};
+pub(crate) use chain::{BondStatusInChain, Chain, SpendingTransactionId};
 
 /// The state of the chains in memory, including queued blocks.
 ///
@@ -517,6 +517,14 @@ impl NonFinalizedState {
             &prepared,
             &new_chain.unspent_utxos(),
             &new_chain.spent_utxos,
+            finalized_state,
+        )?;
+
+        // Validate delegation bonds
+        // Reads from disk
+        check::delegation::validate_delegation_bonds(
+            &prepared,
+            &new_chain,
             finalized_state,
         )?;
 

@@ -35,8 +35,15 @@ use zebra_chain::{
 };
 
 use crate::{
-    request::Treestate, service::check, ContextuallyVerifiedBlock, HashOrHeight, OutputLocation,
-    TransactionLocation, ValidateContextError,
+    request::Treestate,
+    service::{
+        check,
+        finalized_state::disk_format::{
+            self, BondKey, BondStatus, DelegationBond,
+        },
+    },
+    ContextuallyVerifiedBlock, HashOrHeight, OutputLocation, TransactionLocation,
+    ValidateContextError,
 };
 
 #[cfg(feature = "indexer")]
@@ -84,6 +91,17 @@ pub(crate) type SpendingTransactionId = transaction::Hash;
 #[cfg(not(feature = "indexer"))]
 pub(crate) type SpendingTransactionId = ();
 
+/// The status of a delegation bond in the non-finalized chain.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BondStatusInChain {
+    /// Bond is active and receiving rewards.
+    Active,
+    /// Bond has begun unbonding (first transaction completed).
+    Unbonding,
+    /// Bond has been withdrawn (second transaction completed).
+    Withdrawn,
+}
+
 /// The internal state of [`Chain`].
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ChainInner {
@@ -112,6 +130,14 @@ pub struct ChainInner {
     ///
     /// Note: Spending transaction ids are only tracked when the `indexer` feature is selected.
     pub(crate) spent_utxos: HashMap<transparent::OutPoint, SpendingTransactionId>,
+
+    // Delegation Bonds
+    //
+    /// Delegation bonds created or operated on by blocks in this chain.
+    /// Maps BondKey -> (DelegationBond, BondStatusInChain).
+    /// We store the full bond data and status to support chain reorgs.
+    pub(crate) delegation_bonds:
+        HashMap<disk_format::BondKey, (disk_format::DelegationBond, BondStatusInChain)>,
 
     // Note commitment trees
     //
@@ -249,6 +275,7 @@ impl Chain {
             tx_loc_by_hash: Default::default(),
             created_utxos: Default::default(),
             spent_utxos: Default::default(),
+            delegation_bonds: Default::default(),
             sprout_anchors: MultiSet::new(),
             sprout_anchors_by_height: Default::default(),
             sprout_trees_by_anchor: Default::default(),
@@ -1505,10 +1532,132 @@ impl Chain {
         Ok(())
     }
 
-    /// Update the chain tip with the `contextually_valid` block,
-    /// except for the note commitment and history tree updates.
+    /// Process a delegation bond from a staking action.
     ///
-    /// Used to implement `update_chain_tip_with::<ContextuallyVerifiedBlock>`.
+    /// Updates the chain's delegation bond state based on the staking action kind:
+    /// - CreateNewDelegationBond: creates new bond
+    /// - BeginDelegationUnbonding: looks up bond from self.delegation_bonds, updates status,
+    ///   decreases staking_bonded pool, increases staking_unbonded pool
+    /// - WithdrawDelegationBond: looks up bond from self.delegation_bonds and updates status
+    fn update_chain_tip_with_delegation_bond(
+        &mut self,
+        staking_action: &zcash_primitives::transaction::StakingAction,
+        _transaction_hash: &transaction::Hash,
+        transaction_location: disk_format::TransactionLocation,
+    ) -> Result<(), ValidateContextError> {
+        use zcash_primitives::transaction::StakingActionKind;
+
+        let bond_key = staking_action.arg32_0;
+
+        match staking_action.kind {
+            StakingActionKind::CreateNewDelegationBond => {
+                // Extract bond data
+                // Note: amount validation should have been done during contextual validation
+                let amount = Amount::try_from(staking_action.amount_zats)
+                    .expect("bond amount should have been validated");
+                let target_finalizer = staking_action.arg32_2;
+
+                let bond = disk_format::DelegationBond::new(
+                    amount,
+                    target_finalizer,
+                    transaction_location,
+                );
+
+                // Insert as active bond
+                // Note: duplicate bond check should have been done during contextual validation
+                let previous = self.delegation_bonds.insert(bond_key, (bond, BondStatusInChain::Active));
+                assert!(
+                    previous.is_none(),
+                    "duplicate delegation bond should have been rejected during validation"
+                );
+            }
+            StakingActionKind::BeginDelegationUnbonding => {
+                // Get the bond from self.delegation_bonds
+                let (bond, _status) = self.delegation_bonds.get(&bond_key)
+                    .copied()
+                    .expect("bond must exist in chain (should have been validated)");
+
+                // Update status to Unbonding
+                self.delegation_bonds.insert(bond_key, (bond, BondStatusInChain::Unbonding));
+
+                // Decrease staking_bonded pool by bond amount
+                let current_bonded = self.chain_value_pools.staking_bonded_amount();
+                let new_bonded = (current_bonded - bond.amount)
+                    .map_err(|e| ValidateContextError::InvalidDelegationBond(
+                        format!("staking_bonded pool underflow when unbonding: {:?}", e)
+                    ))?;
+                self.chain_value_pools.set_staking_bonded_amount(new_bonded);
+
+                // Increase staking_unbonded pool by bond amount
+                let current_unbonded = self.chain_value_pools.staking_unbonded_amount();
+                let new_unbonded = (current_unbonded + bond.amount)
+                    .map_err(|e| ValidateContextError::InvalidDelegationBond(
+                        format!("staking_unbonded pool overflow when unbonding: {:?}", e)
+                    ))?;
+                self.chain_value_pools.set_staking_unbonded_amount(new_unbonded);
+            }
+            StakingActionKind::WithdrawDelegationBond => {
+                // Get the bond from self.delegation_bonds
+                let (bond, _status) = self.delegation_bonds.get(&bond_key)
+                    .copied()
+                    .expect("bond must exist in chain (should have been validated)");
+
+                // Update status to Withdrawn
+                self.delegation_bonds.insert(bond_key, (bond, BondStatusInChain::Withdrawn));
+            }
+            // Other staking actions don't affect delegation bonds
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Revert a delegation bond operation when a block is removed from the chain.
+    ///
+    /// This reverses the state changes made by `update_chain_tip_with_delegation_bond`:
+    /// - CreateNewDelegationBond: removes bond from delegation_bonds
+    /// - BeginDelegationUnbonding: changes status back from Unbonding to Active
+    /// - WithdrawDelegationBond: changes status back from Withdrawn to Unbonding
+    fn revert_delegation_bond(
+        &mut self,
+        staking_action: &zcash_primitives::transaction::StakingAction,
+        position: RevertPosition,
+    ) {
+        if position == RevertPosition::Root { return; }
+        use zcash_primitives::transaction::StakingActionKind;
+
+        let bond_key = staking_action.arg32_0;
+
+        match staking_action.kind {
+            StakingActionKind::CreateNewDelegationBond => {
+                // Remove the bond that was created
+                assert!(
+                    self.delegation_bonds.remove(&bond_key).is_some(),
+                    "bond must be present if it was added to chain"
+                );
+            }
+            StakingActionKind::BeginDelegationUnbonding => {
+                // Change status back from Unbonding to Active
+                let (bond, status) = self.delegation_bonds.get_mut(&bond_key).expect(
+                    "bond must be present if unbonding was added to chain"
+                );
+                assert_eq!(*status, BondStatusInChain::Unbonding,
+                    "bond should be unbonding if unbonding was added to chain");
+                *status = BondStatusInChain::Active;
+            }
+            StakingActionKind::WithdrawDelegationBond => {
+                // Change status back from Withdrawn to Unbonding
+                let (bond, status) = self.delegation_bonds.get_mut(&bond_key).expect(
+                    "bond must be present if withdrawal was added to chain"
+                );
+                assert_eq!(*status, BondStatusInChain::Withdrawn,
+                    "bond should be withdrawn if withdrawal was added to chain");
+                *status = BondStatusInChain::Unbonding;
+            }
+            _ => {}
+        }
+    }
+
     #[instrument(skip(self, contextually_valid), fields(block = %contextually_valid.block))]
     #[allow(clippy::unwrap_in_result)]
     fn update_chain_tip_with_block_except_trees(
@@ -1625,6 +1774,15 @@ impl Chain {
             self.update_chain_tip_with(&(outputs, &transaction_hash, new_outputs))?;
             // delete the utxos this consumed
             self.update_chain_tip_with(&(inputs, &transaction_hash, spent_outputs))?;
+
+            // process delegation bonds if this transaction has a staking action
+            if let Some(staking_action) = transaction.staking_action() {
+                self.update_chain_tip_with_delegation_bond(
+                    staking_action,
+                    &transaction_hash,
+                    transaction_location,
+                )?;
+            }
 
             // add the shielded data
 
@@ -1806,6 +1964,11 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
             self.revert_chain_with(&(outputs, transaction_hash, new_outputs), position);
             // reset the utxos this consumed
             self.revert_chain_with(&(inputs, transaction_hash, spent_outputs), position);
+
+            // revert delegation bonds if this transaction had a staking action
+            if let Some(staking_action) = transaction.staking_action() {
+                self.revert_delegation_bond(staking_action, position);
+            }
 
             // TODO: move this to the history tree UpdateWith.revert...()?
             // remove `transaction.hash` from `tx_loc_by_hash`
