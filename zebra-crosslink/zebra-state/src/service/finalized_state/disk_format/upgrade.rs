@@ -102,7 +102,11 @@ fn format_upgrades(
             Version::new(26, 0, 0),
         )),
         Box::new(block_info_and_address_received::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 5])
+        Box::new(no_migration::NoMigration::new(
+            "add delegation bonds column families",
+            Version::new(27, 1, 0),
+        )),
+    ] as [Box<dyn DiskFormatUpgrade>; 6])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -490,9 +494,9 @@ impl DbFormatChange {
         //   (unless a future upgrade breaks these format checks)
         // - re-opening the current version should be valid, regardless of whether the upgrade
         //   or new block code created the format (or any combination).
-        Self::format_validity_checks_detailed(db, cancel_receiver)?.unwrap_or_else(|_| {
+        Self::format_validity_checks_detailed(db, cancel_receiver)?.unwrap_or_else(|err| {
             panic!(
-                "unexpected invalid database format: delete and re-sync the database at '{:?}'",
+                "unexpected invalid database format: delete and re-sync the database at '{:?}': {err}",
                 db.path()
             )
         });

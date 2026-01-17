@@ -78,22 +78,30 @@ impl ZebraDb {
     /// - Apply rewards in finalized state
     /// - Count active bonds when validating non-finalized blocks
     pub fn active_bonds(&self) -> impl Iterator<Item = (BondKey, DelegationBond)> + '_ {
+        self.all_bonds()
+            .filter(|(_key, _bond, status)| status.is_active())
+            .map(|(key, bond, _status)| (key, bond))
+    }
+
+    /// Returns the count of active bonds in finalized state.
+    pub fn active_bond_count(&self) -> usize {
+        self.active_bonds().count()
+    }
+
+    /// Returns an iterator over all bond keys, their data, and their status.
+    ///
+    /// Used to initialize the non-finalized chain's delegation_bonds HashMap.
+    pub fn all_bonds(&self) -> impl Iterator<Item = (BondKey, DelegationBond, BondStatus)> + '_ {
         let bond_status_cf = self.bond_status_by_key_cf();
         let delegation_bond_cf = self.delegation_bond_by_key_cf();
 
         bond_status_cf
             .zs_items_in_range_ordered(..)
             .into_iter()
-            .filter(|(_key, status)| status.is_active())
-            .filter_map(move |(key, _status)| {
+            .filter_map(move |(key, status)| {
                 let bond = delegation_bond_cf.zs_get(&key)?;
-                Some((key, bond))
+                Some((key, bond, status))
             })
-    }
-
-    /// Returns the count of active bonds in finalized state.
-    pub fn active_bond_count(&self) -> usize {
-        self.active_bonds().count()
     }
 }
 

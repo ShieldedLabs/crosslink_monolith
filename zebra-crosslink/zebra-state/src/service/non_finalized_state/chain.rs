@@ -268,14 +268,28 @@ impl Chain {
         orchard_note_commitment_tree: Arc<orchard::tree::NoteCommitmentTree>,
         history_tree: Arc<HistoryTree>,
         finalized_tip_chain_value_pools: ValueBalance<NonNegative>,
+        finalized_bonds: impl IntoIterator<Item = (disk_format::BondKey, disk_format::DelegationBond, disk_format::BondStatus)>,
     ) -> Self {
+        // Convert finalized bonds to chain format with their actual status
+        let delegation_bonds: HashMap<_, _> = finalized_bonds
+            .into_iter()
+            .map(|(key, bond, status)| {
+                let chain_status = match status {
+                    disk_format::BondStatus::Active => BondStatusInChain::Active,
+                    disk_format::BondStatus::Unbonding { .. } => BondStatusInChain::Unbonding,
+                    disk_format::BondStatus::Withdrawn { .. } => BondStatusInChain::Withdrawn,
+                };
+                (key, (bond, chain_status))
+            })
+            .collect();
+
         let inner = ChainInner {
             blocks: Default::default(),
             height_by_hash: Default::default(),
             tx_loc_by_hash: Default::default(),
             created_utxos: Default::default(),
             spent_utxos: Default::default(),
-            delegation_bonds: Default::default(),
+            delegation_bonds,
             sprout_anchors: MultiSet::new(),
             sprout_anchors_by_height: Default::default(),
             sprout_trees_by_anchor: Default::default(),

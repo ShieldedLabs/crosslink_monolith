@@ -421,6 +421,7 @@ impl NonFinalizedState {
                 finalized_state.orchard_tree_for_tip(),
                 finalized_state.history_tree(),
                 finalized_state.finalized_value_pool(),
+                finalized_state.all_bonds(),
             );
             Arc::new(chain)
         } else {
@@ -478,6 +479,7 @@ impl NonFinalizedState {
             finalized_state.orchard_tree_for_tip(),
             finalized_state.history_tree(),
             finalized_state.finalized_value_pool(),
+            finalized_state.all_bonds(),
         );
 
         let (height, hash) = (prepared.height, prepared.hash);
