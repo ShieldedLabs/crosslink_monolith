@@ -27,6 +27,7 @@ use super::check;
 use crate::service::non_finalized_state::Chain;
 
 pub(crate) mod anchors;
+pub(crate) mod delegation;
 pub(crate) mod difficulty;
 pub(crate) mod nullifier;
 pub(crate) mod utxo;

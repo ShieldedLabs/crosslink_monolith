@@ -1210,6 +1210,18 @@ impl Transaction {
         self.orchard_shielded_data().is_some()
     }
 
+    // staking actions
+
+    /// Access the staking action in this transaction, if there is any.
+    ///
+    /// Only VCrosslink transactions can have staking actions.
+    pub fn staking_action(&self) -> Option<&zcash_primitives::transaction::StakingAction> {
+        match self {
+            Transaction::VCrosslink { staking_action, .. } => staking_action.as_ref(),
+            _ => None,
+        }
+    }
+
     // value balances
 
     /// Return the transparent value balance,

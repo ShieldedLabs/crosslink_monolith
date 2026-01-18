@@ -455,7 +455,7 @@ impl ValueBalance<NonNegative> {
             32 => Amount::zero(),
             40 => Amount::zero(),
             56 => Amount::from_bytes(
-                bytes[40..48]
+                bytes[48..56]
                     .try_into()
                     .expect("staking_unbonded amount should be parsable"),
             )

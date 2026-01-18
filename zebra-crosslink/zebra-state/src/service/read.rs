@@ -16,6 +16,7 @@ use crate::service;
 
 pub mod address;
 pub mod block;
+pub mod delegation;
 pub mod difficulty;
 pub mod find;
 pub mod tree;
@@ -42,6 +43,9 @@ pub use find::{
     non_finalized_state_contains_block_hash, tip, tip_height, tip_with_value_balance,
 };
 pub use tree::{orchard_subtrees, orchard_tree, sapling_subtrees, sapling_tree};
+pub use delegation::{
+    bond_exists, delegation_bond, is_bond_active, is_bond_unbonding, is_bond_withdrawn,
+};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 #[allow(unused_imports)]

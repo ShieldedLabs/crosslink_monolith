@@ -317,6 +317,10 @@ pub enum ValidateContextError {
     #[error("dropping the state: dropped unused non-finalized state queue block")]
     #[non_exhaustive]
     DroppedUnusedBlock,
+
+    #[error("invalid delegation bond operation: {0}")]
+    #[non_exhaustive]
+    InvalidDelegationBond(String),
 }
 
 /// Trait for creating the corresponding duplicate nullifier error from a nullifier.

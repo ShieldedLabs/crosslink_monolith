@@ -35,7 +35,7 @@ use crate::{
 pub mod column_family;
 
 mod disk_db;
-mod disk_format;
+pub(crate) mod disk_format;
 mod zebra_db;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -96,6 +96,9 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "history_tree",
     "tip_chain_value_pool",
     BLOCK_INFO,
+    // Delegation Bonds
+    "delegation_bond_by_key",
+    "bond_status_by_key",
 ];
 
 /// The finalized part of the chain state, stored in the db.
