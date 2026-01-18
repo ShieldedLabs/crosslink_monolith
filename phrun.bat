@@ -16,4 +16,10 @@ if "%config%"=="-Release" (
     set "build_folder=debug"
 )
 
-start "" "%root%\%project%\target\%build_folder%\deps\zebrad.exe" "-c" "%root%\%project%\regtest.local.toml"
+if "%project%"=="zebra-crosslink" (
+    set "executable=zebrad"
+) else (
+    set "executable=visualizer_zcash"
+)
+
+start "" "%root%\%project%\target\%build_folder%\deps\%executable%.exe" "-c" "%root%\%project%\regtest.local.toml"

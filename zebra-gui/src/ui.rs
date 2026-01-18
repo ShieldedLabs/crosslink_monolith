@@ -782,7 +782,7 @@ pub fn ui_left_pane(ui: &mut Context,
         ..Decl
     }) {
         tab_id_user_wallet  = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Your Wallet");
-        tab_id_miner_wallet = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Miner Wallet");
+        tab_id_miner_wallet = ui.tab(radius, padding, tab_id, "Miner Wallet");
     }
     ui.nav_skip = false;
 
@@ -1452,7 +1452,12 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
 
                     let button_text_h = ui.scale(16.0);
-                    ui.text(label, TextDecl { h: button_text_h, align: AlignX::Center, ..TextDecl });
+                    let mut hsva = WHITE.hsva();
+                    if !enabled {
+                        hsva.2 = hsva.2.mul(0.5);
+                    }
+                    let text_colour = hsva.rgba();
+                    ui.text(label, TextDecl { colour: text_colour, h: button_text_h, align: AlignX::Center, ..TextDecl });
                 }
                 clicked
             };
@@ -1538,6 +1543,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
                         }
 
+                        let tx_is_in_block      = tx.mined_h.is_in_block();
                         let tx_is_on_best_chain = tx.mined_h.is_in_block() && !tx.is_outside_bc;
 
                         if let _ = elem().decl(Decl{
@@ -1560,7 +1566,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 // TODO: account for mempool
-                                let icon = match (tx.kind(), tx_is_on_best_chain) {
+                                let icon = match (tx.kind(), tx_is_in_block) {
                                     (WalletTxKind::Send,     true) => ICON_UP_SMALL,
                                     (WalletTxKind::SelfSend, true) => ICON_DOWN_SMALL,
                                     (WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
@@ -1600,16 +1606,16 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 let label = match tx.kind() {
-                                    WalletTxKind::Send     => if tx_is_on_best_chain { "Sent"     } else { "Sending"   },
-                                    WalletTxKind::Receive  => if tx_is_on_best_chain { "Received" } else { "Receiving" },
-                                    WalletTxKind::SelfSend => if tx_is_on_best_chain { "Returned" } else { "Returning" },
-                                    WalletTxKind::Shield   => if tx_is_on_best_chain { "Shielded" } else { "Shielding" },
-                                    WalletTxKind::Stake    => if tx_is_on_best_chain { "Staked"   } else { "Staking"   },
-                                    WalletTxKind::BeginUnstake  => if tx_is_on_best_chain { "Unbonding" } else { "Unbonding" },
-                                    WalletTxKind::ClaimUnstake  => if tx_is_on_best_chain { "Unstaked" } else { "Unstaking" },
+                                    WalletTxKind::Send          => if tx_is_in_block { "Sent"      } else { "Sending"   },
+                                    WalletTxKind::Receive       => if tx_is_in_block { "Received"  } else { "Receiving" },
+                                    WalletTxKind::SelfSend      => if tx_is_in_block { "Returned"  } else { "Returning" },
+                                    WalletTxKind::Shield        => if tx_is_in_block { "Shielded"  } else { "Shielding" },
+                                    WalletTxKind::Stake         => if tx_is_in_block { "Staked"    } else { "Staking"   },
+                                    WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unbonding" } else { "Unbonding" },
+                                    WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking" },
                                 };
 
-                                let label_str = if tx.mined_h.is_in_block() {
+                                let label_str = if tx_is_in_block {
                                     frame_strf!(data, "{} @ {}", label, tx.mined_h.0)
                                 } else {
                                     frame_strf!(data, "{}", label)
