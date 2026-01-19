@@ -410,6 +410,9 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         viz_state.camera_y += (dym / old_screen_unit) - (dym / new_screen_unit);
     }
 
+    draw_ctx.text_line(FontKind::Normal, 600.0, 500.0, 40.0, "'j'7.", 0xffffffff);
+    draw_ctx.text_line(FontKind::Icons, 600.0, 600.0, 40.0, &format!("{}", ICON_OK_CIRCLED), 0xffffffff);
+
     let zoom = (ZOOM_FACTOR.powf(viz_state.zoom) * ui.scale);
     // origin
     let screen_unit = SCREEN_UNIT_CONST * zoom;
