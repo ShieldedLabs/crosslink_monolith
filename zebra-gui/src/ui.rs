@@ -93,11 +93,12 @@ pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum Floating  { #[default] None, Parent, Root(f32, f32) }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum ClipMode  { #[default] None, Clip, Scroll(f32, f32) }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Align   { x: AlignX, y: AlignY }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignX    { #[default] Left, Right, Center }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignY    { #[default] Top, Bottom, Center }
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Align   { x: AlignX, y: AlignY }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]                         pub enum Sizing    { Fit(f32, f32), Grow(f32, f32), Fixed(f32), Percent(f32) }
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Id { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Id      { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum Wrap      { #[default] Words, Newline, None, Chars }
 impl Default for Sizing { fn default() -> Self { Self::Fit(0.0, f32::MAX) } }
 impl Align {
     pub const TopLeft:     Self = Self { y: AlignY::Top,    x: AlignX::Left };
@@ -183,14 +184,14 @@ pub struct TextDecl {
     h: f32,
     colour: (u8, u8, u8, u8),
     align: AlignX,
-    wrap_chars: bool,
+    wrap: Wrap,
 }
 pub const TextDecl: TextDecl = TextDecl {
     font: FontKind::Normal,
     h: 0.0,
     colour: WHITE,
     align: AlignX::Left,
-    wrap_chars: false,
+    wrap: Wrap::Words,
 };
 
 
@@ -540,10 +541,11 @@ impl Context {
                 AlignX::Right  => clay::text::TextAlignment::Right,
                 AlignX::Center => clay::text::TextAlignment::Center,
             })
-            .wrap_mode(if decl.wrap_chars {
-                clay::text::TextElementConfigWrapMode::Chars
-            } else {
-                clay::text::TextElementConfigWrapMode::Words
+            .wrap_mode(match decl.wrap {
+                Wrap::Words   => clay::text::TextElementConfigWrapMode::Words,
+                Wrap::Newline => clay::text::TextElementConfigWrapMode::Newline,
+                Wrap::None    => clay::text::TextElementConfigWrapMode::None,
+                Wrap::Chars   => clay::text::TextElementConfigWrapMode::Chars
             })
             .end();
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
@@ -1481,18 +1483,25 @@ pub fn ui_left_pane(ui: &mut Context,
                 }
             };
 
-            if txs.len() == 0 {
-                ui.history_scroll = 0.0;
-            }
+            let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
+            let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
 
             let id = id("History Scroll Container");
             if ui.hovered(id) {
                 ui.history_scroll -= ui.input().zoom_delta     as f32 * 32.0;
                 ui.history_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
+
+                if ui.input().mouse_held(MouseButton::Left) {
+                    ui.history_scroll -= ui.input().mouse_delta().1 as f32 / ui.scale;
+                }
             }
             if ui.history_scroll < 0.0 {
                 ui.history_scroll = 0.0;
             }
+            if txs.len() == 0 {
+                ui.history_scroll = 0.0;
+            }
+
             let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
             if scroll_container_data.found {
                 let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
@@ -1548,7 +1557,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                         if let _ = elem().decl(Decl {
                             id: id_index("Transaction", index as u32),
-                            padding,
+                            padding: padding.mul(0.5),
                             child_gap,
                             height: fit!(),
                             width: percent!(1.0),
@@ -1649,14 +1658,21 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
 
                             // right info
-                            if let _ = elem().decl(Decl{
+                            if let _ = elem().decl(Decl {
                                 id: id_index("Right Info", index as u32),
-                                height: fit!(),
+                                height: grow!(),
                                 width: fit!(),
+                                child_gap: ui.scale(5.0),
                                 direction: TopToBottom,
                                 align: Right,
                                 ..Decl
                             }) {
+                                let confirmation_icons_h = ui.scale(10.0);
+
+                                ui.text(" ", TextDecl { font: Icons, colour, h: confirmation_icons_h, align: AlignX::Center, ..TextDecl });
+
+                                let _ = elem().decl(Decl { height: grow!(), ..Decl }); // spacer
+
                                 // @todo colors
                                 let colour = match tx.kind() {
                                     WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
@@ -1669,8 +1685,12 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                 let totals = tx.totals();
                                 match tx.kind() {
+                                    // TODO: don't use account_value_delta, use sent_zats.
+                                    // We care about fees if we spent any money ourselves.
+                                    // If we just received from someone else, we don't care about fees.
+                                    // TODO: BeginUnstake sends just a fee with no receive, ClaimUnstake receives with no send.
                                     WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake | WalletTxKind::BeginUnstake => {
-                                        let send_amount: i64 = tx.account_value_delta().into();
+                                        let send_amount: i64 = tx.account_value_delta().into(); // TODO: don't use account_value_delta, use sent_zats.
                                         let send_amount: u64 = send_amount.abs() as u64;
 
                                         let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
@@ -1699,6 +1719,32 @@ pub fn ui_left_pane(ui: &mut Context,
                                 if tx.kind() != WalletTxKind::Receive &&
                                    tx.kind() != WalletTxKind::BeginUnstake {
                                     ui.text(frame_strf!(data, "Fee: {} cTAZ", str_from_ctaz(fee)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
+                                }
+
+                                let _ = elem().decl(Decl { height: grow!(), ..Decl }); // spacer
+
+                                if let _ = elem().decl(Decl {
+                                    id: id_index("Confirmation Status", index as u32),
+                                    height: fit!(),
+                                    width: grow!(),
+                                    align: Right,
+                                    ..Decl
+                                }) {
+                                    let CONFIRMATIONS_THRESHOLD = 3;
+
+                                    let finalized = false; // @TODO phillip
+                                    let confirmed = tx_is_in_block && tx.mined_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height; // @Todo: Use wallet state instead of viz state for this
+
+                                    pub const RED: (u8, u8, u8, u8) = (255, 64, 67, 0xff); /* @todo colors */
+
+                                    let (colour, text) = if finalized           { (BLUE,  DOUBLE_ICON_OK_CIRCLED_1) }
+                                                    else if confirmed           { (WHITE, DOUBLE_ICON_OK_CIRCLED2_1) }
+                                                    else if tx_is_on_best_chain { (WHITE, ICON_OK_CIRCLED2_1) }
+                                                    else if tx_is_in_block      { (RED,   ICON_FORK) }
+                                                    else                        { (WHITE, " ") };
+                                    let colour = colour.mul(0.75);
+
+                                    ui.text(text, TextDecl { font: Icons, colour, h: confirmation_icons_h, wrap: Wrap::None, align: AlignX::Right,  ..TextDecl });
                                 }
                             }
                         }
@@ -2334,7 +2380,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             }) {
                 let text_h = ui.scale(10.0);
                 // Block Inspector Contents
-                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { font: Mono, wrap_chars: true, h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { font: Mono, wrap: Wrap::Chars, h: text_h, align: AlignX::Left, ..TextDecl });
 
                 let text = {
                     if let Some(text) = viz.inspect_block_json_text.as_ref() {
@@ -2343,7 +2389,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         frame_strf!(data, "Loading info for block {}...", viz.inspecting_block_hash).to_string()
                     }
                 };
-                ui.text(frame_strf!(data, "{}", text), TextDecl { font: Mono, wrap_chars: true, h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "{}", text), TextDecl { font: Mono, wrap: Wrap::Chars, h: text_h, align: AlignX::Left, ..TextDecl });
             }
         }
     }
@@ -2426,8 +2472,22 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 _ => { 0 }
             };
 
+            let draw_debug_rect = || {
+                if ui.debug {
+                    let thickness = 2.0;
+                    let color = 0x80ff00ff;
+                    let t  = (thickness / 2.0) as isize;
+
+                    ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x1+t) as f32, (y2+t) as f32, color);
+                    ui.draw().rectangle((x2-t) as f32, (y1-t) as f32, (x2+t) as f32, (y2+t) as f32, color);
+                    ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x2-t) as f32, (y1+t) as f32, color);
+                    ui.draw().rectangle((x1-t) as f32, (y2-t) as f32, (x2-t) as f32, (y2+t) as f32, color);
+                }
+            };
+
             // @Hack for generating nav highlight rectangle via draw commands.
             if colour == 0x01000000 {
+                draw_debug_rect();
                 continue;
             }
 
@@ -2501,16 +2561,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 }
             }
 
-            if ui.debug {
-                let thickness = 2.0;
-                let color = 0x80ff00ff;
-                let t  = (thickness / 2.0) as isize;
-
-                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x1+t) as f32, (y2+t) as f32, color);
-                ui.draw().rectangle((x2-t) as f32, (y1-t) as f32, (x2+t) as f32, (y2+t) as f32, color);
-                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x2-t) as f32, (y1+t) as f32, color);
-                ui.draw().rectangle((x1-t) as f32, (y2-t) as f32, (x2-t) as f32, (y2+t) as f32, color);
-            }
+            draw_debug_rect();
         }
 
         if ui.nav_enable && let Some((x1, y1, x2, y2)) = nav_bbox && !data.textboxes.contains_key(&ui.nav_id) {
