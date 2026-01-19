@@ -217,7 +217,7 @@ impl DrawCtx {
         }
     }
 
-    pub fn _render_glyph_if_not_cached(tracker: &mut FontTracker, glyph_id: u16, px_advance: u16) {
+    pub fn _render_glyph_if_not_cached(tracker: &mut FontTracker, glyph_id: u16) {
         unsafe {
             if tracker.glyph_to_bitmap_index[glyph_id as usize] == u16::MAX
             {
@@ -226,8 +226,6 @@ impl DrawCtx {
                 let bitmap_index = tracker.cached_bitmaps_counter;
                 tracker.cached_bitmaps_counter += 1;
                 tracker.glyph_to_bitmap_index[glyph_id as usize] = bitmap_index;
-
-                tracker.cached_bitmap_widths.push(px_advance);
 
                 let mut _scale = ScaleContext::new();
                 let mut scale = _scale.builder(swash_font).size(tracker.ppem).hint(false).build();
@@ -239,6 +237,8 @@ impl DrawCtx {
                 .format(swash::zeno::Format::Alpha)
                 .render(&mut scale, glyph_id as u16).unwrap();
                 assert_eq!(image.content, swash::scale::image::Content::Mask);
+
+                tracker.cached_bitmap_widths.push((image.placement.width as isize + image.placement.left.max(0) as isize) as u16);
 
                 let actual_height = if tracker.fudge_to_px_height == usize::MAX { tracker.target_px_height } else { tracker.fudge_to_px_height };
                 for y in 0..actual_height {
@@ -252,7 +252,7 @@ impl DrawCtx {
                     let cy = (y as i32 - actual_height as i32 + image.placement.top + tracker.baseline_y as i32) as usize;
                     std::ptr::write_bytes(row_put, 0, row_len);
                     if (cy as u32) < image.placement.height {
-                        std::ptr::copy_nonoverlapping(&image.data[image.placement.width as usize * cy], row_put.add(image.placement.left as usize & row_len.wrapping_sub(1)), image.placement.width as usize);
+                        std::ptr::copy_nonoverlapping(&image.data[image.placement.width as usize * cy], row_put.add(image.placement.left.max(0) as usize & row_len.wrapping_sub(1)), image.placement.width as usize);
                     }
                 }
             }
@@ -356,7 +356,7 @@ impl DrawCtx {
                 if (acc_x + px_advance as isize) <= 0 { acc_x += px_advance as isize; continue; }
                 if acc_x > self.window_width { break; }
 
-                Self::_render_glyph_if_not_cached(tracker, g_info.glyph_id as u16, px_advance as u16);
+                Self::_render_glyph_if_not_cached(tracker, g_info.glyph_id as u16);
 
                 *glyph_bitmap_run_start.add(glyph_bitmap_run_count) = (tracker.glyph_to_bitmap_index[g_info.glyph_id as usize], acc_x as i16);
                 glyph_bitmap_run_count += 1;
