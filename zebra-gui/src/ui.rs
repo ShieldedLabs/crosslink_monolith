@@ -1732,8 +1732,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                 }) {
                                     let CONFIRMATIONS_THRESHOLD = 3;
 
-                                    let finalized = false; // @TODO phillip
-                                    let confirmed = tx_is_in_block && tx.mined_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height; // @Todo: Use wallet state instead of viz state for this
+                                    let finalized = tx.mined_h.0 as u64                           <= viz.bc_finalized_tip_height; // @Todo: Use wallet state instead of viz state for this
+                                    let confirmed = tx.mined_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height;           // @Todo: Use wallet state instead of viz state for this
 
                                     pub const RED: (u8, u8, u8, u8) = (255, 64, 67, 0xff); /* @todo colors */
 
@@ -2286,11 +2286,13 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     ..Decl
                 }) {
                     // @todo: two vertical panes with right aligned label and left aligned height
-                    ui.text(frame_strf!(data, "PoS Height: {}", viz.bft_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
-                    ui.text(frame_strf!(data, "PoW Height: {}", viz.bc_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
-                    ui.text(frame_strf!(data, "Orchard Pool Zatoshis: {}", viz.orchard_pool_balance), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
-                    ui.text(frame_strf!(data, "Staking (Bonded) Pool Zatoshis: {}", viz.staking_bonded_pool_balance), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
-                    ui.text(frame_strf!(data, "Staking (Unbonded) Pool Zatoshis: {}", viz.staking_unbonded_pool_balance), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                    let decl = TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl };
+                    ui.text(frame_strf!(data, "PoS Height: {}", viz.bft_tip_height), decl);
+                    ui.text(frame_strf!(data, "PoW Height: {}", viz.bc_tip_height), decl);
+                    ui.text(frame_strf!(data, "PoW Finalized Height: {}", viz.bc_finalized_tip_height), decl);
+                    ui.text(frame_strf!(data, "Orchard Pool Zatoshis: {}", viz.orchard_pool_balance), decl);
+                    ui.text(frame_strf!(data, "Staking (Bonded) Pool Zatoshis: {}", viz.staking_bonded_pool_balance), decl);
+                    ui.text(frame_strf!(data, "Staking (Unbonded) Pool Zatoshis: {}", viz.staking_unbonded_pool_balance), decl);
                 }
             }
 
