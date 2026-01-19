@@ -30,6 +30,7 @@ pub struct UiData {
     pub recv_address:  String,
 
     pub textboxes: HashMap<u32, TextboxState>,
+    pub scroll_containers: HashMap<u32, ScrollContainerState>,
 }
 
 
@@ -724,6 +725,31 @@ impl Context {
         text
     }
 
+    pub fn scroll_container<'data>(&mut self, data: &'data mut UiData, id: Id, scroll_end_height: f32) -> (Id, ClipMode, &'data mut f32) {
+        let mut scroll_container_state = data.scroll_containers.entry(id.id).or_default();
+
+        if self.hovered(id) {
+            scroll_container_state.scroll -= self.input().zoom_delta     as f32 * 32.0;
+            scroll_container_state.scroll -= self.input().scroll_delta.1 as f32 * 32.0;
+
+            if self.input().mouse_held(MouseButton::Left) {
+                scroll_container_state.scroll -= self.input().mouse_delta().1 as f32 / self.scale;
+            }
+        }
+
+        let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
+        if scroll_container_data.found {
+            let max = scroll_container_data.contentDimensions.height / self.scale - scroll_end_height;
+            if scroll_container_state.scroll > max {
+                scroll_container_state.scroll = max;
+            }
+        };
+        if scroll_container_state.scroll < 0.0 {
+            scroll_container_state.scroll = 0.0;
+        }
+
+        (id, Scroll(0.0, -scroll_container_state.scroll * self.scale), &mut scroll_container_state.scroll)
+    }
 }
 
 pub trait     Dup2: Copy { fn dup2(self) -> (Self, Self); }
@@ -759,6 +785,11 @@ pub struct TextboxState {
     pub selection: (usize, usize),
     pub bbox: (isize, isize, isize, isize),
     pub h: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ScrollContainerState {
+    pub scroll: f32,
 }
 
 pub fn ui_left_pane(ui: &mut Context,
@@ -1163,25 +1194,12 @@ pub fn ui_left_pane(ui: &mut Context,
                             staked_roster.push((false, p.0, p.0, p.1, p.1));
                         }
                     }
-                    if staked_roster.len() == 0 {
-                        ui.unstake_scroll = 0.0;
-                    }
 
-                    let id = id("Unstake Scroll Container");
-                    if ui.hovered(id) {
-                        ui.unstake_scroll -= ui.input().zoom_delta     as f32 * 32.0;
-                        ui.unstake_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
+                    let (id, mut clip, mut scroll) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
+                    if staked_roster.len() == 0 {
+                        clip = Scroll(0.0, 0.0);
+                        *scroll = 0.0;
                     }
-                    if ui.unstake_scroll < 0.0 {
-                        ui.unstake_scroll = 0.0;
-                    }
-                    let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
-                    if scroll_container_data.found {
-                        let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
-                        if ui.unstake_scroll > max {
-                            ui.unstake_scroll = max;
-                        }
-                    };
                     if let _ = elem().decl(Decl {
                         id,
                         colour: TRANSACTION_HISTORY_CONTAINER_COL,
@@ -1191,7 +1209,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         height: grow!(),
                         // height: percent!(1.0),
                         direction: TopToBottom,
-                        clip: Scroll(0.0, -ui.unstake_scroll * ui.scale),
+                        clip,
                         align: Top,
                         ..Decl
                     }) {
@@ -1486,29 +1504,11 @@ pub fn ui_left_pane(ui: &mut Context,
             let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
             let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
 
-            let id = id("History Scroll Container");
-            if ui.hovered(id) {
-                ui.history_scroll -= ui.input().zoom_delta     as f32 * 32.0;
-                ui.history_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
-
-                if ui.input().mouse_held(MouseButton::Left) {
-                    ui.history_scroll -= ui.input().mouse_delta().1 as f32 / ui.scale;
-                }
-            }
-            if ui.history_scroll < 0.0 {
-                ui.history_scroll = 0.0;
-            }
+            let (id, mut clip, mut scroll) = ui.scroll_container(data, id("History Scroll Container"), 96.0);
             if txs.len() == 0 {
-                ui.history_scroll = 0.0;
+                clip = Scroll(0.0, 0.0);
+                *scroll = 0.0;
             }
-
-            let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
-            if scroll_container_data.found {
-                let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
-                if ui.history_scroll > max {
-                    ui.history_scroll = max;
-                }
-            };
             if let _ = elem().decl(Decl {
                 id,
                 colour: TRANSACTION_HISTORY_CONTAINER_COL,
@@ -1518,7 +1518,7 @@ pub fn ui_left_pane(ui: &mut Context,
                 height: grow!(),
                 // height: percent!(1.0),
                 direction: TopToBottom,
-                clip: Scroll(0.0, -ui.history_scroll * ui.scale),
+                clip,
                 align: Top,
                 ..Decl
             }) {
@@ -1852,7 +1852,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
         let mut clickable_icon = |ui: &mut Context, id, icon, enabled | {
             let (clicked, colour, _) = ui.button_ex(false, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
-            if let _ = elem().decl(Decl{
+            if let _ = elem().decl(Decl {
                 id,
                 child_gap,
                 align: Center,
@@ -1889,25 +1889,11 @@ pub fn ui_right_pane(ui: &mut Context,
             }
         }
 
+        let (id, mut clip, mut scroll) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
         if roster.len() == 0 {
-            ui.finalizers_scroll = 0.0;
+            clip = Scroll(0.0, 0.0);
+            *scroll = 0.0;
         }
-
-        let id = id("History Scroll Container");
-        if ui.hovered(id) {
-            ui.finalizers_scroll -= ui.input().zoom_delta     as f32 * 32.0;
-            ui.finalizers_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
-        }
-        if ui.finalizers_scroll < 0.0 {
-            ui.finalizers_scroll = 0.0;
-        }
-        let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
-        if scroll_container_data.found {
-            let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
-            if ui.finalizers_scroll > max {
-                ui.finalizers_scroll = max;
-            }
-        };
         if let _ = elem().decl(Decl {
             id,
             colour: TRANSACTION_HISTORY_CONTAINER_COL,
@@ -1917,7 +1903,7 @@ pub fn ui_right_pane(ui: &mut Context,
             height: grow!(),
             // height: percent!(1.0),
             direction: TopToBottom,
-            clip: Scroll(0.0, -ui.finalizers_scroll * ui.scale),
+            clip,
             align: Top,
             ..Decl
         }) {
@@ -2658,10 +2644,6 @@ pub struct Context {
     pub pane_tab_r: Id,
 
     pub modal: Modal,
-
-    pub history_scroll:    f32,
-    pub finalizers_scroll: f32,
-    pub unstake_scroll:    f32,
 
     pub tx_loading_animation_timer: f32,
 }
