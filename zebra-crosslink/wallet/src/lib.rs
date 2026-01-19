@@ -316,6 +316,7 @@ enum WalletAction {
 pub enum WalletTxKind {
     Send,
     Receive,
+    Mine,
     SelfSend,
     Shield, // a form of SelfSend
     Stake,
@@ -491,6 +492,11 @@ impl WalletTx {
             return WalletTxKind::SelfSend;
         }
         let all = self.totals();
+
+        if self.is_coinbase && all.spent_zats == Zatoshis::ZERO && all.recv_zats > Zatoshis::ZERO {
+            return WalletTxKind::Mine;
+        }
+
         // if *all* of the sent zats go to ourself we assume this was the purpose
         // otherwise we assume the self-sent zats are change
         // ALT: only consider it change if a single note is received (per pool?)

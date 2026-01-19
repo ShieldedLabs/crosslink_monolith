@@ -1546,7 +1546,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         let tx_is_in_block      = tx.mined_h.is_in_block();
                         let tx_is_on_best_chain = tx.mined_h.is_in_block() && !tx.is_outside_bc;
 
-                        if let _ = elem().decl(Decl{
+                        if let _ = elem().decl(Decl {
                             id: id_index("Transaction", index as u32),
                             padding,
                             child_gap,
@@ -1557,7 +1557,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             ..Decl
                         }) {
                             // left icon
-                            if let _ = elem().decl(Decl{
+                            if let _ = elem().decl(Decl {
                                 id: id_index("Left Icon", index as u32),
                                 height: fit!(),
                                 width: fixed!(ui.scale(32.0)),
@@ -1570,6 +1570,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     (WalletTxKind::Send,     true) => ICON_UP_SMALL,
                                     (WalletTxKind::SelfSend, true) => ICON_DOWN_SMALL,
                                     (WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
+                                    (WalletTxKind::Mine,     true) => ICON_MONEY_1, // TODO: pickaxe/tools icon
                                     (WalletTxKind::Shield,   true) => ICON_SHIELD,
                                     (WalletTxKind::Stake,    true) => ICON_LINK_1,
                                     (WalletTxKind::BeginUnstake,  true) => ICON_LINK_EXT_ALT,
@@ -1597,7 +1598,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
 
                             // info
-                            if let _ = elem().decl(Decl{
+                            if let _ = elem().decl(Decl {
                                 id: id_index("Centre Info", index as u32),
                                 height: fit!(),
                                 width: grow!(),
@@ -1608,6 +1609,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 let label = match tx.kind() {
                                     WalletTxKind::Send          => if tx_is_in_block { "Sent"      } else { "Sending"   },
                                     WalletTxKind::Receive       => if tx_is_in_block { "Received"  } else { "Receiving" },
+                                    WalletTxKind::Mine          => if tx_is_in_block { "Mined"     } else { "Mining"    },
                                     WalletTxKind::SelfSend      => if tx_is_in_block { "Returned"  } else { "Returning" },
                                     WalletTxKind::Shield        => if tx_is_in_block { "Shielded"  } else { "Shielding" },
                                     WalletTxKind::Stake         => if tx_is_in_block { "Staked"    } else { "Staking"   },
@@ -1659,7 +1661,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 let colour = match tx.kind() {
                                     WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
                                     WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
-                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake => (0x5a, 0xb5, 0x52, 0xff),
+                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake | WalletTxKind::Mine => (0x5a, 0xb5, 0x52, 0xff),
                                     WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
                                     WalletTxKind::BeginUnstake => WHITE,
                                     _ => WHITE,
@@ -1674,7 +1676,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                         let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
                                         ui.text(frame_strf!(data, "{}{} cTAZ", prefix, str_from_ctaz(send_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                     },
-                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake => {
+                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake | WalletTxKind::Mine => {
                                         if true { // total
                                             ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(totals.recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                         } else { // transparent, shielded
