@@ -2607,7 +2607,7 @@ pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet
 
     let dummy_input = InputCtx {
         this_mouse_pos: ui.input().this_mouse_pos,
-        last_mouse_pos: ui.input().last_mouse_pos,
+        last_mouse_pos: ui.input().this_mouse_pos,
 
         mouse_down: ui.input().mouse_down,
         keys_down1: ui.input().keys_down1,
