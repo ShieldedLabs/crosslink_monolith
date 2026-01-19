@@ -1732,11 +1732,11 @@ pub fn ui_left_pane(ui: &mut Context,
                                 }) {
                                     let CONFIRMATIONS_THRESHOLD = 3;
 
-                                    let finalized = tx.mined_h.0 as u64                           <= viz.bc_finalized_tip_height; // @Todo: Use wallet state instead of viz state for this
+                                    let finalized = tx.mined_h.0 as u64                           <= 16; // @Todo: Use wallet state instead of viz state for this
                                     let confirmed = tx.mined_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height;           // @Todo: Use wallet state instead of viz state for this
 
-                                    pub const RED: (u8, u8, u8, u8) = (255, 64, 67, 0xff); /* @todo colors */
-
+                                    pub const RED:  (u8, u8, u8, u8) = (255, 64, 67, 0xff);      /* @todo colors */
+                                    pub const BLUE: (u8, u8, u8, u8) = (0x33, 0x88, 0xde, 0xff); /* @todo colors */
                                     let (colour, text) = if finalized           { (BLUE,  DOUBLE_ICON_OK_CIRCLED_1) }
                                                     else if confirmed           { (WHITE, DOUBLE_ICON_OK_CIRCLED2_1) }
                                                     else if tx_is_on_best_chain { (WHITE, ICON_OK_CIRCLED2_1) }
