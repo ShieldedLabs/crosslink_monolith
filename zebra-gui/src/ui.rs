@@ -30,6 +30,7 @@ pub struct UiData {
     pub recv_address:  String,
 
     pub textboxes: HashMap<u32, TextboxState>,
+    pub scroll_containers: HashMap<u32, ScrollContainerState>,
 }
 
 
@@ -93,11 +94,12 @@ pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum Floating  { #[default] None, Parent, Root(f32, f32) }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum ClipMode  { #[default] None, Clip, Scroll(f32, f32) }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Align   { x: AlignX, y: AlignY }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignX    { #[default] Left, Right, Center }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignY    { #[default] Top, Bottom, Center }
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Align   { x: AlignX, y: AlignY }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]                         pub enum Sizing    { Fit(f32, f32), Grow(f32, f32), Fixed(f32), Percent(f32) }
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Id { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Id      { id: u32, offset: u32, base_id: u32, len: usize, chars: *const u8 }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum Wrap      { #[default] Words, Newline, None, Chars }
 impl Default for Sizing { fn default() -> Self { Self::Fit(0.0, f32::MAX) } }
 impl Align {
     pub const TopLeft:     Self = Self { y: AlignY::Top,    x: AlignX::Left };
@@ -183,14 +185,14 @@ pub struct TextDecl {
     h: f32,
     colour: (u8, u8, u8, u8),
     align: AlignX,
-    wrap_chars: bool,
+    wrap: Wrap,
 }
 pub const TextDecl: TextDecl = TextDecl {
     font: FontKind::Normal,
     h: 0.0,
     colour: WHITE,
     align: AlignX::Left,
-    wrap_chars: false,
+    wrap: Wrap::Words,
 };
 
 
@@ -540,10 +542,11 @@ impl Context {
                 AlignX::Right  => clay::text::TextAlignment::Right,
                 AlignX::Center => clay::text::TextAlignment::Center,
             })
-            .wrap_mode(if decl.wrap_chars {
-                clay::text::TextElementConfigWrapMode::Chars
-            } else {
-                clay::text::TextElementConfigWrapMode::Words
+            .wrap_mode(match decl.wrap {
+                Wrap::Words   => clay::text::TextElementConfigWrapMode::Words,
+                Wrap::Newline => clay::text::TextElementConfigWrapMode::Newline,
+                Wrap::None    => clay::text::TextElementConfigWrapMode::None,
+                Wrap::Chars   => clay::text::TextElementConfigWrapMode::Chars
             })
             .end();
         unsafe { clay::Clay__OpenTextElement(label.into(), config.into()) };
@@ -722,6 +725,31 @@ impl Context {
         text
     }
 
+    pub fn scroll_container<'data>(&mut self, data: &'data mut UiData, id: Id, scroll_end_height: f32) -> (Id, ClipMode, &'data mut f32) {
+        let mut scroll_container_state = data.scroll_containers.entry(id.id).or_default();
+
+        if self.hovered(id) {
+            scroll_container_state.scroll -= self.input().zoom_delta     as f32 * 32.0;
+            scroll_container_state.scroll -= self.input().scroll_delta.1 as f32 * 32.0;
+
+            if self.input().mouse_held(MouseButton::Left) {
+                scroll_container_state.scroll -= self.input().mouse_delta().1 as f32 / self.scale;
+            }
+        }
+
+        let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
+        if scroll_container_data.found {
+            let max = scroll_container_data.contentDimensions.height / self.scale - scroll_end_height;
+            if scroll_container_state.scroll > max {
+                scroll_container_state.scroll = max;
+            }
+        };
+        if scroll_container_state.scroll < 0.0 {
+            scroll_container_state.scroll = 0.0;
+        }
+
+        (id, Scroll(0.0, -scroll_container_state.scroll * self.scale), &mut scroll_container_state.scroll)
+    }
 }
 
 pub trait     Dup2: Copy { fn dup2(self) -> (Self, Self); }
@@ -759,6 +787,11 @@ pub struct TextboxState {
     pub h: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ScrollContainerState {
+    pub scroll: f32,
+}
+
 pub fn ui_left_pane(ui: &mut Context,
                 wallet_state: Arc<Mutex<WalletState>>,
                 data: &mut UiData,
@@ -782,7 +815,7 @@ pub fn ui_left_pane(ui: &mut Context,
         ..Decl
     }) {
         tab_id_user_wallet  = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Your Wallet");
-        tab_id_miner_wallet = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Miner Wallet");
+        tab_id_miner_wallet = ui.tab(radius, padding, tab_id, "Miner Wallet");
     }
     ui.nav_skip = false;
 
@@ -1161,25 +1194,12 @@ pub fn ui_left_pane(ui: &mut Context,
                             staked_roster.push((false, p.0, p.0, p.1, p.1));
                         }
                     }
-                    if staked_roster.len() == 0 {
-                        ui.unstake_scroll = 0.0;
-                    }
 
-                    let id = id("Unstake Scroll Container");
-                    if ui.hovered(id) {
-                        ui.unstake_scroll -= ui.input().zoom_delta     as f32 * 32.0;
-                        ui.unstake_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
+                    let (id, mut clip, mut scroll) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
+                    if staked_roster.len() == 0 {
+                        clip = Scroll(0.0, 0.0);
+                        *scroll = 0.0;
                     }
-                    if ui.unstake_scroll < 0.0 {
-                        ui.unstake_scroll = 0.0;
-                    }
-                    let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
-                    if scroll_container_data.found {
-                        let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
-                        if ui.unstake_scroll > max {
-                            ui.unstake_scroll = max;
-                        }
-                    };
                     if let _ = elem().decl(Decl {
                         id,
                         colour: TRANSACTION_HISTORY_CONTAINER_COL,
@@ -1189,7 +1209,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         height: grow!(),
                         // height: percent!(1.0),
                         direction: TopToBottom,
-                        clip: Scroll(0.0, -ui.unstake_scroll * ui.scale),
+                        clip,
                         align: Top,
                         ..Decl
                     }) {
@@ -1452,7 +1472,12 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
 
                     let button_text_h = ui.scale(16.0);
-                    ui.text(label, TextDecl { h: button_text_h, align: AlignX::Center, ..TextDecl });
+                    let mut hsva = WHITE.hsva();
+                    if !enabled {
+                        hsva.2 = hsva.2.mul(0.5);
+                    }
+                    let text_colour = hsva.rgba();
+                    ui.text(label, TextDecl { colour: text_colour, h: button_text_h, align: AlignX::Center, ..TextDecl });
                 }
                 clicked
             };
@@ -1476,25 +1501,14 @@ pub fn ui_left_pane(ui: &mut Context,
                 }
             };
 
-            if txs.len() == 0 {
-                ui.history_scroll = 0.0;
-            }
+            let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
+            let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
 
-            let id = id("History Scroll Container");
-            if ui.hovered(id) {
-                ui.history_scroll -= ui.input().zoom_delta     as f32 * 32.0;
-                ui.history_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
+            let (id, mut clip, mut scroll) = ui.scroll_container(data, id("History Scroll Container"), 96.0);
+            if txs.len() == 0 {
+                clip = Scroll(0.0, 0.0);
+                *scroll = 0.0;
             }
-            if ui.history_scroll < 0.0 {
-                ui.history_scroll = 0.0;
-            }
-            let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
-            if scroll_container_data.found {
-                let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
-                if ui.history_scroll > max {
-                    ui.history_scroll = max;
-                }
-            };
             if let _ = elem().decl(Decl {
                 id,
                 colour: TRANSACTION_HISTORY_CONTAINER_COL,
@@ -1504,7 +1518,7 @@ pub fn ui_left_pane(ui: &mut Context,
                 height: grow!(),
                 // height: percent!(1.0),
                 direction: TopToBottom,
-                clip: Scroll(0.0, -ui.history_scroll * ui.scale),
+                clip,
                 align: Top,
                 ..Decl
             }) {
@@ -1538,11 +1552,12 @@ pub fn ui_left_pane(ui: &mut Context,
                             let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
                         }
 
+                        let tx_is_in_block      = tx.mined_h.is_in_block();
                         let tx_is_on_best_chain = tx.mined_h.is_in_block() && !tx.is_outside_bc;
 
-                        if let _ = elem().decl(Decl{
+                        if let _ = elem().decl(Decl {
                             id: id_index("Transaction", index as u32),
-                            padding,
+                            padding: padding.mul(0.5),
                             child_gap,
                             height: fit!(),
                             width: percent!(1.0),
@@ -1551,7 +1566,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             ..Decl
                         }) {
                             // left icon
-                            if let _ = elem().decl(Decl{
+                            if let _ = elem().decl(Decl {
                                 id: id_index("Left Icon", index as u32),
                                 height: fit!(),
                                 width: fixed!(ui.scale(32.0)),
@@ -1560,10 +1575,11 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 // TODO: account for mempool
-                                let icon = match (tx.kind(), tx_is_on_best_chain) {
+                                let icon = match (tx.kind(), tx_is_in_block) {
                                     (WalletTxKind::Send,     true) => ICON_UP_SMALL,
                                     (WalletTxKind::SelfSend, true) => ICON_DOWN_SMALL,
                                     (WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
+                                    (WalletTxKind::Mine,     true) => ICON_MONEY_1, // TODO: pickaxe/tools icon
                                     (WalletTxKind::Shield,   true) => ICON_SHIELD,
                                     (WalletTxKind::Stake,    true) => ICON_LINK_1,
                                     (WalletTxKind::BeginUnstake,  true) => ICON_LINK_EXT_ALT,
@@ -1591,7 +1607,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
 
                             // info
-                            if let _ = elem().decl(Decl{
+                            if let _ = elem().decl(Decl {
                                 id: id_index("Centre Info", index as u32),
                                 height: fit!(),
                                 width: grow!(),
@@ -1600,16 +1616,17 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 let label = match tx.kind() {
-                                    WalletTxKind::Send     => if tx_is_on_best_chain { "Sent"     } else { "Sending"   },
-                                    WalletTxKind::Receive  => if tx_is_on_best_chain { "Received" } else { "Receiving" },
-                                    WalletTxKind::SelfSend => if tx_is_on_best_chain { "Returned" } else { "Returning" },
-                                    WalletTxKind::Shield   => if tx_is_on_best_chain { "Shielded" } else { "Shielding" },
-                                    WalletTxKind::Stake    => if tx_is_on_best_chain { "Staked"   } else { "Staking"   },
-                                    WalletTxKind::BeginUnstake  => if tx_is_on_best_chain { "Unbonding" } else { "Unbonding" },
-                                    WalletTxKind::ClaimUnstake  => if tx_is_on_best_chain { "Unstaked" } else { "Unstaking" },
+                                    WalletTxKind::Send          => if tx_is_in_block { "Sent"      } else { "Sending"   },
+                                    WalletTxKind::Receive       => if tx_is_in_block { "Received"  } else { "Receiving" },
+                                    WalletTxKind::Mine          => if tx_is_in_block { "Mined"     } else { "Mining"    },
+                                    WalletTxKind::SelfSend      => if tx_is_in_block { "Returned"  } else { "Returning" },
+                                    WalletTxKind::Shield        => if tx_is_in_block { "Shielded"  } else { "Shielding" },
+                                    WalletTxKind::Stake         => if tx_is_in_block { "Staked"    } else { "Staking"   },
+                                    WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unbonding" } else { "Unbonding" },
+                                    WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking" },
                                 };
 
-                                let label_str = if tx.mined_h.is_in_block() {
+                                let label_str = if tx_is_in_block {
                                     frame_strf!(data, "{} @ {}", label, tx.mined_h.0)
                                 } else {
                                     frame_strf!(data, "{}", label)
@@ -1641,19 +1658,26 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
 
                             // right info
-                            if let _ = elem().decl(Decl{
+                            if let _ = elem().decl(Decl {
                                 id: id_index("Right Info", index as u32),
-                                height: fit!(),
+                                height: grow!(),
                                 width: fit!(),
+                                child_gap: ui.scale(5.0),
                                 direction: TopToBottom,
                                 align: Right,
                                 ..Decl
                             }) {
+                                let confirmation_icons_h = ui.scale(10.0);
+
+                                ui.text(" ", TextDecl { font: Icons, colour, h: confirmation_icons_h, align: AlignX::Center, ..TextDecl });
+
+                                let _ = elem().decl(Decl { height: grow!(), ..Decl }); // spacer
+
                                 // @todo colors
                                 let colour = match tx.kind() {
                                     WalletTxKind::Send    => (0xec, 0x27, 0x3f, 0xff),
                                     WalletTxKind::Stake   => (0xff, 0xaf, 0x0e, 0xff),
-                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake => (0x5a, 0xb5, 0x52, 0xff),
+                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake | WalletTxKind::Mine => (0x5a, 0xb5, 0x52, 0xff),
                                     WalletTxKind::Shield  => (0x33, 0x88, 0xde, 0xff),
                                     WalletTxKind::BeginUnstake => WHITE,
                                     _ => WHITE,
@@ -1661,14 +1685,18 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                 let totals = tx.totals();
                                 match tx.kind() {
+                                    // TODO: don't use account_value_delta, use sent_zats.
+                                    // We care about fees if we spent any money ourselves.
+                                    // If we just received from someone else, we don't care about fees.
+                                    // TODO: BeginUnstake sends just a fee with no receive, ClaimUnstake receives with no send.
                                     WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake | WalletTxKind::BeginUnstake => {
-                                        let send_amount: i64 = tx.account_value_delta().into();
+                                        let send_amount: i64 = tx.account_value_delta().into(); // TODO: don't use account_value_delta, use sent_zats.
                                         let send_amount: u64 = send_amount.abs() as u64;
 
                                         let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
                                         ui.text(frame_strf!(data, "{}{} cTAZ", prefix, str_from_ctaz(send_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                     },
-                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake => {
+                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake | WalletTxKind::Mine => {
                                         if true { // total
                                             ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(totals.recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                         } else { // transparent, shielded
@@ -1691,6 +1719,32 @@ pub fn ui_left_pane(ui: &mut Context,
                                 if tx.kind() != WalletTxKind::Receive &&
                                    tx.kind() != WalletTxKind::BeginUnstake {
                                     ui.text(frame_strf!(data, "Fee: {} cTAZ", str_from_ctaz(fee)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
+                                }
+
+                                let _ = elem().decl(Decl { height: grow!(), ..Decl }); // spacer
+
+                                if let _ = elem().decl(Decl {
+                                    id: id_index("Confirmation Status", index as u32),
+                                    height: fit!(),
+                                    width: grow!(),
+                                    align: Right,
+                                    ..Decl
+                                }) {
+                                    let CONFIRMATIONS_THRESHOLD = 3;
+
+                                    let finalized = tx.mined_h.0 as u64                           <= 16; // @Todo: Use wallet state instead of viz state for this
+                                    let confirmed = tx.mined_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height;           // @Todo: Use wallet state instead of viz state for this
+
+                                    pub const RED:  (u8, u8, u8, u8) = (255, 64, 67, 0xff);      /* @todo colors */
+                                    pub const BLUE: (u8, u8, u8, u8) = (0x33, 0x88, 0xde, 0xff); /* @todo colors */
+                                    let (colour, text) = if finalized           { (BLUE,  DOUBLE_ICON_OK_CIRCLED_1) }
+                                                    else if confirmed           { (WHITE, DOUBLE_ICON_OK_CIRCLED2_1) }
+                                                    else if tx_is_on_best_chain { (WHITE, ICON_OK_CIRCLED2_1) }
+                                                    else if tx_is_in_block      { (RED,   ICON_FORK) }
+                                                    else                        { (WHITE, " ") };
+                                    let colour = colour.mul(0.75);
+
+                                    ui.text(text, TextDecl { font: Icons, colour, h: confirmation_icons_h, wrap: Wrap::None, align: AlignX::Right,  ..TextDecl });
                                 }
                             }
                         }
@@ -1798,7 +1852,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
         let mut clickable_icon = |ui: &mut Context, id, icon, enabled | {
             let (clicked, colour, _) = ui.button_ex(false, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
-            if let _ = elem().decl(Decl{
+            if let _ = elem().decl(Decl {
                 id,
                 child_gap,
                 align: Center,
@@ -1835,25 +1889,11 @@ pub fn ui_right_pane(ui: &mut Context,
             }
         }
 
+        let (id, mut clip, mut scroll) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
         if roster.len() == 0 {
-            ui.finalizers_scroll = 0.0;
+            clip = Scroll(0.0, 0.0);
+            *scroll = 0.0;
         }
-
-        let id = id("History Scroll Container");
-        if ui.hovered(id) {
-            ui.finalizers_scroll -= ui.input().zoom_delta     as f32 * 32.0;
-            ui.finalizers_scroll -= ui.input().scroll_delta.1 as f32 * 32.0;
-        }
-        if ui.finalizers_scroll < 0.0 {
-            ui.finalizers_scroll = 0.0;
-        }
-        let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
-        if scroll_container_data.found {
-            let max = scroll_container_data.contentDimensions.height / ui.scale - 96.0;
-            if ui.finalizers_scroll > max {
-                ui.finalizers_scroll = max;
-            }
-        };
         if let _ = elem().decl(Decl {
             id,
             colour: TRANSACTION_HISTORY_CONTAINER_COL,
@@ -1863,7 +1903,7 @@ pub fn ui_right_pane(ui: &mut Context,
             height: grow!(),
             // height: percent!(1.0),
             direction: TopToBottom,
-            clip: Scroll(0.0, -ui.finalizers_scroll * ui.scale),
+            clip,
             align: Top,
             ..Decl
         }) {
@@ -2232,11 +2272,13 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     ..Decl
                 }) {
                     // @todo: two vertical panes with right aligned label and left aligned height
-                    ui.text(frame_strf!(data, "PoS Height: {}", viz.bft_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
-                    ui.text(frame_strf!(data, "PoW Height: {}", viz.bc_tip_height), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
-                    ui.text(frame_strf!(data, "Orchard Pool Zatoshis: {}", viz.orchard_pool_balance), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
-                    ui.text(frame_strf!(data, "Staking (Bonded) Pool Zatoshis: {}", viz.staking_bonded_pool_balance), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
-                    ui.text(frame_strf!(data, "Staking (Unbonded) Pool Zatoshis: {}", viz.staking_unbonded_pool_balance), TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl });
+                    let decl = TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl };
+                    ui.text(frame_strf!(data, "PoS Height: {}", viz.bft_tip_height), decl);
+                    ui.text(frame_strf!(data, "PoW Height: {}", viz.bc_tip_height), decl);
+                    ui.text(frame_strf!(data, "PoW Finalized Height: {}", viz.bc_finalized_tip_height), decl);
+                    ui.text(frame_strf!(data, "Orchard Pool Zatoshis: {}", viz.orchard_pool_balance), decl);
+                    ui.text(frame_strf!(data, "Staking (Bonded) Pool Zatoshis: {}", viz.staking_bonded_pool_balance), decl);
+                    ui.text(frame_strf!(data, "Staking (Unbonded) Pool Zatoshis: {}", viz.staking_unbonded_pool_balance), decl);
                 }
             }
 
@@ -2326,7 +2368,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             }) {
                 let text_h = ui.scale(10.0);
                 // Block Inspector Contents
-                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { font: Mono, wrap_chars: true, h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { font: Mono, wrap: Wrap::Chars, h: text_h, align: AlignX::Left, ..TextDecl });
 
                 let text = {
                     if let Some(text) = viz.inspect_block_json_text.as_ref() {
@@ -2335,7 +2377,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         frame_strf!(data, "Loading info for block {}...", viz.inspecting_block_hash).to_string()
                     }
                 };
-                ui.text(frame_strf!(data, "{}", text), TextDecl { font: Mono, wrap_chars: true, h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "{}", text), TextDecl { font: Mono, wrap: Wrap::Chars, h: text_h, align: AlignX::Left, ..TextDecl });
             }
         }
     }
@@ -2418,8 +2460,22 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 _ => { 0 }
             };
 
+            let draw_debug_rect = || {
+                if ui.debug {
+                    let thickness = 2.0;
+                    let color = 0x80ff00ff;
+                    let t  = (thickness / 2.0) as isize;
+
+                    ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x1+t) as f32, (y2+t) as f32, color);
+                    ui.draw().rectangle((x2-t) as f32, (y1-t) as f32, (x2+t) as f32, (y2+t) as f32, color);
+                    ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x2-t) as f32, (y1+t) as f32, color);
+                    ui.draw().rectangle((x1-t) as f32, (y2-t) as f32, (x2-t) as f32, (y2+t) as f32, color);
+                }
+            };
+
             // @Hack for generating nav highlight rectangle via draw commands.
             if colour == 0x01000000 {
+                draw_debug_rect();
                 continue;
             }
 
@@ -2493,16 +2549,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 }
             }
 
-            if ui.debug {
-                let thickness = 2.0;
-                let color = 0x80ff00ff;
-                let t  = (thickness / 2.0) as isize;
-
-                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x1+t) as f32, (y2+t) as f32, color);
-                ui.draw().rectangle((x2-t) as f32, (y1-t) as f32, (x2+t) as f32, (y2+t) as f32, color);
-                ui.draw().rectangle((x1-t) as f32, (y1-t) as f32, (x2-t) as f32, (y1+t) as f32, color);
-                ui.draw().rectangle((x1-t) as f32, (y2-t) as f32, (x2-t) as f32, (y2+t) as f32, color);
-            }
+            draw_debug_rect();
         }
 
         if ui.nav_enable && let Some((x1, y1, x2, y2)) = nav_bbox && !data.textboxes.contains_key(&ui.nav_id) {
@@ -2548,7 +2595,7 @@ pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet
 
     let dummy_input = InputCtx {
         this_mouse_pos: ui.input().this_mouse_pos,
-        last_mouse_pos: ui.input().last_mouse_pos,
+        last_mouse_pos: ui.input().this_mouse_pos,
 
         mouse_down: ui.input().mouse_down,
         keys_down1: ui.input().keys_down1,
@@ -2597,10 +2644,6 @@ pub struct Context {
     pub pane_tab_r: Id,
 
     pub modal: Modal,
-
-    pub history_scroll:    f32,
-    pub finalizers_scroll: f32,
-    pub unstake_scroll:    f32,
 
     pub tx_loading_animation_timer: f32,
 }

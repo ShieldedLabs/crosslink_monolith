@@ -33,6 +33,7 @@ impl RequestToZebra {
 
 pub struct ResponseFromZebra {
     pub bc_tip_height: u64,
+    pub bc_finalized_tip_height: u64,
     pub bft_tip_height: u64,
     pub bc_blocks: Vec<BcBlock>,
     pub bft_blocks: Vec<BftBlock>,
@@ -49,6 +50,7 @@ impl ResponseFromZebra {
     pub fn _0() -> Self {
         ResponseFromZebra {
             bc_tip_height: 0,
+            bc_finalized_tip_height: 0,
             bft_tip_height: 0,
             bc_blocks: Vec::new(),
             bft_blocks: Vec::new(),
@@ -204,6 +206,7 @@ pub struct VizState {
     pub bc_tip_y: f32,
 
     pub bc_tip_height: u64,
+    pub bc_finalized_tip_height: u64,
     pub bft_tip_height: u64,
 
     pub last_frame_hovered_hash: Hash32,
@@ -237,6 +240,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         send_to_zebra: me_send,
         receive_from_zebra: me_receive,
         bc_tip_height: 0,
+        bc_finalized_tip_height: 0,
         bft_tip_height: 0,
 
         bc_tip_y: 0.0,

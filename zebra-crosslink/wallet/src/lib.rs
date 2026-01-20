@@ -316,6 +316,7 @@ enum WalletAction {
 pub enum WalletTxKind {
     Send,
     Receive,
+    Mine,
     SelfSend,
     Shield, // a form of SelfSend
     Stake,
@@ -418,7 +419,7 @@ pub struct WalletTx {
 }
 
 impl WalletTx {
-    pub fn with_fake_data(kind: WalletTxKind, sent: u64, recv: u64, shielding: bool, memo: &str, mined_h: u32) -> Self {
+    pub fn with_fake_data(kind: WalletTxKind, sent: u64, recv: u64, shielding: bool, is_outside_bc: bool, memo: &str, mined_h: u32) -> Self {
         let mut memo_as_bytes = [0u8; 512];
         &memo_as_bytes[0..memo.len()].copy_from_slice(memo.as_bytes());
 
@@ -449,7 +450,7 @@ impl WalletTx {
             memo_count: if memo.len() != 0 { 1 } else { 0 },
                 memo: memo_as_bytes,
             is_coinbase: false,
-            is_outside_bc: false,
+            is_outside_bc,
             staking_action: None,
     }
 }
@@ -491,6 +492,11 @@ impl WalletTx {
             return WalletTxKind::SelfSend;
         }
         let all = self.totals();
+
+        if self.is_coinbase && all.spent_zats == Zatoshis::ZERO && all.recv_zats > Zatoshis::ZERO {
+            return WalletTxKind::Mine;
+        }
+
         // if *all* of the sent zats go to ourself we assume this was the purpose
         // otherwise we assume the self-sent zats are change
         // ALT: only consider it change if a single note is received (per pool?)
