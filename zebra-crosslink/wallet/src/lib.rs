@@ -4681,6 +4681,20 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
 
                     WalletAction::ClaimBond(txid) => {
+                        // Query bond info from the chain
+                        let bond_info_request = zcash_client_backend::proto::service::BondInfoRequest {
+                            bond_key: txid.as_ref().to_vec(),
+                        };
+                        match client.get_bond_info(bond_info_request).await {
+                            Ok(response) => {
+                                let info = response.into_inner();
+                                println!("Bond info: amount={}, status={}", info.amount, info.status);
+                            }
+                            Err(e) => {
+                                println!("Failed to get bond info: {:?}", e);
+                            }
+                        }
+
                         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
                         let maybe_send_txid = user_wallet.claim_bond_using_orchard(network, &mut client, &user_usk, &orchard_tree, txid.as_ref()).await;
                         println!("Try miner send txid: {:?}", maybe_send_txid);

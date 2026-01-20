@@ -47,7 +47,7 @@ use crate::{
     constants::{
         MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS, MAX_LEGACY_CHAIN_BLOCKS,
     },
-    response::NonFinalizedBlocksListener,
+    response::{BondInfoResponse, NonFinalizedBlocksListener},
     service::{
         block_iter::any_ancestor_blocks,
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
@@ -2266,6 +2266,35 @@ impl Service<ReadRequest> for ReadStateService {
                     ))
                 }
                 .boxed()
+            }
+
+            ReadRequest::BondInfo(bond_key) => {
+                let state = self.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || {
+                        let bond_info = state.non_finalized_state_receiver.with_watch_data(
+                            |non_finalized_state| non_finalized_state.best_chain().map(|chain| chain.delegation_bonds.get(&bond_key).cloned()),
+                        ).flatten();
+
+                        timer.finish(module_path!(), line!(), "ReadRequest::BondInfo");
+
+                        let response = bond_info.map(|(bond, status)| {
+                            use crate::service::non_finalized_state::BondStatusInChain;
+                            BondInfoResponse {
+                                amount: bond.amount,
+                                status: match status {
+                                    BondStatusInChain::Active => 0,
+                                    BondStatusInChain::Unbonding => 1,
+                                    BondStatusInChain::Withdrawn => 2,
+                                },
+                            }
+                        });
+
+                        Ok(ReadResponse::BondInfo(response))
+                    })
+                })
+                .wait_for_panics()
             }
         }
     }

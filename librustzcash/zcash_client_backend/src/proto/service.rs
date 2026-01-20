@@ -166,6 +166,23 @@ pub struct Balance {
     #[prost(int64, tag = "1")]
     pub value_zat: i64,
 }
+/// Request for GetBondInfo RPC
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BondInfoRequest {
+    /// 32-byte bond key
+    #[prost(bytes = "vec", tag = "1")]
+    pub bond_key: ::prost::alloc::vec::Vec<u8>,
+}
+/// Response for GetBondInfo RPC
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BondInfoResponse {
+    /// Bond amount in zatoshis
+    #[prost(uint64, tag = "1")]
+    pub amount: u64,
+    /// 0 = Active, 1 = Unbonding, 2 = Withdrawn
+    #[prost(uint32, tag = "2")]
+    pub status: u32,
+}
 /// The a shortened transaction ID is the prefix in big-endian (hex) format
 /// (then converted to binary).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -926,6 +943,36 @@ pub mod compact_tx_streamer_client {
                     ),
                 );
             self.inner.server_streaming(req, path, codec).await
+        }
+        /// Return information about a delegation bond
+        pub async fn get_bond_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BondInfoRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::BondInfoResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBondInfo",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                        "GetBondInfo",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
         }
         /// Return information about this lightwalletd instance and the blockchain
         pub async fn get_lightd_info(

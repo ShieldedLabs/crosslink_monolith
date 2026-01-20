@@ -25,7 +25,10 @@ use zebra_chain::work::difficulty::CompactDifficulty;
 #[allow(unused_imports)]
 use crate::{ReadRequest, Request};
 
-use crate::{service::read::AddressUtxos, NonFinalizedState, TransactionLocation, WatchReceiver};
+use crate::{
+    service::read::AddressUtxos,
+    NonFinalizedState, TransactionLocation, WatchReceiver,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
@@ -413,6 +416,20 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::NonFinalizedBlocksListener`]
     NonFinalizedBlocksListener(NonFinalizedBlocksListener),
+
+    /// Response to [`ReadRequest::BondInfo`] with bond value and status.
+    ///
+    /// Returns `None` if the bond does not exist.
+    BondInfo(Option<BondInfoResponse>),
+}
+
+/// Information about a delegation bond.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BondInfoResponse {
+    /// The current bond amount in zatoshis.
+    pub amount: Amount<NonNegative>,
+    /// The bond status: 0 = Active, 1 = Unbonding, 2 = Withdrawn.
+    pub status: u8,
 }
 
 /// A structure with the information needed from the state to build a `getblocktemplate` RPC response.
@@ -514,7 +531,9 @@ impl TryFrom<ReadResponse> for Response {
 
             ReadResponse::ValidBlockProposal => Ok(Response::ValidBlockProposal),
 
-            ReadResponse::SolutionRate(_) | ReadResponse::TipBlockSize(_) => {
+            ReadResponse::SolutionRate(_)
+            | ReadResponse::TipBlockSize(_)
+            | ReadResponse::BondInfo(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
         }

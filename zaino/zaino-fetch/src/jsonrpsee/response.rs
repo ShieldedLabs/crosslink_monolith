@@ -1458,6 +1458,10 @@ impl ResponseToError for Vec<zcash_primitives::transaction::RosterMember> {
     type RpcError = Infallible;
 }
 
+impl ResponseToError for Option<zebra_rpc::methods::GetBondInfoResponse> {
+    type RpcError = Infallible;
+}
+
 // impl From<GetBytes> for Vec<u8> {
 //     fn from(v: GetBytes) -> Vec<u8> {
 //         v.data

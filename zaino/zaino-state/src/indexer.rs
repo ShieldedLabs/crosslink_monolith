@@ -16,10 +16,10 @@ use zaino_fetch::jsonrpsee::response::{
 use zaino_proto::proto::{
     compact_formats::CompactBlock,
     service::{
-        AddressList, Balance, BlockId, BlockRange, Bytes, Duration, Exclude, GetAddressUtxosArg,
-        GetAddressUtxosReplyList, GetSubtreeRootsArg, LightdInfo, PingResponse, RawTransaction,
-        SendResponse, ShieldedProtocol, SubtreeRoot, TransparentAddressBlockFilter, TreeState,
-        TxFilter,
+        AddressList, Balance, BlockId, BlockRange, BondInfoRequest, BondInfoResponse, Bytes,
+        Duration, Exclude, GetAddressUtxosArg, GetAddressUtxosReplyList, GetSubtreeRootsArg,
+        LightdInfo, PingResponse, RawTransaction, SendResponse, ShieldedProtocol, SubtreeRoot,
+        TransparentAddressBlockFilter, TreeState, TxFilter,
     },
 };
 use zebra_chain::{block::Height, subtree::NoteCommitmentSubtreeIndex};
@@ -604,6 +604,12 @@ pub trait LightWalletIndexer: Send + Sync + Clone + ZcashIndexer + 'static {
     /// Return the requested full (not compact) transaction (as from zcashd)
     async fn get_transaction(&self, request: TxFilter) -> Result<RawTransaction, Self::Error>;
     async fn get_roster(&self) -> Result<Bytes, Self::Error>;
+
+    /// Return information about a delegation bond
+    async fn get_bond_info(
+        &self,
+        request: BondInfoRequest,
+    ) -> Result<BondInfoResponse, Self::Error>;
 
     /// Submit the given transaction to the Zcash network
     async fn send_transaction(&self, request: RawTransaction) -> Result<SendResponse, Self::Error>;

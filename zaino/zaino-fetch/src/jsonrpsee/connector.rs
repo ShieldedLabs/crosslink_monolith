@@ -748,6 +748,14 @@ impl JsonRpSeeConnector {
         self.send_request("get_tfl_roster_zats", params).await
     }
 
+    /// Get bond info by bond key
+    pub async fn get_bond_info(&self, bond_key: String) -> Result<Option<zebra_rpc::methods::GetBondInfoResponse>, RpcRequestError<Infallible>> {
+        let params = vec![
+            serde_json::to_value(bond_key).map_err(RpcRequestError::JsonRpc)?,
+        ];
+        self.send_request("getbondinfo", params).await
+    }
+
     /// Returns the transaction ids made by the provided transparent addresses.
     ///
     /// zcashd reference: [`getaddresstxids`](https://zcash.github.io/rpc/getaddresstxids.html)

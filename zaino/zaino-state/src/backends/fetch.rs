@@ -37,9 +37,10 @@ use zaino_fetch::{
 use zaino_proto::proto::{
     compact_formats::CompactBlock,
     service::{
-        AddressList, Balance, BlockId, BlockRange, Bytes, Duration, Exclude, GetAddressUtxosArg,
-        GetAddressUtxosReply, GetAddressUtxosReplyList, LightdInfo, PingResponse, RawTransaction,
-        SendResponse, TransparentAddressBlockFilter, TreeState, TxFilter,
+        AddressList, Balance, BlockId, BlockRange, BondInfoRequest, BondInfoResponse, Bytes,
+        Duration, Exclude, GetAddressUtxosArg, GetAddressUtxosReply, GetAddressUtxosReplyList,
+        LightdInfo, PingResponse, RawTransaction, SendResponse, TransparentAddressBlockFilter,
+        TreeState, TxFilter,
     },
 };
 
@@ -1024,6 +1025,25 @@ impl LightWalletIndexer for FetchServiceSubscriber {
 
     async fn get_roster(&self) -> Result<Bytes, Self::Error> {
         Ok(self.get_raw_roster().await?)
+    }
+
+    async fn get_bond_info(&self, request: BondInfoRequest) -> Result<BondInfoResponse, Self::Error> {
+        let bond_key_hex = hex::encode(&request.bond_key);
+        let result: Result<Option<zebra_rpc::methods::GetBondInfoResponse>, _> = self
+            .fetcher
+            .get_bond_info(bond_key_hex)
+            .await;
+        match result.map_err(FetchServiceError::from)? {
+            Some(info) => {
+                Ok(BondInfoResponse {
+                    amount: info.amount(),
+                    status: info.status() as u32,
+                })
+            }
+            None => Err(FetchServiceError::TonicStatusError(
+                tonic::Status::not_found("Bond not found"),
+            )),
+        }
     }
 
     /// Submit the given transaction to the Zcash network

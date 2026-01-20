@@ -195,6 +195,18 @@ pub trait Rpc {
         address_strings: GetAddressBalanceRequest,
     ) -> Result<GetAddressBalanceResponse>;
 
+    /// Returns information about a delegation bond.
+    ///
+    /// # Parameters
+    ///
+    /// - `bond_key`: (string, required) The 32-byte bond key as a hex string.
+    ///
+    /// # Returns
+    ///
+    /// Bond information including amount and status, or null if the bond doesn't exist.
+    #[method(name = "getbondinfo")]
+    async fn get_bond_info(&self, bond_key: String) -> Result<Option<GetBondInfoResponse>>;
+
     /// Sends the raw bytes of a signed transaction to the local node's mempool, if the transaction is valid.
     /// Returns the [`SentTransactionHash`] for the transaction, as a JSON string.
     ///
@@ -1497,6 +1509,40 @@ where
                     received,
                 })
             }
+            _ => unreachable!("Unexpected response from state service: {response:?}"),
+        }
+    }
+
+    async fn get_bond_info(&self, bond_key: String) -> Result<Option<GetBondInfoResponse>> {
+        let bond_key_bytes: [u8; 32] = Vec::from_hex(&bond_key)
+            .map_err(|_| ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                "invalid hex string for bond_key",
+                None::<()>,
+            ))?
+            .try_into()
+            .map_err(|_| ErrorObject::owned(
+                ErrorCode::InvalidParams.code(),
+                "bond_key must be exactly 32 bytes",
+                None::<()>,
+            ))?;
+
+        let request = zebra_state::ReadRequest::BondInfo(bond_key_bytes);
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(request)
+            .await
+            .map_misc_error()?;
+
+        match response {
+            zebra_state::ReadResponse::BondInfo(Some(info)) => {
+                Ok(Some(GetBondInfoResponse {
+                    amount: u64::from(info.amount),
+                    status: info.status,
+                }))
+            }
+            zebra_state::ReadResponse::BondInfo(None) => Ok(None),
             _ => unreachable!("Unexpected response from state service: {response:?}"),
         }
     }
@@ -4052,6 +4098,27 @@ pub struct GetAddressBalanceResponse {
 
 #[deprecated(note = "Use `GetAddressBalanceResponse` instead.")]
 pub use self::GetAddressBalanceResponse as AddressBalance;
+
+/// Response to a `getbondinfo` RPC request.
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    Getters,
+    new,
+)]
+pub struct GetBondInfoResponse {
+    /// The bond amount in zatoshis.
+    #[getter(copy)]
+    amount: u64,
+    /// The bond status: 0 = Active, 1 = Unbonding, 2 = Withdrawn.
+    #[getter(copy)]
+    status: u8,
+}
 
 /// A hex-encoded [`ConsensusBranchId`] string.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
