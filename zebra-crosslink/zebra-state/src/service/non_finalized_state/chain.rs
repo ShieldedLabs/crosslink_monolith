@@ -139,6 +139,11 @@ pub struct ChainInner {
     pub(crate) delegation_bonds:
         HashMap<disk_format::BondKey, (disk_format::DelegationBond, BondStatusInChain)>,
 
+    /// Staking rewards distributed to each bond at each block height.
+    /// Indexed by block position in the chain (0 = first non-finalized block).
+    /// Used for exact reverting without rounding issues.
+    pub(crate) bond_rewards: Vec<Vec<(disk_format::BondKey, u64)>>,
+
     // Note commitment trees
     //
     /// The Sprout note commitment tree for each anchor.
@@ -290,6 +295,7 @@ impl Chain {
             created_utxos: Default::default(),
             spent_utxos: Default::default(),
             delegation_bonds,
+            bond_rewards: Vec::new(),
             sprout_anchors: MultiSet::new(),
             sprout_anchors_by_height: Default::default(),
             sprout_trees_by_anchor: Default::default(),
@@ -1658,6 +1664,18 @@ impl Chain {
                 assert_eq!(*status, BondStatusInChain::Unbonding,
                     "bond should be unbonding if unbonding was added to chain");
                 *status = BondStatusInChain::Active;
+                let bond_amount = bond.amount;
+
+                // Revert pool balances: move value back from unbonded to bonded
+                let current_bonded = self.chain_value_pools.staking_bonded_amount();
+                let new_bonded = (current_bonded + bond_amount)
+                    .expect("reverting unbonding should not overflow bonded pool");
+                self.chain_value_pools.set_staking_bonded_amount(new_bonded);
+
+                let current_unbonded = self.chain_value_pools.staking_unbonded_amount();
+                let new_unbonded = (current_unbonded - bond_amount)
+                    .expect("reverting unbonding should not underflow unbonded pool");
+                self.chain_value_pools.set_staking_unbonded_amount(new_unbonded);
             }
             StakingActionKind::WithdrawDelegationBond => {
                 // Change status back from Withdrawn to Unbonding
@@ -1816,6 +1834,19 @@ impl Chain {
         let size = block.zcash_serialized_size();
         self.update_chain_tip_with(&(*chain_value_pool_change, height, size))?;
 
+        let bond_reward_total_todo = 1000000;
+        let mut reward_store_for_revert: Vec<([u8; 32], u64)> = Vec::new();
+        let mut total_bond_delta = 0;
+        for (bond_key, (bond, bond_status)) in self.inner.delegation_bonds.iter_mut() {
+            if *bond_status == BondStatusInChain::Active {
+                bond.amount = (bond.amount + Amount::new(1)).unwrap();
+                total_bond_delta += 1u64;
+                reward_store_for_revert.push((*bond_key, 1u64,));
+            }
+        }
+        self.inner.chain_value_pools.set_staking_bonded_amount((self.inner.chain_value_pools.staking_bonded_amount() + Amount::new(total_bond_delta as i64)).unwrap());
+        self.bond_rewards.push(reward_store_for_revert);
+
         Ok(())
     }
 }
@@ -1881,6 +1912,28 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
         contextually_valid: &ContextuallyVerifiedBlock,
         position: RevertPosition,
     ) {
+        // Revert staking rewards FIRST, before reverting transactions
+        if position == RevertPosition::Root {
+            // Block being finalized, just discard the rewards record
+            self.bond_rewards.remove(0);
+        } else {
+            // Block being reverted from tip, reverse the rewards
+            let rewards = self.bond_rewards.pop().expect("rewards must exist for tip block");
+            for (bond_key, reward_amount) in rewards {
+                // Subtract reward from bond amount
+                let (bond, _status) = self.delegation_bonds.get_mut(&bond_key)
+                    .expect("bond must exist if it received rewards");
+                bond.amount = (bond.amount - Amount::try_from(reward_amount as i64).unwrap())
+                    .expect("reverting reward should not underflow bond amount");
+
+                // Subtract from staking_bonded pool
+                let current_bonded = self.chain_value_pools.staking_bonded_amount();
+                let new_bonded = (current_bonded - Amount::try_from(reward_amount as i64).unwrap())
+                    .expect("reverting reward should not underflow bonded pool");
+                self.chain_value_pools.set_staking_bonded_amount(new_bonded);
+            }
+        }
+
         let (
             block,
             hash,
