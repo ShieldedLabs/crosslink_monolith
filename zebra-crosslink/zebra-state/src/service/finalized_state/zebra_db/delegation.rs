@@ -121,6 +121,10 @@ impl DiskWriteBatch {
         // Process transactions to update bond state
         use zcash_primitives::transaction::StakingActionKind;
 
+        // Track bonds created in this block so we can apply rewards to them
+        // (they won't be in the DB yet when we apply rewards)
+        let mut bonds_created_in_block: HashMap<BondKey, DelegationBond> = HashMap::new();
+
         // Iterate through all transactions in the block
         for (transaction_index, transaction) in finalized.block.transactions.iter().enumerate() {
             // Check if transaction has a staking action
@@ -138,6 +142,9 @@ impl DiskWriteBatch {
                         let bond =
                             DelegationBond::new(amount, target_finalizer, transaction_location);
 
+                        // Track this bond for reward application
+                        bonds_created_in_block.insert(bond_key, bond.clone());
+
                         // Insert new bond
                         self.prepare_new_delegation_bond(&db.db, bond_key, bond);
                     }
@@ -152,6 +159,21 @@ impl DiskWriteBatch {
                     // Other staking actions don't affect delegation bonds
                     _ => {}
                 }
+            }
+        }
+
+        // Apply bond rewards accumulated in the non-finalized state
+        let delegation_bond_by_key_cf = db.db.cf_handle(DELEGATION_BOND_BY_KEY).unwrap();
+        for (bond_key, reward_amount) in &finalized.bond_rewards {
+            // Get current bond from DB, or from bonds created in this block
+            let bond_opt = db.delegation_bond(bond_key)
+                .or_else(|| bonds_created_in_block.get(bond_key).cloned());
+
+            if let Some(mut bond) = bond_opt {
+                // Add reward to bond amount
+                bond.amount = (bond.amount + Amount::try_from(*reward_amount as i64)?)?;
+                // Write updated bond back
+                self.zs_insert(&delegation_bond_by_key_cf, *bond_key, bond);
             }
         }
 

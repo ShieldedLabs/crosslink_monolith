@@ -266,28 +266,33 @@ impl DiskWriteBatch {
                 finalized.deferred_pool_balance_change,
             )?)?;
 
+        // Apply bond rewards to the staking_bonded pool tally FIRST,
+        // before unbonding moves value between pools (to match non-finalized state order)
+        let total_rewards: u64 = finalized.bond_rewards.iter().map(|(_, amount)| amount).sum();
+        if total_rewards > 0 {
+            let current_bonded = new_value_pool.staking_bonded_amount();
+            let new_bonded: Amount<NonNegative> = (current_bonded + Amount::try_from(total_rewards as i64)?)
+                .expect("staking_bonded pool should not overflow from rewards");
+            new_value_pool.set_staking_bonded_amount(new_bonded);
+        }
+
         // Handle BeginDelegationUnbonding staking actions.
         // These move value from staking_bonded to staking_unbonded, but this transfer
         // is not captured by chain_value_pool_change (which only handles value entering/leaving pools).
-        for tx in finalized.block.transactions.iter() {
-            if let Some(staking_action) = tx.staking_action() {
-                if staking_action.kind == StakingActionKind::BeginDelegationUnbonding {
-                    let bond_key: BondKey = staking_action.arg32_0;
-                    let bond = db.delegation_bond(&bond_key)
-                        .expect("bond must exist when unbonding (should have been validated)");
+        // Use the pre-computed unbonding_amounts which include rewards from the non-finalized state.
+        for (_bond_key, bond_amount) in &finalized.unbonding_amounts {
+            let bond_amount: Amount<NonNegative> = Amount::try_from(*bond_amount as i64)?;
 
-                    // Move value from staking_bonded to staking_unbonded
-                    let current_bonded = new_value_pool.staking_bonded_amount();
-                    let new_bonded: Amount<NonNegative> = (current_bonded - bond.amount)
-                        .expect("staking_bonded pool should not underflow");
-                    new_value_pool.set_staking_bonded_amount(new_bonded);
+            // Move value from staking_bonded to staking_unbonded
+            let current_bonded = new_value_pool.staking_bonded_amount();
+            let new_bonded: Amount<NonNegative> = (current_bonded - bond_amount)
+                .expect("staking_bonded pool should not underflow");
+            new_value_pool.set_staking_bonded_amount(new_bonded);
 
-                    let current_unbonded = new_value_pool.staking_unbonded_amount();
-                    let new_unbonded: Amount<NonNegative> = (current_unbonded + bond.amount)
-                        .expect("staking_unbonded pool should not overflow");
-                    new_value_pool.set_staking_unbonded_amount(new_unbonded);
-                }
-            }
+            let current_unbonded = new_value_pool.staking_unbonded_amount();
+            let new_unbonded: Amount<NonNegative> = (current_unbonded + bond_amount)
+                .expect("staking_unbonded pool should not overflow");
+            new_value_pool.set_staking_unbonded_amount(new_unbonded);
         }
 
         let _ = db

@@ -130,7 +130,7 @@ fn chain_transparent_balance_change(
     // so we pop root blocks from `chain` until the chain root is a child of the finalized tip.
     while chain.non_finalized_root_height() < required_chain_root {
         // TODO: just revert the transparent balances, to improve performance
-        chain.pop_root();
+        let _ = chain.pop_root();
     }
 
     chain.partial_transparent_balance_change(addresses)

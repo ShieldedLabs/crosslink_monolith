@@ -384,9 +384,9 @@ impl Chain {
     }
 
     /// Pops the lowest height block of the non-finalized portion of a chain,
-    /// and returns it with its associated treestate.
+    /// and returns it with its associated treestate, bond rewards, and unbonding amounts for that block.
     #[instrument(level = "debug", skip(self))]
-    pub(crate) fn pop_root(&mut self) -> (ContextuallyVerifiedBlock, Treestate) {
+    pub(crate) fn pop_root(&mut self) -> (ContextuallyVerifiedBlock, Treestate, Vec<([u8; 32], u64)>, Vec<([u8; 32], u64)>) {
         // Obtain the lowest height.
         let block_height = self.non_finalized_root_height();
 
@@ -409,10 +409,32 @@ impl Chain {
             .remove(&block_height)
             .expect("only called while blocks is populated");
 
-        // Update cumulative data members.
+        // Extract bond rewards for this block BEFORE revert_chain_with discards them
+        let bond_rewards = if !self.bond_rewards.is_empty() {
+            self.bond_rewards.remove(0)
+        } else {
+            Vec::new()
+        };
+
+        // Extract full bond amounts for bonds that will be unbonded in this block
+        // (needed for finalized state pool accounting)
+        use zcash_primitives::transaction::StakingActionKind;
+        let mut unbonding_amounts: Vec<([u8; 32], u64)> = Vec::new();
+        for tx in block.block.transactions.iter() {
+            if let Some(staking_action) = tx.staking_action() {
+                if staking_action.kind == StakingActionKind::BeginDelegationUnbonding {
+                    let bond_key = staking_action.arg32_0;
+                    let (bond, _status) = self.delegation_bonds.get(&bond_key)
+                        .expect("bond must exist when unbonding");
+                    unbonding_amounts.push((bond_key, bond.amount.into()));
+                }
+            }
+        }
+
+        // Update cumulative data members (this no longer discards bond_rewards since we extracted them above)
         self.revert_chain_with(&block, RevertPosition::Root);
 
-        (block, treestate)
+        (block, treestate, bond_rewards, unbonding_amounts)
     }
 
     /// Returns the block at the provided height and all of its descendant blocks.
@@ -1914,8 +1936,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
     ) {
         // Revert staking rewards FIRST, before reverting transactions
         if position == RevertPosition::Root {
-            // Block being finalized, just discard the rewards record
-            self.bond_rewards.remove(0);
+            // Block being finalized - rewards already extracted by pop_root, nothing to do here
         } else {
             // Block being reverted from tip, reverse the rewards
             let rewards = self.bond_rewards.pop().expect("rewards must exist for tip block");

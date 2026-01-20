@@ -340,13 +340,13 @@ fn finalized_equals_pushed_genesis() -> Result<()> {
             }
 
         for _ in 0..finalized_count {
-            full_chain.pop_root();
+            let _ = full_chain.pop_root();
         }
 
         // Make sure the temporary trees from finalized tip forks are removed.
         // TODO: update the test or the code so this extra step isn't needed?
-        full_chain.pop_root();
-        partial_chain.pop_root();
+        let _ = full_chain.pop_root();
+        let _ = partial_chain.pop_root();
 
         prop_assert_eq!(full_chain.blocks.len(), partial_chain.blocks.len());
         prop_assert!(
@@ -422,13 +422,13 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
             }
 
         for _ in 0..finalized_count {
-            full_chain.pop_root();
+            let _ = full_chain.pop_root();
         }
 
         // Make sure the temporary trees from finalized tip forks are removed.
         // TODO: update the test or the code so this extra step isn't needed?
-        full_chain.pop_root();
-        partial_chain.pop_root();
+        let _ = full_chain.pop_root();
+        let _ = partial_chain.pop_root();
 
         prop_assert_eq!(full_chain.blocks.len(), partial_chain.blocks.len());
         prop_assert!(

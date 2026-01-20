@@ -76,12 +76,11 @@ pub fn validate_delegation_bonds(
                     block_unbonding_bonds.insert(bond_key, ());
                 }
                 StakingActionKind::WithdrawDelegationBond => {
-                    // Check that bond exists and is unbonding
+                    // Check that bond exists, is unbonding, and withdrawal amount matches bond amount
                     validate_bond_for_withdrawal(
                         bond_key,
-                        &block_unbonding_bonds,
+                        staking_action.amount_zats,
                         non_finalized_chain,
-                        finalized_state,
                     )?;
                 }
                 // Other staking actions don't affect delegation bonds
@@ -190,24 +189,26 @@ fn validate_bond_for_unbonding(
     )))
 }
 
-/// Validates WithdrawDelegationBond: ensures the bond exists and is unbonding.
+/// Validates WithdrawDelegationBond: ensures the bond exists, is unbonding, and amount matches.
 fn validate_bond_for_withdrawal(
     bond_key: [u8; 32],
-    block_unbonding_bonds: &HashMap<[u8; 32], ()>,
+    withdrawal_amount: u64,
     non_finalized_chain: &Chain,
-    finalized_state: &ZebraDb,
 ) -> Result<(), ValidateContextError> {
-    // Check if bond was unbonded in this block (allowed)
-    if block_unbonding_bonds.contains_key(&bond_key) {
-        return Ok(());
-    }
-
     // Check if bond exists in non-finalized state
-    if let Some((_bond, status)) = non_finalized_chain.delegation_bonds.get(&bond_key) {
+    if let Some((bond, status)) = non_finalized_chain.delegation_bonds.get(&bond_key) {
         use crate::service::non_finalized_state::BondStatusInChain;
 
         match status {
             BondStatusInChain::Unbonding => {
+                // Validate that withdrawal amount matches bond amount
+                let bond_amount: u64 = bond.amount.into();
+                if withdrawal_amount != bond_amount {
+                    return Err(ValidateContextError::InvalidDelegationBond(format!(
+                        "withdrawal amount {} does not match bond amount {}: {:?}",
+                        withdrawal_amount, bond_amount, bond_key
+                    )));
+                }
                 return Ok(());
             }
             BondStatusInChain::Active => {
@@ -225,31 +226,7 @@ fn validate_bond_for_withdrawal(
         }
     }
 
-    // Check finalized state
-    if finalized_state.delegation_bond(&bond_key).is_some() {
-        let status = finalized_state.bond_status(&bond_key).ok_or_else(|| {
-            ValidateContextError::InvalidDelegationBond(format!(
-                "bond status not found for bond: {:?}",
-                bond_key
-            ))
-        })?;
-
-        if status.is_unbonding() {
-            return Ok(());
-        } else if status.is_active() {
-            return Err(ValidateContextError::InvalidDelegationBond(format!(
-                "delegation bond must be unbonded before withdrawal: {:?}",
-                bond_key
-            )));
-        } else {
-            return Err(ValidateContextError::InvalidDelegationBond(format!(
-                "delegation bond is already withdrawn: {:?}",
-                bond_key
-            )));
-        }
-    }
-
-    // Bond not found anywhere
+    // Bond not found in non-finalized state
     Err(ValidateContextError::InvalidDelegationBond(format!(
         "delegation bond not found: {:?}",
         bond_key

@@ -1715,10 +1715,15 @@ pub fn ui_left_pane(ui: &mut Context,
                                     },
                                 }
 
-                                let fee: u64 = tx.fee().into_u64();
                                 if tx.kind() != WalletTxKind::Receive &&
-                                   tx.kind() != WalletTxKind::BeginUnstake {
-                                    ui.text(frame_strf!(data, "Fee: {} cTAZ", str_from_ctaz(fee)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
+                                   tx.kind() != WalletTxKind::BeginUnstake
+                                {
+                                    let fee_str = if let Some(fee) = tx.fee() {
+                                        str_from_ctaz(fee.into_u64())
+                                    } else {
+                                        format!("<unknown>")
+                                    };
+                                    ui.text(frame_strf!(data, "Fee: {} cTAZ", fee_str), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                 }
 
                                 let _ = elem().decl(Decl { height: grow!(), ..Decl }); // spacer

@@ -359,6 +359,10 @@ pub enum FinalizableBlock {
     Contextual {
         contextually_verified: ContextuallyVerifiedBlock,
         treestate: Treestate,
+        /// Bond rewards accumulated for this block: (bond_key, reward_amount)
+        bond_rewards: Vec<([u8; 32], u64)>,
+        /// Bond amounts for bonds being unbonded in this block: (bond_key, full_amount_with_rewards)
+        unbonding_amounts: Vec<([u8; 32], u64)>,
     },
 }
 
@@ -383,24 +387,30 @@ pub struct FinalizedBlock {
     pub(super) treestate: Treestate,
     /// This block's deferred pool value balance change.
     pub(super) deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    /// Bond rewards accumulated for this block: (bond_key, reward_amount)
+    pub(super) bond_rewards: Vec<([u8; 32], u64)>,
+    /// Bond amounts for bonds being unbonded in this block: (bond_key, full_amount_with_rewards)
+    pub(super) unbonding_amounts: Vec<([u8; 32], u64)>,
 }
 
 impl FinalizedBlock {
     /// Constructs [`FinalizedBlock`] from [`CheckpointVerifiedBlock`] and its [`Treestate`].
     pub fn from_checkpoint_verified(block: CheckpointVerifiedBlock, treestate: Treestate) -> Self {
-        Self::from_semantically_verified(SemanticallyVerifiedBlock::from(block), treestate)
+        Self::from_semantically_verified(SemanticallyVerifiedBlock::from(block), treestate, Vec::new(), Vec::new())
     }
 
-    /// Constructs [`FinalizedBlock`] from [`ContextuallyVerifiedBlock`] and its [`Treestate`].
+    /// Constructs [`FinalizedBlock`] from [`ContextuallyVerifiedBlock`], [`Treestate`], bond rewards, and unbonding amounts.
     pub fn from_contextually_verified(
         block: ContextuallyVerifiedBlock,
         treestate: Treestate,
+        bond_rewards: Vec<([u8; 32], u64)>,
+        unbonding_amounts: Vec<([u8; 32], u64)>,
     ) -> Self {
-        Self::from_semantically_verified(SemanticallyVerifiedBlock::from(block), treestate)
+        Self::from_semantically_verified(SemanticallyVerifiedBlock::from(block), treestate, bond_rewards, unbonding_amounts)
     }
 
-    /// Constructs [`FinalizedBlock`] from [`SemanticallyVerifiedBlock`] and its [`Treestate`].
-    fn from_semantically_verified(block: SemanticallyVerifiedBlock, treestate: Treestate) -> Self {
+    /// Constructs [`FinalizedBlock`] from [`SemanticallyVerifiedBlock`], [`Treestate`], bond rewards, and unbonding amounts.
+    fn from_semantically_verified(block: SemanticallyVerifiedBlock, treestate: Treestate, bond_rewards: Vec<([u8; 32], u64)>, unbonding_amounts: Vec<([u8; 32], u64)>) -> Self {
         Self {
             block: block.block,
             hash: block.hash,
@@ -409,16 +419,20 @@ impl FinalizedBlock {
             transaction_hashes: block.transaction_hashes,
             treestate,
             deferred_pool_balance_change: block.deferred_pool_balance_change,
+            bond_rewards,
+            unbonding_amounts,
         }
     }
 }
 
 impl FinalizableBlock {
-    /// Create a new [`FinalizableBlock`] given a [`ContextuallyVerifiedBlock`].
-    pub fn new(contextually_verified: ContextuallyVerifiedBlock, treestate: Treestate) -> Self {
+    /// Create a new [`FinalizableBlock`] given a [`ContextuallyVerifiedBlock`], treestate, bond rewards, and unbonding amounts.
+    pub fn new(contextually_verified: ContextuallyVerifiedBlock, treestate: Treestate, bond_rewards: Vec<([u8; 32], u64)>, unbonding_amounts: Vec<([u8; 32], u64)>) -> Self {
         Self::Contextual {
             contextually_verified,
             treestate,
+            bond_rewards,
+            unbonding_amounts,
         }
     }
 
