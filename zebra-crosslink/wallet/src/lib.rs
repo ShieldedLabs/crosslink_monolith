@@ -28,7 +28,7 @@ use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_note_encryption::{try_compact_note_decryption, try_note_decryption, try_output_recovery_with_ovk, ShieldedOutput};
-use zcash_primitives::transaction::builder::{BuildConfig, Builder as TxBuilder, BuildResult as TxBuildResult};
+use zcash_primitives::transaction::builder::{self, BuildConfig, Builder as TxBuilder, BuildResult as TxBuildResult};
 use zcash_primitives::transaction::components::TxOut;
 use zcash_primitives::transaction::fees::{
     self,
@@ -94,9 +94,10 @@ impl BlockHeight {
     // the more sure we are about its continued existence
     pub const INVALID: Self = Self(u32::MAX); // NOTE: here for headroom for +1 to fake <= using <
     // ALT: maybe better to go the other way round: use <= and saturating_sub(1)
-    // TODO: creating (slow), sending, sent, mempool
-    pub const INTERNAL: Self = Self(u32::MAX-1);
-    pub const MEMPOOL: Self = Self(u32::MAX-2);
+    pub const PROPOSED: Self = Self(u32::MAX-1); // NOTE: no valid txid here
+    pub const BUILT:    Self = Self(u32::MAX-2);
+    pub const SENT:     Self = Self(u32::MAX-3);
+    pub const MEMPOOL:  Self = Self(u32::MAX-4);
 
     pub fn is_in_block(&self) -> bool {
         self.0 < Self::MEMPOOL.0
@@ -127,9 +128,11 @@ impl std::fmt::Debug for BlockHeight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "BlockHeight(")?;
         match *self {
-            Self::INVALID => write!(f, "<invalid>"),
-            Self::INTERNAL => write!(f, "<internal>"),
-            Self::MEMPOOL => write!(f, "<mempool>"),
+            Self::INVALID  => write!(f, "<invalid>"),
+            Self::PROPOSED => write!(f, "<proposed>"),
+            Self::BUILT    => write!(f, "<built>"),
+            Self::SENT     => write!(f, "<sent>"),
+            Self::MEMPOOL  => write!(f, "<mempool>"),
             _ => self.0.fmt(f)
         }?;
         write!(f, ")")
@@ -138,9 +141,11 @@ impl std::fmt::Debug for BlockHeight {
 impl std::fmt::Display for BlockHeight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::INVALID => write!(f, "<invalid>"),
-            Self::INTERNAL => write!(f, "<internal>"),
-            Self::MEMPOOL => write!(f, "<mempool>"),
+            Self::INVALID  => write!(f, "<invalid>"),
+            Self::PROPOSED => write!(f, "<proposed>"),
+            Self::BUILT    => write!(f, "<built>"),
+            Self::SENT     => write!(f, "<sent>"),
+            Self::MEMPOOL  => write!(f, "<mempool>"),
             _ => self.0.fmt(f)
         }
     }
@@ -279,25 +284,59 @@ struct BuildPrep {
     o_outputs: Vec<ProposedOrchardOutput>,
 
     staking_action: Option<StakingAction>,
+}
+impl BuildPrep {
+    fn fee_required(&self) -> Result<Zatoshis, builder::FeeError<zip317::FeeError>> {
+        // NOTE: we can impl these ourselves
+        use zcash_primitives::transaction::fees::transparent::{InputView, OutputView};
+        let orchard_actions = orchard::builder::BundleType::DEFAULT.num_actions(
+            self.o_inputs.len(), self.o_outputs.len()
+        ).map_err(|e| builder::FeeError::Bundle(e))?;
 
-    expected_fee: Zatoshis,
+        zip317::FeeRule::standard().fee_required(
+            &TEST_NETWORK,
+            LRZBlockHeight::from_u32(self.block_h),
+            self.t_inputs.iter().map(|input| input.serialized_size()),
+            self.t_outputs.iter().map(|output| 8 + output.dst.script().0.len()), // DUP from zcash_primitives/src/transaction/fees/transparent.rs
+            0, 0, // sapling
+            orchard_actions
+        ).map_err(|e| builder::FeeError::FeeRule(e))
+    }
 }
 
-// this is basically just the info that TxBuilder takes
-enum ProposalStage {
-    Prebuild(BuildPrep),
-    Postbuild {
-        tx_res: TxBuildResult,
-    },
-}
+
 struct ProposedTx {
-    pub parts: [WalletTxPart; 3],
-    pub stage: ProposalStage,
-    pub block_h: u32,
+    pub tx: WalletTx,
+    pub prep: Option<BuildPrep>,
+    pub tx_res: Option<TxBuildResult>,
     // pub orchard_anchor_h: u32,
     // pub orchard_fvk: Option<orchard::keys::FullViewingKey>,
     // pub src_usk: UnifiedSpendingKey,
     // pub outputs: Vec<TxOutput>,
+}
+impl ProposedTx {
+    const EMPTY: Self = Self {
+        tx: WalletTx {
+            account_id: 0,
+            txid: TxId::from_bytes([0; 32]),
+            expiry_h: None,
+            mined_h: BlockHeight::INVALID,
+            is_coinbase: false,
+            is_outside_bc: true, // default invalid
+            part_flags: 0,
+            parts: [WalletTxPart::ZERO; 2],
+            memo_count: 0,
+            memo: EMPTY_MEMO_BYTES,
+            staking_action: None,
+        },
+        prep: None,
+        tx_res: None,
+    };
+
+    fn is_in_progress(&self) -> bool {
+        (BlockHeight::SENT..=BlockHeight::PROPOSED).contains(&self.tx.mined_h) &&
+            !self.tx.is_outside_bc
+    }
 }
 
 const CHEAT_UNSTAKING: bool = false;
@@ -408,6 +447,34 @@ impl WalletTxPart {
         recv_note_count: 0,
         recv_zats: Zatoshis::ZERO,
     };
+
+    pub fn from_staking_action(staking_action: Option<StakingAction>) -> Self {
+        let mut b = WalletTxPart::ZERO;
+
+        if let Some(staking_action) = staking_action {
+            match staking_action.kind {
+                StakingActionKind::Null => (),
+
+                StakingActionKind::CreateNewDelegationBond => {
+                    b.sent(Zatoshis::from_u64(staking_action.amount_zats).expect("already converted"), true).unwrap();
+                    b.recv(Zatoshis::from_u64(staking_action.amount_zats).expect("already converted"), true).unwrap();
+                },
+
+                StakingActionKind::BeginDelegationUnbonding => {},
+
+                StakingActionKind::WithdrawDelegationBond => {
+                    b.spent(Zatoshis::from_u64(staking_action.amount_zats).expect("already converted"), true).unwrap();
+                },
+
+                StakingActionKind::RetargetDelegationBond |
+                    StakingActionKind::RegisterFinalizer |
+                    StakingActionKind::ConvertFinalizerRewardToDelegationBond |
+                    StakingActionKind::UpdateFinalizerKey => todo!("remaining staking actions"),
+            }
+        }
+
+        b
+    }
 
     pub fn checked_add(&self, rhs: &WalletTxPart) -> Option<WalletTxPart> {
         Some(WalletTxPart {
@@ -588,29 +655,7 @@ impl WalletTx {
     }
 
     pub fn totals(&self) -> WalletTxPart {
-        let mut b = WalletTxPart::ZERO;
-        if let Some(staking_action) = self.staking_action {
-            match staking_action.kind {
-                StakingActionKind::Null => (),
-
-                StakingActionKind::CreateNewDelegationBond => {
-                    b.sent(Zatoshis::from_u64(staking_action.amount_zats).expect("already converted"), true).unwrap();
-                    b.recv(Zatoshis::from_u64(staking_action.amount_zats).expect("already converted"), true).unwrap();
-                },
-
-                StakingActionKind::BeginDelegationUnbonding => {},
-
-                StakingActionKind::WithdrawDelegationBond => {
-                    b.spent(Zatoshis::from_u64(staking_action.amount_zats).expect("already converted"), true).unwrap();
-                },
-
-                StakingActionKind::RetargetDelegationBond |
-                    StakingActionKind::RegisterFinalizer |
-                    StakingActionKind::ConvertFinalizerRewardToDelegationBond |
-                    StakingActionKind::UpdateFinalizerKey => todo!("remaining staking actions"),
-            }
-        }
-
+        let mut b = WalletTxPart::from_staking_action(self.staking_action);
         self.parts[0].unchecked_add(&self.parts[1]).unchecked_add(&b)
     }
 
@@ -818,6 +863,7 @@ pub fn str_from_ctaz(val: u64) -> String {
 }
 
 enum TxOutput {
+    // TODO: bool "allow fee deduction from here"
     Transparent {
         dst: TransparentAddress,
         zats: Zatoshis,
@@ -1075,156 +1121,137 @@ impl ManualWallet {
     }
 
     // TODO: always return full tx if created
-    async fn build_and_send_tx<P: Parameters>(&mut self, network: P, client: &mut CompactTxStreamerClient<Channel>, proposal: ProposedTx) ->
-    Option<TxId> {
-        //- TOTALS GATHERED; CHECK VALUES
-        let Some(_totals) = WalletTxPart::checked_sum(&proposal.parts) else {
-            println!("tx build error: total values are too large to be represented by Zatoshis");
-            return None;
-        };
+    async fn send_built_tx<P: Parameters>(&mut self, network: P, client: &mut CompactTxStreamerClient<Channel>, wallet_tx: &mut WalletTx, tx: &Transaction) -> bool {
+        let tz = Timer::scope("send_built_tx");
 
-        let mut memo = EMPTY_MEMO_BYTES;
-        let mut memo_count = 0;
-        let mut staking_action = None;
-
-        let stage = match proposal.stage {
-            ProposalStage::Prebuild(BuildPrep{
-                block_h, build_config,
-                t_keys, s_keys, o_keys,
-                t_inputs, t_outputs, o_inputs, o_outputs,
-                staking_action: stake_action,
-                expected_fee
-            }) => {
-                let mut txb = TxBuilder::new(network, LRZBlockHeight::from_u32(block_h), build_config);
-
-                for t_input in t_inputs {
-                    let (outpoint, coin) = (t_input.outpoint().clone(), t_input.coin().clone());
-                    if let Err(err) = match t_input.kind() {
-                        &TransparentInputKind::P2pkh{ pubkey } => txb.add_transparent_input(pubkey, outpoint, coin),
-                        TransparentInputKind::P2sh{ redeem_script } => txb.add_transparent_p2sh_input(redeem_script.clone(), outpoint, coin),
-                    } {
-                        println!("constructing transparent input: {err:?}");
-                        return None;
-                    }
-                }
-
-                for ProposedTransparentOutput{ dst, zats } in t_outputs {
-                    if let Err(err) = txb.add_transparent_output(&dst, zats) {
-                        println!("constructing transparent output: {err:?}");
-                        return None;
-                    }
-                }
-
-                for ProposedOrchardSpend{ fvk, note, witness_merkle_path } in o_inputs {
-                    if let Err(err) = txb.add_orchard_spend::<zip317::FeeError>(fvk, note.note, witness_merkle_path) {
-                        println!("constructing orchard spend: {err:?}");
-                        return None;
-                    }
-                }
-
-                for ProposedOrchardOutput{ ovk, dst, zats, memo: spend_memo } in o_outputs {
-                    if !memo_is_empty(spend_memo.as_array()) {
-                        memo_count += 1;
-                        memo = spend_memo.as_array().clone(); // TODO: multi-memo
-                    }
-                    if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(ovk, dst, zats.into_u64(), spend_memo) {
-                        println!("constructing orchard output: {err:?}");
-                        return None;
-                    }
-                }
-
-                if let Some(stake_action) = stake_action {
-                    if let Err(err) = txb.put_staking_action(stake_action) {
-                        println!("constructing staking action: {err:?}");
-                        return None;
-                    }
-                    staking_action = Some(stake_action);
-                }
-
-
-                //-- VERY EXPENSIVE TX CREATION (PARTICULARLY IF SHIELDED OUTPUT)
-                use rand_chacha::ChaCha20Rng;
-                let prover = LocalTxProver::bundled();
-                let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
-
-                match txb.build(
-                    &t_keys,
-                    &s_keys,
-                    &o_keys,
-                    rng,
-                    &prover,
-                    &prover,
-                    &zip317::FeeRule::standard(),
-                ) {
-                    Ok(tx_res) => ProposalStage::Postbuild { tx_res },
-                    Err(err) => {
-                        println!("tx build error: {err:?}");
-                        return None;
-                    }
-                }
-            }
-
-            ProposalStage::Postbuild { .. } => proposal.stage,
-        };
-
-        if let ProposalStage::Postbuild{ tx_res } = stage {
-            let tx = tx_res.transaction();
-            let txid = tx.txid();
-            let mut tx_bytes = vec![];
-            tx.write(&mut tx_bytes).unwrap();
-
-            //-- EXPENSIVE NETWORK SEND
-            // TODO: don't block, maybe return a future?
-            let res = client.send_transaction(RawTransaction{ data: tx_bytes, height: 0 }).await;
-            println!("******* res for {:?}: {:?}", tx.txid(), res);
-
-
-            //-- COMPLETION
-            if res.is_ok() {
-                let new_tx = WalletTx{
-                    account_id: 0,
-                    txid: tx.txid(),
-                    expiry_h: None,
-                    mined_h: BlockHeight::INTERNAL,
-                    part_flags: TxParts::FULL_TX,
-                    parts: [proposal.parts[0], proposal.parts[1]],
-                    memo_count,
-                    memo,
-                    is_coinbase: false,
-                    is_outside_bc: !res.is_ok(),
-                    staking_action,
-                };
-
-                let mut insert_i = 0;
-                update_insert_i(&self.txs, &mut insert_i, new_tx.mined_h);
-                update_with_tx(self, new_tx.txid, new_tx, &mut insert_i);
-                Some(new_tx.txid)
-            } else {
-                None
-            }
+        //-- EXPENSIVE NETWORK SEND
+        // TODO: don't block, maybe return a future?
+        let mut raw_tx = RawTransaction{ data: Vec::new(), height: 0 };
+        if let Err(err) = tx.write(&mut raw_tx.data) {
+            println!("couldn't serialize transaction for network send: {err:?}");
+            wallet_tx.is_outside_bc = true;
         } else {
-            None
+            let res = client.send_transaction(raw_tx).await;
+            println!("******* res for {:?}: {:?}", tx.txid(), res);
+            // TODO: distinguish sends that weren't network issues
+            if res.is_ok() {
+                wallet_tx.mined_h = BlockHeight::SENT;
+            } else {
+                wallet_tx.is_outside_bc = true;
+            };
         }
+
+        !wallet_tx.is_outside_bc
+    }
+
+    fn build_tx_from_prep<P: Parameters>(&mut self, network: P, tx: &mut ProposedTx, prep: BuildPrep) -> bool {
+        let tz = Timer::scope("build_tx_from_prep");
+        let prep_fee = prep.fee_required();
+        tx.tx.is_outside_bc = true; // failed until we get past thits point
+
+        let BuildPrep{
+            block_h, build_config,
+            t_keys, s_keys, o_keys,
+            t_inputs, t_outputs, o_inputs, o_outputs,
+            staking_action,
+        } = prep;
+
+        let mut txb = TxBuilder::new(network, LRZBlockHeight::from_u32(block_h), build_config);
+
+        for t_input in t_inputs {
+            let (outpoint, coin) = (t_input.outpoint().clone(), t_input.coin().clone());
+            if let Err(err) = match t_input.kind() {
+                &TransparentInputKind::P2pkh{ pubkey } => txb.add_transparent_input(pubkey, outpoint, coin),
+                TransparentInputKind::P2sh{ redeem_script } => txb.add_transparent_p2sh_input(redeem_script.clone(), outpoint, coin),
+            } {
+                println!("constructing transparent input: {err:?}");
+                return false;
+            }
+        }
+
+        for ProposedTransparentOutput{ dst, zats } in t_outputs {
+            if let Err(err) = txb.add_transparent_output(&dst, zats) {
+                println!("constructing transparent output: {err:?}");
+                return false;
+            }
+        }
+
+        for ProposedOrchardSpend{ fvk, note, witness_merkle_path } in o_inputs {
+            if let Err(err) = txb.add_orchard_spend::<zip317::FeeError>(fvk, note.note, witness_merkle_path) {
+                println!("constructing orchard spend: {err:?}");
+                return false;
+            }
+        }
+
+        for ProposedOrchardOutput{ ovk, dst, zats, memo: spend_memo } in o_outputs {
+            if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(ovk, dst, zats.into_u64(), spend_memo) {
+                println!("constructing orchard output: {err:?}");
+                return false;
+            }
+        }
+
+        if let Some(staking_action) = staking_action {
+            if let Err(err) = txb.put_staking_action(staking_action) {
+                println!("constructing staking action: {err:?}");
+                return false;
+            }
+        }
+
+        if let Ok(txb_fee) = txb.get_fee(&zip317::FeeRule::standard()) {
+            if prep_fee.is_err() || &txb_fee != prep_fee.as_ref().unwrap() {
+                println!("WARNING: fees calculated in 2 ways don't match: {txb_fee:?} vs {prep_fee:?}");
+            }
+        }
+
+
+        //-- VERY EXPENSIVE TX CREATION (PARTICULARLY IF SHIELDED OUTPUT)
+        use rand_chacha::ChaCha20Rng;
+        let prover = LocalTxProver::bundled();
+        let rng = ChaCha20Rng::from_rng(OsRng).unwrap();
+
+        match txb.build(
+            &t_keys,
+            &s_keys,
+            &o_keys,
+            rng,
+            &prover,
+            &prover,
+            &zip317::FeeRule::standard(),
+        ) {
+            Ok(tx_res) => {
+                tx.tx = WalletTx {
+                    txid: tx_res.transaction().txid(),
+                    mined_h: BlockHeight::BUILT,
+                    is_outside_bc: false,
+                    ..tx.tx
+                };
+                tx.tx_res = Some(tx_res);
+            }
+
+            Err(err) => println!("tx build error: {err:?}"),
+        }
+
+        !tx.tx.is_outside_bc
     }
 
 
     // TODO: fee API (need to account for paying for fee forcing more notes, changing the fee)
     // TODO: allow one destination to have an empty value for "send the rest here" (this could be
     // change or normal recipient)
-    pub fn send_zats<P: Parameters>(
-        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>, outputs: &[TxOutput],
+    pub fn send_zats_no_insert<P: Parameters>(
+        &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>, outputs: &[TxOutput],
         src_usk: &UnifiedSpendingKey, opts: &TxOptions<'_>
-    ) -> Option<ProposedTx>
+    ) -> Option<()>
     {
-        let tz = Timer::scope("send_zats");
         let block_h = self.chain_tip_h.0 + 1;
 
-        let fee_zats = 5 * zip317::MARGINAL_FEE.into_u64(); // NOTE: has headroom; TODO: actually calculate
-
-        let account = &self.accounts[0];
+        let account_id = 0;
+        let account = &self.accounts[account_id];
         let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
-        let (t_addr, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
+        let (t_addr, ua) = addrs_from_account(account, account_id.try_into().unwrap()).unwrap(); // @Hack
         let orchard_addr = ua.orchard().unwrap();
+
+        tx.tx.account_id = account_id;
 
         //- CHECK SOURCES, FIND ANCHORS
         let (mut sapling_anchor, mut orchard_anchor) = (None, orchard::Anchor::empty_tree());
@@ -1291,8 +1318,6 @@ impl ManualWallet {
             o_inputs: Vec::new(),
             o_outputs: Vec::new(),
             staking_action: None,
-
-            expected_fee: Zatoshis::const_from_u64(0),
         };
 
         let mut txb = TxBuilder::new(
@@ -1354,13 +1379,12 @@ impl ManualWallet {
                 return None;
             }
             prep.staking_action = Some(staking_action);
+            tx.tx.staking_action = Some(staking_action);
             Some(staking_action)
         } else {
             None
         };
 
-        let mut memo_count = 0;
-        let mut memo = EMPTY_MEMO_BYTES;
         for output in outputs {
             match output {
                 &TxOutput::Transparent{ dst, zats } => {
@@ -1380,8 +1404,8 @@ impl ManualWallet {
                     let is_to_me = (dst == *orchard_addr); // TODO: more comprehensive address matching
                     s.maybe_recv(is_to_me, zats, true)?;
 
-                    memo_count += !memo_is_empty(note_memo.as_array()) as usize;
-                    memo = *note_memo.as_array(); // TODO: handle multiple memos
+                    tx.tx.memo_count += !memo_is_empty(note_memo.as_array()) as usize;
+                    tx.tx.memo = *note_memo.as_array(); // TODO: handle multiple memos
 
                     if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(ovk.clone(), dst.clone(), zats.into_u64(), note_memo.clone()) {
                         println!("tx build error: {err:?}");
@@ -1397,8 +1421,18 @@ impl ManualWallet {
 
         //- SPENDS
         // TODO: use fee_required with our own data directly
-        fn calc_fee<P: Parameters>(txb: &TxBuilder<'_, P, ()>) -> Option<u64> {
-            match txb.get_fee(&zip317::FeeRule::standard()) {
+        fn calc_fee<P: Parameters>(txb: &TxBuilder<'_, P, ()>, prep: &BuildPrep) -> Option<u64> {
+            let txb_fee = txb.get_fee(&zip317::FeeRule::standard());
+            let dbg_txb_fee = txb_fee.as_ref().map(|z| z.into_u64()).unwrap_or(0);
+            let prep_fee = prep.fee_required();
+            let dbg_prep_fee = prep_fee.as_ref().map(|z| z.into_u64()).unwrap_or(0);
+            debug_assert!(
+                (prep_fee.is_err() && txb_fee.is_err()) ||
+                (prep_fee.as_ref().unwrap() == txb_fee.as_ref().unwrap()),
+                "prep_fee {prep_fee:?}, txb_fee {txb_fee:?}"
+            );
+
+            match prep_fee {
                 Ok(zats) => Some(zats.into_u64()),
                 Err(err) => {
                     println!("tx build fee calc error: {err:?}");
@@ -1426,10 +1460,10 @@ impl ManualWallet {
                         t.spent(utxo.value, true)?;
                         println!("  added transparent spend: {}", utxo.value.into_u64());
 
-                        // NOTE: prep inputs added all at once
+                        prep.t_inputs = txb.transparent_inputs().to_vec(); // ALT: do something *not* bad
 
                         total_spend += utxo.value.into_u64();
-                        if (total_spend >= target_send + calc_fee::<P>(&txb)?) {
+                        if (total_spend >= target_send + calc_fee::<P>(&txb, &prep)?) {
                             break 'src_pool;
                         }
                     }
@@ -1481,7 +1515,7 @@ impl ManualWallet {
 
 
                             total_spend   += note_val;
-                            if (total_spend >= target_send + calc_fee::<P>(&txb)?) {
+                            if (total_spend >= target_send + calc_fee::<P>(&txb, &prep)?) {
                                 break 'src_pool;
                             }
                         }
@@ -1489,9 +1523,8 @@ impl ManualWallet {
                 }
             }
         }
-        prep.t_inputs = txb.transparent_inputs().to_vec();
 
-        let min_spend = target_send + calc_fee::<P>(&txb)?;
+        let min_spend = target_send + calc_fee::<P>(&txb, &prep)?;
         let change = match total_spend.cmp(&min_spend) {
             std::cmp::Ordering::Less => {
                 println!("tx build error: can't afford {min_spend}; only {total_spend} available from given sources");
@@ -1524,21 +1557,38 @@ impl ManualWallet {
             }
         };
 
-        Some(ProposedTx {
-            parts: [t, s, b],
-            block_h,
-            stage: ProposalStage::Prebuild(prep),
-        })
+        tx.tx = WalletTx {
+            mined_h: BlockHeight::PROPOSED,
+            part_flags: TxParts::FULL_TX,
+            parts: [t, s],
+            is_outside_bc: false,
+            ..tx.tx
+        };
+        tx.prep = Some(prep);
+        Some(())
+    }
+
+    pub fn send_zats<P: Parameters>(
+        &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>, outputs: &[TxOutput],
+        src_usk: &UnifiedSpendingKey, opts: &TxOptions<'_>
+    ) -> Option<()>
+    {
+        let res = self.send_zats_no_insert(network, tx, client, outputs, src_usk, opts);
+        // let mut insert_i = 0;
+        // update_insert_i(&self.txs, &mut insert_i, tx.tx.mined_h);
+        // update_with_tx(self, tx.tx.txid, tx.tx, &mut insert_i);
+        res
     }
 
     // NOTE: because we get 2 grace actions, we don't need to try and special-case getting all
     // change outputs within a single output, although that might be better for later note use...
     pub fn shield_transparent_zats<P: Parameters>(
-        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
+        &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
         src_usk: &UnifiedSpendingKey, min_zats_to_shield: u64, orchard_tree: &OrchardShardTree,
         memo: MemoBytes
-    ) -> Option<ProposedTx>
+    ) -> Option<()>
     {
+        let tz = Timer::scope("shield_transparent_zats");
         let account = &self.accounts[0];
         let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
         let (t_addr, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
@@ -1546,18 +1596,19 @@ impl ManualWallet {
             let zats = to_zats_or_dump_err("shielding zats", min_zats_to_shield)?;
             let out = &[TxOutput::Orchard{ ovk: Some(ovk), dst, zats, memo }];
             let opts = &TxOptions{ src_pools: &[TxPool::Transparent], ..TxOptions::default() };
-            self.send_zats(network, client, out, src_usk, opts)
+            self.send_zats(network, tx, client, out, src_usk, opts)
         } else {
             None
         }
     }
 
     pub fn send_orchard_to_orchard_zats<P: Parameters>(
-        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
+        &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
         src_usk: &UnifiedSpendingKey, exact_amount_to_send: u64, orchard_tree: &OrchardShardTree, dst: orchard::Address,
         memo: MemoBytes
-    ) -> Option<ProposedTx>
+    ) -> Option<()>
     {
+        let tz = Timer::scope("send_orchard_to_orchard_zats");
         let account = &self.accounts[0];
         let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
         let (t_addr, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
@@ -1565,7 +1616,7 @@ impl ManualWallet {
             let zats = to_zats_or_dump_err("shielding zats", exact_amount_to_send)?;
             let out = &[TxOutput::Orchard{ ovk: Some(ovk), dst, zats, memo }];
             let opts = &TxOptions{ src_pools: &[TxPool::Orchard(orchard_tree)], ..TxOptions::default() };
-            self.send_zats(network, client, out, src_usk, opts)
+            self.send_zats(network, tx, client, out, src_usk, opts)
         } else {
             None
         }
@@ -1573,10 +1624,11 @@ impl ManualWallet {
 
 
     pub fn stake_orchard_to_finalizer<P: Parameters>(
-        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
+        &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
         src_usk: &UnifiedSpendingKey, exact_amount_to_send: u64, orchard_tree: &OrchardShardTree, target_finalizer: [u8; 32],
-    ) -> Option<ProposedTx>
+    ) -> Option<()>
     {
+        let tz = Timer::scope("stake_orchard_to_finalizer");
         let account = &self.accounts[0];
         let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
         if let Some(ovk) = keys.orchard_ovk {
@@ -1594,17 +1646,18 @@ impl ManualWallet {
                     signature: [0u8; 64]
                 }.to_union()),
             };
-            self.send_zats(network, client, &[], src_usk, opts)
+            self.send_zats(network, tx, client, &[], src_usk, opts)
         } else {
             None
         }
     }
 
     pub fn begin_unbonding_using_orchard<P: Parameters>(
-        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
+        &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
         src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, bond_key: [u8; 32],
-    ) -> Option<ProposedTx>
+    ) -> Option<()>
     {
+        let tz = Timer::scope("begin_unbonding_using_orchard");
         let account = &self.accounts[0];
         let opts = &TxOptions{
             src_pools: &[TxPool::Orchard(orchard_tree)],
@@ -1614,14 +1667,15 @@ impl ManualWallet {
                 signature: [0u8; 64]
             }.to_union()),
         };
-        self.send_zats(network, client, &[], src_usk, opts)
+        self.send_zats(network, tx, client, &[], src_usk, opts)
     }
 
     pub async fn claim_bond_using_orchard<P: Parameters>(
-        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
+        &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
         src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, bond_key: [u8; 32],
-    ) -> Option<ProposedTx>
+    ) -> Option<()>
     {
+        let tz = Timer::scope("claim_bond_using_orchard");
         let account = &self.accounts[0];
         let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
         let (_t_addr, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
@@ -1649,7 +1703,7 @@ impl ManualWallet {
                     signature: [0u8; 64]
                 }.to_union()),
             };
-            self.send_zats(network, client, &[], src_usk, opts)
+            self.send_zats(network, tx, client, &[], src_usk, opts)
         } else {
             None
         }
@@ -3354,10 +3408,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let mut faucet_shield_cooldown_instant = Instant::now() - Duration::from_secs(1000);
 
-    let mut proposed_faucet: Option<ProposedTx> = None;
-    let mut proposed_miner_shield: Option<ProposedTx> = None;
-    let mut proposed_stake: Option<ProposedTx> = None;
-    let mut proposed_send: Option<ProposedTx> = None;
+    let mut proposed_faucet = ProposedTx::EMPTY;
+    let mut proposed_miner_shield = ProposedTx::EMPTY;
+    let mut proposed_stake = ProposedTx::EMPTY;
+    let mut proposed_send = ProposedTx::EMPTY;
 
     let mut resync_c = 0;
     'outer_sync: loop {
@@ -4096,11 +4150,15 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
 
+            let waiting_for_send = proposed_send.is_in_progress();
+            let waiting_for_faucet = proposed_faucet.is_in_progress();
+            let waiting_for_stake_to_finalizer = proposed_stake.is_in_progress();
+
             // DO NOT DO ANY WORK AFTER THIS LOCK IS TAKEN
             let mut lock = wallet_state.lock().unwrap();
-            lock.waiting_for_send = proposed_send.is_some();
-            lock.waiting_for_faucet = proposed_faucet.is_some();
-            lock.waiting_for_stake_to_finalizer = proposed_stake.is_some();
+            lock.waiting_for_send = waiting_for_send;
+            lock.waiting_for_faucet = waiting_for_faucet;
+            lock.waiting_for_stake_to_finalizer = waiting_for_stake_to_finalizer;
 
             lock.user_txs = user_txs;
             lock.miner_txs = miner_txs;
@@ -4134,24 +4192,25 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         //     }
         // }
 
-        if faucet_shield_cooldown_instant.elapsed().as_secs() > 5 && proposed_miner_shield.is_none() {
+        if faucet_shield_cooldown_instant.elapsed().as_secs() > 15 && !proposed_miner_shield.is_in_progress() {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
 
             let memo = MemoBytes::from_bytes("shielding notes".as_bytes()).unwrap();
-            proposed_miner_shield = miner_wallet.shield_transparent_zats(network, &mut client, &miner_usk, 1000000000, &orchard_tree, memo);
-            println!("Try miner shield {:?}", proposed_miner_shield.is_some());
+            let ok = miner_wallet.shield_transparent_zats(network, &mut proposed_miner_shield, &mut client, &miner_usk, 1000000000, &orchard_tree, memo).is_some();
+            println!("Try miner shield {ok:?}");
             faucet_shield_cooldown_instant = Instant::now();
         }
 
         if AUTO_SPEND != 0 {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-            if user_wallet.accounts[0].unspent_orchard_notes.len() == 0 {
+            if user_wallet.accounts[0].unspent_orchard_notes.len() == 0 && !proposed_faucet.is_in_progress() {
                 // the user needs money, try to send some (doesn't matter if we fail until we've mined some)
-                proposed_send = miner_wallet.send_orchard_to_orchard_zats(network, &mut client, &miner_usk, 500_000_000, &orchard_tree, *user_ua.orchard().unwrap(),
+                let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, 500_000_000, &orchard_tree, *user_ua.orchard().unwrap(),
                     MemoBytes::from_bytes("auto-sent from miner".as_bytes()).unwrap()
-                );
+                ).is_some();
             } else if ! auto_spend.0 {
-                // auto_spend.0 = user_wallet.stake_orchard_to_finalizer(network, &mut client, &user_usk, 100_000_000, &orchard_tree, [0xcd;32]).await.is_some();
+                // auto_spend.0 = true;
+                // proposed_stake = user_wallet.stake_orchard_to_finalizer(network, &mut client, &user_usk, 100_000_000, &orchard_tree, [0xcd;32]);
             }
         }
 
@@ -4667,22 +4726,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     &WalletAction::RequestFromFaucet => {
                         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
                         let memo = MemoBytes::from_bytes("orchard -> orchard".as_bytes()).unwrap();
-                        proposed_faucet = miner_wallet.send_orchard_to_orchard_zats(network, &mut client, &miner_usk, 500_000_000, &orchard_tree, *user_ua.orchard().unwrap(), memo);
-                        println!("Try miner send: {:?}", proposed_faucet.is_some());
-                        match proposed_faucet {
-                            None => true,
-                            Some(_) => true,
-                        }
+                        let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, 500_000_000, &orchard_tree, *user_ua.orchard().unwrap(), memo).is_some();
+                        println!("Try miner send: {ok:?}");
+                        true // ALT ok
                     }
 
                     &WalletAction::StakeToFinalizer(amount, target_finalizer) => {
                         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        proposed_stake = user_wallet.stake_orchard_to_finalizer(network, &mut client, &user_usk, amount.into_u64(), &orchard_tree, target_finalizer);
-                        println!("Try stake: {:?}", proposed_stake.is_some());
-                        match proposed_stake {
-                            None => false, // TODO: really?
-                            Some(_) => true,
-                        }
+                        let ok = user_wallet.stake_orchard_to_finalizer(network, &mut proposed_stake, &mut client, &user_usk, amount.into_u64(), &orchard_tree, target_finalizer).is_some();
+                        println!("Try stake: {ok:?}");
+                        ok
                     }
 
                     WalletAction::SendToAddress(address, amount) => { true
@@ -4720,22 +4773,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     &WalletAction::UnstakeFromFinalizer(txid) => {
                         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        proposed_stake = user_wallet.begin_unbonding_using_orchard(network, &mut client, &user_usk, &orchard_tree, *txid.as_ref());
-                        println!("Try unstake: {:?}", proposed_stake.is_some());
-                        match proposed_stake {
-                            None => false, // TODO: really?
-                            Some(_) => true,
-                        }
+                        let ok = user_wallet.begin_unbonding_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).is_some();
+                        println!("Try unstake: {ok:?}");
+                        ok
                     }
 
                     &WalletAction::ClaimBond(txid) => {
                         let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        proposed_stake = user_wallet.claim_bond_using_orchard(network, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).await;
-                        println!("Try withdraw stake: {:?}", proposed_stake.is_some());
-                        match proposed_stake {
-                            None => false, // TODO: really?
-                            Some(_) => true,
-                        }
+                        let ok = user_wallet.claim_bond_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).await.is_some();
+                        println!("Try withdraw stake: {ok:?}");
+                        ok
                     }
 
                     _ => { true }
@@ -4749,20 +4796,77 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             wallet_state.lock().unwrap().actions_in_flight.pop_front();
         }
 
-        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-        let wallets = [user_wallet, miner_wallet];
-        for (i, desc, proposal) in [
-            (1, "faucet send",  &mut proposed_faucet),
-            (1, "miner shield", &mut proposed_miner_shield),
-            (0, "stake",        &mut proposed_stake),
-            (0, "send",         &mut proposed_send),
-        ] {
-            let Some(proposal) = proposal.take() else {
-                continue;
-            };
 
-            let maybe_txid = wallets[i].build_and_send_tx(network, &mut client, proposal).await;
-            println!("tried to build {desc}: {maybe_txid:?}");
+        { //-- INCREMENTALLY SEND TXS
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+            async fn continue_proposed_tx<P: Parameters>(wallet: &mut ManualWallet, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>, desc: &str, loud: bool) {
+                let pre_mined_h = tx.tx.mined_h;
+                match tx.tx.mined_h {
+                    BlockHeight::PROPOSED => {
+                        tx.tx.mined_h = BlockHeight::INVALID; // only one attempt
+
+                        let mut ok = false;
+                        if let None = tx.tx.parts[0]
+                            .checked_add(&tx.tx.parts[1])
+                            .and_then(|a| a.checked_add(&WalletTxPart::from_staking_action(tx.tx.staking_action)))
+                        {
+                            println!("tx build error: total values are too large to be represented by Zatoshis");
+                        } else if let Some(prep) = tx.prep.take() {
+                            ok = wallet.build_tx_from_prep(network, tx, prep);
+                        } else {
+                            println!("unexpectedly no prep ready for build");
+                        };
+
+                        if ! ok { // give it a final failed height
+                            tx.tx.mined_h = wallet.chain_tip_h;
+                        }
+                        let mut insert_i = 0;
+                        update_insert_i(&wallet.txs, &mut insert_i, tx.tx.mined_h);
+                        update_with_tx(wallet, tx.tx.txid, tx.tx, &mut insert_i);
+
+                        if loud {
+                            println!("tried to build {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.mined_h, !tx.tx.is_outside_bc);
+                        }
+                        if ! ok {
+                            *tx = ProposedTx::EMPTY;
+                        }
+                    }
+
+                    // NOTE: do a full loop before returning here
+                    BlockHeight::BUILT => {
+                        let mut ok = false;
+                        if let Some(tx_res) = &tx.tx_res {
+                            ok = wallet.send_built_tx(network, client, &mut tx.tx, tx_res.transaction()).await;
+                            if loud {
+                                println!("tried to send {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.mined_h, !tx.tx.is_outside_bc);
+                            }
+                        } else {
+                            *tx = ProposedTx::EMPTY; // not enough info to retry; bail
+                            println!("unexpectedly no tx_res ready for send");
+                        }
+
+                        if ! ok { // give it a final failed height
+                            tx.tx.mined_h = wallet.chain_tip_h;
+                        }
+                        let mut insert_i = 0;
+                        update_insert_i(&wallet.txs, &mut insert_i, tx.tx.mined_h);
+                        update_with_tx(wallet, tx.tx.txid, tx.tx, &mut insert_i);
+
+                        if ok {
+                            *tx = ProposedTx::EMPTY; // Done. Don't retry
+                        } else {
+                            *tx = ProposedTx::EMPTY; // TODO: fixed number of retries
+                        }
+                    }
+
+                    _ => ()
+                }
+            }
+
+            continue_proposed_tx(miner_wallet, network, &mut proposed_faucet,       &mut client, "faucet send",  true).await;
+            continue_proposed_tx(miner_wallet, network, &mut proposed_miner_shield, &mut client, "miner shield", false).await;
+            continue_proposed_tx(user_wallet,  network, &mut proposed_stake,        &mut client, "stake",        true).await;
+            continue_proposed_tx(user_wallet,  network, &mut proposed_send,         &mut client, "send",         true).await;
         }
     }
 }
