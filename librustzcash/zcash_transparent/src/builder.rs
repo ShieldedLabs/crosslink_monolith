@@ -148,7 +148,7 @@ fn construct_script_sig(
 
 #[cfg(feature = "transparent-inputs")]
 #[derive(Debug, Clone)]
-enum InputKind {
+pub enum InputKind {
     P2pkh { pubkey: secp256k1::PublicKey },
     P2sh { redeem_script: script::FromChain },
 }
@@ -164,6 +164,10 @@ pub struct TransparentInputInfo {
 
 #[cfg(feature = "transparent-inputs")]
 impl TransparentInputInfo {
+    pub fn kind(&self) -> &InputKind {
+        &self.kind
+    }
+
     pub fn outpoint(&self) -> &OutPoint {
         &self.utxo
     }
