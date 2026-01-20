@@ -1129,23 +1129,18 @@ impl ManualWallet {
         let mut raw_tx = RawTransaction{ data: Vec::new(), height: 0 };
         if let Err(err) = tx.write(&mut raw_tx.data) {
             println!("couldn't serialize transaction for network send: {err:?}");
-            return false;
-        }
-        let res = client.send_transaction(raw_tx).await;
-        println!("******* res for {:?}: {:?}", tx.txid(), res);
-
-        //-- COMPLETION
-        if res.is_ok() {
-            *wallet_tx = WalletTx{
-                mined_h: BlockHeight::SENT,
-                is_outside_bc: !res.is_ok(),
-                ..*wallet_tx
+            wallet_tx.is_outside_bc = true;
+        } else {
+            let res = client.send_transaction(raw_tx).await;
+            println!("******* res for {:?}: {:?}", tx.txid(), res);
+            // TODO: distinguish sends that weren't network issues
+            if res.is_ok() {
+                wallet_tx.mined_h = BlockHeight::SENT;
+            } else {
+                wallet_tx.is_outside_bc = true;
             };
-
-            let mut insert_i = 0;
-            update_insert_i(&self.txs, &mut insert_i, wallet_tx.mined_h);
-            update_with_tx(self, wallet_tx.txid, *wallet_tx, &mut insert_i);
         }
+
         !wallet_tx.is_outside_bc
     }
 
@@ -1243,7 +1238,7 @@ impl ManualWallet {
     // TODO: fee API (need to account for paying for fee forcing more notes, changing the fee)
     // TODO: allow one destination to have an empty value for "send the rest here" (this could be
     // change or normal recipient)
-    pub fn send_zats<P: Parameters>(
+    pub fn send_zats_no_insert<P: Parameters>(
         &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>, outputs: &[TxOutput],
         src_usk: &UnifiedSpendingKey, opts: &TxOptions<'_>
     ) -> Option<()>
@@ -1571,6 +1566,18 @@ impl ManualWallet {
         };
         tx.prep = Some(prep);
         Some(())
+    }
+
+    pub fn send_zats<P: Parameters>(
+        &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>, outputs: &[TxOutput],
+        src_usk: &UnifiedSpendingKey, opts: &TxOptions<'_>
+    ) -> Option<()>
+    {
+        let res = self.send_zats_no_insert(network, tx, client, outputs, src_usk, opts);
+        // let mut insert_i = 0;
+        // update_insert_i(&self.txs, &mut insert_i, tx.tx.mined_h);
+        // update_with_tx(self, tx.tx.txid, tx.tx, &mut insert_i);
+        res
     }
 
     // NOTE: because we get 2 grace actions, we don't need to try and special-case getting all
@@ -4779,55 +4786,78 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             wallet_state.lock().unwrap().actions_in_flight.pop_front();
         }
 
-        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-        async fn continue_proposed_tx<P: Parameters>(wallet: &mut ManualWallet, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>, desc: &str, loud: bool) {
-            let pre_mined_h = tx.tx.mined_h;
-            match tx.tx.mined_h {
-                BlockHeight::PROPOSED => {
-                    tx.tx.mined_h = BlockHeight::INVALID; // only one attempt
 
-                    let mut ok = false;
-                    if let None = tx.tx.parts[0]
-                        .checked_add(&tx.tx.parts[1])
-                        .and_then(|a| a.checked_add(&WalletTxPart::from_staking_action(tx.tx.staking_action)))
-                    {
-                        println!("tx build error: total values are too large to be represented by Zatoshis");
-                    } else if let Some(prep) = tx.prep.take() {
-                        ok = wallet.build_tx_from_prep(network, tx, prep);
-                    } else {
-                        println!("unexpectedly no prep ready for build");
-                    };
-                    if loud {
-                        println!("tried to build {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.mined_h, !tx.tx.is_outside_bc);
-                    }
-                }
+        { //-- INCREMENTALLY SEND TXS
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+            async fn continue_proposed_tx<P: Parameters>(wallet: &mut ManualWallet, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>, desc: &str, loud: bool) {
+                let pre_mined_h = tx.tx.mined_h;
+                match tx.tx.mined_h {
+                    BlockHeight::PROPOSED => {
+                        tx.tx.mined_h = BlockHeight::INVALID; // only one attempt
 
-                // NOTE: do a full loop before returning here
-                BlockHeight::BUILT => {
-                    if let Some(tx_res) = &tx.tx_res {
-                        let ok = wallet.send_built_tx(network, client, &mut tx.tx, tx_res.transaction()).await;
-                        if loud {
-                            println!("tried to send {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.mined_h, !tx.tx.is_outside_bc);
+                        let mut ok = false;
+                        if let None = tx.tx.parts[0]
+                            .checked_add(&tx.tx.parts[1])
+                            .and_then(|a| a.checked_add(&WalletTxPart::from_staking_action(tx.tx.staking_action)))
+                        {
+                            println!("tx build error: total values are too large to be represented by Zatoshis");
+                        } else if let Some(prep) = tx.prep.take() {
+                            ok = wallet.build_tx_from_prep(network, tx, prep);
+                        } else {
+                            println!("unexpectedly no prep ready for build");
+                        };
+
+                        if ! ok { // give it a final failed height
+                            tx.tx.mined_h = wallet.chain_tip_h;
                         }
+                        let mut insert_i = 0;
+                        update_insert_i(&wallet.txs, &mut insert_i, tx.tx.mined_h);
+                        update_with_tx(wallet, tx.tx.txid, tx.tx, &mut insert_i);
+
+                        if loud {
+                            println!("tried to build {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.mined_h, !tx.tx.is_outside_bc);
+                        }
+                        if ! ok {
+                            *tx = ProposedTx::EMPTY;
+                        }
+                    }
+
+                    // NOTE: do a full loop before returning here
+                    BlockHeight::BUILT => {
+                        let mut ok = false;
+                        if let Some(tx_res) = &tx.tx_res {
+                            ok = wallet.send_built_tx(network, client, &mut tx.tx, tx_res.transaction()).await;
+                            if loud {
+                                println!("tried to send {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.mined_h, !tx.tx.is_outside_bc);
+                            }
+                        } else {
+                            *tx = ProposedTx::EMPTY; // not enough info to retry; bail
+                            println!("unexpectedly no tx_res ready for send");
+                        }
+
+                        if ! ok { // give it a final failed height
+                            tx.tx.mined_h = wallet.chain_tip_h;
+                        }
+                        let mut insert_i = 0;
+                        update_insert_i(&wallet.txs, &mut insert_i, tx.tx.mined_h);
+                        update_with_tx(wallet, tx.tx.txid, tx.tx, &mut insert_i);
+
                         if ok {
                             *tx = ProposedTx::EMPTY; // Done. Don't retry
                         } else {
                             *tx = ProposedTx::EMPTY; // TODO: fixed number of retries
                         }
-                    } else {
-                        *tx = ProposedTx::EMPTY; // not enough info to retry; bail
-                        println!("unexpectedly no tx_res ready for send");
                     }
+
+                    _ => ()
                 }
-
-                _ => ()
             }
-        }
 
-        continue_proposed_tx(miner_wallet, network, &mut proposed_faucet,       &mut client, "faucet send",  true).await;
-        continue_proposed_tx(miner_wallet, network, &mut proposed_miner_shield, &mut client, "miner shield", false).await;
-        continue_proposed_tx(user_wallet,  network, &mut proposed_stake,        &mut client, "stake",        true).await;
-        continue_proposed_tx(user_wallet,  network, &mut proposed_send,         &mut client, "send",         true).await;
+            continue_proposed_tx(miner_wallet, network, &mut proposed_faucet,       &mut client, "faucet send",  true).await;
+            continue_proposed_tx(miner_wallet, network, &mut proposed_miner_shield, &mut client, "miner shield", false).await;
+            continue_proposed_tx(user_wallet,  network, &mut proposed_stake,        &mut client, "stake",        true).await;
+            continue_proposed_tx(user_wallet,  network, &mut proposed_send,         &mut client, "send",         true).await;
+        }
     }
 }
 
