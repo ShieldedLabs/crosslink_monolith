@@ -28,7 +28,7 @@ use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_note_encryption::{try_compact_note_decryption, try_note_decryption, try_output_recovery_with_ovk, ShieldedOutput};
-use zcash_primitives::transaction::builder::{BuildConfig, Builder as TxBuilder, BuildResult as TxBuildResult};
+use zcash_primitives::transaction::builder::{self, BuildConfig, Builder as TxBuilder, BuildResult as TxBuildResult};
 use zcash_primitives::transaction::components::TxOut;
 use zcash_primitives::transaction::fees::{
     self,
@@ -279,8 +279,24 @@ struct BuildPrep {
     o_outputs: Vec<ProposedOrchardOutput>,
 
     staking_action: Option<StakingAction>,
+}
+impl BuildPrep {
+    fn fee_required(&self) -> Result<Zatoshis, builder::FeeError<zip317::FeeError>> {
+        // NOTE: we can impl these ourselves
+        use zcash_primitives::transaction::fees::transparent::{InputView, OutputView};
+        let orchard_actions = orchard::builder::BundleType::DEFAULT.num_actions(
+            self.o_inputs.len(), self.o_outputs.len()
+        ).map_err(|e| builder::FeeError::Bundle(e))?;
 
-    expected_fee: Zatoshis,
+        zip317::FeeRule::standard().fee_required(
+            &TEST_NETWORK,
+            LRZBlockHeight::from_u32(self.block_h),
+            self.t_inputs.iter().map(|input| input.serialized_size()),
+            self.t_outputs.iter().map(|output| 8 + output.dst.script().0.len()), // DUP from zcash_primitives/src/transaction/fees/transparent.rs
+            0, 0, // sapling
+            orchard_actions
+        ).map_err(|e| builder::FeeError::FeeRule(e))
+    }
 }
 
 // this is basically just the info that TxBuilder takes
@@ -1088,13 +1104,16 @@ impl ManualWallet {
         let mut staking_action = None;
 
         let stage = match proposal.stage {
-            ProposalStage::Prebuild(BuildPrep{
-                block_h, build_config,
-                t_keys, s_keys, o_keys,
-                t_inputs, t_outputs, o_inputs, o_outputs,
-                staking_action: stake_action,
-                expected_fee
-            }) => {
+            ProposalStage::Prebuild(prep) => {
+                let prep_fee = prep.fee_required();
+
+                let BuildPrep{
+                    block_h, build_config,
+                    t_keys, s_keys, o_keys,
+                    t_inputs, t_outputs, o_inputs, o_outputs,
+                    staking_action: stake_action,
+                } = prep;
+
                 let mut txb = TxBuilder::new(network, LRZBlockHeight::from_u32(block_h), build_config);
 
                 for t_input in t_inputs {
@@ -1141,6 +1160,11 @@ impl ManualWallet {
                     staking_action = Some(stake_action);
                 }
 
+                if let Ok(txb_fee) = txb.get_fee(&zip317::FeeRule::standard()) {
+                    if prep_fee.is_err() || &txb_fee != prep_fee.as_ref().unwrap() {
+                        println!("WARNING: fees calculated in 2 ways don't match: {txb_fee:?} vs {prep_fee:?}");
+                    }
+                }
 
                 //-- VERY EXPENSIVE TX CREATION (PARTICULARLY IF SHIELDED OUTPUT)
                 use rand_chacha::ChaCha20Rng;
@@ -1291,8 +1315,6 @@ impl ManualWallet {
             o_inputs: Vec::new(),
             o_outputs: Vec::new(),
             staking_action: None,
-
-            expected_fee: Zatoshis::const_from_u64(0),
         };
 
         let mut txb = TxBuilder::new(
@@ -1397,8 +1419,18 @@ impl ManualWallet {
 
         //- SPENDS
         // TODO: use fee_required with our own data directly
-        fn calc_fee<P: Parameters>(txb: &TxBuilder<'_, P, ()>) -> Option<u64> {
-            match txb.get_fee(&zip317::FeeRule::standard()) {
+        fn calc_fee<P: Parameters>(txb: &TxBuilder<'_, P, ()>, prep: &BuildPrep) -> Option<u64> {
+            let txb_fee = txb.get_fee(&zip317::FeeRule::standard());
+            let dbg_txb_fee = txb_fee.as_ref().map(|z| z.into_u64()).unwrap_or(0);
+            let prep_fee = prep.fee_required();
+            let dbg_prep_fee = prep_fee.as_ref().map(|z| z.into_u64()).unwrap_or(0);
+            debug_assert!(
+                (prep_fee.is_err() && txb_fee.is_err()) ||
+                (prep_fee.as_ref().unwrap() == txb_fee.as_ref().unwrap()),
+                "prep_fee {prep_fee:?}, txb_fee {txb_fee:?}"
+            );
+
+            match prep_fee {
                 Ok(zats) => Some(zats.into_u64()),
                 Err(err) => {
                     println!("tx build fee calc error: {err:?}");
@@ -1426,10 +1458,10 @@ impl ManualWallet {
                         t.spent(utxo.value, true)?;
                         println!("  added transparent spend: {}", utxo.value.into_u64());
 
-                        // NOTE: prep inputs added all at once
+                        prep.t_inputs = txb.transparent_inputs().to_vec(); // ALT: do something *not* bad
 
                         total_spend += utxo.value.into_u64();
-                        if (total_spend >= target_send + calc_fee::<P>(&txb)?) {
+                        if (total_spend >= target_send + calc_fee::<P>(&txb, &prep)?) {
                             break 'src_pool;
                         }
                     }
@@ -1481,7 +1513,7 @@ impl ManualWallet {
 
 
                             total_spend   += note_val;
-                            if (total_spend >= target_send + calc_fee::<P>(&txb)?) {
+                            if (total_spend >= target_send + calc_fee::<P>(&txb, &prep)?) {
                                 break 'src_pool;
                             }
                         }
@@ -1489,9 +1521,8 @@ impl ManualWallet {
                 }
             }
         }
-        prep.t_inputs = txb.transparent_inputs().to_vec();
 
-        let min_spend = target_send + calc_fee::<P>(&txb)?;
+        let min_spend = target_send + calc_fee::<P>(&txb, &prep)?;
         let change = match total_spend.cmp(&min_spend) {
             std::cmp::Ordering::Less => {
                 println!("tx build error: can't afford {min_spend}; only {total_spend} available from given sources");
@@ -4137,11 +4168,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             if user_wallet.accounts[0].unspent_orchard_notes.len() == 0 {
                 // the user needs money, try to send some (doesn't matter if we fail until we've mined some)
-                proposed_send = miner_wallet.send_orchard_to_orchard_zats(network, &mut client, &miner_usk, 500_000_000, &orchard_tree, *user_ua.orchard().unwrap(),
+                proposed_faucet = miner_wallet.send_orchard_to_orchard_zats(network, &mut client, &miner_usk, 500_000_000, &orchard_tree, *user_ua.orchard().unwrap(),
                     MemoBytes::from_bytes("auto-sent from miner".as_bytes()).unwrap()
                 );
             } else if ! auto_spend.0 {
-                // auto_spend.0 = user_wallet.stake_orchard_to_finalizer(network, &mut client, &user_usk, 100_000_000, &orchard_tree, [0xcd;32]).await.is_some();
+                // auto_spend.0 = true;
+                // proposed_stake = user_wallet.stake_orchard_to_finalizer(network, &mut client, &user_usk, 100_000_000, &orchard_tree, [0xcd;32]);
             }
         }
 
@@ -4752,7 +4784,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             };
 
             let maybe_txid = wallets[i].build_and_send_tx(network, &mut client, proposal).await;
-            println!("tried to build {desc}: {maybe_txid:?}");
+            if i == 0 {
+                println!("tried to build {desc}: {maybe_txid:?}");
+            }
         }
     }
 }
