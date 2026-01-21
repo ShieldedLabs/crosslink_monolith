@@ -2441,7 +2441,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         }
     }
 
-    if viz.inspecting_block_hash != Hash32::from_u64(0) {
+    if false { // @Phillip @Todo: this causes a Clay crash right now, so disable it until that's fixed.
+    // if viz.inspecting_block_hash != Hash32::from_u64(0) {
         let ctx_menu_pos = (viz.inspecting_block_screen_x, viz.inspecting_block_screen_y);
         let id = id("Block Inspector Contents");
         if ui.hovered(id) {
