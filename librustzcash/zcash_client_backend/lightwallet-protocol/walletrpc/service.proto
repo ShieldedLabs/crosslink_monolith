@@ -56,8 +56,7 @@ message RawTransaction {
     // * height 0: the transaction is in the mempool
     // * height 0xffffffffffffffff: the transaction has been mined on a fork that
     //   is not currently the main chain
-    // * any other height: the transaction has been mined in the main chain at the
-    //   given height
+    // * any other height: the transaction has been mined in the main chain at the given height
     uint64 height = 2;
 }
 
@@ -127,6 +126,17 @@ message Balance {
     int64 valueZat = 1;
 }
 
+// Request for GetBondInfo RPC
+message BondInfoRequest {
+    bytes bondKey = 1;  // 32-byte bond key
+}
+
+// Response for GetBondInfo RPC
+message BondInfoResponse {
+    uint64 amount = 1;  // Bond amount in zatoshis
+    uint32 status = 2;  // 0 = Active, 1 = Unbonding, 2 = Withdrawn
+}
+
 // The a shortened transaction ID is the prefix in big-endian (hex) format
 // (then converted to binary).
 message Exclude {
@@ -178,6 +188,10 @@ message GetAddressUtxosReplyList {
     repeated GetAddressUtxosReply addressUtxos = 1;
 }
 
+message Bytes {
+    bytes data = 1;
+}
+
 service CompactTxStreamer {
     // Return the BlockID of the block at the tip of the best chain
     rpc GetLatestBlock(ChainSpec) returns (BlockID) {}
@@ -192,7 +206,7 @@ service CompactTxStreamer {
 
     // Return the requested full (not compact) transaction (as from zcashd)
     rpc GetTransaction(TxFilter) returns (RawTransaction) {}
-    rpc GetRoster(Empty) returns (RawTransaction) {}
+    rpc GetRoster(Empty) returns (Bytes) {}
     // Submit the given transaction to the Zcash network
     rpc SendTransaction(RawTransaction) returns (SendResponse) {}
 
@@ -238,6 +252,9 @@ service CompactTxStreamer {
 
     rpc GetAddressUtxos(GetAddressUtxosArg) returns (GetAddressUtxosReplyList) {}
     rpc GetAddressUtxosStream(GetAddressUtxosArg) returns (stream GetAddressUtxosReply) {}
+
+    // Return information about a delegation bond
+    rpc GetBondInfo(BondInfoRequest) returns (BondInfoResponse) {}
 
     // Return information about this lightwalletd instance and the blockchain
     rpc GetLightdInfo(Empty) returns (LightdInfo) {}
