@@ -4738,37 +4738,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         ok
                     }
 
-                    WalletAction::SendToAddress(address, amount) => { true
-                        // let Ok(Some(wallet_summary)) = user_wallet.get_wallet_summary(ConfirmationsPolicy::MIN) else {
-                        //     println!("Failed to get wallet summary");
-                        //     break 'process_action false;
-                        // };
-
-                        // let mut spendable = 0;
-                        // let balances = wallet_summary.account_balances();
-                        // for (_, b) in balances {
-                        //     spendable += b.spendable_value().into_u64();
-                        // }
-
-                        // // @todo(judah): better check?
-                        // let amount_with_fee = (*amount - MINIMUM_FEE).unwrap();
-                        // if spendable < amount.into_u64() {
-                        //     println!("Not enough spendable zats to send!");
-                        //     break 'process_action false;
-                        // }
-
-                        // println!("*********** SEND ZEC {:?} ({:?}) TO {}", amount, amount_with_fee, &address.encode(network));
-                        // match send_zats(&mut client, &address, user_wallet, &user_usk, amount_with_fee, network, &TxOptions::default()).await {
-                        //     None => {
-                        //         println!("Failed to send ZEC to {}", address.encode(network));
-                        //         wallet_state.lock().unwrap().waiting_for_send = false;
-                        //         false
-                        //     }
-                        //     Some(_) => {
-                        //         wallet_state.lock().unwrap().waiting_for_send = false;
-                        //         true
-                        //     }
-                        // }
+                    WalletAction::SendToAddress(address, amount) => {
+                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+                        let memo = MemoBytes::from_bytes("send from user wallet".as_bytes()).unwrap();
+                        if let Some(orchard_address) = address.orchard() {
+                            let ok = user_wallet.send_orchard_to_orchard_zats(network, &mut proposed_send, &mut client, &user_usk, amount.into_u64(), &orchard_tree, *orchard_address, memo).is_some();
+                            println!("Try user send: {ok:?}");
+                            true // ALT ok
+                        } else {
+                            false
+                        }
                     }
 
                     &WalletAction::UnstakeFromFinalizer(txid) => {
