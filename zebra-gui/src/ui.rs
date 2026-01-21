@@ -31,6 +31,8 @@ pub struct UiData {
 
     pub textboxes: HashMap<u32, TextboxState>,
     pub scroll_containers: HashMap<u32, ScrollContainerState>,
+
+    pub openables: HashMap<u32, OpenableState>,
 }
 
 
@@ -750,6 +752,15 @@ impl Context {
 
         (id, Scroll(0.0, -scroll_container_state.scroll * self.scale), &mut scroll_container_state.scroll)
     }
+
+    pub fn openable(&mut self, data: &mut UiData, id: Id, activated: bool) -> bool {
+        let mut openable_state = &mut data.openables.entry(id.id).or_default();
+        if activated {
+            openable_state.open = !openable_state.open;
+        }
+
+        openable_state.open
+    }
 }
 
 pub trait     Dup2: Copy { fn dup2(self) -> (Self, Self); }
@@ -790,6 +801,11 @@ pub struct TextboxState {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ScrollContainerState {
     pub scroll: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OpenableState {
+    pub open: bool,
 }
 
 pub fn ui_left_pane(ui: &mut Context,
@@ -1184,16 +1200,18 @@ pub fn ui_left_pane(ui: &mut Context,
                     };
 
                     // TODO: phillip audaciously deleted the accumulated bond amount field, bring that back
-                    let mut staked_roster = Vec::<(bool /* is_unbonded */, [u8; 32] /* bond key */, u64 /* initial */)>::new();
+                    let mut staked_roster = Vec::<(bool /* is_unbonded */, [u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* initial */)>::new();
                     {
                         let lock = wallet_state.lock().unwrap();
                         for p in &lock.stake_positions_unbonded {
-                            staked_roster.push((true, p.0, p.1));
+                            staked_roster.push((true, p.0, p.1, p.2));
                         }
                         for p in &lock.stake_positions_bonded {
-                            staked_roster.push((false, p.0, p.1));
+                            staked_roster.push((false, p.0, p.1, p.2));
                         }
                     }
+
+                    staked_roster.sort_by_key(|x| std::cmp::Reverse((x.0, x.2, x.3)));
 
                     let (id, mut clip, mut scroll) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
                     if staked_roster.len() == 0 {
@@ -1213,6 +1231,19 @@ pub fn ui_left_pane(ui: &mut Context,
                         align: Top,
                         ..Decl
                     }) {
+                        let chunkify = |bytes: &[u8; 32]| {
+                            let mut chunks = [0u64; 4];
+                            for i in 0..4 {
+                                let start = i * 8;
+                                let end = start + 8;
+                                let mut buf = [0u8; 8];
+                                buf.copy_from_slice(&bytes[start..end]);
+                                chunks[i] = u64::from_le_bytes(buf);
+                            }
+
+                            chunks
+                        };
+
                         if staked_roster.len() == 0 {
                             let h = ui.scale(24.0);
                             if let _ = elem().decl(Decl {
@@ -1228,10 +1259,76 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         }
                         else {
-                            let kind_text_h = ui.scale(18.0);
-                            let transaction_text_h = ui.scale(16.0);
+                            let mut prev_is_unbonded: bool = false;
+                            let mut open_is_unbonded: bool = false;
+                            let mut prev_finalizer:   [u8; 32] = [0; 32];
+                            let mut open_finalizer:   bool = false;
 
-                            for (index, &(is_unbonded, bond_key, initial)) in staked_roster.iter().enumerate() {
+                            for (index, &(is_unbonded, bond_key, finalizer, initial)) in staked_roster.iter().enumerate() {
+                                let index: u32 = {
+                                    use std::hash::{Hash, Hasher};
+                                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                                    bond_key.hash(&mut h);
+                                    index.hash(&mut h);
+                                    h.finish() as u32
+                                };
+
+                                if (prev_is_unbonded != is_unbonded) {
+                                    prev_is_unbonded  = is_unbonded;
+                                    let string = if is_unbonded { "Claimable Bonds" } else { "Active Positions" };
+
+                                    let id = id_index(string, index);
+
+                                    let (activated, colour, text_colour) = ui.button_ex(true, BUTTON_GREY.mul(0.8), id, true, winit::window::CursorIcon::Pointer);
+
+                                    if let _ = elem().decl(Decl {
+                                        id,
+                                        colour,
+                                        padding,
+                                        width:  percent!(1.0),
+                                        height: fit!(),
+                                        align:  Left,
+                                        ..Decl
+                                    }) {
+                                        ui.text(string, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
+                                    }
+
+                                    open_is_unbonded = ui.openable(data, id, activated);
+                                }
+
+                                if !open_is_unbonded {
+                                    continue;
+                                }
+
+                                if (prev_finalizer != finalizer) {
+                                    prev_finalizer  = finalizer;
+
+                                    let chunks = chunkify(&finalizer);
+                                    let label = frame_strf!(data, "{}", display_str(&chunks));
+
+                                    let id = id_index(label, index);
+
+                                    let (activated, colour, text_colour) = ui.button_ex(true, BUTTON_GREY.mul(0.8), id, true, winit::window::CursorIcon::Pointer);
+
+                                    if let _ = elem().decl(Decl {
+                                        id,
+                                        colour,
+                                        padding,
+                                        width:  percent!(0.8),
+                                        height: fit!(),
+                                        align:  Left,
+                                        ..Decl
+                                    }) {
+                                        ui.text(label, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
+                                    }
+
+                                    open_finalizer = ui.openable(data, id, activated);
+                                }
+
+                                if !open_finalizer {
+                                    continue;
+                                }
+
                                 let stake_amount = initial as i64;
                                 if index > 0 { // separator
                                     let colour = {
@@ -1285,18 +1382,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                         align: Left,
                                         ..Decl
                                     }) {
-                                        let chunks = {
-                                            let mut chunks = [0u64; 4];
-                                            for i in 0..4 {
-                                                let start = i * 8;
-                                                let end = start + 8;
-                                                let mut buf = [0u8; 8];
-                                                buf.copy_from_slice(&bond_key[start..end]);
-                                                chunks[i] = u64::from_le_bytes(buf);
-                                            }
-
-                                            chunks
-                                        };
+                                        let chunks = chunkify(&finalizer);
 
                                         ui.text(frame_strf!(data, "{}", display_str(&chunks)), TextDecl { font: Mono, h: ui.scale(14.0), align: AlignX::Left, ..TextDecl });
                                     }
@@ -1624,8 +1710,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::SelfSend      => if tx_is_in_block { "Returned"  } else { "Returning" },
                                     WalletTxKind::Shield        => if tx_is_in_block { "Shielded"  } else { "Shielding" },
                                     WalletTxKind::Stake         => if tx_is_in_block { "Staked"    } else { "Staking"   },
-                                    WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unbonding" } else { "Unbonding" },
-                                    WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking" },
+                                    WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking" },
+                                    WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unbonded"  } else { "Unbonding" },
                                 };
 
                                 let label_str = if tx_is_in_block {
@@ -1748,6 +1834,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                                     else if confirmed           { (WHITE, DOUBLE_ICON_OK_CIRCLED2_1) }
                                                     else if tx_is_on_best_chain { (WHITE, ICON_OK_CIRCLED2_1) }
                                                     else if tx_is_in_block      { (RED,   ICON_FORK) }
+                                                    // TODO: proposing case
+                                                    // TODO: building case
                                                     else                        { (WHITE, " ") };
                                     let colour = colour.mul(0.75);
 

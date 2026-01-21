@@ -785,8 +785,8 @@ pub struct WalletState {
 
     pub actions_in_flight: VecDeque<WalletAction>,
 
-    pub stake_positions_bonded: Vec<([u8; 32] /* bond key */, u64 /* initial */)>,
-    pub stake_positions_unbonded: Vec<([u8; 32] /* bond key */, u64 /* initial */)>,
+    pub stake_positions_bonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* initial */)>,
+    pub stake_positions_unbonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* initial */)>,
 }
 
 impl WalletState {
@@ -4132,14 +4132,14 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             for tx in &user_wallet.txs {
                 if let Some(staking_action) = (&tx.staking_action) {
                     if let Some(create_bond) = StakingAction_CreateNewDelegationBond::try_from_union(staking_action) {
-                        stake_positions_bonded.push((create_bond.unique_pubkey, create_bond.amount_zats));
+                        stake_positions_bonded.push((create_bond.unique_pubkey, create_bond.target_finalizer, create_bond.amount_zats));
                     }
                     if let Some(unbond) = StakingAction_BeginDelegationUnbonding::try_from_union(staking_action) {
                         if let Some(existing_i) = stake_positions_bonded.iter().position(|p| p.0 == unbond.unique_pubkey) {
-                            stake_positions_unbonded.push((unbond.unique_pubkey, stake_positions_bonded[existing_i].1));
+                            stake_positions_unbonded.push((unbond.unique_pubkey, stake_positions_bonded[existing_i].1, stake_positions_bonded[existing_i].2));
                             stake_positions_bonded.remove(existing_i);
                         } else {
-                            stake_positions_unbonded.push((unbond.unique_pubkey, u64::MAX));
+                            stake_positions_unbonded.push((unbond.unique_pubkey, [0; 32], u64::MAX));
                         }
                     }
                     if let Some(unbond) = StakingAction_WithdrawDelegationBond::try_from_union(staking_action) {
