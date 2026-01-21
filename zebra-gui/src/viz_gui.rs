@@ -554,7 +554,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
 
         let hash_text_line_w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &null_hash_display_string_star) / screen_unit;
         for (hash, x_pos) in &working_map {
-            viz_state.on_screen_bcs.get_mut(hash).unwrap().t_x = -5.0 - hash_text_line_w - 5.0*(1.0 + *x_pos as f32);
+            viz_state.on_screen_bcs.get_mut(hash).unwrap().t_x = -5.0 - (hash_text_line_w+3.0) * (1.0 + *x_pos as f32);
         }
     }
 
