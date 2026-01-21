@@ -13,6 +13,7 @@ use strum::{EnumCount, IntoEnumIterator};
 use strum_macros::{EnumCount, EnumIter};
 
 use tenderlink::SortedRosterMember;
+use tracing_futures::WithSubscriber;
 use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 use ed25519_zebra::VerificationKeyBytes;
 use zebra_chain::serialization::{
@@ -150,7 +151,7 @@ use zebra_node_services::mempool::{Request as MempoolRequest, Response as Mempoo
 use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
 
 /// Placeholder activation height for Crosslink functionality
-pub const TFL_ACTIVATION_HEIGHT: BlockHeight = BlockHeight(2000);
+pub const TFL_ACTIVATION_HEIGHT: BlockHeight = BlockHeight(0);
 
 #[derive(Debug, Copy, Clone, EnumCount, EnumIter)]
 enum BFTMsgFlag {
@@ -1017,7 +1018,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 }
 
                 if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() { break; }
-                
+
                 let mut round_data = tenderlink::RoundData::EMPTY;
                 round_data.roster = tenderlink_roster_from_internal(&unsorted_roster);
                 round_data.msg_val_sigs = round_data.roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.public_key == v.pub_key.0).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, tenderlink::TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), tenderlink::TMSig(s))]).collect();
@@ -1029,7 +1030,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 round_data.proposal_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
                 round_data.height = ingest_data_for_tenderlink.len() as u64;
                 round_data.round = fat_pointer.get_vote_template().round as u32;
-                
+
                 ingest_data_for_tenderlink.push(round_data);
                 i_bft_blocks.push(block);
                 fat_pointer_to_tip = fat_pointer;

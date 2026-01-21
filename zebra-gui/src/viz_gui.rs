@@ -364,7 +364,11 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
     }
 
     if anything_happened == false {
-        let _ = viz_state.send_to_zebra.try_send(RequestToZebra { want_to_inspect_block: viz_state.inspecting_block_hash, bft_ack_height: viz_state.bft_ack_height, bc_ack_height: viz_state.bc_ack_height, });
+        let _ = viz_state.send_to_zebra.try_send(RequestToZebra {
+            want_to_inspect_block: viz_state.inspecting_block_hash,
+            bft_ack_height: viz_state.bft_ack_height,
+            bc_ack_height: viz_state.bc_ack_height,
+        });
     }
 
     // animations

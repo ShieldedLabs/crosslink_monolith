@@ -1737,7 +1737,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 }) {
                                     let CONFIRMATIONS_THRESHOLD = 3;
 
-                                    let finalized = tx.mined_h.0 as u64                           <= 16; // @Todo: Use wallet state instead of viz state for this
+                                    let finalized = tx.mined_h.0 as u64                           <= viz.bc_finalized_tip_height; // @Todo: Use wallet state instead of viz state for this
                                     let confirmed = tx.mined_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height;           // @Todo: Use wallet state instead of viz state for this
 
                                     pub const RED:  (u8, u8, u8, u8) = (255, 64, 67, 0xff);      /* @todo colors */
