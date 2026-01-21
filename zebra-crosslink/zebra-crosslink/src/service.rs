@@ -176,6 +176,7 @@ pub fn spawn_new_tfl_service(
         bft_err_flags: 0,
         bft_blocks: Vec::new(),
         fat_pointer_to_tip: FatPointerToBftBlock2::null(),
+        peer_strings: Vec::new(),
         our_set_bft_string: None,
         active_bft_string: None,
         validators_at_current_height,

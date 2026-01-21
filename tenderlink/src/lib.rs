@@ -217,6 +217,12 @@ impl std::fmt::Debug for ClosureToUpdateRosterCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToUpdateRosterCmd(..)") }
 }
 
+#[derive(Clone)]
+pub struct ClosureToUpdatePeers(pub Arc<dyn Fn(Vec<PeerInfo>) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>);
+impl std::fmt::Debug for ClosureToUpdatePeers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToUpdatePeers(..)") }
+}
+
 /*
 FROM ZEBRA
 DATA LAYOUT FOR VOTE
@@ -631,6 +637,7 @@ struct TMState {
 
     roster_cmd: Option<String>,
     update_roster_cmd_closure: ClosureToUpdateRosterCmd,
+    update_peers_cmd_closure: ClosureToUpdatePeers,
 
     pow_submit_block_queue: Vec<Arc<zebra_chain::block::Block>>,
     current_powlink: Option<(BlockHash, Powlink)>,
@@ -646,7 +653,9 @@ impl TMState {
         parse_pow_closure: ClosureToParsePow,
         is_pow_in_chain_closure: ClosureIsPoWInChain,
         push_pow_closure: ClosureToPushPow,
-        update_roster_cmd_closure: ClosureToUpdateRosterCmd) -> Self {
+        update_roster_cmd_closure: ClosureToUpdateRosterCmd,
+        update_peers_cmd_closure: ClosureToUpdatePeers,
+    ) -> Self {
         Self {
             hash_keys: HashKeys::default(),
             my_port,
@@ -671,6 +680,7 @@ impl TMState {
             push_pow_closure,
             roster_cmd: None,
             update_roster_cmd_closure,
+            update_peers_cmd_closure,
 
             pow_submit_block_queue: Vec::new(),
             current_powlink: None,
@@ -1343,21 +1353,31 @@ impl Default for PeerTransport {
 
 // TODO: can we megastruct these and collapse the codepaths?
 #[derive(Debug)]
-struct Peer {
-    root_public_bft_key: [u8; 32],
-    endpoint: Option<SecureUdpEndpoint>,
-    outgoing_handshake_state: Option<snow::HandshakeState>,
-    pending_client_ack_snow_state: Option<snow::StatelessTransportState>,
-    snow_state: Option<snow::StatelessTransportState>,
-    watch_dog: Instant,
-
-    transport: PeerTransport,
-
-    connection_is_unknown: bool,
-
-    latest_status_request_height: Option<u64>,
-    latest_status_request_powlink: Option<(BlockHash, u16)>,
-    latest_status: Option<PacketStatus>,
+pub struct Peer {
+    pub root_public_bft_key: [u8; 32],
+    pub endpoint: Option<SecureUdpEndpoint>,
+    pub outgoing_handshake_state: Option<snow::HandshakeState>,
+    pub pending_client_ack_snow_state: Option<snow::StatelessTransportState>,
+    pub snow_state: Option<snow::StatelessTransportState>,
+    pub watch_dog: Instant,
+    pub transport: PeerTransport,
+    pub connection_is_unknown: bool,
+    pub latest_status_request_height: Option<u64>,
+    pub latest_status_request_powlink: Option<(BlockHash, u16)>,
+    pub latest_status: Option<PacketStatus>,
+}
+impl Peer {
+    fn info(&self) -> PeerInfo {
+        let latest_status_request_powlink = self.latest_status_request_powlink.unwrap_or_default();
+        return PeerInfo{
+            connected: self.snow_state.is_some(),
+            connection_is_unknown: self.connection_is_unknown,
+            root_public_bft_key: Some(self.root_public_bft_key),
+            latest_status_request_height: self.latest_status_request_height.unwrap_or_default(),
+            latest_status_request_powlink_hash: latest_status_request_powlink.0,
+            latest_status_request_powlink_id: latest_status_request_powlink.1,
+        };
+    }
 }
 impl Default for Peer {
     fn default() -> Self {
@@ -1378,6 +1398,16 @@ impl Default for Peer {
     }
 }
 
+#[derive(Debug, Default, Copy, Clone)]
+pub struct PeerInfo {
+    pub connected: bool,
+    pub connection_is_unknown: bool,
+    pub root_public_bft_key: Option<[u8; 32]>,
+    pub latest_status_request_height: u64,
+    pub latest_status_request_powlink_hash: BlockHash,
+    pub latest_status_request_powlink_id: u16, // id?
+}
+
 // NOTE: buf can be open-ended
 trait SliceWrite         { fn write_to(&self, buf: &mut [u8]) -> usize; }
 impl SliceWrite for u64  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..8].copy_from_slice(&u64::to_le_bytes(*self)); 8 } }
@@ -1389,15 +1419,27 @@ impl SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..
 
 
 #[derive(Debug)]
-struct UnknownPeer {
-    endpoint: SecureUdpEndpoint,
-    snow_state: snow::StatelessTransportState,
-    pending_client_ack: bool,
-    watch_dog: Instant,
+pub struct UnknownPeer {
+    pub endpoint: SecureUdpEndpoint,
+    pub snow_state: snow::StatelessTransportState,
+    pub pending_client_ack: bool,
+    pub watch_dog: Instant,
 
-    transport: PeerTransport,
-    latest_status_request_height: Option<u64>,
-    latest_status_request_powlink: Option<(BlockHash, u16)>,
+    pub transport: PeerTransport,
+    pub latest_status_request_height: Option<u64>,
+    pub latest_status_request_powlink: Option<(BlockHash, u16)>,
+}
+impl UnknownPeer {
+    fn info(&self) -> PeerInfo {
+        let latest_status_request_powlink = self.latest_status_request_powlink.unwrap_or_default();
+        return PeerInfo{
+            connection_is_unknown: true,
+            latest_status_request_height: self.latest_status_request_height.unwrap_or_default(),
+            latest_status_request_powlink_hash: latest_status_request_powlink.0,
+            latest_status_request_powlink_id: latest_status_request_powlink.1,
+            ..Default::default()
+        };
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1578,7 +1620,14 @@ pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize
     rngs
 }
 
-async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<StaticDHKeyPair>, my_endpoint: Option<SecureUdpEndpoint>, roster: Vec<SortedRosterMember>, roster_endpoint_evidence: Vec<EndpointEvidence>, maybe_seed: Option<u128>) -> std::io::Result<()> {
+async fn instance(
+    my_root_private_key: SigningKey,
+    my_static_keypair: Option<StaticDHKeyPair>,
+    my_endpoint: Option<SecureUdpEndpoint>,
+    roster: Vec<SortedRosterMember>,
+    roster_endpoint_evidence: Vec<EndpointEvidence>,
+    maybe_seed: Option<u128>,
+) -> std::io::Result<()> {
     let block_rng = Arc::new(Mutex::new({
         let seed : u128 = maybe_seed.clone().unwrap_or_else(|| {
             let mut seed_rng = rand::rng();
@@ -1651,6 +1700,9 @@ async fn instance(my_root_private_key: SigningKey, my_static_keypair: Option<Sta
         ClosureToUpdateRosterCmd(Arc::new(move |_str| { Box::pin(async move {
             Some(format!("{:?}", pub_key))
         })})),
+        ClosureToUpdatePeers(Arc::new(move |_all_peers| { Box::pin(async move {
+        })})),
+
         Vec::new(),
     ).await
 }
@@ -1670,6 +1722,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          is_pow_in_chain_closure: ClosureIsPoWInChain,
                          push_pow_closure: ClosureToPushPow,
                          roster_cmd_closure: ClosureToUpdateRosterCmd,
+                         peer_cmd_closure: ClosureToUpdatePeers,
                          ingest_startup_data: Vec<RoundData>,
                         ) -> std::io::Result<()> {
     hook_fail_on_panic();
@@ -1716,7 +1769,21 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>()); }
 
     // TODO: only convert private to public in 1 location
-    let mut bft_state = TMState::init(my_root_private_key, PubKeyID(my_root_public_bft_key.into()), my_port, propose_closure, validate_closure, push_block_closure, get_block_closure, get_pow_closure, parse_pow_closure, is_pow_in_chain_closure, push_pow_closure, roster_cmd_closure); // TODO: double-check this is the right key
+    let mut bft_state = TMState::init(
+        my_root_private_key,
+        PubKeyID(my_root_public_bft_key.into()),
+        my_port,
+        propose_closure,
+        validate_closure,
+        push_block_closure,
+        get_block_closure,
+        get_pow_closure,
+        parse_pow_closure,
+        is_pow_in_chain_closure,
+        push_pow_closure,
+        roster_cmd_closure,
+        peer_cmd_closure,
+    ); // TODO: double-check this is the right key
 
     bft_state.height = ingest_startup_data.len() as u64;
     bft_state.recent_commit_round_cache = ingest_startup_data;
@@ -1742,6 +1809,14 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut next_tick_time = tokio::time::Instant::now();
     loop {
         let ctx_str = bft_state.ctx_str(&roster);
+
+        {
+            let mut peers = peers.iter().map(|p| p.info()).collect::<Vec<PeerInfo>>();
+            for upeer in &unknown_peers {
+                peers.push(upeer.info());
+            }
+            bft_state.update_peers_cmd_closure.0(peers).await;
+        }
 
         fn read_header_and_maybe_status(msg: &[u8]) -> std::io::Result<(PacketHeader, Option<PacketStatus>, usize)> {
             let mut o   = 0;
@@ -2339,7 +2414,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         }
                     }
                 }
-                
                 break;
             }
 
@@ -2920,7 +2994,7 @@ fn print_packet_tag_recv(header: PacketHeader) {
 type ProposalRng = [u32; 2]; // [lo, hi)
 type VoteRng     = [u16; 2];
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct BlockHash(pub [u8; 32]);
+pub struct BlockHash(pub [u8; 32]);
 impl BlockHash { const NIL: Self = Self([0; 32]); }
 const STATUS_PROPOSAL_RNGS_N: usize = 1;
 const STATUS_VOTE_RNGS_N: usize = 1; // ALT: split prevote/precommit numbers

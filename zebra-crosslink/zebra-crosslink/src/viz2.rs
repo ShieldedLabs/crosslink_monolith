@@ -128,6 +128,7 @@ pub async fn service_viz_requests(
                         0
                     };
                     response.bft_tip_height = (internal.bft_blocks.len() as u64).saturating_sub(1);
+                    response.peer_strings = internal.peer_strings.clone();
 
                     response.orchard_pool_balance = orchard_pool_balance;
                     response.staking_bonded_pool_balance = staking_bonded_pool_balance;

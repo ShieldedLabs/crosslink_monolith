@@ -2371,6 +2371,13 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     ui.text(frame_strf!(data, "Orchard Pool Zatoshis: {}", viz.orchard_pool_balance), decl);
                     ui.text(frame_strf!(data, "Staking (Bonded) Pool Zatoshis: {}", viz.staking_bonded_pool_balance), decl);
                     ui.text(frame_strf!(data, "Staking (Unbonded) Pool Zatoshis: {}", viz.staking_unbonded_pool_balance), decl);
+
+                    if ui.debug {
+                        ui.text("------------------", decl);
+                        for peer in &viz.peer_strings {
+                            ui.text(peer, decl);
+                        }
+                    }
                 }
             }
 
