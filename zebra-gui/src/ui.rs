@@ -1168,7 +1168,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
 
                         let icon = if ui.hovered(id) { icon_hovered } else { icon };
-                        if let _ = elem().decl(Decl{
+                        if let _ = elem().decl(Decl {
                             id,
                             child_gap,
                             align: Center,
@@ -1183,15 +1183,15 @@ pub fn ui_left_pane(ui: &mut Context,
                         clicked
                     };
 
-                    // pub staked_roster: Vec<([u8; 32] /* pub key */, [u8; 32] /* txid */, u64 /* initial */, u64 /* accumulated */)>,
-                    let mut staked_roster = Vec::new();
+                    // TODO: phillip audaciously deleted the accumulated bond amount field, bring that back
+                    let mut staked_roster = Vec::<(bool /* is_unbonded */, [u8; 32] /* bond key */, u64 /* initial */)>::new();
                     {
                         let lock = wallet_state.lock().unwrap();
                         for p in &lock.stake_positions_unbonded {
-                            staked_roster.push((true, p.0, p.0, p.1, p.1));
+                            staked_roster.push((true, p.0, p.1));
                         }
                         for p in &lock.stake_positions_bonded {
-                            staked_roster.push((false, p.0, p.0, p.1, p.1));
+                            staked_roster.push((false, p.0, p.1));
                         }
                     }
 
@@ -1231,7 +1231,8 @@ pub fn ui_left_pane(ui: &mut Context,
                             let kind_text_h = ui.scale(18.0);
                             let transaction_text_h = ui.scale(16.0);
 
-                            for (index, member) in staked_roster.iter().enumerate() {
+                            for (index, &(is_unbonded, bond_key, initial)) in staked_roster.iter().enumerate() {
+                                let stake_amount = initial as i64;
                                 if index > 0 { // separator
                                     let colour = {
                                         let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
@@ -1242,7 +1243,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                     let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
                                 }
-                                if let _ = elem().decl(Decl{
+                                if let _ = elem().decl(Decl {
                                     id: id_index("Unstake Roster Member", index as u32),
                                     padding,
                                     child_gap,
@@ -1253,7 +1254,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     ..Decl
                                 }) {
                                     // left icon
-                                    if let _ = elem().decl(Decl{
+                                    if let _ = elem().decl(Decl {
                                         id: id_index("Unstake Roster Member Left Icon", index as u32),
                                         height: fit!(),
                                         width: fixed!(ui.scale(32.0)),
@@ -1261,20 +1262,22 @@ pub fn ui_left_pane(ui: &mut Context,
                                         align: Center,
                                         ..Decl
                                     }) {
-                                        if member.0 {
-                                            if clickable_icon(ui, id_index("Unstake Button", index as u32), ICON_MONEY, ICON_WALLET, true) {
-                                                wallet_state.lock().unwrap().claim_bond(member.1);
-                                            }
-                                        }
-                                        else {
-                                            if clickable_icon(ui, id_index("Unstake Button", index as u32), ICON_LINK_1, ICON_UNLINK, true) {
-                                                wallet_state.lock().unwrap().unstake_from_finalizer(member.1);
+                                        let (icon, icon_hovered) = if is_unbonded {
+                                            (ICON_MONEY, ICON_WALLET)
+                                        } else {
+                                            (ICON_LINK_1, ICON_UNLINK)
+                                        };
+                                        if clickable_icon(ui, id_index("Unstake Button", index as u32), icon, icon_hovered, true) {
+                                            if is_unbonded {
+                                                wallet_state.lock().unwrap().claim_bond(bond_key);
+                                            } else {
+                                                wallet_state.lock().unwrap().unstake_from_finalizer(bond_key);
                                             }
                                         }
                                     }
 
                                     // info
-                                    if let _ = elem().decl(Decl{
+                                    if let _ = elem().decl(Decl {
                                         id: id_index("Unstake Roster Member Info", index as u32),
                                         height: fit!(),
                                         width: grow!(),
@@ -1282,14 +1285,13 @@ pub fn ui_left_pane(ui: &mut Context,
                                         align: Left,
                                         ..Decl
                                     }) {
-                                        let bytes = member.1;
                                         let chunks = {
                                             let mut chunks = [0u64; 4];
                                             for i in 0..4 {
                                                 let start = i * 8;
                                                 let end = start + 8;
                                                 let mut buf = [0u8; 8];
-                                                buf.copy_from_slice(&bytes[start..end]);
+                                                buf.copy_from_slice(&bond_key[start..end]);
                                                 chunks[i] = u64::from_le_bytes(buf);
                                             }
 
@@ -1300,7 +1302,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     }
 
                                     // right info
-                                    if let _ = elem().decl(Decl{
+                                    if let _ = elem().decl(Decl {
                                         id: id_index("Unstake Roster Member Amounts", index as u32),
                                         height: fit!(),
                                         width: fit!(),
@@ -1308,7 +1310,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                         align: Right,
                                         ..Decl
                                     }) {
-                                        let stake_amount: i64 = member.4 as i64;
+                                        // TODO: let accumulated_stake_amount;
                                         let full = stake_amount / 100_000_000;
                                         let part = stake_amount % 100_000_000;
                                         let part_str = format!("{part}00");
@@ -1318,7 +1320,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                         let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
                                         let mut str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
                                         if ui.hovered(id) {
-                                            let stake_amount: i64 = member.3 as i64;
+                                            // TODO: let initial_stake_amount;
                                             let full = stake_amount / 100_000_000;
                                             let part = stake_amount % 100_000_000;
                                             let part_str = format!("{part}00");
@@ -1328,7 +1330,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                             str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
                                         }
 
-                                        if let _ = elem().decl(Decl{
+                                        if let _ = elem().decl(Decl {
                                             id,
                                             width: fit!(),
                                             height: fit!(),
@@ -1737,8 +1739,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                 }) {
                                     let CONFIRMATIONS_THRESHOLD = 3;
 
-                                    let finalized = tx.mined_h.0 as u64                           <= 16; // @Todo: Use wallet state instead of viz state for this
-                                    let confirmed = tx.mined_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height;           // @Todo: Use wallet state instead of viz state for this
+                                    let finalized = tx.mined_h.0 as u64                           <= 16;                // @Todo: Use wallet state instead of viz state for this
+                                    let confirmed = tx.mined_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height; // @Todo: Use wallet state instead of viz state for this
 
                                     pub const RED:  (u8, u8, u8, u8) = (255, 64, 67, 0xff);      /* @todo colors */
                                     pub const BLUE: (u8, u8, u8, u8) = (0x33, 0x88, 0xde, 0xff); /* @todo colors */
@@ -1941,7 +1943,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
                         let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
                     }
-                    if let _ = elem().decl(Decl{
+                    if let _ = elem().decl(Decl {
                         id: id_index("Roster Member", index as u32),
                         padding,
                         child_gap,
@@ -1952,7 +1954,7 @@ pub fn ui_right_pane(ui: &mut Context,
                         ..Decl
                     }) {
                         // left icon
-                        if let _ = elem().decl(Decl{
+                        if let _ = elem().decl(Decl {
                             id: id_index("Roster Member Left Icon", index as u32),
                             height: fit!(),
                             width: fixed!(ui.scale(32.0)),
@@ -1970,7 +1972,7 @@ pub fn ui_right_pane(ui: &mut Context,
                         }
 
                         // info
-                        if let _ = elem().decl(Decl{
+                        if let _ = elem().decl(Decl {
                             id: id_index("Roster Member Info", index as u32),
                             height: fit!(),
                             width: grow!(),
@@ -1996,7 +1998,7 @@ pub fn ui_right_pane(ui: &mut Context,
                         }
 
                         // right info
-                        if let _ = elem().decl(Decl{
+                        if let _ = elem().decl(Decl {
                             id: id_index("Roster Member Amounts", index as u32),
                             height: fit!(),
                             width: fit!(),
