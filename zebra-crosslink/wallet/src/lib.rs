@@ -4089,10 +4089,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             // println!("miner unspent UTXOs {:#?}", NL(&*miner_wallet.accounts[0].utxos));
             // println!("miner spent   UTXOs {:#?}", NL(&*miner_wallet.accounts[0].stxos));
-            println!("miner unspent notes {:#?}", NL(&*miner_wallet.accounts[0].unspent_orchard_notes));
-            println!("miner spent   notes {:#?}", NL(&*miner_wallet.accounts[0].spent_orchard_notes));
-            println!("user  unspent notes {:#?}", NL(&*user_wallet.accounts[0].unspent_orchard_notes));
-            println!("user  spent   notes {:#?}", NL(&*user_wallet.accounts[0].spent_orchard_notes));
+            // println!("miner unspent notes {:#?}", NL(&*miner_wallet.accounts[0].unspent_orchard_notes));
+            // println!("miner spent   notes {:#?}", NL(&*miner_wallet.accounts[0].spent_orchard_notes));
+            // println!("user  unspent notes {:#?}", NL(&*user_wallet.accounts[0].unspent_orchard_notes));
+            // println!("user  spent   notes {:#?}", NL(&*user_wallet.accounts[0].spent_orchard_notes));
 
             let mut miner_unshielded_funds = 0;
             let mut miner_shielded_pending_funds = 0;

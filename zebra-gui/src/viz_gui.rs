@@ -299,9 +299,12 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
     while let Ok(message) = viz_state.receive_from_zebra.try_recv() {
         anything_happened |= viz_state.bc_tip_height != message.bc_tip_height;
         viz_state.bc_tip_height = message.bc_tip_height;
+
         anything_happened |= viz_state.bft_tip_height != message.bft_tip_height;
         viz_state.bft_tip_height = message.bft_tip_height;
 
+        anything_happened |= viz_state.bc_finalized_tip_height != message.bc_finalized_tip_height;
+        viz_state.bc_finalized_tip_height = message.bc_finalized_tip_height;
 
         viz_state.orchard_pool_balance = message.orchard_pool_balance;
         viz_state.staking_bonded_pool_balance = message.staking_bonded_pool_balance;
