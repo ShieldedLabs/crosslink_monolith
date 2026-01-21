@@ -50,7 +50,8 @@ pub enum Response {
     Depth(Option<u32>),
 
     /// Response to [`Request::CrosslinkFinalizeBlock`]
-    CrosslinkFinalized(block::Hash),
+    /// Contains the finalized block hash and an array of (target_finalizer, total_stake) for all active bonds
+    CrosslinkFinalized(block::Hash, Vec<([u8; 32], u64)>),
 
     /// Response to [`Request::Tip`] with the current best chain tip.
     //

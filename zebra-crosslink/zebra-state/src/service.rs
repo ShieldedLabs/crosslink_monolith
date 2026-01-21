@@ -747,7 +747,7 @@ impl StateService {
     fn send_crosslink_finalized_to_non_finalized_state(
         &mut self,
         hash: block::Hash,
-    ) -> oneshot::Receiver<Result<block::Hash, BoxError>> {
+    ) -> oneshot::Receiver<Result<(block::Hash, Vec<([u8; 32], u64)>), BoxError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
 
         if self.block_write_sender.finalized.is_none() {
@@ -1129,7 +1129,7 @@ impl Service<Request> for StateService {
                         // TODO: replace with Result::flatten once it stabilises
                         // https://github.com/rust-lang/rust/issues/70142
                         .and_then(convert::identity)
-                        .map(Response::CrosslinkFinalized)
+                        .map(|(hash, aggregated_stakes)| Response::CrosslinkFinalized(hash, aggregated_stakes))
                 }
                 .instrument(span)
                 .boxed()

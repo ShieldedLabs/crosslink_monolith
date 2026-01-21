@@ -2004,13 +2004,8 @@ pub fn ui_right_pane(ui: &mut Context,
                             align: Right,
                             ..Decl
                         }) {
-                            let stake_amount: i64 = member.voting_power as i64;
-                            let full = stake_amount / 100_000_000;
-                            let part = stake_amount % 100_000_000;
-                            let part_str = format!("{part}00");
-                            let trim_part = part_str.trim_end_matches("0");
                             let colour = (0xff, 0xaf, 0x0e, 0xff);
-                            ui.text(frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]), TextDecl { font: Mono, h: ui.scale(16.0), colour, align: AlignX::Right, ..TextDecl });
+                            ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(member.voting_power)), TextDecl { font: Mono, h: ui.scale(16.0), colour, align: AlignX::Right, ..TextDecl });
                         }
                     }
                 }

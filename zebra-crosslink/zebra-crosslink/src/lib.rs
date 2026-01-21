@@ -588,10 +588,12 @@ async fn new_decided_bft_block_from_malachite(
     internal.fat_pointer_to_tip = fat_pointer.clone();
     internal.latest_final_block = Some((new_final_height, new_final_hash));
 
+    let mut got_stakes = Vec::new();
     drop(internal); // Note(Sam): IT IS VERY IMPORTANT THAT WE DROP THE LOCK BECAUSE ZEBRA_STATE MAY CALL US BACK
     match (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(new_final_hash)).await {
-        Ok(zebra_state::Response::CrosslinkFinalized(hash)) => {
-            info!("Successfully crosslink-finalized {}", hash);
+        Ok(zebra_state::Response::CrosslinkFinalized(hash, aggregated_stakes)) => {
+            info!("Successfully crosslink-finalized {}, active stakes: {:?}", hash, aggregated_stakes);
+            got_stakes = aggregated_stakes;
             assert_eq!(
                 hash, new_final_hash,
                 "PoW finalized hash should now match ours"
@@ -604,169 +606,10 @@ async fn new_decided_bft_block_from_malachite(
     }
 
     internal = tfl_handle.internal.lock().await;
-    {
-        let new_bc_final = internal.latest_final_block;
 
-        // info!("final changed to {:?}", new_bc_final);
-        if let Some(new_final_height_hash) = new_bc_final {
-            let start_hash = if let Some(prev_height_hash) = internal.current_bc_final {
-                prev_height_hash.1
-            } else {
-                new_final_height_hash.1
-            };
-
-            drop(internal);
-            let (new_final_height_hashes, new_final_blocks) = tfl_block_sequence(
-                &call,
-                start_hash,
-                Some(new_final_height_hash),
-                /*include_start_hash*/ true,
-                true,
-            )
-            .await;
-            internal = tfl_handle.internal.lock().await;
-
-            let mut quiet = true;
-            if let (Some(Some(first_block)), Some(Some(last_block))) =
-                (new_final_blocks.first(), new_final_blocks.last())
-            {
-                let a = first_block.coinbase_height().unwrap_or(BlockHeight(0)).0;
-                let b = last_block.coinbase_height().unwrap_or(BlockHeight(0)).0;
-                if a != b {
-                    // Note(Sam), very noisy and not connected to malachite right now.
-                    // println!("Height change: {} => {}:", a, b);
-                    // quiet = false;
-                }
-            }
-            if !quiet {
-                tfl_dump_blocks(&new_final_height_hashes[..], &new_final_blocks[..]);
-            }
-
-            // @Workshop
-            let pos_total_reward: u64 = (650_000_000 - 10_000) / 2; // half of block reward - fee TODO: account for dev fund etc, remove fee
-
-            // walk all blocks in newly-finalized sequence; handle rewards & broadcast them
-            for i in 0..new_final_height_hashes.len() {
-                // skip repeated boundary blocks
-                let new_final_height_hash = &new_final_height_hashes[i];
-                if let Some((_, prev_hash)) = internal.current_bc_final {
-                    if prev_hash == new_final_height_hash.1 {
-                        continue;
-                    }
-                }
-//println!("Applying height: {}", new_final_height_hash.0.0);
-
-                // Divide the reward between finalizers. Any rounding errors are intended to be
-                // accounted for here by giving those zats to the finalizer with the largest
-                // stake. As a result, this should always *exactly* apportion the entire
-                // reward.
-                // TODO: is there a standardised way of doing this?
-                {
-                    // NOTE: recalculating here means the *compounding* is per PoW block, as well
-                    // as the value.
-                    // It also means that finalizers added in the same PoS will get rewards for PoW
-                    // blocks they couldn't have actually voted on.
-
-                    let finalizers = &mut internal.validators_at_current_height;
-                    let mut total_voting_power = 0;
-                    let mut max_power_idxs: Option<(usize, usize)> = None;
-
-                    // determine total_voting_power & max_power_idxs
-                    for finalizer_i in 0..finalizers.len() {
-                        let finalizer = &finalizers[finalizer_i];
-                        if finalizer.voting_power == 0 {
-                            continue;
-                        }
-
-                        for txid_i in 0..finalizer.txids.len() {
-                            if max_power_idxs.is_none()
-                                || finalizers[max_power_idxs.unwrap().0].txids[max_power_idxs.unwrap().1].zats
-                                    < finalizer.voting_power
-                            {
-                                max_power_idxs = Some((finalizer_i, txid_i));
-                            }
-
-                            total_voting_power += finalizer.txids[txid_i].zats;
-                        }
-                    }
-
-                    // Give share of block reward to all finalizers based on their stake
-                    // (except for max staker).
-                    // We make use of the fact that integer division always rounds down such
-                    // that sum_reward <= the infinite-precision sum.
-                    let mut sum_reward = 0_u64;
-                    for finalizer_i in 0..finalizers.len() {
-                        let finalizer = &mut finalizers[finalizer_i];
-                        if finalizer.voting_power == 0 {
-                            continue;
-                        }
-
-                        for txid_i in 0..finalizer.txids.len() {
-                            if (finalizer_i, txid_i) == max_power_idxs.expect("there must be a max finalizer if at least 1 is non-0") {
-                                continue;
-                            }
-
-                            // NOTE: total_voting_power must be non-0 if we have any non-0 roster
-                            // members
-                            // TODO: most numerically stable version of this that won't overflow
-                            let mul: u128 =
-                                (finalizer.txids[txid_i].zats as u128) * (pos_total_reward as u128);
-                            let reward = (mul / (total_voting_power as u128)) as u64;
-                            sum_reward += reward;
-
-                            finalizer.voting_power += reward;
-                            finalizer.txids[txid_i].zats += reward;
-                        }
-                    }
-
-                    // Give remaining block reward (including any accumulated rounding errors)
-                    // to max staker
-                    if let Some((finalizer_i, txid_i)) = max_power_idxs {
-                        let finalizer = &mut finalizers[finalizer_i];
-                        let mul: u128 =
-                            (finalizer.txids[txid_i].zats as u128) * (pos_total_reward as u128);
-                        let reward = (mul / (total_voting_power as u128)) as u64;
-                        let rem_reward = pos_total_reward - sum_reward;
-                        assert!(reward <= rem_reward,
-                            "should be at least the expected share remaining. Any discrepancy should be in this finalizer's favor.\n\
-                            expected reward: {}, remaining reward: {}",
-                            reward, rem_reward);
-
-                        if reward != rem_reward {
-                            info!("Max finalizer/txid given rounding error: expected {}, got {}, bonus: {}",
-                                reward, rem_reward, rem_reward - reward);
-                        }
-
-                        finalizer.voting_power += rem_reward;
-                        finalizer.txids[txid_i].zats += rem_reward;
-                    }
-                }
-
-                // Modify the stake for members
-                if let Some(new_final_block) = &new_final_blocks[i] {
-                    let cmd_c = update_roster_for_block(&mut internal, new_final_block);
-                    if cmd_c > 0 {
-                        info!(
-                            "Applied {} commands to roster from PoW height {}",
-                            cmd_c, new_final_height_hashes[i].0 .0,
-                        );
-                    }
-                } else {
-                    error!(
-                        "failed to get known block at {:?}",
-                        new_final_height_hashes[i]
-                    );
-                    debug_assert!(false, "this shouldn't happen");
-                }
-
-                // We ignore the error because there will be one in the ordinary case
-                // where there are no receivers yet.
-                let _ = internal.final_change_tx.send(*new_final_height_hash);
-            }
-        }
-        internal.current_bc_final = new_bc_final;
+    if got_stakes.len() > 0 {
+        internal.validators_at_current_height = got_stakes.into_iter().map(|s| MalValidator { public_key: s.0, voting_power: s.1 }).collect();
     }
-
 
 //println!("Storing pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, internal.validators_at_current_height);
     if internal.path_to_pos_store_file.to_str() != Some("") {
@@ -1505,7 +1348,7 @@ async fn tfl_service_incoming_request(
             internal
                 .validators_at_current_height
                 .iter()
-                .map(|v| RosterMember{ pub_key:<[u8; 32]>::from(v.public_key), voting_power: v.voting_power, txids:v.txids.clone() })
+                .map(|v| RosterMember{ pub_key:<[u8; 32]>::from(v.public_key), voting_power: v.voting_power, txids: Vec::new() })
                 .collect()
         })),
 
@@ -1819,51 +1662,12 @@ async fn _tfl_dump_block_sequence(
 pub struct MalValidator {
     pub public_key: [u8; 32],
     pub voting_power: u64,
-
-    pub txids: Vec<StakeTxId>,
 }
 
 impl MalValidator {
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    pub fn new(public_key: [u8; 32], initial_stakes: Vec<StakeTxId>) -> Self {
-        Self {
-            public_key,
-            voting_power: Self::total_stake(&initial_stakes),
-            txids: initial_stakes,
-        }
-    }
-
-    pub fn push_txid(&mut self, txid: StakeTxId) {
-        if self.txids.iter().find(|cmp| cmp.txid == txid.txid).is_some() {
-            return;
-        }
-        self.voting_power += txid.zats;
-        self.txids.push(txid);
-    }
-
-    pub fn total_stake(txids: &[StakeTxId]) -> u64 {
-        let mut zats = 0;
-        for it in txids {
-            zats += it.zats;
-        }
-        zats
-    }
-
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         w.write_all(&self.public_key)?;
         w.write_all(&self.voting_power.to_le_bytes())?;
-
-        let len: u32 = self
-            .txids
-            .len()
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "txids too large"))?;
-        w.write_all(&len.to_le_bytes())?;
-
-        for tx in &self.txids {
-            tx.write_to(w)?;
-        }
-
         Ok(())
     }
 
@@ -1875,30 +1679,9 @@ impl MalValidator {
         r.read_exact(&mut vp_bytes)?;
         let voting_power = u64::from_le_bytes(vp_bytes);
 
-        let mut len_bytes = [0u8; 4];
-        r.read_exact(&mut len_bytes)?;
-        let len = u32::from_le_bytes(len_bytes) as usize;
-
-        let mut txids = Vec::with_capacity(len);
-        for _ in 0..len {
-            txids.push(StakeTxId::read_from(r)?);
-        }
-
-        // Optional consistency check: recompute and ensure it matches the stored voting_power.
-        // If you *don't* want voting_power stored on disk, you can drop it from the format
-        // and always compute it here.
-        let computed = Self::total_stake(&txids);
-        if computed != voting_power {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("voting_power mismatch: stored={voting_power}, computed={computed}"),
-            ));
-        }
-
         Ok(Self {
             public_key,
             voting_power,
-            txids,
         })
     }
 }

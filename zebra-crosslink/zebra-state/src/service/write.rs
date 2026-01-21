@@ -132,7 +132,7 @@ pub enum NonFinalizedWriteMessage {
     Commit(QueuedSemanticallyVerified),
     CrosslinkFinalized(
         block::Hash,
-        tokio::sync::oneshot::Sender<Result<block::Hash, BoxError>>,
+        tokio::sync::oneshot::Sender<Result<(block::Hash, Vec<([u8; 32], u64)>), BoxError>>,
     ),
     /// The hash of a block that should be invalidated and removed from
     /// the non-finalized state, if present.
@@ -364,23 +364,24 @@ impl WriteBlockWorkerTask {
                                 }
                             }
                         }
-                        // for block in newly_finalized_blocks {
-                        //     finalized_state.commit_finalized_direct(block.block.into(), None, "commit Crosslink-finalized block").expect(
-                        //         "unexpected finalized block commit error: blocks were already checked by the non-finalized state",
-                        //     );
 
-                        //     non_finalized_state.finalize();
-                        // }
+                        // Aggregate active bonds by target_finalizer
+                        let mut stakes_by_finalizer: std::collections::HashMap<[u8; 32], u64> =
+                            std::collections::HashMap::new();
+                        for (_bond_key, bond) in finalized_state.db.active_bonds() {
+                            let amount: u64 = bond.amount.into();
+                            *stakes_by_finalizer.entry(bond.target_finalizer).or_insert(0) += amount;
+                        }
+                        let aggregated_stakes: Vec<([u8; 32], u64)> =
+                            stakes_by_finalizer.into_iter().collect();
 
-                        let _ = rsp_tx.send(Ok(hash));
+                        let _ = rsp_tx.send(Ok((hash, aggregated_stakes)));
                     } else if finalized_state.db.contains_hash(hash) {
                         warn!("Crosslink finalization: already de-facto finalized as below reorg height");
-                        let _ = rsp_tx.send(Ok(hash));
+                        let _ = rsp_tx.send(Ok((hash, Vec::new())));
                     } else {
                         let _ = rsp_tx.send(Err("Couldn't find finalized block".into()));
                     }
-
-                    // TODO: we may want to add db data here
 
                     continue;
                 }
