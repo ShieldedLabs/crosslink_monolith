@@ -34,40 +34,25 @@ pub async fn service_viz_requests(
         let response_queue = response_queue.as_ref().unwrap();
 
         'main_loop: loop {
-            let mempool_txs = if let Ok(MempoolResponse::FullTransactions { transactions, .. }) =
-                (call.mempool)(MempoolRequest::FullTransactions).await
-            {
-                transactions
-            } else {
-                Vec::new()
-            };
-            let value_balance = if let Ok(StateReadResponse::TipPoolValues { value_balance, .. }) =
-                (call.read_state)(StateReadRequest::TipPoolValues).await
-            {
-                value_balance
-            } else {
-                ValueBalance::zero()
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let Ok(StateReadResponse::TipPoolValues { value_balance, .. }) = (call.read_state)(StateReadRequest::TipPoolValues).await
+            else {
+                continue 'main_loop;
             };
             let orchard_pool_balance = value_balance.orchard_amount().zatoshis();
             let staking_bonded_pool_balance = value_balance.staking_bonded_amount().zatoshis();
             let staking_unbonded_pool_balance = value_balance.staking_unbonded_amount().zatoshis();
 
-            let tip_height_hash: (BlockHeight, BlockHash) = {
-                if let Ok(StateResponse::Tip(Some(tip_height_hash))) =
-                    (call.state)(StateRequest::Tip).await
-                {
-                    tip_height_hash
-                } else {
-                    //error!("Failed to read tip");
-                    continue;
-                }
+            let Ok(StateResponse::Tip(Some(tip_height_hash))) = (call.state)(StateRequest::Tip).await
+            else {
+                continue 'main_loop;
             };
             let bc_tip_height: u64 = tip_height_hash.0.0 as u64;
 
             let bc_req_h = (bc_ack_height, -1);
 
             #[allow(clippy::never_loop)]
-            let (lo_height, bc_tip, height_hashes, seq_blocks) = loop {
+            let (lo_height, bc_tip, height_hashes, seq_blocks) = {
                 let (lo, hi) = (bc_req_h.0, bc_req_h.1);
                 assert!(
                     lo <= hi || (lo >= 0 && hi < 0),
@@ -76,15 +61,9 @@ pub async fn service_viz_requests(
                     hi
                 );
 
-                let tip_height_hash: (BlockHeight, BlockHash) = {
-                    if let Ok(StateResponse::Tip(Some(tip_height_hash))) =
-                        (call.state)(StateRequest::Tip).await
-                    {
-                        tip_height_hash
-                    } else {
-                        //error!("Failed to read tip");
-                        break (BlockHeight(0), None, Vec::new(), Vec::new());
-                    }
+                let Ok(StateResponse::Tip(Some(tip_height_hash))) = (call.state)(StateRequest::Tip).await
+                else {
+                    continue 'main_loop;
                 };
 
                 let (h_lo, h_hi) = (
@@ -118,30 +97,24 @@ pub async fn service_viz_requests(
                     }
                 }
 
-                let hi_height_hash = if let Some(hi_height_hash) =
-                    get_height_hash(call.clone(), h_hi, tip_height_hash).await
-                {
-                    hi_height_hash
-                } else {
-                    break (BlockHeight(0), None, Vec::new(), Vec::new());
+                let Some(hi_height_hash) = get_height_hash(call.clone(), h_hi, tip_height_hash).await
+                else {
+                    continue 'main_loop;
                 };
 
-                let lo_height_hash = if let Some(lo_height_hash) =
-                    get_height_hash(call.clone(), h_lo, hi_height_hash).await
-                {
-                    lo_height_hash
-                } else {
-                    break (BlockHeight(0), None, Vec::new(), Vec::new());
+                let Some(lo_height_hash) = get_height_hash(call.clone(), h_lo, hi_height_hash).await
+                else {
+                    continue 'main_loop;
                 };
 
                 let (height_hashes, blocks) =
                     tfl_block_sequence(&call, lo_height_hash.1, Some(hi_height_hash), true, true).await;
-                break (
+                (
                     lo_height_hash.0,
                     Some(tip_height_hash),
                     height_hashes,
                     blocks,
-                );
+                )
             };
 
             for _ in 0..256 {
@@ -196,7 +169,6 @@ pub async fn service_viz_requests(
                     };
                     let _ = response_queue.try_send(response);
                 } else {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     continue 'main_loop;
                 }
             }
