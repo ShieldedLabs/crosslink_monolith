@@ -86,6 +86,7 @@ pub async fn service_viz_requests(
                 ) -> Option<(BlockHeight, BlockHash)> {
                     if h == existing_height_hash.0 {
                         // avoid duplicating work if we've already got that value
+                        // TODO: does this miss reorgs?
                         Some(existing_height_hash)
                     } else if let Ok(StateResponse::BlockHeader { hash, .. }) =
                         (call.state)(StateRequest::BlockHeader(h.into())).await
@@ -135,7 +136,7 @@ pub async fn service_viz_requests(
                 };
                 seq_blocks.push(block);
             }
-            
+
 
             for _ in 0..256 {
                 if let Ok(request) = request_queue.try_recv() {

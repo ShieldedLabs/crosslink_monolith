@@ -141,6 +141,14 @@ message BondInfoResponse {
     uint32 status = 2;  // 0 = Active, 1 = Unbonding, 2 = Withdrawn
 }
 
+// RequestFaucetDonation RPC
+message FaucetRequest {
+    string address = 1; // orchard-containing UA to send funds to
+}
+message FaucetResponse {
+    uint64 amount = 1;  // Donated amount in zatoshis
+}
+
 // The a shortened transaction ID is the prefix in big-endian (hex) format
 // (then converted to binary).
 message Exclude {
@@ -206,6 +214,8 @@ service CompactTxStreamer {
 
     // Return the requested full (not compact) transaction (as from zcashd)
     rpc GetTransaction(TxFilter) returns (RawTransaction) {}
+    // Return information about BFT roster
+    rpc GetRoster(Empty) returns (Bytes) {}
     // Submit the given transaction to the Zcash network
     rpc SendTransaction(RawTransaction) returns (SendResponse) {}
 
@@ -252,11 +262,11 @@ service CompactTxStreamer {
     rpc GetAddressUtxos(GetAddressUtxosArg) returns (GetAddressUtxosReplyList) {}
     rpc GetAddressUtxosStream(GetAddressUtxosArg) returns (stream GetAddressUtxosReply) {}
 
-    // Return information about BFT roster
-    rpc GetRoster(Empty) returns (Bytes) {}
-
     // Return information about a delegation bond
     rpc GetBondInfo(BondInfoRequest) returns (BondInfoResponse) {}
+
+    // Request the faucet (if attached) donates to the given address
+    rpc RequestFaucetDonation(FaucetRequest) returns (FaucetResponse) {}
 
     // Return information about this lightwalletd instance and the blockchain
     rpc GetLightdInfo(Empty) returns (LightdInfo) {}
