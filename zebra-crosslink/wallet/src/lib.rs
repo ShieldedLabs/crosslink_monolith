@@ -30,7 +30,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tonic::IntoRequest;
 use zcash_client_backend::data_api::chain::{BlockCache, CommitmentTreeRoot};
 use zcash_client_backend::data_api::wallet::{ConfirmationsPolicy, TargetHeight, create_proposed_transactions, propose_shielding, shield_transparent_funds};
-use zcash_client_backend::proto::service::{GetSubtreeRootsArg, RawTransaction, TreeState, TxFilter};
+use zcash_client_backend::proto::service::{GetSubtreeRootsArg, RawTransaction, FaucetRequest, TreeState, TxFilter};
 use zcash_client_backend::wallet::WalletTransparentOutput;
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::util::SystemClock;
@@ -3329,7 +3329,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     println!("USER WALLET ADDRESS:    {}", user_ua_str);
     println!("*************************");
 
-    wallet_state.lock().unwrap().user_recv_ua = user_ua_str;
+    wallet_state.lock().unwrap().user_recv_ua = user_ua_str.clone();
 
 
     println!("waiting for zaino to be ready...");
@@ -3353,6 +3353,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     };
+
+    println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
 
     // NOTE: current model is to reorg this many blocks back
     // ALT: have checkpoints every 16/32 blocks and always sync from the start of one of these

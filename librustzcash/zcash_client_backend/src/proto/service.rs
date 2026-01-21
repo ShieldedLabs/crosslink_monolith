@@ -59,7 +59,8 @@ pub struct RawTransaction {
     /// * height 0: the transaction is in the mempool
     /// * height 0xffffffffffffffff: the transaction has been mined on a fork that
     ///   is not currently the main chain
-    /// * any other height: the transaction has been mined in the main chain at the given height
+    /// * any other height: the transaction has been mined in the main chain at the
+    ///   given height
     #[prost(uint64, tag = "2")]
     pub height: u64,
 }
@@ -79,6 +80,12 @@ pub struct ChainSpec {}
 /// Empty is for gRPCs that take no arguments, currently only GetLightdInfo.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Empty {}
+/// Bytes is for bytes
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Bytes {
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+}
 /// LightdInfo returns various information about this lightwalletd instance
 /// and the state of the blockchain.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -184,6 +191,19 @@ pub struct BondInfoResponse {
     #[prost(uint32, tag = "2")]
     pub status: u32,
 }
+/// RequestFaucetDonation RPC
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FaucetRequest {
+    /// orchard-containing UA to send funds to
+    #[prost(string, tag = "1")]
+    pub address: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FaucetResponse {
+    /// Donated amount in zatoshis
+    #[prost(uint64, tag = "1")]
+    pub amount: u64,
+}
 /// The a shortened transaction ID is the prefix in big-endian (hex) format
 /// (then converted to binary).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -268,11 +288,6 @@ pub struct GetAddressUtxosReply {
 pub struct GetAddressUtxosReplyList {
     #[prost(message, repeated, tag = "1")]
     pub address_utxos: ::prost::alloc::vec::Vec<GetAddressUtxosReply>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Bytes {
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -570,6 +585,7 @@ pub mod compact_tx_streamer_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Return information about BFT roster
         pub async fn get_roster(
             &mut self,
             request: impl tonic::IntoRequest<super::Empty>,
@@ -982,6 +998,33 @@ pub mod compact_tx_streamer_client {
                     GrpcMethod::new(
                         "cash.z.wallet.sdk.rpc.CompactTxStreamer",
                         "GetBondInfo",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Request the faucet (if attached) donates to the given address
+        pub async fn request_faucet_donation(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FaucetRequest>,
+        ) -> std::result::Result<tonic::Response<super::FaucetResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/RequestFaucetDonation",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                        "RequestFaucetDonation",
                     ),
                 );
             self.inner.unary(req, path, codec).await

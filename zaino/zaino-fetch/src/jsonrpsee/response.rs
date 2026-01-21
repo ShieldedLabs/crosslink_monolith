@@ -1462,6 +1462,39 @@ impl ResponseToError for Option<zebra_rpc::methods::GetBondInfoResponse> {
     type RpcError = Infallible;
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum FaucetError {
+    /// No faucet available
+    #[error("Faucet unavailable")]
+    FaucetUnavailable,
+
+    /// Invalid pool
+    #[error("Invalid address: {0}")]
+    InvalidAddress(String),
+
+    /// Duplicate address
+    #[error("Duplicate address in short time period: {0}")]
+    DuplicateAddressTooSoon(String),
+}
+
+impl ResponseToError for zebra_rpc::methods::FaucetResponse {
+    type RpcError = FaucetError;
+}
+impl TryFrom<RpcError> for FaucetError {
+    type Error = RpcError;
+
+    fn try_from(value: RpcError) -> Result<Self, Self::Error> {
+        // TODO: attempt to convert RpcError into errors specific to this RPC response
+        match value.code {
+            1 => Ok(FaucetError::FaucetUnavailable),
+            2 => Ok(FaucetError::InvalidAddress(value.message)),
+            3 => Ok(FaucetError::DuplicateAddressTooSoon(value.message)),
+            _ => Err(value),
+        }
+    }
+}
+
+
 // impl From<GetBytes> for Vec<u8> {
 //     fn from(v: GetBytes) -> Vec<u8> {
 //         v.data
