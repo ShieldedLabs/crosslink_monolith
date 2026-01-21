@@ -1259,9 +1259,9 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         }
                         else {
-                            let mut prev_is_unbonded: bool = false;
+                            let mut prev_is_unbonded: Option<bool> = None;
                             let mut open_is_unbonded: bool = false;
-                            let mut prev_finalizer:   [u8; 32] = [0; 32];
+                            let mut prev_finalizer:   Option<[u8; 32]> = None;
                             let mut open_finalizer:   bool = false;
 
                             for (index, &(is_unbonded, bond_key, finalizer, initial)) in staked_roster.iter().enumerate() {
@@ -1273,8 +1273,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     h.finish() as u32
                                 };
 
-                                if (prev_is_unbonded != is_unbonded) {
-                                    prev_is_unbonded  = is_unbonded;
+                                if (prev_is_unbonded != Some(is_unbonded)) {
+                                    prev_is_unbonded  = Some(is_unbonded);
                                     let string = if is_unbonded { "Claimable Bonds" } else { "Active Positions" };
 
                                     let id = id_index(string, index);
@@ -1300,8 +1300,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     continue;
                                 }
 
-                                if (prev_finalizer != finalizer) {
-                                    prev_finalizer  = finalizer;
+                                if (prev_finalizer != Some(finalizer)) {
+                                    prev_finalizer  = Some(finalizer);
 
                                     let chunks = chunkify(&finalizer);
                                     let label = frame_strf!(data, "{}", display_str(&chunks));
