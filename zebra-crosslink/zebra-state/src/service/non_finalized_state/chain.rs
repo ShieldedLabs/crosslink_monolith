@@ -1856,19 +1856,58 @@ impl Chain {
         let size = block.zcash_serialized_size();
         self.update_chain_tip_with(&(*chain_value_pool_change, height, size))?;
 
-        let bond_reward_total_todo = 1000000;
-        let mut reward_store_for_revert: Vec<([u8; 32], u64)> = Vec::new();
-        let mut total_bond_delta = 0;
-        for (bond_key, (bond, bond_status)) in self.inner.delegation_bonds.iter_mut() {
-            if *bond_status == BondStatusInChain::Active {
-                bond.amount = (bond.amount + Amount::new(1)).unwrap();
-                total_bond_delta += 1u64;
-                reward_store_for_revert.push((*bond_key, 1u64,));
-            }
-        }
-        self.inner.chain_value_pools.set_staking_bonded_amount((self.inner.chain_value_pools.staking_bonded_amount() + Amount::new(total_bond_delta as i64)).unwrap());
-        self.bond_rewards.push(reward_store_for_revert);
+        if self.delegation_bonds.iter().position(|(_, (_, status))| *status == BondStatusInChain::Active).is_none() {
+            self.bond_rewards.push(Vec::new());
+            // TODO handle this case, for prototyping this is whatever.
+        } else {
+            /*
+            Note(Sam): This is inspired from Andrews earlier code. We will use the fact the integer division only rounds
+            down to make sure we do not accidentally mint zats. We first identify the biggest bond, this bond will recieve the remainder.
+            */
+            let mut total_staked_zats = 0u64;
+            let max_staker = {
+                let mut iter = self.inner.delegation_bonds.iter().filter(|(_, (_, status))| *status == BondStatusInChain::Active);
+                let first = iter.next().expect("is any checked already");
+                let mut max_staker = *first.0;
+                let mut biggest = first.1.0.amount.zatoshis() as u64;
+                total_staked_zats += first.1.0.amount.zatoshis() as u64;
+                for other in iter {
+                    total_staked_zats += other.1.0.amount.zatoshis() as u64;
+                    if other.1.0.amount.zatoshis() as u64 > biggest || (other.1.0.amount.zatoshis() as u64 == biggest && *other.0 < max_staker) {
+                        max_staker = *other.0;
+                        biggest = other.1.0.amount.zatoshis() as u64;
+                    }
+                }
+                max_staker
+            };
 
+            let bond_reward_total = 650_000_000;
+            let mut so_far_payed_reward = 0u64;
+
+            let mut reward_store_for_revert: Vec<([u8; 32], u64)> = Vec::new();
+            for (bond_key, (bond, bond_status)) in self.inner.delegation_bonds.iter_mut() {
+                if *bond_status == BondStatusInChain::Active && *bond_key != max_staker {
+                    let mul: u128 = (bond.amount.zatoshis() as u128) * (bond_reward_total as u128);
+                    let reward = (mul / (total_staked_zats as u128)) as u64;
+                    so_far_payed_reward += reward;
+
+                    bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
+                    reward_store_for_revert.push((*bond_key, reward,));
+                }
+            }
+
+            // Biggest bond position gets the remainder.
+            {
+                let (bond, _status) = self.inner.delegation_bonds.get_mut(&max_staker).expect("checked earlier");
+                let reward = bond_reward_total - so_far_payed_reward;
+
+                bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
+                reward_store_for_revert.push((max_staker, reward,));
+            }
+
+            self.inner.chain_value_pools.set_staking_bonded_amount((self.inner.chain_value_pools.staking_bonded_amount() + Amount::new(bond_reward_total as i64)).unwrap());
+            self.bond_rewards.push(reward_store_for_revert);
+        }
         Ok(())
     }
 }

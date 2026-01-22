@@ -52,7 +52,7 @@ pub async fn service_viz_requests(
             let bc_req_h = (bc_ack_height, -1);
 
             #[allow(clippy::never_loop)]
-            let (lo_height, bc_tip, height_hashes, seq_blocks) = {
+            let (lo_height, bc_tip, height_hashes, suspect_seq_blocks) = {
                 let (lo, hi) = (bc_req_h.0, bc_req_h.1);
                 assert!(
                     lo <= hi || (lo >= 0 && hi < 0),
@@ -117,6 +117,23 @@ pub async fn service_viz_requests(
                 )
             };
 
+            // paranoid guards
+            if lo_height.0 as i64 != bc_ack_height as i64 {
+                continue 'main_loop;
+            }
+            if suspect_seq_blocks.is_empty() {
+                continue 'main_loop;
+            }
+            let mut seq_blocks = Vec::new();
+            for maybe in suspect_seq_blocks {
+                let Some(block) = maybe
+                else {
+                    continue 'main_loop;
+                };
+                seq_blocks.push(block);
+            }
+            
+
             for _ in 0..256 {
                 if let Ok(request) = request_queue.try_recv() {
                     let mut internal = tfl_handle.internal.lock().await;
@@ -137,22 +154,20 @@ pub async fn service_viz_requests(
                     bc_ack_height = bc_ack_height.max(request.bc_ack_height as i32);
 
                     for (i, bc) in seq_blocks.iter().enumerate() {
-                        if let Some(bc) = bc {
-                            let this_hash = Hash32::from_bytes(bc.header.hash().0);
-                            if request.want_to_inspect_block == this_hash {
-                                response.what_block_it_is = this_hash;
-                                response.json_dump_of_the_block = format!("{:#?}", bc);
-                            }
-                            response.bc_blocks.push(visualizer_zcash::BcBlock {
-                                this_hash: this_hash,
-                                parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
-                                this_height: lo_height.0 as u64 + i as u64,
-                                is_best_chain: true,
-                                is_finalized: false,
-                                is_implicated_by_bft: false,
-                                points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash()),
-                            });
+                        let this_hash = Hash32::from_bytes(bc.header.hash().0);
+                        if request.want_to_inspect_block == this_hash {
+                            response.what_block_it_is = this_hash;
+                            response.json_dump_of_the_block = format!("{:#?}", bc);
                         }
+                        response.bc_blocks.push(visualizer_zcash::BcBlock {
+                            this_hash: this_hash,
+                            parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
+                            this_height: lo_height.0 as u64 + i as u64,
+                            is_best_chain: true,
+                            is_finalized: false,
+                            is_implicated_by_bft: false,
+                            points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash()),
+                        });
                     }
                     for i in request.bft_ack_height as usize..internal.bft_blocks.len() {
                         let b = &internal.bft_blocks[i];

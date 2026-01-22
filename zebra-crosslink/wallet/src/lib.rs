@@ -1082,6 +1082,9 @@ pub struct ManualWallet {
     // - any best-chain block
     // - best-chain block confirmed by N
     // - finalized block
+
+    pub seen_bond_values: HashMap<[u8; 32], u64>,
+    pub care_about_bonds: Vec<[u8; 32]>,
 }
 // N.B. using some of the same API as WalletDb to allow smooth transition/comparison
 impl ManualWallet {
@@ -1690,6 +1693,7 @@ impl ManualWallet {
                     return None;
                 }
             };
+            self.seen_bond_values.insert(bond_key, amount_zats);
 
             let memo = MemoBytes::from_bytes("Claimed bond".as_bytes()).unwrap();
             let zats = to_zats_or_dump_err("claim bond", amount_zats)?;
@@ -2964,6 +2968,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             chain_tip_h: BlockHeight(0),
             txs: Vec::new(),
             tx_h_map: HashMap::new(),
+            seen_bond_values: HashMap::new(),
+            care_about_bonds: Vec::new(),
         };
 
         (wallet, account)
@@ -4089,10 +4095,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             // println!("miner unspent UTXOs {:#?}", NL(&*miner_wallet.accounts[0].utxos));
             // println!("miner spent   UTXOs {:#?}", NL(&*miner_wallet.accounts[0].stxos));
-            println!("miner unspent notes {:#?}", NL(&*miner_wallet.accounts[0].unspent_orchard_notes));
-            println!("miner spent   notes {:#?}", NL(&*miner_wallet.accounts[0].spent_orchard_notes));
-            println!("user  unspent notes {:#?}", NL(&*user_wallet.accounts[0].unspent_orchard_notes));
-            println!("user  spent   notes {:#?}", NL(&*user_wallet.accounts[0].spent_orchard_notes));
+            // println!("miner unspent notes {:#?}", NL(&*miner_wallet.accounts[0].unspent_orchard_notes));
+            // println!("miner spent   notes {:#?}", NL(&*miner_wallet.accounts[0].spent_orchard_notes));
+            // println!("user  unspent notes {:#?}", NL(&*user_wallet.accounts[0].unspent_orchard_notes));
+            // println!("user  spent   notes {:#?}", NL(&*user_wallet.accounts[0].spent_orchard_notes));
+            // noisy
 
             let mut miner_unshielded_funds = 0;
             let mut miner_shielded_pending_funds = 0;
@@ -4149,6 +4156,17 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                 }
             }
+            for p in &mut stake_positions_bonded {
+                if let Some(zats) = user_wallet.seen_bond_values.get(&p.0) {
+                    p.2 = *zats;
+                }
+            }
+            for p in &mut stake_positions_unbonded {
+                if let Some(zats) = user_wallet.seen_bond_values.get(&p.0) {
+                    p.2 = *zats;
+                }
+            }
+            user_wallet.care_about_bonds = stake_positions_bonded.iter().map(|p| p.0).chain(stake_positions_unbonded.iter().map(|p| p.0)).collect();
 
             let waiting_for_send = proposed_send.is_in_progress();
             let waiting_for_faucet = proposed_faucet.is_in_progress();
@@ -4199,6 +4217,19 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let ok = miner_wallet.shield_transparent_zats(network, &mut proposed_miner_shield, &mut client, &miner_usk, 1000000000, &orchard_tree, memo).is_some();
             println!("Try miner shield {ok:?}");
             faucet_shield_cooldown_instant = Instant::now();
+
+            // also inspect bonds
+            for bond_key in &user_wallet.care_about_bonds {
+                match client.get_bond_info(zcash_client_backend::proto::service::BondInfoRequest { bond_key: bond_key.to_vec(), }).await {
+                    Ok(response) => {
+                        let info = response.into_inner();
+                        user_wallet.seen_bond_values.insert(*bond_key, info.amount);
+                    }
+                    Err(e) => {
+                        println!("Failed to get bond info: {:?}", e);
+                    }
+                };
+            }
         }
 
         if AUTO_SPEND != 0 {

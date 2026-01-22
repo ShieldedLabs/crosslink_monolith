@@ -1116,6 +1116,9 @@ pub fn ui_left_pane(ui: &mut Context,
                         if button_ex(ui,  "+0.1 cTAZ", can && (balance as u64) >= ONE_cTAZ / 10)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ / 10, hex_dest.unwrap());  }
                         if button_ex(ui,    "+1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ, hex_dest.unwrap());       }
                         if button_ex(ui,   "+10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10, hex_dest.unwrap());  }
+                        if button_ex(ui,   "+100 cTAZ", can && (balance as u64) >= ONE_cTAZ * 100)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 100, hex_dest.unwrap());  }
+                        if button_ex(ui,   "+1000 cTAZ", can && (balance as u64) >= ONE_cTAZ * 1000)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 1000, hex_dest.unwrap());  }
+                        if button_ex(ui,   "+10000 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10000)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10000, hex_dest.unwrap());  }
                     }
                 }
                 Modal::Unstake => {
