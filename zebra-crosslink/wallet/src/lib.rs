@@ -771,6 +771,7 @@ pub struct WalletState {
     pub user_shielded_spendable_funds: u64,
 
     pub staked_balance:  u64, // in zats
+    pub withdrawable_balance:  u64, // in zats
     pub show_staked_balance: bool,
 
     pub user_txs:      Vec<WalletTx>,
@@ -4155,15 +4156,19 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                 }
             }
+            let mut user_staked_funds = 0;
+            let mut user_withdrawable_funds = 0;
             for p in &mut stake_positions_bonded {
                 if let Some(zats) = user_wallet.seen_bond_values.get(&p.0) {
                     p.2 = *zats;
                 }
+                user_staked_funds += p.2;
             }
             for p in &mut stake_positions_unbonded {
                 if let Some(zats) = user_wallet.seen_bond_values.get(&p.0) {
                     p.2 = *zats;
                 }
+                user_withdrawable_funds += p.2;
             }
             user_wallet.care_about_bonds = stake_positions_bonded.iter().map(|p| p.0).chain(stake_positions_unbonded.iter().map(|p| p.0)).collect();
 
@@ -4190,6 +4195,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             lock.stake_positions_bonded = stake_positions_bonded;
             lock.stake_positions_unbonded = stake_positions_unbonded;
+
+            lock.staked_balance = user_staked_funds;
+            lock.withdrawable_balance = user_withdrawable_funds;
         }
 
 

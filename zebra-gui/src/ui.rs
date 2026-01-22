@@ -1466,6 +1466,7 @@ pub fn ui_left_pane(ui: &mut Context,
             balance,
             pending_balance,
             staked_balance,
+            withdrawable_balance,
             show_staked_balance,
         ) = {
             let wallet_state = wallet_state.lock().unwrap();
@@ -1473,10 +1474,12 @@ pub fn ui_left_pane(ui: &mut Context,
                 wallet_state.user_balance(),
                 wallet_state.user_pending_balance(),
                 wallet_state.staked_balance,
+                wallet_state.withdrawable_balance,
                 wallet_state.show_staked_balance,
             )} else {(
                 wallet_state.miner_balance(),
                 wallet_state.miner_pending_balance(),
+                0u64,
                 0u64,
                 wallet_state.show_staked_balance,
             )}
@@ -1521,6 +1524,24 @@ pub fn ui_left_pane(ui: &mut Context,
 
             let balance_str = frame_strf!(data, "{} cTAZ Pending", str_from_ctaz(pending_balance.try_into().unwrap()));
             ui.text(&balance_str, TextDecl { h: accent_text_h, align: AlignX::Center, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
+        }
+        if let _ = elem().decl(Decl {
+            width: grow!(),
+            height: fit!(),
+            align: Center,
+            ..Decl
+        }) {
+            let staked_str = frame_strf!(data, "{} cTAZ Staked", str_from_ctaz(staked_balance.try_into().unwrap()));
+            ui.text(&staked_str, TextDecl { h: accent_text_h, align: AlignX::Center, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
+        }
+        if let _ = elem().decl(Decl {
+            width: grow!(),
+            height: fit!(),
+            align: Center,
+            ..Decl
+        }) {
+            let withdrawable_str = frame_strf!(data, "{} cTAZ Withdrawable", str_from_ctaz(withdrawable_balance.try_into().unwrap()));
+            ui.text(&withdrawable_str, TextDecl { h: accent_text_h, align: AlignX::Center, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
         }
 
         // spacer
