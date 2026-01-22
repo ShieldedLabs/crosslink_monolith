@@ -333,9 +333,9 @@ impl ProposedTx {
             account_id: 0,
             txid: TxId::from_bytes([0; 32]),
             expiry_h: None,
-            mined_h: BlockHeight::INVALID,
+            h: BlockHeight::INVALID,
             is_coinbase: false,
-            is_outside_bc: true, // default invalid
+            status: TxStatus::SoftFail(BlockHeight::INVALID),
             part_flags: 0,
             parts: [WalletTxPart::ZERO; 2],
             memo_count: 0,
@@ -347,8 +347,8 @@ impl ProposedTx {
     };
 
     fn is_in_progress(&self) -> bool {
-        (BlockHeight::SENT..=BlockHeight::PROPOSED).contains(&self.tx.mined_h) &&
-            !self.tx.is_outside_bc
+        (BlockHeight::SENT..=BlockHeight::PROPOSED).contains(&self.tx.h) &&
+            self.tx.is_on_bc()
     }
 }
 
@@ -613,13 +613,53 @@ impl TxParts {
     );
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ErrBuf(pub [u8; 128]);
+impl ErrBuf {
+    pub fn from_str(err_str: &str) -> ErrBuf {
+        let mut buf = ErrBuf([0;128]);
+        let err_bytes = err_str.as_bytes();
+        let len = err_bytes.len().min(buf.0.len());
+        buf.0.copy_from_slice(&err_bytes[..len]);
+        buf
+    }
+    pub fn to_string(&self) -> String {
+        String::from_utf8_lossy(&self.0).to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TxStatus {
+    OnBc,
+    SoftFail(BlockHeight),
+    HardFail(BlockHeight, ErrBuf),
+}
+impl TxStatus {
+    pub fn to_any_fail(&self) -> Option<BlockHeight> {
+        match self {
+            TxStatus::OnBc => None,
+            TxStatus::SoftFail(h) => Some(*h),
+            TxStatus::HardFail(h, _) => Some(*h),
+        }
+    }
+
+    pub fn is_on_bc(&self) -> bool {
+        match self {
+            TxStatus::OnBc => true,
+            _ => false,
+        }
+    }
+}
+
+
 // NOTE: trying to not store data that can be computed directly
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WalletTx {
     pub account_id: usize,
     pub txid: zcash_protocol::TxId,
     pub expiry_h: Option<BlockHeight>,
-    pub mined_h: BlockHeight, // TODO: provides location
+    pub h: BlockHeight,  // this is a logical height that is focused on ordering
 
     // TODO: track whether full Transaction has been read
     pub is_coinbase: bool,
@@ -631,12 +671,19 @@ pub struct WalletTx {
     pub memo_count: usize,
     pub memo: [u8; 512],
 
-    pub is_outside_bc: bool, // TODO: "failed_height"; provides fallback symbol info
-
+    pub status: TxStatus,
     pub staking_action: Option<StakingAction>,
 }
 
 impl WalletTx {
+    pub fn reported_height(&self) -> BlockHeight {
+        self.status.to_any_fail().unwrap_or(self.h)
+    }
+
+    pub fn is_on_bc(&self) -> bool {
+        self.status.is_on_bc()
+    }
+
     pub fn with_fake_data(kind: WalletTxKind, sent: u64, recv: u64, shielding: bool, is_outside_bc: bool, memo: &str, mined_h: u32) -> Self {
         let mut memo_as_bytes = EMPTY_MEMO_BYTES;
         &memo_as_bytes[0..memo.len()].copy_from_slice(memo.as_bytes());
@@ -645,7 +692,7 @@ impl WalletTx {
             account_id: 0,//AccountUuid::default(),
             txid: TxId::from_bytes([0; 32]),
             expiry_h: None,
-            mined_h: if mined_h != 0 { (BlockHeight(mined_h)) } else { BlockHeight::MEMPOOL },
+            h: if mined_h != 0 { (BlockHeight(mined_h)) } else { BlockHeight::MEMPOOL },
             part_flags: TxParts::FULL_TX,
             parts: [
                 WalletTxPart { // Transparent
@@ -668,7 +715,7 @@ impl WalletTx {
             memo_count: if memo.len() != 0 { 1 } else { 0 },
             memo: memo_as_bytes,
             is_coinbase: false,
-            is_outside_bc,
+            status: if is_outside_bc { TxStatus::SoftFail(BlockHeight(mined_h)) } else { TxStatus::OnBc }, // may need to change...
             staking_action: None,
         }
     }
@@ -741,19 +788,19 @@ impl WalletTx {
     }
 
 //     pub fn loc(&self, finalized_h: BlockHeight, bc_tip_h: BlockHeight) -> (WalletTxLoc, u32, bool/*finalized*/, bool/*outside_bc*/) {
-//         match self.mined_h {
+//         match self.h {
 //             BlockHeight::MEMPOOL  => (WalletTxLoc::Mempool,  falsself.is_outside_bc),
 //             BlockHeight::INTERNAL => (WalletTxLoc::Internal, falsself.is_outside_bc),
 //             _ => {
 //                 if self.is_outside_bc {
 //                     (WalletTxLoc::Block(0), self.is_outside_bc)
-//                 } else if self.mined_h > bc_tip_h {
-//                     println!("ERROR: mined h on best chain ({}) higher than tip ({})", self.mined_h, bc_tip_h);
+//                 } else if self.h > bc_tip_h {
+//                     println!("ERROR: mined h on best chain ({}) higher than tip ({})", self.h, bc_tip_h);
 //                     return (WalletTxLoc::Block(0), true);
-//                 } else if self.mined_h <= finalized_h {
+//                 } else if self.h <= finalized_h {
 //                     (WalletTxLoc::Finalized, self.is_outside_bc)
 //                 } else {
-//                     (WalletTxLoc::Block(bc_tip_h - self.mined_h), self.is_outside_bc)
+//                     (WalletTxLoc::Block(bc_tip_h - self.h), self.is_outside_bc)
 //                 }
 //             }
 //         }
@@ -949,7 +996,7 @@ fn addrs_from_account(account: &ManualAccount, index: u32) -> Option<(Transparen
 fn update_insert_i(txs: &[WalletTx], insert_i: &mut usize, block_h: BlockHeight) {
     // put at the *end* of txs at the same height
     // i.e. primarily sorted by mined height, secondarily by discovered_time
-    *insert_i += txs[*insert_i..].partition_point(|tx| tx.mined_h <= block_h);
+    *insert_i += txs[*insert_i..].partition_point(|tx| tx.h <= block_h);
 }
 
 fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, insert_i: &mut usize) {
@@ -969,17 +1016,17 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, i
     }
 
     if let Some(tx_h) = wallet.tx_h_map.get_mut(&txid) {
-        if let Some(tx_i) = tx_mined_h_position(&wallet.txs, *tx_h, &txid) {
+        if let Some(tx_i) = tx_h_position(&wallet.txs, *tx_h, &txid) {
             let old_tx = &wallet.txs[tx_i];
             if old_tx != &new_tx {
-                if new_tx.mined_h == BlockHeight::MEMPOOL && old_tx.mined_h.is_in_block() && !old_tx.is_outside_bc {
+                if new_tx.h >= BlockHeight::MEMPOOL && old_tx.h.is_in_block() && old_tx.is_on_bc() {
                     // NOTE: mempool fetch is not synced to chain reading
-                    println!("mempool tx already in best chain; skipping");
+                    println!("transient tx already in best chain; skipping");
                     return;
                 }
 
                 if DUMP_TX_RECV {
-                    println!("{} wallet updated existing transaction {txid} {:?} => {:?}", wallet.name, old_tx.mined_h, new_tx.mined_h);
+                    println!("{} wallet updated existing transaction {txid} {:?} => {:?}", wallet.name, old_tx.h, new_tx.h);
                 }
                 // println!("{} wallet updated existing transaction {txid} {old_tx:?} => {new_tx:?}", wallet.name);
 
@@ -1024,11 +1071,11 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, i
         } else {
             println!("ERROR: {txid:?} not found at associated height {tx_h:?}");
         }
-        *tx_h = new_tx.mined_h;
+        *tx_h = new_tx.h;
     } else {
-        wallet.tx_h_map.insert(txid, new_tx.mined_h);
+        wallet.tx_h_map.insert(txid, new_tx.h);
         if DUMP_TX_RECV {
-            println!("{} wallet inserted new transaction {txid} at {:?}", wallet.name, new_tx.mined_h);
+            println!("{} wallet inserted new transaction {txid} at {:?}", wallet.name, new_tx.h);
         }
     }
     wallet.txs.insert(*insert_i, new_tx);
@@ -1090,7 +1137,7 @@ pub struct ManualWallet {
     // TODO: change type
     // TODO: to avoid nested variably-sized data, we could split these into actions that are
     // txid-linked, then reconstruct on request
-    /// sorted by (mined_h, discovery_time)
+    /// sorted by (h, discovery_time)
     pub txs: Vec<WalletTx>,
     pub tx_h_map: HashMap<TxId, BlockHeight>, // NOTE: not a direct index because txs get inserted
     // data_api has max_scanned in case they're scanned out of order
@@ -1156,25 +1203,27 @@ impl ManualWallet {
         let mut raw_tx = RawTransaction{ data: Vec::new(), height: 0 };
         if let Err(err) = tx.write(&mut raw_tx.data) {
             println!("couldn't serialize transaction for network send: {err:?}");
-            wallet_tx.is_outside_bc = true;
+            let err_buf = ErrBuf::from_str(&format!("couldn't serialize: {err:?}"));
+            wallet_tx.status = TxStatus::HardFail(wallet_tx.h, err_buf); // i.e. built but not sent
+            wallet_tx.h = self.chain_tip_h; // TODO: this should maybe be "sync'd height"
         } else {
             let res = client.send_transaction(raw_tx).await;
             if DUMP_TX_SEND { println!("******* res for {:?}: {:?}", tx.txid(), res); }
             // TODO: distinguish sends that weren't network issues
             if res.is_ok() {
-                wallet_tx.mined_h = BlockHeight::SENT;
+                wallet_tx.h = BlockHeight::SENT;
             } else {
-                wallet_tx.is_outside_bc = true;
+                wallet_tx.status = TxStatus::SoftFail(wallet_tx.h); // i.e. built but not sent
+                wallet_tx.h = self.chain_tip_h; // TODO: this should maybe be "sync'd height"
             };
         }
 
-        !wallet_tx.is_outside_bc
+        wallet_tx.is_on_bc()
     }
 
     fn build_tx_from_prep<P: Parameters>(&mut self, network: P, tx: &mut ProposedTx, prep: BuildPrep) -> bool {
         let tz = Timer::scope_("build_tx_from_prep", DUMP_TX_SEND | DUMP_TX_BUILD);
         let prep_fee = prep.fee_required();
-        tx.tx.is_outside_bc = true; // failed until we get past thits point
 
         let BuildPrep{
             block_h, build_config,
@@ -1248,17 +1297,19 @@ impl ManualWallet {
             Ok(tx_res) => {
                 tx.tx = WalletTx {
                     txid: tx_res.transaction().txid(),
-                    mined_h: BlockHeight::BUILT,
-                    is_outside_bc: false,
+                    h: BlockHeight::BUILT,
+                    status: TxStatus::OnBc,
                     ..tx.tx
                 };
                 tx.tx_res = Some(tx_res);
+                true
             }
 
-            Err(err) => println!("tx build error: {err:?}"),
+            Err(err) => {
+                println!("tx build error: {err:?}");
+                false
+            }
         }
-
-        !tx.tx.is_outside_bc
     }
 
 
@@ -1585,10 +1636,10 @@ impl ManualWallet {
         };
 
         tx.tx = WalletTx {
-            mined_h: BlockHeight::PROPOSED,
             part_flags: TxParts::FULL_TX,
             parts: [t, s],
-            is_outside_bc: false,
+            h: BlockHeight::PROPOSED,
+            status: TxStatus::OnBc,
             ..tx.tx
         };
         tx.prep = Some(prep);
@@ -1602,7 +1653,7 @@ impl ManualWallet {
     {
         let res = self.send_zats_no_insert(network, tx, client, outputs, src_usk, opts);
         // let mut insert_i = 0;
-        // update_insert_i(&self.txs, &mut insert_i, tx.tx.mined_h);
+        // update_insert_i(&self.txs, &mut insert_i, tx.tx.h);
         // update_with_tx(self, tx.tx.txid, tx.tx, &mut insert_i);
         res
     }
@@ -1878,9 +1929,9 @@ fn txo_spent_h_position(notes: &[Txo], block_h: BlockHeight, utxo_id: &OutPoint)
     }
     None
 }
-fn tx_mined_h_position(txs: &[WalletTx], block_h: BlockHeight, txid: &TxId) -> Option<usize> {
-    let mut i = txs.partition_point(|tx| tx.mined_h < block_h);
-    while i < txs.len() && txs[i].mined_h == block_h {
+fn tx_h_position(txs: &[WalletTx], block_h: BlockHeight, txid: &TxId) -> Option<usize> {
+    let mut i = txs.partition_point(|tx| tx.h < block_h);
+    while i < txs.len() && txs[i].h == block_h {
         if &txs[i].txid == txid {
             return Some(i);
         }
@@ -1892,7 +1943,7 @@ fn tx_mined_h_position(txs: &[WalletTx], block_h: BlockHeight, txid: &TxId) -> O
 // GET NOTE/TX INDEXES WITH UNKNOWN HEIGHTS IN SORTED SLICES
 fn tx_position(wallet: &ManualWallet, txid: &TxId) -> Option<usize> {
     if let Some(&tx_h) = wallet.tx_h_map.get(txid) {
-        tx_mined_h_position(&wallet.txs, tx_h, txid)
+        tx_h_position(&wallet.txs, tx_h, txid)
     } else {
         None
     }
@@ -2027,7 +2078,7 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
             block_h
         };
 
-        // TODO: can we just check if we've seen the tx && tx.is_outside_bc == false
+        // TODO: can we just check if we've seen the tx && tx.is_on_bc()
         let have_seen = if let Some(i) = orchard_recv_h_position(&account.recv_orchard_notes, txid_h, &orchard_note.nf) {
             account.recv_orchard_notes[i].monotonically_update(orchard_note);
             true
@@ -2046,10 +2097,9 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
     Some(s)
 }
 
-fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize, is_outside_bc: bool) -> Option<()> {
+fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize, status: TxStatus) -> Option<()> {
     // TODO: we probably want to early-out if our existing tx data is complete
     // (after checking that this doesn't get modified)
-    update_insert_i(&wallet.txs, insert_i, block_h);
 
     let mut expiry_h = Some(BlockHeight::from(tx.expiry_height()));
     if expiry_h.unwrap().0 == 0 {
@@ -2206,16 +2256,17 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
         account_id: 0,
         txid,
         expiry_h,
-        mined_h: block_h,
+        h: block_h,
         part_flags: TxParts::FULL_TX,
         parts: [t, s],
         memo_count,
         memo,
         is_coinbase,
-        is_outside_bc,
+        status,
         staking_action: tx.staking_action(),
     };
 
+    update_insert_i(&wallet.txs, insert_i, block_h);
     update_with_tx(wallet, new_tx.txid, new_tx, insert_i);
     Some(())
 }
@@ -2347,13 +2398,13 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
             account_id: account_i,
             txid,
             expiry_h: None, // TODO
-            mined_h: block_h,
+            h: block_h,
             part_flags: TxParts::SHIELDED_RECV,
             parts: [ WalletTxPart::ZERO, shielded_part ],
             memo_count: 0,
             memo: EMPTY_MEMO_BYTES,
             is_coinbase: false,
-            is_outside_bc: false,
+            status: TxStatus::OnBc,
             staking_action: None,
         };
 
@@ -3100,7 +3151,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         break;
                     }
 
-                    if !tx.is_outside_bc &&
+                    if tx.is_on_bc() &&
                         tx.part_flags != TxParts::FULL_TX &&
                         // (tx.part_flags & TxParts::MEMO) == 0 &&
                             in_flight_tx_requests.get(&tx.txid).is_none()
@@ -3427,10 +3478,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
 
                 //  higher blocks & mempool
-                let invalidate_from_i = wallet.txs.partition_point(|tx| tx.mined_h < block_h);
+                let invalidate_from_i = wallet.txs.partition_point(|tx| tx.h < block_h);
                 for tx in &mut wallet.txs[invalidate_from_i..] {
                     // N.B. these may get revalidated later if the same txs are found in the new blocks
-                    tx.is_outside_bc = true;
+                    tx.status = TxStatus::SoftFail(tx.h);
+                    tx.h = wallet.chain_tip_h;
+                    wallet.tx_h_map.remove(&tx.txid);
+                    wallet.tx_h_map.insert(tx.txid, tx.h);
                 }
             }
         }
@@ -3450,7 +3504,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 // kinda @in_step_sync
                 let block_h = miner_t_txs[t_tx_i].0;
                 let tx = &miner_t_txs[t_tx_i].1;
-                read_full_tx(&mut miner_wallet, 0, &keys, block_h, tx, &mut insert_i, false);
+                read_full_tx(&mut miner_wallet, 0, &keys, block_h, tx, &mut insert_i, TxStatus::OnBc);
             }
         }
 
@@ -3478,7 +3532,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                     Ok(tx) => {
                         for i in 0..2 {
-                            read_full_tx(wallets[i], 0, &keys[i], BlockHeight::MEMPOOL, &tx, insert_idxs[i], false);
+                            read_full_tx(wallets[i], 0, &keys[i], BlockHeight::MEMPOOL, &tx, insert_idxs[i], TxStatus::OnBc);
                         }
                     }
                 }
@@ -3550,10 +3604,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     let existing_tx = &wallets[wallet_i].txs[existing_tx_i];
 
                     let found_h = match bc_h_from_raw_tx_h(raw_tx.height) {
-                        Some(None) => existing_tx.mined_h, // on sidechain: use previously-spec'd height
+                        Some(None) => existing_tx.h, // on sidechain: use previously-spec'd height
                         Some(Some(h)) => {
-                            if h != existing_tx.mined_h {
-                                println!("requested tx {txid:?} has moved from {:?} to {h:?}", existing_tx.mined_h);
+                            if h != existing_tx.h {
+                                println!("requested tx {txid:?} has moved from {:?} to {h:?}", existing_tx.h);
                             }
                             h
                         },
@@ -3566,7 +3620,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     let tx = match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, lrz_h)) {
                         Ok(tx) => tx,
                         Err(err) => {
-                            println!("failed to read tx at height {:?}/{found_h:?}/{lrz_h:?}", existing_tx.mined_h);
+                            println!("failed to read tx at height {:?}/{found_h:?}/{lrz_h:?}", existing_tx.h);
                             continue;
                         }
                     };
@@ -3574,7 +3628,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     if DUMP_SYNC { println!("reading downloaded full tx for {txid:?}"); }
                     let keys = PreparedKeys::from_ufvk_all(&wallets[wallet_i].accounts[0].ufvk);
 
-                    read_full_tx(wallets[wallet_i], 0, &keys, existing_tx.mined_h, &tx, &mut 0, existing_tx.is_outside_bc);
+                    read_full_tx(wallets[wallet_i], 0, &keys, existing_tx.h, &tx, &mut 0, existing_tx.status);
                 }
             }
             if DUMP_SYNC { println!("after  reading, there are {} in flight tx downloads", in_flight_tx_requests.len()); }
@@ -3627,7 +3681,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let mut stake_positions_bonded = Vec::new();
             let mut stake_positions_unbonded = Vec::new();
             for tx in &user_wallet.txs {
-                if tx.is_outside_bc { continue; }
+                if !tx.is_on_bc() { continue; }
                 if let Some(staking_action) = (&tx.staking_action) {
                     if let Some(create_bond) = StakingAction_CreateNewDelegationBond::try_from_union(staking_action) {
                         stake_positions_bonded.push((create_bond.unique_pubkey, create_bond.target_finalizer, create_bond.amount_zats));
@@ -3832,11 +3886,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         { //-- INCREMENTALLY SEND TXS
             async fn continue_proposed_tx<P: Parameters>(wallet: &mut ManualWallet, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>, desc: &str, loud: bool) {
-                let pre_mined_h = tx.tx.mined_h;
-                match tx.tx.mined_h {
+                let pre_mined_h = tx.tx.h;
+                match tx.tx.h {
                     BlockHeight::PROPOSED => {
-                        tx.tx.mined_h = BlockHeight::INVALID; // only one attempt
-
                         let mut ok = false;
                         if let None = tx.tx.parts[0]
                             .checked_add(&tx.tx.parts[1])
@@ -3850,17 +3902,18 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         };
 
                         if ! ok { // give it a final failed height
-                            tx.tx.mined_h = wallet.chain_tip_h;
+                            tx.tx.status = TxStatus::HardFail(tx.tx.h, ErrBuf::from_str("failed to build"));
+                            tx.tx.h = wallet.chain_tip_h;
                         }
                         let mut insert_i = 0;
-                        update_insert_i(&wallet.txs, &mut insert_i, tx.tx.mined_h);
+                        update_insert_i(&wallet.txs, &mut insert_i, tx.tx.h);
                         update_with_tx(wallet, tx.tx.txid, tx.tx, &mut insert_i);
 
                         if loud {
-                            println!("tried to build {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.mined_h, !tx.tx.is_outside_bc);
+                            println!("tried to build {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.h, tx.tx.is_on_bc());
                         }
                         if ! ok {
-                            *tx = ProposedTx::EMPTY;
+                            *tx = ProposedTx::EMPTY; // Meaningless to retry
                         }
                     }
 
@@ -3870,18 +3923,15 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         if let Some(tx_res) = &tx.tx_res {
                             ok = wallet.send_built_tx(network, client, &mut tx.tx, tx_res.transaction()).await;
                             if loud {
-                                println!("tried to send {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.mined_h, !tx.tx.is_outside_bc);
+                                println!("tried to send {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.h, tx.tx.is_on_bc());
                             }
                         } else {
                             *tx = ProposedTx::EMPTY; // not enough info to retry; bail
                             println!("unexpectedly no tx_res ready for send");
                         }
 
-                        if ! ok { // give it a final failed height
-                            tx.tx.mined_h = wallet.chain_tip_h;
-                        }
                         let mut insert_i = 0;
-                        update_insert_i(&wallet.txs, &mut insert_i, tx.tx.mined_h);
+                        update_insert_i(&wallet.txs, &mut insert_i, tx.tx.h);
                         update_with_tx(wallet, tx.tx.txid, tx.tx, &mut insert_i);
 
                         if ok {
