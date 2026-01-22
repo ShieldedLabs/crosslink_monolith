@@ -188,12 +188,14 @@ impl Default for OnScreenBft {
 }
 
 const COLOR_BC:     u32 = 0x82ccc0;
+const COLOR_NBC:    u32 = 0x808080;
 const COLOR_BFT:    u32 = 0xdc4c4f;
 const COLOR_ACCENT: u32 = 0x121212;
 
 const COLOR_BC_LINK:    u32 = 0x4e7b73;
 const COLOR_BFT_LINK:   u32 = 0x9a2d37;
 const COLOR_CROSS_LINK: u32 = 0x4e7b73;
+const COLOR_NBC_LINK:   u32 = 0x4f4f4f;
 
 pub struct VizState {
     pub camera_x: f32,
@@ -495,6 +497,10 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         if on_screen_bc.block.this_height == viz_state.bc_tip_height {
             viz_state.bc_tip_y = on_screen_bc.t_y;
         }
+
+        if !on_screen_bc.block.is_best_chain {
+            on_screen_bc.alpha = 0.25;
+        }
     }
     for on_screen_bft in magic(&mut viz_state.on_screen_bfts).values_mut() {
         if on_screen_bft.block.this_hash == hovered_block {
@@ -599,7 +605,15 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     for on_screen_bc in viz_state.on_screen_bcs.values() {
         let x = on_screen_bc.x;
         let y = on_screen_bc.y;
-        let color = (((on_screen_bc.alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BC, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
+        let finalized_and_on_bc = on_screen_bc.block.is_best_chain && on_screen_bc.block.this_height <= viz_state.bc_finalized_tip_height;
+        let non_finalized_and_on_bc = on_screen_bc.block.is_best_chain && on_screen_bc.block.this_height > viz_state.bc_finalized_tip_height;
+        let base_color = if finalized_and_on_bc || non_finalized_and_on_bc {
+            COLOR_BC
+        } else {
+            COLOR_NBC
+        };
+
+        let color = (((on_screen_bc.alpha*255.0) as u32) << 24) | blend_u32(0x000000, base_color, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
         let color_accent = (((on_screen_bc.alpha*on_screen_bc.finalized_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_ACCENT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
         let color_bft = (((on_screen_bc.alpha*on_screen_bc.implicated_by_bft_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BFT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
 
@@ -611,6 +625,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             viz_state.inspecting_block_screen_x = origin_x + (x*screen_unit);
             viz_state.inspecting_block_screen_y = origin_y + (y*screen_unit);
         }
+
         if very_zoom_out {
             draw_ctx.rectangle(origin_x + (x*screen_unit) - screen_unit*30.0, origin_y + (y*screen_unit), origin_x + (x*screen_unit) + screen_unit*5.0, origin_y + (y*screen_unit) + screen_unit*2.0, (color&0xFFffFF) | ((color >> 26) << 24));
         }
@@ -619,9 +634,9 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit / 2.0, (screen_unit / 2.0)*on_screen_bc.roundness, color_accent);
         }
 
-        // @todo(judah): not sure what this circle is supposed to represent
-        // draw_ctx.circle_square(origin_x + (x*screen_unit) + screen_unit / 3.0, origin_y + (y*screen_unit) - screen_unit / 3.0, screen_unit / 3.0, (screen_unit / 3.0), color_bft);
-        // Answer(Sam): It shows that the block is mentioned inside a BFT block. This is needed in some form so that people can see that sigma is not just 1.
+        if non_finalized_and_on_bc {
+            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit * 0.75, screen_unit*on_screen_bc.roundness * 0.75, 0xFF080808);
+        }
 
         if very_zoom_out == false {
             let here_text_y = (origin_y + (y - 0.5)*screen_unit);
@@ -667,12 +682,14 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 let dx = px-x;
                 let dy = py-y;
                 let (dx, dy, l) = split_vector(dx, dy);
+
                 draw_ctx.line(
                     origin_x + (x + dx * 2.0) * screen_unit,
                     origin_y + (y + dy * 2.0) * screen_unit,
                     origin_x + (x + dx * (l - 2.0))*screen_unit,
                     origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                    arrow_and_line_width, COLOR_BC_LINK | (((on_screen_bc.alpha*255.0) as u32) << 24),
+                    arrow_and_line_width,
+                    base_color | (((on_screen_bc.alpha*255.0) as u32) << 24),
                 );
             }
             if let Some(pointing_at_bft) = viz_state.on_screen_bfts.get(&on_screen_bc.block.points_at_bft_block) {
