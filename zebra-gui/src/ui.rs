@@ -1306,7 +1306,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 if (prev_finalizer != Some(finalizer)) {
                                     prev_finalizer  = Some(finalizer);
 
-                                    let chunks = chunkify(&finalizer);
+                                    let chunks = chunkify(&bond_key);
                                     let label = frame_strf!(data, "{}", display_str(&chunks));
 
                                     let id = id_index(label, index);
@@ -1385,7 +1385,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                         align: Left,
                                         ..Decl
                                     }) {
-                                        let chunks = chunkify(&finalizer);
+                                        let chunks = chunkify(&bond_key);
 
                                         ui.text(frame_strf!(data, "{}", display_str(&chunks)), TextDecl { font: Mono, h: ui.scale(14.0), align: AlignX::Left, ..TextDecl });
                                     }

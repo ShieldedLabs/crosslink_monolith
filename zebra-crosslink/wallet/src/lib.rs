@@ -4131,7 +4131,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
 
             let user_txs = user_wallet.txs.clone();
-            let miner_txs = miner_wallet.txs.clone();
+            let mut miner_txs = miner_wallet.txs[miner_wallet.txs.len().saturating_sub(20)..].to_vec();
 
             let mut stake_positions_bonded = Vec::new();
             let mut stake_positions_unbonded = Vec::new();
