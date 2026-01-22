@@ -185,6 +185,8 @@ pub(crate) struct TFLServiceInternal {
     our_set_bft_string: Option<String>,
     active_bft_string: Option<String>,
 
+    peer_strings: Vec<String>,
+
     // TODO: 2 versions of this: ever-added (in sequence) & currently non-0
     validators_keys_to_names: HashMap<MalPublicKey, String>,
     validators_at_current_height: Vec<MalValidator>,
@@ -947,6 +949,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         let tfl_handle5 = internal_handle.clone();
         let tfl_handle6 = internal_handle.clone();
         let tfl_handle7 = internal_handle.clone();
+        let tfl_handle8 = internal_handle.clone();
 
         use ed25519_zebra::VerificationKeyBytes;
         let tender_pub = VerificationKeyBytes::from(&my_private_key);
@@ -1171,6 +1174,23 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                             internal.active_bft_string = Some(str)
                         }
                         None
+                    }
+                })
+            })),
+            tenderlink::ClosureToUpdatePeers(Arc::new(move |all_peers| {
+                let tfl_handle = tfl_handle8.clone();
+                Box::pin(async move {
+                    let mut internal = tfl_handle.internal.lock().await;
+                    internal.peer_strings.truncate(0);
+
+                    for peer in &all_peers {
+                        internal.peer_strings.push(format!("{} {} ({}) - ({}, {})",
+                            if let Some(pubkey) = peer.root_public_bft_key { tenderlink::PubKeyID(pubkey).to_string() } else { "unknown peer".to_string() },
+                            if peer.connected { "connected" } else { "disconnected" },
+                            if peer.connection_is_unknown { "unknown" } else { "known" },
+                            peer.latest_status_request_height,
+                            peer.latest_status_request_powlink_id
+                        ));
                     }
                 })
             })),

@@ -139,12 +139,13 @@ pub async fn service_viz_requests(
                     let mut internal = tfl_handle.internal.lock().await;
                     let mut response = visualizer_zcash::ResponseFromZebra::_0();
                     response.bc_tip_height = bc_tip_height;
-                    response.bc_finalized_tip_height = if let Some(latest_finalized_block) = internal.current_bc_final {
+                    response.bc_finalized_tip_height = if let Some(latest_finalized_block) = internal.latest_final_block {
                         latest_finalized_block.0.0 as u64
                     } else {
                         0
                     };
                     response.bft_tip_height = (internal.bft_blocks.len() as u64).saturating_sub(1);
+                    response.peer_strings = internal.peer_strings.clone();
 
                     response.orchard_pool_balance = orchard_pool_balance;
                     response.staking_bonded_pool_balance = staking_bonded_pool_balance;

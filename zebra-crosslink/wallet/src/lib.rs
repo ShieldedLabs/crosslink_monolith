@@ -4099,7 +4099,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // println!("miner spent   notes {:#?}", NL(&*miner_wallet.accounts[0].spent_orchard_notes));
             // println!("user  unspent notes {:#?}", NL(&*user_wallet.accounts[0].unspent_orchard_notes));
             // println!("user  spent   notes {:#?}", NL(&*user_wallet.accounts[0].spent_orchard_notes));
-            // noisy
 
             let mut miner_unshielded_funds = 0;
             let mut miner_shielded_pending_funds = 0;

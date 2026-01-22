@@ -1574,10 +1574,12 @@ pub fn ui_left_pane(ui: &mut Context,
             };
 
             let can = (*tab_id == tab_id_user_wallet);
-            if button(ui, can, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
-            if button(ui, can, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
-            if button(ui, can, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
-            if button(ui, can, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
+            if can {
+                if button(ui, can, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
+                if button(ui, can, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
+                if button(ui, can, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
+                if button(ui, can, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
+            }
         }
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
@@ -2372,6 +2374,13 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     ui.text(frame_strf!(data, "Orchard Pool Zatoshis: {}", viz.orchard_pool_balance), decl);
                     ui.text(frame_strf!(data, "Staking (Bonded) Pool Zatoshis: {}", viz.staking_bonded_pool_balance), decl);
                     ui.text(frame_strf!(data, "Staking (Unbonded) Pool Zatoshis: {}", viz.staking_unbonded_pool_balance), decl);
+
+                    if ui.debug {
+                        ui.text("------------------", decl);
+                        for peer in &viz.peer_strings {
+                            ui.text(peer, decl);
+                        }
+                    }
                 }
             }
 
