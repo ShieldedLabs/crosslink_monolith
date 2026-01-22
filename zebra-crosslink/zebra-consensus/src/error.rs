@@ -223,6 +223,32 @@ pub enum TransactionError {
 
     #[error("wrong tx format: tx version is ≥ 5, but `nConsensusBranchId` is missing")]
     MissingConsensusBranchId,
+
+    #[error(
+        "staking action delay not met: bond {bond_key:?} last action at height {last_action_height}, \
+         current height {current_height}, required delay is {required_delay} blocks"
+    )]
+    #[non_exhaustive]
+    StakingActionDelayNotMet {
+        bond_key: [u8; 32],
+        last_action_height: u32,
+        current_height: u32,
+        required_delay: u32,
+    },
+
+    #[error("staking action on non-existent bond: {bond_key:?}")]
+    StakingActionBondNotFound { bond_key: [u8; 32] },
+
+    #[error(
+        "staking action outside staking window: block {block_height} is not within the staking window \
+         (staking allowed when block_height % {period} < {window})"
+    )]
+    #[non_exhaustive]
+    StakingActionOutsideWindow {
+        block_height: u32,
+        period: u32,
+        window: u32,
+    },
 }
 
 impl From<ValidateContextError> for TransactionError {

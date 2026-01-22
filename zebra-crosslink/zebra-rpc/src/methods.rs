@@ -207,6 +207,18 @@ pub trait Rpc {
     #[method(name = "getbondinfo")]
     async fn get_bond_info(&self, bond_key: String) -> Result<Option<GetBondInfoResponse>>;
 
+    /// Requests a donation from an attached faucet
+    ///
+    /// # Parameters
+    ///
+    /// - `bond_key`: (string, required) The 32-byte bond key as a hex string.
+    ///
+    /// # Returns
+    ///
+    /// Bond information including amount and status, or null if the bond doesn't exist.
+    #[method(name = "requestfaucetdonation")]
+    async fn request_faucet_donation(&self, bond_key: FaucetRequest) -> Result<FaucetResponse>;
+
     /// Sends the raw bytes of a signed transaction to the local node's mempool, if the transaction is valid.
     /// Returns the [`SentTransactionHash`] for the transaction, as a JSON string.
     ///
@@ -1540,11 +1552,63 @@ where
                 Ok(Some(GetBondInfoResponse {
                     amount: u64::from(info.amount),
                     status: info.status,
+                    last_action_height: info.last_action_height,
                 }))
             }
             zebra_state::ReadResponse::BondInfo(None) => Ok(None),
             _ => unreachable!("Unexpected response from state service: {response:?}"),
         }
+    }
+
+    // async fn request_faucet_donation(&self, ua_str: String) -> Result<FaucetResponse> {
+    async fn request_faucet_donation(&self, ua: FaucetRequest) -> Result<FaucetResponse> {
+        let ua_str = ua.address;
+
+        let ret = self
+            .tfl_service
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(TFLServiceRequest::Faucet(ua_str.clone()))
+            .await;
+
+        match ret {
+            Ok(TFLServiceResponse::Faucet(Ok(amount))) => Ok(FaucetResponse{ amount }),
+            Ok(TFLServiceResponse::Faucet(Err(err))) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::Verify.into(),
+                    format!("Faucet request for \"{ua_str}\" failed: {err}"),
+                    None::<()>,
+            )),
+            Err(err) => {
+                // tracing::error!(?ret, "Bad tfl service return.");
+                Err(ErrorObject::owned(
+                        server::error::LegacyCode::Verify.into(),
+                        format!("Faucet request for \"{ua_str}\" failed: {err}"),
+                        None::<()>,
+                ))
+            }
+            _ => unreachable!(""),
+        }
+
+        // let request = zebra_state::ReadRequest::BondInfo(bond_key_bytes);
+        // let response = self
+        //     .read_state
+        //     .clone()
+        //     .oneshot(request)
+        //     .await
+        //     .map_misc_error()?;
+
+        // match response {
+        //     zebra_state::ReadResponse::BondInfo(Some(info)) => {
+        //         Ok(Some(GetBondInfoResponse {
+        //             amount: u64::from(info.amount),
+        //             status: info.status,
+        //         }))
+        //     }
+        //     zebra_state::ReadResponse::BondInfo(None) => Ok(None),
+        //     _ => unreachable!("Unexpected response from state service: {response:?}"),
+        // }
     }
 
     // TODO: use HexData or GetRawTransaction::Bytes to handle the transaction data argument
@@ -4118,6 +4182,39 @@ pub struct GetBondInfoResponse {
     /// The bond status: 0 = Active, 1 = Unbonding, 2 = Withdrawn.
     #[getter(copy)]
     status: u8,
+    /// The block height of the last staking action on this bond.
+    #[getter(copy)]
+    last_action_height: u32,
+}
+
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    // Getters,
+    // new,
+)]
+pub struct FaucetRequest {
+    pub address: String,
+}
+
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    // Getters,
+    // new,
+)]
+pub struct FaucetResponse {
+    pub amount: u64,
 }
 
 /// A hex-encoded [`ConsensusBranchId`] string.

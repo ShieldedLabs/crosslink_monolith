@@ -46,6 +46,8 @@ pub enum TFLServiceRequest {
     FatPointerToBFTChainTip,
     /// Send a staking command transaction
     StakingCmd(String),
+    /// faucet
+    Faucet(String),
 }
 
 /// Types of responses that can be returned by the TFLService.
@@ -71,6 +73,8 @@ pub enum TFLServiceResponse {
     FatPointerToBFTChainTip(zebra_chain::block::FatPointerToBftBlock),
     /// Send a staking command transaction
     StakingCmd,
+    /// Faucet
+    Faucet(Result<u64, String>),
 }
 
 /// Errors that can occur when interacting with the TFLService.

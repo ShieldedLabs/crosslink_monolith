@@ -1619,8 +1619,13 @@ impl Chain {
                     .copied()
                     .expect("bond must exist in chain (should have been validated)");
 
-                // Update status to Unbonding
-                self.delegation_bonds.insert(bond_key, (bond, BondStatusInChain::Unbonding));
+                // Update status to Unbonding and set created_at to current transaction location
+                let updated_bond = disk_format::DelegationBond::new(
+                    bond.amount,
+                    bond.target_finalizer,
+                    transaction_location,
+                );
+                self.delegation_bonds.insert(bond_key, (updated_bond, BondStatusInChain::Unbonding));
 
                 // Decrease staking_bonded pool by bond amount
                 let current_bonded = self.chain_value_pools.staking_bonded_amount();
@@ -1644,8 +1649,13 @@ impl Chain {
                     .copied()
                     .expect("bond must exist in chain (should have been validated)");
 
-                // Update status to Withdrawn
-                self.delegation_bonds.insert(bond_key, (bond, BondStatusInChain::Withdrawn));
+                // Update status to Withdrawn and set created_at to current transaction location
+                let updated_bond = disk_format::DelegationBond::new(
+                    bond.amount,
+                    bond.target_finalizer,
+                    transaction_location,
+                );
+                self.delegation_bonds.insert(bond_key, (updated_bond, BondStatusInChain::Withdrawn));
             }
             // Other staking actions don't affect delegation bonds
             _ => {}

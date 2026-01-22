@@ -9,8 +9,8 @@ use zaino_proto::proto::{
     service::{
         compact_tx_streamer_server::CompactTxStreamer, Address, AddressList, Balance, BlockId,
         BlockRange, BondInfoRequest, BondInfoResponse, Bytes, ChainSpec, Duration, Empty, Exclude,
-        GetAddressUtxosArg, GetAddressUtxosReplyList, GetSubtreeRootsArg, LightdInfo, PingResponse,
-        RawTransaction, SendResponse, TransparentAddressBlockFilter, TreeState, TxFilter,
+        FaucetRequest, FaucetResponse, GetAddressUtxosArg, GetAddressUtxosReplyList, GetSubtreeRootsArg, LightdInfo,
+        PingResponse, RawTransaction, SendResponse, TransparentAddressBlockFilter, TreeState, TxFilter,
     },
 };
 use zaino_state::{
@@ -189,6 +189,8 @@ where
         "Return a stream of current Mempool transactions. This will keep the output stream open while \
         there are mempool transactions. It will close the returned stream when a new block is mined."
         get_mempool_stream(Empty) -> Self::GetMempoolStreamStream as streamingempty,
+        "Request donation from the faucet to the given orchard-containing UA"
+        request_faucet_donation(FaucetRequest) -> FaucetResponse,
         "Testing-only, requires lightwalletd --ping-very-insecure (do not enable in production) [from zebrad] \
         This RPC has not been implemented as it is not currently used by zingolib. \
         If you require this RPC please open an issue or PR at [https://github.com/zingolabs/zaino]\

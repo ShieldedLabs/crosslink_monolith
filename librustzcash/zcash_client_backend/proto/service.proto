@@ -54,8 +54,10 @@ message RawTransaction {
     // the `RawTransaction` type are as follows:
     //
     // * height 0: the transaction is in the mempool
-    // * height 0xffffffffffffffff: the transaction has been mined on a fork that is not currently the main chain
-    // * any other height: the transaction has been mined in the main chain at the given height
+    // * height 0xffffffffffffffff: the transaction has been mined on a fork that
+    //   is not currently the main chain
+    // * any other height: the transaction has been mined in the main chain at the
+    //   given height
     uint64 height = 2;
 }
 
@@ -72,6 +74,9 @@ message ChainSpec {}
 
 // Empty is for gRPCs that take no arguments, currently only GetLightdInfo.
 message Empty {}
+
+// Bytes is for bytes
+message Bytes { bytes data = 1; }
 
 // LightdInfo returns various information about this lightwalletd instance
 // and the state of the blockchain.
@@ -134,6 +139,15 @@ message BondInfoRequest {
 message BondInfoResponse {
     uint64 amount = 1;  // Bond amount in zatoshis
     uint32 status = 2;  // 0 = Active, 1 = Unbonding, 2 = Withdrawn
+    uint32 lastActionHeight = 3;  // Block height of last staking action on this bond
+}
+
+// RequestFaucetDonation RPC
+message FaucetRequest {
+    string address = 1; // orchard-containing UA to send funds to
+}
+message FaucetResponse {
+    uint64 amount = 1;  // Donated amount in zatoshis
 }
 
 // The a shortened transaction ID is the prefix in big-endian (hex) format
@@ -187,10 +201,6 @@ message GetAddressUtxosReplyList {
     repeated GetAddressUtxosReply addressUtxos = 1;
 }
 
-message Bytes {
-    bytes data = 1;
-}
-
 service CompactTxStreamer {
     // Return the BlockID of the block at the tip of the best chain
     rpc GetLatestBlock(ChainSpec) returns (BlockID) {}
@@ -205,6 +215,7 @@ service CompactTxStreamer {
 
     // Return the requested full (not compact) transaction (as from zcashd)
     rpc GetTransaction(TxFilter) returns (RawTransaction) {}
+    // Return information about BFT roster
     rpc GetRoster(Empty) returns (Bytes) {}
     // Submit the given transaction to the Zcash network
     rpc SendTransaction(RawTransaction) returns (SendResponse) {}
@@ -254,6 +265,9 @@ service CompactTxStreamer {
 
     // Return information about a delegation bond
     rpc GetBondInfo(BondInfoRequest) returns (BondInfoResponse) {}
+
+    // Request the faucet (if attached) donates to the given address
+    rpc RequestFaucetDonation(FaucetRequest) returns (FaucetResponse) {}
 
     // Return information about this lightwalletd instance and the blockchain
     rpc GetLightdInfo(Empty) returns (LightdInfo) {}

@@ -1462,6 +1462,19 @@ impl ResponseToError for Option<zebra_rpc::methods::GetBondInfoResponse> {
     type RpcError = Infallible;
 }
 
+pub type FaucetError = String;
+impl ResponseToError for zebra_rpc::methods::FaucetResponse {
+    type RpcError = FaucetError;
+}
+impl TryFrom<RpcError> for FaucetError {
+    type Error = RpcError;
+
+    fn try_from(value: RpcError) -> Result<Self, Self::Error> {
+        Err(value)
+    }
+}
+
+
 // impl From<GetBytes> for Vec<u8> {
 //     fn from(v: GetBytes) -> Vec<u8> {
 //         v.data

@@ -1689,6 +1689,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 // TODO: account for mempool
+                                let mut pending = false;
                                 let icon = match (tx.kind(), tx_is_in_block) {
                                     (WalletTxKind::Send,     true) => ICON_UP_SMALL,
                                     (WalletTxKind::SelfSend, true) => ICON_DOWN_SMALL,
@@ -1699,6 +1700,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     (WalletTxKind::BeginUnstake,  true) => ICON_LINK_EXT_ALT,
                                     (WalletTxKind::ClaimUnstake,  true) => ICON_UNLINK,
                                     _ => {
+                                        pending = true;
                                         let timer = (ui.tx_loading_animation_timer * 3.0) as u64;
                                         if timer % 3 == 0 {
                                             ICON_DOT
@@ -1711,10 +1713,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                 };
 
                                 // TODO: account for mempool & confirmation level
-                                let colour = if tx_is_on_best_chain {
+                                let colour = if tx_is_on_best_chain || pending {
                                     WHITE
                                 } else {
-                                    (0x60, 0x60, 0x60, 0xff) /* @todo colors */
+                                    (0xc0, 0x30, 0x20, 0xff) /* @todo colors */
                                 };
 
                                 ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });

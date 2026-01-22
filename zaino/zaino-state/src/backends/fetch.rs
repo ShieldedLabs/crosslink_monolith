@@ -38,7 +38,7 @@ use zaino_proto::proto::{
     compact_formats::CompactBlock,
     service::{
         AddressList, Balance, BlockId, BlockRange, BondInfoRequest, BondInfoResponse, Bytes,
-        Duration, Exclude, GetAddressUtxosArg, GetAddressUtxosReply, GetAddressUtxosReplyList,
+        Duration, Exclude, FaucetRequest, FaucetResponse, GetAddressUtxosArg, GetAddressUtxosReply, GetAddressUtxosReplyList,
         LightdInfo, PingResponse, RawTransaction, SendResponse, TransparentAddressBlockFilter,
         TreeState, TxFilter,
     },
@@ -1038,12 +1038,22 @@ impl LightWalletIndexer for FetchServiceSubscriber {
                 Ok(BondInfoResponse {
                     amount: info.amount(),
                     status: info.status() as u32,
+                    last_action_height: info.last_action_height(),
                 })
             }
             None => Err(FetchServiceError::TonicStatusError(
                 tonic::Status::not_found("Bond not found"),
             )),
         }
+    }
+
+    async fn request_faucet_donation(&self, request: FaucetRequest) -> Result<FaucetResponse, Self::Error> {
+        let result: zebra_rpc::methods::FaucetResponse = self
+            .fetcher
+            .request_faucet_donation(zebra_rpc::methods::FaucetRequest{ address: request.address })
+            .await
+            .map_err(FetchServiceError::from)?;
+        Ok(FaucetResponse{ amount: result.amount })
     }
 
     /// Submit the given transaction to the Zcash network
@@ -1065,7 +1075,7 @@ impl LightWalletIndexer for FetchServiceSubscriber {
     ) -> Result<RawTransactionStream, Self::Error> {
         self.get_taddress_transactions(request).await
     }
-    
+
     /// Return the txids corresponding to the given t-address within the given block range
     #[allow(deprecated)]
     async fn get_taddress_transactions(

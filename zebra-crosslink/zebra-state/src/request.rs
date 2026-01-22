@@ -891,6 +891,14 @@ pub enum Request {
     /// Returns [`Response::ValidBlockProposal`] when successful.
     /// See `[ReadRequest::CheckBlockProposalValidity]` for details.
     CheckBlockProposalValidity(SemanticallyVerifiedBlock),
+
+    /// Looks up a delegation bond by its key.
+    ///
+    /// Returns
+    ///
+    /// * [`Response::BondInfo(Some(...))`](Response::BondInfo) if the bond exists;
+    /// * [`Response::BondInfo(None)`](Response::BondInfo) otherwise.
+    BondInfo([u8; 32]),
 }
 
 impl Request {
@@ -920,6 +928,7 @@ impl Request {
             Request::InvalidateBlock(_) => "invalidate_block",
             Request::ReconsiderBlock(_) => "reconsider_block",
             Request::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
+            Request::BondInfo(_) => "bond_info",
         }
     }
 
@@ -1330,6 +1339,8 @@ impl TryFrom<Request> for ReadRequest {
             Request::CheckBlockProposalValidity(semantically_verified) => Ok(
                 ReadRequest::CheckBlockProposalValidity(semantically_verified),
             ),
+
+            Request::BondInfo(bond_key) => Ok(ReadRequest::BondInfo(bond_key)),
         }
     }
 }
