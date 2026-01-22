@@ -3,6 +3,7 @@
 
 const AUTO_SPEND:    bool = false; // automatically make spends without requiring GUI interaction
 const DUMP_ACTIONS:  bool = true;
+const DUMP_FAUCET:   bool = false;
 const DUMP_NOTES:    bool = false;
 const DUMP_ROSTER:   bool = false;
 const DUMP_SYNC:     bool = true;
