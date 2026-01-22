@@ -762,7 +762,7 @@ impl JsonRpSeeConnector {
         let params = vec![
             serde_json::to_value(request).map_err(RpcRequestError::JsonRpc)?,
         ];
-        self.send_request("getbondinfo", params).await
+        self.send_request("requestfaucetdonation", params).await
     }
 
     /// Returns the transaction ids made by the provided transparent addresses.

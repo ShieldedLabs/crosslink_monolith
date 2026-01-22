@@ -74,7 +74,7 @@ pub enum TFLServiceResponse {
     /// Send a staking command transaction
     StakingCmd,
     /// Faucet
-    Faucet(u64),
+    Faucet(Result<u64, String>),
 }
 
 /// Errors that can occur when interacting with the TFLService.

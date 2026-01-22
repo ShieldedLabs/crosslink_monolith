@@ -217,7 +217,7 @@ pub trait Rpc {
     ///
     /// Bond information including amount and status, or null if the bond doesn't exist.
     #[method(name = "requestfaucetdonation")]
-    async fn request_faucet_donation(&self, bond_key: String) -> Result<FaucetResponse>;
+    async fn request_faucet_donation(&self, bond_key: FaucetRequest) -> Result<FaucetResponse>;
 
     /// Sends the raw bytes of a signed transaction to the local node's mempool, if the transaction is valid.
     /// Returns the [`SentTransactionHash`] for the transaction, as a JSON string.
@@ -1559,33 +1559,9 @@ where
         }
     }
 
-    async fn request_faucet_donation(&self, ua_str: String) -> Result<FaucetResponse> {
-        // let ua = zcash_address::unified::Address::decode(&ua_str)
-        //     .map_err(|err|
-        //     ErrorObject::owned(
-        //         server::error::LegacyCode::InvalidParameter.into(),
-        //         format!("invalid address: \"{ua_str}\" failed: {err}"),
-        //         None::<()>,
-        //     )
-        // )?.1;
-
-        // let ua = zcash_keys::address::UnifiedAddress::try_from(ua).map_err(|err|
-        //     ErrorObject::owned(
-        //         server::error::LegacyCode::InvalidParameter.into(),
-        //         format!("invalid address: \"{ua_str}\" failed: {err}"),
-        //         None::<()>,
-        //     )
-        // )?;
-
-        // let Some(orchard) = ua.orchard() else {
-        //     return Err(ErrorObject::owned(
-        //         server::error::LegacyCode::InvalidParameter.into(),
-        //         format!("invalid address: \"{ua_str}\" failed: must contain an orchard receiver"),
-        //         None::<()>,
-        //     ));
-        // };
-
-        // todo!("faucet");
+    // async fn request_faucet_donation(&self, ua_str: String) -> Result<FaucetResponse> {
+    async fn request_faucet_donation(&self, ua: FaucetRequest) -> Result<FaucetResponse> {
+        let ua_str = ua.address;
 
         let ret = self
             .tfl_service
@@ -1597,7 +1573,12 @@ where
             .await;
 
         match ret {
-            Ok(TFLServiceResponse::Faucet(amount)) => Ok(FaucetResponse{ amount }),
+            Ok(TFLServiceResponse::Faucet(Ok(amount))) => Ok(FaucetResponse{ amount }),
+            Ok(TFLServiceResponse::Faucet(Err(err))) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::Verify.into(),
+                    format!("Faucet request for \"{ua_str}\" failed: {err}"),
+                    None::<()>,
+            )),
             Err(err) => {
                 // tracing::error!(?ret, "Bad tfl service return.");
                 Err(ErrorObject::owned(

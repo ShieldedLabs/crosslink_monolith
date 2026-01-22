@@ -2515,11 +2515,11 @@ impl LightWalletIndexer for StateServiceSubscriber {
         todo!("expecting fetch");
     }
 
-    async fn get_bond_info(&self, request: BondInfoRequest) -> Result<BondInfoResponse, Self::Error> {
+    async fn get_bond_info(&self, _request: BondInfoRequest) -> Result<BondInfoResponse, Self::Error> {
         todo!("expecting fetch");
     }
 
-    async fn request_faucet_donation(&self, request: FaucetRequest) -> Result<FaucetResponse, Self::Error> {
+    async fn request_faucet_donation(&self, _request: FaucetRequest) -> Result<FaucetResponse, Self::Error> {
         todo!("expecting fetch");
     }
 

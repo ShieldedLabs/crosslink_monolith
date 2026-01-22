@@ -93,6 +93,10 @@ use zcash_client_backend::{
 
 use zcash_protocol::consensus::{NetworkType, Parameters, MAIN_NETWORK, TEST_NETWORK};
 
+#[derive(Clone)]
+pub struct FaucetRequestClosure(pub Arc<dyn Fn(String) -> Result<u64, String> + Sync + Send + 'static>);
+pub static FAUCET_REQUEST: Mutex<Option<FaucetRequestClosure>> = Mutex::new(None);
+
 // NOTE: this has slightly different semantics from the protocol version, hence the different type
 // TODO: some code becomes simpler with a u64, but I'm leaving this the same as default for now
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -2842,6 +2846,26 @@ fn shard_tree_root(tree: &OrchardShardTree) -> orchard::tree::MerkleHashOrchard 
         .unwrap()
 }
 
+const FAUCET_Q_LEN: usize = 16;
+struct FaucetQ {
+    pub read_o: u8,
+    pub write_o: u8,
+    pub data: [Option<orchard::Address>; FAUCET_Q_LEN],
+}
+impl FaucetQ {
+    fn len(&self) -> usize {
+        self.write_o.wrapping_sub(self.read_o).into()
+    }
+}
+// TODO: atomic
+static FAUCET_Q: Mutex<FaucetQ> = Mutex::new(FaucetQ {
+    read_o: 0,
+    write_o: 0,
+    data: [None; FAUCET_Q_LEN],
+});
+const TEST_FAUCET: bool = false;
+const FAUCET_VALUE: u64 = 500_000_000;
+
 /// NOTE: this *must* only be called in sequential order without gaps (including after reorg/truncate)
 fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, next_orchard_pos: &mut u64, insert_i: &mut usize, orchard_tree: &mut OrchardShardTree) -> (TxId, bool/*ours*/, bool/*ok*/) {
     let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
@@ -3270,6 +3294,43 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let network = &TEST_NETWORK;
 
+    *FAUCET_REQUEST.lock().unwrap() = Some(FaucetRequestClosure(Arc::new(|ua_str: String| -> Result<u64, String> {
+        // let ua = zcash_address::unified::Address::decode(&ua_str).map_err(|err|
+        //     Err(format!("invalid address: \"{ua_str}\" failed: {err}"))
+        // )?.1;
+        let ua = match zcash_keys::address::Address::decode(network, &ua_str) {
+            Some(zcash_keys::address::Address::Unified(ua)) => ua,
+            Some(_) => return Err(format!("must be an orchard-containing UA")),
+            None => return Err(format!("couldn't decode address")),
+        };
+        let Some(orchard_addr) = ua.orchard() else {
+            return Err(format!("must contain an orchard receiver"));
+        };
+
+        let mut q = FAUCET_Q.lock().unwrap();
+        if q.len() == q.data.len() {
+            return Err(format!("faucet too busy, come back later"));
+        }
+
+        for idx in 0..q.len() {
+            let i = (q.read_o as usize + idx) % q.data.len();
+            if let Some(existing_addr) = &q.data[i] {
+                if orchard_addr == existing_addr {
+                    return Err(format!("the last request for this address is still pending, come back later"));
+                }
+            } else {
+                println!("Faucet Q error: got None result where there should be valid data");
+            }
+        }
+
+        let i = q.write_o as usize % q.data.len();
+        q.write_o += 1;
+        q.data[i] = Some(orchard_addr.clone());
+
+        Ok(FAUCET_VALUE)
+    })));
+
+
     let (
         miner_wallet_init,
         mut miner_account,
@@ -3321,10 +3382,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         (user_wallet, user_account, seed, user_usk, user_pubkey, user_privkey, user_t_addr, user_ua, HashMap::<TxId, (Option<StakingAction>, Vec<String>)>::new())
     };
 
+    let miner_ua_str = miner_ua.encode(network);
     let user_ua_str = user_ua.encode(network);
     println!("*************************");
-    println!("MINER WALLET T-ADDRESS: {}", miner_ua.encode(network));
-    println!("MINER WALLET ADDRESS:   {}", miner_t_address.encode(network));
+    println!("MINER WALLET T-ADDRESS: {}", miner_t_address.encode(network));
+    println!("MINER WALLET ADDRESS:   {}", miner_ua_str);
     println!("USER WALLET T-ADDRESS:  {}", user_t_address.encode(network));
     println!("USER WALLET ADDRESS:    {}", user_ua_str);
     println!("*************************");
@@ -3354,7 +3416,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     };
 
-    println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
+    if TEST_FAUCET {
+        println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
+        println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: "arosienarsoienaroisetn".to_owned() }).await);
+        println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
+        FAUCET_Q.lock().unwrap().read_o += 1; // fake read
+        println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
+    }
 
     // NOTE: current model is to reorg this many blocks back
     // ALT: have checkpoints every 16/32 blocks and always sync from the start of one of these
@@ -3444,6 +3512,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let mut resync_c = 0;
     'outer_sync: loop {
+
+        if TEST_FAUCET {
+            println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
+            println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: miner_ua_str.clone() }).await);
+        }
+
         if resync_c > 0 {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
@@ -4271,7 +4345,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             if user_wallet.accounts[0].unspent_orchard_notes.len() == 0 && !proposed_faucet.is_in_progress() {
                 // the user needs money, try to send some (doesn't matter if we fail until we've mined some)
-                let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, 500_000_000, &orchard_tree, *user_ua.orchard().unwrap(),
+                let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, FAUCET_VALUE, &orchard_tree, *user_ua.orchard().unwrap(),
                     MemoBytes::from_bytes("auto-sent from miner".as_bytes()).unwrap()
                 ).is_some();
             } else if ! auto_spend.0 {
@@ -4769,6 +4843,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // since it's probably waiting for the wallet_state mutex to unlock.
         let mut retries_this_round = 6;
         loop {
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+
             let action: WalletAction = {
                 let mut wallet_lock = wallet_state.try_lock();
                 let Ok(wallet_state) = &mut wallet_lock else {
@@ -4783,55 +4859,68 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 };
 
                 if DUMP_ACTIONS { println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len()); }
-                let Some(action) = wallet_state.actions_in_flight.front() else { break; };
-                action.clone()
-            };
-
-            let ok: bool = 'process_action: {
-                match &action {
-                    &WalletAction::RequestFromFaucet => {
-                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        let memo = MemoBytes::from_bytes("orchard -> orchard".as_bytes()).unwrap();
-                        let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, 500_000_000, &orchard_tree, *user_ua.orchard().unwrap(), memo).is_some();
-                        if DUMP_ACTIONS { println!("Try miner send: {ok:?}"); }
-                        true // ALT ok
-                    }
-
-                    &WalletAction::StakeToFinalizer(amount, target_finalizer) => {
-                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        let ok = user_wallet.stake_orchard_to_finalizer(network, &mut proposed_stake, &mut client, &user_usk, amount.into_u64(), &orchard_tree, target_finalizer).is_some();
-                        println!("Try stake: {ok:?}");
-                        ok
-                    }
-
-                    WalletAction::SendToAddress(address, amount) => {
-                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        let memo = MemoBytes::from_bytes("send from user wallet".as_bytes()).unwrap();
-                        if let Some(orchard_address) = address.orchard() {
-                            let ok = user_wallet.send_orchard_to_orchard_zats(network, &mut proposed_send, &mut client, &user_usk, amount.into_u64(), &orchard_tree, *orchard_address, memo).is_some();
-                            if DUMP_ACTIONS { println!("Try user send: {ok:?}"); }
-                            true // ALT ok
-                        } else {
-                            false
+                let Some(action) = wallet_state.actions_in_flight.front() else {
+                    // if we're not doing anything else, process a faucet RPC request
+                    if ! proposed_faucet.is_in_progress() {
+                        let mut q = FAUCET_Q.lock().unwrap();
+                        if DUMP_FAUCET { println!("faucet Q read_o: {}, write_o: {}", q.read_o, q.write_o); }
+                        if q.len() > 0 {
+                            let i = q.read_o as usize % q.data.len();
+                            if DUMP_FAUCET { println!("faucet Q new element at {i}: {:?}", q.data[i]); }
+                            if let Some(orchard_addr) = q.data[i] {
+                                let memo = MemoBytes::from_bytes("With love from your favourite faucet... Don't spend it all at once!".as_bytes()).unwrap();
+                                let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, FAUCET_VALUE, &orchard_tree, orchard_addr, memo).is_some();
+                                if DUMP_ACTIONS { println!("Try RPC faucet send: {ok:?}"); }
+                                q.read_o += 1;
+                            } else {
+                                println!("Faucet Q error: got None result where there should be valid data");
+                            }
                         }
                     }
 
-                    &WalletAction::UnstakeFromFinalizer(txid) => {
-                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        let ok = user_wallet.begin_unbonding_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).is_some();
-                        if DUMP_ACTIONS { println!("Try unstake: {ok:?}"); }
-                        ok
-                    }
+                    break;
+                };
+                action.clone()
+            };
 
-                    &WalletAction::ClaimBond(txid) => {
-                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        let ok = user_wallet.claim_bond_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).await.is_some();
-                        if DUMP_ACTIONS { println!("Try withdraw stake: {ok:?}"); }
-                        ok
-                    }
-
-                    _ => { true }
+            let ok: bool = match &action {
+                &WalletAction::RequestFromFaucet => {
+                    let memo = MemoBytes::from_bytes("With love from your favourite faucet... Don't spend it all at once!".as_bytes()).unwrap();
+                    let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, FAUCET_VALUE, &orchard_tree, *user_ua.orchard().unwrap(), memo).is_some();
+                    if DUMP_ACTIONS { println!("Try miner send: {ok:?}"); }
+                    true // ALT ok
                 }
+
+                &WalletAction::StakeToFinalizer(amount, target_finalizer) => {
+                    let ok = user_wallet.stake_orchard_to_finalizer(network, &mut proposed_stake, &mut client, &user_usk, amount.into_u64(), &orchard_tree, target_finalizer).is_some();
+                    println!("Try stake: {ok:?}");
+                    ok
+                }
+
+                WalletAction::SendToAddress(address, amount) => {
+                    if let Some(orchard_address) = address.orchard() {
+                        let memo = MemoBytes::from_bytes("send from user wallet".as_bytes()).unwrap();
+                        let ok = user_wallet.send_orchard_to_orchard_zats(network, &mut proposed_send, &mut client, &user_usk, amount.into_u64(), &orchard_tree, *orchard_address, memo).is_some();
+                        if DUMP_ACTIONS { println!("Try user send: {ok:?}"); }
+                        true // ALT ok
+                    } else {
+                        false
+                    }
+                }
+
+                &WalletAction::UnstakeFromFinalizer(txid) => {
+                    let ok = user_wallet.begin_unbonding_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).is_some();
+                    if DUMP_ACTIONS { println!("Try unstake: {ok:?}"); }
+                    ok
+                }
+
+                &WalletAction::ClaimBond(txid) => {
+                    let ok = user_wallet.claim_bond_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).await.is_some();
+                    if DUMP_ACTIONS { println!("Try withdraw stake: {ok:?}"); }
+                    ok
+                }
+
+                &WalletAction::TestStakeAction => true,
             };
 
             if !ok {
