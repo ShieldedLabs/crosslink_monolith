@@ -194,6 +194,19 @@ pub struct BondInfoResponse {
     #[prost(uint32, tag = "3")]
     pub last_action_height: u32,
 }
+/// RequestFaucetDonation RPC
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FaucetRequest {
+    /// orchard-containing UA to send funds to
+    #[prost(string, tag = "1")]
+    pub address: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FaucetResponse {
+    /// Donated amount in zatoshis
+    #[prost(uint64, tag = "1")]
+    pub amount: u64,
+}
 /// The a shortened transaction ID is the prefix in big-endian (hex) format
 /// (then converted to binary).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -574,6 +587,33 @@ pub mod compact_tx_streamer_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Return information about BFT roster
+        pub async fn get_roster(
+            &mut self,
+            request: impl tonic::IntoRequest<super::Empty>,
+        ) -> std::result::Result<tonic::Response<super::Bytes>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetRoster",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                        "GetRoster",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Submit the given transaction to the Zcash network
         pub async fn send_transaction(
             &mut self,
@@ -934,33 +974,6 @@ pub mod compact_tx_streamer_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
-        /// Return information about BFT roster
-        pub async fn get_roster(
-            &mut self,
-            request: impl tonic::IntoRequest<super::Empty>,
-        ) -> std::result::Result<tonic::Response<super::Bytes>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetRoster",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetRoster",
-                    ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
         /// Return information about a delegation bond
         pub async fn get_bond_info(
             &mut self,
@@ -987,6 +1000,33 @@ pub mod compact_tx_streamer_client {
                     GrpcMethod::new(
                         "cash.z.wallet.sdk.rpc.CompactTxStreamer",
                         "GetBondInfo",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Request the faucet (if attached) donates to the given address
+        pub async fn request_faucet_donation(
+            &mut self,
+            request: impl tonic::IntoRequest<super::FaucetRequest>,
+        ) -> std::result::Result<tonic::Response<super::FaucetResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/RequestFaucetDonation",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                        "RequestFaucetDonation",
                     ),
                 );
             self.inner.unary(req, path, codec).await
@@ -1117,6 +1157,11 @@ pub mod compact_tx_streamer_server {
             &self,
             request: tonic::Request<super::TxFilter>,
         ) -> std::result::Result<tonic::Response<super::RawTransaction>, tonic::Status>;
+        /// Return information about BFT roster
+        async fn get_roster(
+            &self,
+            request: tonic::Request<super::Empty>,
+        ) -> std::result::Result<tonic::Response<super::Bytes>, tonic::Status>;
         /// Submit the given transaction to the Zcash network
         async fn send_transaction(
             &self,
@@ -1250,11 +1295,6 @@ pub mod compact_tx_streamer_server {
             tonic::Response<Self::GetAddressUtxosStreamStream>,
             tonic::Status,
         >;
-        /// Return information about BFT roster
-        async fn get_roster(
-            &self,
-            request: tonic::Request<super::Empty>,
-        ) -> std::result::Result<tonic::Response<super::Bytes>, tonic::Status>;
         /// Return information about a delegation bond
         async fn get_bond_info(
             &self,
@@ -1263,6 +1303,11 @@ pub mod compact_tx_streamer_server {
             tonic::Response<super::BondInfoResponse>,
             tonic::Status,
         >;
+        /// Request the faucet (if attached) donates to the given address
+        async fn request_faucet_donation(
+            &self,
+            request: tonic::Request<super::FaucetRequest>,
+        ) -> std::result::Result<tonic::Response<super::FaucetResponse>, tonic::Status>;
         /// Return information about this lightwalletd instance and the blockchain
         async fn get_lightd_info(
             &self,
@@ -1617,6 +1662,49 @@ pub mod compact_tx_streamer_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetTransactionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetRoster" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetRosterSvc<T: CompactTxStreamer>(pub Arc<T>);
+                    impl<T: CompactTxStreamer> tonic::server::UnaryService<super::Empty>
+                    for GetRosterSvc<T> {
+                        type Response = super::Bytes;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::Empty>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as CompactTxStreamer>::get_roster(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetRosterSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -2211,49 +2299,6 @@ pub mod compact_tx_streamer_server {
                     };
                     Box::pin(fut)
                 }
-                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetRoster" => {
-                    #[allow(non_camel_case_types)]
-                    struct GetRosterSvc<T: CompactTxStreamer>(pub Arc<T>);
-                    impl<T: CompactTxStreamer> tonic::server::UnaryService<super::Empty>
-                    for GetRosterSvc<T> {
-                        type Response = super::Bytes;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::Empty>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as CompactTxStreamer>::get_roster(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = GetRosterSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBondInfo" => {
                     #[allow(non_camel_case_types)]
                     struct GetBondInfoSvc<T: CompactTxStreamer>(pub Arc<T>);
@@ -2285,6 +2330,55 @@ pub mod compact_tx_streamer_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetBondInfoSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/RequestFaucetDonation" => {
+                    #[allow(non_camel_case_types)]
+                    struct RequestFaucetDonationSvc<T: CompactTxStreamer>(pub Arc<T>);
+                    impl<
+                        T: CompactTxStreamer,
+                    > tonic::server::UnaryService<super::FaucetRequest>
+                    for RequestFaucetDonationSvc<T> {
+                        type Response = super::FaucetResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::FaucetRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as CompactTxStreamer>::request_faucet_donation(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RequestFaucetDonationSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

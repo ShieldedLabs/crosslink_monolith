@@ -42,7 +42,7 @@ use zaino_proto::proto::{
     compact_formats::CompactBlock,
     service::{
         AddressList, Balance, BlockId, BlockRange, BondInfoRequest, BondInfoResponse, Bytes,
-        Exclude, GetAddressUtxosArg, GetAddressUtxosReply, GetAddressUtxosReplyList, LightdInfo,
+        Exclude, FaucetRequest, FaucetResponse, GetAddressUtxosArg, GetAddressUtxosReply, GetAddressUtxosReplyList, LightdInfo,
         PingResponse, RawTransaction, SendResponse, TransparentAddressBlockFilter, TreeState,
         TxFilter,
     },
@@ -2515,7 +2515,11 @@ impl LightWalletIndexer for StateServiceSubscriber {
         todo!("expecting fetch");
     }
 
-    async fn get_bond_info(&self, request: BondInfoRequest) -> Result<BondInfoResponse, Self::Error> {
+    async fn get_bond_info(&self, _request: BondInfoRequest) -> Result<BondInfoResponse, Self::Error> {
+        todo!("expecting fetch");
+    }
+
+    async fn request_faucet_donation(&self, _request: FaucetRequest) -> Result<FaucetResponse, Self::Error> {
         todo!("expecting fetch");
     }
 

@@ -8182,6 +8182,7 @@ dependencies = [
  "jsonrpsee-proc-macros",
  "jsonrpsee-types",
  "nix",
+ "orchard",
  "prost 0.14.1",
  "rand 0.8.5",
  "semver",

@@ -1380,6 +1380,17 @@ async fn tfl_service_incoming_request(
             ))
         }
 
+        TFLServiceRequest::Faucet(request) => {
+            Ok(TFLServiceResponse::Faucet({
+                let closure = wallet::FAUCET_REQUEST.lock().unwrap();
+                if let Some(closure) = closure.as_ref() {
+                    (closure.0)(request)
+                } else {
+                    Err("No faucet available".to_owned())
+                }
+            }))
+        }
+
         _ => Err(TFLServiceError::NotImplemented),
     }
 }

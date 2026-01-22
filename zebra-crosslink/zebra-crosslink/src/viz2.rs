@@ -86,6 +86,7 @@ pub async fn service_viz_requests(
                 ) -> Option<(BlockHeight, BlockHash)> {
                     if h == existing_height_hash.0 {
                         // avoid duplicating work if we've already got that value
+                        // TODO: does this miss reorgs?
                         Some(existing_height_hash)
                     } else if let Ok(StateResponse::BlockHeader { hash, .. }) =
                         (call.state)(StateRequest::BlockHeader(h.into())).await
@@ -119,20 +120,23 @@ pub async fn service_viz_requests(
 
             // paranoid guards
             if lo_height.0 as i64 != bc_ack_height as i64 {
+                println!("PARANOID != WRONG: lo {} vs ack {bc_ack_height}", lo_height.0);
                 continue 'main_loop;
             }
             if suspect_seq_blocks.is_empty() {
+                println!("PARANOID != WRONG: empty seq blocks");
                 continue 'main_loop;
             }
             let mut seq_blocks = Vec::new();
-            for maybe in suspect_seq_blocks {
+            for (i, maybe) in suspect_seq_blocks.iter().enumerate() {
                 let Some(block) = maybe
                 else {
+                    println!("PARANOID != WRONG: None seq block at {i}");
                     continue 'main_loop;
                 };
                 seq_blocks.push(block);
             }
-            
+
 
             for _ in 0..256 {
                 if let Ok(request) = request_queue.try_recv() {

@@ -1306,7 +1306,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 if (prev_finalizer != Some(finalizer)) {
                                     prev_finalizer  = Some(finalizer);
 
-                                    let chunks = chunkify(&bond_key);
+                                    let chunks = chunkify(&finalizer);
                                     let label = frame_strf!(data, "{}", display_str(&chunks));
 
                                     let id = id_index(label, index);

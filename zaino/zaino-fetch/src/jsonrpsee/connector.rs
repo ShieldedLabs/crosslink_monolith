@@ -32,6 +32,7 @@ use crate::jsonrpsee::{
         block_subsidy::GetBlockSubsidy,
         mining_info::GetMiningInfoWire,
         peer_info::GetPeerInfo,
+        FaucetError,
         GetBalanceError, GetBalanceResponse, GetBlockCountResponse, GetBlockError, GetBlockHash,
         GetBlockResponse, GetBlockchainInfoResponse, GetInfoResponse, GetMempoolInfoResponse,
         GetSubtreesError, GetSubtreesResponse, GetTransactionResponse, GetTreestateError,
@@ -754,6 +755,14 @@ impl JsonRpSeeConnector {
             serde_json::to_value(bond_key).map_err(RpcRequestError::JsonRpc)?,
         ];
         self.send_request("getbondinfo", params).await
+    }
+
+    /// Get bond info by bond key
+    pub async fn request_faucet_donation(&self, request: zebra_rpc::methods::FaucetRequest) -> Result<zebra_rpc::methods::FaucetResponse, RpcRequestError<FaucetError>> {
+        let params = vec![
+            serde_json::to_value(request).map_err(RpcRequestError::JsonRpc)?,
+        ];
+        self.send_request("requestfaucetdonation", params).await
     }
 
     /// Returns the transaction ids made by the provided transparent addresses.

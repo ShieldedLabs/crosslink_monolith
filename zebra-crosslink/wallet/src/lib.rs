@@ -1,7 +1,15 @@
 //! Internal wallet
 #![allow(warnings)]
 
-const AUTO_SPEND: u8 = 0; // automatically make spends without requiring GUI interaction
+const AUTO_SPEND:    bool = false; // automatically make spends without requiring GUI interaction
+const DUMP_ACTIONS:  bool = true;
+const DUMP_NOTES:    bool = false;
+const DUMP_ROSTER:   bool = false;
+const DUMP_SYNC:     bool = true;
+const DUMP_TREES:    bool = false;
+const DUMP_TX_BUILD: bool = false;
+const DUMP_TX_RECV:  bool = false;
+const DUMP_TX_SEND:  bool = false;
 
 use rand::seq::SliceRandom;
 use zcash_client_backend::data_api::WalletCommitmentTrees;
@@ -22,7 +30,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tonic::IntoRequest;
 use zcash_client_backend::data_api::chain::{BlockCache, CommitmentTreeRoot};
 use zcash_client_backend::data_api::wallet::{ConfirmationsPolicy, TargetHeight, create_proposed_transactions, propose_shielding, shield_transparent_funds};
-use zcash_client_backend::proto::service::{GetSubtreeRootsArg, RawTransaction, TreeState, TxFilter};
+use zcash_client_backend::proto::service::{GetSubtreeRootsArg, RawTransaction, FaucetRequest, TreeState, TxFilter};
 use zcash_client_backend::wallet::WalletTransparentOutput;
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::util::SystemClock;
@@ -84,6 +92,10 @@ use zcash_client_backend::{
 };
 
 use zcash_protocol::consensus::{NetworkType, Parameters, MAIN_NETWORK, TEST_NETWORK};
+
+#[derive(Clone)]
+pub struct FaucetRequestClosure(pub Arc<dyn Fn(String) -> Result<u64, String> + Sync + Send + 'static>);
+pub static FAUCET_REQUEST: Mutex<Option<FaucetRequestClosure>> = Mutex::new(None);
 
 // NOTE: this has slightly different semantics from the protocol version, hence the different type
 // TODO: some code becomes simpler with a u64, but I'm leaving this the same as default for now
@@ -375,18 +387,24 @@ async fn wait_for_zainod() {
     }
 }
 
-struct Timer<'a> { t_bgn: std::time::Instant, name: &'a str }
+struct Timer<'a> { t_bgn: std::time::Instant, name: &'a str, loud: bool }
 impl<'a> Timer<'a> {
-    pub fn scope(name: &'a str) -> Self {
-        println!("started {}", name);
-        Self {
-            name, t_bgn: std::time::Instant::now()
+    pub fn scope_(name: &'a str, loud: bool) -> Self {
+        if loud {
+            println!("started {}", name);
         }
+        Self { name, t_bgn: std::time::Instant::now(), loud }
+    }
+
+    pub fn scope(name: &'a str) -> Self {
+        Timer::scope_(name, true)
     }
 }
 impl Drop for Timer<'_> {
     fn drop(&mut self) {
-        println!("{} took {}ms", self.name, self.t_bgn.elapsed().as_millis());
+        if self.loud {
+            println!("{} took {}ms", self.name, self.t_bgn.elapsed().as_millis());
+        }
     }
 }
 
@@ -600,7 +618,7 @@ pub struct WalletTx {
     pub account_id: usize,
     pub txid: zcash_protocol::TxId,
     pub expiry_h: Option<BlockHeight>,
-    pub mined_h: BlockHeight,
+    pub mined_h: BlockHeight, // TODO: provides location
 
     // TODO: track whether full Transaction has been read
     pub is_coinbase: bool,
@@ -612,7 +630,7 @@ pub struct WalletTx {
     pub memo_count: usize,
     pub memo: [u8; 512],
 
-    pub is_outside_bc: bool,
+    pub is_outside_bc: bool, // TODO: "failed_height"; provides fallback symbol info
 
     pub staking_action: Option<StakingAction>,
 }
@@ -959,7 +977,9 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, i
                     return;
                 }
 
-                println!("{} wallet updated existing transaction {txid} {:?} => {:?}", wallet.name, old_tx.mined_h, new_tx.mined_h);
+                if DUMP_TX_RECV {
+                    println!("{} wallet updated existing transaction {txid} {:?} => {:?}", wallet.name, old_tx.mined_h, new_tx.mined_h);
+                }
                 // println!("{} wallet updated existing transaction {txid} {old_tx:?} => {new_tx:?}", wallet.name);
 
                 // leave the tx-parts from the components not provided here
@@ -1006,7 +1026,9 @@ fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, i
         *tx_h = new_tx.mined_h;
     } else {
         wallet.tx_h_map.insert(txid, new_tx.mined_h);
-        println!("{} wallet inserted new transaction {txid} at {:?}", wallet.name, new_tx.mined_h);
+        if DUMP_TX_RECV {
+            println!("{} wallet inserted new transaction {txid} at {:?}", wallet.name, new_tx.mined_h);
+        }
     }
     wallet.txs.insert(*insert_i, new_tx);
     *insert_i += 1;
@@ -1126,7 +1148,7 @@ impl ManualWallet {
 
     // TODO: always return full tx if created
     async fn send_built_tx<P: Parameters>(&mut self, network: P, client: &mut CompactTxStreamerClient<Channel>, wallet_tx: &mut WalletTx, tx: &Transaction) -> bool {
-        let tz = Timer::scope("send_built_tx");
+        let tz = Timer::scope_("send_built_tx", DUMP_TX_SEND);
 
         //-- EXPENSIVE NETWORK SEND
         // TODO: don't block, maybe return a future?
@@ -1136,7 +1158,7 @@ impl ManualWallet {
             wallet_tx.is_outside_bc = true;
         } else {
             let res = client.send_transaction(raw_tx).await;
-            println!("******* res for {:?}: {:?}", tx.txid(), res);
+            if DUMP_TX_SEND { println!("******* res for {:?}: {:?}", tx.txid(), res); }
             // TODO: distinguish sends that weren't network issues
             if res.is_ok() {
                 wallet_tx.mined_h = BlockHeight::SENT;
@@ -1149,7 +1171,7 @@ impl ManualWallet {
     }
 
     fn build_tx_from_prep<P: Parameters>(&mut self, network: P, tx: &mut ProposedTx, prep: BuildPrep) -> bool {
-        let tz = Timer::scope("build_tx_from_prep");
+        let tz = Timer::scope_("build_tx_from_prep", DUMP_TX_SEND | DUMP_TX_BUILD);
         let prep_fee = prep.fee_required();
         tx.tx.is_outside_bc = true; // failed until we get past thits point
 
@@ -1168,35 +1190,35 @@ impl ManualWallet {
                 &TransparentInputKind::P2pkh{ pubkey } => txb.add_transparent_input(pubkey, outpoint, coin),
                 TransparentInputKind::P2sh{ redeem_script } => txb.add_transparent_p2sh_input(redeem_script.clone(), outpoint, coin),
             } {
-                println!("constructing transparent input: {err:?}");
+                if DUMP_TX_BUILD { println!("constructing transparent input: {err:?}"); }
                 return false;
             }
         }
 
         for ProposedTransparentOutput{ dst, zats } in t_outputs {
             if let Err(err) = txb.add_transparent_output(&dst, zats) {
-                println!("constructing transparent output: {err:?}");
+                if DUMP_TX_BUILD { println!("constructing transparent output: {err:?}"); }
                 return false;
             }
         }
 
         for ProposedOrchardSpend{ fvk, note, witness_merkle_path } in o_inputs {
             if let Err(err) = txb.add_orchard_spend::<zip317::FeeError>(fvk, note.note, witness_merkle_path) {
-                println!("constructing orchard spend: {err:?}");
+                if DUMP_TX_BUILD { println!("constructing orchard spend: {err:?}"); }
                 return false;
             }
         }
 
         for ProposedOrchardOutput{ ovk, dst, zats, memo: spend_memo } in o_outputs {
             if let Err(err) = txb.add_orchard_output::<zip317::FeeError>(ovk, dst, zats.into_u64(), spend_memo) {
-                println!("constructing orchard output: {err:?}");
+                if DUMP_TX_BUILD { println!("constructing orchard output: {err:?}"); }
                 return false;
             }
         }
 
         if let Some(staking_action) = staking_action {
             if let Err(err) = txb.put_staking_action(staking_action) {
-                println!("constructing staking action: {err:?}");
+                if DUMP_TX_BUILD { println!("constructing staking action: {err:?}"); }
                 return false;
             }
         }
@@ -1342,7 +1364,7 @@ impl ManualWallet {
             StakingActionKind::CreateNewDelegationBond => {
                 b.sent(to_zats_or_dump_err("tx build: new bond", staking_action.amount_zats)?, true)?;
                 b.recv(to_zats_or_dump_err("tx build: new bond", staking_action.amount_zats)?, true)?;
-                println!("  added new staking position: {}", staking_action.amount_zats);
+                if DUMP_TX_BUILD { println!("  added new staking position: {}", staking_action.amount_zats); }
             },
 
             StakingActionKind::BeginDelegationUnbonding => {
@@ -1354,7 +1376,7 @@ impl ManualWallet {
                 // };
                 // no direct send - fee for transitioning between 2 pools we don't touch directly
                 // TODO: (fallback to) pay for fee from bond?
-                println!("  unstaking bond: {}", staking_action.amount_zats);
+                if DUMP_TX_BUILD { println!("  unstaking bond: {}", staking_action.amount_zats); }
             },
 
             StakingActionKind::WithdrawDelegationBond => {
@@ -1368,7 +1390,7 @@ impl ManualWallet {
                 // fee comes from bond itself
                 // TODO: does this now have the correct amount?
                 b.spent(to_zats_or_dump_err("tx build: new bond", staking_action.amount_zats)?, true)?;
-                println!("  withdrawing bond: {}", staking_action.amount_zats);
+                if DUMP_TX_BUILD { println!("  withdrawing bond: {}", staking_action.amount_zats); }
             },
 
             StakingActionKind::RetargetDelegationBond |
@@ -1401,7 +1423,7 @@ impl ManualWallet {
                         return None;
                     }
                     prep.t_outputs.push(ProposedTransparentOutput{ dst, zats });
-                    println!("  added transparent output: {}", zats.into_u64());
+                    if DUMP_TX_BUILD { println!("  added transparent output: {}", zats.into_u64()); }
                 }
                 &TxOutput::Orchard{ ref ovk, dst, zats, memo: ref note_memo } => {
                     s.sent(zats, true)?;
@@ -1416,7 +1438,7 @@ impl ManualWallet {
                         return None;
                     }
                     prep.o_outputs.push(ProposedOrchardOutput{ ovk: ovk.clone(), dst: dst.clone(), zats, memo: note_memo.clone() });
-                    println!("  added orchard output: {}", zats.into_u64());
+                    if DUMP_TX_BUILD { println!("  added orchard output: {}", zats.into_u64()); }
                 }
             }
         }
@@ -1462,7 +1484,7 @@ impl ManualWallet {
                             continue;
                         }
                         t.spent(utxo.value, true)?;
-                        println!("  added transparent spend: {}", utxo.value.into_u64());
+                        if DUMP_TX_BUILD { println!("  added transparent spend: {}", utxo.value.into_u64()); }
 
                         prep.t_inputs = txb.transparent_inputs().to_vec(); // ALT: do something *not* bad
 
@@ -1513,7 +1535,7 @@ impl ManualWallet {
                             let note_val = note.note.value().inner();
 
                             s.spent(to_zats_or_dump_err("tx build orchard note", note_val)?, true)?;
-                            println!("  added orchard spend: {}", note_val);
+                            if DUMP_TX_BUILD { println!("  added orchard spend: {}", note_val); }
 
                             prep.o_inputs.push(ProposedOrchardSpend{ fvk: fvk.clone(), note, witness_merkle_path: merkle_path });
 
@@ -1546,7 +1568,7 @@ impl ManualWallet {
                         return None;
                     };
                     prep.o_outputs.push(ProposedOrchardOutput{ ovk: Some(ovk), dst: orchard_addr.clone(), zats: change, memo: MemoBytes::empty() });
-                    println!("  added orchard change: {}", change.into_u64());
+                    if DUMP_TX_BUILD { println!("  added orchard change: {}", change.into_u64()); }
                 } else {
                     t.sent(change, true)?;
                     t.recv(change, true)?;
@@ -1555,7 +1577,7 @@ impl ManualWallet {
                         return None;
                     };
                     prep.t_outputs.push(ProposedTransparentOutput{ dst: t_addr, zats: change });
-                    println!("  added transparent change: {}", change.into_u64());
+                    if DUMP_TX_BUILD { println!("  added transparent change: {}", change.into_u64()); }
                 }
                 change
             }
@@ -2824,6 +2846,26 @@ fn shard_tree_root(tree: &OrchardShardTree) -> orchard::tree::MerkleHashOrchard 
         .unwrap()
 }
 
+const FAUCET_Q_LEN: usize = 16;
+struct FaucetQ {
+    pub read_o: u8,
+    pub write_o: u8,
+    pub data: [Option<orchard::Address>; FAUCET_Q_LEN],
+}
+impl FaucetQ {
+    fn len(&self) -> usize {
+        self.write_o.wrapping_sub(self.read_o).into()
+    }
+}
+// TODO: atomic
+static FAUCET_Q: Mutex<FaucetQ> = Mutex::new(FaucetQ {
+    read_o: 0,
+    write_o: 0,
+    data: [None; FAUCET_Q_LEN],
+});
+const TEST_FAUCET: bool = false;
+const FAUCET_VALUE: u64 = 500_000_000;
+
 /// NOTE: this *must* only be called in sequential order without gaps (including after reorg/truncate)
 fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, next_orchard_pos: &mut u64, insert_i: &mut usize, orchard_tree: &mut OrchardShardTree) -> (TxId, bool/*ours*/, bool/*ok*/) {
     let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
@@ -2870,7 +2912,9 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
         if *next_orchard_pos >= shard_tree_size(&orchard_tree) {
             assert_eq!(*next_orchard_pos, shard_tree_size(&orchard_tree), "should be appending sequentially");
             orchard_tree.append(orchard::tree::MerkleHashOrchard::from_cmx(&action.cmx()), retention).expect("Infallible Memory Store");
-            println!("new orchard root at {:?} tree size={:02} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
+            if DUMP_TREES {
+                println!("new orchard root at {:?} tree size={:02} {:?}", block_h, shard_tree_size(orchard_tree), shard_tree_root(orchard_tree));
+            }
             // let position = orchard_tree.max_leaf_position(None).expect("Infallible Memory Store").expect("just appended");
         }
         *next_orchard_pos += 1;
@@ -3250,6 +3294,43 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let network = &TEST_NETWORK;
 
+    *FAUCET_REQUEST.lock().unwrap() = Some(FaucetRequestClosure(Arc::new(|ua_str: String| -> Result<u64, String> {
+        // let ua = zcash_address::unified::Address::decode(&ua_str).map_err(|err|
+        //     Err(format!("invalid address: \"{ua_str}\" failed: {err}"))
+        // )?.1;
+        let ua = match zcash_keys::address::Address::decode(network, &ua_str) {
+            Some(zcash_keys::address::Address::Unified(ua)) => ua,
+            Some(_) => return Err(format!("must be an orchard-containing UA")),
+            None => return Err(format!("couldn't decode address")),
+        };
+        let Some(orchard_addr) = ua.orchard() else {
+            return Err(format!("must contain an orchard receiver"));
+        };
+
+        let mut q = FAUCET_Q.lock().unwrap();
+        if q.len() == q.data.len() {
+            return Err(format!("faucet too busy, come back later"));
+        }
+
+        for idx in 0..q.len() {
+            let i = (q.read_o as usize + idx) % q.data.len();
+            if let Some(existing_addr) = &q.data[i] {
+                if orchard_addr == existing_addr {
+                    return Err(format!("the last request for this address is still pending, come back later"));
+                }
+            } else {
+                println!("Faucet Q error: got None result where there should be valid data");
+            }
+        }
+
+        let i = q.write_o as usize % q.data.len();
+        q.write_o += 1;
+        q.data[i] = Some(orchard_addr.clone());
+
+        Ok(FAUCET_VALUE)
+    })));
+
+
     let (
         miner_wallet_init,
         mut miner_account,
@@ -3301,15 +3382,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         (user_wallet, user_account, seed, user_usk, user_pubkey, user_privkey, user_t_addr, user_ua, HashMap::<TxId, (Option<StakingAction>, Vec<String>)>::new())
     };
 
+    let miner_ua_str = miner_ua.encode(network);
     let user_ua_str = user_ua.encode(network);
     println!("*************************");
-    println!("MINER WALLET T-ADDRESS: {}", miner_ua.encode(network));
-    println!("MINER WALLET ADDRESS:   {}", miner_t_address.encode(network));
+    println!("MINER WALLET T-ADDRESS: {}", miner_t_address.encode(network));
+    println!("MINER WALLET ADDRESS:   {}", miner_ua_str);
     println!("USER WALLET T-ADDRESS:  {}", user_t_address.encode(network));
     println!("USER WALLET ADDRESS:    {}", user_ua_str);
     println!("*************************");
 
-    wallet_state.lock().unwrap().user_recv_ua = user_ua_str;
+    wallet_state.lock().unwrap().user_recv_ua = user_ua_str.clone();
 
 
     println!("waiting for zaino to be ready...");
@@ -3333,6 +3415,14 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     };
+
+    if TEST_FAUCET {
+        println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
+        println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: "arosienarsoienaroisetn".to_owned() }).await);
+        println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
+        FAUCET_Q.lock().unwrap().read_o += 1; // fake read
+        println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
+    }
 
     // NOTE: current model is to reorg this many blocks back
     // ALT: have checkpoints every 16/32 blocks and always sync from the start of one of these
@@ -3422,6 +3512,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let mut resync_c = 0;
     'outer_sync: loop {
+
+        if TEST_FAUCET {
+            println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
+            println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: miner_ua_str.clone() }).await);
+        }
+
         if resync_c > 0 {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
@@ -3530,7 +3626,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                         if m.voting_power != voting_power_check {
                             // TODO: use manually-found one?
-                            println!("******* RECEIVED ROSTER VOTING POWER INACCURATE: {} vs {}", m.voting_power, voting_power_check);
+                            if DUMP_ROSTER { println!("******* RECEIVED ROSTER VOTING POWER INACCURATE: {} vs {}", m.voting_power, voting_power_check); }
                             // ok = false;
                             // break;
                         }
@@ -3551,11 +3647,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         })
                     .collect::<Vec<WalletRosterMember>>()
                         .clone();
-                    // println!("*********** WALLET ROSTER: {wallet_roster:?}");
+                    if DUMP_ROSTER { println!("*********** WALLET ROSTER: {wallet_roster:?}"); }
                     wallet_state.lock().unwrap().roster = wallet_roster;
                 }
             }
-            // println!("*********** ROSTER: {roster:?}");
+            if DUMP_ROSTER { println!("*********** ROSTER: {roster:?}"); }
 
 
             // NETWORK TIP HEIGHT
@@ -3693,12 +3789,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             needs_resync = true;
                         }
                         if Some(prev_hash) != expected_prev_hash {
-                            println!("reorg occurred before height {}; hash mismatch {prev_hash:?} vs {expected_prev_hash:?}", new_blocks[0].height);
+                            if DUMP_SYNC { println!("reorg occurred before height {}; hash mismatch {prev_hash:?} vs {expected_prev_hash:?}", new_blocks[0].height); }
                             req_start_h = req_start_h.saturating_sub(MAX_BLOCKS_TO_DOWNLOAD_AT_TIME);
                             needs_resync = true;
                         }
                         if needs_resync {
-                            println!("hit discontinuity; handling reorg!");
+                            if DUMP_SYNC { println!("hit discontinuity; handling reorg!"); }
                             continue 'sync_find_continuation_point;
                         }
                     }
@@ -3748,7 +3844,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             // invalid res   ##--------
                             // valid 1       ##########
                             // valid 2       ----------
-                            println!("reorg occurred in the middle of the returned blocks, caching up to the reorg, then we'll update to the other chain on the next iteration");
+                            if DUMP_SYNC { println!("reorg occurred in the middle of the returned blocks, caching up to the reorg, then we'll update to the other chain on the next iteration"); }
                             data_is_invalid = true;
                         }
                     }
@@ -3768,7 +3864,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 // println!("nothing to sync");
                 break (Vec::new(), Vec::new(), None, req_rng, ChainState::empty(LRZBlockHeight::from_u32(0), zcash_primitives::block::BlockHash([0; 32])));
             }
-            println!("downloaded compact blocks {}-{}", new_blocks.first().unwrap().height, new_blocks.last().unwrap().height);
+            if DUMP_SYNC { println!("downloaded compact blocks {}-{}", new_blocks.first().unwrap().height, new_blocks.last().unwrap().height); }
 
             let compact_block_max_h = new_blocks.last().expect("non-empty vector").height;
 
@@ -3804,7 +3900,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             };
             if new_raw_t_txs.len() > 0 {
-                println!("downloaded transparent txs at heights {}-{}", min_t_h, max_t_h);
+                if DUMP_SYNC { println!("downloaded transparent txs at heights {}-{}", min_t_h, max_t_h); }
             }
 
             let mut new_t_txs = Vec::<(BlockHeight, Transaction)>::with_capacity(new_raw_t_txs.len());
@@ -3822,7 +3918,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 let h = match bc_h_from_raw_tx_h(raw_tx.height) {
                     Some(None) => {
-                        println!("found sidechain transparent tx that we don't have height for, skipping...");
+                        if DUMP_SYNC { println!("found sidechain transparent tx that we don't have height for, skipping..."); }
                         continue;
                     }
                     Some(Some(h)) => h,
@@ -3858,7 +3954,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             // truncate compact blocks to match transparent // @in_step_sync
             if let Some(h) = t_failed_at_h {
-                println!("truncating compact blocks to match transparent at {h}");
+                if DUMP_SYNC { println!("truncating compact blocks to match transparent at {h}"); }
                 // ALT: partition_point then truncate
                 while new_blocks.len() > 0 {
                     if new_blocks.last().unwrap().height < h {
@@ -3979,7 +4075,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let insert_idxs = [&mut 0, &mut 0];
 
             while let Ok(raw_tx) = mempool_recv.try_recv() {
-                println!("got mempool tx with tip height: {}", raw_tx.height);
+                if DUMP_SYNC {
+                    println!("got mempool tx with tip height: {}", raw_tx.height);
+                }
                 // NOTE: expected LRZ height different from abstract mempool height
                 match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, LRZBlockHeight::from_u32(network_tip_h.0 + 1))) {
                     Err(err) => {
@@ -4001,8 +4099,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         if let Some(start_block_i) = sync_from_i {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             let sync_start_h = <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above");
-            println!("cache at {}, new blocks: {}-{}; updating wallets...",
-                pow_cache.next_tip_h-1, new_blocks.first().unwrap().height, new_blocks.last().unwrap().height);
+            if DUMP_SYNC {
+                println!("cache at {}, new blocks: {}-{}; updating wallets...",
+                    pow_cache.next_tip_h-1, new_blocks.first().unwrap().height, new_blocks.last().unwrap().height);
+            }
 
             let rng_start_orchard_tree_size = shard_tree_size(&orchard_tree);
 
@@ -4035,7 +4135,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         //-- READ ANY DOWNLOADED FULL TXS
         if in_flight_tx_requests.len() > 0 {
-            println!("before reading, there are {} in flight tx downloads", in_flight_tx_requests.len());
+            if DUMP_SYNC { println!("before reading, there are {} in flight tx downloads", in_flight_tx_requests.len()); }
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             let wallets = [miner_wallet, user_wallet];
             while let Some(tx_completion) = in_flight_tx_join_set.try_join_next() {
@@ -4055,7 +4155,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 //   * Choosing this because currently block-reading is the only way we detect
                 //     inconsistency around reorg; we don't want to add stale data here that never
                 //     gets fixed
-                println!("download finished for {txid:?}");
+                if DUMP_SYNC { println!("download finished for {txid:?}"); }
                 in_flight_tx_requests.remove(&txid);
                 if let (Some(raw_tx), Some(existing_tx_i)) = (dl_result, tx_position(&wallets[wallet_i], &txid)) {
                     let existing_tx = &wallets[wallet_i].txs[existing_tx_i];
@@ -4082,24 +4182,26 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         }
                     };
 
-                    println!("reading downloaded full tx for {txid:?}");
+                    if DUMP_SYNC { println!("reading downloaded full tx for {txid:?}"); }
                     let keys = PreparedKeys::from_ufvk_all(&wallets[wallet_i].accounts[0].ufvk);
 
                     read_full_tx(wallets[wallet_i], 0, &keys, existing_tx.mined_h, &tx, &mut 0, existing_tx.is_outside_bc);
                 }
             }
-            println!("after  reading, there are {} in flight tx downloads", in_flight_tx_requests.len());
+            if DUMP_SYNC { println!("after  reading, there are {} in flight tx downloads", in_flight_tx_requests.len()); }
         }
 
         //-- SEND DATA TO UI
         {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-            // println!("miner unspent UTXOs {:#?}", NL(&*miner_wallet.accounts[0].utxos));
-            // println!("miner spent   UTXOs {:#?}", NL(&*miner_wallet.accounts[0].stxos));
-            // println!("miner unspent notes {:#?}", NL(&*miner_wallet.accounts[0].unspent_orchard_notes));
-            // println!("miner spent   notes {:#?}", NL(&*miner_wallet.accounts[0].spent_orchard_notes));
-            // println!("user  unspent notes {:#?}", NL(&*user_wallet.accounts[0].unspent_orchard_notes));
-            // println!("user  spent   notes {:#?}", NL(&*user_wallet.accounts[0].spent_orchard_notes));
+            if DUMP_NOTES {
+                // println!("miner unspent UTXOs {:#?}", NL(&*miner_wallet.accounts[0].utxos));
+                // println!("miner spent   UTXOs {:#?}", NL(&*miner_wallet.accounts[0].stxos));
+                println!("miner unspent notes {:#?}", NL(&*miner_wallet.accounts[0].unspent_orchard_notes));
+                println!("miner spent   notes {:#?}", NL(&*miner_wallet.accounts[0].spent_orchard_notes));
+                println!("user  unspent notes {:#?}", NL(&*user_wallet.accounts[0].unspent_orchard_notes));
+                println!("user  spent   notes {:#?}", NL(&*user_wallet.accounts[0].spent_orchard_notes));
+            }
 
             let mut miner_unshielded_funds = 0;
             let mut miner_shielded_pending_funds = 0;
@@ -4223,7 +4325,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             let memo = MemoBytes::from_bytes("shielding notes".as_bytes()).unwrap();
             let ok = miner_wallet.shield_transparent_zats(network, &mut proposed_miner_shield, &mut client, &miner_usk, 1000000000, &orchard_tree, memo).is_some();
-            println!("Try miner shield {ok:?}");
+            if DUMP_TX_BUILD { println!("Try miner shield {ok:?}"); }
             faucet_shield_cooldown_instant = Instant::now();
 
             // also inspect bonds
@@ -4240,11 +4342,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
-        if AUTO_SPEND != 0 {
+        if AUTO_SPEND {
             let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             if user_wallet.accounts[0].unspent_orchard_notes.len() == 0 && !proposed_faucet.is_in_progress() {
                 // the user needs money, try to send some (doesn't matter if we fail until we've mined some)
-                let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, 500_000_000, &orchard_tree, *user_ua.orchard().unwrap(),
+                let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, FAUCET_VALUE, &orchard_tree, *user_ua.orchard().unwrap(),
                     MemoBytes::from_bytes("auto-sent from miner".as_bytes()).unwrap()
                 ).is_some();
             } else if ! auto_spend.0 {
@@ -4742,6 +4844,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // since it's probably waiting for the wallet_state mutex to unlock.
         let mut retries_this_round = 6;
         loop {
+            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
+
             let action: WalletAction = {
                 let mut wallet_lock = wallet_state.try_lock();
                 let Ok(wallet_state) = &mut wallet_lock else {
@@ -4755,56 +4859,69 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     }
                 };
 
-                println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len());
-                let Some(action) = wallet_state.actions_in_flight.front() else { break; };
-                action.clone()
-            };
-
-            let ok: bool = 'process_action: {
-                match &action {
-                    &WalletAction::RequestFromFaucet => {
-                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        let memo = MemoBytes::from_bytes("orchard -> orchard".as_bytes()).unwrap();
-                        let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, 500_000_000, &orchard_tree, *user_ua.orchard().unwrap(), memo).is_some();
-                        println!("Try miner send: {ok:?}");
-                        true // ALT ok
-                    }
-
-                    &WalletAction::StakeToFinalizer(amount, target_finalizer) => {
-                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        let ok = user_wallet.stake_orchard_to_finalizer(network, &mut proposed_stake, &mut client, &user_usk, amount.into_u64(), &orchard_tree, target_finalizer).is_some();
-                        println!("Try stake: {ok:?}");
-                        ok
-                    }
-
-                    WalletAction::SendToAddress(address, amount) => {
-                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        let memo = MemoBytes::from_bytes("send from user wallet".as_bytes()).unwrap();
-                        if let Some(orchard_address) = address.orchard() {
-                            let ok = user_wallet.send_orchard_to_orchard_zats(network, &mut proposed_send, &mut client, &user_usk, amount.into_u64(), &orchard_tree, *orchard_address, memo).is_some();
-                            println!("Try user send: {ok:?}");
-                            true // ALT ok
-                        } else {
-                            false
+                if DUMP_ACTIONS { println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len()); }
+                let Some(action) = wallet_state.actions_in_flight.front() else {
+                    // if we're not doing anything else, process a faucet RPC request
+                    if ! proposed_faucet.is_in_progress() {
+                        let mut q = FAUCET_Q.lock().unwrap();
+                        if DUMP_FAUCET { println!("faucet Q read_o: {}, write_o: {}", q.read_o, q.write_o); }
+                        if q.len() > 0 {
+                            let i = q.read_o as usize % q.data.len();
+                            if DUMP_FAUCET { println!("faucet Q new element at {i}: {:?}", q.data[i]); }
+                            if let Some(orchard_addr) = q.data[i] {
+                                let memo = MemoBytes::from_bytes("With love from your favourite faucet... Don't spend it all at once!".as_bytes()).unwrap();
+                                let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, FAUCET_VALUE, &orchard_tree, orchard_addr, memo).is_some();
+                                if DUMP_ACTIONS { println!("Try RPC faucet send: {ok:?}"); }
+                                q.read_o += 1;
+                            } else {
+                                println!("Faucet Q error: got None result where there should be valid data");
+                            }
                         }
                     }
 
-                    &WalletAction::UnstakeFromFinalizer(txid) => {
-                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        let ok = user_wallet.begin_unbonding_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).is_some();
-                        println!("Try unstake: {ok:?}");
-                        ok
-                    }
+                    break;
+                };
+                action.clone()
+            };
 
-                    &WalletAction::ClaimBond(txid) => {
-                        let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-                        let ok = user_wallet.claim_bond_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).await.is_some();
-                        println!("Try withdraw stake: {ok:?}");
-                        ok
-                    }
-
-                    _ => { true }
+            let ok: bool = match &action {
+                &WalletAction::RequestFromFaucet => {
+                    let memo = MemoBytes::from_bytes("With love from your favourite faucet... Don't spend it all at once!".as_bytes()).unwrap();
+                    let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, FAUCET_VALUE, &orchard_tree, *user_ua.orchard().unwrap(), memo).is_some();
+                    if DUMP_ACTIONS { println!("Try miner send: {ok:?}"); }
+                    true // ALT ok
                 }
+
+                &WalletAction::StakeToFinalizer(amount, target_finalizer) => {
+                    let ok = user_wallet.stake_orchard_to_finalizer(network, &mut proposed_stake, &mut client, &user_usk, amount.into_u64(), &orchard_tree, target_finalizer).is_some();
+                    println!("Try stake: {ok:?}");
+                    ok
+                }
+
+                WalletAction::SendToAddress(address, amount) => {
+                    if let Some(orchard_address) = address.orchard() {
+                        let memo = MemoBytes::from_bytes("send from user wallet".as_bytes()).unwrap();
+                        let ok = user_wallet.send_orchard_to_orchard_zats(network, &mut proposed_send, &mut client, &user_usk, amount.into_u64(), &orchard_tree, *orchard_address, memo).is_some();
+                        if DUMP_ACTIONS { println!("Try user send: {ok:?}"); }
+                        true // ALT ok
+                    } else {
+                        false
+                    }
+                }
+
+                &WalletAction::UnstakeFromFinalizer(txid) => {
+                    let ok = user_wallet.begin_unbonding_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).is_some();
+                    if DUMP_ACTIONS { println!("Try unstake: {ok:?}"); }
+                    ok
+                }
+
+                &WalletAction::ClaimBond(txid) => {
+                    let ok = user_wallet.claim_bond_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).await.is_some();
+                    if DUMP_ACTIONS { println!("Try withdraw stake: {ok:?}"); }
+                    ok
+                }
+
+                &WalletAction::TestStakeAction => true,
             };
 
             if !ok {
@@ -4881,10 +4998,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
 
-            continue_proposed_tx(miner_wallet, network, &mut proposed_faucet,       &mut client, "faucet send",  true).await;
-            continue_proposed_tx(miner_wallet, network, &mut proposed_miner_shield, &mut client, "miner shield", false).await;
-            continue_proposed_tx(user_wallet,  network, &mut proposed_stake,        &mut client, "stake",        true).await;
-            continue_proposed_tx(user_wallet,  network, &mut proposed_send,         &mut client, "send",         true).await;
+            continue_proposed_tx(miner_wallet, network, &mut proposed_faucet,       &mut client, "faucet send",  DUMP_TX_SEND).await;
+            continue_proposed_tx(miner_wallet, network, &mut proposed_miner_shield, &mut client, "miner shield", DUMP_TX_SEND && false).await;
+            continue_proposed_tx(user_wallet,  network, &mut proposed_stake,        &mut client, "stake",        DUMP_TX_SEND).await;
+            continue_proposed_tx(user_wallet,  network, &mut proposed_send,         &mut client, "send",         DUMP_TX_SEND).await;
         }
     }
 }
