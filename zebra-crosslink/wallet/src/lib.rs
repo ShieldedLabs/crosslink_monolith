@@ -599,16 +599,16 @@ impl WalletTxPart {
 }
 
 type TxPartFlags = u8;
-struct TxParts(pub TxPartFlags);
+pub struct TxParts(pub TxPartFlags);
 impl TxParts {
-    const NONE:          TxPartFlags = 0;
-    const TRANSPARENT:   TxPartFlags = 1 << WalletTxPart::TRANSPARENT;
-    const SHIELDED_RECV: TxPartFlags = 1 << WalletTxPart::SHIELDED;
-    const SHIELDED_SENT: TxPartFlags = 1 << 2;
-    const MEMO:          TxPartFlags = 1 << 3;
-    const STAKING_ACTION: TxPartFlags = 1 << 4;
+    pub const NONE:           TxPartFlags = 0;
+    pub const TRANSPARENT:    TxPartFlags = 1 << WalletTxPart::TRANSPARENT;
+    pub const SHIELDED_RECV:  TxPartFlags = 1 << WalletTxPart::SHIELDED;
+    pub const SHIELDED_SENT:  TxPartFlags = 1 << 2;
+    pub const MEMO:           TxPartFlags = 1 << 3;
+    pub const STAKING_ACTION: TxPartFlags = 1 << 4;
 
-    const FULL_TX: TxPartFlags = (
+    pub const FULL_TX: TxPartFlags = (
         Self::TRANSPARENT | Self::SHIELDED_RECV | Self::SHIELDED_SENT | Self::MEMO | Self::STAKING_ACTION
     );
 }

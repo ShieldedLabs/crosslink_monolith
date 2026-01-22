@@ -12,7 +12,7 @@ use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 use std::collections::HashMap;
 //use clay::*; // @Temporary
 
-use wallet::{ BlockHeight, WalletState, WalletTxKind, TxStatus, str_from_ctaz };
+use wallet::{ BlockHeight, WalletState, WalletTxKind, TxParts, TxStatus, str_from_ctaz };
 
 use super::*;
 
@@ -1690,27 +1690,20 @@ pub fn ui_left_pane(ui: &mut Context,
                                 align: Center,
                                 ..Decl
                             }) {
-                                // TODO: account for mempool
-                                let mut pending = false;
-                                let icon = match (tx.kind(), tx_is_in_block) {
-                                    (WalletTxKind::Send,     true) => ICON_UP_SMALL,
-                                    (WalletTxKind::SelfSend, true) => ICON_DOWN_SMALL,
-                                    (WalletTxKind::Receive,  true) => ICON_DOWN_SMALL,
-                                    (WalletTxKind::Mine,     true) => ICON_MONEY_1, // TODO: pickaxe/tools icon
-                                    (WalletTxKind::Shield,   true) => ICON_SHIELD,
-                                    (WalletTxKind::Stake,    true) => ICON_LINK_1,
-                                    (WalletTxKind::BeginUnstake,  true) => ICON_LINK_EXT_ALT,
-                                    (WalletTxKind::ClaimUnstake,  true) => ICON_UNLINK,
-                                    _ => {
-                                        pending = true;
-                                        let timer = (ui.tx_loading_animation_timer * 3.0) as u64;
-                                        if timer % 3 == 0 {
-                                            ICON_DOT
-                                        } else if timer % 3 == 1 {
-                                            ICON_DOT_2
-                                        } else {
-                                            ICON_DOT_3
-                                        }
+                                let mut pending = tx.part_flags != TxParts::FULL_TX;
+                                let icon = if pending {
+                                    let timer = (ui.tx_loading_animation_timer * 3.0) as usize;
+                                    [ICON_DOT, ICON_DOT_2, ICON_DOT_3][timer % 3]
+                                } else {
+                                    match tx.kind() {
+                                        WalletTxKind::Send         => ICON_UP_SMALL,
+                                        WalletTxKind::SelfSend     => ICON_DOWN_SMALL,
+                                        WalletTxKind::Receive      => ICON_DOWN_SMALL,
+                                        WalletTxKind::Mine         => ICON_MONEY_1, // TODO: pickaxe/tools icon
+                                        WalletTxKind::Shield       => ICON_SHIELD,
+                                        WalletTxKind::Stake        => ICON_LINK_1,
+                                        WalletTxKind::BeginUnstake => ICON_LINK_EXT_ALT,
+                                        WalletTxKind::ClaimUnstake => ICON_UNLINK,
                                     }
                                 };
 
