@@ -2732,7 +2732,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
 
     let (
-        miner_wallet_init,
+        mut miner_wallet,
         mut miner_account,
         miner_seed,
         miner_usk,
@@ -2755,7 +2755,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     };
 
     let (
-        user_wallet_init,
+        mut user_wallet,
         mut user_account,
         user_seed,
         user_usk,
@@ -2828,13 +2828,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     // ALT: have checkpoints every 16/32 blocks and always sync from the start of one of these
     const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u64 = 64;
     let mut time_since_last_transparent_shielded = std::time::Instant::now() - std::time::Duration::from_secs(1000);
-
-    let (mut user_use_i,  mut user_update_i)  = (0,0);
-    let (mut miner_use_i, mut miner_update_i) = (0,0);
-    // let mut user_wallets  = [user_wallet_init,  WalletDb::for_path(":memory:", network, SystemClock, OsRng).unwrap()];
-    // let mut miner_wallets = [miner_wallet_init, WalletDb::for_path(":memory:", network, SystemClock, OsRng).unwrap()];
-    let mut user_wallets  = [user_wallet_init];
-    let mut miner_wallets = [miner_wallet_init];
 
     let mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly = Vec::<TxId>::new();
 
@@ -3066,7 +3059,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     // AFAICT there's no downside to updating these as frequently as possible, even if the
                     // rest of sync is lagging behind
-                    for wallet in [&mut miner_wallets[miner_use_i], &mut user_wallets[user_use_i]] {
+                    for wallet in [&mut miner_wallet, &mut user_wallet] {
                         wallet.chain_tip_h = BlockHeight(network_tip_h);
                     }
                 },
@@ -3100,7 +3093,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             // START DOWNLOADS FOR FULL TRANSACTIONS
             // TODO: fairer requests
-            for (wallet_i, wallet) in [&mut miner_wallets[miner_use_i], &mut user_wallets[user_use_i]].into_iter().enumerate() {
+            for (wallet_i, wallet) in [&mut miner_wallet, &mut user_wallet].into_iter().enumerate() {
                 for tx in &wallet.txs {
                     // TODO: trigger whenever we see a tx we want more info on
                     if in_flight_tx_requests.len() >= MAX_TXS_TO_DOWNLOAD_AT_TIME as usize {
@@ -3375,7 +3368,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             break (new_blocks, new_t_txs, sync_from_i, req_rng, prev_tip_chain_state);
         };
 
-        let network_tip_h = user_wallets[user_use_i].chain_tip_h;
+        let network_tip_h = user_wallet.chain_tip_h;
 
         // let mut orchard_frontier = prev_tip_chain_state.final_orchard_tree().clone();
         // let mut orchard_tree = incrementalmerkletree::frontier::CommitmentTree::from_frontier(&orchard_frontier);
@@ -3393,8 +3386,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             orchard_tree.truncate_to_checkpoint(&last_block_h); // N.B. checkpoints are at the *end* of their block
 
-            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-            for (wallet_i, wallet) in [miner_wallet, user_wallet].into_iter().enumerate() {
+            for (wallet_i, wallet) in [&mut miner_wallet, &mut user_wallet].into_iter().enumerate() {
                 //-- INVALIDATE TXS >= NEW BLOCKS HEIGHT
                 for account in &mut wallet.accounts {
                     account.fully_detected_h = account.fully_detected_h.min(last_block_h);
@@ -3452,14 +3444,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // } else {
             //     req_rng.0.try_into.expect("fits in u32")
             // };
-            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             let keys = PreparedKeys::from_ufvk_all(&miner_wallet.accounts[0].ufvk);
             let mut insert_i = 0;
             for t_tx_i in 0..miner_t_txs.len() {
                 // kinda @in_step_sync
                 let block_h = miner_t_txs[t_tx_i].0;
                 let tx = &miner_t_txs[t_tx_i].1;
-                read_full_tx(miner_wallet, 0, &keys, block_h, tx, &mut insert_i, false);
+                read_full_tx(&mut miner_wallet, 0, &keys, block_h, tx, &mut insert_i, false);
             }
         }
 
@@ -3467,7 +3458,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         {
             // TODO: maybe wait until we're ~block-synced before doing this
             // NOTE: assumes we can keep up... maybe dropping with some feedback about that is better?
-            let wallets = [&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]];
+            let wallets = [&mut user_wallet, &mut miner_wallet];
             let keys = [
                 PreparedKeys::from_ufvk_all(&wallets[0].accounts[0].ufvk),
                 PreparedKeys::from_ufvk_all(&wallets[1].accounts[0].ufvk),
@@ -3497,7 +3488,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         //-- ADD/REVALIDATE SHIELDED TXS FROM NEW BLOCKS -- CANONICAL "SPINE"
         if let Some(start_block_i) = sync_from_i {
-            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             let sync_start_h = <u32>::try_from(new_blocks[start_block_i].height).expect("successfully converted above");
             if DUMP_SYNC {
                 println!("cache at {}, new blocks: {}-{}; updating wallets...",
@@ -3506,7 +3496,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             let rng_start_orchard_tree_size = shard_tree_size(&orchard_tree);
 
-            for (wallet_i, wallet) in [miner_wallet, user_wallet].into_iter().enumerate() {
+            for (wallet_i, wallet) in [&mut miner_wallet, &mut user_wallet].into_iter().enumerate() {
                 let mut next_orchard_pos = rng_start_orchard_tree_size;
                 let keys = PreparedKeys::from_ufvk_ivks(&wallet.accounts[0].ufvk); // NOTE: can't use ovk for CompactTx
                 let mut insert_i = 0;
@@ -3536,8 +3526,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         //-- READ ANY DOWNLOADED FULL TXS
         if in_flight_tx_requests.len() > 0 {
             if DUMP_SYNC { println!("before reading, there are {} in flight tx downloads", in_flight_tx_requests.len()); }
-            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-            let wallets = [miner_wallet, user_wallet];
+            let wallets = [&mut miner_wallet, &mut user_wallet];
             while let Some(tx_completion) = in_flight_tx_join_set.try_join_next() {
                 let (txid, wallet_i, dl_result): (TxId, usize, Option<RawTransaction>) = match tx_completion {
                     Ok(v) => v,
@@ -3593,7 +3582,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         //-- SEND DATA TO UI
         {
-            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             if DUMP_NOTES {
                 // println!("miner unspent UTXOs {:#?}", NL(&*miner_wallet.accounts[0].utxos));
                 // println!("miner spent   UTXOs {:#?}", NL(&*miner_wallet.accounts[0].stxos));
@@ -3706,7 +3694,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
         // Anchor debugging
         // {
-        //     let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
         //     for i in 0..miner_wallet.chain_tip_h.0 {
         //         let orchard_anchor_h = BlockHeight(i);
         //         let try_anchor = match orchard_tree.root_at_checkpoint_id(&orchard_anchor_h).expect("Infallible MemoryShardStore") {
@@ -3721,8 +3708,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // }
 
         if faucet_shield_cooldown_instant.elapsed().as_secs() > 15 && !proposed_miner_shield.is_in_progress() {
-            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-
             let memo = MemoBytes::from_bytes("shielding notes".as_bytes()).unwrap();
             let ok = miner_wallet.shield_transparent_zats(network, &mut proposed_miner_shield, &mut client, &miner_usk, 1000000000, &orchard_tree, memo).is_some();
             if DUMP_TX_BUILD { println!("Try miner shield {ok:?}"); }
@@ -3743,7 +3728,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         if AUTO_SPEND {
-            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             if user_wallet.accounts[0].unspent_orchard_notes.len() == 0 && !proposed_faucet.is_in_progress() {
                 // the user needs money, try to send some (doesn't matter if we fail until we've mined some)
                 let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, FAUCET_VALUE, &orchard_tree, *user_ua.orchard().unwrap(),
@@ -3760,8 +3744,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // since it's probably waiting for the wallet_state mutex to unlock.
         let mut retries_this_round = 6;
         loop {
-            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
-
             let action: WalletAction = {
                 let mut wallet_lock = wallet_state.try_lock();
                 let Ok(wallet_state) = &mut wallet_lock else {
@@ -3849,7 +3831,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
 
         { //-- INCREMENTALLY SEND TXS
-            let (user_wallet, miner_wallet) = (&mut user_wallets[user_use_i], &mut miner_wallets[miner_use_i]);
             async fn continue_proposed_tx<P: Parameters>(wallet: &mut ManualWallet, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>, desc: &str, loud: bool) {
                 let pre_mined_h = tx.tx.mined_h;
                 match tx.tx.mined_h {
@@ -3914,10 +3895,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 }
             }
 
-            continue_proposed_tx(miner_wallet, network, &mut proposed_faucet,       &mut client, "faucet send",  DUMP_TX_SEND).await;
-            continue_proposed_tx(miner_wallet, network, &mut proposed_miner_shield, &mut client, "miner shield", DUMP_TX_SEND && false).await;
-            continue_proposed_tx(user_wallet,  network, &mut proposed_stake,        &mut client, "stake",        DUMP_TX_SEND).await;
-            continue_proposed_tx(user_wallet,  network, &mut proposed_send,         &mut client, "send",         DUMP_TX_SEND).await;
+            continue_proposed_tx(&mut miner_wallet, network, &mut proposed_faucet,       &mut client, "faucet send",  DUMP_TX_SEND).await;
+            continue_proposed_tx(&mut miner_wallet, network, &mut proposed_miner_shield, &mut client, "miner shield", DUMP_TX_SEND && false).await;
+            continue_proposed_tx(&mut user_wallet,  network, &mut proposed_stake,        &mut client, "stake",        DUMP_TX_SEND).await;
+            continue_proposed_tx(&mut user_wallet,  network, &mut proposed_send,         &mut client, "send",         DUMP_TX_SEND).await;
         }
     }
 }
