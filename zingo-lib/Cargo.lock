@@ -11030,6 +11030,7 @@ dependencies = [
  "tower-fallback",
  "tracing",
  "tracing-futures",
+ "zcash_primitives",
  "zcash_proofs",
  "zcash_protocol",
  "zebra-chain",

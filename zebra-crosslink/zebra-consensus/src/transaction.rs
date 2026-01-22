@@ -449,6 +449,12 @@ where
 
             tracing::trace!(?tx_id, "passed quick checks");
 
+            // Check staking day window (staking actions only allowed during specific block ranges)
+            Self::check_staking_day_window(&tx, req.height())?;
+
+            // Check staking action delay (applies to both mempool and block transactions)
+            Self::check_staking_action_delay(&tx, req.height(), state.clone()).await?;
+
             if let Some(block_time) = req.block_time() {
                 check::lock_time_has_passed(&tx, req.height(), block_time)?;
             } else {
@@ -858,6 +864,107 @@ where
             request.known_utxos(),
             spent_utxos,
         )
+    }
+
+    /// Minimum number of blocks that must pass between staking actions on the same bond.
+    pub const STAKING_ACTION_DELAY_BLOCKS: u32 = 15;
+
+    /// The period length for staking days. A new staking day starts every N blocks.
+    pub const STAKING_DAY_PERIOD: u32 = 100;
+
+    /// The window size within each staking day period where staking actions are allowed.
+    /// Staking actions are only valid when `block_height % STAKING_DAY_PERIOD < STAKING_DAY_WINDOW`.
+    pub const STAKING_DAY_WINDOW: u32 = 10;
+
+    /// Checks that staking actions in a transaction respect the required delay since the
+    /// last action on the same bond.
+    ///
+    /// For BeginDelegationUnbonding and WithdrawDelegationBond actions, verifies that at least
+    /// `STAKING_ACTION_DELAY_BLOCKS` blocks have passed since the bond was created or last modified.
+    ///
+    /// Returns `Ok(())` if the transaction has no staking action or the delay is satisfied.
+    async fn check_staking_action_delay(
+        tx: &Transaction,
+        height: block::Height,
+        state: Timeout<ZS>,
+    ) -> Result<(), TransactionError> {
+        use zcash_primitives::transaction::StakingActionKind;
+
+        let staking_action = match tx.staking_action() {
+            Some(action) => action,
+            None => return Ok(()),
+        };
+
+        // Only check delay for actions that modify existing bonds
+        match staking_action.kind {
+            StakingActionKind::BeginDelegationUnbonding
+            | StakingActionKind::WithdrawDelegationBond => {}
+            _ => return Ok(()),
+        }
+
+        let bond_key = staking_action.arg32_0;
+
+        // Query the state for bond info
+        let query = state.oneshot(zs::Request::BondInfo(bond_key));
+
+        let response = query
+            .await
+            .map_err(|e| TransactionError::ValidateMempoolLockTimeError(
+                format!("failed to query bond info: {}", e)
+            ))?;
+
+        let zs::Response::BondInfo(bond_info) = response else {
+            unreachable!("BondInfo request always responds with BondInfo")
+        };
+
+        let Some(info) = bond_info else {
+            // Bond doesn't exist - this will be caught by other validation
+            return Err(TransactionError::StakingActionBondNotFound { bond_key });
+        };
+
+        let last_action_height = info.last_action_height;
+        let current_height = height.0;
+
+        // Check if enough blocks have passed since the last action
+        if current_height < last_action_height + Self::STAKING_ACTION_DELAY_BLOCKS {
+            return Err(TransactionError::StakingActionDelayNotMet {
+                bond_key,
+                last_action_height,
+                current_height,
+                required_delay: Self::STAKING_ACTION_DELAY_BLOCKS,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Checks that staking actions are only performed within the allowed staking window.
+    ///
+    /// Staking actions are only valid when `block_height % STAKING_DAY_PERIOD < STAKING_DAY_WINDOW`.
+    /// For example, with PERIOD=100 and WINDOW=10, staking is allowed on blocks 0-9, 100-109, 200-209, etc.
+    ///
+    /// Returns `Ok(())` if the transaction has no staking action or is within the staking window.
+    fn check_staking_day_window(
+        tx: &Transaction,
+        height: block::Height,
+    ) -> Result<(), TransactionError> {
+        // Only check if the transaction has a staking action
+        if tx.staking_action().is_none() {
+            return Ok(());
+        }
+
+        let block_height = height.0;
+        let position_in_period = block_height % Self::STAKING_DAY_PERIOD;
+
+        if position_in_period >= Self::STAKING_DAY_WINDOW {
+            return Err(TransactionError::StakingActionOutsideWindow {
+                block_height,
+                period: Self::STAKING_DAY_PERIOD,
+                window: Self::STAKING_DAY_WINDOW,
+            });
+        }
+
+        Ok(())
     }
 
     /// Verify a V4 transaction.

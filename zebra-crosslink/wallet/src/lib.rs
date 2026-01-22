@@ -4137,6 +4137,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let mut stake_positions_bonded = Vec::new();
             let mut stake_positions_unbonded = Vec::new();
             for tx in &user_wallet.txs {
+                if tx.is_outside_bc { continue; }
                 if let Some(staking_action) = (&tx.staking_action) {
                     if let Some(create_bond) = StakingAction_CreateNewDelegationBond::try_from_union(staking_action) {
                         stake_positions_bonded.push((create_bond.unique_pubkey, create_bond.target_finalizer, create_bond.amount_zats));

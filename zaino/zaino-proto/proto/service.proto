@@ -139,6 +139,7 @@ message BondInfoRequest {
 message BondInfoResponse {
     uint64 amount = 1;  // Bond amount in zatoshis
     uint32 status = 2;  // 0 = Active, 1 = Unbonding, 2 = Withdrawn
+    uint32 lastActionHeight = 3;  // Block height of last staking action on this bond
 }
 
 // The a shortened transaction ID is the prefix in big-endian (hex) format

@@ -1038,6 +1038,7 @@ impl LightWalletIndexer for FetchServiceSubscriber {
                 Ok(BondInfoResponse {
                     amount: info.amount(),
                     status: info.status() as u32,
+                    last_action_height: info.last_action_height(),
                 })
             }
             None => Err(FetchServiceError::TonicStatusError(

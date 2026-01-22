@@ -1540,6 +1540,7 @@ where
                 Ok(Some(GetBondInfoResponse {
                     amount: u64::from(info.amount),
                     status: info.status,
+                    last_action_height: info.last_action_height,
                 }))
             }
             zebra_state::ReadResponse::BondInfo(None) => Ok(None),
@@ -4118,6 +4119,9 @@ pub struct GetBondInfoResponse {
     /// The bond status: 0 = Active, 1 = Unbonding, 2 = Withdrawn.
     #[getter(copy)]
     status: u8,
+    /// The block height of the last staking action on this bond.
+    #[getter(copy)]
+    last_action_height: u32,
 }
 
 /// A hex-encoded [`ConsensusBranchId`] string.

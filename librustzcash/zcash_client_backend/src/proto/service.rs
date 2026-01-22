@@ -182,6 +182,9 @@ pub struct BondInfoResponse {
     /// 0 = Active, 1 = Unbonding, 2 = Withdrawn
     #[prost(uint32, tag = "2")]
     pub status: u32,
+    /// Block height of last staking action on this bond
+    #[prost(uint32, tag = "3")]
+    pub last_action_height: u32,
 }
 /// The a shortened transaction ID is the prefix in big-endian (hex) format
 /// (then converted to binary).

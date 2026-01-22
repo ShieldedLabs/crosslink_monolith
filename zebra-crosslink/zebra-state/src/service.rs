@@ -1286,7 +1286,8 @@ impl Service<Request> for StateService {
             | Request::BlockHeader(_)
             | Request::FindBlockHashes { .. }
             | Request::FindBlockHeaders { .. }
-            | Request::CheckBestChainTipNullifiersAndAnchors(_) => {
+            | Request::CheckBestChainTipNullifiersAndAnchors(_)
+            | Request::BondInfo(_) => {
                 // Redirect the request to the concurrent ReadStateService
                 let read_service = self.read_service.clone();
 
@@ -2288,6 +2289,7 @@ impl Service<ReadRequest> for ReadStateService {
                                     BondStatusInChain::Unbonding => 1,
                                     BondStatusInChain::Withdrawn => 2,
                                 },
+                                last_action_height: bond.created_at.height.0,
                             }
                         });
 

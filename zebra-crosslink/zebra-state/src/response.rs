@@ -113,6 +113,9 @@ pub enum Response {
 
     /// Response to [`Request::CheckBlockProposalValidity`]
     ValidBlockProposal,
+
+    /// Response to [`Request::BondInfo`] with bond information.
+    BondInfo(Option<BondInfoResponse>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -431,6 +434,8 @@ pub struct BondInfoResponse {
     pub amount: Amount<NonNegative>,
     /// The bond status: 0 = Active, 1 = Unbonding, 2 = Withdrawn.
     pub status: u8,
+    /// The block height of the last staking action on this bond.
+    pub last_action_height: u32,
 }
 
 /// A structure with the information needed from the state to build a `getblocktemplate` RPC response.
@@ -533,10 +538,11 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::ValidBlockProposal => Ok(Response::ValidBlockProposal),
 
             ReadResponse::SolutionRate(_)
-            | ReadResponse::TipBlockSize(_)
-            | ReadResponse::BondInfo(_) => {
+            | ReadResponse::TipBlockSize(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
+
+            ReadResponse::BondInfo(info) => Ok(Response::BondInfo(info)),
         }
     }
 }
