@@ -1,38 +1,34 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug executable 'zebrad'",
-            "program": "/Users/azmr/crosslink_monolith/zebra-crosslink/target/debug/zebrad",
-            "sourceLanguages": ["rust"],
-            "cargo": {
-                "args": [
-                    "build",
-                    "--manifest-path=/Users/azmr/crosslink_monolith/zebra-crosslink/Cargo.toml",
-                    "--bin=zebrad",
-                    "--package=zebrad",
-                    "-Finternal-miner,viz_gui"
-                ],
-                "filter": {
-                    "name": "zebrad",
-                    "kind": "bin"
-                }
-            },
-            "args": ["-c", "/Users/azmr/Library/Preferences/zebrad_cl.toml"],
-            "cwd": "${workspaceFolder}",
-            "env": { "RUSTFLAGS": "-Awarnings" },
-            "showDisassembly": false,
-            "breakpoints": {
-                "exception": {
-                    "rust_panic": "eh",
-                    "cpp_exception": "eh"
-                }
-            }
-        }
-    ]
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug zebrad (viz_gui)",
+      "type": "lldb",
+      "request": "launch",
+
+      "cargo": {
+        "args": [
+          "run",
+          "--manifest-path",
+          "${workspaceFolder}/zebra-crosslink/Cargo.toml",
+          "--features",
+          "viz_gui",
+          "--bin",
+          "zebrad"
+        ]
+      },
+
+      "args": [
+        "-c",
+        "${workspaceFolder}/../regtest.toml"
+      ],
+
+      "env": {
+        "RUSTFLAGS": "-Awarnings"
+      },
+
+      "cwd": "${workspaceFolder}/zebra-crosslink",
+      "sourceLanguages": ["rust"]
+    }
+  ]
 }

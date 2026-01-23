@@ -43,7 +43,7 @@ const MAX_BANDWIDTH_BYTES_PER_SECOND: usize = 1_000_000;
 
 
 use static_assertions::{const_assert};
-use std::{io::{Cursor, Read}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, sync::{Arc, Mutex}};
+use std::{hash::DefaultHasher, io::{Cursor, Read}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, sync::{Arc, Mutex}};
 use byteorder::{LittleEndian, ReadBytesExt};
 use ed25519_zebra::{Signature, SigningKey, VerificationKeyBytes, VerificationKey};
 use rand::{seq::{IndexedRandom}, Rng, RngCore, SeedableRng};
@@ -2129,13 +2129,102 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&mut roster).await;
 
+                // Note(Sam): I am going to emulate the future production p2p network by always adding the two ShieldedLabs servers as known validator peers with zero voting power if they are not
+                // already in the roster.
+
+
+fn parse_to_ipv6_bytes(s: &str) -> Result<([u8; 16], u16), std::net::AddrParseError> {
+    let sa: SocketAddr = s.parse()?;
+
+    let (ip6, port) = match sa {
+        SocketAddr::V4(v4) => {
+            // Map IPv4 to IPv6-mapped ::ffff:a.b.c.d
+            (v4.ip().to_ipv6_mapped(), v4.port())
+            // (Alternatively on newer Rust: (v4.ip().to_ipv6_mapped(), v4.port()))
+        }
+        SocketAddr::V6(v6) => (*v6.ip(), v6.port()),
+    };
+
+    Ok((ip6.octets(), port))
+}
+fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint) {
+    use std::hash::Hasher;
+    let mut hasher = DefaultHasher::new();
+    hasher.write(addr.as_bytes());
+    let seed = hasher.finish();
+
+    let kp = snow::Builder::with_resolver(
+        "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap(),
+        Box::new(SnowRngResolver::seed_from_u64(seed)),
+    )
+    .generate_keypair()
+    .unwrap();
+    let static_keypair = StaticDHKeyPair {
+        private: kp.private.try_into().unwrap(),
+        public: kp.public.try_into().unwrap(),
+    };
+    let (ip, port) = parse_to_ipv6_bytes(addr).unwrap();
+    (
+        static_keypair,
+        SecureUdpEndpoint {
+            public_key: static_keypair.public,
+            ip_address: ip,
+            port,
+        },
+    )
+}
+
+                let server_a_pub_key = {
+                    let mut bytes = [0u8; 32];
+
+                    let s = "cda713740df267bae9ac35c58729567a87b29b757e9d7628426b1c3c4fd5bc73";
+                    for i in 0..32 {
+                        let start = i * 2;
+                        let b = u8::from_str_radix(&s[start..start + 2], 16).unwrap();
+                        bytes[31 - i] = b; // reverse order
+                    }
+                    bytes
+                };
+
+                if peers.iter().position(|p| p.root_public_bft_key == server_a_pub_key).is_none() && server_a_pub_key != my_root_private_key.as_ref() {
+                    let (a, b) = goofy_addr_string_to_stuff("45.76.30.90:8234");
+                    let evidence = EndpointEvidence { endpoint: b, root_public_bft_key: server_a_pub_key };
+                    roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
+                    roster_endpoint_evidence.push(evidence);
+                    peers.push(Peer { root_public_bft_key: server_a_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
+                }
+
+                let server_b_pub_key = {
+                    let mut bytes = [0u8; 32];
+
+                    let s = "1e7813a5fd2d3462d109d9d3ecb427ec3bf01469ddc1d46bb4daa0d9826a00e6";
+                    for i in 0..32 {
+                        let start = i * 2;
+                        let b = u8::from_str_radix(&s[start..start + 2], 16).unwrap();
+                        bytes[31 - i] = b; // reverse order
+                    }
+                    bytes
+                };
+
+                if peers.iter().position(|p| p.root_public_bft_key == server_b_pub_key).is_none() && server_b_pub_key != my_root_private_key.as_ref() {
+                    let (a, b) = goofy_addr_string_to_stuff("70.34.201.202:8234");
+                    let evidence = EndpointEvidence { endpoint: b, root_public_bft_key: server_b_pub_key };
+                    roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
+                    roster_endpoint_evidence.push(evidence);
+                    peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
+                }
+
                 {
                     let active_roster = &roster[..active_roster_len(&roster)];
-                    // Drop those who are not in the active roster.
-                    peers.retain(|p| active_roster.iter().position(|rp| rp.pub_key.0 == p.root_public_bft_key).is_some());
+                    // Drop those who are not in the active roster. And not the backup p2p servers.
+                    peers.retain(|p| p.root_public_bft_key == server_a_pub_key || p.root_public_bft_key == server_b_pub_key || active_roster.iter().position(|rp| rp.pub_key.0 == p.root_public_bft_key).is_some());
                     for rp in active_roster {
                         if peers.iter().position(|p| p.root_public_bft_key == rp.pub_key.0).is_none() && rp.pub_key.0 != my_root_private_key.as_ref() {
-                            peers.push(Peer { root_public_bft_key: rp.pub_key.0, ..Peer::default() });
+                            let mut peer = Peer { root_public_bft_key: rp.pub_key.0, ..Peer::default() };
+                            if let Some(evidence) = roster_endpoint_evidence.iter().find(|evidence| evidence.root_public_bft_key == rp.pub_key.0) {
+                                peer.endpoint = Some(evidence.endpoint);
+                            }
+                            peers.push(peer);
                         }
                     }
                 }
