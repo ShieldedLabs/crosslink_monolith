@@ -1376,6 +1376,22 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }
                                         }
                                     }
+                                    if is_unbonded == false {
+                                        // left-right icon
+                                        if let _ = elem().decl(Decl {
+                                            id: id_index("Retarget Roster Member Right Icon", index as u32),
+                                            height: fit!(),
+                                            width: fixed!(ui.scale(32.0)),
+                                            direction: TopToBottom,
+                                            align: Center,
+                                            ..Decl
+                                        }) {
+                                            let (icon, icon_hovered) = (ICON_MOVE, ICON_RESIZE_FULL_ALT);
+                                            if clickable_icon(ui, id_index("Retarget Button", index as u32), icon, icon_hovered, true) {
+                                                wallet_state.lock().unwrap().retarget_bond(bond_key, [0u8; 32]);
+                                            }
+                                        }
+                                    }
 
                                     // info
                                     if let _ = elem().decl(Decl {
@@ -1703,6 +1719,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                         WalletTxKind::Shield       => ICON_SHIELD,
                                         WalletTxKind::Stake        => ICON_LINK_1,
                                         WalletTxKind::BeginUnstake => ICON_LINK_EXT_ALT,
+                                        WalletTxKind::Retarget => ICON_MOVE,
                                         WalletTxKind::ClaimUnstake => ICON_UNLINK,
                                     }
                                 };
@@ -1734,6 +1751,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::Shield        => if tx_is_in_block { "Shielded"  } else { "Shielding" },
                                     WalletTxKind::Stake         => if tx_is_in_block { "Staked"    } else { "Staking"   },
                                     WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking" },
+                                    WalletTxKind::Retarget  => if tx_is_in_block { "Moved Delegation"  } else { "Moving Delegation" },
                                     WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unbonded"  } else { "Unbonding" },
                                 };
 

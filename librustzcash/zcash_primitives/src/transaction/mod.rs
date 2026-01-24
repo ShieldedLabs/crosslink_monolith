@@ -1482,6 +1482,32 @@ impl StakingAction_BeginDelegationUnbonding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct StakingAction_RetargetDelegationBond {
+    pub unique_pubkey: [u8; 32],
+    pub challenge: [u8; 32],
+    pub signature: [u8; 64],
+    pub target_finalizer: [u8; 32],
+}
+
+impl StakingAction_RetargetDelegationBond {
+    pub fn to_union(&self) -> StakingAction {
+        StakingAction { kind: StakingActionKind::RetargetDelegationBond, arg32_0: self.unique_pubkey, arg32_1: self.challenge, arg64_0: self.signature, arg32_2: self.target_finalizer, ..Default::default() }
+    }
+    pub fn try_from_union(union: &StakingAction) -> Option<StakingAction_RetargetDelegationBond> {
+        if union.kind == StakingActionKind::RetargetDelegationBond {
+            Some(StakingAction_RetargetDelegationBond {
+                unique_pubkey: union.arg32_0,
+                challenge: union.arg32_1,
+                signature: union.arg64_0,
+                target_finalizer: union.arg32_2,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct StakingAction_WithdrawDelegationBond {
     pub amount_zats: u64,
     pub unique_pubkey: [u8; 32],

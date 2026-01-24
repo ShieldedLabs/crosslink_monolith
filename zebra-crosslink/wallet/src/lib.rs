@@ -46,7 +46,7 @@ use zcash_primitives::transaction::fees::{
 };
 use zcash_primitives::transaction::sighash::{signature_hash, SignableInput};
 use zcash_primitives::transaction::txid::TxIdDigester;
-use zcash_primitives::transaction::{Authorized, StakingAction_BeginDelegationUnbonding, StakingAction_CreateNewDelegationBond, StakingAction_WithdrawDelegationBond, Transaction, TransactionData, TxVersion, Unauthorized};
+use zcash_primitives::transaction::{Authorized, StakingAction_BeginDelegationUnbonding, StakingAction_CreateNewDelegationBond, StakingAction_RetargetDelegationBond, StakingAction_WithdrawDelegationBond, Transaction, TransactionData, TxVersion, Unauthorized};
 use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight as LRZBlockHeight, BranchId};
@@ -418,6 +418,7 @@ enum WalletAction {
     TestStakeAction,
     StakeToFinalizer(Zatoshis, [u8; 32]),
     UnstakeFromFinalizer(TxId),
+    RetargetBond(TxId, [u8; 32]),
     ClaimBond(TxId),
     SendToAddress(UnifiedAddress, Zatoshis),
 }
@@ -431,6 +432,7 @@ pub enum WalletTxKind {
     Shield, // a form of SelfSend
     Stake,
     BeginUnstake,
+    Retarget,
     ClaimUnstake,
 }
 
@@ -479,14 +481,13 @@ impl WalletTxPart {
                     b.recv(Zatoshis::from_u64(staking_action.amount_zats).expect("already converted"), true).unwrap();
                 },
 
-                StakingActionKind::BeginDelegationUnbonding => {},
+                StakingActionKind::BeginDelegationUnbonding | StakingActionKind::RetargetDelegationBond => {},
 
                 StakingActionKind::WithdrawDelegationBond => {
                     b.spent(Zatoshis::from_u64(staking_action.amount_zats).expect("already converted"), true).unwrap();
                 },
 
-                StakingActionKind::RetargetDelegationBond |
-                    StakingActionKind::RegisterFinalizer |
+                StakingActionKind::RegisterFinalizer |
                     StakingActionKind::ConvertFinalizerRewardToDelegationBond |
                     StakingActionKind::UpdateFinalizerKey => todo!("remaining staking actions"),
             }
@@ -757,6 +758,9 @@ impl WalletTx {
             if staking_action.kind == StakingActionKind::BeginDelegationUnbonding {
                 return WalletTxKind::BeginUnstake;
             }
+            if staking_action.kind == StakingActionKind::RetargetDelegationBond {
+                return WalletTxKind::Retarget;
+            }
             if staking_action.kind == StakingActionKind::WithdrawDelegationBond {
                 return WalletTxKind::ClaimUnstake;
             }
@@ -893,6 +897,14 @@ impl WalletState {
             return;
         }
         self.actions_in_flight.push_back(WalletAction::UnstakeFromFinalizer(txid));
+    }
+    
+    pub fn retarget_bond(&mut self, txid: [u8; 32], new_target: [u8; 32]) {
+        let txid = TxId::from_bytes(txid);
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::RetargetBond(id, _to) if id.eq(&txid) => true, _ => false }).count() != 0 {
+            return;
+        }
+        self.actions_in_flight.push_back(WalletAction::RetargetBond(txid, new_target));
     }
 
     pub fn claim_bond(&mut self, txid: [u8; 32]) {
@@ -1431,6 +1443,18 @@ impl ManualWallet {
                 if DUMP_TX_BUILD { println!("  unstaking bond: {}", staking_action.amount_zats); }
             },
 
+            StakingActionKind::RetargetDelegationBond => {
+                // let txid = TxId::from_bytes(staking_action.arg32_0);
+                // TODO: check it hasn't already been unstaked
+                // let Some(bond_tx) = self.txs.iter().find(|t| t.txid == txid) else {
+                //     println!("Could not find bond txid {:?} that was ready to unstake.", txid);
+                //     return None;
+                // };
+                // no direct send - fee for transitioning between 2 pools we don't touch directly
+                // TODO: (fallback to) pay for fee from bond?
+                if DUMP_TX_BUILD { println!("  unstaking bond: {}", staking_action.amount_zats); }
+            },
+
             StakingActionKind::WithdrawDelegationBond => {
                 let bond_key = &staking_action.arg32_0; // TODO is this always true?
                 // TODO: check it hasn't already been unbonded
@@ -1445,7 +1469,6 @@ impl ManualWallet {
                 if DUMP_TX_BUILD { println!("  withdrawing bond: {}", staking_action.amount_zats); }
             },
 
-            StakingActionKind::RetargetDelegationBond |
             StakingActionKind::RegisterFinalizer |
             StakingActionKind::ConvertFinalizerRewardToDelegationBond |
             StakingActionKind::UpdateFinalizerKey => todo!("remaining staking actions"),
@@ -1743,6 +1766,25 @@ impl ManualWallet {
                 unique_pubkey: bond_key,
                 challenge: [0u8; 32],
                 signature: [0u8; 64]
+            }.to_union()),
+        };
+        self.send_zats(network, tx, client, &[], src_usk, opts)
+    }
+
+    pub fn retarget_bond_using_orchard<P: Parameters>(
+        &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
+        src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, bond_key: [u8; 32], new_target: [u8; 32],
+    ) -> Option<()>
+    {
+        let tz = Timer::scope("begin_unbonding_using_orchard");
+        let account = &self.accounts[0];
+        let opts = &TxOptions{
+            src_pools: &[TxPool::Orchard(orchard_tree)],
+            staking_action: Some(StakingAction_RetargetDelegationBond {
+                unique_pubkey: bond_key,
+                challenge: [0u8; 32],
+                signature: [0u8; 64],
+                target_finalizer: new_target,
             }.to_union()),
         };
         self.send_zats(network, tx, client, &[], src_usk, opts)
@@ -3864,6 +3906,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 &WalletAction::UnstakeFromFinalizer(txid) => {
                     let ok = user_wallet.begin_unbonding_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).is_some();
                     if DUMP_ACTIONS { println!("Try unstake: {ok:?}"); }
+                    ok
+                }
+
+                &WalletAction::RetargetBond(txid, new_target) => {
+                    let ok = user_wallet.retarget_bond_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref(), new_target).is_some();
+                    if DUMP_ACTIONS { println!("Try retarget: {ok:?}"); }
                     ok
                 }
 
