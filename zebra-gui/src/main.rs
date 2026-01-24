@@ -45,15 +45,15 @@ fn main() {
             WalletTx::with_fake_data(WalletTxKind::Unstake, 10_000_000_000, 0, false, false, "", 0), */
         ];
 
-        let mut pending: Vec<_> = txs.iter().filter(|tx| !tx.mined_h.is_in_block()).map(|tx| tx.clone()).collect();
-        let mut mined:   Vec<_> = txs.iter().filter(|tx|  tx.mined_h.is_in_block()).map(|tx| tx.clone()).collect();
+        let mut pending: Vec<_> = txs.iter().filter(|tx| !tx.h.is_in_block()).map(|tx| tx.clone()).collect();
+        let mut mined:   Vec<_> = txs.iter().filter(|tx|  tx.h.is_in_block()).map(|tx| tx.clone()).collect();
         pending.sort_by(| a, b | a.txid.cmp(&b.txid));
-        mined.sort_by(|a, b| b.mined_h.cmp(&a.mined_h));
+        mined.sort_by(|a, b| b.h.cmp(&a.h));
         pending.extend_from_slice(&mined);
 
         wallet_state.lock().unwrap().user_txs = pending;
         wallet_state.lock().unwrap().roster = vec![
-            /* WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 25540_000_000, txids: vec![] },
+            WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 25540_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0xBBu8; 32], voting_power: 111000100_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0xCCu8; 32], voting_power: 250_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0xDDu8; 32], voting_power: 100_000_000, txids: vec![] },
@@ -68,13 +68,13 @@ fn main() {
             WalletRosterMember{ pub_key: [0x66u8; 32], voting_power: 250_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0x77u8; 32], voting_power: 100_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0x88u8; 32], voting_power: 250_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0x99u8; 32], voting_power: 100_000_000, txids: vec![] }, */
+            WalletRosterMember{ pub_key: [0x99u8; 32], voting_power: 100_000_000, txids: vec![] },
         ];
         wallet_state.lock().unwrap().stake_positions_bonded = vec![
-            /* ([0xAAu8; 32], [0x1u8; 32], 100_000_000, 250_000_000),
-            ([0xBBu8; 32], [0x1u8; 32], 100_000_000, 100_000_000),
-            ([0xCCu8; 32], [0x1u8; 32], 100_000_000, 250_000_000),
-            ([0xDDu8; 32], [0x1u8; 32], 100_000_000, 100_000_000), */
+            ([0x1u8; 32], [0xAAu8; 32], 100_000_000),
+            ([0x2u8; 32], [0xBBu8; 32], 100_000_000),
+            ([0x3u8; 32], [0xCCu8; 32], 100_000_000),
+            ([0x4u8; 32], [0xDDu8; 32], 100_000_000),
         ];
     }
 
