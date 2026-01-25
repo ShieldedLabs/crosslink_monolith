@@ -943,13 +943,22 @@ where
     /// Staking actions are only valid when `block_height % STAKING_DAY_PERIOD < STAKING_DAY_WINDOW`.
     /// For example, with PERIOD=100 and WINDOW=10, staking is allowed on blocks 0-9, 100-109, 200-209, etc.
     ///
+    /// RetargetDelegationBond is exempt from this rule and can be submitted at any time.
+    ///
     /// Returns `Ok(())` if the transaction has no staking action or is within the staking window.
     fn check_staking_day_window(
         tx: &Transaction,
         height: block::Height,
     ) -> Result<(), TransactionError> {
-        // Only check if the transaction has a staking action
-        if tx.staking_action().is_none() {
+        use zcash_primitives::transaction::StakingActionKind;
+
+        let staking_action = match tx.staking_action() {
+            Some(action) => action,
+            None => return Ok(()),
+        };
+
+        // RetargetDelegationBond is exempt from staking day restrictions
+        if staking_action.kind == StakingActionKind::RetargetDelegationBond {
             return Ok(());
         }
 

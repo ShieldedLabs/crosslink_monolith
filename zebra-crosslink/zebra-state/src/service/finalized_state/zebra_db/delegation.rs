@@ -156,6 +156,17 @@ impl DiskWriteBatch {
                         // Mark bond as withdrawn
                         self.prepare_withdrawn_delegation_bond(&db.db, db, bond_key, transaction_location)?;
                     }
+                    StakingActionKind::RetargetDelegationBond => {
+                        // Update the bond's target_finalizer
+                        let new_target = staking_action.arg32_2;
+                        self.prepare_retarget_delegation_bond(
+                            &db.db,
+                            db,
+                            bond_key,
+                            new_target,
+                            &mut bonds_created_in_block,
+                        )?;
+                    }
                     // Other staking actions don't affect delegation bonds
                     _ => {}
                 }
@@ -165,9 +176,10 @@ impl DiskWriteBatch {
         // Apply bond rewards accumulated in the non-finalized state
         let delegation_bond_by_key_cf = db.db.cf_handle(DELEGATION_BOND_BY_KEY).unwrap();
         for (bond_key, reward_amount) in &finalized.bond_rewards {
-            // Get current bond from DB, or from bonds created in this block
-            let bond_opt = db.delegation_bond(bond_key)
-                .or_else(|| bonds_created_in_block.get(bond_key).cloned());
+            // Get current bond from bonds modified in this block first, then fall back to DB.
+            // This ensures we use the updated bond if it was retargeted/created in this block.
+            let bond_opt = bonds_created_in_block.get(bond_key).cloned()
+                .or_else(|| db.delegation_bond(bond_key));
 
             if let Some(mut bond) = bond_opt {
                 // Add reward to bond amount
@@ -266,6 +278,43 @@ impl DiskWriteBatch {
                 withdrawn_at: transaction_location,
             },
         );
+
+        Ok(())
+    }
+
+    /// Retarget a delegation bond to a new finalizer in the database batch.
+    ///
+    /// Updates only the bond's `target_finalizer` field (not `created_at` or `amount`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bond doesn't exist.
+    fn prepare_retarget_delegation_bond(
+        &mut self,
+        disk_db: &DiskDb,
+        zebra_db: &ZebraDb,
+        bond_key: BondKey,
+        new_target: [u8; 32],
+        bonds_created_in_block: &mut HashMap<BondKey, DelegationBond>,
+    ) -> Result<(), BoxError> {
+        let delegation_bond_by_key_cf = disk_db.cf_handle(DELEGATION_BOND_BY_KEY).unwrap();
+
+        // Get current bond from bonds modified in this block first, then fall back to DB.
+        // This ensures we use the updated bond if it was modified earlier in this block.
+        let bond_opt = bonds_created_in_block.get(&bond_key).cloned()
+            .or_else(|| zebra_db.delegation_bond(&bond_key));
+
+        let mut bond = bond_opt.ok_or_else(|| format!("bond {:?} not found for retarget", bond_key))?;
+
+        // Update only target_finalizer (not created_at or amount)
+        bond.target_finalizer = new_target;
+
+        // Always update bonds_created_in_block so subsequent operations in this block
+        // (e.g., rewards application) see the updated bond instead of the stale DB value
+        bonds_created_in_block.insert(bond_key, bond.clone());
+
+        // Write updated bond
+        self.zs_insert(&delegation_bond_by_key_cf, bond_key, bond);
 
         Ok(())
     }

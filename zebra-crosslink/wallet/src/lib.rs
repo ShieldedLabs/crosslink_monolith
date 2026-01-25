@@ -3728,6 +3728,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     if let Some(create_bond) = StakingAction_CreateNewDelegationBond::try_from_union(staking_action) {
                         stake_positions_bonded.push((create_bond.unique_pubkey, create_bond.target_finalizer, create_bond.amount_zats));
                     }
+                    if let Some(retarget) = StakingAction_RetargetDelegationBond::try_from_union(staking_action) {
+                        if let Some(existing_i) = stake_positions_bonded.iter().position(|p| p.0 == retarget.unique_pubkey) {
+                            stake_positions_bonded[existing_i].1 = retarget.target_finalizer;
+                        }
+                    }
                     if let Some(unbond) = StakingAction_BeginDelegationUnbonding::try_from_union(staking_action) {
                         if let Some(existing_i) = stake_positions_bonded.iter().position(|p| p.0 == unbond.unique_pubkey) {
                             stake_positions_unbonded.push((unbond.unique_pubkey, stake_positions_bonded[existing_i].1, stake_positions_bonded[existing_i].2));

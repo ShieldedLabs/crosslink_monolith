@@ -144,6 +144,11 @@ pub struct ChainInner {
     /// Used for exact reverting without rounding issues.
     pub(crate) bond_rewards: Vec<Vec<(disk_format::BondKey, u64)>>,
 
+    /// Pre-block target finalizers for bonds that were retargeted at each block height.
+    /// Indexed by block position in the chain (0 = first non-finalized block).
+    /// Stores the target finalizer BEFORE the retarget, so we can restore it on revert.
+    pub(crate) bond_retargets: Vec<HashMap<disk_format::BondKey, [u8; 32]>>,
+
     // Note commitment trees
     //
     /// The Sprout note commitment tree for each anchor.
@@ -296,6 +301,7 @@ impl Chain {
             spent_utxos: Default::default(),
             delegation_bonds,
             bond_rewards: Vec::new(),
+            bond_retargets: Vec::new(),
             sprout_anchors: MultiSet::new(),
             sprout_anchors_by_height: Default::default(),
             sprout_trees_by_anchor: Default::default(),
@@ -415,6 +421,11 @@ impl Chain {
         } else {
             Vec::new()
         };
+
+        // Discard bond retargets for this block (not needed for finalized state)
+        if !self.bond_retargets.is_empty() {
+            self.bond_retargets.remove(0);
+        }
 
         // Extract full bond amounts for bonds that will be unbonded in this block
         // (needed for finalized state pool accounting)
@@ -1657,6 +1668,26 @@ impl Chain {
                 );
                 self.delegation_bonds.insert(bond_key, (updated_bond, BondStatusInChain::Withdrawn));
             }
+            StakingActionKind::RetargetDelegationBond => {
+                // Get the old target first (immutable borrow)
+                let old_target = {
+                    let (bond, _status) = self.delegation_bonds.get(&bond_key)
+                        .expect("bond must exist in chain (should have been validated)");
+                    bond.target_finalizer
+                };
+
+                // Record the pre-block target for this bond (only if not already recorded in this block)
+                // This allows us to restore the original target on revert
+                let retargets_this_block = self.bond_retargets.last_mut()
+                    .expect("bond_retargets should have been initialized for this block");
+                retargets_this_block.entry(bond_key).or_insert(old_target);
+
+                // Update only target_finalizer (not created_at or amount)
+                let new_target = staking_action.arg32_2;
+                let (bond, _status) = self.delegation_bonds.get_mut(&bond_key)
+                    .expect("bond must exist in chain");
+                bond.target_finalizer = new_target;
+            }
             // Other staking actions don't affect delegation bonds
             _ => {}
         }
@@ -1670,6 +1701,7 @@ impl Chain {
     /// - CreateNewDelegationBond: removes bond from delegation_bonds
     /// - BeginDelegationUnbonding: changes status back from Unbonding to Active
     /// - WithdrawDelegationBond: changes status back from Withdrawn to Unbonding
+    /// - RetargetDelegationBond: handled at block level via bond_retargets, not here
     fn revert_delegation_bond(
         &mut self,
         staking_action: &zcash_primitives::transaction::StakingAction,
@@ -1760,6 +1792,9 @@ impl Chain {
             .to_work()
             .expect("work has already been validated");
         self.partial_cumulative_work += block_work;
+
+        // Initialize empty retargets map for this block (will be populated if any retargets occur)
+        self.bond_retargets.push(HashMap::new());
 
         // for each transaction in block
         for (transaction_index, (transaction, transaction_hash)) in block
@@ -2001,6 +2036,14 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 let new_bonded = (current_bonded - Amount::try_from(reward_amount as i64).unwrap())
                     .expect("reverting reward should not underflow bonded pool");
                 self.chain_value_pools.set_staking_bonded_amount(new_bonded);
+            }
+
+            // Revert bond retargets - restore old target_finalizer values
+            let retargets = self.bond_retargets.pop().expect("retargets must exist for tip block");
+            for (bond_key, old_target) in retargets {
+                let (bond, _status) = self.delegation_bonds.get_mut(&bond_key)
+                    .expect("bond must exist if it was retargeted");
+                bond.target_finalizer = old_target;
             }
         }
 
