@@ -395,6 +395,7 @@ pub enum Modal {
     Receive,
     Stake,
     Unstake,
+    Retarget,
 }
 
 pub fn rgba_to_hsva(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8, u8) {
@@ -1134,6 +1135,69 @@ pub fn ui_left_pane(ui: &mut Context,
                         if button_ex(ui,   "+10000 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10000) { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10000, hex_dest.unwrap());  }
                     }
                 }
+                Modal::Retarget => {
+                    title_bar(ui, true, "Retarget Delegation Bond", id("Retarget Title Bar"));
+
+                    let mut stake_address = "0000000000000000";
+                    if data.stake_address.len() >= 16 {
+                        stake_address = &data.stake_address;
+                    }
+
+                    ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                    if button_ex(ui, "Paste Address", true) {
+                        data.stake_address = ui.input().get_from_clipboard().trim().to_string();
+                    }
+
+                    // spacer
+                    if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
+
+                    if (balance as u64) < 10_000 {
+                        let colour = (0xff, 0xaf, 0x0e, 0xff);
+                        ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
+                    }
+
+                    pub fn addr_from_str_bytes(data: &[u8]) -> Option<[u8; 32]> {
+                        const VALS: [u8; 256] = {
+                            let mut v = [0xff; 256];
+                            v[b'0' as usize] = 0x0;
+                            v[b'1' as usize] = 0x1;
+                            v[b'2' as usize] = 0x2;
+                            v[b'3' as usize] = 0x3;
+                            v[b'4' as usize] = 0x4;
+                            v[b'5' as usize] = 0x5;
+                            v[b'6' as usize] = 0x6;
+                            v[b'7' as usize] = 0x7;
+                            v[b'8' as usize] = 0x8;
+                            v[b'9' as usize] = 0x9;
+                            v[b'a' as usize] = 0xa;
+                            v[b'b' as usize] = 0xb;
+                            v[b'c' as usize] = 0xc;
+                            v[b'd' as usize] = 0xd;
+                            v[b'e' as usize] = 0xe;
+                            v[b'f' as usize] = 0xf;
+                            v
+                        };
+                        let mut buf = [0u8; 32];
+                        for i in 0..32 {
+                            let a = data.get(2*i)?;
+                            let b = data.get(2*i + 1)?;
+                            let a = VALS[*a as usize];
+                            if a == 0xff {
+                                return None;
+                            }
+                            let b = VALS[*b as usize];
+                            if b == 0xff {
+                                return None;
+                            }
+                            buf[31-i] = (a << 4) | b
+                        }
+                        Some(buf)
+                    }
+                    let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
+
+                    let can = hex_dest.is_some();
+                    if button_ex(ui, "Retarget", can) { wallet_state.lock().unwrap().retarget_bond(ui.retarget_modal_bond_key, hex_dest.unwrap()); }
+                }
                 Modal::Unstake => {
                     title_bar(ui, true, "Unstake", id("Unstake Title Bar"));
 
@@ -1445,7 +1509,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                         }) {
                                             let (icon, icon_hovered) = (ICON_MOVE, ICON_RESIZE_FULL_ALT);
                                             if clickable_icon(ui, id_index("Retarget Button", index as u32), icon, icon_hovered, true) {
-                                                wallet_state.lock().unwrap().retarget_bond(bond_key, [0u8; 32]);
+                                                ui.modal = Modal::Retarget;
+                                                ui.retarget_modal_bond_key = bond_key;
                                             }
                                         }
                                     }
@@ -2896,6 +2961,7 @@ pub struct Context {
     pub pane_tab_r: Id,
 
     pub modal: Modal,
+    pub retarget_modal_bond_key: [u8; 32],
 
     pub tx_loading_animation_timer: f32,
 }
