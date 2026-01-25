@@ -7,8 +7,8 @@ set "RUSTFLAGS=-Awarnings"
 set "PROTOC=C:\Work\ShieldedLabs\protoc\bin\protoc.exe"
 set "SOURCE_DATE_EPOCH=0"
 
-set "project=zebra-crosslink"
-REM set "project=zebra-gui"
+rem set "project=zebra-crosslink"
+set "project=zebra-gui"
 
 set "config=%1"
 
@@ -31,8 +31,8 @@ popd
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 if "%project%"=="zebra-crosslink" (
-    echo copy /Y  "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe"                "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_1.exe"
-    echo copy /Y  "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe"                "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_2.exe"
-    echo start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_1.exe" "-c" "%root%\zebra-crosslink\testnet_1.toml"
-    echo start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_2.exe" "-c" "%root%\zebra-crosslink\testnet_2.toml"
+    rem copy /Y  "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe"                "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_1.exe"
+    rem copy /Y  "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe"                "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_2.exe"
+    rem start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_1.exe" "-c" "%root%\zebra-crosslink\testnet_1.toml"
+    rem start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_2.exe" "-c" "%root%\zebra-crosslink\testnet_2.toml"
 )

@@ -239,8 +239,11 @@ pub fn id_index(label: &str, index: u32) -> Id {
 }
 
 #[derive(Default)] pub struct Element { decl: Decl }
-pub fn elem() -> Element { unsafe { clay::Clay__OpenElement(); } Element::default() }
-impl Drop for Element { fn drop(&mut self) { unsafe { clay::Clay__CloseElement(); } } }
+pub fn elem() -> Element { elem_bgn(); Element::default() }
+impl Drop for Element { fn drop(&mut self) { elem_end(); } }
+
+pub fn elem_bgn() { unsafe { clay::Clay__OpenElement();  } }
+pub fn elem_end() { unsafe { clay::Clay__CloseElement(); } }
 
 pub const Clay_ElementId_ZERO: clay::Clay_ElementId = clay::Clay_ElementId { id: 0, offset: 0, baseId: 0, stringId: clay::Clay_String { isStaticallyAllocated: false, length: 0, chars: std::ptr::null() } };
 pub const Clay_SizingMinMax_ZERO: clay::Clay_SizingMinMax = clay::Clay_SizingMinMax { min: 0f32, max: f32::MAX };
@@ -289,8 +292,7 @@ pub const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Cl
     userData: std::ptr::null_mut(),
 };
 
-impl Element {
-    fn decl(&mut self, item: Decl) -> &mut Self {
+    pub fn decl(item: Decl) {
         fn sizing(sizing: Sizing) -> clay::layout::Sizing {
             match sizing {
                 Sizing::Fit(min, max)  => { clay::layout::Sizing::Fit(min, max) }
@@ -357,7 +359,11 @@ impl Element {
         };
 
         unsafe { clay::Clay__ConfigureOpenElement(decl); }
+    }
 
+impl Element {
+    fn decl(&mut self, item: Decl) -> &mut Self {
+        decl(item);
         self.decl = item;
         self
     }
@@ -468,6 +474,9 @@ impl Context {
     pub fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
 
     pub fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
+    pub fn hovered_uniquely(&self, id: Id) -> bool {
+        self.hovered_id == id
+    }
 
     pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: winit::window::CursorIcon) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
 
@@ -586,7 +595,7 @@ impl Context {
     }
 
     pub fn tab(&mut self,
-           radius: (f32, f32, f32, f32),
+           radius:  (f32, f32, f32, f32),
            padding: (f32, f32, f32, f32),
            tab_id: &mut Id,
            label: &str) -> Id {
@@ -863,6 +872,9 @@ pub fn ui_left_pane(ui: &mut Context,
         if ui.modal == Modal::Stake {
             height = fit!();
         }
+        if ui.modal == Modal::Unstake {
+            height = percent!(0.9);
+        }
 
         if let _elem = elem().decl(Decl {
             child_gap, radius,
@@ -870,7 +882,7 @@ pub fn ui_left_pane(ui: &mut Context,
             padding: padding.mul(2.0),
             colour: MODAL_COL,
             width:  grow!(ui.scale(192.0), ui.scale(384.0)),
-            height: height,
+            height,
             align: Top,
             direction: TopToBottom,
             ..Decl
@@ -1113,13 +1125,13 @@ pub fn ui_left_pane(ui: &mut Context,
                         let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
 
                         let can = !waiting_for_stake_to_finalizer && hex_dest.is_some();
-                        if button_ex(ui, "+0.01 cTAZ", can && (balance as u64) >= ONE_cTAZ / 100) { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ / 100, hex_dest.unwrap()); }
-                        if button_ex(ui,  "+0.1 cTAZ", can && (balance as u64) >= ONE_cTAZ / 10)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ / 10, hex_dest.unwrap());  }
-                        if button_ex(ui,    "+1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ, hex_dest.unwrap());       }
-                        if button_ex(ui,   "+10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10, hex_dest.unwrap());  }
-                        if button_ex(ui,   "+100 cTAZ", can && (balance as u64) >= ONE_cTAZ * 100)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 100, hex_dest.unwrap());  }
-                        if button_ex(ui,   "+1000 cTAZ", can && (balance as u64) >= ONE_cTAZ * 1000)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 1000, hex_dest.unwrap());  }
-                        if button_ex(ui,   "+10000 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10000)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10000, hex_dest.unwrap());  }
+                        if button_ex(ui, "+0.01 cTAZ",    can && (balance as u64) >= ONE_cTAZ / 100)   { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ / 100, hex_dest.unwrap()); }
+                        if button_ex(ui,  "+0.1 cTAZ",    can && (balance as u64) >= ONE_cTAZ / 10)    { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ / 10, hex_dest.unwrap());  }
+                        if button_ex(ui,    "+1 cTAZ",    can && (balance as u64) >= ONE_cTAZ)         { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ, hex_dest.unwrap());       }
+                        if button_ex(ui,   "+10 cTAZ",    can && (balance as u64) >= ONE_cTAZ * 10)    { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10, hex_dest.unwrap());  }
+                        if button_ex(ui,   "+100 cTAZ",   can && (balance as u64) >= ONE_cTAZ * 100)   { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 100, hex_dest.unwrap());  }
+                        if button_ex(ui,   "+1000 cTAZ",  can && (balance as u64) >= ONE_cTAZ * 1000)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 1000, hex_dest.unwrap());  }
+                        if button_ex(ui,   "+10000 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10000) { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10000, hex_dest.unwrap());  }
                     }
                 }
                 Modal::Unstake => {
@@ -1225,14 +1237,15 @@ pub fn ui_left_pane(ui: &mut Context,
                     if let _ = elem().decl(Decl {
                         id,
                         colour: TRANSACTION_HISTORY_CONTAINER_COL,
-                        child_gap: child_gap * 0.5, padding,
+                        // child_gap: child_gap * 0.5,
+                        padding: padding.mul(0.5),
                         radius: padding.0.dup4(),
                         width:  percent!(1.0),
                         height: grow!(),
                         // height: percent!(1.0),
                         direction: TopToBottom,
                         clip,
-                        align: Top,
+                        align: TopLeft,
                         ..Decl
                     }) {
                         let chunkify = |bytes: &[u8; 32]| {
@@ -1263,9 +1276,10 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         }
                         else {
-                            let mut prev_is_unbonded: Option<bool> = None;
-                            let mut open_is_unbonded: bool = false;
+                            let mut prev_is_unbonded: Option<bool>     = None;
                             let mut prev_finalizer:   Option<[u8; 32]> = None;
+
+                            let mut open_is_unbonded: bool = false;
                             let mut open_finalizer:   bool = false;
 
                             for (index, &(is_unbonded, bond_key, finalizer, initial)) in staked_roster.iter().enumerate() {
@@ -1277,23 +1291,45 @@ pub fn ui_left_pane(ui: &mut Context,
                                     h.finish() as u32
                                 };
 
-                                if (prev_is_unbonded != Some(is_unbonded)) {
-                                    prev_is_unbonded  = Some(is_unbonded);
+                                if prev_is_unbonded != Some(is_unbonded) {
+                                    if prev_is_unbonded.is_some() {
+                                        elem_end();
+                                    }
+                                    prev_is_unbonded = Some(is_unbonded);
+                                    prev_finalizer = None;
+
                                     let string = if is_unbonded { "Claimable Bonds" } else { "Active Positions" };
 
                                     let id = id_index(string, index);
 
-                                    let (activated, colour, text_colour) = ui.button_ex(true, BUTTON_GREY.mul(0.8), id, true, winit::window::CursorIcon::Pointer);
+                                    let colour = BUTTON_GREY.mul(0.8);
+
+                                    elem_bgn();
+                                    decl(Decl {
+                                        colour,
+                                        radius,
+                                        child_gap,
+                                        padding,
+                                        width:  grow!(),
+                                        height: fit!(),
+                                        align: TopLeft,
+                                        direction: TopToBottom,
+                                        ..Decl
+                                    });
+
+                                    let (activated, colour, text_colour) = ui.button_ex(true, colour, id, true, winit::window::CursorIcon::Pointer);
 
                                     if let _ = elem().decl(Decl {
                                         id,
                                         colour,
+                                        radius,
                                         padding,
-                                        width:  percent!(1.0),
+                                        width:  grow!(),
                                         height: fit!(),
                                         align:  Left,
                                         ..Decl
-                                    }) {
+                                    })
+                                    {
                                         ui.text(string, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
                                     }
 
@@ -1304,25 +1340,46 @@ pub fn ui_left_pane(ui: &mut Context,
                                     continue;
                                 }
 
-                                if (prev_finalizer != Some(finalizer)) {
-                                    prev_finalizer  = Some(finalizer);
+                                if prev_finalizer != Some(finalizer) {
+                                    if prev_finalizer.is_some() {
+                                        elem_end();
+                                    }
+                                    prev_finalizer = Some(finalizer);
 
                                     let chunks = chunkify(&finalizer);
                                     let label = frame_strf!(data, "{}", display_str(&chunks));
 
                                     let id = id_index(label, index);
 
-                                    let (activated, colour, text_colour) = ui.button_ex(true, BUTTON_GREY.mul(0.8), id, true, winit::window::CursorIcon::Pointer);
+                                    let colour = BUTTON_GREY.mul(0.6);
+
+                                    let (activated, colour, text_colour) = ui.button_ex(true, colour, id, true, winit::window::CursorIcon::Pointer);
+
+                                    elem_bgn();
+                                    decl(Decl {
+                                        colour,
+                                        radius,
+                                        child_gap,
+                                        padding,
+                                        width:  grow!(),
+                                        height: fit!(),
+                                        align: TopLeft,
+                                        direction: TopToBottom,
+                                        ..Decl
+                                    });
 
                                     if let _ = elem().decl(Decl {
                                         id,
                                         colour,
+                                        radius,
                                         padding,
-                                        width:  percent!(0.8),
+                                        width:  grow!(),
                                         height: fit!(),
                                         align:  Left,
                                         ..Decl
-                                    }) {
+                                    })
+                                    {
+                                        // ui.text("Staked to:", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
                                         ui.text(label, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
                                     }
 
@@ -1446,6 +1503,13 @@ pub fn ui_left_pane(ui: &mut Context,
                                         }
                                     }
                                 }
+                            }
+
+                            if prev_finalizer.is_some() {
+                                elem_end();
+                            }
+                            if prev_is_unbonded.is_some() {
+                                elem_end();
                             }
                         }
                     }
@@ -1613,6 +1677,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
             let can = (*tab_id == tab_id_user_wallet);
             if can {
+                // TODO: send should use ICON_PAPER_PLANE but it would be nice to support negative glyph advance first
                 if button(ui, can, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
                 if button(ui, can, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
                 if button(ui, can, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
@@ -1643,7 +1708,8 @@ pub fn ui_left_pane(ui: &mut Context,
             if let _ = elem().decl(Decl {
                 id,
                 colour: TRANSACTION_HISTORY_CONTAINER_COL,
-                child_gap: child_gap * 0.5, padding,
+                child_gap: 0.0,
+                padding,
                 radius: padding.0.dup4(),
                 width:  percent!(1.0),
                 height: grow!(),
@@ -1668,8 +1734,12 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
                 }
                 else {
-                    let kind_text_h = ui.scale(18.0);
+                    let kind_text_h        = ui.scale(18.0);
                     let transaction_text_h = ui.scale(16.0);
+
+                    let transaction_element_height = ui.scale(100.0);
+                    let separator_height           = ui.scale(8.0);
+                    let transaction_inner_height   = transaction_element_height - separator_height;
 
                     for (index, tx) in txs.iter().rev().enumerate() {
                         if index > 0 { // separator
@@ -1680,23 +1750,26 @@ pub fn ui_left_pane(ui: &mut Context,
                                 col.rgba()
                             };
 
-                            let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
+                            if let _ = elem().decl(Decl { height: fixed!(separator_height), width: percent!(1.0), align: Center, ..Decl }) {
+                                let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
+                            }
                         }
 
-                        let tx_h = tx.reported_height();
+                        let tx_h                = tx.reported_height();
                         let tx_is_in_block      = tx_h.is_in_block();
                         let tx_is_on_best_chain = tx_is_in_block && tx.is_on_bc();
 
                         if let _ = elem().decl(Decl {
                             id: id_index("Transaction", index as u32),
-                            padding: padding.mul(0.5),
+                            padding,
                             child_gap,
-                            height: fit!(),
+                            height: fixed!(transaction_inner_height),
                             width: percent!(1.0),
                             direction: LeftToRight,
                             align: Center,
                             ..Decl
                         }) {
+
                             // left icon
                             if let _ = elem().decl(Decl {
                                 id: id_index("Left Icon", index as u32),
@@ -1796,10 +1869,6 @@ pub fn ui_left_pane(ui: &mut Context,
                                 align: Right,
                                 ..Decl
                             }) {
-                                let confirmation_icons_h = ui.scale(10.0);
-
-                                ui.text(" ", TextDecl { font: Icons, colour, h: confirmation_icons_h, align: AlignX::Center, ..TextDecl });
-
                                 let _ = elem().decl(Decl { height: grow!(), ..Decl }); // spacer
 
                                 // @todo colors
@@ -1855,13 +1924,13 @@ pub fn ui_left_pane(ui: &mut Context,
                                     ui.text(frame_strf!(data, "Fee: {} cTAZ", fee_str), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                 }
 
-                                let _ = elem().decl(Decl { height: grow!(), ..Decl }); // spacer
+                                // let _ = elem().decl(Decl { height: grow!(), ..Decl }); // spacer
 
                                 if let _ = elem().decl(Decl {
                                     id: id_index("Confirmation Status", index as u32),
-                                    height: fit!(),
+                                    height: grow!(),
                                     width: grow!(),
-                                    align: Right,
+                                    align: BottomRight,
                                     ..Decl
                                 }) {
                                     let CONFIRMATIONS_THRESHOLD = 3;
@@ -1915,6 +1984,9 @@ pub fn ui_left_pane(ui: &mut Context,
                                     };
 
                                     let colour = colour.mul(0.75);
+
+                                    let confirmation_icons_h = if text == ICON_FORK { ui.scale(20.0) } else { ui.scale(12.0) };
+
                                     ui.text(text, TextDecl { font: Icons, colour, h: confirmation_icons_h, wrap: Wrap::None, align: AlignX::Right,  ..TextDecl });
                                 }
                             }
@@ -2628,6 +2700,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 nav_bbox = Some(bbox);
             }
 
+            if unsafe { clay::Clay_PointerOver(Id { id: command.id, ..Id }.clay().id) } {
+                ui.hovered_id = Id { id: command.id, ..Id };
+            }
+
             let colour = match command.config {
                 Rectangle(ref config)                 => { clay_color_to_u32(config.color) }
                 RenderCommandConfig::Text(ref config) => { clay_color_to_u32(config.color) }
@@ -2807,6 +2883,8 @@ pub struct Context {
     pub mouse_pressed_id:             Id,
     pub key_pressed_id:               Id,
     // pub most_recent_mouse_pressed_id: Id,
+
+    pub hovered_id: Id,
 
     pub nav_id_to_idx: HashMap<u32, usize>,
     pub nav_idx_to_id: Vec<u32>,
