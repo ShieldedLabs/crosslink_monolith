@@ -749,6 +749,12 @@ impl Context {
             if self.input().mouse_held(MouseButton::Left) {
                 scroll_container_state.scroll -= self.input().mouse_delta().1 as f32 / self.scale;
             }
+            if self.input().key_pressed(KeyCode::PageUp) {
+                scroll_container_state.scroll -= scroll_container_state.viewport_height / self.scale;
+            }
+            if self.input().key_pressed(KeyCode::PageDown) {
+                scroll_container_state.scroll += scroll_container_state.viewport_height / self.scale;
+            }
         }
 
         let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
@@ -1815,7 +1821,8 @@ pub fn ui_left_pane(ui: &mut Context,
         let padding = child_gap.dup4();
 
         // buttons container
-        if let _ = elem().decl(Decl {
+        let can = (*tab_id == tab_id_user_wallet);
+        if can && let _ = elem().decl(Decl {
             id: id("Buttons Container"),
             padding, child_gap, align: Center,
             width: grow!(),
@@ -1858,20 +1865,17 @@ pub fn ui_left_pane(ui: &mut Context,
                 clicked
             };
 
-            let can = (*tab_id == tab_id_user_wallet);
-            if can {
-                // TODO: send should use ICON_PAPER_PLANE but it would be nice to support negative glyph advance first
-                if button(ui, can, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
-                if button(ui, can, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
-                if button(ui, can, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
-                if button(ui, can, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
-            }
+            // TODO: send should use ICON_PAPER_PLANE but it would be nice to support negative glyph advance first
+            if button(ui, can, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
+            if button(ui, can, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
+            if button(ui, can, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
+            if button(ui, can, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
         }
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
         {
-            let txs = {
+            let mut txs = {
                 let state = wallet_state.lock().unwrap();
                 if *tab_id == tab_id_user_wallet {
                     state.user_txs.clone()
@@ -1879,6 +1883,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     state.miner_txs.clone()
                 }
             };
+            txs.reverse();
 
             let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
             let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
@@ -1924,20 +1929,23 @@ pub fn ui_left_pane(ui: &mut Context,
                     let separator_height           = ui.scale(8.0);
                     let transaction_inner_height   = transaction_element_height - separator_height;
 
-                    let culled_pre_n  = ((ui.scale(*scroll) / transaction_element_height).floor() as usize).saturating_sub(1);
-                    let culled_in_n   = ((viewport_h) / transaction_element_height).ceil() as usize + 1;
-                    let culled_post_n = (txs.len() - (culled_pre_n + culled_in_n).min(txs.len()));
+                    let culled_pre_n    = ((ui.scale(*scroll) / transaction_element_height).floor() as usize).saturating_sub(1);
+                    let culled_in_bgn_o = culled_pre_n;
+                    let culled_in_n     = (viewport_h / transaction_element_height).ceil() as usize;
+                    let culled_in_end_o = (culled_pre_n + culled_in_n).min(txs.len());
+                    let culled_post_n   = (txs.len() - culled_in_end_o);
 
                     // culling preamble spacer
                     let _ = elem().decl(Decl { height: Sizing::Fixed(culled_pre_n as f32 * transaction_element_height), ..Decl });
 
-                    for (index, tx) in txs.iter().rev().enumerate() {
-                        if index < culled_pre_n {
-                            continue;
-                        }
-                        if index >= culled_pre_n + culled_in_n {
-                            break;
-                        }
+                    for (index, tx) in (&txs[culled_in_bgn_o .. culled_in_end_o]).iter().enumerate() {
+                        let index = index + culled_pre_n;
+                        // if index < 0 {
+                        //     continue;
+                        // }
+                        // if index > culled_in_n {
+                        //     break;
+                        // }
 
                         if index > 0 { // separator
                             let colour = {
@@ -2887,27 +2895,23 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         let mut nav_bbox: Option<(isize, isize, isize, isize)> = None;
 
         for command in render_commands {
+            let x1 = (command.bounding_box.x)                               as isize;
+            let y1 = (command.bounding_box.y)                               as isize;
+            let x2 = (command.bounding_box.x + command.bounding_box.width)  as isize;
+            let y2 = (command.bounding_box.y + command.bounding_box.height) as isize;
+
             if let Some(scroll_container_state) = data.scroll_containers.get_mut(&command.id) {
-                scroll_container_state.viewport_height = command.bounding_box.height;
+                let x1 = x1.max(0);
+                let y1 = y1.max(0);
+                let x2 = x2.min(window_w as isize);
+                let y2 = y2.min(window_h as isize);
+
+                scroll_container_state.viewport_height = (y2 - y1) as f32;
             }
 
             if !is_rendering {
                 continue;
             }
-
-            fn clay_color_to_u32(color: clay::Color) -> u32 {
-                let r = color.r as u32;
-                let g = color.g as u32;
-                let b = color.b as u32;
-                let a = color.a as u32;
-                let color = (a << 24) | (r << 16) | (g << 8) | b;
-                color
-            }
-
-            let x1 = (command.bounding_box.x)                               as isize;
-            let y1 = (command.bounding_box.y)                               as isize;
-            let x2 = (command.bounding_box.x + command.bounding_box.width)  as isize;
-            let y2 = (command.bounding_box.y + command.bounding_box.height) as isize;
 
             let bbox = (x1, y1, x2, y2);
 
@@ -2917,6 +2921,15 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
             if unsafe { clay::Clay_PointerOver(Id { id: command.id, ..Id }.clay().id) } {
                 ui.hovered_id = Id { id: command.id, ..Id };
+            }
+
+            fn clay_color_to_u32(color: clay::Color) -> u32 {
+                let r = color.r as u32;
+                let g = color.g as u32;
+                let b = color.b as u32;
+                let a = color.a as u32;
+                let color = (a << 24) | (r << 16) | (g << 8) | b;
+                color
             }
 
             let colour = match command.config {
