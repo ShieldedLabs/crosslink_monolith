@@ -742,6 +742,15 @@ impl Context {
     pub fn scroll_container<'data>(&mut self, data: &'data mut UiData, id: Id, scroll_end_height: f32) -> (Id, ClipMode, &'data mut f32, f32) {
         let mut scroll_container_state = data.scroll_containers.entry(id.id).or_default();
 
+        let max = {
+            let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
+            if scroll_container_data.found {
+                scroll_container_data.contentDimensions.height / self.scale - scroll_end_height
+            } else {
+                0.0
+            }
+        };
+
         if self.hovered(id) {
             scroll_container_state.scroll -= self.input().zoom_delta     as f32 * 32.0;
             scroll_container_state.scroll -= self.input().scroll_delta.1 as f32 * 32.0;
@@ -755,15 +764,17 @@ impl Context {
             if self.input().key_pressed(KeyCode::PageDown) {
                 scroll_container_state.scroll += scroll_container_state.viewport_height / self.scale;
             }
-        }
-
-        let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
-        if scroll_container_data.found {
-            let max = scroll_container_data.contentDimensions.height / self.scale - scroll_end_height;
-            if scroll_container_state.scroll > max {
+            if self.input().key_pressed(KeyCode::Home) {
+                scroll_container_state.scroll = 0.0;
+            }
+            if self.input().key_pressed(KeyCode::End) {
                 scroll_container_state.scroll = max;
             }
-        };
+        }
+
+        if scroll_container_state.scroll > max {
+            scroll_container_state.scroll = max;
+        }
         if scroll_container_state.scroll < 0.0 {
             scroll_container_state.scroll = 0.0;
         }
