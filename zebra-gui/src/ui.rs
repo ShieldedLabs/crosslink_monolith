@@ -12,7 +12,7 @@ use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 use std::collections::HashMap;
 //use clay::*; // @Temporary
 
-use wallet::{ BlockHeight, WalletState, WalletTxKind, TxParts, TxStatus, str_from_ctaz };
+use wallet::{ BlockHeight, TxParts, TxStatus, WalletState, WalletTxKind, WalletTxPart, str_from_ctaz };
 
 use super::*;
 
@@ -2111,7 +2111,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::BeginUnstake | WalletTxKind::Retarget => (false, "", 0), // fee-only
 
                                     WalletTxKind::Send  => (true, "-", all.sent_zats.into_u64().saturating_sub(all.recv_zats.into_u64())),
-                                    WalletTxKind::Stake => (true, "",  WalletTxPart::from_staking_action(&tx.staking_action).recv_zats.into_u64(), // aka bond.recv_zats
+                                    WalletTxKind::Stake => (true, "",  WalletTxPart::from_staking_action(tx.staking_action).recv_zats.into_u64()), // aka bond.recv_zats
                                     WalletTxKind::Stake => (true, "",  all.sent_zats.into_u64().saturating_sub(all_no_bond.recv_zats.into_u64())), // aka bond.recv_zats
 
                                     WalletTxKind::SelfSend     => (true, "",  all.recv_zats.into_u64()),
