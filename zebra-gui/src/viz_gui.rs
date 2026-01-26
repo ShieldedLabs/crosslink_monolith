@@ -73,6 +73,7 @@ pub struct BcBlock {
     pub this_hash: Hash32,
     pub parent_hash: Hash32,
     pub this_height: u64,
+    pub txs_n: usize,
     pub is_best_chain: bool,
     pub is_finalized: bool,
     pub is_implicated_by_bft: bool,
@@ -84,6 +85,7 @@ impl Default for BcBlock {
             this_hash: Hash32::from_u64(0),
             parent_hash: Hash32::from_u64(0),
             this_height: 0,
+            txs_n: 0,
             is_best_chain: false,
             is_finalized: false,
             is_implicated_by_bft: false,
@@ -271,19 +273,19 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         peer_strings: Vec::new(),
     };
     if fake_data {
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, txs_n: 1, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(2), parent_hash: Hash32::from_u64(1), this_height: 1, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(2), parent_hash: Hash32::from_u64(1), this_height: 1, txs_n: 6, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(3), parent_hash: Hash32::from_u64(2), this_height: 2, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(3), parent_hash: Hash32::from_u64(2), this_height: 2, txs_n: 2, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(8), parent_hash: Hash32::from_u64(1), this_height: 1, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(8), parent_hash: Hash32::from_u64(1), this_height: 1, txs_n: 4256, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(9), parent_hash: Hash32::from_u64(2), this_height: 2, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(9), parent_hash: Hash32::from_u64(2), this_height: 2, txs_n: 16, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(10), parent_hash: Hash32::from_u64(8), this_height: 2, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(10), parent_hash: Hash32::from_u64(8), this_height: 2, txs_n: 15, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(11), parent_hash: Hash32::from_u64(10), this_height: 3, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(11), parent_hash: Hash32::from_u64(10), this_height: 3, txs_n: 3, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
 
         let block = OnScreenBft { block: BftBlock { this_hash: Hash32::from_u64(5), parent_hash: Hash32::from_u64(0), this_height: 0, points_at_bc_block: Hash32::from_u64(1), ..Default::default() }, ..Default::default() };
@@ -359,7 +361,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                     if let Some(bc) = viz_state.on_screen_bcs.get_mut(hash) { bc.block.is_implicated_by_bft = true; }
                     else {
                         let parent = viz_state.on_screen_bcs.get(&prev).unwrap();
-                        let block = OnScreenBc { y: spawn_y, block: BcBlock { this_hash: *hash, parent_hash: parent.block.this_hash, this_height: parent.block.this_height + 1, is_best_chain: false, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
+                        let block = OnScreenBc { y: spawn_y, block: BcBlock { this_hash: *hash, parent_hash: parent.block.this_hash, txs_n: 1, this_height: parent.block.this_height + 1, is_best_chain: false, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
                         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
                     }
                     prev = *hash;
@@ -460,14 +462,14 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             let y2 = -10.0 * ((sday*UI_COPY_STAKING_DAY_PERIOD) as f32 - 0.5) * screen_unit;
             let y1 = -10.0 * ((sday*UI_COPY_STAKING_DAY_PERIOD + UI_COPY_STAKING_DAY_WINDOW) as f32 + 0.5) * screen_unit;
 
-            draw_ctx.rectangle_r(origin_x - 60.0 * screen_unit, origin_y + y1, origin_x + 60.0 * screen_unit, origin_y + y2, 1, color);
+            draw_ctx.rectangle_r(0.0, origin_y + y1, draw_ctx.window_width as f32, origin_y + y2, 1, color);
         }
         let sday = sday + 1;
         {
             let y2 = -10.0 * ((sday*UI_COPY_STAKING_DAY_PERIOD) as f32 - 0.5) * screen_unit;
             let y1 = -10.0 * ((sday*UI_COPY_STAKING_DAY_PERIOD + UI_COPY_STAKING_DAY_WINDOW) as f32 + 0.5) * screen_unit;
 
-            draw_ctx.rectangle_r(origin_x - 60.0 * screen_unit, origin_y + y1, origin_x + 60.0 * screen_unit, origin_y + y2, 1, color);
+            draw_ctx.rectangle_r(0.0, origin_y + y1, draw_ctx.window_width as f32, origin_y + y2, 1, color);
         }
     }
 
@@ -643,16 +645,22 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             viz_state.inspecting_block_screen_y = origin_y + (y*screen_unit);
         }
 
-        if very_zoom_out {
-            draw_ctx.rectangle(origin_x + (x*screen_unit) - screen_unit*30.0, origin_y + (y*screen_unit), origin_x + (x*screen_unit) + screen_unit*5.0, origin_y + (y*screen_unit) + screen_unit*2.0, (color&0xFFffFF) | ((color >> 26) << 24));
-        }
-        else {
-            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bc.roundness, color);
-            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit / 2.0, (screen_unit / 2.0)*on_screen_bc.roundness, color_accent);
-        }
+        // draw PoW node
+        {
+            let rad = 0.5*screen_unit * (on_screen_bc.block.txs_n as f32).log2().max(0.5);
 
-        if non_finalized_and_on_bc {
-            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit * 0.75, screen_unit*on_screen_bc.roundness * 0.75, 0xFF080808);
+            let (pt_x, pt_y) = (origin_x + (x*screen_unit), origin_y + (y*screen_unit));
+            if very_zoom_out {
+                draw_ctx.rectangle(pt_x - screen_unit*30.0, pt_y, pt_x + screen_unit*5.0, pt_y + screen_unit*2.0, (color&0xFFffFF) | ((color >> 26) << 24));
+            } else {
+                draw_ctx.circle_square(pt_x, pt_y, rad,  rad  * on_screen_bc.roundness, color);
+                let rad2 = 0.5 * rad;
+                draw_ctx.circle_square(pt_x, pt_y, rad2, rad2 * on_screen_bc.roundness, color_accent);
+            }
+
+            if !finalized {
+                draw_ctx.circle_square(pt_x, pt_y, rad * 0.65, rad * on_screen_bc.roundness * 0.65, 0xFF080808);
+            }
         }
 
         if very_zoom_out == false {
