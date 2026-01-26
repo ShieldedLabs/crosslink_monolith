@@ -471,21 +471,31 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     let world_mouse_y = viz_state.camera_y + ((input_ctx.mouse_pos().1.clamp(0, draw_ctx.window_height) - draw_ctx.window_height/2) as f32) / screen_unit;
 
     {
-        let color = 0xff_404040;
         let sday = (viz_state.bc_finalized_tip_height) / UI_COPY_STAKING_DAY_PERIOD;
-        {
-            let y2 = -10.0 * ((sday*UI_COPY_STAKING_DAY_PERIOD) as f32 - 0.5) * screen_unit;
-            let y1 = -10.0 * ((sday*UI_COPY_STAKING_DAY_PERIOD + UI_COPY_STAKING_DAY_WINDOW) as f32 + 0.5) * screen_unit;
+        let draw_staking_day_section = | day | {
+            let y2 = -10.0 * ((day*UI_COPY_STAKING_DAY_PERIOD) as f32 - 0.5) * screen_unit;
+            let y1 = -10.0 * ((day*UI_COPY_STAKING_DAY_PERIOD + UI_COPY_STAKING_DAY_WINDOW) as f32 + 0.5) * screen_unit;
 
-            draw_ctx.rectangle_r(0.0, origin_y + y1, draw_ctx.window_width as f32, origin_y + y2, 1, color);
-        }
-        let sday = sday + 1;
-        {
-            let y2 = -10.0 * ((sday*UI_COPY_STAKING_DAY_PERIOD) as f32 - 0.5) * screen_unit;
-            let y1 = -10.0 * ((sday*UI_COPY_STAKING_DAY_PERIOD + UI_COPY_STAKING_DAY_WINDOW) as f32 + 0.5) * screen_unit;
+            let text_height = 1.0 * screen_unit;
+            let line_thickness = 1.0 * screen_unit;
+            let line_width = 60.0;
 
-            draw_ctx.rectangle_r(0.0, origin_y + y1, draw_ctx.window_width as f32, origin_y + y2, 1, color);
-        }
+            // window
+            draw_ctx.rectangle_r(origin_x - line_width * screen_unit, origin_y + y1, origin_x + line_width * screen_unit, origin_y + y2, 1, 0x06ffffff);
+
+            // start
+            let start_color = 0xaa5fdc4c;
+            draw_ctx.text_line(FontKind::Mono, (origin_x + (line_width + 1.0) * screen_unit), origin_y + y2, text_height, "Staking Day Start", start_color);
+            draw_ctx.rectangle_r(origin_x - line_width * screen_unit, origin_y + y2, origin_x + line_width * screen_unit, origin_y + y2 + line_thickness, 1, start_color);
+
+            // end
+            let end_color = 0xaadc4c4f;
+            draw_ctx.text_line(FontKind::Mono, (origin_x + (line_width + 1.0) * screen_unit), origin_y + y1, text_height, "Staking Day End", end_color);
+            draw_ctx.rectangle_r(origin_x - line_width * screen_unit, origin_y + y1, origin_x + line_width * screen_unit, origin_y + y1 + line_thickness, 1, end_color);
+        };
+
+        draw_staking_day_section(sday);
+        draw_staking_day_section(sday + 1);
     }
 
     let mut hovered_block = Hash32::from_u64(0);
