@@ -410,7 +410,7 @@ impl Drop for Timer<'_> {
 }
 
 
-fn block_policy_10() -> ConfirmationsPolicy { ConfirmationsPolicy::new(std::num::NonZeroU32::new(5).unwrap(), std::num::NonZeroU32::new(5).unwrap(), false).unwrap() }
+// fn block_policy_10() -> ConfirmationsPolicy { ConfirmationsPolicy::new(std::num::NonZeroU32::new(5).unwrap(), std::num::NonZeroU32::new(5).unwrap(), false).unwrap() }
 
 #[derive(Debug, Clone, PartialEq)]
 enum WalletAction {
@@ -721,19 +721,24 @@ impl WalletTx {
         }
     }
 
-    pub fn totals(&self) -> WalletTxPart {
-        let mut b = WalletTxPart::from_staking_action(self.staking_action);
-        self.parts[0].unchecked_add(&self.parts[1]).unchecked_add(&b)
+    pub fn totals(&self, include_staking: bool) -> WalletTxPart {
+        let res = self.parts[0].unchecked_add(&self.parts[1]);
+        if include_staking {
+            let b = WalletTxPart::from_staking_action(self.staking_action);
+            res.unchecked_add(&b)
+        } else {
+            res
+        }
     }
 
-    pub fn account_value_delta(&self) -> ZatBalance {
-        let all = self.totals();
+    pub fn account_value_delta(&self, include_staking: bool) -> ZatBalance {
+        let all = self.totals(include_staking);
         // NOTE: into_i64 isn't pub...
         ZatBalance::from_i64(all.recv_zats.into_u64() as i64 - all.spent_zats.into_u64() as i64).expect("checked before")
     }
 
     pub fn fee(&self) -> Option<Zatoshis> {
-        let all = self.totals();
+        let all = self.totals(true);
         // NOTE: into_i64 isn't pub...
         let spent = all.spent_zats.into_u64();
         let sent = all.sent_zats.into_u64();
@@ -766,7 +771,7 @@ impl WalletTx {
             }
             return WalletTxKind::SelfSend;
         }
-        let all = self.totals();
+        let all = self.totals(true);
 
         if self.is_coinbase && all.spent_zats == Zatoshis::ZERO && all.recv_zats > Zatoshis::ZERO {
             return WalletTxKind::Mine;
@@ -898,7 +903,7 @@ impl WalletState {
         }
         self.actions_in_flight.push_back(WalletAction::UnstakeFromFinalizer(txid));
     }
-    
+
     pub fn retarget_bond(&mut self, txid: [u8; 32], new_target: [u8; 32]) {
         let txid = TxId::from_bytes(txid);
         if self.actions_in_flight.iter().filter(|a| match a { WalletAction::RetargetBond(id, _to) if id.eq(&txid) => true, _ => false }).count() != 0 {
@@ -1013,7 +1018,9 @@ fn update_insert_i(txs: &[WalletTx], insert_i: &mut usize, block_h: BlockHeight)
 
 fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, insert_i: &mut usize) {
     // find if there's an existing height/transaction for this txid
-    let new_totals = new_tx.totals();
+    // NOTE: we ignore staking here because we don't track if they're ours properly without
+    // signatures, and we always spend for fee or receive in orchard with them
+    let new_totals = new_tx.totals(false);
     if (new_totals.spent_note_count == 0 &&
         new_totals.recv_note_count == 0 &&
         new_totals.sent_note_count == 0)

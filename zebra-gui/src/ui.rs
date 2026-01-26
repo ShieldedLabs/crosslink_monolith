@@ -2105,14 +2105,14 @@ pub fn ui_left_pane(ui: &mut Context,
                                     _ => WHITE,
                                 };
 
-                                let totals = tx.totals();
+                                let totals = tx.totals(true);
                                 match tx.kind() {
                                     // TODO: don't use account_value_delta, use sent_zats.
                                     // We care about fees if we spent any money ourselves.
                                     // If we just received from someone else, we don't care about fees.
                                     // TODO: BeginUnstake sends just a fee with no receive, ClaimUnstake receives with no send.
                                     WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake | WalletTxKind::BeginUnstake => {
-                                        let send_amount: i64 = tx.account_value_delta().into(); // TODO: don't use account_value_delta, use sent_zats.
+                                        let send_amount: i64 = tx.account_value_delta(true).into(); // TODO: don't use account_value_delta, use sent_zats.
                                         let send_amount: u64 = send_amount.abs() as u64;
 
                                         let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
