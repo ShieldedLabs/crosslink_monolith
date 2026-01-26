@@ -1999,6 +1999,10 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         }
 
+                        if hovered {
+                            viz.ui_hovered_height = Some(tx.reported_height());
+                        }
+
                         if let _ = elem().decl(Decl {
                             id,
                             padding,
@@ -3092,6 +3096,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 }
 
 pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet_state: Arc<Mutex<WalletState>>) -> bool {
+    viz.ui_hovered_height = None; // @todo(judah): not sure where to reset this
+
     ui.tx_loading_animation_timer += ui.delta;
     if ui.tx_loading_animation_timer >= 1.0 {
         ui.tx_loading_animation_timer = 0.0;

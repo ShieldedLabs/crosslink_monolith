@@ -194,6 +194,7 @@ const COLOR_BC:     u32 = 0x82ccc0;
 const COLOR_NBC:    u32 = 0x808080;
 const COLOR_BFT:    u32 = 0xdc4c4f;
 const COLOR_ACCENT: u32 = 0x121212;
+const COLOR_BRIGHT: u32 = 0xffffff;
 
 const COLOR_BC_LINK:    u32 = 0x4e7b73;
 const COLOR_BFT_LINK:   u32 = 0x9a2d37;
@@ -216,6 +217,7 @@ pub struct VizState {
     pub bc_tip_height: u64,
     pub bc_finalized_tip_height: u64,
     pub bft_tip_height: u64,
+    pub ui_hovered_height: Option<BlockHeight>,
 
     pub last_frame_hovered_hash: Hash32,
 
@@ -263,6 +265,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         bc_tip_height: 0,
         bc_finalized_tip_height: 0,
         bft_tip_height: 0,
+        ui_hovered_height: None,
 
         bc_tip_y: 0.0,
 
@@ -649,7 +652,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         let y = on_screen_bc.y;
         let finalized = on_screen_bc.block.is_best_chain && on_screen_bc.block.this_height <= viz_state.bc_finalized_tip_height;
         let base_color = if on_screen_bc.block.is_best_chain {
-            COLOR_BC
+            if viz_state.ui_hovered_height.is_some() && on_screen_bc.block.this_height == viz_state.ui_hovered_height.unwrap().0 as u64 {
+                COLOR_BRIGHT
+            } else {
+                COLOR_BC
+            }
         } else {
             COLOR_NBC
         };
