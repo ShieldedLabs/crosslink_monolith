@@ -782,8 +782,8 @@ impl Context {
         (id, Scroll(0.0, -scroll_container_state.scroll * self.scale), &mut scroll_container_state.scroll, scroll_container_state.viewport_height)
     }
 
-    pub fn openable(&mut self, data: &mut UiData, id: Id, activated: bool) -> bool {
-        let mut openable_state = &mut data.openables.entry(id.id).or_default();
+    pub fn openable(&mut self, data: &mut UiData, id: Id, activated: bool, open_by_default: bool) -> bool {
+        let mut openable_state = &mut data.openables.entry(id.id).or_insert(OpenableState { open: open_by_default });
         if activated {
             openable_state.open = !openable_state.open;
         }
@@ -1402,7 +1402,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     ui.text(string, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
                                 }
 
-                                if ui.openable(data, id, activated) {
+                                if ui.openable(data, id, activated, true) {
                                     for &(bond_key, finalizer, initial) in &staked_roster_unbonded {
                                         let index: u32 = {
                                             use std::hash::{Hash, Hasher};
@@ -1505,6 +1505,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                 }
                                 elem_end();
                             }
+
+
                             if staked_roster_bonded.len() > 0 {
                                 let string = "Staked Bonds";
                                 let id = id_index("StakedBondsContainer", 0);
@@ -1538,7 +1540,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     ui.text(string, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
                                 }
 
-                                if ui.openable(data, id, activated) {
+                                if ui.openable(data, id, activated, true) {
                                     let mut prev_finalizer:   Option<[u8; 32]> = None;
                                     let mut open_finalizer:   bool = false;
                                     for &(bond_key, finalizer, initial) in &staked_roster_bonded {
@@ -1593,7 +1595,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 ui.text(label, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
                                             }
 
-                                            open_finalizer = ui.openable(data, id, activated);
+                                            open_finalizer = ui.openable(data, id, activated, false);
                                         }
 
                                         if !open_finalizer {
