@@ -623,17 +623,16 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     for on_screen_bc in viz_state.on_screen_bcs.values() {
         let x = on_screen_bc.x;
         let y = on_screen_bc.y;
-        let finalized_and_on_bc = on_screen_bc.block.is_best_chain && on_screen_bc.block.this_height <= viz_state.bc_finalized_tip_height;
-        let non_finalized_and_on_bc = on_screen_bc.block.is_best_chain && on_screen_bc.block.this_height > viz_state.bc_finalized_tip_height;
-        let base_color = if finalized_and_on_bc || non_finalized_and_on_bc {
+        let finalized = on_screen_bc.block.is_best_chain && on_screen_bc.block.this_height <= viz_state.bc_finalized_tip_height;
+        let base_color = if on_screen_bc.block.is_best_chain {
             COLOR_BC
         } else {
             COLOR_NBC
         };
 
-        let color = (((on_screen_bc.alpha*255.0) as u32) << 24) | blend_u32(0x000000, base_color, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
-        let color_accent = (((on_screen_bc.alpha*on_screen_bc.finalized_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_ACCENT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
-        let color_bft = (((on_screen_bc.alpha*on_screen_bc.implicated_by_bft_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BFT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
+        let color        = (((on_screen_bc.alpha*255.0)                                      as u32) << 24) | blend_u32(0x000000, base_color,   ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
+        let color_accent = (((on_screen_bc.alpha*on_screen_bc.finalized_alpha*255.0)         as u32) << 24) | blend_u32(0x000000, COLOR_ACCENT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
+        let color_bft    = (((on_screen_bc.alpha*on_screen_bc.implicated_by_bft_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BFT,    ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
 
         if hovered_block == on_screen_bc.block.this_hash {
             hovered_block_screen_x = origin_x + (x*screen_unit);
