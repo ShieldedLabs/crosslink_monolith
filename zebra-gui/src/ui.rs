@@ -2105,41 +2105,32 @@ pub fn ui_left_pane(ui: &mut Context,
                                     _ => WHITE,
                                 };
 
-                                let totals = tx.totals(true);
-                                match tx.kind() {
-                                    // TODO: don't use account_value_delta, use sent_zats.
-                                    // We care about fees if we spent any money ourselves.
-                                    // If we just received from someone else, we don't care about fees.
-                                    // TODO: BeginUnstake sends just a fee with no receive, ClaimUnstake receives with no send.
-                                    WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake | WalletTxKind::BeginUnstake => {
-                                        let send_amount: i64 = tx.account_value_delta(true).into(); // TODO: don't use account_value_delta, use sent_zats.
-                                        let send_amount: u64 = send_amount.abs() as u64;
+                                let all = tx.totals(true);
+                                let all_no_bond = tx.totals(false);
+                                let (show_val, prefix, zats) = match tx.kind() {
+                                    WalletTxKind::BeginUnstake | WalletTxKind::Retarget => (false, "", 0), // fee-only
 
-                                        let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
-                                        ui.text(frame_strf!(data, "{}{} cTAZ", prefix, str_from_ctaz(send_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
-                                    },
-                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake | WalletTxKind::Mine => {
-                                        if true { // total
-                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(totals.recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
-                                        } else { // transparent, shielded
-                                            let (t_z, s_z) = (tx.parts[0].recv_zats.into_u64(), tx.parts[1].recv_zats.into_u64());
-                                            ui.text(frame_strf!(data, "+{} | {} cTAZ", str_from_ctaz(t_z), str_from_ctaz(s_z)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
-                                        }
-                                    },
-                                    WalletTxKind::Shield => {
-                                        // TODO: (how) do we want to show the fee?
-                                        let shield_amount = totals.recv_zats.into_u64();
+                                    WalletTxKind::Send  => (true, "-", all.sent_zats.into_u64().saturating_sub(all.recv_zats.into_u64())),
+                                    WalletTxKind::Stake => (true, "",  WalletTxPart::from_staking_action(&tx.staking_action).recv_zats.into_u64(), // aka bond.recv_zats
+                                    WalletTxKind::Stake => (true, "",  all.sent_zats.into_u64().saturating_sub(all_no_bond.recv_zats.into_u64())), // aka bond.recv_zats
 
-                                        ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(shield_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
-                                    },
-                                    _ => {
-                                        ui.text("TODO cTAZ", TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
-                                    },
+                                    WalletTxKind::SelfSend     => (true, "",  all.recv_zats.into_u64()),
+                                    WalletTxKind::Shield       => (true, "",  all.recv_zats.into_u64()),
+                                    WalletTxKind::Receive      => (true, "+", all.recv_zats.into_u64()),
+                                    WalletTxKind::ClaimUnstake => (true, "+", all.recv_zats.into_u64()),
+                                    WalletTxKind::Mine         => (true, "+", all.recv_zats.into_u64()),
+                                };
+
+                                if show_val {
+                                    ui.text(frame_strf!(data, "{}{} cTAZ", prefix, str_from_ctaz(zats)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
+                                    // let (t_z, s_z) = (tx.parts[0].recv_zats.into_u64(), tx.parts[1].recv_zats.into_u64());
+                                    // ui.text(frame_strf!(data, "+{} | {} cTAZ", str_from_ctaz(t_z), str_from_ctaz(s_z)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                 }
 
+                                // We care about fees if we spent any money ourselves.
+                                // If we just received from somewhere else, we don't care about fees.
                                 if tx.kind() != WalletTxKind::Receive &&
-                                   tx.kind() != WalletTxKind::Mine &&
-                                   tx.kind() != WalletTxKind::BeginUnstake
+                                   tx.kind() != WalletTxKind::Mine // ALT: if fee != Some(0)
                                 {
                                     let fee_str = if let Some(fee) = tx.fee() {
                                         str_from_ctaz(fee.into_u64())
