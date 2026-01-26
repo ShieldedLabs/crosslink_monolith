@@ -862,6 +862,7 @@ pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
 
 pub static SOUND_UI_WOOSH: &[u8] = include_bytes!("../assets/ui_woosh.ogg");
 pub static SOUND_UI_HOVER: &[u8] = include_bytes!("../assets/ui_hover.ogg");
+pub static SOUND_NOW_STAKING_DAY1: &[u8] = include_bytes!("../assets/now_staking_day1.ogg");
 
 const DRAW_CALL_MAX: usize = 131072;
 const GLYPH_RUN_MAX: usize = 16384;
@@ -1309,6 +1310,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                     if debug_do_anyway {
                                                         current_animation_id = debug_next_animation_id;
                                                         debug_next_animation_id += 1;
+                                                        play_sound(SOUND_NOW_STAKING_DAY1, 2.0, 1.0);
                                                     }
                                                 }
                                                 if let Some(t) = current_animation_t.as_mut() {
