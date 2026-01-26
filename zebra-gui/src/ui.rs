@@ -1280,21 +1280,19 @@ pub fn ui_left_pane(ui: &mut Context,
                     };
 
                     // TODO: phillip audaciously deleted the accumulated bond amount field, bring that back
-                    let mut staked_roster = Vec::<(bool /* is_unbonded */, [u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* initial */)>::new();
+                    let mut staked_roster_unbonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* current estimated */)>;
+                    let mut staked_roster_bonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* current estimated */)>;
                     {
                         let lock = wallet_state.lock().unwrap();
-                        for p in &lock.stake_positions_unbonded {
-                            staked_roster.push((true, p.0, p.1, p.2));
-                        }
-                        for p in &lock.stake_positions_bonded {
-                            staked_roster.push((false, p.0, p.1, p.2));
-                        }
+                        staked_roster_unbonded = lock.stake_positions_unbonded.clone();
+                        staked_roster_bonded = lock.stake_positions_bonded.clone();
                     }
 
-                    staked_roster.sort_by_key(|x| std::cmp::Reverse((x.0, x.2, x.3)));
+                    staked_roster_unbonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
+                    staked_roster_bonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
 
                     let (id, mut clip, mut scroll) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
-                    if staked_roster.len() == 0 {
+                    if (staked_roster_unbonded.len() + staked_roster_bonded.len()) == 0 {
                         clip = Scroll(0.0, 0.0);
                         *scroll = 0.0;
                     }
@@ -1325,7 +1323,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             chunks
                         };
 
-                        if staked_roster.len() == 0 {
+                        if (staked_roster_unbonded.len() + staked_roster_bonded.len()) == 0 {
                             let h = ui.scale(24.0);
                             if let _ = elem().decl(Decl {
                                 direction: TopToBottom,
@@ -1340,240 +1338,346 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         }
                         else {
-                            let mut prev_is_unbonded: Option<bool>     = None;
-                            let mut prev_finalizer:   Option<[u8; 32]> = None;
-
-                            let mut open_is_unbonded: bool = false;
-                            let mut open_finalizer:   bool = false;
-
-                            for (index, &(is_unbonded, bond_key, finalizer, initial)) in staked_roster.iter().enumerate() {
-                                let index: u32 = {
-                                    use std::hash::{Hash, Hasher};
-                                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                                    bond_key.hash(&mut h);
-                                    index.hash(&mut h);
-                                    h.finish() as u32
-                                };
-
-                                if prev_is_unbonded != Some(is_unbonded) {
-                                    if prev_is_unbonded.is_some() {
-                                        elem_end();
-                                    }
-                                    prev_is_unbonded = Some(is_unbonded);
-                                    prev_finalizer = None;
-
-                                    let string = if is_unbonded { "Claimable Bonds" } else { "Active Positions" };
-
-                                    let id = id_index(string, index);
-
-                                    let colour = BUTTON_GREY.mul(0.8);
-
-                                    elem_bgn();
-                                    decl(Decl {
-                                        colour,
-                                        radius,
-                                        child_gap,
-                                        padding,
-                                        width:  grow!(),
-                                        height: fit!(),
-                                        align: TopLeft,
-                                        direction: TopToBottom,
-                                        ..Decl
-                                    });
-
-                                    let (activated, colour, text_colour) = ui.button_ex(true, colour, id, true, winit::window::CursorIcon::Pointer);
-
-                                    if let _ = elem().decl(Decl {
-                                        id,
-                                        colour,
-                                        radius,
-                                        padding,
-                                        width:  grow!(),
-                                        height: fit!(),
-                                        align:  Left,
-                                        ..Decl
-                                    })
-                                    {
-                                        ui.text(string, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
-                                    }
-
-                                    open_is_unbonded = ui.openable(data, id, activated);
-                                }
-
-                                if !open_is_unbonded {
-                                    continue;
-                                }
-
-                                if prev_finalizer != Some(finalizer) {
-                                    if prev_finalizer.is_some() {
-                                        elem_end();
-                                    }
-                                    prev_finalizer = Some(finalizer);
-
-                                    let chunks = chunkify(&finalizer);
-                                    let label = frame_strf!(data, "{}", display_str(&chunks));
-
-                                    let id = id_index(label, index);
-
-                                    let colour = BUTTON_GREY.mul(0.6);
-
-                                    let (activated, colour, text_colour) = ui.button_ex(true, colour, id, true, winit::window::CursorIcon::Pointer);
-
-                                    elem_bgn();
-                                    decl(Decl {
-                                        colour,
-                                        radius,
-                                        child_gap,
-                                        padding,
-                                        width:  grow!(),
-                                        height: fit!(),
-                                        align: TopLeft,
-                                        direction: TopToBottom,
-                                        ..Decl
-                                    });
-
-                                    if let _ = elem().decl(Decl {
-                                        id,
-                                        colour,
-                                        radius,
-                                        padding,
-                                        width:  grow!(),
-                                        height: fit!(),
-                                        align:  Left,
-                                        ..Decl
-                                    })
-                                    {
-                                        // ui.text("Staked to:", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
-                                        ui.text(label, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
-                                    }
-
-                                    open_finalizer = ui.openable(data, id, activated);
-                                }
-
-                                if !open_finalizer {
-                                    continue;
-                                }
-
-                                let stake_amount = initial as i64;
-                                if index > 0 { // separator
-                                    let colour = {
-                                        let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
-                                        col = col.hsva();
-                                        col.2 = col.2.mul(1.5).min(255);
-                                        col.rgba()
-                                    };
-
-                                    let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
-                                }
-                                if let _ = elem().decl(Decl {
-                                    id: id_index("Unstake Roster Member", index as u32),
-                                    padding,
+                            if staked_roster_unbonded.len() > 0 {
+                                let string = "Claimable Bonds";
+                                let id = id_index("ClaimableBondsContainer", 0);
+                                let colour = BUTTON_GREY.mul(0.8);
+                                elem_bgn();
+                                decl(Decl {
+                                    colour,
+                                    radius,
                                     child_gap,
-                                    height: fixed!(ui.scale(48.0)),
-                                    width: percent!(1.0),
-                                    direction: LeftToRight,
-                                    align: Center,
+                                    padding,
+                                    width:  grow!(),
+                                    height: fit!(),
+                                    align: TopLeft,
+                                    direction: TopToBottom,
                                     ..Decl
-                                }) {
-                                    // left icon
-                                    if let _ = elem().decl(Decl {
-                                        id: id_index("Unstake Roster Member Left Icon", index as u32),
-                                        height: fit!(),
-                                        width: fixed!(ui.scale(32.0)),
-                                        direction: TopToBottom,
-                                        align: Center,
-                                        ..Decl
-                                    }) {
-                                        let (icon, icon_hovered) = if is_unbonded {
-                                            (ICON_MONEY, ICON_WALLET)
-                                        } else {
-                                            (ICON_LINK_1, ICON_UNLINK)
+                                });
+
+                                let (activated, colour, text_colour) = ui.button_ex(true, colour, id, true, winit::window::CursorIcon::Pointer);
+
+                                if let _ = elem().decl(Decl {
+                                    id,
+                                    colour,
+                                    radius,
+                                    padding,
+                                    width:  grow!(),
+                                    height: fit!(),
+                                    align:  Left,
+                                    ..Decl
+                                })
+                                {
+                                    ui.text(string, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
+                                }
+
+                                if ui.openable(data, id, activated) {
+                                    for &(bond_key, finalizer, initial) in &staked_roster_unbonded {
+                                        let index: u32 = {
+                                            use std::hash::{Hash, Hasher};
+                                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                                            0x890452908345u64.hash(&mut h);
+                                            bond_key.hash(&mut h);
+                                            h.finish() as u32
                                         };
-                                        if clickable_icon(ui, id_index("Unstake Button", index as u32), icon, icon_hovered, true) {
-                                            if is_unbonded {
-                                                wallet_state.lock().unwrap().claim_bond(bond_key);
-                                            } else {
-                                                wallet_state.lock().unwrap().unstake_from_finalizer(bond_key);
-                                            }
+
+                                        let stake_amount = initial as i64;
+                                        if index > 0 { // separator
+                                            let colour = {
+                                                let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
+                                                col = col.hsva();
+                                                col.2 = col.2.mul(1.5).min(255);
+                                                col.rgba()
+                                            };
+
+                                            let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
                                         }
-                                    }
-                                    if is_unbonded == false {
-                                        // left-right icon
                                         if let _ = elem().decl(Decl {
-                                            id: id_index("Retarget Roster Member Right Icon", index as u32),
-                                            height: fit!(),
-                                            width: fixed!(ui.scale(32.0)),
-                                            direction: TopToBottom,
+                                            id: id_index("Unstake Roster Member", index as u32),
+                                            padding,
+                                            child_gap,
+                                            height: fixed!(ui.scale(48.0)),
+                                            width: percent!(1.0),
+                                            direction: LeftToRight,
                                             align: Center,
                                             ..Decl
                                         }) {
-                                            let (icon, icon_hovered) = (ICON_MOVE, ICON_RESIZE_FULL_ALT);
-                                            if clickable_icon(ui, id_index("Retarget Button", index as u32), icon, icon_hovered, true) {
-                                                ui.modal = Modal::Retarget;
-                                                ui.retarget_modal_bond_key = bond_key;
+                                            // left icon
+                                            if let _ = elem().decl(Decl {
+                                                id: id_index("Unstake Roster Member Left Icon", index as u32),
+                                                height: fit!(),
+                                                width: fixed!(ui.scale(32.0)),
+                                                direction: TopToBottom,
+                                                align: Center,
+                                                ..Decl
+                                            }) {
+                                                let (icon, icon_hovered) = (ICON_MONEY, ICON_WALLET);
+                                                if clickable_icon(ui, id_index("Unstake Button", index as u32), icon, icon_hovered, true) {
+                                                    wallet_state.lock().unwrap().claim_bond(bond_key);
+                                                }
+                                            }
+
+                                            // info
+                                            if let _ = elem().decl(Decl {
+                                                id: id_index("Unstake Roster Member Info", index as u32),
+                                                height: fit!(),
+                                                width: grow!(),
+                                                direction: TopToBottom,
+                                                align: Left,
+                                                ..Decl
+                                            }) {
+                                                let chunks = chunkify(&bond_key);
+
+                                                ui.text(frame_strf!(data, "{}", display_str(&chunks)), TextDecl { font: Mono, h: ui.scale(14.0), align: AlignX::Left, ..TextDecl });
+                                            }
+
+                                            // right info
+                                            if let _ = elem().decl(Decl {
+                                                id: id_index("Unstake Roster Member Amounts", index as u32),
+                                                height: fit!(),
+                                                width: fit!(),
+                                                direction: TopToBottom,
+                                                align: Right,
+                                                ..Decl
+                                            }) {
+                                                // TODO: let accumulated_stake_amount;
+                                                let full = stake_amount / 100_000_000;
+                                                let part = stake_amount % 100_000_000;
+                                                let part_str = format!("{part}00");
+                                                let trim_part = part_str.trim_end_matches("0");
+
+                                                let id = id_index("Unstake Clickable Text", index as u32);
+                                                let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
+                                                let mut str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
+                                                if ui.hovered(id) {
+                                                    // TODO: let initial_stake_amount;
+                                                    let full = stake_amount / 100_000_000;
+                                                    let part = stake_amount % 100_000_000;
+                                                    let part_str = format!("{part}00");
+                                                    let trim_part = part_str.trim_end_matches("0");
+
+                                                    colour = WHITE;
+                                                    str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
+                                                }
+
+                                                if let _ = elem().decl(Decl {
+                                                    id,
+                                                    width: fit!(),
+                                                    height: fit!(),
+                                                    ..Decl
+                                                }) {
+                                                    ui.text(str, TextDecl { font: Mono, h: ui.scale(14.0), colour, align: AlignX::Right, ..TextDecl });
+                                                }
                                             }
                                         }
                                     }
-
-                                    // info
-                                    if let _ = elem().decl(Decl {
-                                        id: id_index("Unstake Roster Member Info", index as u32),
-                                        height: fit!(),
-                                        width: grow!(),
-                                        direction: TopToBottom,
-                                        align: Left,
-                                        ..Decl
-                                    }) {
-                                        let chunks = chunkify(&bond_key);
-
-                                        ui.text(frame_strf!(data, "{}", display_str(&chunks)), TextDecl { font: Mono, h: ui.scale(14.0), align: AlignX::Left, ..TextDecl });
-                                    }
-
-                                    // right info
-                                    if let _ = elem().decl(Decl {
-                                        id: id_index("Unstake Roster Member Amounts", index as u32),
-                                        height: fit!(),
-                                        width: fit!(),
-                                        direction: TopToBottom,
-                                        align: Right,
-                                        ..Decl
-                                    }) {
-                                        // TODO: let accumulated_stake_amount;
-                                        let full = stake_amount / 100_000_000;
-                                        let part = stake_amount % 100_000_000;
-                                        let part_str = format!("{part}00");
-                                        let trim_part = part_str.trim_end_matches("0");
-
-                                        let id = id_index("Unstake Clickable Text", index as u32);
-                                        let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
-                                        let mut str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
-                                        if ui.hovered(id) {
-                                            // TODO: let initial_stake_amount;
-                                            let full = stake_amount / 100_000_000;
-                                            let part = stake_amount % 100_000_000;
-                                            let part_str = format!("{part}00");
-                                            let trim_part = part_str.trim_end_matches("0");
-
-                                            colour = WHITE;
-                                            str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
-                                        }
-
-                                        if let _ = elem().decl(Decl {
-                                            id,
-                                            width: fit!(),
-                                            height: fit!(),
-                                            ..Decl
-                                        }) {
-                                            ui.text(str, TextDecl { font: Mono, h: ui.scale(14.0), colour, align: AlignX::Right, ..TextDecl });
-                                        }
-                                    }
                                 }
-                            }
-
-                            if prev_finalizer.is_some() {
                                 elem_end();
                             }
-                            if prev_is_unbonded.is_some() {
+                            if staked_roster_bonded.len() > 0 {
+                                let string = "Staked Bonds";
+                                let id = id_index("StakedBondsContainer", 0);
+                                let colour = BUTTON_GREY.mul(0.8);
+                                elem_bgn();
+                                decl(Decl {
+                                    colour,
+                                    radius,
+                                    child_gap,
+                                    padding,
+                                    width:  grow!(),
+                                    height: fit!(),
+                                    align: TopLeft,
+                                    direction: TopToBottom,
+                                    ..Decl
+                                });
+
+                                let (activated, colour, text_colour) = ui.button_ex(true, colour, id, true, winit::window::CursorIcon::Pointer);
+
+                                if let _ = elem().decl(Decl {
+                                    id,
+                                    colour,
+                                    radius,
+                                    padding,
+                                    width:  grow!(),
+                                    height: fit!(),
+                                    align:  Left,
+                                    ..Decl
+                                })
+                                {
+                                    ui.text(string, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
+                                }
+
+                                if ui.openable(data, id, activated) {
+                                    let mut prev_finalizer:   Option<[u8; 32]> = None;
+                                    let mut open_finalizer:   bool = false;
+                                    for &(bond_key, finalizer, initial) in &staked_roster_bonded {
+                                        let index: u32 = {
+                                            use std::hash::{Hash, Hasher};
+                                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                                            0x3953467893478u64.hash(&mut h);
+                                            bond_key.hash(&mut h);
+                                            finalizer.hash(&mut h);
+                                            h.finish() as u32
+                                        };
+                                        if prev_finalizer != Some(finalizer) {
+                                            if prev_finalizer.is_some() {
+                                                elem_end();
+                                            }
+                                            prev_finalizer = Some(finalizer);
+
+                                            let chunks = chunkify(&finalizer);
+                                            let label = frame_strf!(data, "{}", display_str(&chunks));
+
+                                            let id = id_index(label, index);
+
+                                            let colour = BUTTON_GREY.mul(0.6);
+
+                                            let (activated, colour, text_colour) = ui.button_ex(true, colour, id, true, winit::window::CursorIcon::Pointer);
+
+                                            elem_bgn();
+                                            decl(Decl {
+                                                colour,
+                                                radius,
+                                                child_gap,
+                                                padding,
+                                                width:  grow!(),
+                                                height: fit!(),
+                                                align: TopLeft,
+                                                direction: TopToBottom,
+                                                ..Decl
+                                            });
+
+                                            if let _ = elem().decl(Decl {
+                                                id,
+                                                colour,
+                                                radius,
+                                                padding,
+                                                width:  grow!(),
+                                                height: fit!(),
+                                                align:  Left,
+                                                ..Decl
+                                            })
+                                            {
+                                                // ui.text("Staked to:", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
+                                                ui.text(label, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
+                                            }
+
+                                            open_finalizer = ui.openable(data, id, activated);
+                                        }
+
+                                        if !open_finalizer {
+                                            continue;
+                                        }
+
+                                        let stake_amount = initial as i64;
+                                        if index > 0 { // separator
+                                            let colour = {
+                                                let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
+                                                col = col.hsva();
+                                                col.2 = col.2.mul(1.5).min(255);
+                                                col.rgba()
+                                            };
+
+                                            let _ = elem().decl(Decl { colour, height: fixed!(ui.scale(2.0)), width: percent!(1.0), ..Decl });
+                                        }
+                                        if let _ = elem().decl(Decl {
+                                            id: id_index("Unstake Roster Member", index as u32),
+                                            padding,
+                                            child_gap,
+                                            height: fixed!(ui.scale(48.0)),
+                                            width: percent!(1.0),
+                                            direction: LeftToRight,
+                                            align: Center,
+                                            ..Decl
+                                        }) {
+                                            // left icon
+                                            if let _ = elem().decl(Decl {
+                                                id: id_index("Unstake Roster Member Left Icon", index as u32),
+                                                height: fit!(),
+                                                width: fixed!(ui.scale(32.0)),
+                                                direction: TopToBottom,
+                                                align: Center,
+                                                ..Decl
+                                            }) {
+                                                let (icon, icon_hovered) = (ICON_LINK_1, ICON_UNLINK);
+                                                if clickable_icon(ui, id_index("Unstake Button", index as u32), icon, icon_hovered, true) {
+                                                    wallet_state.lock().unwrap().unstake_from_finalizer(bond_key);
+                                                }
+                                            }
+                                            // left-right icon
+                                            if let _ = elem().decl(Decl {
+                                                id: id_index("Retarget Roster Member Right Icon", index as u32),
+                                                height: fit!(),
+                                                width: fixed!(ui.scale(32.0)),
+                                                direction: TopToBottom,
+                                                align: Center,
+                                                ..Decl
+                                            }) {
+                                                let (icon, icon_hovered) = (ICON_MOVE, ICON_RESIZE_FULL_ALT);
+                                                if clickable_icon(ui, id_index("Retarget Button", index as u32), icon, icon_hovered, true) {
+                                                    ui.modal = Modal::Retarget;
+                                                    ui.retarget_modal_bond_key = bond_key;
+                                                }
+                                            }
+
+                                            // info
+                                            if let _ = elem().decl(Decl {
+                                                id: id_index("Unstake Roster Member Info", index as u32),
+                                                height: fit!(),
+                                                width: grow!(),
+                                                direction: TopToBottom,
+                                                align: Left,
+                                                ..Decl
+                                            }) {
+                                                let chunks = chunkify(&bond_key);
+
+                                                ui.text(frame_strf!(data, "{}", display_str(&chunks)), TextDecl { font: Mono, h: ui.scale(14.0), align: AlignX::Left, ..TextDecl });
+                                            }
+
+                                            // right info
+                                            if let _ = elem().decl(Decl {
+                                                id: id_index("Unstake Roster Member Amounts", index as u32),
+                                                height: fit!(),
+                                                width: fit!(),
+                                                direction: TopToBottom,
+                                                align: Right,
+                                                ..Decl
+                                            }) {
+                                                // TODO: let accumulated_stake_amount;
+                                                let full = stake_amount / 100_000_000;
+                                                let part = stake_amount % 100_000_000;
+                                                let part_str = format!("{part}00");
+                                                let trim_part = part_str.trim_end_matches("0");
+
+                                                let id = id_index("Unstake Clickable Text", index as u32);
+                                                let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
+                                                let mut str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
+                                                if ui.hovered(id) {
+                                                    // TODO: let initial_stake_amount;
+                                                    let full = stake_amount / 100_000_000;
+                                                    let part = stake_amount % 100_000_000;
+                                                    let part_str = format!("{part}00");
+                                                    let trim_part = part_str.trim_end_matches("0");
+
+                                                    colour = WHITE;
+                                                    str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
+                                                }
+
+                                                if let _ = elem().decl(Decl {
+                                                    id,
+                                                    width: fit!(),
+                                                    height: fit!(),
+                                                    ..Decl
+                                                }) {
+                                                    ui.text(str, TextDecl { font: Mono, h: ui.scale(14.0), colour, align: AlignX::Right, ..TextDecl });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if prev_finalizer.is_some() {
+                                        elem_end();
+                                    }
+                                }
                                 elem_end();
                             }
                         }
