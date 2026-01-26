@@ -1938,6 +1938,61 @@ pub fn ui_left_pane(ui: &mut Context,
                             align: Center,
                             ..Decl
                         }) {
+                            let mut icon_text_buf = String::new();
+                            let (icon_colour, status_icon) = {
+                                let CONFIRMATIONS_THRESHOLD = 3;
+
+                                pub const RED:  (u8, u8, u8, u8) = (255, 64, 67, 0xff);      /* @todo colors */
+                                pub const BLUE: (u8, u8, u8, u8) = (0x33, 0x88, 0xde, 0xff); /* @todo colors */
+                                let (icon_colour, status_icon) = match tx.status {
+                                    TxStatus::OnBc => {
+                                        if tx_h.0 as u64 <= viz.bc_finalized_tip_height { // finalized
+                                            (BLUE,  DOUBLE_ICON_OK_CIRCLED_1)
+                                        } else if tx_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height { // confirmed
+                                            (WHITE, DOUBLE_ICON_OK_CIRCLED2_1)
+                                        } else if tx_is_in_block {
+                                            (WHITE, ICON_OK_CIRCLED2_1)
+                                        } else if tx_h == BlockHeight::MEMPOOL {
+                                            (GREY, ICON_OK_CIRCLED2_1)
+                                        } else if tx_h == BlockHeight::SENT {
+                                            (WHITE, ICON_PAPER_PLANE)
+                                        } else if tx_h == BlockHeight::BUILT {
+                                            (WHITE, ICON_WRENCH)
+                                        } else if tx_h == BlockHeight::PROPOSED {
+                                            (GREY, ICON_WRENCH)
+                                        } else { // INVALID
+                                            (GREY, ICON_CANCEL)
+                                        }
+                                    }
+
+                                    TxStatus::SoftFail(h) | TxStatus::HardFail(h, _) => {
+                                        let icon = if h == BlockHeight::PROPOSED {
+                                            ICON_WRENCH // Failed to build
+                                        } else if h == BlockHeight::BUILT {
+                                            ICON_PAPER_PLANE // Failed to send
+                                        } else if h == BlockHeight::SENT {
+                                            ICON_CANCEL // TODO
+                                        } else if h == BlockHeight::MEMPOOL {
+                                            ICON_CANCEL // TODO
+                                        } else if tx_is_in_block {
+                                            ICON_FORK
+                                        } else {
+                                            ICON_CANCEL
+                                        };
+
+                                        match tx.status {
+                                            TxStatus::OnBc => unreachable!("already filtered"),
+                                            TxStatus::SoftFail(_) => (GREY, icon),
+                                            TxStatus::HardFail(_, msg) => {
+                                                icon_text_buf = format!("{} {icon}", msg.to_string());
+                                                (RED, &icon_text_buf as &str)
+                                            }
+                                        }
+                                    }
+                                };
+
+                                (colour.mul(0.75), status_icon)
+                            };
 
                             // left icon
                             if let _ = elem().decl(Decl {
@@ -1961,19 +2016,19 @@ pub fn ui_left_pane(ui: &mut Context,
                                         WalletTxKind::Shield       => ICON_SHIELD,
                                         WalletTxKind::Stake        => ICON_LINK_1,
                                         WalletTxKind::BeginUnstake => ICON_LINK_EXT_ALT,
-                                        WalletTxKind::Retarget => ICON_MOVE,
+                                        WalletTxKind::Retarget     => ICON_MOVE,
                                         WalletTxKind::ClaimUnstake => ICON_UNLINK,
                                     }
                                 };
 
                                 // TODO: account for mempool & confirmation level
-                                let colour = if tx_is_on_best_chain || pending {
-                                    WHITE
-                                } else {
-                                    (0xc0, 0x30, 0x20, 0xff) /* @todo colors */
-                                };
+                                // let colour = if tx_is_on_best_chain || pending {
+                                //     WHITE
+                                // } else {
+                                //     (0xc0, 0x30, 0x20, 0xff) /* @todo colors */
+                                // };
 
-                                ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+                                ui.text(icon, TextDecl { font: Icons, colour: icon_colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
                             }
 
                             // info
@@ -1993,7 +2048,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::Shield        => if tx_is_in_block { "Shielded"  } else { "Shielding" },
                                     WalletTxKind::Stake         => if tx_is_in_block { "Staked"    } else { "Staking"   },
                                     WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking" },
-                                    WalletTxKind::Retarget  => if tx_is_in_block { "Moved Delegation"  } else { "Moving Delegation" },
+                                    WalletTxKind::Retarget      => if tx_is_in_block { "Moved Delegation"  } else { "Moving Delegation" },
                                     WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unbonded"  } else { "Unbonding" },
                                 };
 
@@ -2083,6 +2138,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 }
 
                                 if tx.kind() != WalletTxKind::Receive &&
+                                   tx.kind() != WalletTxKind::Mine &&
                                    tx.kind() != WalletTxKind::BeginUnstake
                                 {
                                     let fee_str = if let Some(fee) = tx.fee() {
@@ -2102,61 +2158,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                     align: BottomRight,
                                     ..Decl
                                 }) {
-                                    let CONFIRMATIONS_THRESHOLD = 3;
-
-                                    pub const RED:  (u8, u8, u8, u8) = (255, 64, 67, 0xff);      /* @todo colors */
-                                    pub const BLUE: (u8, u8, u8, u8) = (0x33, 0x88, 0xde, 0xff); /* @todo colors */
-                                    let (colour, text) = match tx.status {
-                                        TxStatus::OnBc => {
-                                            if tx_h.0 as u64 <= viz.bc_finalized_tip_height { // finalized
-                                                (BLUE,  DOUBLE_ICON_OK_CIRCLED_1)
-                                            } else if tx_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height { // confirmed
-                                                (WHITE, DOUBLE_ICON_OK_CIRCLED2_1)
-                                            } else if tx_is_in_block {
-                                                (WHITE, ICON_OK_CIRCLED2_1)
-                                            } else if tx_h == BlockHeight::MEMPOOL {
-                                                (GREY, ICON_OK_CIRCLED2_1)
-                                            } else if tx_h == BlockHeight::SENT {
-                                                (WHITE, ICON_PAPER_PLANE)
-                                            } else if tx_h == BlockHeight::BUILT {
-                                                (WHITE, ICON_WRENCH)
-                                            } else if tx_h == BlockHeight::PROPOSED {
-                                                (GREY, ICON_WRENCH)
-                                            } else { // INVALID
-                                                (GREY, ICON_CANCEL)
-                                            }
-                                        }
-
-                                        TxStatus::SoftFail(h) | TxStatus::HardFail(h, _) => {
-                                            (
-                                                if let TxStatus::SoftFail(_) = tx.status {
-                                                    GREY
-                                                } else {
-                                                    RED
-                                                },
-
-                                                if h == BlockHeight::PROPOSED {
-                                                    ICON_WRENCH // Failed to build
-                                                } else if h == BlockHeight::BUILT {
-                                                    ICON_PAPER_PLANE // Failed to send
-                                                } else if h == BlockHeight::SENT {
-                                                    ICON_CANCEL // TODO
-                                                } else if h == BlockHeight::MEMPOOL {
-                                                    ICON_CANCEL // TODO
-                                                } else if tx_is_in_block {
-                                                    ICON_FORK
-                                                } else {
-                                                    ICON_CANCEL
-                                                }
-                                            )
-                                        }
-                                    };
-
-                                    let colour = colour.mul(0.75);
-
-                                    let confirmation_icons_h = if text == ICON_FORK { ui.scale(20.0) } else { ui.scale(12.0) };
-
-                                    ui.text(text, TextDecl { font: Icons, colour, h: confirmation_icons_h, wrap: Wrap::None, align: AlignX::Right,  ..TextDecl });
+                                    let confirmation_icons_h = if status_icon == ICON_FORK { ui.scale(20.0) } else { ui.scale(12.0) };
+                                    ui.text(status_icon, TextDecl { font: Icons, colour: icon_colour, h: confirmation_icons_h, wrap: Wrap::None, align: AlignX::Right,  ..TextDecl });
                                 }
                             }
                         }

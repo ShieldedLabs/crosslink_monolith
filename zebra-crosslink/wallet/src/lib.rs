@@ -3520,6 +3520,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 //  higher blocks & mempool
                 let invalidate_from_i = wallet.txs.partition_point(|tx| tx.h < block_h);
                 for tx in &mut wallet.txs[invalidate_from_i..] {
+                    if tx.h > BlockHeight::MEMPOOL {
+                        // mid-construction items aren't auto-invalidated
+                        // maybe sent should be?
+                        break;
+                    }
                     // N.B. these may get revalidated later if the same txs are found in the new blocks
                     tx.status = TxStatus::SoftFail(tx.h);
                     tx.h = wallet.chain_tip_h;
@@ -3961,7 +3966,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         update_with_tx(wallet, tx.tx.txid, tx.tx, &mut insert_i);
 
                         if loud {
-                            println!("tried to build {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.h, tx.tx.is_on_bc());
+                            println!("tried to build {desc}: ({ok}) was {pre_mined_h}, now {} ({:?})", tx.tx.h, tx.tx.status);
                         }
                         if ! ok {
                             *tx = ProposedTx::EMPTY; // Meaningless to retry
@@ -3974,7 +3979,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         if let Some(tx_res) = &tx.tx_res {
                             ok = wallet.send_built_tx(network, client, &mut tx.tx, tx_res.transaction()).await;
                             if loud {
-                                println!("tried to send {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.h, tx.tx.is_on_bc());
+                                println!("tried to send {desc}: ({ok}) was {pre_mined_h}, now {} ({:?})", tx.tx.h, tx.tx.status);
                             }
                         } else {
                             *tx = ProposedTx::EMPTY; // not enough info to retry; bail
