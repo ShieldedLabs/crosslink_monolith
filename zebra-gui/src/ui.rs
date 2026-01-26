@@ -739,7 +739,7 @@ impl Context {
         text
     }
 
-    pub fn scroll_container<'data>(&mut self, data: &'data mut UiData, id: Id, scroll_end_height: f32) -> (Id, ClipMode, &'data mut f32) {
+    pub fn scroll_container<'data>(&mut self, data: &'data mut UiData, id: Id, scroll_end_height: f32) -> (Id, ClipMode, &'data mut f32, f32) {
         let mut scroll_container_state = data.scroll_containers.entry(id.id).or_default();
 
         if self.hovered(id) {
@@ -762,7 +762,7 @@ impl Context {
             scroll_container_state.scroll = 0.0;
         }
 
-        (id, Scroll(0.0, -scroll_container_state.scroll * self.scale), &mut scroll_container_state.scroll)
+        (id, Scroll(0.0, -scroll_container_state.scroll * self.scale), &mut scroll_container_state.scroll, scroll_container_state.viewport_height)
     }
 
     pub fn openable(&mut self, data: &mut UiData, id: Id, activated: bool) -> bool {
@@ -813,6 +813,7 @@ pub struct TextboxState {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ScrollContainerState {
     pub scroll: f32,
+    pub viewport_height: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -846,6 +847,18 @@ pub fn ui_left_pane(ui: &mut Context,
         tab_id_miner_wallet = ui.tab(radius, padding, tab_id, "Miner Wallet");
     }
     ui.nav_skip = false;
+
+    let shift_held = (ui.input().key_held(KeyCode::ShiftLeft)   || ui.input().key_held(KeyCode::ShiftRight));
+    let ctrl_held  = (ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight));
+
+    // CTRL-TAB to switch between user and miner wallet.
+    if ui.input().key_pressed(KeyCode::Tab) && ctrl_held {
+        if *tab_id == tab_id_miner_wallet {
+            *tab_id = tab_id_user_wallet;
+        } else {
+            *tab_id = tab_id_miner_wallet;
+        }
+    }
 
     // You can't operate on the miner, so you can't open any modals. // @Todo: maybe you can open Receive?
     if *tab_id == tab_id_miner_wallet {
@@ -1292,9 +1305,9 @@ pub fn ui_left_pane(ui: &mut Context,
                     staked_roster_unbonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
                     staked_roster_bonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
 
-                    let (id, mut clip, mut scroll) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
+                    let (id, mut clip, mut scroll, viewport_h) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
                     if (staked_roster_unbonded.len() + staked_roster_bonded.len()) == 0 {
-                        clip = Scroll(0.0, 0.0);
+                        clip = ClipMode::None;
                         *scroll = 0.0;
                     }
                     if let _ = elem().decl(Decl {
@@ -1870,9 +1883,9 @@ pub fn ui_left_pane(ui: &mut Context,
             let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
             let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
 
-            let (id, mut clip, mut scroll) = ui.scroll_container(data, id("History Scroll Container"), 96.0);
+            let (id, mut clip, mut scroll, viewport_h) = ui.scroll_container(data, id("History Scroll Container"), 96.0);
             if txs.len() == 0 {
-                clip = Scroll(0.0, 0.0);
+                clip = ClipMode::None;
                 *scroll = 0.0;
             }
             if let _ = elem().decl(Decl {
@@ -1882,8 +1895,8 @@ pub fn ui_left_pane(ui: &mut Context,
                 padding,
                 radius: padding.0.dup4(),
                 width:  percent!(1.0),
-                height: grow!(),
-                // height: percent!(1.0),
+                // height: grow!(),
+                height: percent!(1.0),
                 direction: TopToBottom,
                 clip,
                 align: Top,
@@ -1911,7 +1924,21 @@ pub fn ui_left_pane(ui: &mut Context,
                     let separator_height           = ui.scale(8.0);
                     let transaction_inner_height   = transaction_element_height - separator_height;
 
+                    let culled_pre_n  = ((ui.scale(*scroll) / transaction_element_height).floor() as usize).saturating_sub(1);
+                    let culled_in_n   = ((viewport_h) / transaction_element_height).ceil() as usize + 1;
+                    let culled_post_n = (txs.len() - (culled_pre_n + culled_in_n).min(txs.len()));
+
+                    // culling preamble spacer
+                    let _ = elem().decl(Decl { height: Sizing::Fixed(culled_pre_n as f32 * transaction_element_height), ..Decl });
+
                     for (index, tx) in txs.iter().rev().enumerate() {
+                        if index < culled_pre_n {
+                            continue;
+                        }
+                        if index >= culled_pre_n + culled_in_n {
+                            break;
+                        }
+
                         if index > 0 { // separator
                             let colour = {
                                 let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
@@ -2165,6 +2192,9 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         }
                     }
+
+                    // culling postamble spacer
+                    let _ = elem().decl(Decl { height: Sizing::Fixed(culled_post_n as f32 * transaction_element_height), ..Decl });
                 }
             }
         }
@@ -2305,9 +2335,9 @@ pub fn ui_right_pane(ui: &mut Context,
             }
         }
 
-        let (id, mut clip, mut scroll) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
+        let (id, mut clip, mut scroll, viewport_h) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
         if roster.len() == 0 {
-            clip = Scroll(0.0, 0.0);
+            clip = ClipMode::None;
             *scroll = 0.0;
         }
         if let _ = elem().decl(Decl {
@@ -2595,6 +2625,9 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
     ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Default);
 
+    let shift_held = (ui.input().key_held(KeyCode::ShiftLeft)   || ui.input().key_held(KeyCode::ShiftRight));
+    let ctrl_held  = (ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight));
+
     ui.capture = false;
     // let prev_nav_idx_to_id = ui.nav_idx_to_id.clone();
     ui.nav_id_to_idx.clear();
@@ -2827,10 +2860,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
     //     ui.nav_enable = false;
     // }
 
-    if ui.input().key_pressed(KeyCode::Tab) && ui.nav_idx_to_id.len() > 0 {
+    if ui.input().key_pressed(KeyCode::Tab) && !ctrl_held && ui.nav_idx_to_id.len() > 0 {
         let idx = if ui.nav_id != 0 {
             let old_idx = ui.nav_id_to_idx[&ui.nav_id] as isize;
-            if (ui.input().key_held(KeyCode::ShiftLeft) || ui.input().key_held(KeyCode::ShiftRight)) {
+            if shift_held {
                 (old_idx - 1).rem_euclid(ui.nav_idx_to_id.len() as isize) as usize
             } else {
                 (old_idx + 1).rem_euclid(ui.nav_idx_to_id.len() as isize) as usize
@@ -2850,10 +2883,18 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
     // Return the list of render commands of your layout
     let render_commands = c.end();
 
-    if is_rendering {
+    {
         let mut nav_bbox: Option<(isize, isize, isize, isize)> = None;
 
         for command in render_commands {
+            if let Some(scroll_container_state) = data.scroll_containers.get_mut(&command.id) {
+                scroll_container_state.viewport_height = command.bounding_box.height;
+            }
+
+            if !is_rendering {
+                continue;
+            }
+
             fn clay_color_to_u32(color: clay::Color) -> u32 {
                 let r = color.r as u32;
                 let g = color.g as u32;
