@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, hash::Hash, sync::Mutex};
 
+use wallet::BlockHeight;
 // use twox_hash::XxHash3_64;
 use winit::event::MouseButton;
 
@@ -233,6 +234,17 @@ pub struct VizState {
 
     pub peer_strings: Vec<String>,
 }
+
+impl VizState {
+    pub fn pos_at_height(&self, height: BlockHeight) -> (f32, f32, bool) {
+        if height.is_in_block() {
+            (0.0, -10.0 * height.0 as f32, true) // @todo: should handle sidechain x-axis, maybe this should take a hash instead
+        } else {
+            (0.0, 0.0, false)
+        }
+    }
+}
+
 pub fn viz_gui_init(fake_data: bool) -> VizState {
     let (me_send, zebra_receive) = std::sync::mpsc::sync_channel(128);
     let (zebra_send, me_receive) = std::sync::mpsc::sync_channel(128);
@@ -500,6 +512,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 on_screen_bc.y = 0.0;
                 on_screen_bc.alpha = 0.0;
             }
+            if input_ctx.mouse_pressed(MouseButton::Left) {
+                viz_state.camera_x = on_screen_bc.t_x;
+                viz_state.camera_y = on_screen_bc.t_y;
+                viz_state.zoom = 2.0;
+            }
 
             on_screen_bc.t_bft_arrow_alpha = 1.0;
         } else {
@@ -530,6 +547,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 on_screen_bft.x = 0.0;
                 on_screen_bft.y = 0.0;
                 on_screen_bft.alpha = 0.0;
+            }
+            if input_ctx.mouse_pressed(MouseButton::Left) {
+                viz_state.camera_x = on_screen_bft.t_x;
+                viz_state.camera_y = on_screen_bft.t_y;
+                viz_state.zoom = 2.0;
             }
         } else {
             on_screen_bft.t_roundness = 1.0;

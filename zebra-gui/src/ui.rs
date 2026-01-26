@@ -1951,7 +1951,8 @@ pub fn ui_left_pane(ui: &mut Context,
                     // culling preamble spacer
                     let _ = elem().decl(Decl { height: Sizing::Fixed(culled_pre_n as f32 * transaction_element_height), ..Decl });
 
-                    for (index, tx) in (&txs[culled_in_bgn_o .. culled_in_end_o]).iter().enumerate() {
+                    let culled_txs = &txs[culled_in_bgn_o .. culled_in_end_o];
+                    for (index, tx) in culled_txs.iter().enumerate() {
                         let index = index + culled_pre_n;
                         // if index < 0 {
                         //     continue;
@@ -1977,10 +1978,36 @@ pub fn ui_left_pane(ui: &mut Context,
                         let tx_is_in_block      = tx_h.is_in_block();
                         let tx_is_on_best_chain = tx_is_in_block && tx.is_on_bc();
 
+                        let id = id_index("Transaction", index as u32);
+                        let (clicked, hovered) = {
+                            let skip_before = ui.nav_skip;
+                            ui.nav_skip = true;
+
+                            let (clicked, _, _) = ui.button_ex(true, BLACK, id, true, winit::window::CursorIcon::Pointer);
+                            let hovered = ui.hovered(id);
+                            ui.nav_skip = skip_before;
+
+                            (clicked, hovered)
+                        };
+
+                        if clicked {
+                            let (cx, cy, ok) = viz.pos_at_height(tx.reported_height());
+                            if ok {
+                                viz.camera_x = cx;
+                                viz.camera_y = cy;
+                                viz.zoom = 2.0;
+                            }
+                        }
+
                         if let _ = elem().decl(Decl {
-                            id: id_index("Transaction", index as u32),
+                            id,
                             padding,
                             child_gap,
+                            colour: if hovered {
+                                TRANSACTION_HISTORY_CONTAINER_COL.mul(0.25)
+                            } else {
+                                (0, 0, 0, 0)
+                            },
                             height: fixed!(transaction_inner_height),
                             width: percent!(1.0),
                             direction: LeftToRight,
