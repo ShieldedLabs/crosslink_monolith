@@ -2905,12 +2905,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             let y2 = (command.bounding_box.y + command.bounding_box.height) as isize;
 
             if let Some(scroll_container_state) = data.scroll_containers.get_mut(&command.id) {
-                let x1 = x1.max(0);
-                let y1 = y1.max(0);
-                let x2 = x2.min(window_w as isize);
-                let y2 = y2.min(window_h as isize);
-
-                scroll_container_state.viewport_height = (y2 - y1) as f32;
+                scroll_container_state.viewport_height = command.bounding_box.height.min(window_h);
             }
 
             if !is_rendering {
