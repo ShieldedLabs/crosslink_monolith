@@ -410,7 +410,7 @@ impl Drop for Timer<'_> {
 }
 
 
-fn block_policy_10() -> ConfirmationsPolicy { ConfirmationsPolicy::new(std::num::NonZeroU32::new(5).unwrap(), std::num::NonZeroU32::new(5).unwrap(), false).unwrap() }
+// fn block_policy_10() -> ConfirmationsPolicy { ConfirmationsPolicy::new(std::num::NonZeroU32::new(5).unwrap(), std::num::NonZeroU32::new(5).unwrap(), false).unwrap() }
 
 #[derive(Debug, Clone, PartialEq)]
 enum WalletAction {
@@ -721,19 +721,24 @@ impl WalletTx {
         }
     }
 
-    pub fn totals(&self) -> WalletTxPart {
-        let mut b = WalletTxPart::from_staking_action(self.staking_action);
-        self.parts[0].unchecked_add(&self.parts[1]).unchecked_add(&b)
+    pub fn totals(&self, include_staking: bool) -> WalletTxPart {
+        let res = self.parts[0].unchecked_add(&self.parts[1]);
+        if include_staking {
+            let b = WalletTxPart::from_staking_action(self.staking_action);
+            res.unchecked_add(&b)
+        } else {
+            res
+        }
     }
 
-    pub fn account_value_delta(&self) -> ZatBalance {
-        let all = self.totals();
+    pub fn account_value_delta(&self, include_staking: bool) -> ZatBalance {
+        let all = self.totals(include_staking);
         // NOTE: into_i64 isn't pub...
         ZatBalance::from_i64(all.recv_zats.into_u64() as i64 - all.spent_zats.into_u64() as i64).expect("checked before")
     }
 
     pub fn fee(&self) -> Option<Zatoshis> {
-        let all = self.totals();
+        let all = self.totals(true);
         // NOTE: into_i64 isn't pub...
         let spent = all.spent_zats.into_u64();
         let sent = all.sent_zats.into_u64();
@@ -766,7 +771,7 @@ impl WalletTx {
             }
             return WalletTxKind::SelfSend;
         }
-        let all = self.totals();
+        let all = self.totals(true);
 
         if self.is_coinbase && all.spent_zats == Zatoshis::ZERO && all.recv_zats > Zatoshis::ZERO {
             return WalletTxKind::Mine;
@@ -898,7 +903,7 @@ impl WalletState {
         }
         self.actions_in_flight.push_back(WalletAction::UnstakeFromFinalizer(txid));
     }
-    
+
     pub fn retarget_bond(&mut self, txid: [u8; 32], new_target: [u8; 32]) {
         let txid = TxId::from_bytes(txid);
         if self.actions_in_flight.iter().filter(|a| match a { WalletAction::RetargetBond(id, _to) if id.eq(&txid) => true, _ => false }).count() != 0 {
@@ -1013,7 +1018,9 @@ fn update_insert_i(txs: &[WalletTx], insert_i: &mut usize, block_h: BlockHeight)
 
 fn update_with_tx(wallet: &mut ManualWallet, txid: TxId, mut new_tx: WalletTx, insert_i: &mut usize) {
     // find if there's an existing height/transaction for this txid
-    let new_totals = new_tx.totals();
+    // NOTE: we ignore staking here because we don't track if they're ours properly without
+    // signatures, and we always spend for fee or receive in orchard with them
+    let new_totals = new_tx.totals(false);
     if (new_totals.spent_note_count == 0 &&
         new_totals.recv_note_count == 0 &&
         new_totals.sent_note_count == 0)
@@ -2171,17 +2178,15 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                     if let Some(utxo_i) = txo_recv_h_position(&account.utxos, prevout_txid_h, &input.prevout) {
                         let utxo = account.utxos.remove(utxo_i);
                         let stxo = Txo { spent_h: block_h, ..utxo };
-                        if let Some(last_stxo) = account.stxos.last() {
-                            if last_stxo.spent_h > stxo.spent_h {
-                                println!("ERROR: out of sequence spent UTXO: {} > {}", last_stxo.spent_h, stxo.spent_h);
-                            }
-                        }
                         t.spent(stxo.value, true)?;
 
-                        if let Some(last_stxo) = account.stxos.last() {
-                            debug_assert!(last_stxo.spent_h <= stxo.spent_h, "{} <= {}", last_stxo.spent_h, stxo.spent_h);
-                        }
-                        account.stxos.push(stxo);
+                        // if let Some(last_stxo) = account.stxos.last() {
+                        //     if last_stxo.spent_h > stxo.spent_h {
+                        //         println!("ERROR: out of sequence spent UTXO: {} > {}", last_stxo.spent_h, stxo.spent_h);
+                        //     }
+                        //     debug_assert!(last_stxo.spent_h <= stxo.spent_h, "{} <= {}", last_stxo.spent_h, stxo.spent_h);
+                        // }
+                        txo_spent_h_insert(&mut account.stxos, stxo);
                     } else if let Some(txo_i) = txo_recv_h_position(&account.recv_txos, prevout_txid_h, &input.prevout) {
                         // NOTE: we need to use our own tracking of the TXO as otherwise we don't know the value
                         t.spent(account.recv_txos[txo_i].value, true)?;
@@ -3522,6 +3527,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 //  higher blocks & mempool
                 let invalidate_from_i = wallet.txs.partition_point(|tx| tx.h < block_h);
                 for tx in &mut wallet.txs[invalidate_from_i..] {
+                    if tx.h > BlockHeight::MEMPOOL {
+                        // mid-construction items aren't auto-invalidated
+                        // maybe sent should be?
+                        break;
+                    }
                     // N.B. these may get revalidated later if the same txs are found in the new blocks
                     tx.status = TxStatus::SoftFail(tx.h);
                     tx.h = wallet.chain_tip_h;
@@ -3563,7 +3573,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             while let Ok(raw_tx) = mempool_recv.try_recv() {
                 if DUMP_SYNC {
-                    println!("got mempool tx with tip height: {}", raw_tx.height);
+                    println!("got mempool tx with tip height: {} vs chain tip {}", raw_tx.height, wallets[0].chain_tip_h.0);
                 }
                 // NOTE: expected LRZ height different from abstract mempool height
                 match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, LRZBlockHeight::from_u32(network_tip_h.0 + 1))) {
@@ -3718,7 +3728,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
 
             let user_txs = user_wallet.txs.clone();
-            let mut miner_txs = miner_wallet.txs[miner_wallet.txs.len().saturating_sub(20)..].to_vec();
+            let miner_txs = miner_wallet.txs.clone();
 
             let mut stake_positions_bonded = Vec::new();
             let mut stake_positions_unbonded = Vec::new();
@@ -3963,7 +3973,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         update_with_tx(wallet, tx.tx.txid, tx.tx, &mut insert_i);
 
                         if loud {
-                            println!("tried to build {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.h, tx.tx.is_on_bc());
+                            println!("tried to build {desc}: ({ok}) was {pre_mined_h}, now {} ({:?})", tx.tx.h, tx.tx.status);
                         }
                         if ! ok {
                             *tx = ProposedTx::EMPTY; // Meaningless to retry
@@ -3976,7 +3986,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         if let Some(tx_res) = &tx.tx_res {
                             ok = wallet.send_built_tx(network, client, &mut tx.tx, tx_res.transaction()).await;
                             if loud {
-                                println!("tried to send {desc}: ({ok}) was {pre_mined_h}, now {} ({})", tx.tx.h, tx.tx.is_on_bc());
+                                println!("tried to send {desc}: ({ok}) was {pre_mined_h}, now {} ({:?})", tx.tx.h, tx.tx.status);
                             }
                         } else {
                             *tx = ProposedTx::EMPTY; // not enough info to retry; bail

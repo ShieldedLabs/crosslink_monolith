@@ -13,36 +13,36 @@ fn main() {
             WalletTx::with_fake_data(WalletTxKind::Stake, 10_000_000_000, 0, false, false, "", 0),
             WalletTx::with_fake_data(WalletTxKind::BeginUnstake, 10_000_000_000, 0, false, false, "", 13),
             WalletTx::with_fake_data(WalletTxKind::BeginUnstake, 10_000_000_000, 0, false, true, "Fork", 13),
-            /* WalletTx::with_fake_data(WalletTxKind::Send, 100_000_000, 0, false, false, "Hello, world!", 15),
+            WalletTx::with_fake_data(WalletTxKind::Send, 100_000_000, 0, false, false, "Hello, world!", 15),
             WalletTx::with_fake_data(WalletTxKind::Receive, 0, 100_000_000, false, false, "Other things", 25),
             WalletTx::with_fake_data(WalletTxKind::Send, 250_000_000, 0, true, false, "More things", 32),
             WalletTx::with_fake_data(WalletTxKind::Shield, 10_000_000_000, 0, true, false, "", 64),
             WalletTx::with_fake_data(WalletTxKind::Stake, 10_000_000_000, 0, false, false, "", 0),
-            WalletTx::with_fake_data(WalletTxKind::Unstake, 10_000_000_000, 0, false, false, "", 0),
+            WalletTx::with_fake_data(WalletTxKind::BeginUnstake, 10_000_000_000, 0, false, false, "", 0),
             WalletTx::with_fake_data(WalletTxKind::Send, 100_000_000, 0, false, false, "Hello this is a test to see if the word wrapping works properly........", 0),
             WalletTx::with_fake_data(WalletTxKind::Receive, 0, 100_000_000, false, false, "Other things", 0),
             WalletTx::with_fake_data(WalletTxKind::Send, 250_000_000, 0, true, false, "More things", 0),
             WalletTx::with_fake_data(WalletTxKind::Shield, 10_000_000_000, 0, true, false, "", 73),
             WalletTx::with_fake_data(WalletTxKind::Stake, 10_000_000_000, 0, false, false, "", 0),
-            WalletTx::with_fake_data(WalletTxKind::Unstake, 10_000_000_000, 0, false, false, "", 74),
+            WalletTx::with_fake_data(WalletTxKind::BeginUnstake, 10_000_000_000, 0, false, false, "", 74),
             WalletTx::with_fake_data(WalletTxKind::Send, 100_000_000, 0, false, false, "Hello, world!", 0),
             WalletTx::with_fake_data(WalletTxKind::Receive, 0, 100_000_000, false, false, "Other things", 0),
             WalletTx::with_fake_data(WalletTxKind::Send, 250_000_000, 0, true, false, "More things", 0),
             WalletTx::with_fake_data(WalletTxKind::Shield, 10_000_000_000, 0, true, false, "", 100),
             WalletTx::with_fake_data(WalletTxKind::Stake, 10_000_000_000, 0, false, false, "", 750),
-            WalletTx::with_fake_data(WalletTxKind::Unstake, 10_000_000_000, 0, false, false, "", 800),
+            WalletTx::with_fake_data(WalletTxKind::BeginUnstake, 10_000_000_000, 0, false, false, "", 800),
             WalletTx::with_fake_data(WalletTxKind::Send, 100_000_000, 0, false, false, "Hello, world!", 0),
             WalletTx::with_fake_data(WalletTxKind::Receive, 0, 100_000_000, false, false, "Other things", 0),
             WalletTx::with_fake_data(WalletTxKind::Send, 250_000_000, 0, true, false, "More things", 0),
             WalletTx::with_fake_data(WalletTxKind::Shield, 10_000_000_000, 0, true, false, "", 801),
             WalletTx::with_fake_data(WalletTxKind::Stake, 10_000_000_000, 0, false, false, "", 805),
-            WalletTx::with_fake_data(WalletTxKind::Unstake, 10_000_000_000, 0, false, false, "", 9000),
+            WalletTx::with_fake_data(WalletTxKind::BeginUnstake, 10_000_000_000, 0, false, false, "", 9000),
             WalletTx::with_fake_data(WalletTxKind::Send, 100_000_000, 0, false, false, "Hello, world!", 1024),
             WalletTx::with_fake_data(WalletTxKind::Receive, 0, 100_000_000, false, false, "Other things", 9001),
             WalletTx::with_fake_data(WalletTxKind::Send, 250_000_000, 0, true, false, "More things", 0),
             WalletTx::with_fake_data(WalletTxKind::Shield, 10_000_000_000, 0, true, false, "", 0),
             WalletTx::with_fake_data(WalletTxKind::Stake, 10_000_000_000, 0, false, false, "", 0),
-            WalletTx::with_fake_data(WalletTxKind::Unstake, 10_000_000_000, 0, false, false, "", 0), */
+            WalletTx::with_fake_data(WalletTxKind::BeginUnstake, 10_000_000_000, 0, false, false, "", 0),
         ];
 
         let mut pending: Vec<_> = txs.iter().filter(|tx| !tx.h.is_in_block()).map(|tx| tx.clone()).collect();
@@ -51,7 +51,7 @@ fn main() {
         mined.sort_by(|a, b| b.h.cmp(&a.h));
         pending.extend_from_slice(&mined);
 
-        wallet_state.lock().unwrap().user_txs = pending;
+        wallet_state.lock().unwrap().miner_txs = pending;
         wallet_state.lock().unwrap().roster = vec![
             WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 25540_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0xBBu8; 32], voting_power: 111000100_000_000, txids: vec![] },
