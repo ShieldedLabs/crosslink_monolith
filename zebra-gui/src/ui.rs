@@ -369,7 +369,8 @@ impl Element {
     }
 }
 
-pub const PANE_PERCENT: f32 = 0.27; // @PreventPanesColliding
+pub const PANE_PERCENT_LEFT:  f32 = 0.30; // @PreventPanesColliding
+pub const PANE_PERCENT_RIGHT: f32 = 0.24; // @PreventPanesColliding
 
 pub const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
 pub const GREY:             (u8, u8, u8, u8) = (0xff, 0x99, 0x99, 0x99);
@@ -882,7 +883,7 @@ pub fn ui_left_pane(ui: &mut Context,
             id: id("Modal Contents"),
             padding: padding.mul(2.0),
             colour: MODAL_COL,
-            width:  grow!(ui.scale(192.0), ui.scale(384.0)),
+            width:  grow!(ui.scale(192.0)/* , ui.scale(384.0) */),
             height,
             align: Top,
             direction: TopToBottom,
@@ -2632,12 +2633,13 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         ..Decl
     }) {
 
-        let pane_pct = Sizing::Percent(ui.zoom * PANE_PERCENT);
+        let pane_pct_left  = Sizing::Percent(ui.zoom * PANE_PERCENT_LEFT);
+        let pane_pct_right = Sizing::Percent(ui.zoom * PANE_PERCENT_RIGHT);
 
         if let _elem = elem().decl(Decl {
             id: id("Left Pane"),
             direction: TopToBottom,
-            width: pane_pct,
+            width: pane_pct_left,
             height: grow!(),
             clip: Clip,
             ..Decl
@@ -2740,7 +2742,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         if let _elem = elem().decl(Decl {
             id: id("Right Pane"),
             direction: TopToBottom,
-            width: pane_pct,
+            width: pane_pct_right,
             height: grow!(),
             clip: Clip,
             ..Decl
