@@ -2171,17 +2171,15 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                     if let Some(utxo_i) = txo_recv_h_position(&account.utxos, prevout_txid_h, &input.prevout) {
                         let utxo = account.utxos.remove(utxo_i);
                         let stxo = Txo { spent_h: block_h, ..utxo };
-                        if let Some(last_stxo) = account.stxos.last() {
-                            if last_stxo.spent_h > stxo.spent_h {
-                                println!("ERROR: out of sequence spent UTXO: {} > {}", last_stxo.spent_h, stxo.spent_h);
-                            }
-                        }
                         t.spent(stxo.value, true)?;
 
-                        if let Some(last_stxo) = account.stxos.last() {
-                            debug_assert!(last_stxo.spent_h <= stxo.spent_h, "{} <= {}", last_stxo.spent_h, stxo.spent_h);
-                        }
-                        account.stxos.push(stxo);
+                        // if let Some(last_stxo) = account.stxos.last() {
+                        //     if last_stxo.spent_h > stxo.spent_h {
+                        //         println!("ERROR: out of sequence spent UTXO: {} > {}", last_stxo.spent_h, stxo.spent_h);
+                        //     }
+                        //     debug_assert!(last_stxo.spent_h <= stxo.spent_h, "{} <= {}", last_stxo.spent_h, stxo.spent_h);
+                        // }
+                        txo_spent_h_insert(&mut account.stxos, stxo);
                     } else if let Some(txo_i) = txo_recv_h_position(&account.recv_txos, prevout_txid_h, &input.prevout) {
                         // NOTE: we need to use our own tracking of the TXO as otherwise we don't know the value
                         t.spent(account.recv_txos[txo_i].value, true)?;
