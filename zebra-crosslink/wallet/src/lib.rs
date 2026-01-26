@@ -3573,7 +3573,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             while let Ok(raw_tx) = mempool_recv.try_recv() {
                 if DUMP_SYNC {
-                    println!("got mempool tx with tip height: {}", raw_tx.height);
+                    println!("got mempool tx with tip height: {} vs chain tip {}", raw_tx.height, wallets[0].chain_tip_h.0);
                 }
                 // NOTE: expected LRZ height different from abstract mempool height
                 match Transaction::read(&raw_tx.data[..], BranchId::for_height(network, LRZBlockHeight::from_u32(network_tip_h.0 + 1))) {
