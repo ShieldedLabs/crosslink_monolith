@@ -453,6 +453,24 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     let world_mouse_x = viz_state.camera_x + ((input_ctx.mouse_pos().0.clamp(0, draw_ctx.window_width) - draw_ctx.window_width/2) as f32) / screen_unit;
     let world_mouse_y = viz_state.camera_y + ((input_ctx.mouse_pos().1.clamp(0, draw_ctx.window_height) - draw_ctx.window_height/2) as f32) / screen_unit;
 
+    {
+        let color = 0xff_404040;
+        let sday = (viz_state.bc_finalized_tip_height) / UI_COPY_STAKING_DAY_PERIOD;
+        {
+            let y2 = -10.0 * ((sday*UI_COPY_STAKING_DAY_PERIOD) as f32 - 0.5) * screen_unit;
+            let y1 = -10.0 * ((sday*UI_COPY_STAKING_DAY_PERIOD + UI_COPY_STAKING_DAY_WINDOW) as f32 + 0.5) * screen_unit;
+
+            draw_ctx.rectangle_r(origin_x - 60.0 * screen_unit, origin_y + y1, origin_x + 60.0 * screen_unit, origin_y + y2, 1, color);
+        }
+        let sday = sday + 1;
+        {
+            let y2 = -10.0 * ((sday*UI_COPY_STAKING_DAY_PERIOD) as f32 - 0.5) * screen_unit;
+            let y1 = -10.0 * ((sday*UI_COPY_STAKING_DAY_PERIOD + UI_COPY_STAKING_DAY_WINDOW) as f32 + 0.5) * screen_unit;
+
+            draw_ctx.rectangle_r(origin_x - 60.0 * screen_unit, origin_y + y1, origin_x + 60.0 * screen_unit, origin_y + y2, 1, color);
+        }
+    }
+
     let mut hovered_block = Hash32::from_u64(0);
     let mut hovered_block_screen_x = 0.0;
     let mut hovered_block_screen_y = 0.0;
