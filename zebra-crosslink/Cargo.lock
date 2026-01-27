@@ -9875,7 +9875,6 @@ dependencies = [
  "zcash_transparent",
  "zebra-chain",
  "zebra-consensus",
- "zebra-crosslink",
  "zebra-network",
  "zebra-node-services",
  "zebra-script",
