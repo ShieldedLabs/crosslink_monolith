@@ -3113,7 +3113,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         if !just_init_new_tx && resync_c > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
         }
         resync_c += 1;
         just_init_new_tx = false;
