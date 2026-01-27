@@ -33,6 +33,8 @@ pub struct UiData {
     pub scroll_containers: HashMap<u32, ScrollContainerState>,
 
     pub openables: HashMap<u32, OpenableState>,
+
+    pub tooltip_text: String,
 }
 
 
@@ -40,6 +42,13 @@ pub struct UiData {
 macro_rules! frame_strf {
     ($data:expr, $($arg:tt)*) => {
         $data.frame_str(&format_args!($($arg)*).to_string())
+    };
+}
+
+#[macro_export]
+macro_rules! set_tooltip_text {
+    ($data:expr, $($arg:tt)*) => {
+        $data.tooltip_text = format_args!($($arg)*).to_string();
     };
 }
 
@@ -328,6 +337,7 @@ pub const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Cl
                     element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
                     parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
                 };
+                // TODO: decl.floating.pointerCaptureMode = clay::Clay_PointerCaptureMode_CLAY_POINTER_CAPTURE_MODE_PASSTHROUGH;
             },
             Floating::Root(x, y) => {
                 decl.floating.attachTo = clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_ROOT;
@@ -337,6 +347,7 @@ pub const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Cl
                     element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
                     parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
                 };
+                decl.floating.pointerCaptureMode = clay::Clay_PointerCaptureMode_CLAY_POINTER_CAPTURE_MODE_PASSTHROUGH;
             },
             _ => {},
         }
@@ -373,7 +384,6 @@ pub const PANE_PERCENT_LEFT:  f32 = 0.30; // @PreventPanesColliding
 pub const PANE_PERCENT_RIGHT: f32 = 0.24; // @PreventPanesColliding
 
 pub const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
-pub const GREY:             (u8, u8, u8, u8) = (0xff, 0x99, 0x99, 0x99);
 // pub const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
 pub const PANE_COL:         (u8, u8, u8, u8) = (0x13, 0x13, 0x13, 0xff); // @FigmaScreenshot
 pub const INACTIVE_TAB_COL: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
@@ -475,14 +485,17 @@ impl Context {
     pub fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
     pub fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
 
-    pub fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
+    pub fn hovered_raw(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
+    pub fn hovered(&self, id: Id) -> bool {
+        self.mouse_pressed_id == Id::default() && self.hovered_raw(id)
+    }
     pub fn hovered_uniquely(&self, id: Id) -> bool {
-        self.hovered_id == id
+        self.mouse_pressed_id == Id::default() && self.hovered_id == id
     }
 
     pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: winit::window::CursorIcon) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
 
-        let mouse_hover = self.hovered(id);
+        let mouse_hover = self.hovered_raw(id);
         let key_hover   = self.nav_enable && self.nav_id == id.id;
 
         let mouse_held     = mouse_hover && self.input().mouse_held(winit::event::MouseButton::Left);
@@ -498,7 +511,8 @@ impl Context {
         let mouse_activated  = enabled && self.mouse_pressed_id == id && if act_on_press { mouse_pressed } else { mouse_released };
         let key_activated    = enabled && self.key_pressed_id   == id && if act_on_press { key_pressed   } else { key_released   };
 
-        if mouse_hover && pointer_on_hover != winit::window::CursorIcon::Default {
+        if mouse_hover && pointer_on_hover != winit::window::CursorIcon::Default &&
+            (self.mouse_pressed_id == Id::default() || self.mouse_pressed_id == id) {
             self.cursor = winit::window::Cursor::Icon(pointer_on_hover);
         }
 
@@ -740,7 +754,7 @@ impl Context {
     }
 
     pub fn scroll_container<'data>(&mut self, data: &'data mut UiData, id: Id, scroll_end_height: f32) -> (Id, ClipMode, &'data mut f32, f32, f32, f32) {
-        let mut scroll_container_state = data.scroll_containers.entry(id.id).or_default();
+        let mut scroll_container_state = data.scroll_containers.entry(id.id).or_insert(Default::default());
 
         scroll_container_state.content_height = {
             let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
@@ -756,9 +770,6 @@ impl Context {
             scroll_container_state.scroll -= self.input().zoom_delta     as f32 * 32.0;
             scroll_container_state.scroll -= self.input().scroll_delta.1 as f32 * 32.0;
 
-            if self.input().mouse_held(MouseButton::Left) {
-                scroll_container_state.scroll -= self.input().mouse_delta().1 as f32 / self.scale;
-            }
             if self.input().key_pressed(KeyCode::PageUp) {
                 scroll_container_state.scroll -= scroll_container_state.viewport_height / self.scale;
             }
@@ -888,6 +899,8 @@ pub fn ui_left_pane(ui: &mut Context,
     if *tab_id == tab_id_miner_wallet {
         ui.modal = Modal::None;
     }
+    const deemph_mul: f32 = 0.65;
+    let grey: (u8, u8, u8, u8) = WHITE.mul(deemph_mul);
 
     if ui.modal != Modal::None && let _elem = elem().decl(Decl {
         child_gap,
@@ -901,7 +914,6 @@ pub fn ui_left_pane(ui: &mut Context,
         height: grow!(),
         ..Decl
     }) {
-
         let container_id = _elem.decl.id;
         let container_hovered = ui.hovered(container_id);
 
@@ -1894,15 +1906,21 @@ pub fn ui_left_pane(ui: &mut Context,
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
-        let mut txs = {
-            let state = wallet_state.lock().unwrap();
-            if *tab_id == tab_id_user_wallet {
-                state.user_txs.clone()
-            } else {
-                state.miner_txs.clone()
+        let txs = {
+            let (mut txs, locals, local_n) = {
+                let state = wallet_state.lock().unwrap();
+                if *tab_id == tab_id_user_wallet {
+                    (state.user_txs.clone(), state.user_local_txs, state.user_local_txs_n)
+                } else {
+                    (state.miner_txs.clone(), state.miner_local_txs, state.miner_local_txs_n)
+                }
+            };
+            for i in 0..local_n {
+                txs.push(locals[i]);
             }
+            txs.reverse();
+            txs
         };
-        txs.reverse();
 
         let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
         let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
@@ -1986,9 +2004,8 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         }
 
-                        let tx_h                = tx.reported_height();
-                        let tx_is_in_block      = tx_h.is_in_block();
-                        let tx_is_on_best_chain = tx_is_in_block && tx.is_on_bc();
+                        let tx_h           = tx.reported_height();
+                        let tx_is_in_block = tx_h.is_in_block();
 
                         let id = id_index("Transaction", index as u32);
                         let (clicked, hovered) = {
@@ -2031,29 +2048,30 @@ pub fn ui_left_pane(ui: &mut Context,
                             ..Decl
                         }) {
                             let mut icon_text_buf = String::new();
-                            let (icon_colour, status_icon) = {
+                            let (text_colour, mut icon_colour, status_icon) = {
                                 let CONFIRMATIONS_THRESHOLD = 3;
 
                                 pub const RED:  (u8, u8, u8, u8) = (255, 64, 67, 0xff);      /* @todo colors */
                                 pub const BLUE: (u8, u8, u8, u8) = (0x33, 0x88, 0xde, 0xff); /* @todo colors */
-                                let (icon_colour, status_icon) = match tx.status {
+                                match tx.status {
                                     TxStatus::OnBc => {
                                         if tx_h.0 as u64 <= viz.bc_finalized_tip_height { // finalized
-                                            (BLUE,  DOUBLE_ICON_OK_CIRCLED_1)
+                                            (WHITE, BLUE,  DOUBLE_ICON_OK_CIRCLED_1)
                                         } else if tx_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height { // confirmed
-                                            (WHITE, DOUBLE_ICON_OK_CIRCLED2_1)
+                                            (WHITE, WHITE, DOUBLE_ICON_OK_CIRCLED2_1)
                                         } else if tx_is_in_block {
-                                            (WHITE, ICON_OK_CIRCLED2_1)
+                                            (WHITE, WHITE, ICON_OK_CIRCLED2_1)
                                         } else if tx_h == BlockHeight::MEMPOOL {
-                                            (GREY, ICON_OK_CIRCLED2_1)
+                                            (WHITE, WHITE, ICON_EYE_1)
                                         } else if tx_h == BlockHeight::SENT {
-                                            (WHITE, ICON_PAPER_PLANE)
+                                            (WHITE, WHITE, ICON_PAPER_PLANE)
                                         } else if tx_h == BlockHeight::BUILT {
-                                            (WHITE, ICON_WRENCH)
+                                            (WHITE, WHITE, ICON_WRENCH)
                                         } else if tx_h == BlockHeight::PROPOSED {
-                                            (GREY, ICON_WRENCH)
+                                            (grey, grey, ICON_WRENCH)
                                         } else { // INVALID
-                                            (GREY, ICON_CANCEL)
+                                            println!("UI saw tx at {tx_h:?} ({:?}, {:?})", tx.h, tx.status);
+                                            (grey, grey, ICON_CANCEL)
                                         }
                                     }
 
@@ -2063,9 +2081,9 @@ pub fn ui_left_pane(ui: &mut Context,
                                         } else if h == BlockHeight::BUILT {
                                             ICON_PAPER_PLANE // Failed to send
                                         } else if h == BlockHeight::SENT {
-                                            ICON_CANCEL // TODO
+                                            ICON_EYE_OFF
                                         } else if h == BlockHeight::MEMPOOL {
-                                            ICON_CANCEL // TODO
+                                            ICON_EYE_1
                                         } else if tx_is_in_block {
                                             ICON_FORK
                                         } else {
@@ -2074,17 +2092,17 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                         match tx.status {
                                             TxStatus::OnBc => unreachable!("already filtered"),
-                                            TxStatus::SoftFail(_) => (GREY, icon),
+                                            TxStatus::SoftFail(_) => (grey, grey, icon),
                                             TxStatus::HardFail(_, msg) => {
                                                 icon_text_buf = format!("{} {icon}", msg.to_string());
-                                                (RED, &icon_text_buf as &str)
+                                                (RED, RED, &icon_text_buf as &str)
                                             }
                                         }
                                     }
-                                };
-
-                                (colour.mul(0.75), status_icon)
+                                }
                             };
+
+                            icon_colour = icon_colour.mul(deemph_mul);
 
                             // left icon
                             if let _ = elem().decl(Decl {
@@ -2133,15 +2151,15 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 let label = match tx.kind() {
-                                    WalletTxKind::Send          => if tx_is_in_block { "Sent"      } else { "Sending"   },
-                                    WalletTxKind::Receive       => if tx_is_in_block { "Received"  } else { "Receiving" },
-                                    WalletTxKind::Mine          => if tx_is_in_block { "Mined"     } else { "Mining"    },
-                                    WalletTxKind::SelfSend      => if tx_is_in_block { "Returned"  } else { "Returning" },
-                                    WalletTxKind::Shield        => if tx_is_in_block { "Shielded"  } else { "Shielding" },
-                                    WalletTxKind::Stake         => if tx_is_in_block { "Staked"    } else { "Staking"   },
-                                    WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking" },
-                                    WalletTxKind::Retarget      => if tx_is_in_block { "Moved Delegation"  } else { "Moving Delegation" },
-                                    WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unbonded"  } else { "Unbonding" },
+                                    WalletTxKind::Send          => if tx_is_in_block { "Sent"      } else { "Sending..."   },
+                                    WalletTxKind::Receive       => if tx_is_in_block { "Received"  } else { "Receiving..." },
+                                    WalletTxKind::Mine          => if tx_is_in_block { "Mined"     } else { "Mining..."    },
+                                    WalletTxKind::SelfSend      => if tx_is_in_block { "Returned"  } else { "Returning..." },
+                                    WalletTxKind::Shield        => if tx_is_in_block { "Shielded"  } else { "Shielding..." },
+                                    WalletTxKind::Stake         => if tx_is_in_block { "Staked"    } else { "Staking..."   },
+                                    WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking..." },
+                                    WalletTxKind::Retarget      => if tx_is_in_block { "Moved Delegation"  } else { "Moving Delegation..." },
+                                    WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unbonded"  } else { "Unbonding..." },
                                 };
 
                                 let label_str = if tx_is_in_block {
@@ -2150,13 +2168,14 @@ pub fn ui_left_pane(ui: &mut Context,
                                     frame_strf!(data, "{}", label)
                                 };
 
-                                ui.text(label_str, TextDecl { h: kind_text_h, align: AlignX::Left, ..TextDecl });
+                                ui.text(label_str, TextDecl { h: kind_text_h, align: AlignX::Left, colour: text_colour, ..TextDecl });
 
+                                let details_col = text_colour.mul(deemph_mul);
                                 // spacer
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
                                 let txid = tx.txid.to_string();
-                                ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { font: Mono, h: transaction_text_h, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, align: AlignX::Left, ..TextDecl });
+                                ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { font: Mono, h: transaction_text_h, colour: details_col, align: AlignX::Left, ..TextDecl });
 
                                 // spacer
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
@@ -2170,7 +2189,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }
                                         }
 
-                                        ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
+                                        ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: details_col, ..TextDecl });
                                     }
                                 }
                             }
@@ -2234,13 +2253,17 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                 // let _ = elem().decl(Decl { height: grow!(), ..Decl }); // spacer
 
-                                if let _ = elem().decl(Decl {
+                                if let _elem = elem().decl(Decl {
                                     id:     id_index("Confirmation Status", index as u32),
                                     height: grow!(),
                                     width:  grow!(),
                                     align:  BottomRight,
                                     ..Decl
                                 }) {
+                                    if ui.hovered(_elem.decl.id) {
+                                        set_tooltip_text!(data, "Hello, World!");
+                                    }
+
                                     let confirmation_icons_h = if status_icon == ICON_FORK { ui.scale(20.0) } else { ui.scale(12.0) };
                                     ui.text(status_icon, TextDecl { font: Icons, colour: icon_colour, h: confirmation_icons_h, wrap: Wrap::None, align: AlignX::Right,  ..TextDecl });
                                 }
@@ -2253,22 +2276,24 @@ pub fn ui_left_pane(ui: &mut Context,
                 }
             }
 
+            let radius = ui.scale(6.0);
 
-            let handle_pct = (if content_h == 0.0 {
-                1.0
-            } else {
-                viewport_h / content_h
-            }).max(0.01).min(1.0);
+            let scrollbar_region_h = viewport_h - padding.2 - padding.3;
 
-            let scroll_pct = (if content_h == 0.0 {
-                0.0
-            } else {
-                scroll / max
-            }).max(0.0).min(1.0);
+            let handle_height = {
+                let handle_pct = if content_h == 0.0 { 1.0 } else { viewport_h / content_h };
+                let handle_height = handle_pct * scrollbar_region_h;
+                handle_height.max(radius * 3.0).min(scrollbar_region_h)
+            };
 
-            let handle_pre = scroll_pct * (1.0 - handle_pct);
+            let scroll_pct = (if max == 0.0 { 0.0 } else { scroll / max }).max(0.0).min(1.0);
 
-            if handle_pct < 1.0 && let _ = elem().decl(Decl {
+            let handle_offset = scroll_pct * (scrollbar_region_h - handle_height);
+
+            ui.nav_skip = true; // @Hack.
+
+            if max > 0.0 && handle_height < scrollbar_region_h && let _ = elem().decl(Decl {
+                id: id_index("Scrollbar Region", id.id as u32),
                 width:  fixed!(ui.scale(32.0)),
                 height: percent!(1.0),
                 padding: (ui.scale(10.0), 0.0, padding.2, padding.3),
@@ -2276,16 +2301,30 @@ pub fn ui_left_pane(ui: &mut Context,
                 align: TopLeft,
                 ..Decl
             }) {
-                let id = ui::id("Scrollbar Handle");
+                let button_id = ui::id("Scrollbar Handle");
                 let colour = (0x60, 0x60, 0x60, 0);
-                let (activated, mut colour, _) = ui.button_ex(false, colour, id, true, winit::window::CursorIcon::Default);
+                let (activated, mut colour, _) = ui.button_ex(true, colour, button_id, true, winit::window::CursorIcon::Default);
                 colour.3 = colour.2;
 
-                let radius = ui.scale(6.0);
+                if ui.mouse_pressed_id == button_id {
+                    let mut scroll_container_state = data.scroll_containers.entry(id.id).or_insert(Default::default());
 
-                let _ = elem().decl(Decl {                                                                 height: Sizing::Percent(handle_pre), ..Decl });
-                let _ = elem().decl(Decl { id, colour, radius: radius.dup4(), width: fixed!(radius * 2.0), height: Sizing::Percent(handle_pct), ..Decl });
+                    let delta_viewport_px  = ui.input().mouse_delta().1 as f32;
+                    let delta_viewport_pct = delta_viewport_px / (scrollbar_region_h - handle_height);
+
+                    let content_scrollable_h = max;
+
+                    let delta_content_pct = delta_viewport_pct;
+                    let delta_content_px  = delta_content_pct * content_scrollable_h;
+
+                    scroll_container_state.scroll += delta_content_px;
+                }
+
+                let _ = elem().decl(Decl {                                                                            height: fixed!(handle_offset), ..Decl });
+                let _ = elem().decl(Decl { id: button_id, colour, radius: radius.dup4(), width: fixed!(radius * 2.0), height: fixed!(handle_height), ..Decl });
             }
+
+            ui.nav_skip = false; // @Hack.
         }
     }
 
@@ -2733,6 +2772,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
     let radius = ui.scale(12.0).dup4();
 
+    data.tooltip_text.clear();
+
     // Begin the layout
     let clay = magic(ui).clay();
     clay.set_layout_dimensions((window_w as f32, window_h as f32).into());
@@ -2924,6 +2965,23 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         }
     }
 
+
+    if data.tooltip_text.len() > 0 {
+        let mouse_pos = ui.input().mouse_pos();
+        let tooltip_pos = (mouse_pos.0 as f32 + 8.0 * ui.dpi_scale, mouse_pos.1 as f32 + 6.0 * ui.dpi_scale);
+
+        if let _ = elem().decl(Decl {
+            id: id("Tooltip Floating Pane"),
+            colour: PANE_COL,
+            child_gap, padding, radius,
+            width:  fit!(),
+            height: fit!(),
+            floating: Floating::Root(tooltip_pos.0, tooltip_pos.1),
+            ..Decl
+        }) {
+            ui.text(&data.tooltip_text, TextDecl { h: ui.scale(16.0), align: AlignX::Left, ..TextDecl });
+        }
+    }
 
     if !ui.input().mouse_held(winit::event::MouseButton::Left) {
         ui.mouse_pressed_id = Id::default();
