@@ -30,7 +30,7 @@
 		<ConfigProperties>
 			<ConfigAndPlatform>
 				<Name>Debug:x64</Name>
-				<BuildCommand>echo.</BuildCommand>
+				<BuildCommand>build</BuildCommand>
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
 				<CleanCommand></CleanCommand>
@@ -40,8 +40,8 @@
 				<Args></Args>
 				<WorkingDirectory>C:\Work\ShieldedLabs\crosslink_monolith\zebra-gui</WorkingDirectory>
 				<DebugCommand></DebugCommand>
-				<DebuggerExe>echo.</DebuggerExe>
-				<DebugSln></DebugSln>
+				<DebuggerExe></DebuggerExe>
+				<DebugSln>visualizer_zcash.sln</DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
 				<PrioritiseFiles></PrioritiseFiles>
