@@ -2253,22 +2253,21 @@ pub fn ui_left_pane(ui: &mut Context,
                 }
             }
 
+            let radius = ui.scale(6.0);
 
-            let handle_pct = (if content_h == 0.0 {
-                1.0
-            } else {
-                viewport_h / content_h
-            }).max(0.01).min(1.0);
+            let scrollbar_region_h = viewport_h - padding.2 - padding.3;
 
-            let scroll_pct = (if content_h == 0.0 {
-                0.0
-            } else {
-                scroll / max
-            }).max(0.0).min(1.0);
+            let handle_height = {
+                let handle_pct = if content_h == 0.0 { 1.0 } else { viewport_h / content_h };
+                let handle_height = handle_pct * scrollbar_region_h;
+                handle_height.max(radius * 3.0).min(scrollbar_region_h)
+            };
 
-            let handle_pre = scroll_pct * (1.0 - handle_pct);
+            let scroll_pct = (if max == 0.0 { 0.0 } else { scroll / max }).max(0.0).min(1.0);
 
-            if handle_pct < 1.0 && let _ = elem().decl(Decl {
+            let handle_offset = scroll_pct * (scrollbar_region_h - handle_height);
+
+            if max > 0.0 && handle_height < scrollbar_region_h && let _ = elem().decl(Decl {
                 width:  fixed!(ui.scale(32.0)),
                 height: percent!(1.0),
                 padding: (ui.scale(10.0), 0.0, padding.2, padding.3),
@@ -2281,10 +2280,8 @@ pub fn ui_left_pane(ui: &mut Context,
                 let (activated, mut colour, _) = ui.button_ex(false, colour, id, true, winit::window::CursorIcon::Default);
                 colour.3 = colour.2;
 
-                let radius = ui.scale(6.0);
-
-                let _ = elem().decl(Decl {                                                                 height: Sizing::Percent(handle_pre), ..Decl });
-                let _ = elem().decl(Decl { id, colour, radius: radius.dup4(), width: fixed!(radius * 2.0), height: Sizing::Percent(handle_pct), ..Decl });
+                let _ = elem().decl(Decl {                                                                 height: fixed!(handle_offset), ..Decl });
+                let _ = elem().decl(Decl { id, colour, radius: radius.dup4(), width: fixed!(radius * 2.0), height: fixed!(handle_height), ..Decl });
             }
         }
     }
