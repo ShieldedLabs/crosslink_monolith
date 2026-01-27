@@ -867,14 +867,14 @@ where
     }
 
     /// Minimum number of blocks that must pass between staking actions on the same bond.
-    pub const STAKING_ACTION_DELAY_BLOCKS: u32 = 35;
+    pub const STAKING_ACTION_DELAY_BLOCKS: u32 = 75;
 
     /// The period length for staking days. A new staking day starts every N blocks.
-    pub const STAKING_DAY_PERIOD: u32 = 100;
+    pub const STAKING_DAY_PERIOD: u32 = 150;
 
     /// The window size within each staking day period where staking actions are allowed.
     /// Staking actions are only valid when `block_height % STAKING_DAY_PERIOD < STAKING_DAY_WINDOW`.
-    pub const STAKING_DAY_WINDOW: u32 = 30;
+    pub const STAKING_DAY_WINDOW: u32 = 70;
 
     /// Checks that staking actions in a transaction respect the required delay since the
     /// last action on the same bond.
