@@ -12,7 +12,7 @@ use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 use std::collections::HashMap;
 //use clay::*; // @Temporary
 
-use wallet::{ BlockHeight, WalletState, WalletTxKind, TxParts, TxStatus, str_from_ctaz };
+use wallet::{ BlockHeight, TxParts, TxStatus, WalletState, WalletTxKind, WalletTxPart, str_from_ctaz };
 
 use super::*;
 
@@ -369,7 +369,8 @@ impl Element {
     }
 }
 
-pub const PANE_PERCENT: f32 = 0.27; // @PreventPanesColliding
+pub const PANE_PERCENT_LEFT:  f32 = 0.30; // @PreventPanesColliding
+pub const PANE_PERCENT_RIGHT: f32 = 0.24; // @PreventPanesColliding
 
 pub const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
 pub const GREY:             (u8, u8, u8, u8) = (0xff, 0x99, 0x99, 0x99);
@@ -738,8 +739,17 @@ impl Context {
         text
     }
 
-    pub fn scroll_container<'data>(&mut self, data: &'data mut UiData, id: Id, scroll_end_height: f32) -> (Id, ClipMode, &'data mut f32) {
+    pub fn scroll_container<'data>(&mut self, data: &'data mut UiData, id: Id, scroll_end_height: f32) -> (Id, ClipMode, &'data mut f32, f32) {
         let mut scroll_container_state = data.scroll_containers.entry(id.id).or_default();
+
+        let max = {
+            let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
+            if scroll_container_data.found {
+                scroll_container_data.contentDimensions.height / self.scale - scroll_end_height
+            } else {
+                0.0
+            }
+        };
 
         if self.hovered(id) {
             scroll_container_state.scroll -= self.input().zoom_delta     as f32 * 32.0;
@@ -748,24 +758,32 @@ impl Context {
             if self.input().mouse_held(MouseButton::Left) {
                 scroll_container_state.scroll -= self.input().mouse_delta().1 as f32 / self.scale;
             }
-        }
-
-        let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
-        if scroll_container_data.found {
-            let max = scroll_container_data.contentDimensions.height / self.scale - scroll_end_height;
-            if scroll_container_state.scroll > max {
+            if self.input().key_pressed(KeyCode::PageUp) {
+                scroll_container_state.scroll -= scroll_container_state.viewport_height / self.scale;
+            }
+            if self.input().key_pressed(KeyCode::PageDown) {
+                scroll_container_state.scroll += scroll_container_state.viewport_height / self.scale;
+            }
+            if self.input().key_pressed(KeyCode::Home) {
+                scroll_container_state.scroll = 0.0;
+            }
+            if self.input().key_pressed(KeyCode::End) {
                 scroll_container_state.scroll = max;
             }
-        };
+        }
+
+        if scroll_container_state.scroll > max {
+            scroll_container_state.scroll = max;
+        }
         if scroll_container_state.scroll < 0.0 {
             scroll_container_state.scroll = 0.0;
         }
 
-        (id, Scroll(0.0, -scroll_container_state.scroll * self.scale), &mut scroll_container_state.scroll)
+        (id, Scroll(0.0, -scroll_container_state.scroll * self.scale), &mut scroll_container_state.scroll, scroll_container_state.viewport_height)
     }
 
-    pub fn openable(&mut self, data: &mut UiData, id: Id, activated: bool) -> bool {
-        let mut openable_state = &mut data.openables.entry(id.id).or_default();
+    pub fn openable(&mut self, data: &mut UiData, id: Id, activated: bool, open_by_default: bool) -> bool {
+        let mut openable_state = &mut data.openables.entry(id.id).or_insert(OpenableState { open: open_by_default });
         if activated {
             openable_state.open = !openable_state.open;
         }
@@ -812,6 +830,7 @@ pub struct TextboxState {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ScrollContainerState {
     pub scroll: f32,
+    pub viewport_height: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -845,6 +864,18 @@ pub fn ui_left_pane(ui: &mut Context,
         tab_id_miner_wallet = ui.tab(radius, padding, tab_id, "Miner Wallet");
     }
     ui.nav_skip = false;
+
+    let shift_held = (ui.input().key_held(KeyCode::ShiftLeft)   || ui.input().key_held(KeyCode::ShiftRight));
+    let ctrl_held  = (ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight));
+
+    // CTRL-TAB to switch between user and miner wallet.
+    if ui.input().key_pressed(KeyCode::Tab) && ctrl_held {
+        if *tab_id == tab_id_miner_wallet {
+            *tab_id = tab_id_user_wallet;
+        } else {
+            *tab_id = tab_id_miner_wallet;
+        }
+    }
 
     // You can't operate on the miner, so you can't open any modals. // @Todo: maybe you can open Receive?
     if *tab_id == tab_id_miner_wallet {
@@ -882,7 +913,7 @@ pub fn ui_left_pane(ui: &mut Context,
             id: id("Modal Contents"),
             padding: padding.mul(2.0),
             colour: MODAL_COL,
-            width:  grow!(ui.scale(192.0), ui.scale(384.0)),
+            width:  grow!(ui.scale(192.0)/* , ui.scale(384.0) */),
             height,
             align: Top,
             direction: TopToBottom,
@@ -1291,9 +1322,9 @@ pub fn ui_left_pane(ui: &mut Context,
                     staked_roster_unbonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
                     staked_roster_bonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
 
-                    let (id, mut clip, mut scroll) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
+                    let (id, mut clip, mut scroll, viewport_h) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
                     if (staked_roster_unbonded.len() + staked_roster_bonded.len()) == 0 {
-                        clip = Scroll(0.0, 0.0);
+                        clip = ClipMode::None;
                         *scroll = 0.0;
                     }
                     if let _ = elem().decl(Decl {
@@ -1371,7 +1402,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     ui.text(string, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
                                 }
 
-                                if ui.openable(data, id, activated) {
+                                if ui.openable(data, id, activated, true) {
                                     for &(bond_key, finalizer, initial) in &staked_roster_unbonded {
                                         let index: u32 = {
                                             use std::hash::{Hash, Hasher};
@@ -1474,6 +1505,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                 }
                                 elem_end();
                             }
+
+
                             if staked_roster_bonded.len() > 0 {
                                 let string = "Staked Bonds";
                                 let id = id_index("StakedBondsContainer", 0);
@@ -1507,7 +1540,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     ui.text(string, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
                                 }
 
-                                if ui.openable(data, id, activated) {
+                                if ui.openable(data, id, activated, true) {
                                     let mut prev_finalizer:   Option<[u8; 32]> = None;
                                     let mut open_finalizer:   bool = false;
                                     for &(bond_key, finalizer, initial) in &staked_roster_bonded {
@@ -1562,7 +1595,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 ui.text(label, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
                                             }
 
-                                            open_finalizer = ui.openable(data, id, activated);
+                                            open_finalizer = ui.openable(data, id, activated, false);
                                         }
 
                                         if !open_finalizer {
@@ -1801,7 +1834,8 @@ pub fn ui_left_pane(ui: &mut Context,
         let padding = child_gap.dup4();
 
         // buttons container
-        if let _ = elem().decl(Decl {
+        let can = (*tab_id == tab_id_user_wallet);
+        if can && let _ = elem().decl(Decl {
             id: id("Buttons Container"),
             padding, child_gap, align: Center,
             width: grow!(),
@@ -1844,20 +1878,17 @@ pub fn ui_left_pane(ui: &mut Context,
                 clicked
             };
 
-            let can = (*tab_id == tab_id_user_wallet);
-            if can {
-                // TODO: send should use ICON_PAPER_PLANE but it would be nice to support negative glyph advance first
-                if button(ui, can, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
-                if button(ui, can, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
-                if button(ui, can, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
-                if button(ui, can, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
-            }
+            // TODO: send should use ICON_PAPER_PLANE but it would be nice to support negative glyph advance first
+            if button(ui, can, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
+            if button(ui, can, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
+            if button(ui, can, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
+            if button(ui, can, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
         }
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
         {
-            let txs = {
+            let mut txs = {
                 let state = wallet_state.lock().unwrap();
                 if *tab_id == tab_id_user_wallet {
                     state.user_txs.clone()
@@ -1865,13 +1896,14 @@ pub fn ui_left_pane(ui: &mut Context,
                     state.miner_txs.clone()
                 }
             };
+            txs.reverse();
 
             let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
             let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
 
-            let (id, mut clip, mut scroll) = ui.scroll_container(data, id("History Scroll Container"), 96.0);
+            let (id, mut clip, mut scroll, viewport_h) = ui.scroll_container(data, id("History Scroll Container"), 96.0);
             if txs.len() == 0 {
-                clip = Scroll(0.0, 0.0);
+                clip = ClipMode::None;
                 *scroll = 0.0;
             }
             if let _ = elem().decl(Decl {
@@ -1881,8 +1913,8 @@ pub fn ui_left_pane(ui: &mut Context,
                 padding,
                 radius: padding.0.dup4(),
                 width:  percent!(1.0),
-                height: grow!(),
-                // height: percent!(1.0),
+                // height: grow!(),
+                height: percent!(1.0),
                 direction: TopToBottom,
                 clip,
                 align: Top,
@@ -1910,7 +1942,25 @@ pub fn ui_left_pane(ui: &mut Context,
                     let separator_height           = ui.scale(8.0);
                     let transaction_inner_height   = transaction_element_height - separator_height;
 
-                    for (index, tx) in txs.iter().rev().enumerate() {
+                    let culled_pre_n    = ((ui.scale(*scroll) / transaction_element_height).floor() as usize).saturating_sub(1);
+                    let culled_in_bgn_o = culled_pre_n;
+                    let culled_in_n     = (viewport_h / transaction_element_height).ceil() as usize;
+                    let culled_in_end_o = (culled_pre_n + culled_in_n).min(txs.len());
+                    let culled_post_n   = (txs.len() - culled_in_end_o);
+
+                    // culling preamble spacer
+                    let _ = elem().decl(Decl { height: Sizing::Fixed(culled_pre_n as f32 * transaction_element_height), ..Decl });
+
+                    let culled_txs = &txs[culled_in_bgn_o .. culled_in_end_o];
+                    for (index, tx) in culled_txs.iter().enumerate() {
+                        let index = index + culled_pre_n;
+                        // if index < 0 {
+                        //     continue;
+                        // }
+                        // if index > culled_in_n {
+                        //     break;
+                        // }
+
                         if index > 0 { // separator
                             let colour = {
                                 let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
@@ -1928,16 +1978,101 @@ pub fn ui_left_pane(ui: &mut Context,
                         let tx_is_in_block      = tx_h.is_in_block();
                         let tx_is_on_best_chain = tx_is_in_block && tx.is_on_bc();
 
+                        let id = id_index("Transaction", index as u32);
+                        let (clicked, hovered) = {
+                            let skip_before = ui.nav_skip;
+                            ui.nav_skip = true;
+
+                            let (clicked, _, _) = ui.button_ex(true, BLACK, id, true, winit::window::CursorIcon::Pointer);
+                            let hovered = ui.hovered(id);
+                            ui.nav_skip = skip_before;
+
+                            (clicked, hovered)
+                        };
+
+                        if clicked {
+                            let (cx, cy, ok) = viz.pos_at_height(tx.reported_height());
+                            if ok {
+                                viz.camera_x = cx;
+                                viz.camera_y = cy;
+                                viz.zoom = 2.0;
+                            }
+                        }
+
+                        if hovered {
+                            viz.ui_hovered_height = Some(tx.reported_height());
+                        }
+
                         if let _ = elem().decl(Decl {
-                            id: id_index("Transaction", index as u32),
+                            id,
                             padding,
                             child_gap,
+                            colour: if hovered {
+                                TRANSACTION_HISTORY_CONTAINER_COL.mul(0.25)
+                            } else {
+                                (0, 0, 0, 0)
+                            },
                             height: fixed!(transaction_inner_height),
                             width: percent!(1.0),
                             direction: LeftToRight,
                             align: Center,
                             ..Decl
                         }) {
+                            let mut icon_text_buf = String::new();
+                            let (icon_colour, status_icon) = {
+                                let CONFIRMATIONS_THRESHOLD = 3;
+
+                                pub const RED:  (u8, u8, u8, u8) = (255, 64, 67, 0xff);      /* @todo colors */
+                                pub const BLUE: (u8, u8, u8, u8) = (0x33, 0x88, 0xde, 0xff); /* @todo colors */
+                                let (icon_colour, status_icon) = match tx.status {
+                                    TxStatus::OnBc => {
+                                        if tx_h.0 as u64 <= viz.bc_finalized_tip_height { // finalized
+                                            (BLUE,  DOUBLE_ICON_OK_CIRCLED_1)
+                                        } else if tx_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height { // confirmed
+                                            (WHITE, DOUBLE_ICON_OK_CIRCLED2_1)
+                                        } else if tx_is_in_block {
+                                            (WHITE, ICON_OK_CIRCLED2_1)
+                                        } else if tx_h == BlockHeight::MEMPOOL {
+                                            (GREY, ICON_OK_CIRCLED2_1)
+                                        } else if tx_h == BlockHeight::SENT {
+                                            (WHITE, ICON_PAPER_PLANE)
+                                        } else if tx_h == BlockHeight::BUILT {
+                                            (WHITE, ICON_WRENCH)
+                                        } else if tx_h == BlockHeight::PROPOSED {
+                                            (GREY, ICON_WRENCH)
+                                        } else { // INVALID
+                                            (GREY, ICON_CANCEL)
+                                        }
+                                    }
+
+                                    TxStatus::SoftFail(h) | TxStatus::HardFail(h, _) => {
+                                        let icon = if h == BlockHeight::PROPOSED {
+                                            ICON_WRENCH // Failed to build
+                                        } else if h == BlockHeight::BUILT {
+                                            ICON_PAPER_PLANE // Failed to send
+                                        } else if h == BlockHeight::SENT {
+                                            ICON_CANCEL // TODO
+                                        } else if h == BlockHeight::MEMPOOL {
+                                            ICON_CANCEL // TODO
+                                        } else if tx_is_in_block {
+                                            ICON_FORK
+                                        } else {
+                                            ICON_CANCEL
+                                        };
+
+                                        match tx.status {
+                                            TxStatus::OnBc => unreachable!("already filtered"),
+                                            TxStatus::SoftFail(_) => (GREY, icon),
+                                            TxStatus::HardFail(_, msg) => {
+                                                icon_text_buf = format!("{} {icon}", msg.to_string());
+                                                (RED, &icon_text_buf as &str)
+                                            }
+                                        }
+                                    }
+                                };
+
+                                (colour.mul(0.75), status_icon)
+                            };
 
                             // left icon
                             if let _ = elem().decl(Decl {
@@ -1961,19 +2096,19 @@ pub fn ui_left_pane(ui: &mut Context,
                                         WalletTxKind::Shield       => ICON_SHIELD,
                                         WalletTxKind::Stake        => ICON_LINK_1,
                                         WalletTxKind::BeginUnstake => ICON_LINK_EXT_ALT,
-                                        WalletTxKind::Retarget => ICON_MOVE,
+                                        WalletTxKind::Retarget     => ICON_MOVE,
                                         WalletTxKind::ClaimUnstake => ICON_UNLINK,
                                     }
                                 };
 
                                 // TODO: account for mempool & confirmation level
-                                let colour = if tx_is_on_best_chain || pending {
-                                    WHITE
-                                } else {
-                                    (0xc0, 0x30, 0x20, 0xff) /* @todo colors */
-                                };
+                                // let colour = if tx_is_on_best_chain || pending {
+                                //     WHITE
+                                // } else {
+                                //     (0xc0, 0x30, 0x20, 0xff) /* @todo colors */
+                                // };
 
-                                ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+                                ui.text(icon, TextDecl { font: Icons, colour: icon_colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
                             }
 
                             // info
@@ -1993,7 +2128,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::Shield        => if tx_is_in_block { "Shielded"  } else { "Shielding" },
                                     WalletTxKind::Stake         => if tx_is_in_block { "Staked"    } else { "Staking"   },
                                     WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking" },
-                                    WalletTxKind::Retarget  => if tx_is_in_block { "Moved Delegation"  } else { "Moving Delegation" },
+                                    WalletTxKind::Retarget      => if tx_is_in_block { "Moved Delegation"  } else { "Moving Delegation" },
                                     WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unbonded"  } else { "Unbonding" },
                                 };
 
@@ -2050,40 +2185,32 @@ pub fn ui_left_pane(ui: &mut Context,
                                     _ => WHITE,
                                 };
 
-                                let totals = tx.totals();
-                                match tx.kind() {
-                                    // TODO: don't use account_value_delta, use sent_zats.
-                                    // We care about fees if we spent any money ourselves.
-                                    // If we just received from someone else, we don't care about fees.
-                                    // TODO: BeginUnstake sends just a fee with no receive, ClaimUnstake receives with no send.
-                                    WalletTxKind::Send | WalletTxKind::SelfSend | WalletTxKind::Stake | WalletTxKind::BeginUnstake => {
-                                        let send_amount: i64 = tx.account_value_delta().into(); // TODO: don't use account_value_delta, use sent_zats.
-                                        let send_amount: u64 = send_amount.abs() as u64;
+                                let all = tx.totals(true);
+                                let all_no_bond = tx.totals(false);
+                                let (show_val, prefix, zats) = match tx.kind() {
+                                    WalletTxKind::BeginUnstake | WalletTxKind::Retarget => (false, "", 0), // fee-only
 
-                                        let prefix = if tx.kind() == WalletTxKind::Send { "-" } else { "" };
-                                        ui.text(frame_strf!(data, "{}{} cTAZ", prefix, str_from_ctaz(send_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
-                                    },
-                                    WalletTxKind::Receive | WalletTxKind::ClaimUnstake | WalletTxKind::Mine => {
-                                        if true { // total
-                                            ui.text(frame_strf!(data, "+{} cTAZ", str_from_ctaz(totals.recv_zats.into_u64())), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
-                                        } else { // transparent, shielded
-                                            let (t_z, s_z) = (tx.parts[0].recv_zats.into_u64(), tx.parts[1].recv_zats.into_u64());
-                                            ui.text(frame_strf!(data, "+{} | {} cTAZ", str_from_ctaz(t_z), str_from_ctaz(s_z)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
-                                        }
-                                    },
-                                    WalletTxKind::Shield => {
-                                        // TODO: (how) do we want to show the fee?
-                                        let shield_amount = totals.recv_zats.into_u64();
+                                    WalletTxKind::Send  => (true, "-", all.sent_zats.into_u64().saturating_sub(all.recv_zats.into_u64())),
+                                    WalletTxKind::Stake => (true, "",  WalletTxPart::from_staking_action(tx.staking_action).recv_zats.into_u64()), // aka bond.recv_zats
+                                    WalletTxKind::Stake => (true, "",  all.sent_zats.into_u64().saturating_sub(all_no_bond.recv_zats.into_u64())), // aka bond.recv_zats
 
-                                        ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(shield_amount)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
-                                    },
-                                    _ => {
-                                        ui.text("TODO cTAZ", TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
-                                    },
+                                    WalletTxKind::SelfSend     => (true, "",  all.recv_zats.into_u64()),
+                                    WalletTxKind::Shield       => (true, "",  all.recv_zats.into_u64()),
+                                    WalletTxKind::Receive      => (true, "+", all.recv_zats.into_u64()),
+                                    WalletTxKind::ClaimUnstake => (true, "+", all.recv_zats.into_u64()),
+                                    WalletTxKind::Mine         => (true, "+", all.recv_zats.into_u64()),
+                                };
+
+                                if show_val {
+                                    ui.text(frame_strf!(data, "{}{} cTAZ", prefix, str_from_ctaz(zats)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
+                                    // let (t_z, s_z) = (tx.parts[0].recv_zats.into_u64(), tx.parts[1].recv_zats.into_u64());
+                                    // ui.text(frame_strf!(data, "+{} | {} cTAZ", str_from_ctaz(t_z), str_from_ctaz(s_z)), TextDecl { h: transaction_text_h, align: AlignX::Right, colour, ..TextDecl });
                                 }
 
+                                // We care about fees if we spent any money ourselves.
+                                // If we just received from somewhere else, we don't care about fees.
                                 if tx.kind() != WalletTxKind::Receive &&
-                                   tx.kind() != WalletTxKind::BeginUnstake
+                                   tx.kind() != WalletTxKind::Mine // ALT: if fee != Some(0)
                                 {
                                     let fee_str = if let Some(fee) = tx.fee() {
                                         str_from_ctaz(fee.into_u64())
@@ -2102,65 +2229,15 @@ pub fn ui_left_pane(ui: &mut Context,
                                     align: BottomRight,
                                     ..Decl
                                 }) {
-                                    let CONFIRMATIONS_THRESHOLD = 3;
-
-                                    pub const RED:  (u8, u8, u8, u8) = (255, 64, 67, 0xff);      /* @todo colors */
-                                    pub const BLUE: (u8, u8, u8, u8) = (0x33, 0x88, 0xde, 0xff); /* @todo colors */
-                                    let (colour, text) = match tx.status {
-                                        TxStatus::OnBc => {
-                                            if tx_h.0 as u64 <= viz.bc_finalized_tip_height { // finalized
-                                                (BLUE,  DOUBLE_ICON_OK_CIRCLED_1)
-                                            } else if tx_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height { // confirmed
-                                                (WHITE, DOUBLE_ICON_OK_CIRCLED2_1)
-                                            } else if tx_is_in_block {
-                                                (WHITE, ICON_OK_CIRCLED2_1)
-                                            } else if tx_h == BlockHeight::MEMPOOL {
-                                                (GREY, ICON_OK_CIRCLED2_1)
-                                            } else if tx_h == BlockHeight::SENT {
-                                                (WHITE, ICON_PAPER_PLANE)
-                                            } else if tx_h == BlockHeight::BUILT {
-                                                (WHITE, ICON_WRENCH)
-                                            } else if tx_h == BlockHeight::PROPOSED {
-                                                (GREY, ICON_WRENCH)
-                                            } else { // INVALID
-                                                (GREY, ICON_CANCEL)
-                                            }
-                                        }
-
-                                        TxStatus::SoftFail(h) | TxStatus::HardFail(h, _) => {
-                                            (
-                                                if let TxStatus::SoftFail(_) = tx.status {
-                                                    GREY
-                                                } else {
-                                                    RED
-                                                },
-
-                                                if h == BlockHeight::PROPOSED {
-                                                    ICON_WRENCH // Failed to build
-                                                } else if h == BlockHeight::BUILT {
-                                                    ICON_PAPER_PLANE // Failed to send
-                                                } else if h == BlockHeight::SENT {
-                                                    ICON_CANCEL // TODO
-                                                } else if h == BlockHeight::MEMPOOL {
-                                                    ICON_CANCEL // TODO
-                                                } else if tx_is_in_block {
-                                                    ICON_FORK
-                                                } else {
-                                                    ICON_CANCEL
-                                                }
-                                            )
-                                        }
-                                    };
-
-                                    let colour = colour.mul(0.75);
-
-                                    let confirmation_icons_h = if text == ICON_FORK { ui.scale(20.0) } else { ui.scale(12.0) };
-
-                                    ui.text(text, TextDecl { font: Icons, colour, h: confirmation_icons_h, wrap: Wrap::None, align: AlignX::Right,  ..TextDecl });
+                                    let confirmation_icons_h = if status_icon == ICON_FORK { ui.scale(20.0) } else { ui.scale(12.0) };
+                                    ui.text(status_icon, TextDecl { font: Icons, colour: icon_colour, h: confirmation_icons_h, wrap: Wrap::None, align: AlignX::Right,  ..TextDecl });
                                 }
                             }
                         }
                     }
+
+                    // culling postamble spacer
+                    let _ = elem().decl(Decl { height: Sizing::Fixed(culled_post_n as f32 * transaction_element_height), ..Decl });
                 }
             }
         }
@@ -2301,9 +2378,9 @@ pub fn ui_right_pane(ui: &mut Context,
             }
         }
 
-        let (id, mut clip, mut scroll) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
+        let (id, mut clip, mut scroll, viewport_h) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
         if roster.len() == 0 {
-            clip = Scroll(0.0, 0.0);
+            clip = ClipMode::None;
             *scroll = 0.0;
         }
         if let _ = elem().decl(Decl {
@@ -2591,6 +2668,9 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
     ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::Default);
 
+    let shift_held = (ui.input().key_held(KeyCode::ShiftLeft)   || ui.input().key_held(KeyCode::ShiftRight));
+    let ctrl_held  = (ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight));
+
     ui.capture = false;
     // let prev_nav_idx_to_id = ui.nav_idx_to_id.clone();
     ui.nav_id_to_idx.clear();
@@ -2632,12 +2712,13 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         ..Decl
     }) {
 
-        let pane_pct = Sizing::Percent(ui.zoom * PANE_PERCENT);
+        let pane_pct_left  = Sizing::Percent(ui.zoom * PANE_PERCENT_LEFT);
+        let pane_pct_right = Sizing::Percent(ui.zoom * PANE_PERCENT_RIGHT);
 
         if let _elem = elem().decl(Decl {
             id: id("Left Pane"),
             direction: TopToBottom,
-            width: pane_pct,
+            width: pane_pct_left,
             height: grow!(),
             clip: Clip,
             ..Decl
@@ -2740,7 +2821,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         if let _elem = elem().decl(Decl {
             id: id("Right Pane"),
             direction: TopToBottom,
-            width: pane_pct,
+            width: pane_pct_right,
             height: grow!(),
             clip: Clip,
             ..Decl
@@ -2822,10 +2903,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
     //     ui.nav_enable = false;
     // }
 
-    if ui.input().key_pressed(KeyCode::Tab) && ui.nav_idx_to_id.len() > 0 {
+    if ui.input().key_pressed(KeyCode::Tab) && !ctrl_held && ui.nav_idx_to_id.len() > 0 {
         let idx = if ui.nav_id != 0 {
             let old_idx = ui.nav_id_to_idx[&ui.nav_id] as isize;
-            if (ui.input().key_held(KeyCode::ShiftLeft) || ui.input().key_held(KeyCode::ShiftRight)) {
+            if shift_held {
                 (old_idx - 1).rem_euclid(ui.nav_idx_to_id.len() as isize) as usize
             } else {
                 (old_idx + 1).rem_euclid(ui.nav_idx_to_id.len() as isize) as usize
@@ -2845,23 +2926,22 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
     // Return the list of render commands of your layout
     let render_commands = c.end();
 
-    if is_rendering {
+    {
         let mut nav_bbox: Option<(isize, isize, isize, isize)> = None;
 
         for command in render_commands {
-            fn clay_color_to_u32(color: clay::Color) -> u32 {
-                let r = color.r as u32;
-                let g = color.g as u32;
-                let b = color.b as u32;
-                let a = color.a as u32;
-                let color = (a << 24) | (r << 16) | (g << 8) | b;
-                color
-            }
-
             let x1 = (command.bounding_box.x)                               as isize;
             let y1 = (command.bounding_box.y)                               as isize;
             let x2 = (command.bounding_box.x + command.bounding_box.width)  as isize;
             let y2 = (command.bounding_box.y + command.bounding_box.height) as isize;
+
+            if let Some(scroll_container_state) = data.scroll_containers.get_mut(&command.id) {
+                scroll_container_state.viewport_height = command.bounding_box.height.min(window_h);
+            }
+
+            if !is_rendering {
+                continue;
+            }
 
             let bbox = (x1, y1, x2, y2);
 
@@ -2871,6 +2951,15 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
             if unsafe { clay::Clay_PointerOver(Id { id: command.id, ..Id }.clay().id) } {
                 ui.hovered_id = Id { id: command.id, ..Id };
+            }
+
+            fn clay_color_to_u32(color: clay::Color) -> u32 {
+                let r = color.r as u32;
+                let g = color.g as u32;
+                let b = color.b as u32;
+                let a = color.a as u32;
+                let color = (a << 24) | (r << 16) | (g << 8) | b;
+                color
             }
 
             let colour = match command.config {
@@ -3007,6 +3096,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 }
 
 pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet_state: Arc<Mutex<WalletState>>) -> bool {
+    viz.ui_hovered_height = None; // @todo(judah): not sure where to reset this
+
     ui.tx_loading_animation_timer += ui.delta;
     if ui.tx_loading_animation_timer >= 1.0 {
         ui.tx_loading_animation_timer = 0.0;

@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, hash::Hash, sync::Mutex};
 
+use wallet::BlockHeight;
 // use twox_hash::XxHash3_64;
 use winit::event::MouseButton;
 
@@ -73,6 +74,7 @@ pub struct BcBlock {
     pub this_hash: Hash32,
     pub parent_hash: Hash32,
     pub this_height: u64,
+    pub txs_n: usize,
     pub is_best_chain: bool,
     pub is_finalized: bool,
     pub is_implicated_by_bft: bool,
@@ -84,6 +86,7 @@ impl Default for BcBlock {
             this_hash: Hash32::from_u64(0),
             parent_hash: Hash32::from_u64(0),
             this_height: 0,
+            txs_n: 0,
             is_best_chain: false,
             is_finalized: false,
             is_implicated_by_bft: false,
@@ -191,6 +194,7 @@ const COLOR_BC:     u32 = 0x82ccc0;
 const COLOR_NBC:    u32 = 0x808080;
 const COLOR_BFT:    u32 = 0xdc4c4f;
 const COLOR_ACCENT: u32 = 0x121212;
+const COLOR_BRIGHT: u32 = 0xffffff;
 
 const COLOR_BC_LINK:    u32 = 0x4e7b73;
 const COLOR_BFT_LINK:   u32 = 0x9a2d37;
@@ -213,6 +217,7 @@ pub struct VizState {
     pub bc_tip_height: u64,
     pub bc_finalized_tip_height: u64,
     pub bft_tip_height: u64,
+    pub ui_hovered_height: Option<BlockHeight>,
 
     pub last_frame_hovered_hash: Hash32,
 
@@ -231,6 +236,17 @@ pub struct VizState {
 
     pub peer_strings: Vec<String>,
 }
+
+impl VizState {
+    pub fn pos_at_height(&self, height: BlockHeight) -> (f32, f32, bool) {
+        if height.is_in_block() {
+            (0.0, -10.0 * height.0 as f32, true) // @todo: should handle sidechain x-axis, maybe this should take a hash instead
+        } else {
+            (0.0, 0.0, false)
+        }
+    }
+}
+
 pub fn viz_gui_init(fake_data: bool) -> VizState {
     let (me_send, zebra_receive) = std::sync::mpsc::sync_channel(128);
     let (zebra_send, me_receive) = std::sync::mpsc::sync_channel(128);
@@ -249,6 +265,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         bc_tip_height: 0,
         bc_finalized_tip_height: 0,
         bft_tip_height: 0,
+        ui_hovered_height: None,
 
         bc_tip_y: 0.0,
 
@@ -271,19 +288,19 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         peer_strings: Vec::new(),
     };
     if fake_data {
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, txs_n: 1, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(2), parent_hash: Hash32::from_u64(1), this_height: 1, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(2), parent_hash: Hash32::from_u64(1), this_height: 1, txs_n: 6, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(3), parent_hash: Hash32::from_u64(2), this_height: 2, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(3), parent_hash: Hash32::from_u64(2), this_height: 2, txs_n: 2, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(8), parent_hash: Hash32::from_u64(1), this_height: 1, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(8), parent_hash: Hash32::from_u64(1), this_height: 1, txs_n: 4256, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(9), parent_hash: Hash32::from_u64(2), this_height: 2, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(9), parent_hash: Hash32::from_u64(2), this_height: 2, txs_n: 16, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(10), parent_hash: Hash32::from_u64(8), this_height: 2, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(10), parent_hash: Hash32::from_u64(8), this_height: 2, txs_n: 15, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(11), parent_hash: Hash32::from_u64(10), this_height: 3, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(11), parent_hash: Hash32::from_u64(10), this_height: 3, txs_n: 3, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
 
         let block = OnScreenBft { block: BftBlock { this_hash: Hash32::from_u64(5), parent_hash: Hash32::from_u64(0), this_height: 0, points_at_bc_block: Hash32::from_u64(1), ..Default::default() }, ..Default::default() };
@@ -359,7 +376,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                     if let Some(bc) = viz_state.on_screen_bcs.get_mut(hash) { bc.block.is_implicated_by_bft = true; }
                     else {
                         let parent = viz_state.on_screen_bcs.get(&prev).unwrap();
-                        let block = OnScreenBc { y: spawn_y, block: BcBlock { this_hash: *hash, parent_hash: parent.block.this_hash, this_height: parent.block.this_height + 1, is_best_chain: false, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
+                        let block = OnScreenBc { y: spawn_y, block: BcBlock { this_hash: *hash, parent_hash: parent.block.this_hash, txs_n: 1, this_height: parent.block.this_height + 1, is_best_chain: false, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
                         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
                     }
                     prev = *hash;
@@ -453,6 +470,34 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     let world_mouse_x = viz_state.camera_x + ((input_ctx.mouse_pos().0.clamp(0, draw_ctx.window_width) - draw_ctx.window_width/2) as f32) / screen_unit;
     let world_mouse_y = viz_state.camera_y + ((input_ctx.mouse_pos().1.clamp(0, draw_ctx.window_height) - draw_ctx.window_height/2) as f32) / screen_unit;
 
+    {
+        let sday = (viz_state.bc_finalized_tip_height) / UI_COPY_STAKING_DAY_PERIOD;
+        let draw_staking_day_section = | day | {
+            let y2 = -10.0 * ((day*UI_COPY_STAKING_DAY_PERIOD) as f32 - 0.5) * screen_unit;
+            let y1 = -10.0 * ((day*UI_COPY_STAKING_DAY_PERIOD + UI_COPY_STAKING_DAY_WINDOW) as f32 + 0.5) * screen_unit;
+
+            let text_height = 1.0 * screen_unit;
+            let line_thickness = 1.0 * screen_unit;
+            let line_width = 60.0;
+
+            // window
+            draw_ctx.rectangle_r(origin_x - line_width * screen_unit, origin_y + y1, origin_x + line_width * screen_unit, origin_y + y2, 1, 0x06ffffff);
+
+            // start
+            let start_color = 0xaa5fdc4c;
+            draw_ctx.text_line(FontKind::Mono, (origin_x + (line_width + 1.0) * screen_unit), origin_y + y2, text_height, "Staking Day Start", start_color);
+            draw_ctx.rectangle_r(origin_x - line_width * screen_unit, origin_y + y2, origin_x + line_width * screen_unit, origin_y + y2 + line_thickness, 1, start_color);
+
+            // end
+            let end_color = 0xaadc4c4f;
+            draw_ctx.text_line(FontKind::Mono, (origin_x + (line_width + 1.0) * screen_unit), origin_y + y1, text_height, "Staking Day End", end_color);
+            draw_ctx.rectangle_r(origin_x - line_width * screen_unit, origin_y + y1, origin_x + line_width * screen_unit, origin_y + y1 + line_thickness, 1, end_color);
+        };
+
+        draw_staking_day_section(sday);
+        draw_staking_day_section(sday + 1);
+    }
+
     let mut hovered_block = Hash32::from_u64(0);
     let mut hovered_block_screen_x = 0.0;
     let mut hovered_block_screen_y = 0.0;
@@ -479,6 +524,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 on_screen_bc.x = 0.0;
                 on_screen_bc.y = 0.0;
                 on_screen_bc.alpha = 0.0;
+            }
+            if input_ctx.mouse_pressed(MouseButton::Left) {
+                viz_state.camera_x = on_screen_bc.t_x;
+                viz_state.camera_y = on_screen_bc.t_y;
+                viz_state.zoom = 2.0;
             }
 
             on_screen_bc.t_bft_arrow_alpha = 1.0;
@@ -510,6 +560,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 on_screen_bft.x = 0.0;
                 on_screen_bft.y = 0.0;
                 on_screen_bft.alpha = 0.0;
+            }
+            if input_ctx.mouse_pressed(MouseButton::Left) {
+                viz_state.camera_x = on_screen_bft.t_x;
+                viz_state.camera_y = on_screen_bft.t_y;
+                viz_state.zoom = 2.0;
             }
         } else {
             on_screen_bft.t_roundness = 1.0;
@@ -605,17 +660,20 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     for on_screen_bc in viz_state.on_screen_bcs.values() {
         let x = on_screen_bc.x;
         let y = on_screen_bc.y;
-        let finalized_and_on_bc = on_screen_bc.block.is_best_chain && on_screen_bc.block.this_height <= viz_state.bc_finalized_tip_height;
-        let non_finalized_and_on_bc = on_screen_bc.block.is_best_chain && on_screen_bc.block.this_height > viz_state.bc_finalized_tip_height;
-        let base_color = if finalized_and_on_bc || non_finalized_and_on_bc {
-            COLOR_BC
+        let finalized = on_screen_bc.block.is_best_chain && on_screen_bc.block.this_height <= viz_state.bc_finalized_tip_height;
+        let base_color = if on_screen_bc.block.is_best_chain {
+            if viz_state.ui_hovered_height.is_some() && on_screen_bc.block.this_height == viz_state.ui_hovered_height.unwrap().0 as u64 {
+                COLOR_BRIGHT
+            } else {
+                COLOR_BC
+            }
         } else {
             COLOR_NBC
         };
 
-        let color = (((on_screen_bc.alpha*255.0) as u32) << 24) | blend_u32(0x000000, base_color, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
-        let color_accent = (((on_screen_bc.alpha*on_screen_bc.finalized_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_ACCENT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
-        let color_bft = (((on_screen_bc.alpha*on_screen_bc.implicated_by_bft_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BFT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
+        let color        = (((on_screen_bc.alpha*255.0)                                      as u32) << 24) | blend_u32(0x000000, base_color,   ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
+        let color_accent = (((on_screen_bc.alpha*on_screen_bc.finalized_alpha*255.0)         as u32) << 24) | blend_u32(0x000000, COLOR_ACCENT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
+        let color_bft    = (((on_screen_bc.alpha*on_screen_bc.implicated_by_bft_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BFT,    ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
 
         if hovered_block == on_screen_bc.block.this_hash {
             hovered_block_screen_x = origin_x + (x*screen_unit);
@@ -626,16 +684,22 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             viz_state.inspecting_block_screen_y = origin_y + (y*screen_unit);
         }
 
-        if very_zoom_out {
-            draw_ctx.rectangle(origin_x + (x*screen_unit) - screen_unit*30.0, origin_y + (y*screen_unit), origin_x + (x*screen_unit) + screen_unit*5.0, origin_y + (y*screen_unit) + screen_unit*2.0, (color&0xFFffFF) | ((color >> 26) << 24));
-        }
-        else {
-            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bc.roundness, color);
-            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit / 2.0, (screen_unit / 2.0)*on_screen_bc.roundness, color_accent);
-        }
+        // draw PoW node
+        {
+            let rad = 0.5*screen_unit * (on_screen_bc.block.txs_n as f32).log2().max(0.5);
 
-        if non_finalized_and_on_bc {
-            draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit * 0.75, screen_unit*on_screen_bc.roundness * 0.75, 0xFF080808);
+            let (pt_x, pt_y) = (origin_x + (x*screen_unit), origin_y + (y*screen_unit));
+            if very_zoom_out {
+                draw_ctx.rectangle(pt_x - screen_unit*30.0, pt_y, pt_x + screen_unit*5.0, pt_y + screen_unit*2.0, (color&0xFFffFF) | ((color >> 26) << 24));
+            } else {
+                draw_ctx.circle_square(pt_x, pt_y, rad,  rad  * on_screen_bc.roundness, color);
+                let rad2 = 0.5 * rad;
+                draw_ctx.circle_square(pt_x, pt_y, rad2, rad2 * on_screen_bc.roundness, color_accent);
+            }
+
+            if !finalized {
+                draw_ctx.circle_square(pt_x, pt_y, rad * 0.65, rad * on_screen_bc.roundness * 0.65, 0xFF080808);
+            }
         }
 
         if very_zoom_out == false {

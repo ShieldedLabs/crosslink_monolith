@@ -165,9 +165,10 @@ pub async fn service_viz_requests(
                             response.json_dump_of_the_block = format!("{:#?}", bc);
                         }
                         response.bc_blocks.push(visualizer_zcash::BcBlock {
-                            this_hash: this_hash,
+                            this_hash,
                             parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
                             this_height: lo_height.0 as u64 + i as u64,
+                            txs_n: bc.transactions.len(),
                             is_best_chain: true,
                             is_finalized: false,
                             is_implicated_by_bft: false,

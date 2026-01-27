@@ -7,12 +7,12 @@ set "RUSTFLAGS=-Awarnings"
 set "PROTOC=C:\Work\ShieldedLabs\protoc\bin\protoc.exe"
 set "SOURCE_DATE_EPOCH=0"
 
-rem set "project=zebra-crosslink"
-set "project=zebra-gui"
+set "project=zebra-crosslink"
+rem set "project=zebra-gui"
 
 set "config=%1"
 
-if "%config%"=="-Release" (
+if "%config%"=="Release" (
     set "flags=--release"
     set "build_folder=release"
 ) else (

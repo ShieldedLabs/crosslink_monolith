@@ -27,6 +27,11 @@ use rustybuzz::{shape, Face as RbFace, UnicodeBuffer};
 #[allow(unused_imports)]
 use swash::{scale::ScaleContext, text, FontRef};
 
+
+pub const UI_COPY_STAKING_ACTION_DELAY_BLOCKS: u64 = 35;
+pub const UI_COPY_STAKING_DAY_PERIOD: u64 = 100;
+pub const UI_COPY_STAKING_DAY_WINDOW: u64 = 30;
+
 const RENDER_TILE_SHIFT: usize = 7;
 const RENDER_TILE_SIZE: usize = 1 << RENDER_TILE_SHIFT;
 const RENDER_TILE_INTRA_MASK: usize = RENDER_TILE_SIZE.wrapping_sub(1);
@@ -419,6 +424,26 @@ impl DrawCtx {
                     radius_tr: 0,
                     radius_bl: 0,
                     radius_br: 0,
+                    color
+                };
+            }
+        }
+    }
+
+    pub fn rectangle_r(&self, x1: f32, y1: f32, x2: f32, y2: f32, radius: isize, color: u32) {
+        unsafe {
+            if *self.draw_command_count + 1 <= DRAW_CALL_MAX {
+                let put = self.draw_command_buffer.add(*self.draw_command_count);
+                *self.draw_command_count += 1;
+                *put = DrawCommand::RoundedRectangle {
+                    x: x1,
+                    x2: x2,
+                    y: y1,
+                    y2: y2,
+                    radius_tl: radius,
+                    radius_tr: radius,
+                    radius_bl: radius,
+                    radius_br: radius,
                     color
                 };
             }
@@ -837,6 +862,7 @@ pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
 
 pub static SOUND_UI_WOOSH: &[u8] = include_bytes!("../assets/ui_woosh.ogg");
 pub static SOUND_UI_HOVER: &[u8] = include_bytes!("../assets/ui_hover.ogg");
+pub static SOUND_NOW_STAKING_DAY1: &[u8] = include_bytes!("../assets/now_staking_day1.ogg");
 
 const DRAW_CALL_MAX: usize = 131072;
 const GLYPH_RUN_MAX: usize = 16384;
@@ -891,6 +917,12 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
     let mut saved_tile_hashes = Vec::new();
     let mut whole_screen_hash = 0u64;
     let mut did_window_resize = true;
+
+    // staking day cosmetics
+    let mut last_frame_finalized_bc_height = 0;
+    let mut debug_next_animation_id = 0;
+    let mut current_animation_t = None;
+    let mut current_animation_id = 0;
 
     let mut input_ctx = InputCtx {
         mouse_moved: false,
@@ -1094,6 +1126,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             is_anything_happening_at_all_in_any_way |= input_ctx.mouse_moved;
                                             is_anything_happening_at_all_in_any_way |= input_ctx.scroll_delta != (0.0, 0.0);
                                             is_anything_happening_at_all_in_any_way |= input_ctx.zoom_delta != 0.0;
+                                            is_anything_happening_at_all_in_any_way |= current_animation_t.is_some();
 
                                             input_ctx.mouse_pressed  = 0;
                                             input_ctx.mouse_released = 0;
@@ -1261,6 +1294,41 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 let should_quit = ui_update(&mut gui_ctx, &mut ui_data, &mut viz_state, wallet_state.clone());
                                                 if should_quit {
                                                     elwt.exit();
+                                                }
+                                            }
+
+                                            {
+                                                let new_height = viz_state.bc_finalized_tip_height;
+                                                let new_pi= (new_height / UI_COPY_STAKING_DAY_PERIOD) * 2 + (new_height % UI_COPY_STAKING_DAY_PERIOD > UI_COPY_STAKING_DAY_WINDOW) as u64;
+                                                let old_pi= (last_frame_finalized_bc_height / UI_COPY_STAKING_DAY_PERIOD) * 2 + (last_frame_finalized_bc_height % UI_COPY_STAKING_DAY_PERIOD > UI_COPY_STAKING_DAY_WINDOW) as u64;
+                                                last_frame_finalized_bc_height = new_height;
+
+                                                let debug_do_anyway = gui_ctx.debug && input_ctx.key_pressed(KeyCode::F4);
+                                                if (new_pi as i64 - old_pi as i64).abs() == 1 || debug_do_anyway {
+                                                    current_animation_id = new_pi;
+                                                    current_animation_t = Some(0.0);
+                                                    if debug_do_anyway {
+                                                        current_animation_id = debug_next_animation_id;
+                                                        debug_next_animation_id += 1;
+                                                        play_sound(SOUND_NOW_STAKING_DAY1, 2.0, 1.0);
+                                                    }
+                                                }
+                                                if let Some(t) = current_animation_t.as_mut() {
+                                                    let old_t = *t;
+                                                    *t += dt;
+                                                    let t = *t;
+
+                                                    let text_h = window_height as f32 / 6.0;
+
+                                                    let text_string = if current_animation_id & 1 != 0 { "Staking Day has Ended" } else { "Staking Day has Begun" };
+                                                    let text_y = cubic_hold(t as f32 / 5.0, 0.1, 0.7, 0.4)*1.4 * window_height as f32 - text_h;
+
+                                                    let text_w = draw_ctx.measure_text_line(FontKind::Normal, text_h, text_string);
+                                                    let text_x = window_width as f32 / 2.0 - text_w / 2.0;
+                                                    draw_ctx.rectangle_r(text_x - 20.0, text_y - 20.0, text_x + text_w + 20.0, text_y + text_h + 20.0, 30, 0x70_000000);
+                                                    draw_ctx.text_line(FontKind::Normal, text_x, text_y, text_h, text_string, 0xffffffff);
+
+                                                    if t > 10.0 { current_animation_t = None; }
                                                 }
                                             }
 
@@ -2077,4 +2145,60 @@ fn sd_segment(
     let dy = pa.1 - h * ba.1;
 
     (dx * dx + dy * dy).sqrt() - r
+}
+
+#[inline]
+fn clamp01(x: f32) -> f32 {
+    if x < 0.0 { 0.0 } else if x > 1.0 { 1.0 } else { x }
+}
+
+#[inline]
+fn smoothstep01(u: f32) -> f32 {
+    // cubic: 3u^2 - 2u^3
+    let u = clamp01(u);
+    let u2 = u * u;
+    (3.0 * u2) - (2.0 * u2 * u)
+}
+
+/// Cubic spline with a true "stand still" plateau.
+/// Maps t in [0,1] to y in [0,1].
+///
+/// hold_start: start time of the standstill (0..1)
+/// hold_end:   end time of the standstill   (0..1), should be > hold_start
+/// hold_y:     y value during the hold (typically 0.5), should be in [0,1]
+///
+/// Notes:
+/// - y'(0)=0, y'(hold_start)=0, y'(hold_end)=0, y'(1)=0
+/// - y is constant in [hold_start, hold_end]
+pub fn cubic_hold(t: f32, hold_start: f32, hold_end: f32, hold_y: f32) -> f32 {
+    let t = clamp01(t);
+    let hs = clamp01(hold_start);
+    let he = clamp01(hold_end);
+    let hy = clamp01(hold_y);
+
+    // Avoid division by zero / nonsense ranges
+    // If hold region collapses, this becomes a single smoothstep.
+    let eps = 1.0e-6;
+
+    if he <= hs + eps {
+        return smoothstep01(t);
+    }
+
+    if t <= hs {
+        // Ease 0 -> hy over [0, hs]
+        let denom = if hs > eps { hs } else { eps };
+        let u = t / denom;
+        return hy * smoothstep01(u);
+    }
+
+    if t < he {
+        // Flat hold
+        return hy;
+    }
+
+    // Ease hy -> 1 over [he, 1]
+    let denom = (1.0 - he);
+    let denom = if denom > eps { denom } else { eps };
+    let u = (t - he) / denom;
+    hy + (1.0 - hy) * smoothstep01(u)
 }
