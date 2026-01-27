@@ -1906,15 +1906,21 @@ pub fn ui_left_pane(ui: &mut Context,
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
-        let mut txs = {
-            let state = wallet_state.lock().unwrap();
-            if *tab_id == tab_id_user_wallet {
-                state.user_txs.clone()
-            } else {
-                state.miner_txs.clone()
+        let txs = {
+            let (mut txs, locals, local_n) = {
+                let state = wallet_state.lock().unwrap();
+                if *tab_id == tab_id_user_wallet {
+                    (state.user_txs.clone(), state.user_local_txs, state.user_local_txs_n)
+                } else {
+                    (state.miner_txs.clone(), state.miner_local_txs, state.miner_local_txs_n)
+                }
+            };
+            for i in 0..local_n {
+                txs.push(locals[i]);
             }
+            txs.reverse();
+            txs
         };
-        txs.reverse();
 
         let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
         let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
@@ -1998,9 +2004,8 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         }
 
-                        let tx_h                = tx.reported_height();
-                        let tx_is_in_block      = tx_h.is_in_block();
-                        let tx_is_on_best_chain = tx_is_in_block && tx.is_on_bc();
+                        let tx_h           = tx.reported_height();
+                        let tx_is_in_block = tx_h.is_in_block();
 
                         let id = id_index("Transaction", index as u32);
                         let (clicked, hovered) = {
@@ -2145,15 +2150,15 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ..Decl
                             }) {
                                 let label = match tx.kind() {
-                                    WalletTxKind::Send          => if tx_is_in_block { "Sent"      } else { "Sending"   },
-                                    WalletTxKind::Receive       => if tx_is_in_block { "Received"  } else { "Receiving" },
-                                    WalletTxKind::Mine          => if tx_is_in_block { "Mined"     } else { "Mining"    },
-                                    WalletTxKind::SelfSend      => if tx_is_in_block { "Returned"  } else { "Returning" },
-                                    WalletTxKind::Shield        => if tx_is_in_block { "Shielded"  } else { "Shielding" },
-                                    WalletTxKind::Stake         => if tx_is_in_block { "Staked"    } else { "Staking"   },
-                                    WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking" },
-                                    WalletTxKind::Retarget      => if tx_is_in_block { "Moved Delegation"  } else { "Moving Delegation" },
-                                    WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unbonded"  } else { "Unbonding" },
+                                    WalletTxKind::Send          => if tx_is_in_block { "Sent"      } else { "Sending..."   },
+                                    WalletTxKind::Receive       => if tx_is_in_block { "Received"  } else { "Receiving..." },
+                                    WalletTxKind::Mine          => if tx_is_in_block { "Mined"     } else { "Mining..."    },
+                                    WalletTxKind::SelfSend      => if tx_is_in_block { "Returned"  } else { "Returning..." },
+                                    WalletTxKind::Shield        => if tx_is_in_block { "Shielded"  } else { "Shielding..." },
+                                    WalletTxKind::Stake         => if tx_is_in_block { "Staked"    } else { "Staking..."   },
+                                    WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking..." },
+                                    WalletTxKind::Retarget      => if tx_is_in_block { "Moved Delegation"  } else { "Moving Delegation..." },
+                                    WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unbonded"  } else { "Unbonding..." },
                                 };
 
                                 let label_str = if tx_is_in_block {
