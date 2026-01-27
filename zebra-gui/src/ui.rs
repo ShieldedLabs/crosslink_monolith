@@ -384,7 +384,6 @@ pub const PANE_PERCENT_LEFT:  f32 = 0.30; // @PreventPanesColliding
 pub const PANE_PERCENT_RIGHT: f32 = 0.24; // @PreventPanesColliding
 
 pub const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
-pub const GREY:             (u8, u8, u8, u8) = (0xff, 0x99, 0x99, 0x99);
 // pub const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
 pub const PANE_COL:         (u8, u8, u8, u8) = (0x13, 0x13, 0x13, 0xff); // @FigmaScreenshot
 pub const INACTIVE_TAB_COL: (u8, u8, u8, u8) = (0x0f, 0x0f, 0x0f, 0xff);
@@ -900,6 +899,8 @@ pub fn ui_left_pane(ui: &mut Context,
     if *tab_id == tab_id_miner_wallet {
         ui.modal = Modal::None;
     }
+    const deemph_mul: f32 = 0.65;
+    let grey: (u8, u8, u8, u8) = WHITE.mul(deemph_mul);
 
     if ui.modal != Modal::None && let _elem = elem().decl(Decl {
         child_gap,
@@ -913,7 +914,6 @@ pub fn ui_left_pane(ui: &mut Context,
         height: grow!(),
         ..Decl
     }) {
-
         let container_id = _elem.decl.id;
         let container_hovered = ui.hovered(container_id);
 
@@ -2048,29 +2048,30 @@ pub fn ui_left_pane(ui: &mut Context,
                             ..Decl
                         }) {
                             let mut icon_text_buf = String::new();
-                            let (icon_colour, status_icon) = {
+                            let (text_colour, mut icon_colour, status_icon) = {
                                 let CONFIRMATIONS_THRESHOLD = 3;
 
                                 pub const RED:  (u8, u8, u8, u8) = (255, 64, 67, 0xff);      /* @todo colors */
                                 pub const BLUE: (u8, u8, u8, u8) = (0x33, 0x88, 0xde, 0xff); /* @todo colors */
-                                let (icon_colour, status_icon) = match tx.status {
+                                match tx.status {
                                     TxStatus::OnBc => {
                                         if tx_h.0 as u64 <= viz.bc_finalized_tip_height { // finalized
-                                            (BLUE,  DOUBLE_ICON_OK_CIRCLED_1)
+                                            (WHITE, BLUE,  DOUBLE_ICON_OK_CIRCLED_1)
                                         } else if tx_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height { // confirmed
-                                            (WHITE, DOUBLE_ICON_OK_CIRCLED2_1)
+                                            (WHITE, WHITE, DOUBLE_ICON_OK_CIRCLED2_1)
                                         } else if tx_is_in_block {
-                                            (WHITE, ICON_OK_CIRCLED2_1)
+                                            (WHITE, WHITE, ICON_OK_CIRCLED2_1)
                                         } else if tx_h == BlockHeight::MEMPOOL {
-                                            (GREY, ICON_OK_CIRCLED2_1)
+                                            (WHITE, WHITE, ICON_EYE_1)
                                         } else if tx_h == BlockHeight::SENT {
-                                            (WHITE, ICON_PAPER_PLANE)
+                                            (WHITE, WHITE, ICON_PAPER_PLANE)
                                         } else if tx_h == BlockHeight::BUILT {
-                                            (WHITE, ICON_WRENCH)
+                                            (WHITE, WHITE, ICON_WRENCH)
                                         } else if tx_h == BlockHeight::PROPOSED {
-                                            (GREY, ICON_WRENCH)
+                                            (grey, grey, ICON_WRENCH)
                                         } else { // INVALID
-                                            (GREY, ICON_CANCEL)
+                                            println!("UI saw tx at {tx_h:?} ({:?}, {:?})", tx.h, tx.status);
+                                            (grey, grey, ICON_CANCEL)
                                         }
                                     }
 
@@ -2080,9 +2081,9 @@ pub fn ui_left_pane(ui: &mut Context,
                                         } else if h == BlockHeight::BUILT {
                                             ICON_PAPER_PLANE // Failed to send
                                         } else if h == BlockHeight::SENT {
-                                            ICON_CANCEL // TODO
+                                            ICON_EYE_OFF
                                         } else if h == BlockHeight::MEMPOOL {
-                                            ICON_CANCEL // TODO
+                                            ICON_EYE_1
                                         } else if tx_is_in_block {
                                             ICON_FORK
                                         } else {
@@ -2091,17 +2092,17 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                         match tx.status {
                                             TxStatus::OnBc => unreachable!("already filtered"),
-                                            TxStatus::SoftFail(_) => (GREY, icon),
+                                            TxStatus::SoftFail(_) => (grey, grey, icon),
                                             TxStatus::HardFail(_, msg) => {
                                                 icon_text_buf = format!("{} {icon}", msg.to_string());
-                                                (RED, &icon_text_buf as &str)
+                                                (RED, RED, &icon_text_buf as &str)
                                             }
                                         }
                                     }
-                                };
-
-                                (colour.mul(0.75), status_icon)
+                                }
                             };
+
+                            icon_colour = icon_colour.mul(deemph_mul);
 
                             // left icon
                             if let _ = elem().decl(Decl {
@@ -2167,13 +2168,14 @@ pub fn ui_left_pane(ui: &mut Context,
                                     frame_strf!(data, "{}", label)
                                 };
 
-                                ui.text(label_str, TextDecl { h: kind_text_h, align: AlignX::Left, ..TextDecl });
+                                ui.text(label_str, TextDecl { h: kind_text_h, align: AlignX::Left, colour: text_colour, ..TextDecl });
 
+                                let details_col = text_colour.mul(deemph_mul);
                                 // spacer
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
                                 let txid = tx.txid.to_string();
-                                ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { font: Mono, h: transaction_text_h, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, align: AlignX::Left, ..TextDecl });
+                                ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { font: Mono, h: transaction_text_h, colour: details_col, align: AlignX::Left, ..TextDecl });
 
                                 // spacer
                                 if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
@@ -2187,7 +2189,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }
                                         }
 
-                                        ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
+                                        ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: details_col, ..TextDecl });
                                     }
                                 }
                             }
