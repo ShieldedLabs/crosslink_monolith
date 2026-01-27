@@ -28,9 +28,9 @@ use rustybuzz::{shape, Face as RbFace, UnicodeBuffer};
 use swash::{scale::ScaleContext, text, FontRef};
 
 
-pub const UI_COPY_STAKING_ACTION_DELAY_BLOCKS: u64 = 35;
-pub const UI_COPY_STAKING_DAY_PERIOD: u64 = 100;
-pub const UI_COPY_STAKING_DAY_WINDOW: u64 = 30;
+pub const UI_COPY_STAKING_ACTION_DELAY_BLOCKS: u64 = 75;
+pub const UI_COPY_STAKING_DAY_PERIOD: u64 = 150;
+pub const UI_COPY_STAKING_DAY_WINDOW: u64 = 70;
 
 const RENDER_TILE_SHIFT: usize = 7;
 const RENDER_TILE_SIZE: usize = 1 << RENDER_TILE_SHIFT;
@@ -1513,11 +1513,13 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                         }
                                                     }
 
+                                                    let global_sound_volume = 0.7;
+
                                                     if old_t < 0.001 && t >= 0.001 {
-                                                        play_sound(music_sound, music_volume, 1.0);
+                                                        play_sound(music_sound, global_sound_volume*music_volume, 1.0);
                                                     }
                                                     if old_t < music_sound_delay && t >= music_sound_delay {
-                                                        play_sound(voice_sound, voice_volume, 1.0);
+                                                        play_sound(voice_sound, global_sound_volume*voice_volume, 1.0);
                                                     }
 
                                                     let text_h = window_height as f32 / 6.0;
