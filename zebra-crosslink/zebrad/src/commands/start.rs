@@ -114,6 +114,13 @@ pub struct StartCmd {
 
 impl StartCmd {
     async fn start(&self) -> Result<(), Report> {
+
+        #[cfg(not(feature = "viz_gui"))]
+        {
+            let wallet_state = Arc::new(std::sync::Mutex::new(wallet::WalletState::new()));
+            tokio::spawn(zebra_crosslink::wallet::wallet_main(wallet_state));
+        }
+
         let config = APPLICATION.config();
         let is_regtest = config.network.network.is_regtest();
 

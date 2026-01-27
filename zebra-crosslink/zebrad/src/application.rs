@@ -644,7 +644,6 @@ pub fn boot(app_cell: &'static AppCell<ZebradApp>) -> ! {
 
         zebra_crosslink::viz2::viz_main(Some(tokio_root_thread_handle), wallet_state);
     }
-
     #[cfg(not(feature = "viz_gui"))]
     ZebradApp::run(app_cell, args);
 

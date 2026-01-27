@@ -3855,18 +3855,20 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // since it's probably waiting for the wallet_state mutex to unlock.
         let mut retries_this_round = 6;
         loop {
+            // Check lock availability without storing the MutexGuard type
+            if wallet_state.try_lock().is_err() {
+                if retries_this_round > 0 {
+                    retries_this_round -= 1;
+                    println!("wallet lock retry ({retries_this_round} attempts remaining)");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(9)).await;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
             let action: WalletAction = {
-                let mut wallet_lock = wallet_state.try_lock();
-                let Ok(wallet_state) = &mut wallet_lock else {
-                    if retries_this_round > 0 {
-                        retries_this_round -= 1;
-                        println!("wallet lock retry ({retries_this_round} attempts remaining)");
-                        tokio::time::sleep(tokio::time::Duration::from_millis(9)).await;
-                        continue;
-                    } else {
-                        break;
-                    }
-                };
+                let mut wallet_state = wallet_state.lock().unwrap();
 
                 if DUMP_ACTIONS { println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len()); }
                 let Some(action) = wallet_state.actions_in_flight.front() else {
