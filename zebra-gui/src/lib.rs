@@ -1440,7 +1440,6 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                     else {
                                                         let music_index = music_random % 7;
                                                         let voice_index = voice_random % 6;
-                                                        let music_index = 6;
                                                         match music_index {
                                                             6 => {
                                                                 music_sound = SOUND_CELLO_DRONE1;
