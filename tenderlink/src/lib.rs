@@ -1556,10 +1556,10 @@ fn nonce_is_ok2(nonce: u64, ack_latest: u64, ack_field: u64) -> bool {(
 
 fn nonce_is_ok(nonce: u64, ack_latest: u64, ack_field: u64) -> bool {
     if nonce > ack_latest && nonce > ack_latest + NONCE_FORWARD_JUMP_TOLERANCE { return false; }
-    if nonce == ack_latest                                                           { return false; }
-    if nonce + 64 < ack_latest                                                       { return false; }
+    if nonce == ack_latest                                                     { return false; }
+    if nonce + 64 < ack_latest                                                 { return false; }
     // NOTE: this shift can overflow if we don't return before
-    if nonce < ack_latest && ack_field >> (ack_latest - nonce) & 1 != 0  { return false; }
+    if nonce < ack_latest && ack_field >> (ack_latest - nonce) & 1 != 0        { return false; }
     true
 }
 

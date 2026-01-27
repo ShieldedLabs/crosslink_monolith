@@ -1983,6 +1983,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                     let culled_txs = &txs[culled_in_bgn_o .. culled_in_end_o];
                     for (index, tx) in culled_txs.iter().enumerate() {
+                        let index_real = index;
                         let index = index + culled_pre_n;
                         // if index < 0 {
                         //     continue;
@@ -2047,55 +2048,61 @@ pub fn ui_left_pane(ui: &mut Context,
                             align:      Center,
                             ..Decl
                         }) {
-                            let mut icon_text_buf = String::new();
-                            let (text_colour, mut icon_colour, status_icon) = {
+                            let mut error_text_buf = String::new();
+                            let (text_colour, mut icon_colour, status_icon, tooltip) = {
                                 let CONFIRMATIONS_THRESHOLD = 3;
+
+                                let confirmations_n = if viz.bc_tip_height >= tx_h.0 as u64 {
+                                    viz.bc_tip_height - tx_h.0 as u64
+                                } else {
+                                    0
+                                };
 
                                 pub const RED:  (u8, u8, u8, u8) = (255, 64, 67, 0xff);      /* @todo colors */
                                 pub const BLUE: (u8, u8, u8, u8) = (0x33, 0x88, 0xde, 0xff); /* @todo colors */
                                 match tx.status {
                                     TxStatus::OnBc => {
                                         if tx_h.0 as u64 <= viz.bc_finalized_tip_height { // finalized
-                                            (WHITE, BLUE,  DOUBLE_ICON_OK_CIRCLED_1)
+                                            (WHITE, BLUE,  DOUBLE_ICON_OK_CIRCLED_1, "This transaction is in a finalized block.")
                                         } else if tx_h.0 as u64 + CONFIRMATIONS_THRESHOLD <= viz.bc_tip_height { // confirmed
-                                            (WHITE, WHITE, DOUBLE_ICON_OK_CIRCLED2_1)
+                                            (WHITE, WHITE, DOUBLE_ICON_OK_CIRCLED2_1, &format!("Confirmations: {}/3", confirmations_n).to_string() as &str)
                                         } else if tx_is_in_block {
-                                            (WHITE, WHITE, ICON_OK_CIRCLED2_1)
+                                            (WHITE, WHITE, ICON_OK_CIRCLED2_1, &format!("Confirmations: {}/3", confirmations_n).to_string() as &str)
                                         } else if tx_h == BlockHeight::MEMPOOL {
-                                            (WHITE, WHITE, ICON_EYE_1)
+                                            (WHITE, WHITE, ICON_EYE_1, "This transaction is in the mempool waiting to be mined.")
                                         } else if tx_h == BlockHeight::SENT {
-                                            (WHITE, WHITE, ICON_PAPER_PLANE)
+                                            (WHITE, WHITE, ICON_PAPER_PLANE, "This transaction is being sent to the network.")
                                         } else if tx_h == BlockHeight::BUILT {
-                                            (WHITE, WHITE, ICON_WRENCH)
+                                            (WHITE, WHITE, ICON_WRENCH, "This transaction is being built by your wallet.")
                                         } else if tx_h == BlockHeight::PROPOSED {
-                                            (grey, grey, ICON_WRENCH)
+                                            (grey, grey, ICON_WRENCH, "This transaction is in the queue and will be built soon.")
                                         } else { // INVALID
                                             println!("UI saw tx at {tx_h:?} ({:?}, {:?})", tx.h, tx.status);
-                                            (grey, grey, ICON_CANCEL)
+                                            (grey, grey, ICON_CANCEL, "This transaction has encountered an error.")
                                         }
                                     }
 
                                     TxStatus::SoftFail(h) | TxStatus::HardFail(h, _) => {
-                                        let icon = if h == BlockHeight::PROPOSED {
-                                            ICON_WRENCH // Failed to build
+                                        let (icon, tooltip) = if h == BlockHeight::PROPOSED {
+                                            (ICON_WRENCH,      "This transaction failed to build.") // Failed to build
                                         } else if h == BlockHeight::BUILT {
-                                            ICON_PAPER_PLANE // Failed to send
+                                            (ICON_PAPER_PLANE, "This transaction failed to send.") // Failed to send
                                         } else if h == BlockHeight::SENT {
-                                            ICON_EYE_OFF
+                                            (ICON_EYE_OFF,     "This transaction was to enter the mempool.")
                                         } else if h == BlockHeight::MEMPOOL {
-                                            ICON_EYE_1
+                                            (ICON_EYE_1,       "This transaction failed while in the mempool.")
                                         } else if tx_is_in_block {
-                                            ICON_FORK
+                                            (ICON_FORK,        "This transaction is on a side chain.")
                                         } else {
-                                            ICON_CANCEL
+                                            (ICON_CANCEL,      "This transaction encountered an error.")
                                         };
 
                                         match tx.status {
                                             TxStatus::OnBc => unreachable!("already filtered"),
-                                            TxStatus::SoftFail(_) => (grey, grey, icon),
+                                            TxStatus::SoftFail(_) => (grey, grey, icon, tooltip),
                                             TxStatus::HardFail(_, msg) => {
-                                                icon_text_buf = format!("{} {icon}", msg.to_string());
-                                                (RED, RED, &icon_text_buf as &str)
+                                                error_text_buf = format!("{}", msg.to_string());
+                                                (RED, RED, icon, &error_text_buf as &str)
                                             }
                                         }
                                     }
@@ -2256,12 +2263,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                 if let _elem = elem().decl(Decl {
                                     id:     id_index("Confirmation Status", index as u32),
                                     height: grow!(),
-                                    width:  grow!(),
+                                    width:   fit!(),
                                     align:  BottomRight,
                                     ..Decl
                                 }) {
                                     if ui.hovered(_elem.decl.id) {
-                                        set_tooltip_text!(data, "Hello, World!");
+                                        set_tooltip_text!(data, "{}", tooltip);
                                     }
 
                                     let confirmation_icons_h = if status_icon == ICON_FORK { ui.scale(20.0) } else { ui.scale(12.0) };
@@ -2293,10 +2300,9 @@ pub fn ui_left_pane(ui: &mut Context,
             ui.nav_skip = true; // @Hack.
 
             if max > 0.0 && handle_height < scrollbar_region_h && let _ = elem().decl(Decl {
-                id: id_index("Scrollbar Region", id.id as u32),
-                width:  fixed!(ui.scale(32.0)),
-                height: percent!(1.0),
-                padding: (ui.scale(10.0), 0.0, padding.2, padding.3),
+                id:      id_index("Scrollbar Region", id.id as u32),
+                width:   fixed!(ui.scale(32.0)),
+                padding: (ui.scale(10.0), 0.0, padding.2, 0.0),
                 direction: TopToBottom,
                 align: TopLeft,
                 ..Decl
@@ -2322,6 +2328,8 @@ pub fn ui_left_pane(ui: &mut Context,
 
                 let _ = elem().decl(Decl {                                                                            height: fixed!(handle_offset), ..Decl });
                 let _ = elem().decl(Decl { id: button_id, colour, radius: radius.dup4(), width: fixed!(radius * 2.0), height: fixed!(handle_height), ..Decl });
+            } else {
+                let _ = elem().decl(Decl { width: fixed!(padding.1), ..Decl });
             }
 
             ui.nav_skip = false; // @Hack.

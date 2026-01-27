@@ -1867,7 +1867,7 @@ impl ManualWallet {
         {
             return;
         }
-        println!("auditing {}", tx.txid);
+        // println!("auditing {}", tx.txid);
 
         let (mut t, mut s, mut b) = (WalletTxPart::ZERO, WalletTxPart::ZERO, WalletTxPart::ZERO);
         for account in &self.accounts {
