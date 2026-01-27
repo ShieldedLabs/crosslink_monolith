@@ -33,6 +33,8 @@ pub struct UiData {
     pub scroll_containers: HashMap<u32, ScrollContainerState>,
 
     pub openables: HashMap<u32, OpenableState>,
+
+    pub tooltip_text: String,
 }
 
 
@@ -40,6 +42,13 @@ pub struct UiData {
 macro_rules! frame_strf {
     ($data:expr, $($arg:tt)*) => {
         $data.frame_str(&format_args!($($arg)*).to_string())
+    };
+}
+
+#[macro_export]
+macro_rules! set_tooltip_text {
+    ($data:expr, $($arg:tt)*) => {
+        $data.tooltip_text = format_args!($($arg)*).to_string();
     };
 }
 
@@ -328,6 +337,7 @@ pub const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Cl
                     element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
                     parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_CENTER_CENTER,
                 };
+                // TODO: decl.floating.pointerCaptureMode = clay::Clay_PointerCaptureMode_CLAY_POINTER_CAPTURE_MODE_PASSTHROUGH;
             },
             Floating::Root(x, y) => {
                 decl.floating.attachTo = clay::Clay_FloatingAttachToElement_CLAY_ATTACH_TO_ROOT;
@@ -337,6 +347,7 @@ pub const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Cl
                     element: clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
                     parent:  clay::Clay_FloatingAttachPointType_CLAY_ATTACH_POINT_LEFT_TOP,
                 };
+                decl.floating.pointerCaptureMode = clay::Clay_PointerCaptureMode_CLAY_POINTER_CAPTURE_MODE_PASSTHROUGH;
             },
             _ => {},
         }
@@ -2235,13 +2246,17 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                 // let _ = elem().decl(Decl { height: grow!(), ..Decl }); // spacer
 
-                                if let _ = elem().decl(Decl {
+                                if let _elem = elem().decl(Decl {
                                     id:     id_index("Confirmation Status", index as u32),
                                     height: grow!(),
                                     width:  grow!(),
                                     align:  BottomRight,
                                     ..Decl
                                 }) {
+                                    if ui.hovered(_elem.decl.id) {
+                                        set_tooltip_text!(data, "Hello, World!");
+                                    }
+
                                     let confirmation_icons_h = if status_icon == ICON_FORK { ui.scale(20.0) } else { ui.scale(12.0) };
                                     ui.text(status_icon, TextDecl { font: Icons, colour: icon_colour, h: confirmation_icons_h, wrap: Wrap::None, align: AlignX::Right,  ..TextDecl });
                                 }
@@ -2750,6 +2765,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
     let radius = ui.scale(12.0).dup4();
 
+    data.tooltip_text.clear();
+
     // Begin the layout
     let clay = magic(ui).clay();
     clay.set_layout_dimensions((window_w as f32, window_h as f32).into());
@@ -2941,6 +2958,23 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         }
     }
 
+
+    if data.tooltip_text.len() > 0 {
+        let mouse_pos = ui.input().mouse_pos();
+        let tooltip_pos = (mouse_pos.0 as f32 + 8.0 * ui.dpi_scale, mouse_pos.1 as f32 + 6.0 * ui.dpi_scale);
+
+        if let _ = elem().decl(Decl {
+            id: id("Tooltip Floating Pane"),
+            colour: PANE_COL,
+            child_gap, padding, radius,
+            width:  fit!(),
+            height: fit!(),
+            floating: Floating::Root(tooltip_pos.0, tooltip_pos.1),
+            ..Decl
+        }) {
+            ui.text(&data.tooltip_text, TextDecl { h: ui.scale(16.0), align: AlignX::Left, ..TextDecl });
+        }
+    }
 
     if !ui.input().mouse_held(winit::event::MouseButton::Left) {
         ui.mouse_pressed_id = Id::default();
