@@ -51,7 +51,7 @@ fn main() {
         mined.sort_by(|a, b| b.h.cmp(&a.h));
         pending.extend_from_slice(&mined);
 
-        wallet_state.lock().unwrap().miner_txs = pending;
+        wallet_state.lock().unwrap().user_txs = pending;
         wallet_state.lock().unwrap().roster = vec![
             WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 25540_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0xBBu8; 32], voting_power: 111000100_000_000, txids: vec![] },

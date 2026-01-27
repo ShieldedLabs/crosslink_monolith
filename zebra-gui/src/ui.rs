@@ -739,17 +739,18 @@ impl Context {
         text
     }
 
-    pub fn scroll_container<'data>(&mut self, data: &'data mut UiData, id: Id, scroll_end_height: f32) -> (Id, ClipMode, &'data mut f32, f32) {
+    pub fn scroll_container<'data>(&mut self, data: &'data mut UiData, id: Id, scroll_end_height: f32) -> (Id, ClipMode, &'data mut f32, f32, f32, f32) {
         let mut scroll_container_state = data.scroll_containers.entry(id.id).or_default();
 
-        let max = {
+        scroll_container_state.content_height = {
             let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
             if scroll_container_data.found {
-                scroll_container_data.contentDimensions.height / self.scale - scroll_end_height
+                scroll_container_data.contentDimensions.height
             } else {
                 0.0
             }
         };
+        let max = scroll_container_state.content_height / self.scale - scroll_end_height;
 
         if self.hovered(id) {
             scroll_container_state.scroll -= self.input().zoom_delta     as f32 * 32.0;
@@ -779,7 +780,12 @@ impl Context {
             scroll_container_state.scroll = 0.0;
         }
 
-        (id, Scroll(0.0, -scroll_container_state.scroll * self.scale), &mut scroll_container_state.scroll, scroll_container_state.viewport_height)
+        (id,
+         Scroll(0.0, -scroll_container_state.scroll * self.scale),
+         &mut scroll_container_state.scroll,
+         scroll_container_state.content_height,
+         scroll_container_state.viewport_height,
+         max)
     }
 
     pub fn openable(&mut self, data: &mut UiData, id: Id, activated: bool, open_by_default: bool) -> bool {
@@ -830,6 +836,7 @@ pub struct TextboxState {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ScrollContainerState {
     pub scroll: f32,
+    pub content_height: f32,
     pub viewport_height: f32,
 }
 
@@ -1322,7 +1329,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     staked_roster_unbonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
                     staked_roster_bonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
 
-                    let (id, mut clip, mut scroll, viewport_h) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
+                    let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
                     if (staked_roster_unbonded.len() + staked_roster_bonded.len()) == 0 {
                         clip = ClipMode::None;
                         *scroll = 0.0;
@@ -1887,33 +1894,38 @@ pub fn ui_left_pane(ui: &mut Context,
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
 
-        {
-            let mut txs = {
-                let state = wallet_state.lock().unwrap();
-                if *tab_id == tab_id_user_wallet {
-                    state.user_txs.clone()
-                } else {
-                    state.miner_txs.clone()
-                }
-            };
-            txs.reverse();
-
-            let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
-            let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
-
-            let (id, mut clip, mut scroll, viewport_h) = ui.scroll_container(data, id("History Scroll Container"), 96.0);
-            if txs.len() == 0 {
-                clip = ClipMode::None;
-                *scroll = 0.0;
+        let mut txs = {
+            let state = wallet_state.lock().unwrap();
+            if *tab_id == tab_id_user_wallet {
+                state.user_txs.clone()
+            } else {
+                state.miner_txs.clone()
             }
+        };
+        txs.reverse();
+
+        let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
+        let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
+
+        let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("History Scroll Container"), 96.0);
+        if txs.len() == 0 {
+            clip = ClipMode::None;
+            *scroll = 0.0;
+        }
+        let scroll = *scroll;
+        if let _ = elem().decl(Decl {
+            colour: TRANSACTION_HISTORY_CONTAINER_COL,
+            radius: padding.0.dup4(),
+            width:  percent!(1.0),
+            height: grow!(),
+            direction: LeftToRight,
+            align: TopLeft,
+            ..Decl
+        }) {
             if let _ = elem().decl(Decl {
                 id,
-                colour: TRANSACTION_HISTORY_CONTAINER_COL,
-                child_gap: 0.0,
-                padding,
-                radius: padding.0.dup4(),
-                width:  percent!(1.0),
-                // height: grow!(),
+                padding: (padding.0, 0.0, padding.2, padding.3),
+                width:  grow!(),
                 height: percent!(1.0),
                 direction: TopToBottom,
                 clip,
@@ -1942,9 +1954,9 @@ pub fn ui_left_pane(ui: &mut Context,
                     let separator_height           = ui.scale(8.0);
                     let transaction_inner_height   = transaction_element_height - separator_height;
 
-                    let culled_pre_n    = ((ui.scale(*scroll) / transaction_element_height).floor() as usize).saturating_sub(1);
+                    let culled_pre_n    = ((ui.scale(scroll) / transaction_element_height).floor() as usize).saturating_sub(1);
                     let culled_in_bgn_o = culled_pre_n;
-                    let culled_in_n     = (viewport_h / transaction_element_height).ceil() as usize;
+                    let culled_in_n     = 1 + (viewport_h / transaction_element_height).ceil() as usize + 1;
                     let culled_in_end_o = (culled_pre_n + culled_in_n).min(txs.len());
                     let culled_post_n   = (txs.len() - culled_in_end_o);
 
@@ -2012,10 +2024,10 @@ pub fn ui_left_pane(ui: &mut Context,
                             } else {
                                 (0, 0, 0, 0)
                             },
-                            height: fixed!(transaction_inner_height),
-                            width: percent!(1.0),
-                            direction: LeftToRight,
-                            align: Center,
+                            height:     fixed!(transaction_inner_height),
+                            width:      percent!(1.0),
+                            direction:  LeftToRight,
+                            align:      Center,
                             ..Decl
                         }) {
                             let mut icon_text_buf = String::new();
@@ -2223,10 +2235,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                 // let _ = elem().decl(Decl { height: grow!(), ..Decl }); // spacer
 
                                 if let _ = elem().decl(Decl {
-                                    id: id_index("Confirmation Status", index as u32),
+                                    id:     id_index("Confirmation Status", index as u32),
                                     height: grow!(),
-                                    width: grow!(),
-                                    align: BottomRight,
+                                    width:  grow!(),
+                                    align:  BottomRight,
                                     ..Decl
                                 }) {
                                     let confirmation_icons_h = if status_icon == ICON_FORK { ui.scale(20.0) } else { ui.scale(12.0) };
@@ -2239,6 +2251,40 @@ pub fn ui_left_pane(ui: &mut Context,
                     // culling postamble spacer
                     let _ = elem().decl(Decl { height: Sizing::Fixed(culled_post_n as f32 * transaction_element_height), ..Decl });
                 }
+            }
+
+
+            let handle_pct = (if content_h == 0.0 {
+                1.0
+            } else {
+                viewport_h / content_h
+            }).max(0.01).min(1.0);
+
+            let scroll_pct = (if content_h == 0.0 {
+                0.0
+            } else {
+                scroll / max
+            }).max(0.0).min(1.0);
+
+            let handle_pre = scroll_pct * (1.0 - handle_pct);
+
+            if handle_pct < 1.0 && let _ = elem().decl(Decl {
+                width:  fixed!(ui.scale(32.0)),
+                height: percent!(1.0),
+                padding: (ui.scale(10.0), 0.0, padding.2, padding.3),
+                direction: TopToBottom,
+                align: TopLeft,
+                ..Decl
+            }) {
+                let id = ui::id("Scrollbar Handle");
+                let colour = (0x60, 0x60, 0x60, 0);
+                let (activated, mut colour, _) = ui.button_ex(false, colour, id, true, winit::window::CursorIcon::Default);
+                colour.3 = colour.2;
+
+                let radius = ui.scale(6.0);
+
+                let _ = elem().decl(Decl {                                                                 height: Sizing::Percent(handle_pre), ..Decl });
+                let _ = elem().decl(Decl { id, colour, radius: radius.dup4(), width: fixed!(radius * 2.0), height: Sizing::Percent(handle_pct), ..Decl });
             }
         }
     }
@@ -2378,7 +2424,7 @@ pub fn ui_right_pane(ui: &mut Context,
             }
         }
 
-        let (id, mut clip, mut scroll, viewport_h) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
+        let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
         if roster.len() == 0 {
             clip = ClipMode::None;
             *scroll = 0.0;
