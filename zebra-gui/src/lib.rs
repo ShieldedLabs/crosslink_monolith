@@ -863,6 +863,30 @@ pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
 pub static SOUND_UI_WOOSH: &[u8] = include_bytes!("../assets/ui_woosh.ogg");
 pub static SOUND_UI_HOVER: &[u8] = include_bytes!("../assets/ui_hover.ogg");
 pub static SOUND_NOW_STAKING_DAY1: &[u8] = include_bytes!("../assets/now_staking_day1.ogg");
+pub static SOUND_NOW_STAKING_DAY2: &[u8] = include_bytes!("../assets/now_staking_day2.ogg");
+pub static SOUND_NOW_STAKING_DAY3: &[u8] = include_bytes!("../assets/now_staking_day3.ogg");
+pub static SOUND_IT_IS_TIME_TO_STAKE1: &[u8] = include_bytes!("../assets/it_is_time_to_stake1.ogg");
+pub static SOUND_SUBMIT_STAKING_TRANSACTIONS1: &[u8] = include_bytes!("../assets/submit_staking_transactions1.ogg");
+pub static SOUND_SUBMIT_STAKING_TRANSACTIONS2: &[u8] = include_bytes!("../assets/submit_staking_transactions2.ogg");
+pub static SOUND_UNLEASH_YOUR_CAPITAL1: &[u8] = include_bytes!("../assets/unleash_your_capital1.ogg");
+pub static SOUND_TOKENS_AWAIT_STAKING1: &[u8] = include_bytes!("../assets/your_tokens_await_staking1.ogg");
+pub static SOUND_CLAIM_YOUR_REWARDS1: &[u8] = include_bytes!("../assets/claim_your_rewards1.ogg");
+pub static SOUND_LOCK_AND_EARN1: &[u8] = include_bytes!("../assets/lock_and_earn1.ogg");
+pub static SOUND_STAKING_DAY_OVER1: &[u8] = include_bytes!("../assets/staking_day_over1.ogg");
+pub static SOUND_STAKING_DAY_OVER2: &[u8] = include_bytes!("../assets/staking_day_over2.ogg");
+pub static SOUND_STAKING_DAY_OVER3: &[u8] = include_bytes!("../assets/staking_day_over3.ogg");
+pub static SOUND_STAKING_DAY_OVER4: &[u8] = include_bytes!("../assets/staking_day_over4.ogg");
+pub static SOUND_STAKING_DAY_OVER5: &[u8] = include_bytes!("../assets/staking_day_over5.ogg");
+pub static SOUND_STAKING_DAY_OVER6: &[u8] = include_bytes!("../assets/staking_day_over6.ogg");
+pub static SOUND_DAMATIC_HORN1: &[u8] = include_bytes!("../assets/dramatic_horn1.ogg");
+pub static SOUND_DAMATIC_HORN2: &[u8] = include_bytes!("../assets/dramatic_horn2.ogg");
+pub static SOUND_DAMATIC_HORN3: &[u8] = include_bytes!("../assets/dramatic_horn3.ogg");
+pub static SOUND_TRUMPET_FANFARE1: &[u8] = include_bytes!("../assets/trumpet_fanfare1.ogg");
+pub static SOUND_GONG1: &[u8] = include_bytes!("../assets/gong1.ogg");
+pub static SOUND_DRUM_FADEIN1: &[u8] = include_bytes!("../assets/drum_fadein1.ogg");
+pub static SOUND_EPIC_TRANSITION1: &[u8] = include_bytes!("../assets/epic_transition1.ogg");
+pub static SOUND_SOFT_CELLO1: &[u8] = include_bytes!("../assets/soft_cello1.ogg");
+pub static SOUND_CELLO_DRONE1: &[u8] = include_bytes!("../assets/cello_drone1.ogg");
 
 const DRAW_CALL_MAX: usize = 131072;
 const GLYPH_RUN_MAX: usize = 16384;
@@ -1310,7 +1334,6 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                     if debug_do_anyway {
                                                         current_animation_id = debug_next_animation_id;
                                                         debug_next_animation_id += 1;
-                                                        play_sound(SOUND_NOW_STAKING_DAY1, 2.0, 1.0);
                                                     }
                                                 }
                                                 if let Some(t) = current_animation_t.as_mut() {
@@ -1318,17 +1341,197 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                     *t += dt;
                                                     let t = *t;
 
+                                                    let music_random = (1+current_animation_id).wrapping_mul(11583847947735601999);
+                                                    let voice_random = (1+current_animation_id).wrapping_mul(13723614751765347379);
+
+                                                    let music_sound;
+                                                    let music_volume;
+                                                    let music_visual_delay;
+                                                    let music_sound_delay;
+                                                    let voice_sound;
+                                                    let voice_volume;
+
+                                                    if current_animation_id & 1 == 0 {
+                                                        let music_index = music_random % 6;
+                                                        let voice_index = voice_random % 10;
+
+                                                        match music_index {
+                                                            5 => {
+                                                                music_sound = SOUND_EPIC_TRANSITION1;
+                                                                music_volume = 1.0;
+                                                                music_visual_delay = 0.5;
+                                                                music_sound_delay = 1.0;
+                                                            }
+                                                            4 => {
+                                                                music_sound = SOUND_DAMATIC_HORN3;
+                                                                music_volume = 1.0;
+                                                                music_visual_delay = 1.5;
+                                                                music_sound_delay = 2.0;
+                                                            }
+                                                            3 => {
+                                                                music_sound = SOUND_DAMATIC_HORN2;
+                                                                music_volume = 1.0;
+                                                                music_visual_delay = 1.5;
+                                                                music_sound_delay = 2.0;
+                                                            }
+                                                            2 => {
+                                                                music_sound = SOUND_DRUM_FADEIN1;
+                                                                music_volume = 1.2;
+                                                                music_visual_delay = 7.0;
+                                                                music_sound_delay = 7.0;
+                                                            }
+                                                            1 => {
+                                                                music_sound = SOUND_TRUMPET_FANFARE1;
+                                                                music_volume = 1.0;
+                                                                music_visual_delay = 12.5;
+                                                                music_sound_delay = 13.5;
+                                                            }
+                                                            _ => {
+                                                                music_sound = SOUND_DAMATIC_HORN1;
+                                                                music_volume = 1.0;
+                                                                music_visual_delay = 0.5;
+                                                                music_sound_delay = 1.0;
+                                                            }
+                                                        }
+
+                                                        match voice_index {
+                                                            9 => {
+                                                                voice_sound = SOUND_LOCK_AND_EARN1;
+                                                                voice_volume = 1.4;
+                                                            }
+                                                            8 => {
+                                                                voice_sound = SOUND_CLAIM_YOUR_REWARDS1;
+                                                                voice_volume = 1.4;
+                                                            }
+                                                            7 => {
+                                                                voice_sound = SOUND_SUBMIT_STAKING_TRANSACTIONS2;
+                                                                voice_volume = 1.4;
+                                                            }
+                                                            6 => {
+                                                                voice_sound = SOUND_NOW_STAKING_DAY3;
+                                                                voice_volume = 1.4;
+                                                            }
+                                                            5 => {
+                                                                voice_sound = SOUND_NOW_STAKING_DAY2;
+                                                                voice_volume = 1.4;
+                                                            }
+                                                            4 => {
+                                                                voice_sound = SOUND_TOKENS_AWAIT_STAKING1;
+                                                                voice_volume = 1.8;
+                                                            }
+                                                            3 => {
+                                                                voice_sound = SOUND_UNLEASH_YOUR_CAPITAL1;
+                                                                voice_volume = 1.8;
+                                                            }
+                                                            2 => {
+                                                                voice_sound = SOUND_SUBMIT_STAKING_TRANSACTIONS1;
+                                                                voice_volume = 1.8;
+                                                            }
+                                                            1 => {
+                                                                voice_sound = SOUND_IT_IS_TIME_TO_STAKE1;
+                                                                voice_volume = 1.8;
+                                                            }
+                                                            _ => {
+                                                                voice_sound = SOUND_NOW_STAKING_DAY1;
+                                                                voice_volume = 1.8;
+                                                            }
+                                                        }
+                                                    }
+                                                    else {
+                                                        let music_index = music_random % 7;
+                                                        let voice_index = voice_random % 6;
+                                                        let music_index = 6;
+                                                        match music_index {
+                                                            6 => {
+                                                                music_sound = SOUND_CELLO_DRONE1;
+                                                                music_volume = 2.0;
+                                                                music_visual_delay = 12.5;
+                                                                music_sound_delay = 13.5;
+                                                            }
+                                                            5 => {
+                                                                music_sound = SOUND_SOFT_CELLO1;
+                                                                music_volume = 1.0;
+                                                                music_visual_delay = 3.5;
+                                                                music_sound_delay = 4.5;
+                                                            }
+                                                            4 => {
+                                                                music_sound = SOUND_EPIC_TRANSITION1;
+                                                                music_volume = 1.0;
+                                                                music_visual_delay = 0.5;
+                                                                music_sound_delay = 1.0;
+                                                            }
+                                                            3 => {
+                                                                music_sound = SOUND_DAMATIC_HORN3;
+                                                                music_volume = 1.0;
+                                                                music_visual_delay = 1.5;
+                                                                music_sound_delay = 2.0;
+                                                            }
+                                                            2 => {
+                                                                music_sound = SOUND_DAMATIC_HORN2;
+                                                                music_volume = 1.0;
+                                                                music_visual_delay = 1.5;
+                                                                music_sound_delay = 2.0;
+                                                            }
+                                                            1 => {
+                                                                music_sound = SOUND_DRUM_FADEIN1;
+                                                                music_volume = 1.2;
+                                                                music_visual_delay = 7.0;
+                                                                music_sound_delay = 7.0;
+                                                            }
+                                                            _ => {
+                                                                music_sound = SOUND_GONG1;
+                                                                music_volume = 1.5;
+                                                                music_visual_delay = 0.2;
+                                                                music_sound_delay = 0.5;
+                                                            }
+                                                        }
+
+                                                        match voice_index {
+                                                            5 => {
+                                                                voice_sound = SOUND_STAKING_DAY_OVER6;
+                                                                voice_volume = 1.2;
+                                                            }
+                                                            4 => {
+                                                                voice_sound = SOUND_STAKING_DAY_OVER5;
+                                                                voice_volume = 1.0;
+                                                            }
+                                                            3 => {
+                                                                voice_sound = SOUND_STAKING_DAY_OVER4;
+                                                                voice_volume = 1.2;
+                                                            }
+                                                            2 => {
+                                                                voice_sound = SOUND_STAKING_DAY_OVER3;
+                                                                voice_volume = 1.2;
+                                                            }
+                                                            1 => {
+                                                                voice_sound = SOUND_STAKING_DAY_OVER2;
+                                                                voice_volume = 1.2;
+                                                            }
+                                                            _ => {
+                                                                voice_sound = SOUND_STAKING_DAY_OVER1;
+                                                                voice_volume = 1.2;
+                                                            }
+                                                        }
+                                                    }
+
+                                                    if old_t < 0.001 && t >= 0.001 {
+                                                        play_sound(music_sound, music_volume, 1.0);
+                                                    }
+                                                    if old_t < music_sound_delay && t >= music_sound_delay {
+                                                        play_sound(voice_sound, voice_volume, 1.0);
+                                                    }
+
                                                     let text_h = window_height as f32 / 6.0;
 
                                                     let text_string = if current_animation_id & 1 != 0 { "Staking Day has Ended" } else { "Staking Day has Begun" };
-                                                    let text_y = cubic_hold(t as f32 / 5.0, 0.1, 0.7, 0.4)*1.4 * window_height as f32 - text_h;
+                                                    let text_y = cubic_hold((t - music_visual_delay) as f32 / 5.0, 0.1, 0.7, 0.4)*1.4 * window_height as f32 - text_h;
 
                                                     let text_w = draw_ctx.measure_text_line(FontKind::Normal, text_h, text_string);
                                                     let text_x = window_width as f32 / 2.0 - text_w / 2.0;
                                                     draw_ctx.rectangle_r(text_x - 20.0, text_y - 20.0, text_x + text_w + 20.0, text_y + text_h + 20.0, 30, 0x70_000000);
                                                     draw_ctx.text_line(FontKind::Normal, text_x, text_y, text_h, text_string, 0xffffffff);
 
-                                                    if t > 10.0 { current_animation_t = None; }
+                                                    if t > 60.0 { current_animation_t = None; }
                                                 }
                                             }
 
