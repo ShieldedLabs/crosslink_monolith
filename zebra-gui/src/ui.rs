@@ -740,7 +740,7 @@ impl Context {
     }
 
     pub fn scroll_container<'data>(&mut self, data: &'data mut UiData, id: Id, scroll_end_height: f32) -> (Id, ClipMode, &'data mut f32, f32, f32, f32) {
-        let mut scroll_container_state = data.scroll_containers.entry(id.id).or_default();
+        let mut scroll_container_state = data.scroll_containers.entry(id.id).or_insert(Default::default());
 
         scroll_container_state.content_height = {
             let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
@@ -756,9 +756,6 @@ impl Context {
             scroll_container_state.scroll -= self.input().zoom_delta     as f32 * 32.0;
             scroll_container_state.scroll -= self.input().scroll_delta.1 as f32 * 32.0;
 
-            if self.input().mouse_held(MouseButton::Left) {
-                scroll_container_state.scroll -= self.input().mouse_delta().1 as f32 / self.scale;
-            }
             if self.input().key_pressed(KeyCode::PageUp) {
                 scroll_container_state.scroll -= scroll_container_state.viewport_height / self.scale;
             }
@@ -2267,7 +2264,10 @@ pub fn ui_left_pane(ui: &mut Context,
 
             let handle_offset = scroll_pct * (scrollbar_region_h - handle_height);
 
+            ui.nav_skip = true; // @Hack.
+
             if max > 0.0 && handle_height < scrollbar_region_h && let _ = elem().decl(Decl {
+                id: id_index("Scrollbar Region", id.id as u32),
                 width:  fixed!(ui.scale(32.0)),
                 height: percent!(1.0),
                 padding: (ui.scale(10.0), 0.0, padding.2, padding.3),
@@ -2275,14 +2275,30 @@ pub fn ui_left_pane(ui: &mut Context,
                 align: TopLeft,
                 ..Decl
             }) {
-                let id = ui::id("Scrollbar Handle");
+                let button_id = ui::id("Scrollbar Handle");
                 let colour = (0x60, 0x60, 0x60, 0);
-                let (activated, mut colour, _) = ui.button_ex(false, colour, id, true, winit::window::CursorIcon::Default);
+                let (activated, mut colour, _) = ui.button_ex(true, colour, button_id, true, winit::window::CursorIcon::Default);
                 colour.3 = colour.2;
 
-                let _ = elem().decl(Decl {                                                                 height: fixed!(handle_offset), ..Decl });
-                let _ = elem().decl(Decl { id, colour, radius: radius.dup4(), width: fixed!(radius * 2.0), height: fixed!(handle_height), ..Decl });
+                if ui.mouse_pressed_id == button_id {
+                    let mut scroll_container_state = data.scroll_containers.entry(id.id).or_insert(Default::default());
+
+                    let delta_viewport_px  = ui.input().mouse_delta().1 as f32;
+                    let delta_viewport_pct = delta_viewport_px / (scrollbar_region_h - handle_height);
+
+                    let content_scrollable_h = max;
+
+                    let delta_content_pct = delta_viewport_pct;
+                    let delta_content_px  = delta_content_pct * content_scrollable_h;
+
+                    scroll_container_state.scroll += delta_content_px;
+                }
+
+                let _ = elem().decl(Decl {                                                                            height: fixed!(handle_offset), ..Decl });
+                let _ = elem().decl(Decl { id: button_id, colour, radius: radius.dup4(), width: fixed!(radius * 2.0), height: fixed!(handle_height), ..Decl });
             }
+
+            ui.nav_skip = false; // @Hack.
         }
     }
 
