@@ -475,14 +475,17 @@ impl Context {
     pub fn scale32(&self, size: f32) -> u32 { self.scale(size) as u32 }
     pub fn scale16(&self, size: f32) -> u16 { self.scale(size) as u16 }
 
-    pub fn hovered(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
+    pub fn hovered_raw(&self, id: Id) -> bool { unsafe { clay::Clay_PointerOver(id.clay().id) } }
+    pub fn hovered(&self, id: Id) -> bool {
+        self.mouse_pressed_id == Id::default() && self.hovered_raw(id)
+    }
     pub fn hovered_uniquely(&self, id: Id) -> bool {
-        self.hovered_id == id
+        self.mouse_pressed_id == Id::default() && self.hovered_id == id
     }
 
     pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: winit::window::CursorIcon) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
 
-        let mouse_hover = self.hovered(id);
+        let mouse_hover = self.hovered_raw(id);
         let key_hover   = self.nav_enable && self.nav_id == id.id;
 
         let mouse_held     = mouse_hover && self.input().mouse_held(winit::event::MouseButton::Left);
@@ -498,7 +501,8 @@ impl Context {
         let mouse_activated  = enabled && self.mouse_pressed_id == id && if act_on_press { mouse_pressed } else { mouse_released };
         let key_activated    = enabled && self.key_pressed_id   == id && if act_on_press { key_pressed   } else { key_released   };
 
-        if mouse_hover && pointer_on_hover != winit::window::CursorIcon::Default {
+        if mouse_hover && pointer_on_hover != winit::window::CursorIcon::Default &&
+            (self.mouse_pressed_id == Id::default() || self.mouse_pressed_id == id) {
             self.cursor = winit::window::Cursor::Icon(pointer_on_hover);
         }
 
