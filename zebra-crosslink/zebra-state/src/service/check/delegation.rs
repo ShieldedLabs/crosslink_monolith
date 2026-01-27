@@ -17,6 +17,7 @@ use crate::{
 /// - Validates that CreateNewDelegationBond doesn't create duplicate bonds
 /// - Validates that BeginDelegationUnbonding references existing active bonds
 /// - Validates that WithdrawDelegationBond references existing unbonding bonds
+/// - Validates that RetargetDelegationBond references existing active bonds
 pub fn validate_delegation_bonds(
     semantically_verified: &SemanticallyVerifiedBlock,
     non_finalized_chain: &Chain,
@@ -81,6 +82,15 @@ pub fn validate_delegation_bonds(
                         bond_key,
                         staking_action.amount_zats,
                         non_finalized_chain,
+                    )?;
+                }
+                StakingActionKind::RetargetDelegationBond => {
+                    // Check that bond exists and is active
+                    validate_bond_for_retarget(
+                        bond_key,
+                        &block_new_bonds,
+                        non_finalized_chain,
+                        finalized_state,
                     )?;
                 }
                 // Other staking actions don't affect delegation bonds
@@ -229,6 +239,58 @@ fn validate_bond_for_withdrawal(
     // Bond not found in non-finalized state
     Err(ValidateContextError::InvalidDelegationBond(format!(
         "delegation bond not found: {:?}",
+        bond_key
+    )))
+}
+
+/// Validates RetargetDelegationBond: ensures the bond exists and is active.
+fn validate_bond_for_retarget(
+    bond_key: [u8; 32],
+    block_new_bonds: &HashMap<[u8; 32], DelegationBond>,
+    non_finalized_chain: &Chain,
+    finalized_state: &ZebraDb,
+) -> Result<(), ValidateContextError> {
+    // Check if bond was created in this block (allowed to retarget immediately)
+    if block_new_bonds.contains_key(&bond_key) {
+        return Ok(());
+    }
+
+    // Check if bond exists in non-finalized state
+    if let Some((_bond, status)) = non_finalized_chain.delegation_bonds.get(&bond_key) {
+        use crate::service::non_finalized_state::BondStatusInChain;
+
+        match status {
+            BondStatusInChain::Active => return Ok(()),
+            BondStatusInChain::Unbonding => {
+                return Err(ValidateContextError::InvalidDelegationBond(format!(
+                    "cannot retarget unbonding delegation bond: {:?}",
+                    bond_key
+                )));
+            }
+            BondStatusInChain::Withdrawn => {
+                return Err(ValidateContextError::InvalidDelegationBond(format!(
+                    "cannot retarget withdrawn delegation bond: {:?}",
+                    bond_key
+                )));
+            }
+        }
+    }
+
+    // Check finalized state - bond must exist and be active
+    if finalized_state.delegation_bond(&bond_key).is_some() {
+        if finalized_state.is_bond_active(&bond_key) {
+            return Ok(());
+        } else {
+            return Err(ValidateContextError::InvalidDelegationBond(format!(
+                "cannot retarget delegation bond that is not active: {:?}",
+                bond_key
+            )));
+        }
+    }
+
+    // Bond not found anywhere
+    Err(ValidateContextError::InvalidDelegationBond(format!(
+        "delegation bond not found for retarget: {:?}",
         bond_key
     )))
 }
