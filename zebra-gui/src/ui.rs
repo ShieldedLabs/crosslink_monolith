@@ -12,7 +12,7 @@ use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 use std::collections::HashMap;
 //use clay::*; // @Temporary
 
-use wallet::{ BlockHeight, TxParts, TxStatus, WalletState, WalletTxKind, WalletTxPart, str_from_ctaz };
+use wallet::{ BlockHeight, TxParts, TxStatus, WalletState, WalletTxKind, WalletTxPart, WalletRosterMember, str_from_ctaz };
 
 use super::*;
 
@@ -856,6 +856,119 @@ pub struct OpenableState {
     pub open: bool,
 }
 
+fn display_str(chunks: &[u64; 4]) -> String {
+    let mut bytes = {
+        let mut out = [0u8; 32];
+        let mut i = 0;
+        for &chunk in chunks {
+            let le = chunk.to_le_bytes(); // linear memory bytes for a LE u64
+            out[i..i + 8].copy_from_slice(&le);
+            i += 8;
+        }
+        out
+    };
+
+    let mut str = String::new();
+    bytes.reverse();
+
+    for b in &bytes[0..4] {
+        str.push_str(&format!("{:02x}", b));
+    }
+    str.push_str("..");
+    for b in &bytes[bytes.len() - 4..] {
+        str.push_str(&format!("{:02x}", b));
+    }
+
+    str
+}
+
+fn chunkify(bytes: &[u8; 32]) -> [u64; 4] {
+    let mut chunks = [0u64; 4];
+    for i in 0..4 {
+        let start = i * 8;
+        let end = start + 8;
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[start..end]);
+        chunks[i] = u64::from_le_bytes(buf);
+    }
+
+    chunks
+}
+
+
+fn colour_from_hash(hash: [u8; 32]) -> (u8, u8, u8, u8) {
+    let (mut h, mut s, mut v) = (0u8, 0u8, 0u8);
+    for i in 0..32 {
+        h = ((h ^ hash[i]) as u32).wrapping_mul(hash[i] as u32).wrapping_mul(17*i as u32).wrapping_mul(402653189) as u8;
+        s = ((s ^ hash[i]) as u32).wrapping_mul(hash[i] as u32).wrapping_mul(37*i as u32).wrapping_mul(805306457) as u8;
+        v = ((v ^ hash[i]) as u32).wrapping_mul(hash[i] as u32).wrapping_mul(77*i as u32).wrapping_mul(1610612741) as u8;
+    }
+    (h, s/2 + 80, v/2 + 80, 0xff).rgba()
+}
+
+pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[WalletRosterMember], total_val: u64) {
+    let finalizer_pill_rad = ui.scale(8.0);
+    if let _ = elem().decl(Decl {
+        id: ui::id("Finalizer Ratio Bar Container"),
+        child_gap: ui.scale(5.0),
+        align: Left,
+        direction: LeftToRight,
+        width: percent!(1.0),
+        height: fixed!(finalizer_pill_rad * 4.0),
+        ..Decl
+    }) {
+        let mut rem = 0;
+        for (i, finalizer) in finalizers.iter().enumerate() {
+            let pct = finalizer.voting_power as f32 / total_val as f32;
+            if pct <= 0.01 {
+                rem += finalizer.voting_power;
+                continue;
+            }
+
+            if let el = elem().decl(Decl {
+                id: id_index("finalizer bar", i as u32),
+                colour: colour_from_hash(finalizer.pub_key),
+                radius: {
+                    let l = if i == 0 { finalizer_pill_rad } else { 0.0 };
+                    let r = if i == finalizers.len()-1 && rem == 0 { finalizer_pill_rad } else { 0.0 };
+                    (r, l, r, l) // TODO: order??
+                },
+                align: Left,
+                width:  Sizing::Percent(pct),
+                height: grow!(),
+                ..Decl
+            }) {
+                if ui.hovered(el.decl.id) {
+                    set_tooltip_text!(data, "{}    {} cTAZ    {:.2}%",
+                        display_str(&chunkify(&finalizer.pub_key)),
+                        str_from_ctaz(finalizer.voting_power), 100.0*pct);
+                }
+            }
+        }
+
+        if rem != 0 {
+            let pct = rem as f32 / total_val as f32;
+            if let el = elem().decl(Decl {
+                id: id_index("final bar", !0u32),
+                colour: (0x40, 0x40, 0x40, 0xff),
+                radius: {
+                    let l = if rem == total_val { finalizer_pill_rad } else { 0.0 };
+                    let r = finalizer_pill_rad;
+                    (r, l, r, l) // TODO: order??
+                },
+                align: Left,
+                width:  Sizing::Percent(pct),
+                height: grow!(),
+                ..Decl
+            }) {
+                if ui.hovered(el.decl.id) {
+                    set_tooltip_text!(data, "(Other)    {} cTAZ    {:.2}%", str_from_ctaz(rem), 100.0*pct);
+                }
+            }
+        }
+    }
+}
+
 pub fn ui_left_pane(ui: &mut Context,
                 wallet_state: Arc<Mutex<WalletState>>,
                 data: &mut UiData,
@@ -899,7 +1012,7 @@ pub fn ui_left_pane(ui: &mut Context,
     if *tab_id == tab_id_miner_wallet {
         ui.modal = Modal::None;
     }
-    const deemph_mul: f32 = 0.65;
+    const deemph_mul: f32 = 0.6;
     let grey: (u8, u8, u8, u8) = WHITE.mul(deemph_mul);
 
     if ui.modal != Modal::None && let _elem = elem().decl(Decl {
@@ -1251,31 +1364,43 @@ pub fn ui_left_pane(ui: &mut Context,
                 Modal::Unstake => {
                     title_bar(ui, true, "Unstake", id("Unstake Title Bar"));
 
-                    fn display_str(chunks: &[u64; 4]) -> String {
-                        let mut bytes = {
-                            let mut out = [0u8; 32];
-                            let mut i = 0;
-                            for &chunk in chunks {
-                                let le = chunk.to_le_bytes(); // linear memory bytes for a LE u64
-                                out[i..i + 8].copy_from_slice(&le);
-                                i += 8;
-                            }
-                            out
-                        };
-
-                        let mut str = String::new();
-                        bytes.reverse();
-
-                        for b in &bytes[0..4] {
-                            str.push_str(&format!("{:02x}", b));
-                        }
-                        str.push_str("..");
-                        for b in &bytes[bytes.len() - 4..] {
-                            str.push_str(&format!("{:02x}", b));
-                        }
-
-                        str
+                    // TODO: phillip audaciously deleted the accumulated bond amount field, bring that back
+                    let mut staked_roster_unbonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* current estimated */)>;
+                    let mut staked_roster_bonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* current estimated */)>;
+                    {
+                        let lock = wallet_state.lock().unwrap();
+                        staked_roster_unbonded = lock.stake_positions_unbonded.clone();
+                        staked_roster_bonded = lock.stake_positions_bonded.clone();
                     }
+
+                    staked_roster_unbonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
+                    staked_roster_bonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
+
+                    let mut total_unbonded = 0;
+                    for position in &staked_roster_unbonded {
+                        total_unbonded += position.2;
+                    }
+
+                    let mut bonded_finalizers = Vec::<WalletRosterMember>::new();
+                    let mut total_bonded = 0;
+                    let mut prev_finalizer: Option<[u8; 32]> = None;
+                    for i in 0..staked_roster_bonded.len() {
+                        let &(bond_key, finalizer, position) = &staked_roster_bonded[i];
+
+                        if Some(finalizer) == prev_finalizer {
+                            bonded_finalizers.last_mut().unwrap().voting_power += position;
+                        } else {
+                            prev_finalizer = Some(finalizer);
+                            bonded_finalizers.push(WalletRosterMember {
+                                pub_key: finalizer,
+                                voting_power: position,
+                                txids: Vec::new(),
+                            });
+                        }
+
+                        total_bonded += position;
+                    }
+
 
                     let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
                         let id = id(label);
@@ -1329,17 +1454,6 @@ pub fn ui_left_pane(ui: &mut Context,
                         clicked
                     };
 
-                    // TODO: phillip audaciously deleted the accumulated bond amount field, bring that back
-                    let mut staked_roster_unbonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* current estimated */)>;
-                    let mut staked_roster_bonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* current estimated */)>;
-                    {
-                        let lock = wallet_state.lock().unwrap();
-                        staked_roster_unbonded = lock.stake_positions_unbonded.clone();
-                        staked_roster_bonded = lock.stake_positions_bonded.clone();
-                    }
-
-                    staked_roster_unbonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
-                    staked_roster_bonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
 
                     let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
                     if (staked_roster_unbonded.len() + staked_roster_bonded.len()) == 0 {
@@ -1360,19 +1474,6 @@ pub fn ui_left_pane(ui: &mut Context,
                         align: TopLeft,
                         ..Decl
                     }) {
-                        let chunkify = |bytes: &[u8; 32]| {
-                            let mut chunks = [0u64; 4];
-                            for i in 0..4 {
-                                let start = i * 8;
-                                let end = start + 8;
-                                let mut buf = [0u8; 8];
-                                buf.copy_from_slice(&bytes[start..end]);
-                                chunks[i] = u64::from_le_bytes(buf);
-                            }
-
-                            chunks
-                        };
-
                         if (staked_roster_unbonded.len() + staked_roster_bonded.len()) == 0 {
                             let h = ui.scale(24.0);
                             if let _ = elem().decl(Decl {
@@ -1386,10 +1487,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ui.text(ICON_EYE_OFF, TextDecl { font: Icons, colour: WHITE.mul(0.6), h: ui.scale(64.0), align: AlignX::Center, ..TextDecl });
                                 ui.text("You have not staked to any finalizers yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
                             }
-                        }
-                        else {
+                        } else {
                             if staked_roster_unbonded.len() > 0 {
-                                let string = "Claimable Bonds";
                                 let id = id_index("ClaimableBondsContainer", 0);
                                 let colour = BUTTON_GREY.mul(0.8);
                                 elem_bgn();
@@ -1418,7 +1517,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                     ..Decl
                                 })
                                 {
-                                    ui.text(string, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
+                                    ui.text("Claimable Bonds", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
+                                    let _ = elem().decl(Decl { width: grow!(), ..Decl });
+                                    let colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
+                                    ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(total_unbonded)), TextDecl { font: Mono, colour, h: ui.scale(18.0), align: AlignX::Right, ..TextDecl });
                                 }
 
                                 if ui.openable(data, id, activated, true) {
@@ -1534,7 +1636,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 decl(Decl {
                                     colour,
                                     radius,
-                                    child_gap,
+                                    child_gap: child_gap * 0.5,
                                     padding,
                                     width:  grow!(),
                                     height: fit!(),
@@ -1557,12 +1659,17 @@ pub fn ui_left_pane(ui: &mut Context,
                                 })
                                 {
                                     ui.text(string, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
+                                    let _ = elem().decl(Decl { width: grow!(), ..Decl });
+                                    let colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
+                                    ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(total_bonded)), TextDecl { font: Mono, colour, h: ui.scale(18.0), align: AlignX::Right, ..TextDecl });
                                 }
+
+                                finalizer_ratio_bar(ui, data, &bonded_finalizers, total_bonded);
 
                                 if ui.openable(data, id, activated, true) {
                                     let mut prev_finalizer:   Option<[u8; 32]> = None;
                                     let mut open_finalizer:   bool = false;
-                                    for &(bond_key, finalizer, initial) in &staked_roster_bonded {
+                                    for (bond_i, &(bond_key, finalizer, initial)) in staked_roster_bonded.iter().enumerate() {
                                         let index: u32 = {
                                             use std::hash::{Hash, Hasher};
                                             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1576,6 +1683,14 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 elem_end();
                                             }
                                             prev_finalizer = Some(finalizer);
+
+                                            let mut total_bonded_to_finalizer = 0;
+                                            for i in bond_i..staked_roster_bonded.len() {
+                                                if staked_roster_bonded[i].1 != finalizer {
+                                                    break;
+                                                }
+                                                total_bonded_to_finalizer += staked_roster_bonded[i].2;
+                                            }
 
                                             let chunks = chunkify(&finalizer);
                                             let label = frame_strf!(data, "{}", display_str(&chunks));
@@ -1604,14 +1719,19 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 colour,
                                                 radius,
                                                 padding,
-                                                width:  grow!(),
+                                                width:  percent!(1.0),
                                                 height: fit!(),
                                                 align:  Left,
+                                                direction: LeftToRight,
                                                 ..Decl
                                             })
                                             {
                                                 // ui.text("Staked to:", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
-                                                ui.text(label, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
+                                                ui.text(label, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
+                                                let _ = elem().decl(Decl { width: grow!(), ..Decl });
+                                                let pct = 100.0 * (total_bonded_to_finalizer as f64 / total_bonded as f64);
+                                                let colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
+                                                ui.text(frame_strf!(data, "{} cTAZ ({:.2}%)", str_from_ctaz(total_bonded_to_finalizer), pct), TextDecl { font: Mono, colour, h: ui.scale(18.0), align: AlignX::Right, ..TextDecl });
                                             }
 
                                             open_finalizer = ui.openable(data, id, activated, false);
@@ -2470,6 +2590,12 @@ pub fn ui_right_pane(ui: &mut Context,
                 ui.input().send_to_clipboard(&recv_address);
             }
         }
+
+        let mut total_stake = 0u64;
+        for member in roster {
+            total_stake += member.voting_power;
+        }
+        finalizer_ratio_bar(ui, data, &roster, total_stake);
 
         let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
         if roster.len() == 0 {
