@@ -5,7 +5,7 @@ use wallet::{WalletRosterMember, WalletTx, WalletTxKind};
 fn main() {
     let wallet_state: Arc<Mutex<wallet::WalletState>> = Arc::<Mutex::<wallet::WalletState>>::new(Mutex::<wallet::WalletState>::new(wallet::WalletState::new()));
     if true {
-        let txs = vec![
+        let mut txs = vec![
             WalletTx::with_fake_data(WalletTxKind::Send, 100_000_000, 0, false, false, "Hello, world!", 0),
             WalletTx::with_fake_data(WalletTxKind::Receive, 0, 100_000_000, false, false, "Other things", 10),
             WalletTx::with_fake_data(WalletTxKind::Send, 250_000_000, 0, true, false, "More things", 11),
@@ -44,6 +44,7 @@ fn main() {
             WalletTx::with_fake_data(WalletTxKind::Stake, 10_000_000_000, 0, false, false, "", 0),
             WalletTx::with_fake_data(WalletTxKind::BeginUnstake, 10_000_000_000, 0, false, false, "", 0),
         ];
+        txs.repeat(27);
 
         let mut pending: Vec<_> = txs.iter().filter(|tx| !tx.h.is_in_block()).map(|tx| tx.clone()).collect();
         let mut mined:   Vec<_> = txs.iter().filter(|tx|  tx.h.is_in_block()).map(|tx| tx.clone()).collect();
@@ -51,10 +52,10 @@ fn main() {
         mined.sort_by(|a, b| b.h.cmp(&a.h));
         pending.extend_from_slice(&mined);
 
-        wallet_state.lock().unwrap().user_txs = pending;
+        wallet_state.lock().unwrap().miner_txs = pending;
         wallet_state.lock().unwrap().roster = vec![
             WalletRosterMember{ pub_key: [0xAAu8; 32], voting_power: 25540_000_000, txids: vec![] },
-            WalletRosterMember{ pub_key: [0xBBu8; 32], voting_power: 111000100_000_000, txids: vec![] },
+            WalletRosterMember{ pub_key: [0xBBu8; 32], voting_power: 111000_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0xCCu8; 32], voting_power: 250_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0xDDu8; 32], voting_power: 100_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0xEEu8; 32], voting_power: 250_000_000, txids: vec![] },

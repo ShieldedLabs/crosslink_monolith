@@ -2,7 +2,7 @@
 #![allow(warnings)]
 
 const AUTO_SPEND:    bool = false; // automatically make spends without requiring GUI interaction
-const DUMP_ACTIONS:  bool = true;
+const DUMP_ACTIONS:  bool = false;
 const DUMP_FAUCET:   bool = false;
 const DUMP_NOTES:    bool = false;
 const DUMP_ROSTER:   bool = false;
@@ -862,7 +862,6 @@ pub struct WalletState {
 
     pub staked_balance:  u64, // in zats
     pub withdrawable_balance:  u64, // in zats
-    pub show_staked_balance: bool,
 
     pub user_local_txs_n: usize,
     pub user_local_txs: [WalletTx; 3],
@@ -1867,7 +1866,7 @@ impl ManualWallet {
         {
             return;
         }
-        println!("auditing {}", tx.txid);
+        // println!("auditing {}", tx.txid);
 
         let (mut t, mut s, mut b) = (WalletTxPart::ZERO, WalletTxPart::ZERO, WalletTxPart::ZERO);
         for account in &self.accounts {
@@ -1925,7 +1924,7 @@ impl ManualWallet {
     }
 
     pub fn audit_txs(&self) {
-        let tz = Timer::scope("audit_txs");
+        // let tz = Timer::scope("audit_txs");
         // NOTE: this could be significantly optimized if we want it running a lot
         for tx in &self.txs {
             self.audit_tx(tx);
@@ -3909,7 +3908,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
 
             let new_wallet_state_push_time = Instant::now();
-            println!("\n################ Wallet state period: {:#?}\n", new_wallet_state_push_time.duration_since(wallet_state_push_time));
+            // println!("\n################ Wallet state period: {:#?}\n", new_wallet_state_push_time.duration_since(wallet_state_push_time));
             wallet_state_push_time = new_wallet_state_push_time;
             // DO NOT DO ANY WORK AFTER THIS LOCK IS TAKEN
             let mut lock = wallet_state.lock().unwrap();

@@ -8,7 +8,7 @@ const PRINT_PROTOCOL:       bool = 1 == 1;
 const PRINT_PROTOCOL_TAG:   bool = 0 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
 const PRINT_ROSTER_CMD:     bool = 1 == 1;
-const PRINT_NETWORK_STATS:  bool = 1 == 1;
+const PRINT_NETWORK_STATS:  bool = 0 == 1;
 const PRINT_PEERS:          bool = 0 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
@@ -381,8 +381,8 @@ impl std::fmt::Debug   for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PubKeyID(pub [u8; 32]);
 impl PubKeyID { const NIL: Self = Self([0; 32]); }
-impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
-impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Pub{", &self.0[..2])?; write!(f, "}}") } }
+impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str_rev(f, &self.0) } }
+impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str_rev(f, "Pub{", &self.0[..2])?; write!(f, "}}") } }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TMSig(pub [u8; 64]);
@@ -1509,9 +1509,20 @@ fn fmt_byte_str(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Resu
     Ok(())
 }
 
+fn fmt_byte_str_rev(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
+    let n = usize::min(bytes.len(), f.precision().unwrap_or(bytes.len()));
+    for i in 0..n { write!(f, "{:02x}", bytes[n-(i+1)])?; }
+    Ok(())
+}
+
 fn fmt_prefixed_byte_str(f: &mut std::fmt::Formatter<'_>, pre: &str, bytes: &[u8]) -> std::fmt::Result {
     write!(f, "{}", pre)?;
     fmt_byte_str(f, bytes)
+}
+
+fn fmt_prefixed_byte_str_rev(f: &mut std::fmt::Formatter<'_>, pre: &str, bytes: &[u8]) -> std::fmt::Result {
+    write!(f, "{}", pre)?;
+    fmt_byte_str_rev(f, bytes)
 }
 
 impl std::fmt::Debug for StaticDHKeyPair {
@@ -1556,10 +1567,10 @@ fn nonce_is_ok2(nonce: u64, ack_latest: u64, ack_field: u64) -> bool {(
 
 fn nonce_is_ok(nonce: u64, ack_latest: u64, ack_field: u64) -> bool {
     if nonce > ack_latest && nonce > ack_latest + NONCE_FORWARD_JUMP_TOLERANCE { return false; }
-    if nonce == ack_latest                                                           { return false; }
-    if nonce + 64 < ack_latest                                                       { return false; }
+    if nonce == ack_latest                                                     { return false; }
+    if nonce + 64 < ack_latest                                                 { return false; }
     // NOTE: this shift can overflow if we don't return before
-    if nonce < ack_latest && ack_field >> (ack_latest - nonce) & 1 != 0  { return false; }
+    if nonce < ack_latest && ack_field >> (ack_latest - nonce) & 1 != 0        { return false; }
     true
 }
 
@@ -1996,7 +2007,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             let block_size = bytes.len().try_into().unwrap();
             let bytes      = &bytes[..];
 
-            for chunk_i in chunk_needed_i..(chunk_needed_i + 1).min(chunks_n) {
+            for chunk_i in chunk_needed_i..(chunk_needed_i + 2).min(chunks_n) {
                 let (chunk_o, chunk_size) = powlink_chunk_o_size(bytes.len(), chunk_i);
                 let chunk_i: u16          = chunk_i.try_into().unwrap();
                 let chunk                 = PacketPowlinkChunkHeader { hash, block_size, chunk_i };
