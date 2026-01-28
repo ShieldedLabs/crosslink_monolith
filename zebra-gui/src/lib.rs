@@ -836,6 +836,7 @@ pub static FONT_PIXEL_GOHU_11: &[u8] = include_bytes!("../assets/gohufont-uni-11
 pub static FONT_PIXEL_GOHU_14: &[u8] = include_bytes!("../assets/gohufont-uni-14.ttf");
 
 static mut GLOBAL_OUTPUT_STREAM : *mut rodio::OutputStream = std::ptr::null_mut();
+static mut global_audio_volume: f32 = 1.0;
 pub fn setup_audio() {
     unsafe {
         if GLOBAL_OUTPUT_STREAM == std::ptr::null_mut() {
@@ -853,7 +854,7 @@ pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
         if GLOBAL_OUTPUT_STREAM != std::ptr::null_mut() {
             let stream = &mut *GLOBAL_OUTPUT_STREAM;
             let sink = rodio::play(stream.mixer(), std::io::Cursor::new(sound_file)).unwrap();
-            sink.set_volume(volume);
+            sink.set_volume(volume * global_audio_volume);
             sink.set_speed(speed);
             sink.detach();
         }
@@ -1011,10 +1012,10 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
 
     let mut gui_clay = clay_layout::Clay::new((1280., 720.).into());
 
-    let mut gui_ctx = ui::Context::new();
-    let mut ui_data = ui::UiData::default();
+    let mut ui   = ui::Context::new();
+    let mut data = ui::UiData::default();
 
-    gui_ctx.clay = &mut gui_clay;
+    ui.clay = &mut gui_clay;
 
     // let mut t: f64 = 0.0;
 
@@ -1026,6 +1027,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
 
     #[allow(deprecated)]
     event_loop.run(move |event, elwt: &winit::event_loop::ActiveEventLoop| {
+        unsafe { global_audio_volume = ui.global_audio_volume; }
         match event {
             winit::event::Event::Resumed => { // Runs at startup and is where we have to do init.
                 let twindow = Rc::new(elwt.create_window(
@@ -1146,7 +1148,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             let mut is_anything_happening_at_all_in_any_way = false;
 
                                             is_anything_happening_at_all_in_any_way |= did_window_resize;
-                                            is_anything_happening_at_all_in_any_way |= gui_ctx.debug;
+                                            is_anything_happening_at_all_in_any_way |= ui.debug;
                                             is_anything_happening_at_all_in_any_way |= input_ctx.mouse_moved;
                                             is_anything_happening_at_all_in_any_way |= input_ctx.scroll_delta != (0.0, 0.0);
                                             is_anything_happening_at_all_in_any_way |= input_ctx.zoom_delta != 0.0;
@@ -1307,15 +1309,15 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 *put = DrawCommand::ClearScreenToColor { color: 0x080808 /* @todo colors */};
                                             }
 
-                                            gui_ctx.input = &input_ctx;
-                                            gui_ctx.draw  = &draw_ctx;
-                                            gui_ctx.dpi_scale = window.scale_factor() as f32;
-                                            gui_ctx.delta = dt as f32;
+                                            ui.input = &input_ctx;
+                                            ui.draw  = &draw_ctx;
+                                            ui.dpi_scale = window.scale_factor() as f32;
+                                            ui.delta = dt as f32;
 
-                                            viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut gui_ctx, &draw_ctx, dt as f32, &input_ctx);
+                                            viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut ui, &draw_ctx, dt as f32, &input_ctx);
 
                                             {
-                                                let should_quit = ui_update(&mut gui_ctx, &mut ui_data, &mut viz_state, wallet_state.clone());
+                                                let should_quit = ui_update(&mut ui, &mut data, &mut viz_state, wallet_state.clone());
                                                 if should_quit {
                                                     elwt.exit();
                                                 }
@@ -1327,7 +1329,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 let old_pi= (last_frame_finalized_bc_height / UI_COPY_STAKING_DAY_PERIOD) * 2 + (last_frame_finalized_bc_height % UI_COPY_STAKING_DAY_PERIOD > UI_COPY_STAKING_DAY_WINDOW) as u64;
                                                 last_frame_finalized_bc_height = new_height;
 
-                                                let debug_do_anyway = gui_ctx.debug && input_ctx.key_pressed(KeyCode::F4);
+                                                let debug_do_anyway = ui.debug && input_ctx.key_pressed(KeyCode::F4);
                                                 if (new_pi as i64 - old_pi as i64).abs() == 1 || debug_do_anyway {
                                                     current_animation_id = new_pi;
                                                     current_animation_t = Some(0.0);
@@ -1513,7 +1515,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                         }
                                                     }
 
-                                                    let global_sound_volume = 0.7 * gui_ctx.global_audio_volume;
+                                                    let global_sound_volume = 0.7;
 
                                                     if old_t < 0.001 && t >= 0.001 {
                                                         play_sound(music_sound, global_sound_volume*music_volume, 1.0);
@@ -1536,9 +1538,9 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 }
                                             }
 
-                                            if (gui_ctx.prev_cursor != gui_ctx.cursor) {
-                                                gui_ctx.prev_cursor  = gui_ctx.cursor.clone();
-                                                window.set_cursor(gui_ctx.cursor.clone());
+                                            if (ui.prev_cursor != ui.cursor) {
+                                                ui.prev_cursor  = ui.cursor.clone();
+                                                window.set_cursor(ui.cursor.clone());
                                             }
 
                                             input_ctx.mouse_moved = false;
@@ -2010,7 +2012,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 *draw_ctx.debug_pixel_inspector_last_color = *(pixel_src as *mut u32);
                                             }
 
-                                            if gui_ctx.debug {
+                                            if ui.debug {
                                                 *draw_ctx.draw_command_count = 0;
                                                 draw_ctx.text_line(FontKind::Mono, 8.0, 8.0, 13.0,
                                                     &format!(
@@ -2111,7 +2113,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             let frame_pace_us = last_call_to_present_instant.elapsed().as_micros() as u64;
                                             last_call_to_present_instant = Instant::now();
 
-                                            let need_buffer_flip = need_buffer_flip || gui_ctx.debug;
+                                            let need_buffer_flip = need_buffer_flip || ui.debug;
                                             if need_buffer_flip {
                                                 if okay_but_is_it_wayland(elwt) {
                                                     window.pre_present_notify();

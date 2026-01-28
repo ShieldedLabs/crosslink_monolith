@@ -476,7 +476,7 @@ impl HSVA_RGBA for (u8, u8, u8, u8) {
 }
 
 impl Context {
-    pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, ..Default::default() } }
+    pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, global_audio_volume: 1.0, ..Default::default() } }
     pub fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw     } }
     pub fn input(&self) -> &InputCtx { unsafe { &*self.input    } }
     pub fn clay(&self)  -> &mut Clay { unsafe { &mut *self.clay } }
