@@ -3563,6 +3563,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             break (new_blocks, new_t_txs, sync_from_i, req_rng, prev_tip_chain_state);
         };
 
+        let wallets_sync_h = BlockHeight((pow_cache.next_tip_h-1).try_into().unwrap());
         let network_tip_h = user_wallet.chain_tip_h;
 
         // let mut orchard_frontier = prev_tip_chain_state.final_orchard_tree().clone();
@@ -3657,8 +3658,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
-        //-- READ DOWNLOADED MEMPOOL TXS
-        {
+        //-- READ DOWNLOADED MEMPOOL TXS (if we're close to sync'd)
+        if network_tip_h.0 <= wallets_sync_h.0 + 10 {
             // TODO: maybe wait until we're ~block-synced before doing this
             // NOTE: assumes we can keep up... maybe dropping with some feedback about that is better?
             let wallets = [&mut user_wallet, &mut miner_wallet];
@@ -3929,7 +3930,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             lock.stake_positions_bonded = stake_positions_bonded;
             lock.stake_positions_unbonded = stake_positions_unbonded;
 
-            lock.wallets_sync_h = pow_cache.next_tip_h-1;
+            lock.wallets_sync_h = wallets_sync_h.0.into();
             lock.wallets_tip_h = network_tip_h.0.into();
 
             lock.staked_balance = user_staked_funds;

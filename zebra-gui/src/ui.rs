@@ -897,13 +897,21 @@ fn chunkify(bytes: &[u8; 32]) -> [u64; 4] {
 }
 
 
-fn colour_from_hash(hash: [u8; 32]) -> (u8, u8, u8, u8) {
-    let (mut h, mut s, mut v) = (0u8, 0u8, 0u8);
-    for i in 0..32 {
-        h = ((h ^ hash[i]) as u32).wrapping_mul(hash[i] as u32).wrapping_mul(17*i as u32).wrapping_mul(402653189) as u8;
-        s = ((s ^ hash[i]) as u32).wrapping_mul(hash[i] as u32).wrapping_mul(37*i as u32).wrapping_mul(805306457) as u8;
-        v = ((v ^ hash[i]) as u32).wrapping_mul(hash[i] as u32).wrapping_mul(77*i as u32).wrapping_mul(1610612741) as u8;
-    }
+fn colour_from_hash(hash: &[u8; 32]) -> (u8, u8, u8, u8) {
+    // let (mut h, mut s, mut v) = (0u8, 0u8, 0u8);
+    // for i in 0..32 {
+    //     h = ((h ^ hash[i]) as u32).wrapping_mul(hash[i] as u32).wrapping_mul(17*i as u32).wrapping_mul(402653189) as u8;
+    //     s = ((s ^ hash[i]) as u32).wrapping_mul(hash[i] as u32).wrapping_mul(37*i as u32).wrapping_mul(805306457) as u8;
+    //     v = ((v ^ hash[i]) as u32).wrapping_mul(hash[i] as u32).wrapping_mul(77*i as u32).wrapping_mul(1610612741) as u8;
+    // }
+
+    let mut hasher = std::hash::DefaultHasher::new();
+    hasher.write(hash);
+    let val = hasher.finish();
+
+    let h = (val) as u8;
+    let mut s = (val >> 8) as u8;
+    let mut v = (val >> 16) as u8;
 
     s /= 4;
     s += 64;
@@ -936,7 +944,7 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[Wa
 
             if let el = elem().decl(Decl {
                 id: id_index("finalizer bar", i as u32),
-                colour: colour_from_hash(finalizer.pub_key),
+                colour: colour_from_hash(&finalizer.pub_key),
                 radius: {
                     let l = if !done_once { finalizer_pill_rad } else { 0.0 };
                     let r = if i == finalizers.len()-1 && rem == 0 { finalizer_pill_rad } else { 0.0 };
@@ -1524,7 +1532,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         } else {
                             if staked_roster_unbonded.len() > 0 {
-                                let id = id_index("ClaimableBondsContainer", 0);
+                                let id = id_index("WithdrawableBondsContainer", 0);
                                 let colour = BUTTON_GREY.mul(0.8);
                                 elem_bgn();
                                 decl(Decl {
@@ -1552,7 +1560,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                     ..Decl
                                 })
                                 {
-                                    ui.text("Claimable Bonds", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
+                                    ui.text("Withdrawable Bonds", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
                                     let _ = elem().decl(Decl { width: grow!(), ..Decl });
                                     let colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
                                     ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(total_unbonded)), TextDecl { font: Mono, colour, h: ui.scale(18.0), align: AlignX::Right, ..TextDecl });
@@ -1617,9 +1625,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 align: Left,
                                                 ..Decl
                                             }) {
-                                                let chunks = chunkify(&bond_key);
-
-                                                ui.text(frame_strf!(data, "{}", display_str(&chunks)), TextDecl { font: Mono, h: ui.scale(14.0), align: AlignX::Left, ..TextDecl });
+                                                ui.text(frame_strf!(data, "{}", display_str(&chunkify(&bond_key))), TextDecl { font: Mono, h: ui.scale(14.0), align: AlignX::Left, ..TextDecl });
                                             }
 
                                             // right info
@@ -1731,8 +1737,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 total_bonded_to_finalizer += staked_roster_bonded[i].2;
                                             }
 
-                                            let chunks = chunkify(&finalizer);
-                                            let label = frame_strf!(data, "{}", display_str(&chunks));
+                                            let label = frame_strf!(data, "{}", display_str(&chunkify(&finalizer)));
 
                                             let id = id_index(label, index);
 
@@ -1758,6 +1763,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 colour,
                                                 radius,
                                                 padding,
+                                                child_gap,
                                                 width:  percent!(1.0),
                                                 height: fit!(),
                                                 align:  Left,
@@ -1766,7 +1772,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                             })
                                             {
                                                 // ui.text("Staked to:", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
-                                                ui.text(label, TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
+                                                let h = ui.scale(18.0);
+                                                let _ = elem().decl(Decl { width: fixed!(h), height: fixed!(h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&finalizer), ..Decl });
+
+                                                ui.text(label, TextDecl { colour: text_colour, h, align: AlignX::Left, ..TextDecl });
                                                 let _ = elem().decl(Decl { width: grow!(), ..Decl });
                                                 let pct = 100.0 * (total_bonded_to_finalizer as f64 / total_bonded as f64);
                                                 let colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
@@ -1845,9 +1854,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 align: Left,
                                                 ..Decl
                                             }) {
-                                                let chunks = chunkify(&bond_key);
-
-                                                ui.text(frame_strf!(data, "{}", display_str(&chunks)), TextDecl { font: Mono, h: ui.scale(14.0), align: AlignX::Left, ..TextDecl });
+                                                ui.text(frame_strf!(data, "{}", display_str(&chunkify(&bond_key))), TextDecl { font: Mono, h: ui.scale(14.0), align: AlignX::Left, ..TextDecl });
                                             }
 
                                             // right info
@@ -2655,6 +2662,10 @@ pub fn ui_right_pane(ui: &mut Context,
                             }
                         }
 
+                        // finalizer colour token
+                        let info_h = ui.scale(18.0);
+                        let _ = elem().decl(Decl { width: fixed!(info_h), height: fixed!(info_h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&member.pub_key), ..Decl });
+
                         // info
                         if let _ = elem().decl(Decl {
                             id: id_index("Roster Member Info", index as u32),
@@ -2664,21 +2675,7 @@ pub fn ui_right_pane(ui: &mut Context,
                             align: Left,
                             ..Decl
                         }) {
-                            let bytes = member.pub_key;
-                            let chunks = {
-                                let mut chunks = [0u64; 4];
-                                for i in 0..4 {
-                                    let start = i * 8;
-                                    let end = start + 8;
-                                    let mut buf = [0u8; 8];
-                                    buf.copy_from_slice(&bytes[start..end]);
-                                    chunks[i] = u64::from_le_bytes(buf);
-                                }
-
-                                chunks
-                            };
-
-                            ui.text(frame_strf!(data, "{}", display_str(&chunks)), TextDecl { font: Mono, h: ui.scale(18.0), align: AlignX::Left, ..TextDecl });
+                            ui.text(frame_strf!(data, "{}", display_str(&chunkify(&member.pub_key))), TextDecl { font: Mono, h: info_h, align: AlignX::Left, ..TextDecl });
                         }
 
                         // right info
