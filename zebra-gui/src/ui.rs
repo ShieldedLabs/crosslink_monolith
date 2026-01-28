@@ -925,6 +925,7 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[Wa
         ..Decl
     }) {
         let mut rem = 0;
+        let mut done_once = false; // need for the left pill rad
         for (i, finalizer) in finalizers.iter().enumerate() {
             let pct = finalizer.voting_power as f32 / total_val as f32;
             if pct <= 0.01 {
@@ -936,7 +937,7 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[Wa
                 id: id_index("finalizer bar", i as u32),
                 colour: colour_from_hash(finalizer.pub_key),
                 radius: {
-                    let l = if i == 0 { finalizer_pill_rad } else { 0.0 };
+                    let l = if !done_once { finalizer_pill_rad } else { 0.0 };
                     let r = if i == finalizers.len()-1 && rem == 0 { finalizer_pill_rad } else { 0.0 };
                     (r, l, r, l) // TODO: order??
                 },
@@ -951,6 +952,8 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[Wa
                         str_from_ctaz(finalizer.voting_power), 100.0*pct);
                 }
             }
+
+            done_once = true;
         }
 
         if rem != 0 {
