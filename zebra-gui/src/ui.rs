@@ -2092,16 +2092,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                     let culled_txs = &txs[culled_in_bgn_o .. culled_in_end_o];
                     for (index, tx) in culled_txs.iter().enumerate() {
-                        let index_real = index;
-                        let index = index + culled_pre_n;
-                        // if index < 0 {
-                        //     continue;
-                        // }
-                        // if index > culled_in_n {
-                        //     break;
-                        // }
-
-                        if index > 0 { // separator
+                        if index + culled_pre_n > 0 { // separator
                             let colour = {
                                 let mut col = TRANSACTION_HISTORY_CONTAINER_COL;
                                 col = col.hsva();
