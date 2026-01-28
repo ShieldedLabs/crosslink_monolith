@@ -835,7 +835,14 @@ pub static FONT_PIXEL_TINY5: &[u8] = include_bytes!("../assets/Tiny5-Regular.ttf
 pub static FONT_PIXEL_GOHU_11: &[u8] = include_bytes!("../assets/gohufont-uni-11.ttf");
 pub static FONT_PIXEL_GOHU_14: &[u8] = include_bytes!("../assets/gohufont-uni-14.ttf");
 
+// These only exist for global volume. A mixer would be better but this is the minimal diff.
+struct PlayingSound {
+    sink: rodio::Sink,
+    volume: f32, // base volume before multiplication by global volume
+}
+
 static mut GLOBAL_OUTPUT_STREAM : *mut rodio::OutputStream = std::ptr::null_mut();
+static mut playing_sounds: *mut Vec<PlayingSound> = std::ptr::null_mut(); // These only exist for global volume. A mixer would be better but this is the minimal diff.
 static mut global_audio_volume: f32 = 1.0;
 pub fn setup_audio() {
     unsafe {
@@ -844,6 +851,13 @@ pub fn setup_audio() {
                 GLOBAL_OUTPUT_STREAM = alloc(Layout::new::<rodio::OutputStream>()) as *mut rodio::OutputStream;
                 copy_nonoverlapping(&stream, GLOBAL_OUTPUT_STREAM, 1);
                 std::mem::forget(stream);
+            }
+        }
+        if playing_sounds == std::ptr::null_mut() {
+            if let vec = Vec::<PlayingSound>::new() {
+                playing_sounds = alloc(Layout::new::<Vec<PlayingSound>>()) as *mut Vec<PlayingSound>;
+                copy_nonoverlapping(&vec, playing_sounds, 1);
+                std::mem::forget(vec);
             }
         }
     }
@@ -856,7 +870,10 @@ pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
             let sink = rodio::play(stream.mixer(), std::io::Cursor::new(sound_file)).unwrap();
             sink.set_volume(volume * global_audio_volume);
             sink.set_speed(speed);
-            sink.detach();
+
+            let playing = &mut *playing_sounds;
+            playing.retain(|s| !s.sink.empty()); // prune finished sounds
+            playing.push(PlayingSound { sink, volume });
         }
     }
 }
@@ -1027,7 +1044,18 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
 
     #[allow(deprecated)]
     event_loop.run(move |event, elwt: &winit::event_loop::ActiveEventLoop| {
-        unsafe { global_audio_volume = ui.global_audio_volume; }
+        unsafe {
+            global_audio_volume = ui.global_audio_volume;
+
+            if playing_sounds != std::ptr::null_mut() {
+                let playing = &mut *playing_sounds;
+                playing.retain(|s| !s.sink.empty());
+                for s in playing.iter() {
+                    s.sink.set_volume(s.volume * global_audio_volume);
+                }
+            }
+        }
+
         match event {
             winit::event::Event::Resumed => { // Runs at startup and is where we have to do init.
                 let twindow = Rc::new(elwt.create_window(
