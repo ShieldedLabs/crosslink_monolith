@@ -2416,17 +2416,17 @@ void Clay__SizeContainersAlongAxis(bool xAxis) {
                 }
             }
 
-            // Clamp char-wrapped children to the width of their container. This is used in char-wrapping to determine how much extra wrapping to do.
-            for (int32_t childOffset = 0; childOffset < parent->childrenOrTextContent.children.length; childOffset++) {
-                int32_t childElementIndex = parent->childrenOrTextContent.children.elements[childOffset];
-                Clay_LayoutElement *childElement = Clay_LayoutElementArray_Get(&context->layoutElements, childElementIndex);
-
-                // @Hack. This is only tested on fixed() size parent containers.
-                if (Clay__ElementHasConfig(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT)
-                    && Clay__FindElementConfigWithType(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig->wrapMode == CLAY_TEXT_WRAP_CHARS) {
-                    childElement->dimensions.width = CLAY__MIN(childElement->dimensions.width, parentSize - parentPadding);
-                }
-            }
+            // // Clamp char-wrapped children to the width of their container. This is used in char-wrapping to determine how much extra wrapping to do.
+            // for (int32_t childOffset = 0; childOffset < parent->childrenOrTextContent.children.length; childOffset++) {
+            //     int32_t childElementIndex = parent->childrenOrTextContent.children.elements[childOffset];
+            //     Clay_LayoutElement *childElement = Clay_LayoutElementArray_Get(&context->layoutElements, childElementIndex);
+            // 
+            //     // @Hack. This is only tested on fixed() size parent containers.
+            //     if (Clay__ElementHasConfig(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT)
+            //         && Clay__FindElementConfigWithType(childElement, CLAY__ELEMENT_CONFIG_TYPE_TEXT).textElementConfig->wrapMode == CLAY_TEXT_WRAP_CHARS) {
+            //         childElement->dimensions.width = CLAY__MIN(childElement->dimensions.width, parentSize - parentPadding);
+            //     }
+            // }
         }
     }
 }
