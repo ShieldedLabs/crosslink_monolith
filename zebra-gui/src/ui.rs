@@ -1386,11 +1386,11 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
                     let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
 
-                    let can = is_staking_day && hex_dest.is_some();
+                    let can = hex_dest.is_some();
                     let label = "Retarget";
                     let id = id(label);
                     if button_ex(ui, id, label, can) { wallet_state.lock().unwrap().retarget_bond(ui.retarget_modal_bond_key, hex_dest.unwrap()); }
-                    if !can && !is_staking_day && ui.hovered(id) {
+                    if !can && ui.hovered(id) {
                         set_tooltip_text!(data, "You can only retarget stake during Staking Day.");
                     }
                 }
@@ -1830,12 +1830,9 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }) {
                                                 let (icon, icon_hovered) = (ICON_MOVE, ICON_RESIZE_FULL_ALT);
                                                 let id = id_index("Retarget Button", index as u32);
-                                                if clickable_icon(ui, id, icon, icon_hovered, can) {
+                                                if clickable_icon(ui, id, icon, icon_hovered, true) {
                                                     ui.modal = Modal::Retarget;
                                                     ui.retarget_modal_bond_key = bond_key;
-                                                }
-                                                if !can && !is_staking_day && ui.hovered(id) {
-                                                    set_tooltip_text!(data, "You can only retarget stake during Staking Day.");
                                                 }
                                             }
 
