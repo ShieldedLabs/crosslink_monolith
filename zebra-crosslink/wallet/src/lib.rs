@@ -862,7 +862,6 @@ pub struct WalletState {
 
     pub staked_balance:  u64, // in zats
     pub withdrawable_balance:  u64, // in zats
-    pub show_staked_balance: bool,
 
     pub user_local_txs_n: usize,
     pub user_local_txs: [WalletTx; 3],
