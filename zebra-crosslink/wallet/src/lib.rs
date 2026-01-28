@@ -3659,7 +3659,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         //-- READ DOWNLOADED MEMPOOL TXS (if we're close to sync'd)
-        if network_tip_h.0 <= wallets_sync_h.0 + 10 {
+        // if network_tip_h.0 <= wallets_sync_h.0 + 10 // TODO: we want this on the download start
+        {
             // TODO: maybe wait until we're ~block-synced before doing this
             // NOTE: assumes we can keep up... maybe dropping with some feedback about that is better?
             let wallets = [&mut user_wallet, &mut miner_wallet];
@@ -3831,7 +3832,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let mut stake_positions_bonded = Vec::new();
             let mut stake_positions_unbonded = Vec::new();
             for tx in &user_wallet.txs {
-                if !tx.is_on_bc() { continue; }
+                if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
                 if let Some(staking_action) = (&tx.staking_action) {
                     if let Some(create_bond) = StakingAction_CreateNewDelegationBond::try_from_union(staking_action) {
                         stake_positions_bonded.push((create_bond.unique_pubkey, create_bond.target_finalizer, create_bond.amount_zats));
