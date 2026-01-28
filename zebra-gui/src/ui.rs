@@ -2034,13 +2034,17 @@ pub fn ui_left_pane(ui: &mut Context,
         let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
         let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
 
+        ui.tx_outer_container_hack_id = id("History Scroll Outer Container");
+
         let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("History Scroll Container"), 96.0);
         if txs.len() == 0 {
             clip = ClipMode::None;
             *scroll = 0.0;
         }
+
         let scroll = *scroll;
         if let _ = elem().decl(Decl {
+            id: ui.tx_outer_container_hack_id,
             colour: TRANSACTION_HISTORY_CONTAINER_COL,
             radius: padding.0.dup4(),
             width:  percent!(1.0),
@@ -3184,15 +3188,27 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
     {
         let mut nav_bbox: Option<(isize, isize, isize, isize)> = None;
 
-        for command in render_commands {
+        for mut command in render_commands {
+            if command.id == ui.tx_outer_container_hack_id.id {
+                // @HackBecauseClayRefusesToBoundTheHeightOfTheScrollContainerAgainstOurExplicitRequestForNoKnownReasonButOnlyInProductionAndNotInTheTestingGuiBuild
+                if command.bounding_box.height > window_h - command.bounding_box.y {
+                    command.bounding_box.height = window_h - command.bounding_box.y;
+                }
+            }
+
+            if let Some(scroll_container_state) = data.scroll_containers.get_mut(&command.id) {
+                // @HackBecauseClayRefusesToBoundTheHeightOfTheScrollContainerAgainstOurExplicitRequestForNoKnownReasonButOnlyInProductionAndNotInTheTestingGuiBuild
+                if command.bounding_box.height > window_h - command.bounding_box.y {
+                    command.bounding_box.height = window_h - command.bounding_box.y;
+                }
+
+                scroll_container_state.viewport_height = command.bounding_box.height.min(window_h);
+            }
+
             let x1 = (command.bounding_box.x)                               as isize;
             let y1 = (command.bounding_box.y)                               as isize;
             let x2 = (command.bounding_box.x + command.bounding_box.width)  as isize;
             let y2 = (command.bounding_box.y + command.bounding_box.height) as isize;
-
-            if let Some(scroll_container_state) = data.scroll_containers.get_mut(&command.id) {
-                scroll_container_state.viewport_height = command.bounding_box.height.min(window_h);
-            }
 
             if command.id == tooltip_id.id {
                 ui.tooltip_w = command.bounding_box.width  as f32;
@@ -3389,6 +3405,8 @@ pub struct Context {
 
     pub cursor: winit::window::Cursor,
     pub prev_cursor: winit::window::Cursor,
+
+    pub tx_outer_container_hack_id: Id,
 
     pub debug: bool,
     pub pixel_inspector_primed: bool,
