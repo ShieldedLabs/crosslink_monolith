@@ -15,7 +15,7 @@ const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
 const PRINT_RNGS:           bool = 0 == 1;
 const PRINT_SIGN:           bool = 0 == 1;
-const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
+const PRINT_BFT_PROPOSAL:   bool = 1 == 1;
 const PRINT_BFT_VOTE:       bool = 1 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
@@ -803,7 +803,9 @@ impl TMState {
             let proposal = if let Some(valid_value) = self.valid_value_round.0.clone() {
                 Some(valid_value)
             } else {
-                self.propose_closure.0().await
+                let ret = self.propose_closure.0().await;
+                if PRINT_BFT_PROPOSAL { if ret.is_none() { println!("{} propose closure returned None.", self.ctx_str(roster)); } }
+                ret
             };
             if PRINT_BFT_PROPOSAL { if let Some(proposal) = &proposal { println!("{} about to propose with status '{:?}': {:?}", self.ctx_str(roster), self.validate_closure.0(&proposal).await, proposal); } }
 
