@@ -283,6 +283,18 @@
       "src": "iconic"
     },
     {
+      "uid": "8489d61496923b1159b01d8a0a7b2df0",
+      "css": "volume-off",
+      "code": 59436,
+      "src": "elusive"
+    },
+    {
+      "uid": "012ff5762ccb18c16bdfdd6baf187406",
+      "css": "volume-up",
+      "code": 59437,
+      "src": "elusive"
+    },
+    {
       "uid": "5d2d07f112b8de19f2c0dbfec3e42c05",
       "css": "spin5",
       "code": 59448,
