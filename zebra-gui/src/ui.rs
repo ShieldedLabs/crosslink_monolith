@@ -1387,7 +1387,12 @@ pub fn ui_left_pane(ui: &mut Context,
                     let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
 
                     let can = is_staking_day && hex_dest.is_some();
-                    if button(ui, "Retarget", can) { wallet_state.lock().unwrap().retarget_bond(ui.retarget_modal_bond_key, hex_dest.unwrap()); }
+                    let label = "Retarget";
+                    let id = id(label);
+                    if button_ex(ui, id, label, can) { wallet_state.lock().unwrap().retarget_bond(ui.retarget_modal_bond_key, hex_dest.unwrap()); }
+                    if !can && !is_staking_day && ui.hovered(id) {
+                        set_tooltip_text!(data, "You can only retarget stake during Staking Day.");
+                    }
                 }
                 Modal::Unstake => {
                     title_bar(ui, true, "Unstake", id("Unstake Title Bar"));
