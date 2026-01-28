@@ -8,7 +8,7 @@ const PRINT_PROTOCOL:       bool = 1 == 1;
 const PRINT_PROTOCOL_TAG:   bool = 0 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
 const PRINT_ROSTER_CMD:     bool = 1 == 1;
-const PRINT_NETWORK_STATS:  bool = 1 == 1;
+const PRINT_NETWORK_STATS:  bool = 0 == 1;
 const PRINT_PEERS:          bool = 0 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
