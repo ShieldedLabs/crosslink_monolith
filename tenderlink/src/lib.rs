@@ -2007,7 +2007,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             let block_size = bytes.len().try_into().unwrap();
             let bytes      = &bytes[..];
 
-            for chunk_i in chunk_needed_i..(chunk_needed_i + 4).min(chunks_n) {
+            for chunk_i in chunk_needed_i..(chunk_needed_i + 2).min(chunks_n) {
                 let (chunk_o, chunk_size) = powlink_chunk_o_size(bytes.len(), chunk_i);
                 let chunk_i: u16          = chunk_i.try_into().unwrap();
                 let chunk                 = PacketPowlinkChunkHeader { hash, block_size, chunk_i };
