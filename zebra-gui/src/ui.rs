@@ -1468,7 +1468,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         clicked
                     };
 
-                    let mut clickable_icon = |ui: &mut Context, id, icon, icon_hovered, enabled | {
+                    let clickable_icon = |ui: &mut Context, id, icon, icon_hovered, enabled | {
                         let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
 
                         let icon = if ui.hovered(id) { icon_hovered } else { icon };
@@ -2534,7 +2534,7 @@ pub fn ui_right_pane(ui: &mut Context,
             clicked
         };
 
-        let mut clickable_icon = |ui: &mut Context, id, icon, enabled | {
+        let clickable_icon = |ui: &mut Context, id, icon, enabled | {
             let (clicked, colour, _) = ui.button_ex(false, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
             if let _ = elem().decl(Decl {
                 id,
@@ -2946,12 +2946,13 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         }) {
             if let _elem = elem().decl(Decl {
                 id: id("Readability Box"),
-                direction: TopToBottom,
+                direction: LeftToRight,
                 align: Top,
                 width: grow!(),
                 height: fit!(),
                 ..Decl
             }) {
+                let _ = elem().decl(Decl { width: grow!(), ..Decl });
                 if let _ = elem().decl(Decl {
                     radius,
                     padding: padding.mul(0.5),
@@ -2976,6 +2977,34 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         for peer in &viz.peer_strings {
                             ui.text(peer, decl);
                         }
+                    }
+                }
+
+                if let _ = elem().decl(Decl {
+                    width: grow!(),
+                    align: TopRight,
+                    ..Decl
+                }) {
+                    let id = id("Mute Toggle");
+
+                    let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, true, winit::window::CursorIcon::Pointer);
+
+                    let icon = if ui.global_audio_volume > 0.5 { ICON_VOLUME_UP } else { ICON_VOLUME_OFF };
+                    if ui.global_audio_volume > 0.5 { ui.global_audio_volume = 1.0 } else { ui.global_audio_volume = 0.0 };
+                    if let _ = elem().decl(Decl {
+                        id,
+                        child_gap,
+                        align: Center,
+                        direction: TopToBottom,
+                        width: fit!(),
+                        height: fit!(),
+                        ..Decl
+                    }) {
+                        ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(32.0), align: AlignX::Center, ..TextDecl });
+                    }
+
+                    if clicked {
+                        if ui.global_audio_volume > 0.5 { ui.global_audio_volume = 0.0 } else { ui.global_audio_volume = 1.0 };
                     }
                 }
             }
@@ -3346,6 +3375,8 @@ pub struct Context {
     pub input: *const InputCtx,
     pub draw:  *const DrawCtx,
     pub clay:  *mut   Clay,
+
+    pub global_audio_volume: f32,
 
     pub cursor: winit::window::Cursor,
     pub prev_cursor: winit::window::Cursor,

@@ -1513,7 +1513,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                         }
                                                     }
 
-                                                    let global_sound_volume = 0.7;
+                                                    let global_sound_volume = 0.7 * gui_ctx.global_audio_volume;
 
                                                     if old_t < 0.001 && t >= 0.001 {
                                                         play_sound(music_sound, global_sound_volume*music_volume, 1.0);
