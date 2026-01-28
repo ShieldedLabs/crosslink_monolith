@@ -72,7 +72,7 @@ use crate::components::{
 mod tests;
 
 /// The number of peers to request transactions from per crawl event.
-const FANOUT: usize = 3;
+const FANOUT: usize = 5;
 
 /// The delay between crawl events.
 ///
@@ -81,7 +81,7 @@ const FANOUT: usize = 3;
 ///
 /// Using a prime number makes sure that mempool crawler fanouts
 /// don't synchronise with other crawls.
-pub const RATE_LIMIT_DELAY: Duration = Duration::from_secs(73);
+pub const RATE_LIMIT_DELAY: Duration = Duration::from_secs(17);
 
 /// The time to wait for a peer response.
 ///

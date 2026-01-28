@@ -119,7 +119,7 @@ pub const TIPS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
 /// the network efficiently.
 ///
 /// If this timeout is set too low, the peer set and remote peers can get overloaded.
-pub const PEER_GOSSIP_DELAY: Duration = Duration::from_secs(7);
+pub const PEER_GOSSIP_DELAY: Duration = Duration::from_secs(3);
 
 /// Controls how long we wait for a block download request to complete.
 ///
