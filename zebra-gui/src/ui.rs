@@ -1893,12 +1893,6 @@ pub fn ui_left_pane(ui: &mut Context,
         clip: Clip,
         ..Decl
     }) {
-        let balance_text_h = ui.scale(48.0);
-        let accent_text_h  = ui.scale(16.0);
-
-        // spacer
-        // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
-
         let (
             balance,
             pending_balance,
@@ -1919,46 +1913,15 @@ pub fn ui_left_pane(ui: &mut Context,
             )}
         };
 
-        // balance container
-        if let _ = elem().decl(Decl {
-            id: balance_id,
-            width: grow!(),
-            height: fit!(),
-            direction: LeftToRight,
-            align: Center,
-            ..Decl
-        }) {
-            let balance_str = frame_strf!(data, "{} cTAZ", str_from_ctaz(balance.try_into().unwrap()), suffix);
-            ui.text(&balance_str, TextDecl { h: balance_text_h, align: AlignX::Center, ..TextDecl });
+        {
+            let decl = TextDecl { h: ui.scale(48.0), align: AlignX::Center, ..TextDecl };
+            ui.text(&frame_strf!(data, "{} cTAZ", str_from_ctaz(balance.try_into().unwrap())), decl);
         }
-
-        // pending container
-        if let _ = elem().decl(Decl {
-            width: grow!(),
-            height: fit!(),
-            align: Center,
-            ..Decl
-        }) {
-            let balance_str = frame_strf!(data, "{} cTAZ Pending", str_from_ctaz(pending_balance.try_into().unwrap()));
-            ui.text(&balance_str, TextDecl { h: accent_text_h, align: AlignX::Center, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
-        }
-        if let _ = elem().decl(Decl {
-            width: grow!(),
-            height: fit!(),
-            align: Center,
-            ..Decl
-        }) {
-            let staked_str = frame_strf!(data, "{} cTAZ Staked", str_from_ctaz(staked_balance.try_into().unwrap()));
-            ui.text(&staked_str, TextDecl { h: accent_text_h, align: AlignX::Center, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
-        }
-        if let _ = elem().decl(Decl {
-            width: grow!(),
-            height: fit!(),
-            align: Center,
-            ..Decl
-        }) {
-            let withdrawable_str = frame_strf!(data, "{} cTAZ Withdrawable", str_from_ctaz(withdrawable_balance.try_into().unwrap()));
-            ui.text(&withdrawable_str, TextDecl { h: accent_text_h, align: AlignX::Center, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl });
+        {
+            let decl = TextDecl { h: ui.scale(16.0), align: AlignX::Center, colour: (0x90, 0x90, 0x90, 0xff) /* @todo colors */, ..TextDecl };
+            ui.text(&frame_strf!(data, "{} cTAZ Pending",      str_from_ctaz(pending_balance.try_into().unwrap())),      decl);
+            ui.text(&frame_strf!(data, "{} cTAZ Staked",       str_from_ctaz(staked_balance.try_into().unwrap())),       decl);
+            ui.text(&frame_strf!(data, "{} cTAZ Withdrawable", str_from_ctaz(withdrawable_balance.try_into().unwrap())), decl);
         }
 
         // spacer
@@ -1971,9 +1934,8 @@ pub fn ui_left_pane(ui: &mut Context,
         let can = (*tab_id == tab_id_user_wallet);
         if can && let _ = elem().decl(Decl {
             id: id("Buttons Container"),
-            padding, child_gap, align: Center,
-            width: grow!(),
-            height: fit!(),
+            child_gap,
+            align: Center,
             ..Decl
         }) {
 
@@ -2227,7 +2189,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             icon_colour = icon_colour.mul(deemph_mul);
 
                             // left icon
-                            if let _ = elem().decl(Decl {
+                            if /*false &&*/ let _ = elem().decl(Decl {
                                 id: id_index("Left Icon", index as u32),
                                 height: fit!(),
                                 width: fixed!(ui.scale(32.0)),
@@ -2264,7 +2226,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
 
                             // info
-                            if let _ = elem().decl(Decl {
+                            if let _elem = elem().decl(Decl {
                                 id: id_index("Centre Info", index as u32),
                                 height: fit!(),
                                 width: grow!(),
@@ -2284,23 +2246,24 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unbonded"  } else { "Unbonding..." },
                                 };
 
-                                let label_str = if tx_is_in_block {
-                                    frame_strf!(data, "{} @ {}", label, tx_h.0)
-                                } else {
-                                    frame_strf!(data, "{}", label)
-                                };
+                                /* // */ let label_str = if tx_is_in_block {
+                                /* // */     frame_strf!(data, "{} @ {}", label, tx_h.0)
+                                /* // */ } else {
+                                /* // */     frame_strf!(data, "{}", label)
+                                /* // */ };
+                                // let label_str = frame_strf!(data, "{}", index);
 
                                 ui.text(label_str, TextDecl { h: kind_text_h, align: AlignX::Left, colour: text_colour, ..TextDecl });
 
                                 let details_col = text_colour.mul(deemph_mul);
                                 // spacer
-                                if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
+                                /* // */ if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
                                 let txid = tx.txid.to_string();
-                                ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { font: Mono, h: transaction_text_h, colour: details_col, align: AlignX::Left, ..TextDecl });
+                                /* // */ ui.text(frame_strf!(data, "{}..{}", &txid[0..8], &txid[txid.len() - 8..]), TextDecl { font: Mono, h: transaction_text_h, colour: details_col, align: AlignX::Left, ..TextDecl });
 
                                 // spacer
-                                if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
+                                /* // */ if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
                                 if let Ok(memo_str) = String::from_utf8(tx.memo.as_slice().to_vec()) {
                                     let mut memo_str = memo_str.chars().filter(|c| c.is_ascii()).collect::<String>().trim_end_matches(|c| c == '\0').to_string();
@@ -2311,13 +2274,13 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }
                                         }
 
-                                        ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: details_col, ..TextDecl });
+                                        /* // */ ui.text(frame_strf!(data, "{}", memo_str), TextDecl { h: transaction_text_h, align: AlignX::Left, colour: details_col, ..TextDecl });
                                     }
                                 }
                             }
 
                             // right info
-                            if let _ = elem().decl(Decl {
+                            if /*false &&*/ let _ = elem().decl(Decl {
                                 id: id_index("Right Info", index as u32),
                                 height: grow!(),
                                 width: fit!(),
