@@ -1162,10 +1162,15 @@ pub fn ui_left_pane(ui: &mut Context,
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                        data.send_address = ui.textbox(data, id("Send Address Textbox"), "Destination address...", TextDecl {
-                            h: ui.scale(16.0),
-                            ..TextDecl
-                        });
+                        let mut send_address = "0000000000000000";
+                        if data.send_address.len() >= 16 {
+                            send_address = &data.send_address;
+                        }
+
+                        ui.text(frame_strf!(data, "[{}..{}]", &send_address[..8], &send_address[send_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                        if button_ex(ui, "Paste Address", true) {
+                            data.send_address = ui.input().get_from_clipboard().trim().to_string();
+                        }
 
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
