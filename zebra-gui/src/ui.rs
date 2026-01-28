@@ -1036,6 +1036,47 @@ pub fn ui_left_pane(ui: &mut Context,
 
     let is_staking_day = viz.bc_finalized_tip_height % UI_COPY_STAKING_DAY_PERIOD <= UI_COPY_STAKING_DAY_WINDOW;
 
+    // USER STAKING POSITIONS
+    // TODO: phillip audaciously deleted the accumulated bond amount field, bring that back
+    let mut staked_roster_unbonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* current estimated */)>;
+    let mut staked_roster_bonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* current estimated */)>;
+    let mut bonded_finalizers = Vec::<WalletRosterMember>::new();
+    let (mut total_bonded, mut total_unbonded) = (0, 0);
+    {
+        {
+            let lock = wallet_state.lock().unwrap();
+            staked_roster_unbonded = lock.stake_positions_unbonded.clone();
+            staked_roster_bonded = lock.stake_positions_bonded.clone();
+        }
+
+        staked_roster_unbonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
+        staked_roster_bonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
+
+        for position in &staked_roster_unbonded {
+            total_unbonded += position.2;
+        }
+
+        let mut prev_finalizer: Option<[u8; 32]> = None;
+        for i in 0..staked_roster_bonded.len() {
+            let &(bond_key, finalizer, position) = &staked_roster_bonded[i];
+
+            if Some(finalizer) == prev_finalizer {
+                bonded_finalizers.last_mut().unwrap().voting_power += position;
+            } else {
+                prev_finalizer = Some(finalizer);
+                bonded_finalizers.push(WalletRosterMember {
+                    pub_key: finalizer,
+                    voting_power: position,
+                    txids: Vec::new(),
+                });
+            }
+
+            total_bonded += position;
+        }
+    }
+
+
+
     if ui.modal != Modal::None && let _elem = elem().decl(Decl {
         child_gap,
         id: id("Modal Container"),
@@ -1404,44 +1445,6 @@ pub fn ui_left_pane(ui: &mut Context,
                 }
                 Modal::Unstake => {
                     title_bar(ui, true, "Unstake", id("Unstake Title Bar"));
-
-                    // TODO: phillip audaciously deleted the accumulated bond amount field, bring that back
-                    let mut staked_roster_unbonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* current estimated */)>;
-                    let mut staked_roster_bonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* current estimated */)>;
-                    {
-                        let lock = wallet_state.lock().unwrap();
-                        staked_roster_unbonded = lock.stake_positions_unbonded.clone();
-                        staked_roster_bonded = lock.stake_positions_bonded.clone();
-                    }
-
-                    staked_roster_unbonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
-                    staked_roster_bonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
-
-                    let mut total_unbonded = 0;
-                    for position in &staked_roster_unbonded {
-                        total_unbonded += position.2;
-                    }
-
-                    let mut bonded_finalizers = Vec::<WalletRosterMember>::new();
-                    let mut total_bonded = 0;
-                    let mut prev_finalizer: Option<[u8; 32]> = None;
-                    for i in 0..staked_roster_bonded.len() {
-                        let &(bond_key, finalizer, position) = &staked_roster_bonded[i];
-
-                        if Some(finalizer) == prev_finalizer {
-                            bonded_finalizers.last_mut().unwrap().voting_power += position;
-                        } else {
-                            prev_finalizer = Some(finalizer);
-                            bonded_finalizers.push(WalletRosterMember {
-                                pub_key: finalizer,
-                                voting_power: position,
-                                txids: Vec::new(),
-                            });
-                        }
-
-                        total_bonded += position;
-                    }
-
 
                     let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
                         let id = id(label);
@@ -2265,7 +2268,8 @@ pub fn ui_left_pane(ui: &mut Context,
                                 align: Left,
                                 ..Decl
                             }) {
-                                let label = match tx.kind() {
+                                let tx_kind = tx.kind();
+                                let label = match tx_kind {
                                     WalletTxKind::Send          => if tx_is_in_block { "Sent"      } else { "Sending..."   },
                                     WalletTxKind::Receive       => if tx_is_in_block { "Received"  } else { "Receiving..." },
                                     WalletTxKind::Mine          => if tx_is_in_block { "Mined"     } else { "Mining..."    },
@@ -2274,14 +2278,79 @@ pub fn ui_left_pane(ui: &mut Context,
                                     WalletTxKind::Stake         => if tx_is_in_block { "Staked"    } else { "Staking..."   },
                                     WalletTxKind::BeginUnstake  => if tx_is_in_block { "Unstaked"  } else { "Unstaking..." },
                                     WalletTxKind::Retarget      => if tx_is_in_block { "Moved Delegation"  } else { "Moving Delegation..." },
-                                    WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Unbonded"  } else { "Unbonding..." },
+                                    WalletTxKind::ClaimUnstake  => if tx_is_in_block { "Withdrawn"  } else { "Withdrawing..." },
                                 };
 
-                                /* // */ let label_str = if tx_is_in_block {
-                                /* // */     frame_strf!(data, "{} @ {}", label, tx_h.0)
-                                /* // */ } else {
-                                /* // */     frame_strf!(data, "{}", label)
-                                /* // */ };
+                                let label_str = 'get_label: {
+                                    if tx_is_in_block {
+                                        // NOTE: this assumes that objects maintain bond keys after retargeting
+                                        if let Some(staking_action) = tx.staking_action {
+                                            let sent_stake = (tx_kind == WalletTxKind::Stake || tx_kind == WalletTxKind::Retarget);
+
+                                            if sent_stake {
+                                                for bond in &staked_roster_bonded {
+                                                    if bond.0 == staking_action.arg32_0 {
+                                                        // TODO: split mono
+                                                        break 'get_label if bond.1 != staking_action.arg32_2 {
+                                                            frame_strf!(data, "{} @ {} to {} (moved to {}), now {} cTAZ", label, tx_h.0, display_str(&chunkify(&staking_action.arg32_2)), display_str(&chunkify(&bond.1)), str_from_ctaz(bond.2))
+                                                        } else {
+                                                            frame_strf!(data, "{} @ {} to {}, now {} cTAZ", label, tx_h.0, display_str(&chunkify(&staking_action.arg32_2)), str_from_ctaz(bond.2))
+                                                        };
+                                                    }
+                                                }
+
+                                                for bond in &staked_roster_unbonded {
+                                                    if bond.0 == staking_action.arg32_0 {
+                                                        break 'get_label frame_strf!(data, "{} @ {} to {} (unstaked), now {} cTAZ", label, tx_h.0, display_str(&chunkify(&staking_action.arg32_2)), str_from_ctaz(bond.2))
+                                                    }
+                                                }
+                                            }
+
+                                            // TODO: compress
+                                            if tx_kind == WalletTxKind::ClaimUnstake {
+                                                // NOTE: ignoring fee
+                                                let b = WalletTxPart::from_staking_action(tx.staking_action);
+                                                break 'get_label frame_strf!(data, "{} @ {}", label, tx_h.0);
+                                            }
+
+                                            let withdrawal = 'withdrawal: {
+                                                let mut tx_i = index+1;
+                                                while tx_i < txs.len() {
+                                                    if !(txs[tx_i].is_on_bc() && txs[tx_i].h.is_in_block()) {
+                                                        continue;
+                                                    }
+                                                    if let (Some(staking_action), WalletTxKind::ClaimUnstake) = (txs[tx_i].staking_action, txs[tx_i].kind()) {
+                                                        // NOTE: ignoring fee
+                                                        let b = WalletTxPart::from_staking_action(txs[tx_i].staking_action);
+                                                        break 'withdrawal Some((b, txs[tx_i].h));
+                                                    }
+                                                    tx_i += 1;
+                                                }
+                                                None
+                                            };
+
+                                            if let Some(withdrawal) = withdrawal {
+                                                let (b, h) = withdrawal;
+                                                break 'get_label if sent_stake {
+                                                    frame_strf!(data, "{} @ {} to {}, claimed @ {} for {} cTAZ", label, tx_h.0, display_str(&chunkify(&staking_action.arg32_2)), h, str_from_ctaz(b.spent_zats.into_u64()))
+                                                } else {
+                                                    frame_strf!(data, "{} @ {}, claimed @ {} for {} cTAZ", label, tx_h.0, h, str_from_ctaz(b.spent_zats.into_u64()))
+                                                };
+                                            }
+
+                                            // fallback if not found anywhere, not ideal
+                                            if sent_stake {
+                                                frame_strf!(data, "{} @ {} to {}", label, tx_h.0, display_str(&chunkify(&staking_action.arg32_2)))
+                                            } else {
+                                                frame_strf!(data, "{} @ {}", label, tx_h.0)
+                                            }
+                                        } else {
+                                            frame_strf!(data, "{} @ {}", label, tx_h.0)
+                                        }
+                                    } else {
+                                        frame_strf!(data, "{}", label)
+                                    }
+                                };
                                 // let label_str = frame_strf!(data, "{}", index);
 
                                 ui.text(label_str, TextDecl { h: kind_text_h, align: AlignX::Left, colour: text_colour, ..TextDecl });

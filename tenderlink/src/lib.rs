@@ -15,7 +15,7 @@ const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
 const PRINT_RNGS:           bool = 0 == 1;
 const PRINT_SIGN:           bool = 0 == 1;
-const PRINT_BFT_PROPOSAL:   bool = 1 == 1;
+const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
 const PRINT_BFT_VOTE:       bool = 1 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
