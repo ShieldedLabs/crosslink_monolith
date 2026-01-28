@@ -7,18 +7,6 @@
   "ascent": 850,
   "glyphs": [
     {
-      "uid": "75347b319511175da51af3955919dbac",
-      "css": "key-1",
-      "code": 57352,
-      "src": "linecons"
-    },
-    {
-      "uid": "272e08e0e16226aadf94dcbf33aab2b2",
-      "css": "key",
-      "code": 57477,
-      "src": "elusive"
-    },
-    {
       "uid": "a30a32d49f80bb534c062ae1743ef433",
       "css": "down-thin",
       "code": 59392,
@@ -283,16 +271,34 @@
       "src": "iconic"
     },
     {
-      "uid": "8489d61496923b1159b01d8a0a7b2df0",
-      "css": "volume-off",
-      "code": 59436,
+      "uid": "75347b319511175da51af3955919dbac",
+      "css": "key-1",
+      "code": 59438,
+      "src": "linecons"
+    },
+    {
+      "uid": "272e08e0e16226aadf94dcbf33aab2b2",
+      "css": "key",
+      "code": 59439,
       "src": "elusive"
     },
     {
-      "uid": "012ff5762ccb18c16bdfdd6baf187406",
-      "css": "volume-up",
-      "code": 59437,
-      "src": "elusive"
+      "uid": "8beac4a5fd5bed9f82ca7a96cc8ba218",
+      "css": "key-2",
+      "code": 59440,
+      "src": "entypo"
+    },
+    {
+      "uid": "0a9d5a8bfa0ccfd44a38328b8ca276c2",
+      "css": "volume-off-1",
+      "code": 59441,
+      "src": "typicons"
+    },
+    {
+      "uid": "okc52fdxu9uz2wnl0awdtv5373is429s",
+      "css": "volume-high",
+      "code": 59442,
+      "src": "typicons"
     },
     {
       "uid": "5d2d07f112b8de19f2c0dbfec3e42c05",
@@ -893,12 +899,6 @@
       "css": "spread",
       "code": 62759,
       "src": "mfglabs"
-    },
-    {
-      "uid": "8beac4a5fd5bed9f82ca7a96cc8ba218",
-      "css": "key-2",
-      "code": 128273,
-      "src": "entypo"
     }
   ]
 }

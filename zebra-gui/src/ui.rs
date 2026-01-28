@@ -2989,7 +2989,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
                     let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, true, winit::window::CursorIcon::Pointer);
 
-                    let icon = if ui.global_audio_volume > 0.5 { ICON_VOLUME_UP } else { ICON_VOLUME_OFF };
+                    let icon = if ui.global_audio_volume > 0.5 { ICON_VOLUME_HIGH } else { ICON_VOLUME_OFF_1 };
                     if ui.global_audio_volume > 0.5 { ui.global_audio_volume = 1.0 } else { ui.global_audio_volume = 0.0 };
                     if let _ = elem().decl(Decl {
                         id,
