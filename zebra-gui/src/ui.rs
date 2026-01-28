@@ -903,7 +903,14 @@ fn colour_from_hash(hash: [u8; 32]) -> (u8, u8, u8, u8) {
         s = ((s ^ hash[i]) as u32).wrapping_mul(hash[i] as u32).wrapping_mul(37*i as u32).wrapping_mul(805306457) as u8;
         v = ((v ^ hash[i]) as u32).wrapping_mul(hash[i] as u32).wrapping_mul(77*i as u32).wrapping_mul(1610612741) as u8;
     }
-    (h, s/2 + 80, v/2 + 80, 0xff).rgba()
+
+    s /= 4;
+    s += 64;
+
+    v /= 4;
+    v += 64;
+
+    (h, s, v, 0xff).rgba()
 }
 
 pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[WalletRosterMember], total_val: u64) {
