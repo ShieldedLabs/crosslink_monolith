@@ -1273,6 +1273,7 @@ impl DiskDb {
                 DiskDb::IDEAL_OPEN_FILE_LIMIT
             );
         } else if cfg!(windows) {
+            /* These info prints are spammy.
             // This log is verbose during tests.
             #[cfg(not(test))]
             info!(
@@ -1286,6 +1287,7 @@ impl DiskDb {
                 ideal_limit = ?DiskDb::IDEAL_OPEN_FILE_LIMIT,
                 "assuming the open file limit is high enough for Zebra",
             );
+            */
         } else {
             /* These info prints are spammy.
             #[cfg(not(test))]
