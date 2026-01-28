@@ -1025,6 +1025,8 @@ pub fn ui_left_pane(ui: &mut Context,
     const deemph_mul: f32 = 0.6;
     let grey: (u8, u8, u8, u8) = WHITE.mul(deemph_mul);
 
+    let is_staking_day = viz.bc_finalized_tip_height % UI_COPY_STAKING_DAY_PERIOD <= UI_COPY_STAKING_DAY_WINDOW;
+
     if ui.modal != Modal::None && let _elem = elem().decl(Decl {
         child_gap,
         id: id("Modal Container"),
@@ -1117,8 +1119,7 @@ pub fn ui_left_pane(ui: &mut Context,
                 }
             };
 
-            let mut button_ex = |ui: &mut Context, label, enabled: bool| {
-                let id = id(label);
+            let button_ex = |ui: &mut Context, id, label, enabled: bool| {
                 let colour = {
                     let mut hsva = BUTTON_GREY.hsva();
                     hsva.2 = ((hsva.2 as f32) * 1.25).min(255.0) as u8;
@@ -1142,6 +1143,10 @@ pub fn ui_left_pane(ui: &mut Context,
                 }
 
                 clicked
+            };
+            let button = |ui: &mut Context, label, enabled: bool| {
+                let id = id(label);
+                button_ex(ui, id, label, enabled)
             };
 
             match ui.modal {
@@ -1168,7 +1173,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         }
 
                         ui.text(frame_strf!(data, "[{}..{}]", &send_address[..8], &send_address[send_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                        if button_ex(ui, "Paste Address", true) {
+                        if button(ui, "Paste Address", true) {
                             data.send_address = ui.input().get_from_clipboard().trim().to_string();
                         }
 
@@ -1204,8 +1209,8 @@ pub fn ui_left_pane(ui: &mut Context,
                             };
 
                             let can = !waiting_for_send && data.send_address.len() != 0;
-                            if button_ex(ui,    "1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ);       }
-                            if button_ex(ui,   "10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ * 10);  }
+                            if button(ui,    "1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ);       }
+                            if button(ui,   "10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ * 10);  }
                         }
                     }
                 }
@@ -1226,7 +1231,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         if ua.len() != 0 {
                             ui.text(frame_strf!(data, "[{}..{}]", &ua[..8], &ua[ua.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
 
-                            if button_ex(ui, "Copy Address", true) {
+                            if button(ui, "Copy Address", true) {
                                 ui.input().send_to_clipboard(&ua);
                             }
                         } else {
@@ -1243,7 +1248,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
 
                     ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                    if button_ex(ui, "Paste Address", true) {
+                    if button(ui, "Paste Address", true) {
                         data.stake_address = ui.input().get_from_clipboard().trim().to_string();
                     }
 
@@ -1303,14 +1308,21 @@ pub fn ui_left_pane(ui: &mut Context,
                         }
                         let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
 
-                        let can = !waiting_for_stake_to_finalizer && hex_dest.is_some();
-                        if button_ex(ui, "+0.01 cTAZ",    can && (balance as u64) >= ONE_cTAZ / 100)   { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ / 100, hex_dest.unwrap()); }
-                        if button_ex(ui,  "+0.1 cTAZ",    can && (balance as u64) >= ONE_cTAZ / 10)    { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ / 10, hex_dest.unwrap());  }
-                        if button_ex(ui,    "+1 cTAZ",    can && (balance as u64) >= ONE_cTAZ)         { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ, hex_dest.unwrap());       }
-                        if button_ex(ui,   "+10 cTAZ",    can && (balance as u64) >= ONE_cTAZ * 10)    { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10, hex_dest.unwrap());  }
-                        if button_ex(ui,   "+100 cTAZ",   can && (balance as u64) >= ONE_cTAZ * 100)   { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 100, hex_dest.unwrap());  }
-                        if button_ex(ui,   "+1000 cTAZ",  can && (balance as u64) >= ONE_cTAZ * 1000)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 1000, hex_dest.unwrap());  }
-                        if button_ex(ui,   "+10000 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10000) { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10000, hex_dest.unwrap());  }
+                        let can = is_staking_day && !waiting_for_stake_to_finalizer && hex_dest.is_some();
+
+                        let mut hover = false;
+
+                        { let label =  "+0.01 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ / 100)   { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ /   100, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                        { let label =   "+0.1 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ / 10)    { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ /    10, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                        { let label =     "+1 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ)         { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ,         hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                        { let label =    "+10 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ * 10)    { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ *    10, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                        { let label =   "+100 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ * 100)   { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ *   100, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                        { let label =  "+1000 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ * 1000)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ *  1000, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                        { let label = "+10000 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ * 10000) { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10000, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+
+                        if !can && !is_staking_day && hover {
+                            set_tooltip_text!(data, "You can only stake during Staking Day.");
+                        }
                     }
                 }
                 Modal::Retarget => {
@@ -1322,7 +1334,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
 
                     ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                    if button_ex(ui, "Paste Address", true) {
+                    if button(ui, "Paste Address", true) {
                         data.stake_address = ui.input().get_from_clipboard().trim().to_string();
                     }
 
@@ -1373,8 +1385,8 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
                     let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
 
-                    let can = hex_dest.is_some();
-                    if button_ex(ui, "Retarget", can) { wallet_state.lock().unwrap().retarget_bond(ui.retarget_modal_bond_key, hex_dest.unwrap()); }
+                    let can = is_staking_day && hex_dest.is_some();
+                    if button(ui, "Retarget", can) { wallet_state.lock().unwrap().retarget_bond(ui.retarget_modal_bond_key, hex_dest.unwrap()); }
                 }
                 Modal::Unstake => {
                     title_bar(ui, true, "Unstake", id("Unstake Title Bar"));
@@ -1417,7 +1429,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
 
 
-                    let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
+                    let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
                         let id = id(label);
                         let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
                         if let _ = elem().decl(Decl {
@@ -1469,6 +1481,8 @@ pub fn ui_left_pane(ui: &mut Context,
                         clicked
                     };
 
+
+                    let can = is_staking_day;
 
                     let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
                     if (staked_roster_unbonded.len() + staked_roster_bonded.len()) == 0 {
@@ -1579,8 +1593,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 ..Decl
                                             }) {
                                                 let (icon, icon_hovered) = (ICON_MONEY, ICON_WALLET);
-                                                if clickable_icon(ui, id_index("Unstake Button", index as u32), icon, icon_hovered, true) {
+                                                let id = id_index("Unstake Button", index as u32);
+                                                if clickable_icon(ui, id, icon, icon_hovered, can) {
                                                     wallet_state.lock().unwrap().claim_bond(bond_key);
+                                                }
+                                                if !can && !is_staking_day && ui.hovered(id) {
+                                                    set_tooltip_text!(data, "You can only withdraw stake during Staking Day.");
                                                 }
                                             }
 
@@ -1787,8 +1805,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 ..Decl
                                             }) {
                                                 let (icon, icon_hovered) = (ICON_LINK_1, ICON_UNLINK);
-                                                if clickable_icon(ui, id_index("Unstake Button", index as u32), icon, icon_hovered, true) {
+                                                let id = id_index("Unstake Button", index as u32);
+                                                if clickable_icon(ui, id, icon, icon_hovered, can) {
                                                     wallet_state.lock().unwrap().unstake_from_finalizer(bond_key);
+                                                }
+                                                if !can && !is_staking_day && ui.hovered(id) {
+                                                    set_tooltip_text!(data, "You can only unstake during Staking Day.");
                                                 }
                                             }
                                             // left-right icon
@@ -1801,9 +1823,13 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 ..Decl
                                             }) {
                                                 let (icon, icon_hovered) = (ICON_MOVE, ICON_RESIZE_FULL_ALT);
-                                                if clickable_icon(ui, id_index("Retarget Button", index as u32), icon, icon_hovered, true) {
+                                                let id = id_index("Retarget Button", index as u32);
+                                                if clickable_icon(ui, id, icon, icon_hovered, can) {
                                                     ui.modal = Modal::Retarget;
                                                     ui.retarget_modal_bond_key = bond_key;
+                                                }
+                                                if !can && !is_staking_day && ui.hovered(id) {
+                                                    set_tooltip_text!(data, "You can only retarget stake during Staking Day.");
                                                 }
                                             }
 
@@ -1939,7 +1965,7 @@ pub fn ui_left_pane(ui: &mut Context,
             ..Decl
         }) {
 
-            let mut button = |ui: &mut Context, enabled: bool, icon: &'static str, label: &'static str| {
+            let button = |ui: &mut Context, enabled: bool, icon: &'static str, label: &'static str| {
                 let id = id(label);
                 let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_BLUE, id, enabled, winit::window::CursorIcon::Default);
                 if let _ = elem().decl(Decl {
@@ -2477,7 +2503,7 @@ pub fn ui_right_pane(ui: &mut Context,
             str
         }
 
-        let mut button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
+        let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
             let id = id(label);
             let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
             if let _ = elem().decl(Decl {
@@ -2769,7 +2795,7 @@ pub fn ui_right_pane(ui: &mut Context,
             ..Decl
         }) {
 
-            let mut button_ex = |label, act_on_press, enabled: bool| {
+            let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
                 let id = id(label);
                 let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
                 if let _ = elem().decl(Decl {
@@ -2802,7 +2828,7 @@ pub fn ui_right_pane(ui: &mut Context,
                 clicked
             };
 
-            if button_ex("Receive cTAZ", false, !wallet_state.lock().unwrap().waiting_for_faucet) {
+            if button_ex(ui, "Receive cTAZ", false, !wallet_state.lock().unwrap().waiting_for_faucet) {
                 wallet_state.lock().unwrap().request_from_faucet();
             }
         }
