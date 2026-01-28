@@ -604,7 +604,8 @@ impl Context {
             align: Center,
             ..Decl
         }) {
-            self.text(label, TextDecl { h: tab_text_h, align: AlignX::Center, ..TextDecl });
+            let colour = WHITE.mul(if *tab_id == id { 1.0 } else { 0.75 });
+            self.text(label, TextDecl { colour, h: tab_text_h, align: AlignX::Center, ..TextDecl });
         }
 
         id
