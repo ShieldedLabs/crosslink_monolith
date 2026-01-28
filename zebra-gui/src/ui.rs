@@ -604,7 +604,7 @@ impl Context {
             align: Center,
             ..Decl
         }) {
-            let colour = WHITE.mul(if *tab_id == id { 1.0 } else { 0.75 });
+            let colour = WHITE.mul(if *tab_id == id { 1.0 } else { 0.5 });
             self.text(label, TextDecl { colour, h: tab_text_h, align: AlignX::Center, ..TextDecl });
         }
 
@@ -2451,7 +2451,8 @@ pub fn ui_right_pane(ui: &mut Context,
                  child_gap: f32,
                  padding: (f32, f32, f32, f32),
                  radius:  (f32, f32, f32, f32),
-                 tab_id: &mut Id) {
+                 dummy_1: &mut Id,
+                 dummy_2: &mut Id) {
     // @TODO: MAKE THESE NOT USE TABS, JUST USE HEADERS
     let mut tab_id_faucet = Id::default();
     let mut tab_id_roster = Id::default();
@@ -2466,7 +2467,7 @@ pub fn ui_right_pane(ui: &mut Context,
         align: Center,
         ..Decl
     }) {
-        tab_id_roster = ui.tab_ex((0.0, radius.1, radius.2, radius.3), padding, tab_id, id("Finalizers"), frame_strf!(data, "Finalizers ({})", roster.len()));
+        tab_id_roster = ui.tab_ex((0.0, radius.1, radius.2, radius.3), padding, dummy_1, id("Finalizers"), frame_strf!(data, "Finalizers ({})", roster.len()));
     }
     if let _ = elem().decl(Decl {
         id: id("Finalizers Contents"),
@@ -2715,7 +2716,7 @@ pub fn ui_right_pane(ui: &mut Context,
         align: Center,
         ..Decl
     }) {
-        tab_id_faucet = ui.tab_ex(radius, padding, tab_id, id("Faucet"), frame_strf!(data, "Faucet (Height {})", &wallet_state.lock().unwrap().miner_seen_h));
+        tab_id_faucet = ui.tab_ex(radius, padding, dummy_2, id("Faucet"), frame_strf!(data, "Faucet (Height {})", &wallet_state.lock().unwrap().miner_seen_h));
     }
     if let _ = elem().decl(Decl {
         id: id("Faucet Contents"),
@@ -3037,9 +3038,11 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 ui.capture = true;
             }
 
-            let mut pane_tab_r = ui.pane_tab_r;
-            ui_right_pane(ui, wallet_state.clone(), viz, data, child_gap, padding, radius, &mut pane_tab_r);
-            ui.pane_tab_r = pane_tab_r;
+            let mut dummy_1 = ui.dummy_1;
+            let mut dummy_2 = ui.dummy_2;
+            ui_right_pane(ui, wallet_state.clone(), viz, data, child_gap, padding, radius, &mut dummy_1, &mut dummy_2);
+            ui.dummy_1 = dummy_1;
+            ui.dummy_2 = dummy_2;
         }
     }
 
@@ -3376,7 +3379,8 @@ pub struct Context {
     pub nav_skip: bool,
 
     pub pane_tab_l: Id,
-    pub pane_tab_r: Id,
+    pub dummy_1: Id,
+    pub dummy_2: Id,
 
     pub modal: Modal,
     pub retarget_modal_bond_key: [u8; 32],
