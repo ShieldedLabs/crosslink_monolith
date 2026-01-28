@@ -2964,6 +2964,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     colour: (0, 0, 0, 127),
                     ..Decl
                 }) {
+                    let (wallets_sync_h, wallets_tip_h) = {
+                        let state = wallet_state.lock().unwrap();
+                        (state.wallets_sync_h, state.wallets_tip_h)
+                    };
                     // @todo: two vertical panes with right aligned label and left aligned height
                     let decl = TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl };
                     ui.text(frame_strf!(data, "PoS Height: {}", viz.bft_tip_height), decl);
@@ -2972,6 +2976,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     ui.text(frame_strf!(data, "Orchard Pool Zatoshis: {}", viz.orchard_pool_balance), decl);
                     ui.text(frame_strf!(data, "Staking (Bonded) Pool Zatoshis: {}", viz.staking_bonded_pool_balance), decl);
                     ui.text(frame_strf!(data, "Staking (Unbonded) Pool Zatoshis: {}", viz.staking_unbonded_pool_balance), decl);
+                    ui.text(frame_strf!(data, "Wallet Sync: {}/{}", wallets_sync_h, wallets_tip_h), decl);
 
                     if ui.debug {
                         ui.text("------------------", decl);

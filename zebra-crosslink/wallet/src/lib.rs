@@ -839,15 +839,6 @@ pub struct WalletRosterMember {
     pub txids: std::vec::Vec<StakeTxId>,
 }
 
-fn w_flip(use_i: &mut usize, update_i: &mut usize) {
-    if *use_i == *update_i {
-        *update_i = 1;
-    } else {
-        *use_i ^= 1;
-        *update_i ^= 1;
-    }
-}
-
 #[derive(Default, Debug, Clone)]
 pub struct WalletState {
     pub miner_seen_h: u32,
@@ -874,6 +865,9 @@ pub struct WalletState {
     pub waiting_for_faucet: bool,
     pub waiting_for_stake_to_finalizer: bool,
     pub waiting_for_send: bool,
+
+    pub wallets_sync_h: u64,
+    pub wallets_tip_h: u64,
 
     pub user_recv_ua: String,
 
@@ -3917,8 +3911,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             lock.waiting_for_stake_to_finalizer = waiting_for_stake_to_finalizer;
 
             lock.user_local_txs = user_local_txs;
-                lock.user_local_txs_n = user_local_txs_n;
-                lock.miner_local_txs = miner_local_txs;
+            lock.user_local_txs_n = user_local_txs_n;
+            lock.miner_local_txs = miner_local_txs;
             lock.miner_local_txs_n = miner_local_txs_n;
 
             lock.user_txs = user_txs;
@@ -3934,6 +3928,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             lock.stake_positions_bonded = stake_positions_bonded;
             lock.stake_positions_unbonded = stake_positions_unbonded;
+
+            lock.wallets_sync_h = pow_cache.next_tip_h-1;
+            lock.wallets_tip_h = network_tip_h.0.into();
 
             lock.staked_balance = user_staked_funds;
             lock.withdrawable_balance = user_withdrawable_funds;
