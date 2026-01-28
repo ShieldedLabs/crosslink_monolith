@@ -916,7 +916,7 @@ fn colour_from_hash(hash: [u8; 32]) -> (u8, u8, u8, u8) {
 
 pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[WalletRosterMember], total_val: u64) {
     let finalizer_pill_rad = ui.scale(8.0);
-    if let _ = elem().decl(Decl {
+    if finalizers.len() > 0 && total_val > 0 && let _ = elem().decl(Decl {
         id: ui::id("Finalizer Ratio Bar Container"),
         child_gap: ui.scale(5.0),
         align: Left,
