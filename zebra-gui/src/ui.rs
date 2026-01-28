@@ -3113,12 +3113,16 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
     }
 
 
+    let tooltip_id = id("Tooltip Floating Pane");
+
     if data.tooltip_text.len() > 0 {
         let mouse_pos = ui.input().mouse_pos();
-        let tooltip_pos = (mouse_pos.0 as f32 + 8.0 * ui.dpi_scale, mouse_pos.1 as f32 + 6.0 * ui.dpi_scale);
+        let tooltip_pos =
+            ((mouse_pos.0 as f32 + 8.0 * ui.dpi_scale).min(window_w - ui.tooltip_w),
+             (mouse_pos.1 as f32 + 6.0 * ui.dpi_scale).min(window_h - ui.tooltip_h));
 
         if let _ = elem().decl(Decl {
-            id: id("Tooltip Floating Pane"),
+            id: tooltip_id,
             colour: PANE_COL,
             child_gap, padding, radius,
             width:  fit!(),
@@ -3188,6 +3192,11 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
             if let Some(scroll_container_state) = data.scroll_containers.get_mut(&command.id) {
                 scroll_container_state.viewport_height = command.bounding_box.height.min(window_h);
+            }
+
+            if command.id == tooltip_id.id {
+                ui.tooltip_w = command.bounding_box.width  as f32;
+                ui.tooltip_h = command.bounding_box.height as f32;
             }
 
             if !is_rendering {
@@ -3398,6 +3407,9 @@ pub struct Context {
     // pub most_recent_mouse_pressed_id: Id,
 
     pub hovered_id: Id,
+
+    pub tooltip_w: f32,
+    pub tooltip_h: f32,
 
     pub nav_id_to_idx: HashMap<u32, usize>,
     pub nav_idx_to_id: Vec<u32>,
