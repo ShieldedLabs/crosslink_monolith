@@ -652,6 +652,29 @@ impl TxStatus {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum DevNoteActionKind {
+    Recv,
+    Unrecv,
+    Spend,
+    Unspend,
+    // OntoBc,
+    // OffBc,
+    // ChangeHeight,
+}
+#[derive(Debug, Clone, PartialEq)]
+pub enum DevNote {
+    Txo(Txo),
+    OrchardNote(OrchardNote),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DevNoteAction {
+    pub kind: DevNoteActionKind,
+    pub note: DevNote,
+    pub action_h: BlockHeight,
+    pub tip_h: BlockHeight,
+}
 
 // NOTE: trying to not store data that can be computed directly
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1164,6 +1187,38 @@ pub struct ManualAccount {
     pub unspent_orchard_notes: Vec<OrchardNote>,
     pub spent_orchard_notes: Vec<OrchardNote>,
 }
+
+#[cfg(debug_assertions)]
+struct NoteLog(Option<HashMap<(TxId, &'static str), Vec<DevNoteAction>>>);
+
+#[cfg(debug_assertions)]
+fn get_expected_log<'a>(note_log: &'a mut NoteLog, wallet_name: &'static str, txid: &TxId, action: &str) -> Option<&'a mut Vec<DevNoteAction>> {
+    if note_log.0.is_none() {
+        note_log.0 = Some(HashMap::new());
+    }
+
+    if let Some(log) = note_log.0.as_mut().unwrap().get_mut(&(*txid, wallet_name)) {
+        Some(log)
+    } else {
+        println!("TX LOG ERROR: trying to {action} notes with no matching tx: {txid:?}");
+        None
+    }
+}
+
+#[cfg(debug_assertions)]
+fn get_log_or_new<'a>(note_log: &'a mut NoteLog, wallet_name: &'static str, txid: &TxId, action: &str) -> &'a mut Vec<DevNoteAction> {
+    if note_log.0.is_none() {
+        note_log.0 = Some(HashMap::new());
+    }
+
+    note_log.0.as_mut().unwrap().entry((*txid, wallet_name)).or_insert(Vec::new())
+}
+
+#[cfg(debug_assertions)]
+static NOTE_LOG: Mutex<NoteLog> = Mutex::new(NoteLog(None));
+
+
+
 // NOTE: WalletDb doesn't store spending key, so we'll do the same here...
 #[derive(Clone, Debug)]
 pub struct ManualWallet {
@@ -1909,6 +1964,13 @@ impl ManualWallet {
                 // ok &= tx_parts[i].sent_note_count == checks[i].sent_note_count;
                 if !ok {
                     println!("TX SYNC ERROR in {}/{} {} part mismatches check:\n  {:?} vs\n  {:?}", self.name, tx.txid, part_strs[i], tx_parts[i], checks[i]);
+                    #[cfg(debug_assertions)]
+                    {
+                        let mut g_log = NOTE_LOG.lock().unwrap();
+                        if let Some(tx_log) = get_expected_log(&mut g_log, self.name, &tx.txid, "read") {
+                            println!("Note log: {:?}", NL(&tx_log));
+                        }
+                    }
                 }
                 ok = true; // breakpoint
             }
@@ -2148,10 +2210,26 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
     for (note_i, note) in account.unspent_orchard_notes.iter().enumerate() {
         if note.nf == *spent_nf {
             // this action is a spend by us with this note/nullifier: move it to spent
-            let spent_note = account.unspent_orchard_notes.remove(note_i);
-            s.spent(to_zats_or_dump_err("read orchard action spend", spent_note.note.value().inner())?, true)?;
-            orchard_spent_h_insert(&mut account.spent_orchard_notes, OrchardNote { spent_h: block_h, ..spent_note });
+            let unspent_note = account.unspent_orchard_notes.remove(note_i);
+
+            s.spent(to_zats_or_dump_err("read orchard action spend", unspent_note.note.value().inner())?, true)?;
+            let spent_note = OrchardNote { spent_h: block_h, ..unspent_note };
+            orchard_spent_h_insert(&mut account.spent_orchard_notes, spent_note.clone());
             // println!("{} found new spent note at {block_h:?}, tree pos={:02}: spent_nf:{:?}", wallet.name, u64::from(position), *spent_nf);
+
+            #[cfg(debug_assertions)]
+            {
+                let mut g_log = NOTE_LOG.lock().unwrap();
+                get_log_or_new(&mut g_log, wallet.name, txid, "spend").push(
+                    DevNoteAction{
+                        kind: DevNoteActionKind::Spend,
+                        note: DevNote::OrchardNote(spent_note),
+                        action_h: block_h,
+                        tip_h: wallet.chain_tip_h,
+                    }
+                );
+            }
+
             break;
         }
     }
@@ -2209,6 +2287,19 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
             account.recv_orchard_notes[i].monotonically_update(orchard_note);
             true
         } else {
+            #[cfg(debug_assertions)]
+            {
+                let mut g_log = NOTE_LOG.lock().unwrap();
+                get_log_or_new(&mut g_log, wallet.name, txid, "receive").push(
+                    DevNoteAction{
+                        kind: DevNoteActionKind::Recv,
+                        note: DevNote::OrchardNote(orchard_note.clone()),
+                        action_h: block_h,
+                        tip_h: wallet.chain_tip_h,
+                    }
+                );
+            }
+
             orchard_recv_h_insert(&mut account.recv_orchard_notes, orchard_note.clone());
             false
         };
@@ -2256,6 +2347,19 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                         let utxo = account.utxos.remove(utxo_i);
                         let stxo = Txo { spent_h: block_h, ..utxo };
                         t.spent(stxo.value, true)?;
+
+                        #[cfg(debug_assertions)]
+                        {
+                            let mut g_log = NOTE_LOG.lock().unwrap();
+                            get_log_or_new(&mut g_log, wallet.name,  &txid, "spend").push(
+                                DevNoteAction{
+                                    kind: DevNoteActionKind::Spend,
+                                    note: DevNote::Txo(stxo.clone()),
+                                    action_h: block_h,
+                                    tip_h: wallet.chain_tip_h,
+                                }
+                            );
+                        }
 
                         // if let Some(last_stxo) = account.stxos.last() {
                         //     if last_stxo.spent_h > stxo.spent_h {
@@ -2305,6 +2409,19 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                             println!("ERROR: UTXO mismatch: {:?} vs {:?}", account.utxos[utxo_i], &utxo);
                         }
                     } else if txo_recv_h_position(&account.recv_txos, txid_h, &utxo.id).is_none() {
+                        #[cfg(debug_assertions)]
+                        {
+                            let mut g_log = NOTE_LOG.lock().unwrap();
+                            get_log_or_new(&mut g_log, wallet.name, &txid, "receive").push(
+                                DevNoteAction{
+                                    kind: DevNoteActionKind::Recv,
+                                    note: DevNote::Txo(utxo.clone()),
+                                    action_h: block_h,
+                                    tip_h: wallet.chain_tip_h,
+                                }
+                            );
+                        }
+
                         // TODO: can we just check if we've seen the tx && tx.2 == false
                         if let Some(last_txo) = account.recv_txos.last() {
                             debug_assert!(last_txo.recv_h <= utxo.recv_h, "{} <= {}", last_txo.recv_h, utxo.recv_h);
@@ -3593,33 +3710,93 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     account.balance_changes.truncate(truncate_to_i);
 
                     //- UNRECEIVE NOTES
-                    let utxos_at_h_start = account.utxos.partition_point(|txo| txo.recv_h < block_h);
-                    account.utxos.truncate(utxos_at_h_start);
-                    let recv_txos_at_h_start = account.recv_txos.partition_point(|txo| txo.recv_h < block_h);
-                    account.recv_txos.truncate(recv_txos_at_h_start);
+                    {
+                        let utxos_at_h_start = account.utxos.partition_point(|txo| txo.recv_h < block_h);
+                        account.utxos.truncate(utxos_at_h_start);
+                        let recv_txos_at_h_start = account.recv_txos.partition_point(|txo| txo.recv_h < block_h);
 
-                    let unspent_orchard_notes_at_h_start = account.unspent_orchard_notes.partition_point(|txo| txo.recv_h < block_h);
-                    account.unspent_orchard_notes.truncate(unspent_orchard_notes_at_h_start);
-                    let recv_orchard_notes_at_h_start = account.recv_orchard_notes.partition_point(|txo| txo.recv_h < block_h);
-                    account.recv_orchard_notes.truncate(recv_orchard_notes_at_h_start);
+                        #[cfg(debug_assertions)]
+                        for txo in &account.recv_txos[recv_txos_at_h_start..] {
+                            let mut g_log = NOTE_LOG.lock().unwrap();
+                            if let Some(tx_log) = get_expected_log(&mut g_log, wallet.name, &txo.txid(), "unreceive") {
+                                tx_log.push(DevNoteAction{
+                                    kind: DevNoteActionKind::Unrecv,
+                                    note: DevNote::Txo(txo.clone()),
+                                    action_h: block_h,
+                                    tip_h: network_tip_h,
+                                });
+                            }
+                        }
+
+                        account.recv_txos.truncate(recv_txos_at_h_start);
+                    }
+
+                    {
+                        let unspent_orchard_notes_at_h_start = account.unspent_orchard_notes.partition_point(|txo| txo.recv_h < block_h);
+                        account.unspent_orchard_notes.truncate(unspent_orchard_notes_at_h_start);
+                        let recv_orchard_notes_at_h_start = account.recv_orchard_notes.partition_point(|txo| txo.recv_h < block_h);
+                        #[cfg(debug_assertions)]
+                        for note in &account.recv_orchard_notes[recv_orchard_notes_at_h_start..] {
+                            let mut g_log = NOTE_LOG.lock().unwrap();
+                            if let Some(tx_log) = get_expected_log(&mut g_log, wallet.name, &note.txid, "unreceive") {
+                                tx_log.push(DevNoteAction{
+                                    kind: DevNoteActionKind::Unrecv,
+                                    note: DevNote::OrchardNote(note.clone()),
+                                    action_h: block_h,
+                                    tip_h: network_tip_h,
+                                });
+                            }
+                        }
+                        account.recv_orchard_notes.truncate(recv_orchard_notes_at_h_start);
+                    }
 
                     //- UNSPEND NOTES
                     // NOTE: spent notes are in spend_h order, NOT recv_h order
-                    let stxos_at_h_start = account.stxos.partition_point(|txo| txo.spent_h < block_h);
-                    for stxo in &account.stxos[stxos_at_h_start..] {
-                        if stxo.recv_h < block_h {
-                            txo_recv_h_insert(&mut account.utxos, Txo{ spent_h: BlockHeight(0), ..stxo.clone() });
-                        }
-                    }
-                    account.stxos.truncate(stxos_at_h_start);
+                    {
+                        let stxos_at_h_start = account.stxos.partition_point(|txo| txo.spent_h < block_h);
+                        for stxo in &account.stxos[stxos_at_h_start..] {
+                            #[cfg(debug_assertions)]
+                            {
+                                let mut g_log = NOTE_LOG.lock().unwrap();
+                                if let Some(tx_log) = get_expected_log(&mut g_log, wallet.name, &stxo.txid(), "unspend") {
+                                    tx_log.push(DevNoteAction{
+                                        kind: DevNoteActionKind::Unspend,
+                                        note: DevNote::Txo(stxo.clone()),
+                                        action_h: block_h,
+                                        tip_h: network_tip_h,
+                                    });
+                                }
+                            }
 
-                    let spent_orchard_notes_at_h_start = account.spent_orchard_notes.partition_point(|note| note.spent_h < block_h);
-                    for spent_orchard_note in &account.spent_orchard_notes[spent_orchard_notes_at_h_start..] {
-                        if spent_orchard_note.recv_h < block_h {
-                            orchard_recv_h_insert(&mut account.unspent_orchard_notes, OrchardNote{ spent_h: BlockHeight(0), ..spent_orchard_note.clone() });
+                            if stxo.recv_h < block_h {
+                                txo_recv_h_insert(&mut account.utxos, Txo{ spent_h: BlockHeight(0), ..stxo.clone() });
+                            }
                         }
+                        account.stxos.truncate(stxos_at_h_start);
                     }
-                    account.spent_orchard_notes.truncate(spent_orchard_notes_at_h_start);
+
+                    {
+                        let spent_orchard_notes_at_h_start = account.spent_orchard_notes.partition_point(|note| note.spent_h < block_h);
+                        for note in &account.spent_orchard_notes[spent_orchard_notes_at_h_start..] {
+                            #[cfg(debug_assertions)]
+                            {
+                                let mut g_log = NOTE_LOG.lock().unwrap();
+                                if let Some(tx_log) = get_expected_log(&mut g_log, wallet.name, &note.txid, "unspend") {
+                                    tx_log.push(DevNoteAction{
+                                        kind: DevNoteActionKind::Unspend,
+                                        note: DevNote::OrchardNote(note.clone()),
+                                        action_h: block_h,
+                                        tip_h: network_tip_h,
+                                    });
+                                }
+                            }
+
+                            if note.recv_h < block_h {
+                                orchard_recv_h_insert(&mut account.unspent_orchard_notes, OrchardNote{ spent_h: BlockHeight(0), ..note.clone() });
+                            }
+                        }
+                        account.spent_orchard_notes.truncate(spent_orchard_notes_at_h_start);
+                    }
                 }
 
                 //  higher blocks & mempool
@@ -3975,7 +4152,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         if AUTO_SPEND {
-            if user_wallet.accounts[0].unspent_orchard_notes.len() == 0 && !proposed_faucet.is_in_progress() {
+            if /*user_wallet.accounts[0].unspent_orchard_notes.len() == 0 &&*/ !proposed_faucet.is_in_progress() {
                 // the user needs money, try to send some (doesn't matter if we fail until we've mined some)
                 let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, FAUCET_VALUE, &orchard_tree, *user_ua.orchard().unwrap(),
                     MemoBytes::from_bytes("auto-sent from miner".as_bytes()).unwrap()
