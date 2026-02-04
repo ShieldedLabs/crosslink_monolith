@@ -1,5 +1,7 @@
 #![allow(warnings)]
 
+const ONE_cTAZ: u64 = 100_000_000;
+
 use std::net::Shutdown;
 use std::thread::current;
 use std::{hash::Hash};
@@ -1235,8 +1237,6 @@ pub fn ui_left_pane(ui: &mut Context,
                             ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                         }
 
-                        const ONE_cTAZ: u64 = 100_000_000;
-
                         if let _ = elem().decl(Decl {
                             child_gap, radius,
                             id: id("Send Buttons"),
@@ -1310,7 +1310,6 @@ pub fn ui_left_pane(ui: &mut Context,
                         ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                     }
 
-                    const ONE_cTAZ: u64 = 100_000_000;
                     let waiting_for_stake_to_finalizer = wallet_state.lock().unwrap().waiting_for_stake_to_finalizer;
 
                     {
@@ -1926,7 +1925,6 @@ pub fn ui_left_pane(ui: &mut Context,
         align: Top,
         width: percent!(1.0),
         height: grow!(),
-        clip: Clip,
         ..Decl
     }) {
         let (
@@ -2789,9 +2787,6 @@ pub fn ui_right_pane(ui: &mut Context,
         height: fit!(),
         ..Decl
     }) {
-        // spacer
-        if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(16.0)), ..Default::default() }) {}
-
         // big text container
         // if let _ = elem().decl(Decl {
         //     width: percent!(1.0),
@@ -2808,12 +2803,13 @@ pub fn ui_right_pane(ui: &mut Context,
         let padding = child_gap.dup4();
 
         // info container
-        if let _ = elem().decl(Decl {
-            padding: ui.scale(32.0).dup4(), child_gap, align: TopLeft,
-            width: grow!(), height: fit!(),
-            direction: TopToBottom,
-            ..Decl
-        }) {
+        // if let _ = elem().decl(Decl {
+        //     padding: ui.scale(32.0).dup4(), child_gap, align: TopLeft,
+        //     width: grow!(), height: fit!(),
+        //     direction: TopToBottom,
+        //     ..Decl
+        // })
+        if false {
             let title_h = ui.scale(28.0);
             let text_h = ui.scale(22.0);
             let (un, sh_p, sh_s) = {
@@ -2849,16 +2845,16 @@ pub fn ui_right_pane(ui: &mut Context,
         };
 
         // buttons container
-        if let _ = elem().decl(Decl {
-            id: id("Buttons Container"),
-            padding, child_gap, align: Center,
-            width: percent!(1.0),
-            height: fit!(),
-            ..Decl
-        }) {
+        // if let _ = elem().decl(Decl {
+        //     id: id("Buttons Container"),
+        //     padding, child_gap, align: Center,
+        //     width: percent!(1.0),
+        //     height: fit!(),
+        //     ..Decl
+        // })
+        {
 
-            let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
-                let id = id(label);
+            let button_ex = |ui: &mut Context, id, label, act_on_press, enabled: bool| {
                 let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
                 if let _ = elem().decl(Decl {
                     id,
@@ -2890,8 +2886,20 @@ pub fn ui_right_pane(ui: &mut Context,
                 clicked
             };
 
-            if button_ex(ui, "Receive cTAZ", false, !wallet_state.lock().unwrap().waiting_for_faucet) {
+            let miner_shielded_spendable_funds = {
+                let w = wallet_state.lock().unwrap();
+                w.miner_shielded_spendable_funds
+            };
+
+            let can = miner_shielded_spendable_funds > (ONE_cTAZ * 501 / 100);
+
+            let label = "Receive cTAZ";
+            let id = id(label);
+            if button_ex(ui, id, label, false, can && !wallet_state.lock().unwrap().waiting_for_faucet) {
                 wallet_state.lock().unwrap().request_from_faucet();
+            }
+            if !can && ui.hovered(id) {
+                set_tooltip_text!(data, "The faucet is mining more funds.");
             }
         }
     }
@@ -2987,7 +2995,6 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             direction: TopToBottom,
             width: pane_pct_left,
             height: grow!(),
-            clip: Clip,
             ..Decl
         }) {
             let id = _elem.decl.id;
@@ -3124,7 +3131,6 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             direction: TopToBottom,
             width: pane_pct_right,
             height: grow!(),
-            clip: Clip,
             ..Decl
         }) {
             let id = _elem.decl.id;
