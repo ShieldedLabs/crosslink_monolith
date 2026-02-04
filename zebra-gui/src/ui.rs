@@ -106,7 +106,7 @@ pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum Floating  { #[default] None, Parent, Root(f32, f32) }
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum ClipMode  { #[default] None, Clip, Scroll(f32, f32) }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum ClipMode  { #[default] None, ClipX, ClipY, Clip, Scroll(f32) }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Align   { x: AlignX, y: AlignY }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignX    { #[default] Left, Right, Center }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignY    { #[default] Top, Bottom, Center }
@@ -157,7 +157,7 @@ pub const BottomRight: Align = Align::BottomRight;
     }};
 }
 
-use ClipMode::{Clip, Scroll};
+use ClipMode::{ClipX, ClipY, Clip, Scroll};
 use Direction::*;
 
 pub const Id: Id = Id { id: 0, offset: 0, base_id: 0, len: 0, chars: std::ptr::null() };
@@ -321,14 +321,19 @@ pub const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Cl
             a: (item.colour.3 | 0x01) as f32
         };
         decl.id = item.id.clay().id;
-        let clipping = match item.clip { ClipMode::None => false, _ => true };
+        let (clip_x, clip_y) = match item.clip {
+            ClipMode::None      => (false, false, ),
+            ClipMode::ClipX     => (true,  false, ),
+            ClipMode::ClipY     => (false, true,  ),
+            ClipMode::Clip      => (true,  true,  ),
+            ClipMode::Scroll(_) => (false, true,  ),
+        };
         decl.clip = clay::Clay_ClipElementConfig {
-            horizontal: clipping,
-            vertical: clipping,
+            horizontal: clip_x,
+            vertical:   clip_y,
             childOffset: match item.clip {
-                ClipMode::None => clay::Clay_Vector2 { x: 0.0, y: 0.0 },
-                ClipMode::Clip => clay::Clay_Vector2 { x: 0.0, y: 0.0 },
-                ClipMode::Scroll(x, y) => clay::Clay_Vector2 { x, y },
+                ClipMode::Scroll(y) => clay::Clay_Vector2 { x: 0.0, y },
+                _                   => clay::Clay_Vector2 { x: 0.0, y: 0.0 },
             }
         };
         match item.floating {
@@ -795,7 +800,7 @@ impl Context {
         }
 
         (id,
-         Scroll(0.0, -scroll_container_state.scroll * self.scale),
+         Scroll(-scroll_container_state.scroll * self.scale),
          &mut scroll_container_state.scroll,
          scroll_container_state.content_height,
          scroll_container_state.viewport_height,
@@ -1925,6 +1930,7 @@ pub fn ui_left_pane(ui: &mut Context,
         align: Top,
         width: percent!(1.0),
         height: grow!(),
+        clip: ClipX,
         ..Decl
     }) {
         let (
@@ -2774,7 +2780,7 @@ pub fn ui_right_pane(ui: &mut Context,
         align: Center,
         ..Decl
     }) {
-        tab_id_faucet = ui.tab_ex(radius, padding, dummy_2, id("Faucet"), frame_strf!(data, "Faucet (Height {})", &wallet_state.lock().unwrap().miner_seen_h));
+        tab_id_faucet = ui.tab_ex((0.0, radius.1, radius.2, radius.3), padding, dummy_2, id("Faucet"), frame_strf!(data, "Faucet (Height {})", &wallet_state.lock().unwrap().miner_seen_h));
     }
     if let _ = elem().decl(Decl {
         id: id("Faucet Contents"),
@@ -2995,6 +3001,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             direction: TopToBottom,
             width: pane_pct_left,
             height: grow!(),
+            clip: ClipX,
             ..Decl
         }) {
             let id = _elem.decl.id;
@@ -3131,6 +3138,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             direction: TopToBottom,
             width: pane_pct_right,
             height: grow!(),
+            clip: ClipX,
             ..Decl
         }) {
             let id = _elem.decl.id;
