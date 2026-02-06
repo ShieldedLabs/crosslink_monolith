@@ -670,9 +670,10 @@ pub enum DevNote {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DevNoteAction {
+    pub seq:   u64,
+    pub action_h: BlockHeight,
     pub kind: DevNoteActionKind,
     pub note: DevNote,
-    pub action_h: BlockHeight,
     pub tip_h: BlockHeight,
 }
 
@@ -1189,33 +1190,39 @@ pub struct ManualAccount {
 }
 
 #[cfg(debug_assertions)]
-struct NoteLog(Option<HashMap<(TxId, &'static str), Vec<DevNoteAction>>>);
+pub struct NoteLog(Option<HashMap<(TxId, &'static str), Vec<DevNoteAction>>>, u64);
 
 #[cfg(debug_assertions)]
-fn get_expected_log<'a>(note_log: &'a mut NoteLog, wallet_name: &'static str, txid: &TxId, action: &str) -> Option<&'a mut Vec<DevNoteAction>> {
-    if note_log.0.is_none() {
-        note_log.0 = Some(HashMap::new());
+impl NoteLog {
+    pub fn get_expected<'a>(&'a mut self, wallet_name: &'static str, txid: &TxId, action: &str) -> Option<(&'a mut Vec<DevNoteAction>, u64)> {
+        if self.0.is_none() {
+            self.0 = Some(HashMap::new());
+        }
+
+        let seq = self.1;
+        self.1 += 1;
+        if let Some(log) = self.0.as_mut().unwrap().get_mut(&(*txid, wallet_name)) {
+            Some((log, seq))
+        } else {
+            println!("TX LOG ERROR: trying to {action} notes with no matching tx: {txid:?}");
+            None
+        }
     }
 
-    if let Some(log) = note_log.0.as_mut().unwrap().get_mut(&(*txid, wallet_name)) {
-        Some(log)
-    } else {
-        println!("TX LOG ERROR: trying to {action} notes with no matching tx: {txid:?}");
-        None
+    pub fn get_or_new<'a>(&'a mut self, wallet_name: &'static str, txid: &TxId, action: &str) -> (&'a mut Vec<DevNoteAction>, u64) {
+        if self.0.is_none() {
+            self.0 = Some(HashMap::new());
+        }
+
+        let seq = self.1;
+        self.1 += 1;
+        let log = self.0.as_mut().unwrap().entry((*txid, wallet_name)).or_insert(Vec::new());
+        (log, seq)
     }
 }
 
 #[cfg(debug_assertions)]
-fn get_log_or_new<'a>(note_log: &'a mut NoteLog, wallet_name: &'static str, txid: &TxId, action: &str) -> &'a mut Vec<DevNoteAction> {
-    if note_log.0.is_none() {
-        note_log.0 = Some(HashMap::new());
-    }
-
-    note_log.0.as_mut().unwrap().entry((*txid, wallet_name)).or_insert(Vec::new())
-}
-
-#[cfg(debug_assertions)]
-static NOTE_LOG: Mutex<NoteLog> = Mutex::new(NoteLog(None));
+static NOTE_LOG: Mutex<NoteLog> = Mutex::new(NoteLog(None, 0));
 
 
 
@@ -1967,7 +1974,7 @@ impl ManualWallet {
                     #[cfg(debug_assertions)]
                     {
                         let mut g_log = NOTE_LOG.lock().unwrap();
-                        if let Some(tx_log) = get_expected_log(&mut g_log, self.name, &tx.txid, "read") {
+                        if let Some((tx_log, seq)) = g_log.get_expected(self.name, &tx.txid, "read") {
                             println!("Note log: {:?}", NL(&tx_log));
                         }
                     }
@@ -2220,14 +2227,14 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
             #[cfg(debug_assertions)]
             {
                 let mut g_log = NOTE_LOG.lock().unwrap();
-                get_log_or_new(&mut g_log, wallet.name, txid, "spend").push(
-                    DevNoteAction{
-                        kind: DevNoteActionKind::Spend,
-                        note: DevNote::OrchardNote(spent_note),
-                        action_h: block_h,
-                        tip_h: wallet.chain_tip_h,
-                    }
-                );
+                let (tx_log, seq) = g_log.get_or_new(wallet.name, txid, "spend");
+                tx_log.push(DevNoteAction{
+                    seq,
+                    kind: DevNoteActionKind::Spend,
+                    note: DevNote::OrchardNote(spent_note),
+                    action_h: block_h,
+                    tip_h: wallet.chain_tip_h,
+                });
             }
 
             break;
@@ -2290,14 +2297,14 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
             #[cfg(debug_assertions)]
             {
                 let mut g_log = NOTE_LOG.lock().unwrap();
-                get_log_or_new(&mut g_log, wallet.name, txid, "receive").push(
-                    DevNoteAction{
-                        kind: DevNoteActionKind::Recv,
-                        note: DevNote::OrchardNote(orchard_note.clone()),
-                        action_h: block_h,
-                        tip_h: wallet.chain_tip_h,
-                    }
-                );
+                let (tx_log, seq) = g_log.get_or_new(wallet.name, txid, "receive");
+                tx_log.push(DevNoteAction{
+                    seq,
+                    kind: DevNoteActionKind::Recv,
+                    note: DevNote::OrchardNote(orchard_note.clone()),
+                    action_h: block_h,
+                    tip_h: wallet.chain_tip_h,
+                });
             }
 
             orchard_recv_h_insert(&mut account.recv_orchard_notes, orchard_note.clone());
@@ -2351,14 +2358,14 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                         #[cfg(debug_assertions)]
                         {
                             let mut g_log = NOTE_LOG.lock().unwrap();
-                            get_log_or_new(&mut g_log, wallet.name,  &txid, "spend").push(
-                                DevNoteAction{
-                                    kind: DevNoteActionKind::Spend,
-                                    note: DevNote::Txo(stxo.clone()),
-                                    action_h: block_h,
-                                    tip_h: wallet.chain_tip_h,
-                                }
-                            );
+                            let (tx_log, seq) = g_log.get_or_new(wallet.name,  &txid, "spend");
+                            tx_log.push(DevNoteAction{
+                                seq,
+                                kind: DevNoteActionKind::Spend,
+                                note: DevNote::Txo(stxo.clone()),
+                                action_h: block_h,
+                                tip_h: wallet.chain_tip_h,
+                            });
                         }
 
                         // if let Some(last_stxo) = account.stxos.last() {
@@ -2412,14 +2419,14 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
                         #[cfg(debug_assertions)]
                         {
                             let mut g_log = NOTE_LOG.lock().unwrap();
-                            get_log_or_new(&mut g_log, wallet.name, &txid, "receive").push(
-                                DevNoteAction{
-                                    kind: DevNoteActionKind::Recv,
-                                    note: DevNote::Txo(utxo.clone()),
-                                    action_h: block_h,
-                                    tip_h: wallet.chain_tip_h,
-                                }
-                            );
+                            let (tx_log, seq) = g_log.get_or_new(wallet.name, &txid, "receive");
+                            tx_log.push(DevNoteAction{
+                                seq,
+                                kind: DevNoteActionKind::Recv,
+                                note: DevNote::Txo(utxo.clone()),
+                                action_h: block_h,
+                                tip_h: wallet.chain_tip_h,
+                            });
                         }
 
                         // TODO: can we just check if we've seen the tx && tx.2 == false
@@ -3718,8 +3725,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         #[cfg(debug_assertions)]
                         for txo in &account.recv_txos[recv_txos_at_h_start..] {
                             let mut g_log = NOTE_LOG.lock().unwrap();
-                            if let Some(tx_log) = get_expected_log(&mut g_log, wallet.name, &txo.txid(), "unreceive") {
+                            if let Some((tx_log, seq)) = g_log.get_expected(wallet.name, &txo.txid(), "unreceive") {
                                 tx_log.push(DevNoteAction{
+                                    seq,
                                     kind: DevNoteActionKind::Unrecv,
                                     note: DevNote::Txo(txo.clone()),
                                     action_h: block_h,
@@ -3738,8 +3746,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         #[cfg(debug_assertions)]
                         for note in &account.recv_orchard_notes[recv_orchard_notes_at_h_start..] {
                             let mut g_log = NOTE_LOG.lock().unwrap();
-                            if let Some(tx_log) = get_expected_log(&mut g_log, wallet.name, &note.txid, "unreceive") {
+                            if let Some((tx_log, seq)) = g_log.get_expected(wallet.name, &note.txid, "unreceive") {
                                 tx_log.push(DevNoteAction{
+                                    seq,
                                     kind: DevNoteActionKind::Unrecv,
                                     note: DevNote::OrchardNote(note.clone()),
                                     action_h: block_h,
@@ -3758,8 +3767,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             #[cfg(debug_assertions)]
                             {
                                 let mut g_log = NOTE_LOG.lock().unwrap();
-                                if let Some(tx_log) = get_expected_log(&mut g_log, wallet.name, &stxo.txid(), "unspend") {
+                                if let Some((tx_log, seq)) = g_log.get_expected(wallet.name, &stxo.txid(), "unspend") {
                                     tx_log.push(DevNoteAction{
+                                        seq,
                                         kind: DevNoteActionKind::Unspend,
                                         note: DevNote::Txo(stxo.clone()),
                                         action_h: block_h,
@@ -3781,8 +3791,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             #[cfg(debug_assertions)]
                             {
                                 let mut g_log = NOTE_LOG.lock().unwrap();
-                                if let Some(tx_log) = get_expected_log(&mut g_log, wallet.name, &note.txid, "unspend") {
+                                if let Some((tx_log, seq)) = g_log.get_expected(wallet.name, &note.txid, "unspend") {
                                     tx_log.push(DevNoteAction{
+                                        seq,
                                         kind: DevNoteActionKind::Unspend,
                                         note: DevNote::OrchardNote(note.clone()),
                                         action_h: block_h,
