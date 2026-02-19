@@ -8,7 +8,7 @@ const PRINT_PROTOCOL:       bool = 1 == 1;
 const PRINT_PROTOCOL_TAG:   bool = 0 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
 const PRINT_ROSTER_CMD:     bool = 1 == 1;
-const PRINT_NETWORK_STATS:  bool = 0 == 1;
+const PRINT_NETWORK_STATS:  bool = 1 == 1;
 const PRINT_PEERS:          bool = 0 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
@@ -1912,10 +1912,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             o
         }
         fn send_sock_msg(ctx_str: &str, transport: &mut PeerTransport, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, msg: &[u8], stats: &mut NetworkStats) {
-            // println!("Packet sent! Nonce: {}! {} bytes!", transport.nonce, msg.len());
-
-            transport.sent_packets.set(SentPacket { bytes: msg.len(), time_sent: Instant::now() }, transport.nonce as usize);
-
             // TODO(phil) move this code
             let bytes_in_flight = {
                 let mut bytes_in_flight = 0;
@@ -1947,11 +1943,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             let target_bytes_in_flight = ((MAX_BANDWIDTH_BYTES_PER_SECOND as f64 * mean_rtt.max(0.01)) as usize).max(PATH_MTU);
 
             // NOTE(phil) probabilistically lerp down towards 0 likelihood of sending a packet as we approach bandwidth limit
-            // let rand_t = bytes_in_flight as f64 / target_bytes_in_flight as f64;
-            // if rand::random::<f64>() < rand_t {
-            //     if PRINT_PROTOCOL { println!("Dropping packet because of congestion control."); }
-            //     return;
-            // }
+            let rand_t = bytes_in_flight as f64 / target_bytes_in_flight as f64;
+            if rand::random::<f64>() < rand_t {
+                if PRINT_PROTOCOL { println!("Dropping packet because of congestion control."); }
+                return;
+            }
 
             // println!("Packet: {} bytes", msg.len());
             let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0));
@@ -1959,6 +1955,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 Ok(_) => {
                     stats.packets_sent += 1;
                     stats.bytes_sent += msg.len();
+
+                    // println!("Packet sent! Nonce: {}! {} bytes!", transport.nonce, msg.len());
+                    transport.sent_packets.set(SentPacket { bytes: msg.len(), time_sent: Instant::now() }, transport.nonce as usize);
+
                     ()
                 },
                 Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
@@ -2047,7 +2047,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                     if let Some(sent_packet) = transport.sent_packets.at(i) &&
                                 sent_packet.bytes > 0 {
-                        transport.acknowledged_sent_packets.set(AcknowledgedSentPacket { bytes: sent_packet.bytes, rtt: now.duration_since(sent_packet.time_sent).as_secs_f64() }, ack);
+                        transport.acknowledged_sent_packets.set(AcknowledgedSentPacket { bytes: sent_packet.bytes, rtt: now.duration_since(sent_packet.time_sent).as_secs_f64() }, i);
 
                         // println!("Packet acked!: {} bytes! {}", sent_packet.bytes, i + 64 - ack);
 
@@ -2538,17 +2538,19 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                 }
             }
 
-            let mean_rtt = rtt_sum / rtt_sum_n;
+            if rtt_sum_n > 0.0 {
+                let mean_rtt = rtt_sum / rtt_sum_n;
 
-            // NOTE(phil): timeout-drop packets.
-            // TODO(phil): be more intelligent
-            let now = Instant::now();
-            for slot_i in 0..transport.sent_packets.slots.len() {
-                let packet = &mut transport.sent_packets.slots[slot_i].value;
-                if packet.bytes > 0 {
-                    let time_since_sent = now.duration_since(packet.time_sent).as_secs_f64();
-                    if time_since_sent > mean_rtt * 1.5 { // timeout-drop
-                        packet.bytes = 0;
+                // NOTE(phil): timeout-drop packets.
+                // TODO(phil): be more intelligent
+                let now = Instant::now();
+                for slot_i in 0..transport.sent_packets.slots.len() {
+                    let sent_packet = &mut transport.sent_packets.slots[slot_i].value;
+                    if sent_packet.bytes > 0 {
+                        let time_since_sent = now.duration_since(sent_packet.time_sent).as_secs_f64();
+                        if time_since_sent > mean_rtt * 1.5 { // timeout-drop
+                            *sent_packet = SentPacket::default();
+                        }
                     }
                 }
             }
