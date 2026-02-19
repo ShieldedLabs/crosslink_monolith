@@ -807,6 +807,96 @@ impl Context {
          max)
     }
 
+    pub fn scroll_container_bgn(
+        &mut self,
+        data: &mut UiData,
+        padding: (f32, f32, f32, f32),
+        id: Id, clip: ClipMode, scroll: f32, content_h: f32, viewport_h: f32, max: f32
+    ) {
+        elem_bgn();
+        decl(Decl {
+            id: id_index("Outer Container", id.id),
+            colour: TRANSACTION_HISTORY_CONTAINER_COL,
+            radius: padding.0.dup4(),
+            width:  percent!(1.0),
+            height: grow!(),
+            direction: LeftToRight,
+            align: TopLeft,
+            ..Decl
+        });
+        elem_bgn();
+        decl(Decl {
+            id,
+            padding: (padding.0, 0.0, padding.2, padding.3),
+            width:  grow!(),
+            height: percent!(1.0),
+            direction: TopToBottom,
+            clip,
+            align: Top,
+            ..Decl
+        });
+    }
+    pub fn scroll_container_end(
+        &mut self,
+        data: &mut UiData,
+        padding: (f32, f32, f32, f32),
+        id: Id, clip: ClipMode, scroll: f32, content_h: f32, viewport_h: f32, max: f32
+    ) {
+        elem_end();
+
+        let radius = self.scale(6.0);
+
+        let scrollbar_region_h = viewport_h - padding.2 - padding.3;
+
+        let handle_height = {
+            let handle_pct = if content_h == 0.0 { 1.0 } else { viewport_h / content_h };
+            let handle_height = handle_pct * scrollbar_region_h;
+            handle_height.max(radius * 3.0).min(scrollbar_region_h)
+        };
+
+        let scroll_pct = (if max == 0.0 { 0.0 } else { scroll / max }).max(0.0).min(1.0);
+
+        let handle_offset = scroll_pct * (scrollbar_region_h - handle_height);
+
+        self.nav_skip = true; // @Hack.
+
+        if max > 0.0 && handle_height < scrollbar_region_h && let _ = elem().decl(Decl {
+            id:      id_index("Scrollbar Region", id.id as u32),
+            width:   fixed!(self.scale(32.0)),
+            padding: (self.scale(10.0), 0.0, padding.2, 0.0),
+            direction: TopToBottom,
+            align: TopLeft,
+            ..Decl
+        }) {
+            let button_id = ui::id("Scrollbar Handle");
+            let colour = (0x60, 0x60, 0x60, 0);
+            let (activated, mut colour, _) = self.button_ex(true, colour, button_id, true, winit::window::CursorIcon::Default);
+            colour.3 = colour.2;
+
+            if self.mouse_pressed_id == button_id {
+                let mut scroll_container_state = data.scroll_containers.entry(id.id).or_insert(Default::default());
+
+                let delta_viewport_px  = self.input().mouse_delta().1 as f32;
+                let delta_viewport_pct = delta_viewport_px / (scrollbar_region_h - handle_height);
+
+                let content_scrollable_h = max;
+
+                let delta_content_pct = delta_viewport_pct;
+                let delta_content_px  = delta_content_pct * content_scrollable_h;
+
+                scroll_container_state.scroll += delta_content_px;
+            }
+
+            let _ = elem().decl(Decl {                                                                            height: fixed!(handle_offset), ..Decl });
+            let _ = elem().decl(Decl { id: button_id, colour, radius: radius.dup4(), width: fixed!(radius * 2.0), height: fixed!(handle_height), ..Decl });
+        } else {
+            let _ = elem().decl(Decl { width: fixed!(padding.1), ..Decl });
+        }
+
+        self.nav_skip = false; // @Hack.
+        elem_end();
+    }
+
     pub fn openable(&mut self, data: &mut UiData, id: Id, activated: bool, open_by_default: bool) -> bool {
         let mut openable_state = &mut data.openables.entry(id.id).or_insert(OpenableState { open: open_by_default });
         if activated {
@@ -2042,8 +2132,6 @@ pub fn ui_left_pane(ui: &mut Context,
         let DOUBLE_ICON_OK_CIRCLED_1  = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED_1,  ICON_OK_CIRCLED_1).as_str()) };
         let DOUBLE_ICON_OK_CIRCLED2_1 = { (&*frame_strf!(magic(data), "{}{}", ICON_OK_CIRCLED2_1, ICON_OK_CIRCLED2_1).as_str()) };
 
-        ui.tx_outer_container_hack_id = id("History Scroll Outer Container");
-
         let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("History Scroll Container"), 96.0);
         if txs.len() == 0 {
             clip = ClipMode::None;
@@ -2051,26 +2139,9 @@ pub fn ui_left_pane(ui: &mut Context,
         }
 
         let scroll = *scroll;
-        if let _ = elem().decl(Decl {
-            id: ui.tx_outer_container_hack_id,
-            colour: TRANSACTION_HISTORY_CONTAINER_COL,
-            radius: padding.0.dup4(),
-            width:  percent!(1.0),
-            height: grow!(),
-            direction: LeftToRight,
-            align: TopLeft,
-            ..Decl
-        }) {
-            if let _ = elem().decl(Decl {
-                id,
-                padding: (padding.0, 0.0, padding.2, padding.3),
-                width:  grow!(),
-                height: percent!(1.0),
-                direction: TopToBottom,
-                clip,
-                align: Top,
-                ..Decl
-            }) {
+        ui.scroll_container_bgn(data, padding, id, clip, scroll, content_h, viewport_h, max);
+        {
+            {
                 if txs.len() == 0 {
                     let h = ui.scale(24.0);
                     if let _ = elem().decl(Decl {
@@ -2461,58 +2532,8 @@ pub fn ui_left_pane(ui: &mut Context,
                     let _ = elem().decl(Decl { height: Sizing::Fixed(culled_post_n as f32 * transaction_element_height), ..Decl });
                 }
             }
-
-            let radius = ui.scale(6.0);
-
-            let scrollbar_region_h = viewport_h - padding.2 - padding.3;
-
-            let handle_height = {
-                let handle_pct = if content_h == 0.0 { 1.0 } else { viewport_h / content_h };
-                let handle_height = handle_pct * scrollbar_region_h;
-                handle_height.max(radius * 3.0).min(scrollbar_region_h)
-            };
-
-            let scroll_pct = (if max == 0.0 { 0.0 } else { scroll / max }).max(0.0).min(1.0);
-
-            let handle_offset = scroll_pct * (scrollbar_region_h - handle_height);
-
-            ui.nav_skip = true; // @Hack.
-
-            if max > 0.0 && handle_height < scrollbar_region_h && let _ = elem().decl(Decl {
-                id:      id_index("Scrollbar Region", id.id as u32),
-                width:   fixed!(ui.scale(32.0)),
-                padding: (ui.scale(10.0), 0.0, padding.2, 0.0),
-                direction: TopToBottom,
-                align: TopLeft,
-                ..Decl
-            }) {
-                let button_id = ui::id("Scrollbar Handle");
-                let colour = (0x60, 0x60, 0x60, 0);
-                let (activated, mut colour, _) = ui.button_ex(true, colour, button_id, true, winit::window::CursorIcon::Default);
-                colour.3 = colour.2;
-
-                if ui.mouse_pressed_id == button_id {
-                    let mut scroll_container_state = data.scroll_containers.entry(id.id).or_insert(Default::default());
-
-                    let delta_viewport_px  = ui.input().mouse_delta().1 as f32;
-                    let delta_viewport_pct = delta_viewport_px / (scrollbar_region_h - handle_height);
-
-                    let content_scrollable_h = max;
-
-                    let delta_content_pct = delta_viewport_pct;
-                    let delta_content_px  = delta_content_pct * content_scrollable_h;
-
-                    scroll_container_state.scroll += delta_content_px;
-                }
-
-                let _ = elem().decl(Decl {                                                                            height: fixed!(handle_offset), ..Decl });
-                let _ = elem().decl(Decl { id: button_id, colour, radius: radius.dup4(), width: fixed!(radius * 2.0), height: fixed!(handle_height), ..Decl });
-            } else {
-                let _ = elem().decl(Decl { width: fixed!(padding.1), ..Decl });
-            }
-
-            ui.nav_skip = false; // @Hack.
         }
+        ui.scroll_container_end(data, padding, id, clip, scroll, content_h, viewport_h, max);
     }
 
     ui.nav_skip = false;
@@ -3268,13 +3289,6 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         let mut nav_bbox: Option<(isize, isize, isize, isize)> = None;
 
         for mut command in render_commands {
-            if command.id == ui.tx_outer_container_hack_id.id {
-                // @HackBecauseClayRefusesToBoundTheHeightOfTheScrollContainerAgainstOurExplicitRequestForNoKnownReasonButOnlyInProductionAndNotInTheTestingGuiBuild
-                if command.bounding_box.height > window_h - command.bounding_box.y {
-                    command.bounding_box.height = window_h - command.bounding_box.y;
-                }
-            }
-
             if let Some(scroll_container_state) = data.scroll_containers.get_mut(&command.id) {
                 // @HackBecauseClayRefusesToBoundTheHeightOfTheScrollContainerAgainstOurExplicitRequestForNoKnownReasonButOnlyInProductionAndNotInTheTestingGuiBuild
                 if command.bounding_box.height > window_h - command.bounding_box.y {
@@ -3484,8 +3498,6 @@ pub struct Context {
 
     pub cursor: winit::window::Cursor,
     pub prev_cursor: winit::window::Cursor,
-
-    pub tx_outer_container_hack_id: Id,
 
     pub debug: bool,
     pub pixel_inspector_primed: bool,
