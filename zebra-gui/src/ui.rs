@@ -810,7 +810,7 @@ impl Context {
     pub fn scroll_container_bgn(
         &mut self,
         data: &mut UiData,
-        padding: (f32, f32, f32, f32),
+        padding: (f32, f32, f32, f32), child_gap: f32,
         id: Id, clip: ClipMode, scroll: f32, content_h: f32, viewport_h: f32, max: f32
     ) {
         elem_bgn();
@@ -828,6 +828,7 @@ impl Context {
         decl(Decl {
             id,
             padding: (padding.0, 0.0, padding.2, padding.3),
+            child_gap,
             width:  grow!(),
             height: percent!(1.0),
             direction: TopToBottom,
@@ -1597,20 +1598,9 @@ pub fn ui_left_pane(ui: &mut Context,
                         clip = ClipMode::None;
                         *scroll = 0.0;
                     }
-                    if let _ = elem().decl(Decl {
-                        id,
-                        colour: TRANSACTION_HISTORY_CONTAINER_COL,
-                        // child_gap: child_gap * 0.5,
-                        padding: padding.mul(0.5),
-                        radius: padding.0.dup4(),
-                        width:  percent!(1.0),
-                        height: grow!(),
-                        // height: percent!(1.0),
-                        direction: TopToBottom,
-                        clip,
-                        align: TopLeft,
-                        ..Decl
-                    }) {
+                    let scroll = *scroll;
+                    ui.scroll_container_bgn(data, padding, 0.0, id, clip, scroll, content_h, viewport_h, max);
+                    {
                         if (staked_roster_unbonded.len() + staked_roster_bonded.len()) == 0 {
                             let h = ui.scale(24.0);
                             if let _ = elem().decl(Decl {
@@ -1999,6 +1989,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         }
                     }
+                    ui.scroll_container_end(data, padding, id, clip, scroll, content_h, viewport_h, max);
                 }
             }
         }
@@ -2139,7 +2130,7 @@ pub fn ui_left_pane(ui: &mut Context,
         }
 
         let scroll = *scroll;
-        ui.scroll_container_bgn(data, padding, id, clip, scroll, content_h, viewport_h, max);
+        ui.scroll_container_bgn(data, padding, 0.0, id, clip, scroll, content_h, viewport_h, max);
         {
             {
                 if txs.len() == 0 {
@@ -2683,19 +2674,9 @@ pub fn ui_right_pane(ui: &mut Context,
             clip = ClipMode::None;
             *scroll = 0.0;
         }
-        if let _ = elem().decl(Decl {
-            id,
-            colour: TRANSACTION_HISTORY_CONTAINER_COL,
-            child_gap: child_gap * 0.5, padding,
-            radius: padding.0.dup4(),
-            width:  percent!(1.0),
-            height: grow!(),
-            // height: percent!(1.0),
-            direction: TopToBottom,
-            clip,
-            align: Top,
-            ..Decl
-        }) {
+        let scroll = *scroll;
+        ui.scroll_container_bgn(data, padding, child_gap * 0.5, id, clip, scroll, content_h, viewport_h, max);
+        {
             if roster.len() == 0 {
                 let h = ui.scale(24.0);
                 if let _ = elem().decl(Decl {
@@ -2785,6 +2766,7 @@ pub fn ui_right_pane(ui: &mut Context,
                 }
             }
         }
+        ui.scroll_container_end(data, padding, id, clip, scroll, content_h, viewport_h, max);
 
         // spacer
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
