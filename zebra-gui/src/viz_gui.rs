@@ -693,7 +693,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
 
         // draw PoW node
         {
-            let rad = 0.5*screen_unit * (on_screen_bc.block.txs_n as f32).log2().max(0.5);
+            let rad = 0.5*screen_unit * ((2.0 * on_screen_bc.block.txs_n as f32).log2() * 0.25).max(1.0);
 
             let (pt_x, pt_y) = (origin_x + (x*screen_unit), origin_y + (y*screen_unit));
             if very_zoom_out {

@@ -29,6 +29,31 @@
 
       "cwd": "${workspaceFolder}/zebra-crosslink",
       "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "Debug viz_gui with fake data",
+      "type": "lldb",
+      "request": "launch",
+
+      "cargo": {
+        "args": [
+          "run",
+          "--manifest-path",
+          "${workspaceFolder}/zebra-gui/Cargo.toml",
+        ]
+      },
+
+      "args": [
+        "-c",
+        "${workspaceFolder}/../regtest.toml"
+      ],
+
+      "env": {
+        "RUSTFLAGS": "-Awarnings"
+      },
+
+      "cwd": "${workspaceFolder}/zebra-gui",
+      "sourceLanguages": ["rust"]
     }
   ]
 }
