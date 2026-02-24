@@ -247,6 +247,60 @@ impl VizState {
     }
 }
 
+#[derive(Clone, Copy, PartialOrd, PartialEq, Ord, Eq)]
+#[repr(u8)]
+enum InteractiveVizOp {
+    None = 0,
+
+    // on PoW
+    LF = 1,
+    candidate = 2,
+
+    // on PoS
+    bft_last_final = 3,
+    origbft_last_final = 4,
+    snapshot = 5,
+}
+impl InteractiveVizOp {
+    pub fn valid_for_bc(&self) -> bool {
+        InteractiveVizOp::LF <= *self && *self <= InteractiveVizOp::candidate
+    }
+    pub fn valid_for_bft(&self) -> bool {
+        InteractiveVizOp::bft_last_final <= *self && *self <= InteractiveVizOp::snapshot
+    }
+}
+
+pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Vec<Hash32> {
+    let bc = state.on_screen_bcs.get(&block);
+    let bft = state.on_screen_bfts.get(&block);
+
+    if op.valid_for_bc() && bc.is_none() {
+        // println!("no on-screen PoW block found for hash {block}");
+        return Vec::new();
+    }
+
+    if op.valid_for_bft() && bft.is_none() {
+        // println!("no on-screen BFT block found for hash {block}");
+        return Vec::new();
+    }
+
+    match op {
+        InteractiveVizOp::None => Vec::new(),
+
+        InteractiveVizOp::LF => {
+            let mut res = vec![bc.unwrap().block.points_at_bft_block];
+            res.extend(apply_viz_op(state, res[0], InteractiveVizOp::bft_last_final));
+            res
+        }
+        InteractiveVizOp::candidate => todo!(),
+
+        InteractiveVizOp::bft_last_final => vec![bft.unwrap().block.parent_hash],
+        InteractiveVizOp::origbft_last_final => todo!(),
+        InteractiveVizOp::snapshot => todo!(),
+    }
+}
+
+
 pub fn viz_gui_init(fake_data: bool) -> VizState {
     let (me_send, zebra_receive) = std::sync::mpsc::sync_channel(128);
     let (zebra_send, me_receive) = std::sync::mpsc::sync_channel(128);
@@ -301,6 +355,8 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(10), parent_hash: Hash32::from_u64(8), this_height: 2, txs_n: 15, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
         let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(11), parent_hash: Hash32::from_u64(10), this_height: 3, txs_n: 3, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
+        viz_state.on_screen_bcs.insert(block.block.this_hash, block);
+        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(12), parent_hash: Hash32::from_u64(3), this_height: 3, txs_n: 3, is_best_chain: true, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(7), }, ..Default::default() };
         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
 
         let block = OnScreenBft { block: BftBlock { this_hash: Hash32::from_u64(5), parent_hash: Hash32::from_u64(0), this_height: 0, points_at_bc_block: Hash32::from_u64(1), ..Default::default() }, ..Default::default() };
@@ -523,8 +579,13 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         }
     }
 
+    let viz_op = InteractiveVizOp::bft_last_final;
+    let viz_op = InteractiveVizOp::LF;
+    let viz_op = InteractiveVizOp::None;
+    let viz_blocks = apply_viz_op(viz_state, hovered_block, viz_op);
+
     for on_screen_bc in magic(&mut viz_state.on_screen_bcs).values_mut() {
-        if on_screen_bc.block.this_hash == hovered_block {
+        if on_screen_bc.block.this_hash == hovered_block || viz_blocks.contains(&on_screen_bc.block.this_hash) {
             on_screen_bc.t_roundness = 0.3;
             on_screen_bc.t_darkness = 0.2;
             if input_ctx.key_pressed(KeyCode::Space) {
@@ -560,7 +621,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         }
     }
     for on_screen_bft in magic(&mut viz_state.on_screen_bfts).values_mut() {
-        if on_screen_bft.block.this_hash == hovered_block {
+        if on_screen_bft.block.this_hash == hovered_block || viz_blocks.contains(&on_screen_bft.block.this_hash) {
             on_screen_bft.t_roundness = 0.3;
             on_screen_bft.t_darkness = 0.2;
             if input_ctx.key_pressed(KeyCode::Space) {
@@ -668,19 +729,17 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         let x = on_screen_bc.x;
         let y = on_screen_bc.y;
         let finalized = on_screen_bc.block.is_best_chain && on_screen_bc.block.this_height <= viz_state.bc_finalized_tip_height;
-        let base_color = if on_screen_bc.block.is_best_chain {
-            if viz_state.ui_hovered_height.is_some() && on_screen_bc.block.this_height == viz_state.ui_hovered_height.unwrap().0 as u64 {
-                COLOR_BRIGHT
-            } else {
-                COLOR_BC
-            }
+        let base_color = if viz_blocks.last() == Some(&on_screen_bc.block.this_hash) {
+            COLOR_BRIGHT
+        } else if on_screen_bc.block.is_best_chain {
+            // if viz_state.ui_hovered_height.is_some() && on_screen_bc.block.this_height == viz_state.ui_hovered_height.unwrap().0 as u64 {
+            COLOR_BC
         } else {
             COLOR_NBC
         };
 
         let color        = (((on_screen_bc.alpha*255.0)                                      as u32) << 24) | blend_u32(0x000000, base_color,   ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
         let color_accent = (((on_screen_bc.alpha*on_screen_bc.finalized_alpha*255.0)         as u32) << 24) | blend_u32(0x000000, COLOR_ACCENT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
-        let color_bft    = (((on_screen_bc.alpha*on_screen_bc.implicated_by_bft_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BFT,    ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
 
         if hovered_block == on_screen_bc.block.this_hash {
             hovered_block_screen_x = origin_x + (x*screen_unit);
@@ -783,7 +842,12 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     for on_screen_bft in viz_state.on_screen_bfts.values() {
         let x = on_screen_bft.x;
         let y = on_screen_bft.y;
-        let color = (((on_screen_bft.alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_BFT, ((1.0 - on_screen_bft.darkness) * 255.0) as u32);
+        let base_color = if viz_blocks.last() == Some(&on_screen_bft.block.this_hash) {
+            COLOR_BRIGHT
+        } else {
+            COLOR_BFT
+        };
+        let color = (((on_screen_bft.alpha*255.0) as u32) << 24) | blend_u32(0x000000, base_color, ((1.0 - on_screen_bft.darkness) * 255.0) as u32);
 
         if hovered_block == on_screen_bft.block.this_hash {
             hovered_block_screen_x = origin_x + (x*screen_unit);
