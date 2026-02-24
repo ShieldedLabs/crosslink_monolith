@@ -3560,6 +3560,8 @@ pub fn run_instances(i: usize) {
     rt.block_on(std::future::pending::<()>())
 }
 
+mod bandwidth_test;
+
 #[cfg(test)]
 mod tests {
     use super::*;
