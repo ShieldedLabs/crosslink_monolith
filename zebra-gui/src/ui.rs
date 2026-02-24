@@ -76,6 +76,10 @@ pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
         }
     }
 
+    if ui.input().key_pressed(KeyCode::F8) {
+        ui.viz_op = ui.viz_op.cycle_next();
+    }
+
     if ui.pixel_inspector_primed {
         if ui.input().mouse_pressed(MouseButton::Left) {
             unsafe {
@@ -3064,6 +3068,9 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             ui.text(peer, decl);
                         }
                     }
+                    if ui.viz_op != InteractiveVizOp::None {
+                        ui.text(frame_strf!(data, "Visualizing op: {:?}", ui.viz_op), decl);
+                    }
                 }
 
                 if let _ = elem().decl(Decl {
@@ -3507,6 +3514,8 @@ pub struct Context {
     pub nav_id: u32,
     pub nav_enable: bool,
     pub nav_skip: bool,
+
+    pub viz_op: InteractiveVizOp,
 
     pub pane_tab_l: Id,
     pub dummy_1: Id,

@@ -247,29 +247,6 @@ impl VizState {
     }
 }
 
-#[derive(Clone, Copy, PartialOrd, PartialEq, Ord, Eq)]
-#[repr(u8)]
-enum InteractiveVizOp {
-    None = 0,
-
-    // on PoW
-    LF = 1,
-    candidate = 2,
-
-    // on PoS
-    bft_last_final = 3,
-    origbft_last_final = 4,
-    snapshot = 5,
-}
-impl InteractiveVizOp {
-    pub fn valid_for_bc(&self) -> bool {
-        InteractiveVizOp::LF <= *self && *self <= InteractiveVizOp::candidate
-    }
-    pub fn valid_for_bft(&self) -> bool {
-        InteractiveVizOp::bft_last_final <= *self && *self <= InteractiveVizOp::snapshot
-    }
-}
-
 pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Vec<Hash32> {
     let bc = state.on_screen_bcs.get(&block);
     let bft = state.on_screen_bfts.get(&block);
@@ -579,10 +556,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         }
     }
 
-    let viz_op = InteractiveVizOp::bft_last_final;
-    let viz_op = InteractiveVizOp::LF;
-    let viz_op = InteractiveVizOp::None;
-    let viz_blocks = apply_viz_op(viz_state, hovered_block, viz_op);
+    let viz_blocks = apply_viz_op(viz_state, hovered_block, ui.viz_op);
 
     for on_screen_bc in magic(&mut viz_state.on_screen_bcs).values_mut() {
         if on_screen_bc.block.this_hash == hovered_block || viz_blocks.contains(&on_screen_bc.block.this_hash) {
