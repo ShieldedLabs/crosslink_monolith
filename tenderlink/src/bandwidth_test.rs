@@ -1,6 +1,5 @@
 
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
-use std::os::fd::AsRawFd;
 
 #[test]
 fn bwdth_test() {
@@ -304,6 +303,8 @@ mod linux {
 pub use windows::*;
 #[cfg(windows)]
 mod windows {
+    use super::*;
+    
     pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle {
         panic!("Not implemented");
     }
