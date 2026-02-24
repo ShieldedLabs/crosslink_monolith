@@ -10,16 +10,19 @@ fn bwdth_test() {
 }
 
 fn do_the_test_program(port: u16) {
-    let socket = linux::setup_and_bind_udp_socket(port);
+    let socket = setup_and_bind_udp_socket(port);
     // try a non self send in order to make sure non blocking works.
-    let res = linux::udp_send_with_congestion_and_dscp(socket, Ipv6Addr::LOCALHOST, port, b"Hello there!", Dscp::BestEffort);
+    let res = udp_send_with_congestion_and_dscp(socket, Ipv6Addr::LOCALHOST, port, b"Hello there!", Dscp::BestEffort);
     println!("res = {:?}", res);
     let mut buf = [0_u8; 1024];
-    let res = linux::udp_recv_with_congestion_and_dscp(socket, &mut buf);
+    let res = udp_recv_with_congestion_and_dscp(socket, &mut buf);
     println!("res = {:?}", res);
     println!("data = {:?}", &buf[0..res.unwrap().0]);
 }
 
+#[cfg(unix)]
+pub use linux::*;
+#[cfg(unix)]
 mod linux {
     use super::*;
 
@@ -294,6 +297,30 @@ mod linux {
         }
     
         Ok((n as usize, src_ip6, src_port, congested, dscp))
+    }
+}
+
+#[cfg(windows)]
+pub use windows::*;
+#[cfg(windows)]
+mod windows {
+    pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle {
+        panic!("Not implemented");
+    }
+    pub fn udp_send_with_congestion_and_dscp(
+        udp_socket: SockHandle,
+        dst_ip6: Ipv6Addr,
+        dst_port: u16,
+        payload: &[u8],
+        dscp: Dscp,
+    ) -> std::io::Result<usize> {
+        panic!("Not implemented");
+    }
+    pub fn udp_recv_with_congestion_and_dscp(
+        udp_socket: SockHandle,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, Dscp)> {
+        panic!("Not implemented");
     }
 }
 
