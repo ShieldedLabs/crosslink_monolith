@@ -1365,6 +1365,7 @@ pub struct KnownPeer {
     pub endpoint: Option<SecureUdpEndpoint>,
     pub outgoing_handshake_state: Option<snow::HandshakeState>,
     pub pending_client_ack_snow_state: Option<snow::StatelessTransportState>,
+    pub pending_client_ack: bool,
     pub snow_state: Option<snow::StatelessTransportState>,
     pub watch_dog: Instant,
     pub transport: PeerTransport,
@@ -1393,6 +1394,7 @@ impl Default for KnownPeer {
             endpoint: None,
             outgoing_handshake_state: None,
             pending_client_ack_snow_state: None,
+            pending_client_ack: true,
             snow_state: None,
             watch_dog: Instant::now(),
             transport: PeerTransport::default(),
@@ -1427,14 +1429,18 @@ impl SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..
 
 #[derive(Debug)]
 pub struct UnknownPeer {
-    pub endpoint: SecureUdpEndpoint,
-    pub snow_state: snow::StatelessTransportState,
+    pub root_public_bft_key: [u8; 32],
+    pub endpoint: Option<SecureUdpEndpoint>,
+    pub outgoing_handshake_state: Option<snow::HandshakeState>,
+    pub pending_client_ack_snow_state: Option<snow::StatelessTransportState>,
     pub pending_client_ack: bool,
+    pub snow_state: Option<snow::StatelessTransportState>,
     pub watch_dog: Instant,
-
     pub transport: PeerTransport,
+    pub connection_knowledge: ConnectionKnowledge,
     pub latest_status_request_height: Option<u64>,
     pub latest_status_request_powlink: Option<(BlockHash, u16)>,
+    pub latest_status: Option<PacketStatus>,
 }
 impl UnknownPeer {
     fn info(&self) -> PeerInfo {
@@ -2440,13 +2446,14 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
 
                 for peer_i in 0..unknown_peers.len() {
                     let peer = &mut unknown_peers[peer_i];
+                    if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
                     if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
                         peer.latest_status_request_height = None;
-                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint, &mut peer.snow_state, [0; 32], &sock, &mut net_stats);
+                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), [0; 32], &sock, &mut net_stats);
                     }
                     if let Some((hash, chunk_i)) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
                         peer.latest_status_request_powlink = None;
-                        powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &sock, &mut peer.transport, peer.endpoint, &mut peer.snow_state, hash, chunk_i).await;
+                        powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &sock, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash, chunk_i).await;
                     }
 
                     if let Some(cmd) = &roster_cmd {
@@ -2454,7 +2461,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                         let mut o = write_header_and_maybe_status(header, false, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
                         o        += cmd.as_bytes().write_to(&mut send_buf1[o..]);
                         print_packet_tag_send(header);
-                        send_noise_msg(&ctx_str, &mut peer.transport, &mut peer.snow_state, &sock, peer.endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
+                        send_noise_msg(&ctx_str, &mut peer.transport, peer.snow_state.as_mut().unwrap(), &sock, peer.endpoint.unwrap(), &mut send_buf2, &send_buf1[..o], &mut net_stats);
                     }
                 }
 
@@ -2755,10 +2762,10 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
             }
         } else {
             loop {
-                if let Some(i) = unknown_peers.iter().position(|p| p.endpoint.ip_address == from_ip && p.endpoint.port == from_port) {
+                if let Some(i) = unknown_peers.iter().position(|p| p.endpoint.is_some() && p.endpoint.unwrap().ip_address == from_ip && p.endpoint.unwrap().port == from_port) {
                     let peer = &mut unknown_peers[i];
                     nonce = u64::from_le_bytes(raw_msg[..8].try_into().unwrap());
-                    if let Ok(length) = peer.snow_state.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
+                    if let Ok(length) = peer.snow_state.as_ref().unwrap().read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
                         let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
                         let packet_type = header.type_();
@@ -2821,13 +2828,19 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                             send_sock_msg(&ctx_str, &mut transport, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
                             transport.nonce += 1;
                             unknown_peers.push(UnknownPeer {
-                                endpoint: client_endpoint,
-                                snow_state: stateless_snow_state,
+                                root_public_bft_key: [0; 32],
+
+                                endpoint: Some(client_endpoint),
+                                outgoing_handshake_state: None,
+                                pending_client_ack_snow_state: None,
                                 pending_client_ack: true,
+                                snow_state: Some(stateless_snow_state),
                                 watch_dog: Instant::now(),
                                 transport,
+                                connection_knowledge: ConnectionKnowledge::Unknown,
                                 latest_status_request_height: None,
                                 latest_status_request_powlink: None,
+                                latest_status: None,
                             });
                         }
                         break;
@@ -2933,12 +2946,12 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                 PACKET_TYPE_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[read_o..]) {
                     Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == evidence.root_public_bft_key) {
                         peers[i].endpoint = Some(evidence.endpoint);
-                        if peer.endpoint == evidence.endpoint {
+                        if peer.endpoint == Some(evidence.endpoint) {
                             if PRINT_PROTOCOL { println!("{:05}: Promoting unknown peer connection {:?}", my_port, peer.endpoint); }
                             let peer = unknown_peers.remove(peer_index);
                             peers[i].outgoing_handshake_state      = None;
                             peers[i].pending_client_ack_snow_state = None;
-                            peers[i].snow_state                    = Some(peer.snow_state);
+                            peers[i].snow_state                    = peer.snow_state;
                             peers[i].watch_dog                     = Instant::now();
                             peers[i].transport                     = peer.transport;
                             peers[i].connection_knowledge          = ConnectionKnowledge::Known;
