@@ -1928,7 +1928,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             // NOTE(phil) probabilistically lerp down towards 0 likelihood of sending a packet as we approach bandwidth limit
             let rand_t = bytes_in_flight as f64 / target_bytes_in_flight as f64;
             if rand::random::<f64>() < rand_t {
-                if PRINT_PROTOCOL { println!("Dropping packet because of congestion control."); }
+                // if PRINT_PROTOCOL { println!("Dropping packet because of congestion control."); }
                 return;
             }
 
