@@ -30,7 +30,7 @@
 		<ConfigProperties>
 			<ConfigAndPlatform>
 				<Name>Debug:x64</Name>
-				<BuildCommand>cargo build</BuildCommand>
+				<BuildCommand>build.bat</BuildCommand>
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
 				<CleanCommand></CleanCommand>
@@ -44,6 +44,7 @@
 				<DebugSln>tenderlink.sln</DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
+				<PrioritiseFiles></PrioritiseFiles>
 			</ConfigAndPlatform>
 			<ConfigAndPlatform>
 				<Name>Release:x64</Name>
@@ -61,6 +62,7 @@
 				<DebugSln>tenderlink.sln</DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
+				<PrioritiseFiles></PrioritiseFiles>
 			</ConfigAndPlatform>
 			<Config>
 				<Name>Debug</Name>
