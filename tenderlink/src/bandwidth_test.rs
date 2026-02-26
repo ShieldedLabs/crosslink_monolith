@@ -5,18 +5,274 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 fn bwdth_test() {
     println!("Begin the test!");
     
-    do_the_test_program(29453);
+    let _handle = std::thread::spawn(|| {
+        do_the_reflector(32345);
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    do_the_test_program(29453, 32345);
 }
 
-fn do_the_test_program(port: u16) {
+fn do_the_test_program(port: u16, reflector_port: u16) {
     let socket = setup_and_bind_udp_socket(port);
-    // try a non self send in order to make sure non blocking works.
-    let res = udp_send_with_congestion_and_dscp(socket, Ipv6Addr::LOCALHOST, port, b"Hello there!", Dscp::BestEffort);
-    println!("res = {:?}", res);
-    let mut buf = [0_u8; 1024];
-    let res = udp_recv_with_congestion_and_dscp(socket, &mut buf);
-    println!("res = {:?}", res);
-    println!("data = {:?}", &buf[0..res.unwrap().0]);
+    let mut time_of_last_send = std::time::Instant::now();
+    
+    let mut serial_number = 50;
+    let mut bytes_on_the_wire = 0_u64;
+    let mut allowed_bytes_on_the_wire = 20000_u64;
+    
+    let mut packet_buffer = [0_u32; 2048];
+    
+    let mut buf = [0_u8; 16384];
+    loop {
+        let to_send_len_compressed = decompress_packet_size_to_8_bits(compress_packet_size_to_8_bits(180)) as u64;
+        if to_send_len_compressed + bytes_on_the_wire <= allowed_bytes_on_the_wire {
+            time_of_last_send = std::time::Instant::now();
+            store_u64(&mut buf[0..8], serial_number);
+            buf[8] = 1;
+            let packet_size = 180;
+            let res = udp_send_with_congestion_and_dscp(socket, Ipv6Addr::LOCALHOST, reflector_port, &buf[0..packet_size], Dscp::BestEffort);
+            if let Ok(timestamp_ns) = res {
+                packet_buffer[serial_number as usize % 2048] = compress_packet_info(packet_size as u16, timestamp_ns, false, false);
+                serial_number += 1;
+                bytes_on_the_wire += to_send_len_compressed;
+            }
+        }
+    
+        let res = udp_recv_with_congestion_and_dscp(socket, &mut buf);
+        if matches!(res, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock) { continue; }
+        //println!("{}: res = {:?}", port, res);
+        if res.is_err() { continue; }
+        let (buf_len, other_ip_addr, other_port, ecn_marked, _service_class, timestamp_ns) = res.unwrap();
+        if buf_len < 8 { continue; }
+        let packet_serial = load_u64(&buf[0..8]);
+        let packet_plaintext = &buf[8..buf_len];
+        
+        if packet_plaintext[0] == 2 {
+            if packet_plaintext.len() < 1+8+3 || (packet_plaintext.len()-1-8) % 3 != 0 {
+                eprintln!("Error! Bad Ack. data = {}\n", hex::encode(packet_plaintext));
+                continue;
+            }
+            let mut min_rtt_this_ack = u64::MAX;
+            let mut total_bytes_acked_this_ack = 0_u64;
+            
+            let ack_base = load_u64(&packet_plaintext[1..9]);
+            let mut o = 9;
+            while o < packet_plaintext.len() {
+                let val = load_u24(&packet_plaintext[o..o+3]);
+                o += 3;
+                let ecn_marked = val & 0x80_0000 != 0;
+                let ack_number = ack_base + (val & 0x7f_ffff) as u64;
+                if ack_number >= serial_number || ack_number + 2048 < serial_number {
+                    eprintln!("Error! Ack number out of range. {}\n", ack_number);
+                    continue;
+                }
+                let (packet_size_bytes, send_timestamp_ns, _ecn_marked, acked) = decompress_packet_info(packet_buffer[ack_number as usize % 2048]);
+                
+                if acked {
+                    eprintln!("Error! Already recieved ack for {}\n", ack_number);
+                    continue;
+                }
+                packet_buffer[ack_number as usize % 2048] |= 1 | (ecn_marked as u32) << 1;
+                let rtt_ns = subtract_22_bit_timestamps_with_a_known_more_recent(timestamp_ns, send_timestamp_ns);
+                min_rtt_this_ack = min_rtt_this_ack.min(rtt_ns);
+                total_bytes_acked_this_ack += packet_size_bytes as u64;
+            }
+            bytes_on_the_wire -= total_bytes_acked_this_ack;
+            println!("Bulk ACK {} B RTT: {} ns", total_bytes_acked_this_ack, min_rtt_this_ack);
+        }
+        else {
+            println!("{}: data = {:?}", port, packet_plaintext);
+        }
+    }
+}
+
+fn do_the_reflector(port: u16) {
+    let socket = setup_and_bind_udp_socket(port);
+    
+    let mut saved_other_ip_addr = Ipv6Addr::LOCALHOST;
+    let mut saved_other_port = 0;
+    
+    let mut serial_number = 2000;
+    
+    let mut acks_in_waiting_min = 0_u64;
+    let mut acks_in_waiting_buf = [(0_u64, false); ASSUMED_ACK_CAPACITY];
+    let mut acks_in_waiting_count = 0;
+    let mut first_waiting_ack_time_ns = 0_u64;
+    let mut ack_send_buf = [0_u8; ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE];
+    
+    let mut buf = [0_u8; 16384];
+    loop {
+        if acks_in_waiting_count > 0 && monotonic_clock_ns() - first_waiting_ack_time_ns > MAX_WAIT_BEFORE_SENDING_NON_FULL_ACK {
+            store_u64(&mut ack_send_buf[0..8], serial_number);
+            ack_send_buf[8] = 2;
+            serial_number += 1;
+            let mut o = 9;
+            store_u64(&mut ack_send_buf[o..o+8], acks_in_waiting_min);
+            o += 8;
+            for i in 0..acks_in_waiting_count {
+                let val = ((acks_in_waiting_buf[i].0 - acks_in_waiting_min) as u32 & 0x7f_ffff) | ((acks_in_waiting_buf[i].1 as u32) << 23);
+                store_u24(&mut ack_send_buf[o..o+3], val);
+                o += 3;
+            }
+            let res = udp_send_with_congestion_and_dscp(socket, saved_other_ip_addr, saved_other_port, &ack_send_buf[0..o], Dscp::Af21);
+            acks_in_waiting_count = 0;
+        }
+    
+        let res = udp_recv_with_congestion_and_dscp(socket, &mut buf);
+        if matches!(res, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock) { continue; }
+        //println!("{}: res = {:?}", port, res);
+        if res.is_err() { continue; }
+        let (buf_len, other_ip_addr, other_port, ecn_marked, _service_class, timestamp_ns) = res.unwrap();
+        if buf_len < 8 { continue; }
+        let packet_serial = load_u64(&buf[0..8]);
+        let packet_plaintext = &buf[8..buf_len-8];
+        //println!("{}: data = {:?}", port, packet_plaintext);
+        
+        saved_other_ip_addr = other_ip_addr;
+        saved_other_port = other_port;
+        
+        if acks_in_waiting_count == 0 {
+            acks_in_waiting_min = packet_serial;
+            first_waiting_ack_time_ns = timestamp_ns;
+        }
+        else {
+            acks_in_waiting_min = acks_in_waiting_min.min(packet_serial);
+        }
+        acks_in_waiting_buf[acks_in_waiting_count] = (packet_serial, ecn_marked);
+        acks_in_waiting_count += 1;
+        if acks_in_waiting_count == ASSUMED_ACK_CAPACITY || monotonic_clock_ns() - first_waiting_ack_time_ns > MIN_WAIT_BEFORE_SENDING_NON_FULL_ACK {
+            store_u64(&mut ack_send_buf[0..8], serial_number);
+            ack_send_buf[8] = 2;
+            serial_number += 1;
+            let mut o = 9;
+            store_u64(&mut ack_send_buf[o..o+8], acks_in_waiting_min);
+            o += 8;
+            for i in 0..acks_in_waiting_count {
+                let val = ((acks_in_waiting_buf[i].0 - acks_in_waiting_min) as u32 & 0x7f_ffff) | ((acks_in_waiting_buf[i].1 as u32) << 23);
+                store_u24(&mut ack_send_buf[o..o+3], val);
+                o += 3;
+            }
+            let res = udp_send_with_congestion_and_dscp(socket, saved_other_ip_addr, saved_other_port, &ack_send_buf[0..o], Dscp::Af21);
+            acks_in_waiting_count = 0;
+        }
+    }
+}
+
+const ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE: usize = 1232;
+const ASSUMED_ACK_CAPACITY: usize = (ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE-8-1-8)/3;
+
+const MIN_WAIT_BEFORE_SENDING_NON_FULL_ACK: u64 = 5_000_000;
+const MAX_WAIT_BEFORE_SENDING_NON_FULL_ACK: u64 = 20_000_000;
+
+#[inline]
+fn compress_packet_info(packet_size_bytes: u16, timestamp_ns: u64, ecn_marked: bool, acked: bool) -> u32 {
+    let size8 = compress_packet_size_to_8_bits(packet_size_bytes) as u32;
+    let ts22  = ((compress_timestamp_to_22_bits(timestamp_ns) >> 13) as u32) & ((1u32 << 22) - 1);
+    (size8 << 24) | (ts22 << 2) | ((ecn_marked as u32) << 1) | (acked as u32)
+}
+#[inline]
+fn decompress_packet_info(x: u32) -> (u16, u64, bool, bool) {
+    let size8 = (x >> 24) as u8;
+    let ts22  = (x >> 2) & ((1u32 << 22) - 1);
+    let ecn   = ((x >> 1) & 1) != 0;
+    let ack   = (x & 1) != 0;
+
+    let packet_size_bytes = decompress_packet_size_to_8_bits(size8);
+    let timestamp_ns_quantized = (ts22 as u64) << 13;
+
+    (packet_size_bytes, timestamp_ns_quantized, ecn, ack)
+}
+
+#[inline]
+fn subtract_22_bit_timestamps_with_a_known_more_recent(mut recent: u64, mut old: u64) -> u64 {
+    const ROUND_MASK: u64 = 0x1fff;                 // clear low 13 bits
+    const KEEP_MASK:  u64 = 0x0000_0007_ffff_ffff;  // keep low 35 bits
+    const MOD:        u64 = 0x8000_00000;           // 1 << 35
+
+    recent = recent.wrapping_add(ROUND_MASK) & !ROUND_MASK;
+    recent &= KEEP_MASK;
+
+    old = old.wrapping_add(ROUND_MASK) & !ROUND_MASK;
+    old &= KEEP_MASK;
+
+    recent = recent.wrapping_add(((recent < old) as u64) * MOD);
+    recent.wrapping_sub(old)
+}
+#[inline]
+fn compress_timestamp_to_22_bits(mut n: u64) -> u64 {
+    const ROUND_MASK: u64 = 0x1fff;
+    const KEEP_MASK:  u64 = 0x0000_0007_ffff_ffff;
+
+    n = n.wrapping_add(ROUND_MASK) & !ROUND_MASK;
+    n & KEEP_MASK
+}
+
+#[inline]
+fn compress_packet_size_to_8_bits(n: u16) -> u8 {
+    const BASE: u16 = 200;
+    const K: [u16; 8] = [16, 48, 128, 384, 768, 1408, 3136, 6656];
+
+    // remainder we need to represent as a subset-sum of K
+    let mut rem = n.saturating_sub(BASE);
+
+    // Greedy works because K is superincreasing.
+    let mut out: u8 = 0;
+
+    // i = 7 ..= 0
+    let t7 = (rem >= K[7]) as u16; rem = rem.wrapping_sub(t7 * K[7]); out |= (t7 as u8) << 7;
+    let t6 = (rem >= K[6]) as u16; rem = rem.wrapping_sub(t6 * K[6]); out |= (t6 as u8) << 6;
+    let t5 = (rem >= K[5]) as u16; rem = rem.wrapping_sub(t5 * K[5]); out |= (t5 as u8) << 5;
+    let t4 = (rem >= K[4]) as u16; rem = rem.wrapping_sub(t4 * K[4]); out |= (t4 as u8) << 4;
+    let t3 = (rem >= K[3]) as u16; rem = rem.wrapping_sub(t3 * K[3]); out |= (t3 as u8) << 3;
+    let t2 = (rem >= K[2]) as u16; rem = rem.wrapping_sub(t2 * K[2]); out |= (t2 as u8) << 2;
+    let t1 = (rem >= K[1]) as u16; rem = rem.wrapping_sub(t1 * K[1]); out |= (t1 as u8) << 1;
+    let t0 = (rem >= K[0]) as u16; rem = rem.wrapping_sub(t0 * K[0]); out |= (t0 as u8) << 0;
+
+    out
+}
+
+#[inline]
+fn decompress_packet_size_to_8_bits(n: u8) -> u16 {
+    const BASE: u16 = 200;
+    const K: [u16; 8] = [16, 48, 128, 384, 768, 1408, 3136, 6656];
+
+    let mut size = BASE;
+
+    // size = BASE + Σ K[i] * bit(i)
+    size += K[0] * ((n >> 0) & 1) as u16;
+    size += K[1] * ((n >> 1) & 1) as u16;
+    size += K[2] * ((n >> 2) & 1) as u16;
+    size += K[3] * ((n >> 3) & 1) as u16;
+    size += K[4] * ((n >> 4) & 1) as u16;
+    size += K[5] * ((n >> 5) & 1) as u16;
+    size += K[6] * ((n >> 6) & 1) as u16;
+    size += K[7] * ((n >> 7) & 1) as u16;
+
+    size
+}
+
+#[inline]
+fn store_u64(buf: &mut [u8], value: u64) {
+    assert!(buf.len() == 8);
+    buf[..8].copy_from_slice(&value.to_le_bytes());
+}
+#[inline]
+fn load_u64(buf: &[u8]) -> u64 {
+    assert!(buf.len() == 8);
+    u64::from_le_bytes(buf[..8].try_into().unwrap())
+}
+#[inline]
+fn store_u24(buf: &mut [u8], value: u32) {
+    assert!(buf.len() == 3);
+    buf.copy_from_slice(&value.to_le_bytes()[..3]);
+}
+#[inline]
+fn load_u24(buf: &[u8]) -> u32 {
+    assert!(buf.len() == 3);
+
+    let mut tmp = [0u8; 4];
+    tmp[..3].copy_from_slice(buf);
+    u32::from_le_bytes(tmp)
 }
 
 #[cfg(unix)]
@@ -24,6 +280,17 @@ pub use linux::*;
 #[cfg(unix)]
 mod linux {
     use super::*;
+    
+    #[inline]
+    pub fn monotonic_clock_ns() -> u64 {
+        unsafe {
+            let mut ts: libc::timespec = std::mem::zeroed();
+            if libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) != 0 {
+                panic!("clock_gettime() failed: {}", std::io::Error::last_os_error());
+            }
+            (ts.tv_sec as u64) * 1_000_000_000u64 + (ts.tv_nsec as u64)
+        }
+    }
 
     pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle {
         let fd = unsafe {
@@ -116,13 +383,14 @@ mod linux {
     /// - If `dst_ip6` is IPv4-mapped (::ffff:a.b.c.d), it sends to IPv4 using sockaddr_in
     ///   and uses IP_TOS cmsg.
     /// - Otherwise sends to IPv6 using sockaddr_in6 and IPV6_TCLASS cmsg.
+    /// Return value is a nanosecond timestamp of the send.
     pub fn udp_send_with_congestion_and_dscp(
         udp_socket: SockHandle,
         dst_ip6: Ipv6Addr,
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
-    ) -> std::io::Result<usize> {
+    ) -> std::io::Result<u64> {
         let fd = udp_socket.to_native();
     
         let mut iov = libc::iovec {
@@ -198,11 +466,19 @@ mod linux {
     
             msg.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) as _;
     
+            let timestamp_ns = monotonic_clock_ns();
             let n = libc::sendmsg(fd, &msg as *const _ as *mut _, 0);
             if n < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            Ok(n as usize)
+            let sent = n as usize;
+            if sent != payload.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!("partial UDP send: {sent} of {}", payload.len()),
+                ));
+            }
+            Ok(timestamp_ns)
         }
     }
     
@@ -215,7 +491,7 @@ mod linux {
     pub fn udp_recv_with_congestion_and_dscp(
         udp_socket: SockHandle,
         buf: &mut [u8],
-    ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, Dscp)> {
+    ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, Dscp, u64)> {
         let fd = udp_socket.to_native();
     
         let mut iov = libc::iovec {
@@ -235,6 +511,7 @@ mod linux {
         msg.msg_controllen = cbuf.len();
     
         let n = unsafe { libc::recvmsg(fd, &mut msg as *mut libc::msghdr, 0) };
+        let timestamp_ns = monotonic_clock_ns();
         if n < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -295,7 +572,7 @@ mod linux {
             }
         }
     
-        Ok((n as usize, src_ip6, src_port, congested, dscp))
+        Ok((n as usize, src_ip6, src_port, congested, dscp, timestamp_ns))
     }
 }
 
@@ -305,6 +582,10 @@ pub use windows::*;
 mod windows {
     use super::*;
     
+    #[inline]
+    pub fn monotonic_clock_ns() -> u64 {
+        panic!("Not implemented");
+    }
     pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle {
         panic!("Not implemented");
     }
@@ -314,7 +595,7 @@ mod windows {
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
-    ) -> std::io::Result<usize> {
+    ) -> std::io::Result<()> {
         panic!("Not implemented");
     }
     pub fn udp_recv_with_congestion_and_dscp(
