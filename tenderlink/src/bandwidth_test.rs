@@ -28,6 +28,10 @@ fn do_the_test_program(port: u16, reflector_port: u16) {
     let mut bytes_delivered_bucket_cursor = 0_u64;
     let mut bytes_delivered_bucket_cursor_last_time = 0_u64;
     
+    let mut state_machine_cursor = 0_u64;
+    let mut state_machine_cursor_last_time = 0_u64;
+    let mut old_measured_allowed_bytes_on_the_wire = 0_u64;
+    
     let mut packet_buffer = vec![0_u32; PACKET_HISTORY_BUFFER_LEN];
     
     let mut buf = [0_u8; 16384];
@@ -51,18 +55,28 @@ fn do_the_test_program(port: u16, reflector_port: u16) {
             a.max(b).max(c).max(d).max(e)
         };
     
-        let bottleneck_bandwidth_Bps = 30000_000;
-        let allowed_bytes_on_the_wire = ((bottleneck_bandwidth_Bps as u128 * current_min_rtt_on_connection_ns as u128) / 1_000_000_000).max(2000) as u64;
         
         let bottleneck_bandwidth_Bps = (current_max_delivered_bucket_bytes*1_000_000_000) / current_min_rtt_on_connection_ns;
+        let measured_allowed_bytes_on_the_wire = ((bottleneck_bandwidth_Bps as u128 * current_min_rtt_on_connection_ns as u128) / 1_000_000_000).max(2000) as u64;
         
-        if time_of_last_status_print.elapsed() > std::time::Duration::from_millis(200) {
+        let drop_back_edge_timestamp_ns = monotonic_clock_ns();
+        
+        if drop_back_edge_timestamp_ns > state_machine_cursor_last_time + current_min_rtt_on_connection_ns {
+            state_machine_cursor += 1;
+            state_machine_cursor_last_time = drop_back_edge_timestamp_ns;
+        }
+        if measured_allowed_bytes_on_the_wire > old_measured_allowed_bytes_on_the_wire*102/100 { state_machine_cursor = 0; println!("GROW"); }
+        old_measured_allowed_bytes_on_the_wire = measured_allowed_bytes_on_the_wire;
+        if state_machine_cursor >= 12 { state_machine_cursor = 2; }
+        
+        let allowed_bytes_on_the_wire = if state_machine_cursor < 2 { (measured_allowed_bytes_on_the_wire*2).max(measured_allowed_bytes_on_the_wire + 100_000) } else if state_machine_cursor < 4 { (measured_allowed_bytes_on_the_wire*125/100).max(measured_allowed_bytes_on_the_wire + 20_000) } else if state_machine_cursor < 6 { measured_allowed_bytes_on_the_wire*75/100 } else { measured_allowed_bytes_on_the_wire };
+        
+        if time_of_last_status_print.elapsed() > std::time::Duration::from_millis(1000) {
             time_of_last_status_print = std::time::Instant::now();
             println!("rtt: {} us MaxBucket: {} B bottleneck bandwidth: {}", current_min_rtt_on_connection_ns / 1000, current_max_delivered_bucket_bytes, BytesPerSecond(bottleneck_bandwidth_Bps));
-            println!("{} < {}", bytes_on_the_wire, allowed_bytes_on_the_wire);
+            println!("{} < m: {} t: {}", bytes_on_the_wire, measured_allowed_bytes_on_the_wire, allowed_bytes_on_the_wire);
         }
     
-        let drop_back_edge_timestamp_ns = monotonic_clock_ns();
         while drop_cursor < serial_number { // The drop back edge.
             let (packet_size_bytes, send_timestamp_ns, _ecn_marked, acked) = decompress_packet_info(packet_buffer[drop_cursor as usize % PACKET_HISTORY_BUFFER_LEN]);
             let time_since_send_ns = subtract_22_bit_timestamps_with_a_known_more_recent(drop_back_edge_timestamp_ns, send_timestamp_ns);
@@ -124,12 +138,7 @@ fn do_the_test_program(port: u16, reflector_port: u16) {
                     eprintln!("Error! Ack number out of range. Too old for buffer. {}\n", ack_number);
                     continue;
                 }
-                if ack_number < drop_cursor {
-                    eprintln!("Error! Ack number out of range. Considered drop already. {}\n", ack_number);
-                    continue;
-                }
                 let (packet_size_bytes, send_timestamp_ns, _ecn_marked, acked) = decompress_packet_info(packet_buffer[ack_number as usize % PACKET_HISTORY_BUFFER_LEN]);
-                
                 if acked {
                     eprintln!("Error! Already recieved ack for {}\n", ack_number);
                     continue;
@@ -137,7 +146,9 @@ fn do_the_test_program(port: u16, reflector_port: u16) {
                 packet_buffer[ack_number as usize % PACKET_HISTORY_BUFFER_LEN] |= 1 | (ecn_marked as u32) << 1;
                 let rtt_ns = subtract_22_bit_timestamps_with_a_known_more_recent(timestamp_ns, send_timestamp_ns);
                 min_rtt_this_ack = min_rtt_this_ack.min(rtt_ns);
-                total_bytes_acked_this_ack += packet_size_bytes as u64;
+                if ack_number >= drop_cursor {
+                    total_bytes_acked_this_ack += packet_size_bytes as u64;
+                }
             }
             if total_bytes_acked_this_ack > 0 {
                 bytes_on_the_wire -= total_bytes_acked_this_ack;
