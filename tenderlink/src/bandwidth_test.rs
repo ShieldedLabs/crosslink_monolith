@@ -14,27 +14,81 @@ fn bwdth_test() {
 
 fn do_the_test_program(port: u16, reflector_port: u16) {
     let socket = setup_and_bind_udp_socket(port);
-    let mut time_of_last_send = std::time::Instant::now();
+    let mut time_of_last_status_print = std::time::Instant::now();
     
-    let mut serial_number = 50;
+    let mut drop_cursor = 50_u64;
+    let mut serial_number = 50_u64;
     let mut bytes_on_the_wire = 0_u64;
-    let mut allowed_bytes_on_the_wire = 20000_u64;
     
-    let mut packet_buffer = [0_u32; 2048];
+    let mut min_seen_rtt_buckets = [u64::MAX; 10];
+    let mut rtt_bucket_cursor = 0_u64;
+    let mut rtt_bucket_cursor_last_time = 0_u64;
+    
+    let mut bytes_delivered_buckets = [0_u64; 10];
+    let mut bytes_delivered_bucket_cursor = 0_u64;
+    let mut bytes_delivered_bucket_cursor_last_time = 0_u64;
+    
+    let mut packet_buffer = vec![0_u32; PACKET_HISTORY_BUFFER_LEN];
     
     let mut buf = [0_u8; 16384];
     loop {
-        let to_send_len_compressed = decompress_packet_size_to_8_bits(compress_packet_size_to_8_bits(180)) as u64;
-        if to_send_len_compressed + bytes_on_the_wire <= allowed_bytes_on_the_wire {
-            time_of_last_send = std::time::Instant::now();
-            store_u64(&mut buf[0..8], serial_number);
-            buf[8] = 1;
-            let packet_size = 180;
-            let res = udp_send_with_congestion_and_dscp(socket, Ipv6Addr::LOCALHOST, reflector_port, &buf[0..packet_size], Dscp::BestEffort);
-            if let Ok(timestamp_ns) = res {
-                packet_buffer[serial_number as usize % 2048] = compress_packet_info(packet_size as u16, timestamp_ns, false, false);
-                serial_number += 1;
-                bytes_on_the_wire += to_send_len_compressed;
+        let current_min_rtt_on_connection_ns = {
+            let a = min_seen_rtt_buckets[0].min(min_seen_rtt_buckets[1]);
+            let b = min_seen_rtt_buckets[2].min(min_seen_rtt_buckets[3]);
+            let c = min_seen_rtt_buckets[4].min(min_seen_rtt_buckets[5]);
+            let d = min_seen_rtt_buckets[6].min(min_seen_rtt_buckets[7]);
+            let e = min_seen_rtt_buckets[8].min(min_seen_rtt_buckets[9]);
+            a.min(b).min(c).min(d).min(e)
+                .min(10_000_000_000) // RTT assumed to be always less than 10 seconds.
+                .max(5_000_000) // The maths breaks down with RTT close to zero so we pad up to 5 ms always.
+        };
+        let current_max_delivered_bucket_bytes = {
+            let a = bytes_delivered_buckets[0].max(bytes_delivered_buckets[1]);
+            let b = bytes_delivered_buckets[2].max(bytes_delivered_buckets[3]);
+            let c = bytes_delivered_buckets[4].max(bytes_delivered_buckets[5]);
+            let d = bytes_delivered_buckets[6].max(bytes_delivered_buckets[7]);
+            let e = bytes_delivered_buckets[8].max(bytes_delivered_buckets[9]);
+            a.max(b).max(c).max(d).max(e)
+        };
+    
+        let bottleneck_bandwidth_Bps = 30000_000;
+        let allowed_bytes_on_the_wire = ((bottleneck_bandwidth_Bps as u128 * current_min_rtt_on_connection_ns as u128) / 1_000_000_000).max(2000) as u64;
+        
+        let bottleneck_bandwidth_Bps = (current_max_delivered_bucket_bytes*1_000_000_000) / current_min_rtt_on_connection_ns;
+        
+        if time_of_last_status_print.elapsed() > std::time::Duration::from_millis(200) {
+            time_of_last_status_print = std::time::Instant::now();
+            println!("rtt: {} us MaxBucket: {} B bottleneck bandwidth: {}", current_min_rtt_on_connection_ns / 1000, current_max_delivered_bucket_bytes, BytesPerSecond(bottleneck_bandwidth_Bps));
+            println!("{} < {}", bytes_on_the_wire, allowed_bytes_on_the_wire);
+        }
+    
+        let drop_back_edge_timestamp_ns = monotonic_clock_ns();
+        while drop_cursor < serial_number { // The drop back edge.
+            let (packet_size_bytes, send_timestamp_ns, _ecn_marked, acked) = decompress_packet_info(packet_buffer[drop_cursor as usize % PACKET_HISTORY_BUFFER_LEN]);
+            let time_since_send_ns = subtract_22_bit_timestamps_with_a_known_more_recent(drop_back_edge_timestamp_ns, send_timestamp_ns);
+            if time_since_send_ns < current_min_rtt_on_connection_ns * bytes_delivered_buckets.len() as u64 { break; }
+            if acked == false {
+                bytes_on_the_wire -= packet_size_bytes as u64;
+            }
+            drop_cursor += 1;
+        }
+    
+        if serial_number + 1 >= drop_cursor + (PACKET_HISTORY_BUFFER_LEN as u64) {
+            eprintln!("Error! PACKET_HISTORY_BUFFER_LEN is too small.\n");
+            continue;
+        }
+        else {
+            let to_send_len_compressed = decompress_packet_size_to_8_bits(compress_packet_size_to_8_bits(1280)) as u64;
+            if to_send_len_compressed + bytes_on_the_wire <= allowed_bytes_on_the_wire {
+                store_u64(&mut buf[0..8], serial_number);
+                buf[8] = 1;
+                let packet_size = 1280;
+                let res = udp_send_with_congestion_and_dscp(socket, Ipv6Addr::LOCALHOST, reflector_port, &buf[0..packet_size], Dscp::BestEffort);
+                if let Ok(timestamp_ns) = res {
+                    packet_buffer[serial_number as usize % PACKET_HISTORY_BUFFER_LEN] = compress_packet_info(packet_size as u16, timestamp_ns, false, false);
+                    serial_number += 1;
+                    bytes_on_the_wire += to_send_len_compressed;
+                }
             }
         }
     
@@ -62,23 +116,48 @@ fn do_the_test_program(port: u16, reflector_port: u16) {
                 o += 3;
                 let ecn_marked = val & 0x80_0000 != 0;
                 let ack_number = ack_base + (val & 0x7f_ffff) as u64;
-                if ack_number >= serial_number || ack_number + 2048 < serial_number {
-                    eprintln!("Error! Ack number out of range. {}\n", ack_number);
+                if ack_number >= serial_number {
+                    eprintln!("Error! Ack number out of range. Too new. {}\n", ack_number);
                     continue;
                 }
-                let (packet_size_bytes, send_timestamp_ns, _ecn_marked, acked) = decompress_packet_info(packet_buffer[ack_number as usize % 2048]);
+                if ack_number + (PACKET_HISTORY_BUFFER_LEN as u64) < serial_number {
+                    eprintln!("Error! Ack number out of range. Too old for buffer. {}\n", ack_number);
+                    continue;
+                }
+                if ack_number < drop_cursor {
+                    eprintln!("Error! Ack number out of range. Considered drop already. {}\n", ack_number);
+                    continue;
+                }
+                let (packet_size_bytes, send_timestamp_ns, _ecn_marked, acked) = decompress_packet_info(packet_buffer[ack_number as usize % PACKET_HISTORY_BUFFER_LEN]);
                 
                 if acked {
                     eprintln!("Error! Already recieved ack for {}\n", ack_number);
                     continue;
                 }
-                packet_buffer[ack_number as usize % 2048] |= 1 | (ecn_marked as u32) << 1;
+                packet_buffer[ack_number as usize % PACKET_HISTORY_BUFFER_LEN] |= 1 | (ecn_marked as u32) << 1;
                 let rtt_ns = subtract_22_bit_timestamps_with_a_known_more_recent(timestamp_ns, send_timestamp_ns);
                 min_rtt_this_ack = min_rtt_this_ack.min(rtt_ns);
                 total_bytes_acked_this_ack += packet_size_bytes as u64;
             }
-            bytes_on_the_wire -= total_bytes_acked_this_ack;
-            println!("Bulk ACK {} B RTT: {} ns", total_bytes_acked_this_ack, min_rtt_this_ack);
+            if total_bytes_acked_this_ack > 0 {
+                bytes_on_the_wire -= total_bytes_acked_this_ack;
+                
+                let current_time_ns = monotonic_clock_ns();
+                
+                if current_time_ns > rtt_bucket_cursor_last_time + 1_000_000_000 {
+                    rtt_bucket_cursor += 1;
+                    min_seen_rtt_buckets[rtt_bucket_cursor as usize % min_seen_rtt_buckets.len()] = u64::MAX;
+                    rtt_bucket_cursor_last_time = current_time_ns;
+                }
+                min_seen_rtt_buckets[rtt_bucket_cursor as usize % min_seen_rtt_buckets.len()] = min_seen_rtt_buckets[rtt_bucket_cursor as usize % min_seen_rtt_buckets.len()].min(min_rtt_this_ack);
+                
+                if current_time_ns > bytes_delivered_bucket_cursor_last_time + current_min_rtt_on_connection_ns {
+                    bytes_delivered_bucket_cursor += 1;
+                    bytes_delivered_buckets[bytes_delivered_bucket_cursor as usize % bytes_delivered_buckets.len()] = 0;
+                    bytes_delivered_bucket_cursor_last_time = current_time_ns;
+                }
+                bytes_delivered_buckets[bytes_delivered_bucket_cursor as usize % bytes_delivered_buckets.len()] += total_bytes_acked_this_ack;
+            }
         }
         else {
             println!("{}: data = {:?}", port, packet_plaintext);
@@ -164,6 +243,8 @@ const ASSUMED_ACK_CAPACITY: usize = (ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE-8-1-8)/
 const MIN_WAIT_BEFORE_SENDING_NON_FULL_ACK: u64 = 5_000_000;
 const MAX_WAIT_BEFORE_SENDING_NON_FULL_ACK: u64 = 20_000_000;
 
+const PACKET_HISTORY_BUFFER_LEN: usize = 1048576;
+
 #[inline]
 fn compress_packet_info(packet_size_bytes: u16, timestamp_ns: u64, ecn_marked: bool, acked: bool) -> u32 {
     let size8 = compress_packet_size_to_8_bits(packet_size_bytes) as u32;
@@ -187,7 +268,7 @@ fn decompress_packet_info(x: u32) -> (u16, u64, bool, bool) {
 fn subtract_22_bit_timestamps_with_a_known_more_recent(mut recent: u64, mut old: u64) -> u64 {
     const ROUND_MASK: u64 = 0x1fff;                 // clear low 13 bits
     const KEEP_MASK:  u64 = 0x0000_0007_ffff_ffff;  // keep low 35 bits
-    const MOD:        u64 = 0x8000_00000;           // 1 << 35
+    const MOD:        u64 = 0x8_0000_0000;            // 1 << 35
 
     recent = recent.wrapping_add(ROUND_MASK) & !ROUND_MASK;
     recent &= KEEP_MASK;
@@ -662,5 +743,72 @@ impl Dscp {
             46 => Dscp::Ef,
             _ => Dscp::BestEffort,
         }
+    }
+}
+
+/// Bytes per second, formatted in binary units (KiB/MiB/GiB/TiB).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct BytesPerSecond(pub u64);
+
+impl BytesPerSecond {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const TIB: u64 = 1024 * 1024 * 1024 * 1024;
+
+    fn best_unit(bps: u64) -> (u64, &'static str) {
+        if bps >= Self::TIB {
+            (Self::TIB, "TiB/s")
+        } else if bps >= Self::GIB {
+            (Self::GIB, "GiB/s")
+        } else if bps >= Self::MIB {
+            (Self::MIB, "MiB/s")
+        } else if bps >= Self::KIB {
+            (Self::KIB, "KiB/s")
+        } else {
+            (1, "B/s")
+        }
+    }
+
+    fn format_value(value: u64, unit: u64) -> (u64, u64) {
+        // integer + 2-decimal fixed point, rounded half-up:
+        // scaled = round(value * 100 / unit)
+        let scaled = (value.saturating_mul(100) + unit / 2) / unit;
+        (scaled / 100, scaled % 100)
+    }
+}
+
+impl std::fmt::Display for BytesPerSecond {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bps = self.0;
+        let (unit, suffix) = Self::best_unit(bps);
+
+        if unit == 1 {
+            return write!(f, "{} {}", bps, suffix);
+        }
+
+        let (whole, frac) = Self::format_value(bps, unit);
+
+        // If it's an exact integer in that unit, print without decimals.
+        if frac == 0 {
+            write!(f, "{} {}", whole, suffix)
+        } else if whole >= 10 {
+            // For >= 10, 1 decimal place is usually plenty.
+            let one_decimal = (bps.saturating_mul(10) + unit / 2) / unit; // rounded
+            write!(f, "{}.{:01} {}", one_decimal / 10, one_decimal % 10, suffix)
+        } else {
+            // For < 10, print 2 decimals for a bit more resolution.
+            write!(f, "{}.{:02} {}", whole, frac, suffix)
+        }
+    }
+}
+
+impl std::fmt::Debug for BytesPerSecond {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Debug prints both the pretty display and the raw value.
+        f.debug_tuple("BytesPerSecond")
+            .field(&format_args!("{}", self))
+            .field(&self.0)
+            .finish()
     }
 }
