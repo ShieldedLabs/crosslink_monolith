@@ -1187,7 +1187,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                         internal.peer_strings.push(format!("{} {} ({}) - ({}, {})",
                             if let Some(pubkey) = peer.root_public_bft_key { tenderlink::PubKeyID(pubkey).to_string() } else { "unknown peer".to_string() },
                             if peer.connected { "connected" } else { "disconnected" },
-                            if peer.connection_is_unknown { "unknown" } else { "known" },
+                            if peer.connection_knowledge == tenderlink::ConnectionKnowledge::Unknown { "unknown" } else { "known" },
                             peer.latest_status_request_height,
                             peer.latest_status_request_powlink_id
                         ));
