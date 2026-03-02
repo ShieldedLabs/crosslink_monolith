@@ -318,34 +318,66 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         staking_unbonded_pool_balance: 0,
         peer_strings: Vec::new(),
     };
-    if fake_data {
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(1), parent_hash: Hash32::from_u64(0), this_height: 0, txs_n: 1, is_best_chain: true, is_finalized: true, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
-        viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(2), parent_hash: Hash32::from_u64(1), this_height: 1, txs_n: 6, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
-        viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(3), parent_hash: Hash32::from_u64(2), this_height: 2, txs_n: 2, is_best_chain: true, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
-        viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(8), parent_hash: Hash32::from_u64(1), this_height: 1, txs_n: 4256, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
-        viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(9), parent_hash: Hash32::from_u64(2), this_height: 2, txs_n: 16, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
-        viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(10), parent_hash: Hash32::from_u64(8), this_height: 2, txs_n: 15, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
-        viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(11), parent_hash: Hash32::from_u64(10), this_height: 3, txs_n: 3, is_best_chain: false, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(5), }, ..Default::default() };
-        viz_state.on_screen_bcs.insert(block.block.this_hash, block);
-        let block = OnScreenBc { block: BcBlock { this_hash: Hash32::from_u64(12), parent_hash: Hash32::from_u64(3), this_height: 3, txs_n: 3, is_best_chain: true, is_finalized: false, is_implicated_by_bft: false, points_at_bft_block: Hash32::from_u64(7), }, ..Default::default() };
-        viz_state.on_screen_bcs.insert(block.block.this_hash, block);
 
-        let block = OnScreenBft { block: BftBlock { this_hash: Hash32::from_u64(5), parent_hash: Hash32::from_u64(0), this_height: 0, points_at_bc_block: Hash32::from_u64(1), ..Default::default() }, ..Default::default() };
-        viz_state.on_screen_bfts.insert(block.block.this_hash, block);
-        let block = OnScreenBft { block: BftBlock { this_hash: Hash32::from_u64(6), parent_hash: Hash32::from_u64(5), this_height: 1, points_at_bc_block: Hash32::from_u64(2), ..Default::default() }, ..Default::default() };
-        viz_state.on_screen_bfts.insert(block.block.this_hash, block);
-        let block = OnScreenBft { block: BftBlock { this_hash: Hash32::from_u64(7), parent_hash: Hash32::from_u64(6), this_height: 2, points_at_bc_block: Hash32::from_u64(3), ..Default::default() }, ..Default::default() };
-        viz_state.on_screen_bfts.insert(block.block.this_hash, block);
+    if fake_data {
+        // TODO: pull from binary test data
+        let mut make_bc = |seq: &mut u64, parent_hash: Hash32, points_at_bft_block: Hash32, txs_n: usize, is_best_chain: bool, is_finalized: bool, is_implicated_by_bft: bool| -> Hash32 {
+            let this_height = if let Some(parent) = viz_state.on_screen_bcs.get(&parent_hash) {
+                parent.block.this_height+1
+            } else {
+                 0
+            };
+
+            *seq += 1;
+            let this_hash = Hash32::from_u64(*seq);
+            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, is_implicated_by_bft, points_at_bft_block, }, ..Default::default() };
+            viz_state.on_screen_bcs.insert(block.block.this_hash, block);
+            this_hash
+        };
+
+        let mut bft_parent_hash = Hash32::from_u64(0);
+        let mut make_bft = |seq: &mut u64, points_at_bc_block: Hash32| -> Hash32 {
+            *seq += 1;
+            let this_height = viz_state.on_screen_bfts.len() as u64;
+            viz_state.bft_tip_height = this_height;
+
+            let this_hash = Hash32::from_u64(*seq);
+            let block = OnScreenBft { block: BftBlock { this_hash, parent_hash: bft_parent_hash, this_height, points_at_bc_block, proving_blocks: vec![points_at_bc_block] }, ..Default::default() };
+            viz_state.on_screen_bfts.insert(block.block.this_hash, block);
+
+            bft_parent_hash = this_hash;
+            this_hash
+        };
+
+        let seq = &mut 0u64;
+
+
+        let bc_0  = make_bc(seq, Hash32::from_u64(0), Hash32::from_u64(0), 1, /*bc*/true, /*final*/true, /*bft-implicated*/false);
+        let bft0  = make_bft(seq, bc_0);
+        let bc_1  = make_bc(seq, bc_0,  bft0,    6, /*bc*/true,  /*final*/true,  /*bft-implicated*/true);
+        let bc_2  = make_bc(seq, bc_1,  bft0,    2, /*bc*/true,  /*final*/true,  /*bft-implicated*/true);
+        let bc_1a = make_bc(seq, bc_0,  bft0, 4256, /*bc*/false, /*final*/false, /*bft-implicated*/false);
+        let bc_2a = make_bc(seq, bc_1,  bft0,   16, /*bc*/false, /*final*/false, /*bft-implicated*/false);
+        let bc_2b = make_bc(seq, bc_1a, bft0,   15, /*bc*/false, /*final*/false, /*bft-implicated*/false);
+        let bc_3b = make_bc(seq, bc_2b, bft0,    3, /*bc*/false, /*final*/false, /*bft-implicated*/false);
+
+        let bft1  = make_bft(seq, bc_1);
+        let bft2  = make_bft(seq, bc_2);
+
+        let bc_3  = make_bc(seq, bc_2,  bft2,    3, /*bc*/true, /*final*/true,  /*bft-implicated*/false);
+        let bc_4  = make_bc(seq, bc_3,  bft2,    3, /*bc*/true, /*final*/true,  /*bft-implicated*/false);
+        let bc_5  = make_bc(seq, bc_4,  bft2,   18, /*bc*/true, /*final*/false, /*bft-implicated*/false);
+        let bft3  = make_bft(seq, bc_4);
+
+        let bc_6  = make_bc(seq, bc_5,  bft3,    5, /*bc*/true, /*final*/false, /*bft-implicated*/false);
+        let bc_7  = make_bc(seq, bc_6,  bft3,    5, /*bc*/true, /*final*/false, /*bft-implicated*/false);
+        let bc_8  = make_bc(seq, bc_7,  bft3,    5, /*bc*/true, /*final*/false, /*bft-implicated*/false);
+        let bc_8  = make_bc(seq, bc_7,  bft3,    5, /*bc*/true, /*final*/false, /*bft-implicated*/false);
     }
 
     viz_state
 }
+
 pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
     let mut anything_happened = false;
 
@@ -712,8 +744,8 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             COLOR_NBC
         };
 
-        let color        = (((on_screen_bc.alpha*255.0)                                      as u32) << 24) | blend_u32(0x000000, base_color,   ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
-        let color_accent = (((on_screen_bc.alpha*on_screen_bc.finalized_alpha*255.0)         as u32) << 24) | blend_u32(0x000000, COLOR_ACCENT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
+        let color        = (((on_screen_bc.alpha*255.0)                              as u32) << 24) | blend_u32(0x000000, base_color,   ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
+        let color_accent = (((on_screen_bc.alpha*on_screen_bc.finalized_alpha*255.0) as u32) << 24) | blend_u32(0x000000, COLOR_ACCENT, ((1.0 - on_screen_bc.darkness) * 255.0) as u32);
 
         if hovered_block == on_screen_bc.block.this_hash {
             hovered_block_screen_x = origin_x + (x*screen_unit);
