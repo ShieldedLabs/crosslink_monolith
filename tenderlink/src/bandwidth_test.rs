@@ -840,7 +840,7 @@ mod windows {
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<u64> {
         panic!("Not implemented");
     }
     pub fn udp_recv_with_congestion_and_dscp(
@@ -874,7 +874,7 @@ mod windows {
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<u64> {
         panic!("Not implemented");
     }
     pub fn udp_recv_with_congestion_and_dscp(
