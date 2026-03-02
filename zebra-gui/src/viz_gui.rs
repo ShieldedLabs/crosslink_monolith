@@ -257,41 +257,54 @@ pub fn bc_at_h(state: &VizState, height: u64) -> Hash32 {
 }
 
 // TODO(perf): can have a few ancestor backlinks that double in distance for O(log(n))
-pub fn viz_block_lca(state: &VizState, bc_hash_0: Hash32, bc_hash_1: Hash32) -> Hash32 {
+pub fn viz_block_lca(state: &VizState, bc_hash_0: Hash32, bc_hash_1: Hash32) -> Vec<Hash32> {
     let Some(mut bc0) = state.on_screen_bcs.get(&bc_hash_0) else {
-        return Hash32::from_u64(0);
+        return Vec::new()
     };
     let Some(mut bc1) = state.on_screen_bcs.get(&bc_hash_1) else {
-        return Hash32::from_u64(0);
+        return Vec::new()
     };
 
+    let mut res = Vec::new();
     loop {
         match bc0.block.this_height.cmp(&bc1.block.this_height) {
             std::cmp::Ordering::Less => {
                 bc1 = match state.on_screen_bcs.get(&bc1.block.parent_hash) {
                     Some(v) => v,
-                    None => return Hash32::from_u64(0),
+                    None => return Vec::new(),
                 };
+                if res.len() == 0 || res.last().unwrap() != &bc1.block.this_hash {
+                    res.push(bc1.block.this_hash);
+                }
             },
             std::cmp::Ordering::Greater => {
                 bc0 = match state.on_screen_bcs.get(&bc0.block.parent_hash) {
                     Some(v) => v,
-                    None => return Hash32::from_u64(0),
+                    None => return Vec::new(),
                 };
+                if res.len() == 0 || res.last().unwrap() != &bc0.block.this_hash {
+                    res.push(bc0.block.this_hash);
+                }
             },
             std::cmp::Ordering::Equal => {
                 if bc0.block.this_hash == bc1.block.this_hash {
-                    return bc0.block.this_hash;
+                    return res;
                 }
 
                 bc0 = match state.on_screen_bcs.get(&bc0.block.parent_hash) {
                     Some(v) => v,
-                    None => return Hash32::from_u64(0),
+                    None => return Vec::new(),
                 };
                 bc1 = match state.on_screen_bcs.get(&bc1.block.parent_hash) {
                     Some(v) => v,
-                    None => return Hash32::from_u64(0),
+                    None => return Vec::new(),
                 };
+                if res.len() == 0 || res.last().unwrap() != &bc0.block.this_hash {
+                    res.push(bc0.block.this_hash);
+                }
+                if res.len() == 0 || res.last().unwrap() != &bc1.block.this_hash {
+                    res.push(bc1.block.this_hash);
+                }
             },
         }
     }
@@ -301,9 +314,11 @@ pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Ve
     let bc = state.on_screen_bcs.get(&block);
     let bft = state.on_screen_bfts.get(&block);
 
+    let mut res = Vec::new();
+
     if op.valid_for_bc() && bc.is_none() {
         // println!("no on-screen PoW block found for hash {block}");
-        return Vec::new();
+        return res;
     }
 
     if op.valid_for_bft() && bft.is_none() {
@@ -312,32 +327,45 @@ pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Ve
     }
 
     match op {
-        InteractiveVizOp::None => Vec::new(),
+        InteractiveVizOp::None => {},
 
         InteractiveVizOp::LF => {
-            let mut res = vec![bc.unwrap().block.points_at_bft_block];
+            res.push(bc.unwrap().block.points_at_bft_block);
             res.extend(apply_viz_op(state, res[0], InteractiveVizOp::bft_last_final));
-            res
         }
         InteractiveVizOp::candidate => {
-            let lf = *apply_viz_op(state, block, InteractiveVizOp::LF).last().unwrap();
-            let snap = apply_viz_op(state, lf, InteractiveVizOp::snapshot);
+            let lf = apply_viz_op(state, block, InteractiveVizOp::LF);
+            if lf.len() == 0 {
+                return Vec::new();
+            }
+
+            let snap = apply_viz_op(state, *lf.last().unwrap(), InteractiveVizOp::snapshot);
             if snap.len() == 0 {
-                return snap;
+                return Vec::new();
             }
 
             const TMP_SIGMA: u64 = 3;
             let sigma_block = bc_at_h(state, state.bc_tip_height.saturating_sub(TMP_SIGMA));
-            vec![viz_block_lca(state, snap[0], sigma_block)]
+
+            let lca = viz_block_lca(state, snap[0], sigma_block);
+            if lca.len() == 0 {
+                return Vec::new();
+            }
+
+            res.extend(lf);
+            res.extend(snap);
+            res.extend(lca);
         },
 
-        InteractiveVizOp::bft_last_final => vec![bft.unwrap().block.parent_hash],
+        InteractiveVizOp::bft_last_final => res.push(bft.unwrap().block.parent_hash),
         InteractiveVizOp::origbft_last_final => todo!(),
         InteractiveVizOp::snapshot => {
             // TODO: what is the `ceil(1, bc')` suffix?
-            vec![*bft.unwrap().block.proving_blocks.first().unwrap_or(&Hash32::from_u64(0))] // TODO: fall back to genesis hash instead of 0
+            res.push(*bft.unwrap().block.proving_blocks.first().unwrap_or(&Hash32::from_u64(0))); // TODO: fall back to genesis hash instead of 0
         },
     }
+    res
+
 }
 
 
