@@ -889,10 +889,10 @@ pub fn standard_coinbase_outputs(
 
     let script = transparent::Script::new(
         &miner_address
-        .to_transparent_address()
-        .expect("address must have a transparent component")
-        .script()
-        .to_bytes()
+            .to_transparent_address()
+            .expect("address must have a transparent component")
+            .script()
+            .to_bytes(),
     );
 
     // The HashMap returns funding streams in an arbitrary order,

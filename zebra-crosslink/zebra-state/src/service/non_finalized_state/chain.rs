@@ -38,9 +38,7 @@ use crate::{
     request::Treestate,
     service::{
         check,
-        finalized_state::disk_format::{
-            self, BondKey, BondStatus, DelegationBond,
-        },
+        finalized_state::disk_format::{self, BondKey, BondStatus, DelegationBond},
     },
     ContextuallyVerifiedBlock, HashOrHeight, OutputLocation, TransactionLocation,
     ValidateContextError,
@@ -278,7 +276,13 @@ impl Chain {
         orchard_note_commitment_tree: Arc<orchard::tree::NoteCommitmentTree>,
         history_tree: Arc<HistoryTree>,
         finalized_tip_chain_value_pools: ValueBalance<NonNegative>,
-        finalized_bonds: impl IntoIterator<Item = (disk_format::BondKey, disk_format::DelegationBond, disk_format::BondStatus)>,
+        finalized_bonds: impl IntoIterator<
+            Item = (
+                disk_format::BondKey,
+                disk_format::DelegationBond,
+                disk_format::BondStatus,
+            ),
+        >,
     ) -> Self {
         // Convert finalized bonds to chain format with their actual status
         let delegation_bonds: HashMap<_, _> = finalized_bonds
@@ -392,7 +396,14 @@ impl Chain {
     /// Pops the lowest height block of the non-finalized portion of a chain,
     /// and returns it with its associated treestate, bond rewards, and unbonding amounts for that block.
     #[instrument(level = "debug", skip(self))]
-    pub(crate) fn pop_root(&mut self) -> (ContextuallyVerifiedBlock, Treestate, Vec<([u8; 32], u64)>, Vec<([u8; 32], u64)>) {
+    pub(crate) fn pop_root(
+        &mut self,
+    ) -> (
+        ContextuallyVerifiedBlock,
+        Treestate,
+        Vec<([u8; 32], u64)>,
+        Vec<([u8; 32], u64)>,
+    ) {
         // Obtain the lowest height.
         let block_height = self.non_finalized_root_height();
 
@@ -435,7 +446,9 @@ impl Chain {
             if let Some(staking_action) = tx.staking_action() {
                 if staking_action.kind == StakingActionKind::BeginDelegationUnbonding {
                     let bond_key = staking_action.arg32_0;
-                    let (bond, _status) = self.delegation_bonds.get(&bond_key)
+                    let (bond, _status) = self
+                        .delegation_bonds
+                        .get(&bond_key)
                         .expect("bond must exist when unbonding");
                     unbonding_amounts.push((bond_key, bond.amount.into()));
                 }
@@ -1618,7 +1631,9 @@ impl Chain {
 
                 // Insert as active bond
                 // Note: duplicate bond check should have been done during contextual validation
-                let previous = self.delegation_bonds.insert(bond_key, (bond, BondStatusInChain::Active));
+                let previous = self
+                    .delegation_bonds
+                    .insert(bond_key, (bond, BondStatusInChain::Active));
                 assert!(
                     previous.is_none(),
                     "duplicate delegation bond should have been rejected during validation"
@@ -1626,7 +1641,9 @@ impl Chain {
             }
             StakingActionKind::BeginDelegationUnbonding => {
                 // Get the bond from self.delegation_bonds
-                let (bond, _status) = self.delegation_bonds.get(&bond_key)
+                let (bond, _status) = self
+                    .delegation_bonds
+                    .get(&bond_key)
                     .copied()
                     .expect("bond must exist in chain (should have been validated)");
 
@@ -1636,27 +1653,35 @@ impl Chain {
                     bond.target_finalizer,
                     transaction_location,
                 );
-                self.delegation_bonds.insert(bond_key, (updated_bond, BondStatusInChain::Unbonding));
+                self.delegation_bonds
+                    .insert(bond_key, (updated_bond, BondStatusInChain::Unbonding));
 
                 // Decrease staking_bonded pool by bond amount
                 let current_bonded = self.chain_value_pools.staking_bonded_amount();
-                let new_bonded = (current_bonded - bond.amount)
-                    .map_err(|e| ValidateContextError::InvalidDelegationBond(
-                        format!("staking_bonded pool underflow when unbonding: {:?}", e)
-                    ))?;
+                let new_bonded = (current_bonded - bond.amount).map_err(|e| {
+                    ValidateContextError::InvalidDelegationBond(format!(
+                        "staking_bonded pool underflow when unbonding: {:?}",
+                        e
+                    ))
+                })?;
                 self.chain_value_pools.set_staking_bonded_amount(new_bonded);
 
                 // Increase staking_unbonded pool by bond amount
                 let current_unbonded = self.chain_value_pools.staking_unbonded_amount();
-                let new_unbonded = (current_unbonded + bond.amount)
-                    .map_err(|e| ValidateContextError::InvalidDelegationBond(
-                        format!("staking_unbonded pool overflow when unbonding: {:?}", e)
-                    ))?;
-                self.chain_value_pools.set_staking_unbonded_amount(new_unbonded);
+                let new_unbonded = (current_unbonded + bond.amount).map_err(|e| {
+                    ValidateContextError::InvalidDelegationBond(format!(
+                        "staking_unbonded pool overflow when unbonding: {:?}",
+                        e
+                    ))
+                })?;
+                self.chain_value_pools
+                    .set_staking_unbonded_amount(new_unbonded);
             }
             StakingActionKind::WithdrawDelegationBond => {
                 // Get the bond from self.delegation_bonds
-                let (bond, _status) = self.delegation_bonds.get(&bond_key)
+                let (bond, _status) = self
+                    .delegation_bonds
+                    .get(&bond_key)
                     .copied()
                     .expect("bond must exist in chain (should have been validated)");
 
@@ -1666,25 +1691,32 @@ impl Chain {
                     bond.target_finalizer,
                     transaction_location,
                 );
-                self.delegation_bonds.insert(bond_key, (updated_bond, BondStatusInChain::Withdrawn));
+                self.delegation_bonds
+                    .insert(bond_key, (updated_bond, BondStatusInChain::Withdrawn));
             }
             StakingActionKind::RetargetDelegationBond => {
                 // Get the old target first (immutable borrow)
                 let old_target = {
-                    let (bond, _status) = self.delegation_bonds.get(&bond_key)
+                    let (bond, _status) = self
+                        .delegation_bonds
+                        .get(&bond_key)
                         .expect("bond must exist in chain (should have been validated)");
                     bond.target_finalizer
                 };
 
                 // Record the pre-block target for this bond (only if not already recorded in this block)
                 // This allows us to restore the original target on revert
-                let retargets_this_block = self.bond_retargets.last_mut()
+                let retargets_this_block = self
+                    .bond_retargets
+                    .last_mut()
                     .expect("bond_retargets should have been initialized for this block");
                 retargets_this_block.entry(bond_key).or_insert(old_target);
 
                 // Update only target_finalizer (not created_at or amount)
                 let new_target = staking_action.arg32_2;
-                let (bond, _status) = self.delegation_bonds.get_mut(&bond_key)
+                let (bond, _status) = self
+                    .delegation_bonds
+                    .get_mut(&bond_key)
                     .expect("bond must exist in chain");
                 bond.target_finalizer = new_target;
             }
@@ -1707,7 +1739,9 @@ impl Chain {
         staking_action: &zcash_primitives::transaction::StakingAction,
         position: RevertPosition,
     ) {
-        if position == RevertPosition::Root { return; }
+        if position == RevertPosition::Root {
+            return;
+        }
         use zcash_primitives::transaction::StakingActionKind;
 
         let bond_key = staking_action.arg32_0;
@@ -1722,11 +1756,15 @@ impl Chain {
             }
             StakingActionKind::BeginDelegationUnbonding => {
                 // Change status back from Unbonding to Active
-                let (bond, status) = self.delegation_bonds.get_mut(&bond_key).expect(
-                    "bond must be present if unbonding was added to chain"
+                let (bond, status) = self
+                    .delegation_bonds
+                    .get_mut(&bond_key)
+                    .expect("bond must be present if unbonding was added to chain");
+                assert_eq!(
+                    *status,
+                    BondStatusInChain::Unbonding,
+                    "bond should be unbonding if unbonding was added to chain"
                 );
-                assert_eq!(*status, BondStatusInChain::Unbonding,
-                    "bond should be unbonding if unbonding was added to chain");
                 *status = BondStatusInChain::Active;
                 let bond_amount = bond.amount;
 
@@ -1739,15 +1777,20 @@ impl Chain {
                 let current_unbonded = self.chain_value_pools.staking_unbonded_amount();
                 let new_unbonded = (current_unbonded - bond_amount)
                     .expect("reverting unbonding should not underflow unbonded pool");
-                self.chain_value_pools.set_staking_unbonded_amount(new_unbonded);
+                self.chain_value_pools
+                    .set_staking_unbonded_amount(new_unbonded);
             }
             StakingActionKind::WithdrawDelegationBond => {
                 // Change status back from Withdrawn to Unbonding
-                let (bond, status) = self.delegation_bonds.get_mut(&bond_key).expect(
-                    "bond must be present if withdrawal was added to chain"
+                let (bond, status) = self
+                    .delegation_bonds
+                    .get_mut(&bond_key)
+                    .expect("bond must be present if withdrawal was added to chain");
+                assert_eq!(
+                    *status,
+                    BondStatusInChain::Withdrawn,
+                    "bond should be withdrawn if withdrawal was added to chain"
                 );
-                assert_eq!(*status, BondStatusInChain::Withdrawn,
-                    "bond should be withdrawn if withdrawal was added to chain");
                 *status = BondStatusInChain::Unbonding;
             }
             _ => {}
@@ -1901,7 +1944,12 @@ impl Chain {
         let size = block.zcash_serialized_size();
         self.update_chain_tip_with(&(*chain_value_pool_change, height, size))?;
 
-        if self.delegation_bonds.iter().position(|(_, (_, status))| *status == BondStatusInChain::Active).is_none() {
+        if self
+            .delegation_bonds
+            .iter()
+            .position(|(_, (_, status))| *status == BondStatusInChain::Active)
+            .is_none()
+        {
             self.bond_rewards.push(Vec::new());
             // TODO handle this case, for prototyping this is whatever.
         } else {
@@ -1911,16 +1959,22 @@ impl Chain {
             */
             let mut total_staked_zats = 0u64;
             let max_staker = {
-                let mut iter = self.inner.delegation_bonds.iter().filter(|(_, (_, status))| *status == BondStatusInChain::Active);
+                let mut iter = self
+                    .inner
+                    .delegation_bonds
+                    .iter()
+                    .filter(|(_, (_, status))| *status == BondStatusInChain::Active);
                 let first = iter.next().expect("is any checked already");
                 let mut max_staker = *first.0;
-                let mut biggest = first.1.0.amount.zatoshis() as u64;
-                total_staked_zats += first.1.0.amount.zatoshis() as u64;
+                let mut biggest = first.1 .0.amount.zatoshis() as u64;
+                total_staked_zats += first.1 .0.amount.zatoshis() as u64;
                 for other in iter {
-                    total_staked_zats += other.1.0.amount.zatoshis() as u64;
-                    if other.1.0.amount.zatoshis() as u64 > biggest || (other.1.0.amount.zatoshis() as u64 == biggest && *other.0 < max_staker) {
+                    total_staked_zats += other.1 .0.amount.zatoshis() as u64;
+                    if other.1 .0.amount.zatoshis() as u64 > biggest
+                        || (other.1 .0.amount.zatoshis() as u64 == biggest && *other.0 < max_staker)
+                    {
                         max_staker = *other.0;
-                        biggest = other.1.0.amount.zatoshis() as u64;
+                        biggest = other.1 .0.amount.zatoshis() as u64;
                     }
                 }
                 max_staker
@@ -1937,20 +1991,28 @@ impl Chain {
                     so_far_payed_reward += reward;
 
                     bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
-                    reward_store_for_revert.push((*bond_key, reward,));
+                    reward_store_for_revert.push((*bond_key, reward));
                 }
             }
 
             // Biggest bond position gets the remainder.
             {
-                let (bond, _status) = self.inner.delegation_bonds.get_mut(&max_staker).expect("checked earlier");
+                let (bond, _status) = self
+                    .inner
+                    .delegation_bonds
+                    .get_mut(&max_staker)
+                    .expect("checked earlier");
                 let reward = bond_reward_total - so_far_payed_reward;
 
                 bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
-                reward_store_for_revert.push((max_staker, reward,));
+                reward_store_for_revert.push((max_staker, reward));
             }
 
-            self.inner.chain_value_pools.set_staking_bonded_amount((self.inner.chain_value_pools.staking_bonded_amount() + Amount::new(bond_reward_total as i64)).unwrap());
+            self.inner.chain_value_pools.set_staking_bonded_amount(
+                (self.inner.chain_value_pools.staking_bonded_amount()
+                    + Amount::new(bond_reward_total as i64))
+                .unwrap(),
+            );
             self.bond_rewards.push(reward_store_for_revert);
         }
         Ok(())
@@ -2023,10 +2085,15 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
             // Block being finalized - rewards already extracted by pop_root, nothing to do here
         } else {
             // Block being reverted from tip, reverse the rewards
-            let rewards = self.bond_rewards.pop().expect("rewards must exist for tip block");
+            let rewards = self
+                .bond_rewards
+                .pop()
+                .expect("rewards must exist for tip block");
             for (bond_key, reward_amount) in rewards {
                 // Subtract reward from bond amount
-                let (bond, _status) = self.delegation_bonds.get_mut(&bond_key)
+                let (bond, _status) = self
+                    .delegation_bonds
+                    .get_mut(&bond_key)
                     .expect("bond must exist if it received rewards");
                 bond.amount = (bond.amount - Amount::try_from(reward_amount as i64).unwrap())
                     .expect("reverting reward should not underflow bond amount");
@@ -2039,9 +2106,14 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
             }
 
             // Revert bond retargets - restore old target_finalizer values
-            let retargets = self.bond_retargets.pop().expect("retargets must exist for tip block");
+            let retargets = self
+                .bond_retargets
+                .pop()
+                .expect("retargets must exist for tip block");
             for (bond_key, old_target) in retargets {
-                let (bond, _status) = self.delegation_bonds.get_mut(&bond_key)
+                let (bond, _status) = self
+                    .delegation_bonds
+                    .get_mut(&bond_key)
                     .expect("bond must exist if it was retargeted");
                 bond.target_finalizer = old_target;
             }

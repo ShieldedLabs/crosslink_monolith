@@ -199,7 +199,8 @@ impl NonFinalizedState {
 
         // Pop the lowest height block from the best chain to be finalized, and
         // also obtain its associated treestate, bond rewards, and unbonding amounts.
-        let (best_chain_root, root_treestate, bond_rewards, unbonding_amounts) = mut_best_chain.pop_root();
+        let (best_chain_root, root_treestate, bond_rewards, unbonding_amounts) =
+            mut_best_chain.pop_root();
 
         // add best_chain back to `self.chain_set`
         if !best_chain.is_empty() {
@@ -222,7 +223,8 @@ impl NonFinalizedState {
             let mut_side_chain = Arc::make_mut(&mut side_chain);
 
             // remove the first block from `chain`
-            let (side_chain_root, _treestate, _side_rewards, _side_unbonding) = mut_side_chain.pop_root();
+            let (side_chain_root, _treestate, _side_rewards, _side_unbonding) =
+                mut_side_chain.pop_root();
             assert_eq!(side_chain_root.hash, best_chain_root.hash);
 
             // add the chain back to `self.chain_set`
@@ -236,7 +238,12 @@ impl NonFinalizedState {
         self.update_metrics_for_chains();
 
         // Add the treestate, bond rewards, and unbonding amounts to the finalized block.
-        FinalizableBlock::new(best_chain_root, root_treestate, bond_rewards, unbonding_amounts)
+        FinalizableBlock::new(
+            best_chain_root,
+            root_treestate,
+            bond_rewards,
+            unbonding_amounts,
+        )
     }
 
     /// Remove chains that are no longer valid, i.e. they don't contain the newly-finalized hash
@@ -524,11 +531,7 @@ impl NonFinalizedState {
 
         // Validate delegation bonds
         // Reads from disk
-        check::delegation::validate_delegation_bonds(
-            &prepared,
-            &new_chain,
-            finalized_state,
-        )?;
+        check::delegation::validate_delegation_bonds(&prepared, &new_chain, finalized_state)?;
 
         // Reads from disk
         check::anchors::block_sapling_orchard_anchors_refer_to_final_treestates(

@@ -4,7 +4,10 @@ use std::collections::HashMap;
 
 use crate::{
     service::{
-        finalized_state::{disk_format::{BondKey, DelegationBond}, ZebraDb},
+        finalized_state::{
+            disk_format::{BondKey, DelegationBond},
+            ZebraDb,
+        },
         non_finalized_state::Chain,
     },
     SemanticallyVerifiedBlock, ValidateContextError,
@@ -44,14 +47,13 @@ pub fn validate_delegation_bonds(
                     )?;
 
                     // Track this new bond for subsequent validation in this block
-                    let amount =
-                        zebra_chain::amount::Amount::try_from(staking_action.amount_zats)
-                            .map_err(|e| {
-                                ValidateContextError::InvalidDelegationBond(format!(
-                                    "invalid bond amount: {:?}",
-                                    e
-                                ))
-                            })?;
+                    let amount = zebra_chain::amount::Amount::try_from(staking_action.amount_zats)
+                        .map_err(|e| {
+                            ValidateContextError::InvalidDelegationBond(format!(
+                                "invalid bond amount: {:?}",
+                                e
+                            ))
+                        })?;
                     let target_finalizer = staking_action.arg32_2;
                     let bond = DelegationBond::new(
                         amount,

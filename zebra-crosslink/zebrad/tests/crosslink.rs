@@ -19,8 +19,8 @@ use zebra_chain::{
     serialization::*,
     work::{self, difficulty::CompactDifficulty},
 };
-use zebra_crosslink::{FatPointerToBftBlock2, chain::*};
 use zebra_crosslink::test_format::*;
+use zebra_crosslink::{chain::*, FatPointerToBftBlock2};
 use zebra_state::crosslink::*;
 use zebrad::application::CROSSLINK_TEST_CONFIG_OVERRIDE;
 use zebrad::config::ZebradConfig;

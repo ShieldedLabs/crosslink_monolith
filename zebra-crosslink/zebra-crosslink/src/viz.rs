@@ -3933,14 +3933,15 @@ pub async fn viz_main(
             pt.y += font_size * 0.5;
 
             for val in &g.validators_at_current_height {
-                let string =
-                    if let Some(user_name) = g.validators_keys_to_names.get(&val.public_key.into()) {
-                        user_name.clone()
-                    } else {
-                        let mut string = format!("{:?}", MalPublicKey2(val.public_key.into()));
-                        string.truncate(16);
-                        string
-                    };
+                let string = if let Some(user_name) =
+                    g.validators_keys_to_names.get(&val.public_key.into())
+                {
+                    user_name.clone()
+                } else {
+                    let mut string = format!("{:?}", MalPublicKey2(val.public_key.into()));
+                    string.truncate(16);
+                    string
+                };
                 draw_text_right_align(
                     &format!("{} - {}", val.voting_power, &string,),
                     pt,

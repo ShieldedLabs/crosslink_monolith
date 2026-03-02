@@ -1,7 +1,10 @@
 //! Delegation bond queries that search both finalized and non-finalized state.
 
 use crate::service::{
-    finalized_state::{disk_format::{BondKey, BondStatus, DelegationBond}, ZebraDb},
+    finalized_state::{
+        disk_format::{BondKey, BondStatus, DelegationBond},
+        ZebraDb,
+    },
     non_finalized_state::Chain,
 };
 

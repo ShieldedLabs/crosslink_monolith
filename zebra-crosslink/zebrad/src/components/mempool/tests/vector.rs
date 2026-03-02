@@ -1132,7 +1132,13 @@ async fn setup(
     // UTXO verification doesn't matter here.
     let state_config = StateConfig::ephemeral();
     let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change) =
-        zebra_state::init(state_config, network, Height::MAX, 0, std::sync::Arc::new(|_,_| true));
+        zebra_state::init(
+            state_config,
+            network,
+            Height::MAX,
+            0,
+            std::sync::Arc::new(|_, _| true),
+        );
     let mut state_service = ServiceBuilder::new().buffer(10).service(state);
 
     let tx_verifier = MockService::build().for_unit_tests();

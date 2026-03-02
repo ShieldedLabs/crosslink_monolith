@@ -21,14 +21,16 @@ use tracing::{error, info, warn};
 use zebra_chain::block::{Hash as BlockHash, Height as BlockHeight};
 use zebra_chain::transaction::Hash as TxHash;
 use zebra_node_services::mempool::{Request as MempoolRequest, Response as MempoolResponse};
-use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
+use zebra_state::{
+    crosslink::*, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse,
+    Request as StateRequest, Response as StateResponse,
+};
 
 use crate::chain::BftBlock;
 use crate::FatPointerToBftBlock2;
 use crate::{
-    rng_private_public_key_from_address, tfl_service_incoming_request, TFLBlockFinality,
+    rng_private_public_key_from_address, tfl_service_incoming_request, StakeTxId, TFLBlockFinality,
     TFLServiceInternal,
-    StakeTxId,
 };
 
 use tower::Service;
@@ -68,8 +70,12 @@ pub(crate) type ReadStateServiceProcedure = Arc<
             StateReadRequest,
         ) -> Pin<
             Box<
-                dyn Future<Output = Result<StateReadResponse, Box<dyn std::error::Error + Send + Sync>>>
-                    + Send,
+                dyn Future<
+                        Output = Result<
+                            StateReadResponse,
+                            Box<dyn std::error::Error + Send + Sync>,
+                        >,
+                    > + Send,
             >,
         > + Send
         + Sync,
@@ -135,7 +141,9 @@ pub fn spawn_new_tfl_service(
     mempool_service_call: MempoolServiceProcedure,
     force_feed_pow_call: ForceFeedPoWBlockProcedure,
     config: crate::config::Config,
-    closure_from_state_to_here_mutex: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>>,
+    closure_from_state_to_here_mutex: Arc<
+        std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>,
+    >,
 ) -> (TFLServiceHandle, JoinHandle<Result<(), String>>) {
     let (validators_at_current_height, validators_keys_to_names) = {
         let mut array = Vec::with_capacity(config.malachite_peers.len());
@@ -143,7 +151,10 @@ pub fn spawn_new_tfl_service(
 
         for (i, peer) in config.malachite_peers.iter().enumerate() {
             let (_, _, public_key) = rng_private_public_key_from_address(peer.as_bytes());
-            array.push(crate::MalValidator { public_key:public_key.into(), voting_power: 1 });
+            array.push(crate::MalValidator {
+                public_key: public_key.into(),
+                voting_power: 1,
+            });
             // array.push(crate::MalValidator::new(public_key, vec![StakeTxId{ txid: [0;32], zats:((i as u64) * 5) + 1 }])); // @Phillip @Testing
             map.insert(public_key, peer.to_string());
         }
@@ -160,7 +171,10 @@ pub fn spawn_new_tfl_service(
             // .unwrap_or(String::from_str("tester").unwrap());
             info!("user_name: {}", user_name);
             let (_, _, public_key) = rng_private_public_key_from_address(&user_name.as_bytes());
-            array.push(crate::MalValidator { public_key:public_key.into(), voting_power: 1 });
+            array.push(crate::MalValidator {
+                public_key: public_key.into(),
+                voting_power: 1,
+            });
             map.insert(public_key, user_name);
         }
 
@@ -192,15 +206,22 @@ pub fn spawn_new_tfl_service(
         let handle = handle_mtx2.lock().unwrap().clone().unwrap();
         Box::pin(async move {
             let accepted = if fat_pointer.points_at_block_hash() == block.blake3_hash() {
-                crate::validate_bft_block_from_malachite(&handle, block.as_ref()).await.0
+                crate::validate_bft_block_from_malachite(&handle, block.as_ref())
+                    .await
+                    .0
                     == tenderlink::TMStatus::Pass
             } else {
                 false
             };
             if accepted {
                 info!("Successfully force-fed BFT block");
-                crate::new_decided_bft_block_from_malachite(&handle, block.as_ref(), &fat_pointer, Vec::new())
-                    .await;
+                crate::new_decided_bft_block_from_malachite(
+                    &handle,
+                    block.as_ref(),
+                    &fat_pointer,
+                    Vec::new(),
+                )
+                .await;
                 true
             } else {
                 error!("Failed to force-feed BFT block");
@@ -224,12 +245,16 @@ pub fn spawn_new_tfl_service(
     *handle_mtx.lock().unwrap() = Some(handle1.clone());
 
     let handle3 = handle1.clone();
-    *closure_from_state_to_here_mutex.lock().unwrap() = Some(Arc::new(move |fpa, fpb| crate::call_from_state_to_crosslink_to_ask_about_fat_pointers(&handle3, fpa, fpb)));
+    *closure_from_state_to_here_mutex.lock().unwrap() = Some(Arc::new(move |fpa, fpb| {
+        crate::call_from_state_to_crosslink_to_ask_about_fat_pointers(&handle3, fpa, fpb)
+    }));
 
     let handle2 = handle1.clone();
     (
         handle1,
-        tokio::spawn(async move { crate::tfl_service_main_loop(handle2, global_seed, path_to_pos_store_file).await }),
+        tokio::spawn(async move {
+            crate::tfl_service_main_loop(handle2, global_seed, path_to_pos_store_file).await
+        }),
     )
 }
 

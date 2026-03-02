@@ -25,10 +25,7 @@ use zebra_chain::work::difficulty::CompactDifficulty;
 #[allow(unused_imports)]
 use crate::{ReadRequest, Request};
 
-use crate::{
-    service::read::AddressUtxos,
-    NonFinalizedState, TransactionLocation, WatchReceiver,
-};
+use crate::{service::read::AddressUtxos, NonFinalizedState, TransactionLocation, WatchReceiver};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].

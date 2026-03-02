@@ -1,11 +1,13 @@
-
+use std::cmp::{max, min};
 use visualizer_zcash::Hash32;
 use zebra_chain::value_balance::ValueBalance;
-use std::cmp::{max, min};
 
 use crate::*;
 
-pub fn viz_main(tokio_root_thread_handle: Option<std::thread::JoinHandle<()>>, wallet_state: Arc<Mutex<wallet::WalletState>>) {
+pub fn viz_main(
+    tokio_root_thread_handle: Option<std::thread::JoinHandle<()>>,
+    wallet_state: Arc<Mutex<wallet::WalletState>>,
+) {
     // loop {
     //     if let Some(ref thread_handle) = tokio_root_thread_handle {
     //         if thread_handle.is_finished() {
@@ -15,7 +17,6 @@ pub fn viz_main(tokio_root_thread_handle: Option<std::thread::JoinHandle<()>>, w
     // }
     visualizer_zcash::main_thread_run_program(wallet_state, false);
 }
-
 
 /// Bridge between tokio & viz code
 pub async fn service_viz_requests(
@@ -29,13 +30,16 @@ pub async fn service_viz_requests(
     loop {
         let request_queue = visualizer_zcash::REQUESTS_TO_ZEBRA.lock().unwrap();
         let response_queue = visualizer_zcash::RESPONSES_FROM_ZEBRA.lock().unwrap();
-        if request_queue.is_none() || response_queue.is_none() { continue; }
+        if request_queue.is_none() || response_queue.is_none() {
+            continue;
+        }
         let request_queue = request_queue.as_ref().unwrap();
         let response_queue = response_queue.as_ref().unwrap();
 
         'main_loop: loop {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            let Ok(StateReadResponse::TipPoolValues { value_balance, .. }) = (call.read_state)(StateReadRequest::TipPoolValues).await
+            let Ok(StateReadResponse::TipPoolValues { value_balance, .. }) =
+                (call.read_state)(StateReadRequest::TipPoolValues).await
             else {
                 continue 'main_loop;
             };
@@ -43,11 +47,12 @@ pub async fn service_viz_requests(
             let staking_bonded_pool_balance = value_balance.staking_bonded_amount().zatoshis();
             let staking_unbonded_pool_balance = value_balance.staking_unbonded_amount().zatoshis();
 
-            let Ok(StateResponse::Tip(Some(tip_height_hash))) = (call.state)(StateRequest::Tip).await
+            let Ok(StateResponse::Tip(Some(tip_height_hash))) =
+                (call.state)(StateRequest::Tip).await
             else {
                 continue 'main_loop;
             };
-            let bc_tip_height: u64 = tip_height_hash.0.0 as u64;
+            let bc_tip_height: u64 = tip_height_hash.0 .0 as u64;
 
             let bc_req_h = (bc_ack_height, -1);
 
@@ -61,7 +66,8 @@ pub async fn service_viz_requests(
                     hi
                 );
 
-                let Ok(StateResponse::Tip(Some(tip_height_hash))) = (call.state)(StateRequest::Tip).await
+                let Ok(StateResponse::Tip(Some(tip_height_hash))) =
+                    (call.state)(StateRequest::Tip).await
                 else {
                     continue 'main_loop;
                 };
@@ -98,18 +104,21 @@ pub async fn service_viz_requests(
                     }
                 }
 
-                let Some(hi_height_hash) = get_height_hash(call.clone(), h_hi, tip_height_hash).await
+                let Some(hi_height_hash) =
+                    get_height_hash(call.clone(), h_hi, tip_height_hash).await
                 else {
                     continue 'main_loop;
                 };
 
-                let Some(lo_height_hash) = get_height_hash(call.clone(), h_lo, hi_height_hash).await
+                let Some(lo_height_hash) =
+                    get_height_hash(call.clone(), h_lo, hi_height_hash).await
                 else {
                     continue 'main_loop;
                 };
 
                 let (height_hashes, blocks) =
-                    tfl_block_sequence(&call, lo_height_hash.1, Some(hi_height_hash), true, true).await;
+                    tfl_block_sequence(&call, lo_height_hash.1, Some(hi_height_hash), true, true)
+                        .await;
                 (
                     lo_height_hash.0,
                     Some(tip_height_hash),
@@ -120,7 +129,10 @@ pub async fn service_viz_requests(
 
             // paranoid guards
             if lo_height.0 as i64 != bc_ack_height as i64 {
-                println!("PARANOID != WRONG: lo {} vs ack {bc_ack_height}", lo_height.0);
+                println!(
+                    "PARANOID != WRONG: lo {} vs ack {bc_ack_height}",
+                    lo_height.0
+                );
                 continue 'main_loop;
             }
             if suspect_seq_blocks.is_empty() {
@@ -129,25 +141,24 @@ pub async fn service_viz_requests(
             }
             let mut seq_blocks = Vec::new();
             for (i, maybe) in suspect_seq_blocks.iter().enumerate() {
-                let Some(block) = maybe
-                else {
+                let Some(block) = maybe else {
                     println!("PARANOID != WRONG: None seq block at {i}");
                     continue 'main_loop;
                 };
                 seq_blocks.push(block);
             }
 
-
             for _ in 0..256 {
                 if let Ok(request) = request_queue.try_recv() {
                     let mut internal = tfl_handle.internal.lock().await;
                     let mut response = visualizer_zcash::ResponseFromZebra::_0();
                     response.bc_tip_height = bc_tip_height;
-                    response.bc_finalized_tip_height = if let Some(latest_finalized_block) = internal.latest_final_block {
-                        latest_finalized_block.0.0 as u64
-                    } else {
-                        0
-                    };
+                    response.bc_finalized_tip_height =
+                        if let Some(latest_finalized_block) = internal.latest_final_block {
+                            latest_finalized_block.0 .0 as u64
+                        } else {
+                            0
+                        };
                     response.bft_tip_height = (internal.bft_blocks.len() as u64).saturating_sub(1);
                     response.peer_strings = internal.peer_strings.clone();
 
@@ -172,7 +183,9 @@ pub async fn service_viz_requests(
                             is_best_chain: true,
                             is_finalized: false,
                             is_implicated_by_bft: false,
-                            points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash()),
+                            points_at_bft_block: Hash32::from_bytes(
+                                bc.header.fat_pointer_to_bft_block.points_at_block_hash(),
+                            ),
                         });
                     }
                     for i in request.bft_ack_height as usize..internal.bft_blocks.len() {
@@ -186,12 +199,19 @@ pub async fn service_viz_requests(
                             this_hash: this_hash,
                             parent_hash: Hash32::from_bytes(b.previous_block_hash().0),
                             this_height: i as u64,
-                            points_at_bc_block: Hash32::from_bytes(b.finalization_candidate().hash().0),
-                            proving_blocks: b.headers.iter().skip(1).map(|x| Hash32::from_bytes(x.hash().0)).collect(),
+                            points_at_bc_block: Hash32::from_bytes(
+                                b.finalization_candidate().hash().0,
+                            ),
+                            proving_blocks: b
+                                .headers
+                                .iter()
+                                .skip(1)
+                                .map(|x| Hash32::from_bytes(x.hash().0))
+                                .collect(),
                         });
 
                         // TODO: compute the finalized tip height!
-                    };
+                    }
 
                     let _ = response_queue.try_send(response);
                 } else {

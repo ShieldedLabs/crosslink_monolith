@@ -268,11 +268,16 @@ impl DiskWriteBatch {
 
         // Apply bond rewards to the staking_bonded pool tally FIRST,
         // before unbonding moves value between pools (to match non-finalized state order)
-        let total_rewards: u64 = finalized.bond_rewards.iter().map(|(_, amount)| amount).sum();
+        let total_rewards: u64 = finalized
+            .bond_rewards
+            .iter()
+            .map(|(_, amount)| amount)
+            .sum();
         if total_rewards > 0 {
             let current_bonded = new_value_pool.staking_bonded_amount();
-            let new_bonded: Amount<NonNegative> = (current_bonded + Amount::try_from(total_rewards as i64)?)
-                .expect("staking_bonded pool should not overflow from rewards");
+            let new_bonded: Amount<NonNegative> = (current_bonded
+                + Amount::try_from(total_rewards as i64)?)
+            .expect("staking_bonded pool should not overflow from rewards");
             new_value_pool.set_staking_bonded_amount(new_bonded);
         }
 
@@ -285,8 +290,8 @@ impl DiskWriteBatch {
 
             // Move value from staking_bonded to staking_unbonded
             let current_bonded = new_value_pool.staking_bonded_amount();
-            let new_bonded: Amount<NonNegative> = (current_bonded - bond_amount)
-                .expect("staking_bonded pool should not underflow");
+            let new_bonded: Amount<NonNegative> =
+                (current_bonded - bond_amount).expect("staking_bonded pool should not underflow");
             new_value_pool.set_staking_bonded_amount(new_bonded);
 
             let current_unbonded = new_value_pool.staking_unbonded_amount();

@@ -49,7 +49,7 @@ impl zcash_transparent::sighash::TransparentAuthorizingContext for TransparentAu
             .iter()
             .map(|prevout| {
                 zcash_transparent::address::Script(script::Code(
-                        prevout.lock_script.as_raw_bytes().into(),
+                    prevout.lock_script.as_raw_bytes().into(),
                 ))
             })
             .collect()

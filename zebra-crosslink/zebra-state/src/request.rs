@@ -396,7 +396,12 @@ pub struct FinalizedBlock {
 impl FinalizedBlock {
     /// Constructs [`FinalizedBlock`] from [`CheckpointVerifiedBlock`] and its [`Treestate`].
     pub fn from_checkpoint_verified(block: CheckpointVerifiedBlock, treestate: Treestate) -> Self {
-        Self::from_semantically_verified(SemanticallyVerifiedBlock::from(block), treestate, Vec::new(), Vec::new())
+        Self::from_semantically_verified(
+            SemanticallyVerifiedBlock::from(block),
+            treestate,
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     /// Constructs [`FinalizedBlock`] from [`ContextuallyVerifiedBlock`], [`Treestate`], bond rewards, and unbonding amounts.
@@ -406,11 +411,21 @@ impl FinalizedBlock {
         bond_rewards: Vec<([u8; 32], u64)>,
         unbonding_amounts: Vec<([u8; 32], u64)>,
     ) -> Self {
-        Self::from_semantically_verified(SemanticallyVerifiedBlock::from(block), treestate, bond_rewards, unbonding_amounts)
+        Self::from_semantically_verified(
+            SemanticallyVerifiedBlock::from(block),
+            treestate,
+            bond_rewards,
+            unbonding_amounts,
+        )
     }
 
     /// Constructs [`FinalizedBlock`] from [`SemanticallyVerifiedBlock`], [`Treestate`], bond rewards, and unbonding amounts.
-    fn from_semantically_verified(block: SemanticallyVerifiedBlock, treestate: Treestate, bond_rewards: Vec<([u8; 32], u64)>, unbonding_amounts: Vec<([u8; 32], u64)>) -> Self {
+    fn from_semantically_verified(
+        block: SemanticallyVerifiedBlock,
+        treestate: Treestate,
+        bond_rewards: Vec<([u8; 32], u64)>,
+        unbonding_amounts: Vec<([u8; 32], u64)>,
+    ) -> Self {
         Self {
             block: block.block,
             hash: block.hash,
@@ -427,7 +442,12 @@ impl FinalizedBlock {
 
 impl FinalizableBlock {
     /// Create a new [`FinalizableBlock`] given a [`ContextuallyVerifiedBlock`], treestate, bond rewards, and unbonding amounts.
-    pub fn new(contextually_verified: ContextuallyVerifiedBlock, treestate: Treestate, bond_rewards: Vec<([u8; 32], u64)>, unbonding_amounts: Vec<([u8; 32], u64)>) -> Self {
+    pub fn new(
+        contextually_verified: ContextuallyVerifiedBlock,
+        treestate: Treestate,
+        bond_rewards: Vec<([u8; 32], u64)>,
+        unbonding_amounts: Vec<([u8; 32], u64)>,
+    ) -> Self {
         Self::Contextual {
             contextually_verified,
             treestate,

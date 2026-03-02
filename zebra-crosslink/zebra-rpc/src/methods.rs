@@ -57,8 +57,8 @@ use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 use zcash_address::{unified::Encoding, TryFromAddress};
-use zcash_protocol::consensus::Parameters;
 use zcash_primitives::transaction::{RosterMember, StakeTxId};
+use zcash_protocol::consensus::Parameters;
 
 use zebra_chain::{
     amount::{self, Amount, NegativeAllowed, NonNegative},
@@ -1527,17 +1527,21 @@ where
 
     async fn get_bond_info(&self, bond_key: String) -> Result<Option<GetBondInfoResponse>> {
         let bond_key_bytes: [u8; 32] = Vec::from_hex(&bond_key)
-            .map_err(|_| ErrorObject::owned(
-                ErrorCode::InvalidParams.code(),
-                "invalid hex string for bond_key",
-                None::<()>,
-            ))?
+            .map_err(|_| {
+                ErrorObject::owned(
+                    ErrorCode::InvalidParams.code(),
+                    "invalid hex string for bond_key",
+                    None::<()>,
+                )
+            })?
             .try_into()
-            .map_err(|_| ErrorObject::owned(
-                ErrorCode::InvalidParams.code(),
-                "bond_key must be exactly 32 bytes",
-                None::<()>,
-            ))?;
+            .map_err(|_| {
+                ErrorObject::owned(
+                    ErrorCode::InvalidParams.code(),
+                    "bond_key must be exactly 32 bytes",
+                    None::<()>,
+                )
+            })?;
 
         let request = zebra_state::ReadRequest::BondInfo(bond_key_bytes);
         let response = self
@@ -1548,13 +1552,11 @@ where
             .map_misc_error()?;
 
         match response {
-            zebra_state::ReadResponse::BondInfo(Some(info)) => {
-                Ok(Some(GetBondInfoResponse {
-                    amount: u64::from(info.amount),
-                    status: info.status,
-                    last_action_height: info.last_action_height,
-                }))
-            }
+            zebra_state::ReadResponse::BondInfo(Some(info)) => Ok(Some(GetBondInfoResponse {
+                amount: u64::from(info.amount),
+                status: info.status,
+                last_action_height: info.last_action_height,
+            })),
             zebra_state::ReadResponse::BondInfo(None) => Ok(None),
             _ => unreachable!("Unexpected response from state service: {response:?}"),
         }
@@ -1574,18 +1576,18 @@ where
             .await;
 
         match ret {
-            Ok(TFLServiceResponse::Faucet(Ok(amount))) => Ok(FaucetResponse{ amount }),
+            Ok(TFLServiceResponse::Faucet(Ok(amount))) => Ok(FaucetResponse { amount }),
             Ok(TFLServiceResponse::Faucet(Err(err))) => Err(ErrorObject::owned(
-                    server::error::LegacyCode::Verify.into(),
-                    format!("Faucet request for \"{ua_str}\" failed: {err}"),
-                    None::<()>,
+                server::error::LegacyCode::Verify.into(),
+                format!("Faucet request for \"{ua_str}\" failed: {err}"),
+                None::<()>,
             )),
             Err(err) => {
                 // tracing::error!(?ret, "Bad tfl service return.");
                 Err(ErrorObject::owned(
-                        server::error::LegacyCode::Verify.into(),
-                        format!("Faucet request for \"{ua_str}\" failed: {err}"),
-                        None::<()>,
+                    server::error::LegacyCode::Verify.into(),
+                    format!("Faucet request for \"{ua_str}\" failed: {err}"),
+                    None::<()>,
                 ))
             }
             _ => unreachable!(""),
@@ -4164,17 +4166,7 @@ pub struct GetAddressBalanceResponse {
 pub use self::GetAddressBalanceResponse as AddressBalance;
 
 /// Response to a `getbondinfo` RPC request.
-#[derive(
-    Clone,
-    Debug,
-    Eq,
-    PartialEq,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
-    Getters,
-    new,
-)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetBondInfoResponse {
     /// The bond amount in zatoshis.
     #[getter(copy)]

@@ -178,8 +178,7 @@ impl FromDisk for DelegationBond {
             .try_into()
             .expect("amount should be 8 bytes");
         let amount_zatoshis = u64::from_be_bytes(amount_bytes);
-        let amount = Amount::try_from(amount_zatoshis)
-            .expect("amount should be valid");
+        let amount = Amount::try_from(amount_zatoshis).expect("amount should be valid");
         offset += AMOUNT_DISK_BYTES;
 
         // Deserialize target_finalizer (32 bytes)
@@ -189,7 +188,9 @@ impl FromDisk for DelegationBond {
         offset += TARGET_FINALIZER_DISK_BYTES;
 
         // Deserialize created_at location (5 bytes)
-        let created_at = TransactionLocation::from_bytes(&bytes[offset..offset + TRANSACTION_LOCATION_DISK_BYTES]);
+        let created_at = TransactionLocation::from_bytes(
+            &bytes[offset..offset + TRANSACTION_LOCATION_DISK_BYTES],
+        );
 
         Self {
             amount,
@@ -246,7 +247,8 @@ impl FromDisk for BondStatus {
                     1 + TRANSACTION_LOCATION_DISK_BYTES,
                     bytes.len()
                 );
-                let unbonded_at = TransactionLocation::from_bytes(&bytes[1..1 + TRANSACTION_LOCATION_DISK_BYTES]);
+                let unbonded_at =
+                    TransactionLocation::from_bytes(&bytes[1..1 + TRANSACTION_LOCATION_DISK_BYTES]);
                 BondStatus::Unbonding { unbonded_at }
             }
             2 => {
@@ -256,7 +258,8 @@ impl FromDisk for BondStatus {
                     1 + TRANSACTION_LOCATION_DISK_BYTES,
                     bytes.len()
                 );
-                let withdrawn_at = TransactionLocation::from_bytes(&bytes[1..1 + TRANSACTION_LOCATION_DISK_BYTES]);
+                let withdrawn_at =
+                    TransactionLocation::from_bytes(&bytes[1..1 + TRANSACTION_LOCATION_DISK_BYTES]);
                 BondStatus::Withdrawn { withdrawn_at }
             }
             _ => panic!("Invalid BondStatus tag: {}", tag),

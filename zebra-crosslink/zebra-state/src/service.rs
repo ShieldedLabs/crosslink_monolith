@@ -24,11 +24,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use derivative::Derivative;
 use futures::future::FutureExt;
 use tokio::sync::{oneshot, watch};
 use tower::{util::BoxService, Service, ServiceExt};
 use tracing::{instrument, Instrument, Span};
-use derivative::Derivative;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use tower::buffer::Buffer;
@@ -40,8 +40,8 @@ use zebra_chain::{
     subtree::NoteCommitmentSubtreeIndex,
 };
 
-use zebra_chain::{block::Height, serialization::ZcashSerialize};
 use zebra_chain::block::FatPointerToBftBlock;
+use zebra_chain::{block::Height, serialization::ZcashSerialize};
 
 use crate::{
     constants::{
@@ -182,7 +182,8 @@ pub(crate) struct StateService {
     closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
 }
 
-pub type ClosureToCallIntoCrosslinkFromState = Arc<dyn Fn(FatPointerToBftBlock, FatPointerToBftBlock) -> bool + Send + Sync>;
+pub type ClosureToCallIntoCrosslinkFromState =
+    Arc<dyn Fn(FatPointerToBftBlock, FatPointerToBftBlock) -> bool + Send + Sync>;
 
 /// A read-only service for accessing Zebra's cached blockchain state.
 ///
@@ -605,21 +606,35 @@ impl StateService {
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verrified.block, "queueing block for contextual verification");
         let parent_hash = semantically_verrified.block.header.previous_block_hash;
-        let parent_block_header = self.read_service.non_finalized_state_receiver.with_watch_data(
-            |non_finalized_state| {
+        let parent_block_header = self
+            .read_service
+            .non_finalized_state_receiver
+            .with_watch_data(|non_finalized_state| {
                 let mut ret = None;
                 for chain in non_finalized_state.chain_iter() {
                     if ret.is_none() {
-                        ret = chain.block(crate::HashOrHeight::Hash(parent_hash)).map(|b| b.block.header.clone());
+                        ret = chain
+                            .block(crate::HashOrHeight::Hash(parent_hash))
+                            .map(|b| b.block.header.clone());
                     }
                 }
                 ret
-            },
-        );
-        let parent_block_header = if parent_block_header.is_some() { parent_block_header } else { self.read_service.db.block_header(crate::HashOrHeight::Hash(parent_hash)) };
-        let parent_block_fat_pointer = parent_block_header.map(|h| h.fat_pointer_to_bft_block.clone());
+            });
+        let parent_block_header = if parent_block_header.is_some() {
+            parent_block_header
+        } else {
+            self.read_service
+                .db
+                .block_header(crate::HashOrHeight::Hash(parent_hash))
+        };
+        let parent_block_fat_pointer =
+            parent_block_header.map(|h| h.fat_pointer_to_bft_block.clone());
 
-        let this_header_fat_pointer = semantically_verrified.block.header.fat_pointer_to_bft_block.clone();
+        let this_header_fat_pointer = semantically_verrified
+            .block
+            .header
+            .fat_pointer_to_bft_block
+            .clone();
         let semantically_verrified_height = semantically_verrified.height;
 
         if self
@@ -688,7 +703,13 @@ impl StateService {
                 == self.finalized_block_write_last_sent_hash
         {
             // CROSSLINK
-            if parent_block_fat_pointer.is_none() || false == (self.closure_to_call_crosslink)(parent_block_fat_pointer.unwrap(), this_header_fat_pointer) {
+            if parent_block_fat_pointer.is_none()
+                || false
+                    == (self.closure_to_call_crosslink)(
+                        parent_block_fat_pointer.unwrap(),
+                        this_header_fat_pointer,
+                    )
+            {
                 let (rsp_tx, rsp_rx) = oneshot::channel();
                 let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
                     ValidateContextError::CrosslinkNotReady {
@@ -717,7 +738,13 @@ impl StateService {
             tracing::trace!("unready to verify, returning early");
         } else if self.block_write_sender.finalized.is_none() {
             // CROSSLINK
-            if parent_block_fat_pointer.is_none() || false == (self.closure_to_call_crosslink)(parent_block_fat_pointer.unwrap(), this_header_fat_pointer) {
+            if parent_block_fat_pointer.is_none()
+                || false
+                    == (self.closure_to_call_crosslink)(
+                        parent_block_fat_pointer.unwrap(),
+                        this_header_fat_pointer,
+                    )
+            {
                 let (rsp_tx, rsp_rx) = oneshot::channel();
                 let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
                     ValidateContextError::CrosslinkNotReady {
@@ -1129,7 +1156,9 @@ impl Service<Request> for StateService {
                         // TODO: replace with Result::flatten once it stabilises
                         // https://github.com/rust-lang/rust/issues/70142
                         .and_then(convert::identity)
-                        .map(|(hash, aggregated_stakes)| Response::CrosslinkFinalized(hash, aggregated_stakes))
+                        .map(|(hash, aggregated_stakes)| {
+                            Response::CrosslinkFinalized(hash, aggregated_stakes)
+                        })
                 }
                 .instrument(span)
                 .boxed()
@@ -2274,9 +2303,14 @@ impl Service<ReadRequest> for ReadStateService {
 
                 tokio::task::spawn_blocking(move || {
                     span.in_scope(move || {
-                        let bond_info = state.non_finalized_state_receiver.with_watch_data(
-                            |non_finalized_state| non_finalized_state.best_chain().map(|chain| chain.delegation_bonds.get(&bond_key).cloned()),
-                        ).flatten();
+                        let bond_info = state
+                            .non_finalized_state_receiver
+                            .with_watch_data(|non_finalized_state| {
+                                non_finalized_state
+                                    .best_chain()
+                                    .map(|chain| chain.delegation_bonds.get(&bond_key).cloned())
+                            })
+                            .flatten();
 
                         timer.finish(module_path!(), line!(), "ReadRequest::BondInfo");
 
@@ -2426,8 +2460,13 @@ pub fn spawn_init(
 pub fn init_test(network: &Network) -> Buffer<BoxService<Request, Response, BoxError>, Request> {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, _, _, _) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, Arc::new(|_,_| true));
+    let (state_service, _, _, _) = StateService::new(
+        Config::ephemeral(),
+        network,
+        block::Height::MAX,
+        0,
+        Arc::new(|_, _| true),
+    );
 
     Buffer::new(BoxService::new(state_service), 1)
 }
@@ -2447,8 +2486,13 @@ pub fn init_test_services(
 ) {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, read_state_service, latest_chain_tip, chain_tip_change) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, std::sync::Arc::new(|_,_| true));
+    let (state_service, read_state_service, latest_chain_tip, chain_tip_change) = StateService::new(
+        Config::ephemeral(),
+        network,
+        block::Height::MAX,
+        0,
+        std::sync::Arc::new(|_, _| true),
+    );
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
 

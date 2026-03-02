@@ -907,11 +907,12 @@ where
         // Query the state for bond info
         let query = state.oneshot(zs::Request::BondInfo(bond_key));
 
-        let response = query
-            .await
-            .map_err(|e| TransactionError::ValidateMempoolLockTimeError(
-                format!("failed to query bond info: {}", e)
-            ))?;
+        let response = query.await.map_err(|e| {
+            TransactionError::ValidateMempoolLockTimeError(format!(
+                "failed to query bond info: {}",
+                e
+            ))
+        })?;
 
         let zs::Response::BondInfo(bond_info) = response else {
             unreachable!("BondInfo request always responds with BondInfo")

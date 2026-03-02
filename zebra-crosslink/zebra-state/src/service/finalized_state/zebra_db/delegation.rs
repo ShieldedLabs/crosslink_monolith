@@ -150,11 +150,21 @@ impl DiskWriteBatch {
                     }
                     StakingActionKind::BeginDelegationUnbonding => {
                         // Mark bond as unbonding
-                        self.prepare_unbonding_delegation_bond(&db.db, db, bond_key, transaction_location)?;
+                        self.prepare_unbonding_delegation_bond(
+                            &db.db,
+                            db,
+                            bond_key,
+                            transaction_location,
+                        )?;
                     }
                     StakingActionKind::WithdrawDelegationBond => {
                         // Mark bond as withdrawn
-                        self.prepare_withdrawn_delegation_bond(&db.db, db, bond_key, transaction_location)?;
+                        self.prepare_withdrawn_delegation_bond(
+                            &db.db,
+                            db,
+                            bond_key,
+                            transaction_location,
+                        )?;
                     }
                     StakingActionKind::RetargetDelegationBond => {
                         // Update the bond's target_finalizer
@@ -178,7 +188,9 @@ impl DiskWriteBatch {
         for (bond_key, reward_amount) in &finalized.bond_rewards {
             // Get current bond from bonds modified in this block first, then fall back to DB.
             // This ensures we use the updated bond if it was retargeted/created in this block.
-            let bond_opt = bonds_created_in_block.get(bond_key).cloned()
+            let bond_opt = bonds_created_in_block
+                .get(bond_key)
+                .cloned()
                 .or_else(|| db.delegation_bond(bond_key));
 
             if let Some(mut bond) = bond_opt {
@@ -197,7 +209,12 @@ impl DiskWriteBatch {
     /// Inserts into:
     /// - `delegation_bond_by_key`: stores the bond data
     /// - `bond_status_by_key`: stores Active status
-    fn prepare_new_delegation_bond(&mut self, db: &DiskDb, bond_key: BondKey, bond: DelegationBond) {
+    fn prepare_new_delegation_bond(
+        &mut self,
+        db: &DiskDb,
+        bond_key: BondKey,
+        bond: DelegationBond,
+    ) {
         let delegation_bond_by_key_cf = db.cf_handle(DELEGATION_BOND_BY_KEY).unwrap();
         let bond_status_by_key_cf = db.cf_handle(BOND_STATUS_BY_KEY).unwrap();
 
@@ -301,10 +318,13 @@ impl DiskWriteBatch {
 
         // Get current bond from bonds modified in this block first, then fall back to DB.
         // This ensures we use the updated bond if it was modified earlier in this block.
-        let bond_opt = bonds_created_in_block.get(&bond_key).cloned()
+        let bond_opt = bonds_created_in_block
+            .get(&bond_key)
+            .cloned()
             .or_else(|| zebra_db.delegation_bond(&bond_key));
 
-        let mut bond = bond_opt.ok_or_else(|| format!("bond {:?} not found for retarget", bond_key))?;
+        let mut bond =
+            bond_opt.ok_or_else(|| format!("bond {:?} not found for retarget", bond_key))?;
 
         // Update only target_finalizer (not created_at or amount)
         bond.target_finalizer = new_target;

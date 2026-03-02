@@ -370,7 +370,9 @@ impl WriteBlockWorkerTask {
                             std::collections::HashMap::new();
                         for (_bond_key, bond) in finalized_state.db.active_bonds() {
                             let amount: u64 = bond.amount.into();
-                            *stakes_by_finalizer.entry(bond.target_finalizer).or_insert(0) += amount;
+                            *stakes_by_finalizer
+                                .entry(bond.target_finalizer)
+                                .or_insert(0) += amount;
                         }
                         let aggregated_stakes: Vec<([u8; 32], u64)> =
                             stakes_by_finalizer.into_iter().collect();

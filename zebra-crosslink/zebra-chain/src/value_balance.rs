@@ -217,7 +217,13 @@ impl ValueBalance<NegativeAllowed> {
         // https://zebra.zfnd.org/dev/rfcs/0012-value-pools.html#definitions
         //
         // This will error if the remaining value in the transaction value pool is negative.
-        (self.transparent + self.sprout + self.sapling + self.orchard + self.staking_bonded + self.staking_unbonded)?.constrain::<NonNegative>()
+        (self.transparent
+            + self.sprout
+            + self.sapling
+            + self.orchard
+            + self.staking_bonded
+            + self.staking_unbonded)?
+            .constrain::<NonNegative>()
     }
 }
 
@@ -531,7 +537,8 @@ where
             orchard: (self.orchard + rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred + rhs.deferred).map_err(Deferred)?,
             staking_bonded: (self.staking_bonded + rhs.staking_bonded).map_err(StakingBonded)?,
-            staking_unbonded: (self.staking_unbonded + rhs.staking_unbonded).map_err(StakingUnbonded)?,
+            staking_unbonded: (self.staking_unbonded + rhs.staking_unbonded)
+                .map_err(StakingUnbonded)?,
         })
     }
 }
@@ -582,7 +589,8 @@ where
             orchard: (self.orchard - rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred - rhs.deferred).map_err(Deferred)?,
             staking_bonded: (self.staking_bonded - rhs.staking_bonded).map_err(StakingBonded)?,
-            staking_unbonded: (self.staking_unbonded - rhs.staking_unbonded).map_err(StakingUnbonded)?,
+            staking_unbonded: (self.staking_unbonded - rhs.staking_unbonded)
+                .map_err(StakingUnbonded)?,
         })
     }
 }

@@ -242,8 +242,10 @@ impl Application for ZebradApp {
                         .cache_dir
                         .push("zebra_crosslink_workshop_january_cache_delete_me");
 
-                    c.crosslink.malachite_peers =
-                        vec!["70.34.201.202:8234".to_owned(), "45.76.30.90:8234".to_owned()];
+                    c.crosslink.malachite_peers = vec![
+                        "70.34.201.202:8234".to_owned(),
+                        "45.76.30.90:8234".to_owned(),
+                    ];
 
                     c.consensus.checkpoint_sync = false;
                 }
@@ -617,7 +619,8 @@ impl Application for ZebradApp {
 /// command-line arguments, and terminating when complete.
 // <https://docs.rs/abscissa_core/0.7.0/src/abscissa_core/application.rs.html#174-178>
 pub fn boot(app_cell: &'static AppCell<ZebradApp>) -> ! {
-    let args = EntryPoint::process_cli_args(env::args_os().collect()).unwrap_or_else(|err| err.exit());
+    let args =
+        EntryPoint::process_cli_args(env::args_os().collect()).unwrap_or_else(|err| err.exit());
 
     #[cfg(feature = "viz_gui")]
     {

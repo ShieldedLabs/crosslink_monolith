@@ -1569,22 +1569,25 @@ impl Transaction {
     /// Return the staking value balance.
     pub fn staking_action_value_balance(&self) -> ValueBalance<NegativeAllowed> {
         match self {
-            Self::VCrosslink {
-                staking_action,
-                ..
-            } => {
+            Self::VCrosslink { staking_action, .. } => {
                 if let Some(staking_action) = staking_action {
                     if staking_action.kind == StakingActionKind::CreateNewDelegationBond {
-                        ValueBalance::from_staking_bonded_amount(Amount::new(staking_action.amount_zats as i64).neg())
+                        ValueBalance::from_staking_bonded_amount(
+                            Amount::new(staking_action.amount_zats as i64).neg(),
+                        )
                     } else if staking_action.kind == StakingActionKind::WithdrawDelegationBond {
-                        ValueBalance::from_staking_unbonded_amount(Amount::new(staking_action.amount_zats as i64).constrain().unwrap())
+                        ValueBalance::from_staking_unbonded_amount(
+                            Amount::new(staking_action.amount_zats as i64)
+                                .constrain()
+                                .unwrap(),
+                        )
                     } else {
                         ValueBalance::zero() // Note(Sam): I would have liked to have the transfer between bonded and unbonded pools to occur here but I do not think it is possible.
                     }
                 } else {
                     ValueBalance::zero()
                 }
-            },
+            }
             _ => ValueBalance::zero(),
         }
     }
@@ -1938,8 +1941,7 @@ impl Transaction {
             | Transaction::VCrosslink {
                 orchard_shielded_data: Some(orchard_shielded_data),
                 ..
-            }
-            => Some(orchard_shielded_data),
+            } => Some(orchard_shielded_data),
             #[cfg(feature = "tx_v6")]
             Transaction::V6 {
                 orchard_shielded_data: Some(orchard_shielded_data),
