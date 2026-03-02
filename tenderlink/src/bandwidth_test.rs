@@ -388,9 +388,9 @@ pub fn load_u24(buf: &[u8]) -> u32 {
     u32::from_le_bytes(tmp)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub use linux::*;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod linux {
     use super::*;
     
@@ -817,9 +817,43 @@ mod linux {
     }
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 pub use windows::*;
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::*;
+    
+    #[inline]
+    pub fn monotonic_clock_ns() -> u64 {
+        panic!("Not implemented");
+    }
+    
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+    pub struct SockHandle(u64);
+    
+    pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle {
+        panic!("Not implemented");
+    }
+    pub fn udp_send_with_congestion_and_dscp(
+        udp_socket: SockHandle,
+        dst_ip6: Ipv6Addr,
+        dst_port: u16,
+        payload: &[u8],
+        dscp: Dscp,
+    ) -> std::io::Result<()> {
+        panic!("Not implemented");
+    }
+    pub fn udp_recv_with_congestion_and_dscp(
+        udp_socket: SockHandle,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, Dscp)> {
+        panic!("Not implemented");
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use windows::*;
+#[cfg(target_os = "macos")]
 mod windows {
     use super::*;
     
