@@ -852,9 +852,9 @@ mod windows {
 }
 
 #[cfg(target_os = "macos")]
-pub use windows::*;
+pub use macos::*;
 #[cfg(target_os = "macos")]
-mod windows {
+mod macos {
     use super::*;
     
     #[inline]
