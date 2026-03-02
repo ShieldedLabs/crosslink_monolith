@@ -374,6 +374,17 @@ pub use linux::*;
 mod linux {
     use super::*;
     
+    /// Set `msg_controllen` portably.
+    /// On macOS the field is `u32` (`socklen_t`), on Linux it is `usize` (`size_t`).
+    /// See https://github.com/ShieldedLabs/crosslink_monolith/pull/8#issuecomment-3986395278
+    #[inline]
+    fn set_msg_controllen(msg: &mut libc::msghdr, len: usize) {
+        #[cfg(target_os = "macos")]
+        { msg.msg_controllen = len as u32; }
+        #[cfg(not(target_os = "macos"))]
+        { msg.msg_controllen = len; }
+    }
+
     #[inline]
     pub fn monotonic_clock_ns() -> u64 {
         unsafe {
@@ -537,8 +548,8 @@ mod linux {
         msg.msg_iov = &mut iov as *mut libc::iovec;
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = cbuf.len() as u32;
-    
+        set_msg_controllen(&mut msg, cbuf.len());
+
         let tclass_byte = ((dscp as u8) << 2) | 0b10; // ecn
     
         unsafe {
@@ -601,8 +612,8 @@ mod linux {
         msg.msg_iov = &mut iov as *mut libc::iovec;
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
-        msg.msg_controllen = cbuf.len() as u32;
-    
+        set_msg_controllen(&mut msg, cbuf.len());
+
         let n = unsafe { libc::recvmsg(fd, &mut msg as *mut libc::msghdr, 0) };
         let timestamp_ns = monotonic_clock_ns();
         if n < 0 {
