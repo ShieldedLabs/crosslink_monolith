@@ -846,7 +846,7 @@ mod windows {
     pub fn udp_recv_with_congestion_and_dscp(
         udp_socket: SockHandle,
         buf: &mut [u8],
-    ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, Dscp)> {
+    ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, bool, Dscp, u64)> {
         panic!("Not implemented");
     }
 }
@@ -880,7 +880,7 @@ mod windows {
     pub fn udp_recv_with_congestion_and_dscp(
         udp_socket: SockHandle,
         buf: &mut [u8],
-    ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, Dscp)> {
+    ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, bool, Dscp, u64)> {
         panic!("Not implemented");
     }
 }
