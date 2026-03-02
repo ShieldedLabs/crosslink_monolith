@@ -370,6 +370,7 @@ fn load_u24(buf: &[u8]) -> u32 {
 #[cfg(unix)]
 pub use linux::*;
 #[cfg(unix)]
+#[allow(unsafe_code)]
 mod linux {
     use super::*;
     
