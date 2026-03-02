@@ -22,16 +22,17 @@ const TURN_OFF_HASH_BASED_LAZY_RENDER: usize = 0;
 #[repr(u8)]
 pub enum InteractiveVizOp {
     #[default]
-    None = 0,
+    None,
 
     // on PoW
-    LF = 1,
-    candidate = 2,
+    LF,
+    // fin,
+    candidate,
 
     // on PoS
-    bft_last_final = 3,
-    origbft_last_final = 4,
-    snapshot = 5,
+    bft_last_final,
+    origbft_last_final,
+    snapshot,
 }
 impl InteractiveVizOp {
     pub fn valid_for_bc(&self) -> bool {
@@ -42,8 +43,10 @@ impl InteractiveVizOp {
     }
     pub fn cycle_next(&self) -> Self {
         match self {
-            InteractiveVizOp::None => InteractiveVizOp::LF,
-            InteractiveVizOp::LF => InteractiveVizOp::bft_last_final,
+            InteractiveVizOp::None           => InteractiveVizOp::LF,
+            InteractiveVizOp::LF             => InteractiveVizOp::bft_last_final,
+            InteractiveVizOp::bft_last_final => InteractiveVizOp::snapshot,
+            InteractiveVizOp::snapshot       => InteractiveVizOp::candidate,
             _ => InteractiveVizOp::None,
         }
     }

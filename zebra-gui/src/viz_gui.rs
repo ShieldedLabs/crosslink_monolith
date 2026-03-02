@@ -247,6 +247,56 @@ impl VizState {
     }
 }
 
+pub fn bc_at_h(state: &VizState, height: u64) -> Hash32 {
+    for pow in &state.on_screen_bcs {
+        if pow.1.block.is_best_chain && pow.1.block.this_height == height {
+            return pow.1.block.this_hash;
+        }
+    }
+    Hash32::from_u64(0)
+}
+
+// TODO(perf): can have a few ancestor backlinks that double in distance for O(log(n))
+pub fn viz_block_lca(state: &VizState, bc_hash_0: Hash32, bc_hash_1: Hash32) -> Hash32 {
+    let Some(mut bc0) = state.on_screen_bcs.get(&bc_hash_0) else {
+        return Hash32::from_u64(0);
+    };
+    let Some(mut bc1) = state.on_screen_bcs.get(&bc_hash_1) else {
+        return Hash32::from_u64(0);
+    };
+
+    loop {
+        match bc0.block.this_height.cmp(&bc1.block.this_height) {
+            std::cmp::Ordering::Less => {
+                bc1 = match state.on_screen_bcs.get(&bc1.block.parent_hash) {
+                    Some(v) => v,
+                    None => return Hash32::from_u64(0),
+                };
+            },
+            std::cmp::Ordering::Greater => {
+                bc0 = match state.on_screen_bcs.get(&bc0.block.parent_hash) {
+                    Some(v) => v,
+                    None => return Hash32::from_u64(0),
+                };
+            },
+            std::cmp::Ordering::Equal => {
+                if bc0.block.this_hash == bc1.block.this_hash {
+                    return bc0.block.this_hash;
+                }
+
+                bc0 = match state.on_screen_bcs.get(&bc0.block.parent_hash) {
+                    Some(v) => v,
+                    None => return Hash32::from_u64(0),
+                };
+                bc1 = match state.on_screen_bcs.get(&bc1.block.parent_hash) {
+                    Some(v) => v,
+                    None => return Hash32::from_u64(0),
+                };
+            },
+        }
+    }
+}
+
 pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Vec<Hash32> {
     let bc = state.on_screen_bcs.get(&block);
     let bft = state.on_screen_bfts.get(&block);
@@ -269,11 +319,24 @@ pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Ve
             res.extend(apply_viz_op(state, res[0], InteractiveVizOp::bft_last_final));
             res
         }
-        InteractiveVizOp::candidate => todo!(),
+        InteractiveVizOp::candidate => {
+            let lf = *apply_viz_op(state, block, InteractiveVizOp::LF).last().unwrap();
+            let snap = apply_viz_op(state, lf, InteractiveVizOp::snapshot);
+            if snap.len() == 0 {
+                return snap;
+            }
+
+            const TMP_SIGMA: u64 = 3;
+            let sigma_block = bc_at_h(state, state.bc_tip_height.saturating_sub(TMP_SIGMA));
+            vec![viz_block_lca(state, snap[0], sigma_block)]
+        },
 
         InteractiveVizOp::bft_last_final => vec![bft.unwrap().block.parent_hash],
         InteractiveVizOp::origbft_last_final => todo!(),
-        InteractiveVizOp::snapshot => todo!(),
+        InteractiveVizOp::snapshot => {
+            // TODO: what is the `ceil(1, bc')` suffix?
+            vec![*bft.unwrap().block.proving_blocks.first().unwrap_or(&Hash32::from_u64(0))] // TODO: fall back to genesis hash instead of 0
+        },
     }
 }
 
@@ -327,6 +390,13 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
             } else {
                  0
             };
+
+            if is_best_chain {
+                viz_state.bc_tip_height = viz_state.bc_tip_height.max(this_height);
+                if is_finalized {
+                    viz_state.bc_finalized_tip_height = viz_state.bc_finalized_tip_height.max(this_height);
+                }
+            }
 
             *seq += 1;
             let this_hash = Hash32::from_u64(*seq);
