@@ -6,20 +6,31 @@ fn bwdth_test() {
     println!("Begin the test!");
     
     let _handle = std::thread::spawn(|| {
-        do_the_reflector(32345);
+        do_the_test_program(32345, None);
     });
     std::thread::sleep(std::time::Duration::from_millis(100));
-    do_the_test_program(29453, Ipv6Addr::LOCALHOST, 32345);
+    do_the_test_program(29453, Some((Ipv6Addr::LOCALHOST, 32345)));
 }
 
-pub fn do_the_test_program(port: u16, reflector_ip: Ipv6Addr, reflector_port: u16) {
-    let socket = setup_and_bind_udp_socket(port);
+pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
+    
     let mut time_of_last_status_print = std::time::Instant::now();
     let mut ecn_up = false;
     let mut ecn_down = false;
     
-    let mut drop_cursor = 50_u64;
-    let mut serial_number = 50_u64;
+    struct SendState {
+        socket: SockHandle,
+        drop_cursor: u64,
+        serial_number: u64,
+        packet_buffer: Vec<u32>,
+    }
+    let mut send_state = SendState {
+        socket: setup_and_bind_udp_socket(port),
+        drop_cursor: 50,
+        serial_number: 50,
+        packet_buffer: vec![0; PACKET_HISTORY_BUFFER_LEN],
+    };
+    
     let mut bytes_on_the_wire = 0_u64;
     
     let mut min_seen_rtt_buckets = [u64::MAX; 10];
@@ -34,10 +45,66 @@ pub fn do_the_test_program(port: u16, reflector_ip: Ipv6Addr, reflector_port: u1
     let mut state_machine_cursor_last_time = 0_u64;
     let mut old_measured_allowed_bytes_on_the_wire = 0_u64;
     
-    let mut packet_buffer = vec![0_u32; PACKET_HISTORY_BUFFER_LEN];
     
     let mut buf = [0_u8; 16384];
+    
+    
+    struct AckState {
+        // temp
+        saved_other_ip_addr: Ipv6Addr,
+        saved_other_port: u16,
+
+        acks_in_waiting_min: u64,
+        acks_in_waiting_buf: [(u64, bool); ASSUMED_ACK_CAPACITY],
+        acks_in_waiting_count: usize,
+        first_waiting_ack_time_ns: u64,
+
+        ack_send_buf: [u8; 8 + ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE],
+    }
+    let mut ack_state = AckState {
+        saved_other_ip_addr: Ipv6Addr::LOCALHOST,
+        saved_other_port: 0,
+
+        acks_in_waiting_min: 0,
+        acks_in_waiting_buf: [(0, false); ASSUMED_ACK_CAPACITY],
+        acks_in_waiting_count: 0,
+        first_waiting_ack_time_ns: 0,
+
+        ack_send_buf: [0; 8 + ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE],
+    };
+    fn send_acks_helper(ack_state: &mut AckState, send_state: &mut SendState, ecn_down: bool) {
+        assert!(ack_state.acks_in_waiting_count > 0);
+        
+        if send_state.serial_number + 1 >= send_state.drop_cursor + (PACKET_HISTORY_BUFFER_LEN as u64) {
+            eprintln!("Error! PACKET_HISTORY_BUFFER_LEN is too small.\n");
+            return;
+        }
+        
+        store_u64(&mut ack_state.ack_send_buf[0..8], send_state.serial_number);
+        ack_state.ack_send_buf[8] = 2;
+        let mut o = 9;
+        store_u64(&mut ack_state.ack_send_buf[o..o+8], (ack_state.acks_in_waiting_min & 0x7fff_ffff_ffff_ffff) | ((ecn_down as u64) << 63));
+        o += 8;
+        for i in 0..ack_state.acks_in_waiting_count {
+            let val = ((ack_state.acks_in_waiting_buf[i].0 - ack_state.acks_in_waiting_min) as u32 & 0x7f_ffff) | ((ack_state.acks_in_waiting_buf[i].1 as u32) << 23);
+            store_u24(&mut ack_state.ack_send_buf[o..o+3], val);
+            o += 3;
+        }
+        let res = udp_send_with_congestion_and_dscp(send_state.socket, ack_state.saved_other_ip_addr, ack_state.saved_other_port, &ack_state.ack_send_buf[0..o], Dscp::Af21);
+        if let Ok(_timestamp_ns) = res {
+            send_state.packet_buffer[send_state.serial_number as usize % PACKET_HISTORY_BUFFER_LEN] = u32::MAX;
+            send_state.serial_number += 1;
+        }
+        ack_state.acks_in_waiting_count = 0;
+    };
+    
+    
     loop {
+        // Send non full ack packet if needed.
+        if ack_state.acks_in_waiting_count > 0 && monotonic_clock_ns() - ack_state.first_waiting_ack_time_ns > MAX_WAIT_BEFORE_SENDING_NON_FULL_ACK {
+            send_acks_helper(&mut ack_state, &mut send_state, ecn_down);
+        }
+    
         let current_min_rtt_on_connection_ns = {
             let a = min_seen_rtt_buckets[0].min(min_seen_rtt_buckets[1]);
             let b = min_seen_rtt_buckets[2].min(min_seen_rtt_buckets[3]);
@@ -79,8 +146,8 @@ pub fn do_the_test_program(port: u16, reflector_ip: Ipv6Addr, reflector_port: u1
         if state_machine_cursor >= 12 { state_machine_cursor = 2; }
         
         let allowed_bytes_on_the_wire =
-            if state_machine_cursor < 2 { (measured_allowed_bytes_on_the_wire*170/100).max(measured_allowed_bytes_on_the_wire + tu_bytes*10) }
-            else if state_machine_cursor < 9 { measured_allowed_bytes_on_the_wire*97/100 }
+            if state_machine_cursor < 2 { (measured_allowed_bytes_on_the_wire*130/100).max(measured_allowed_bytes_on_the_wire + tu_bytes*10) }
+            else if state_machine_cursor < 10 { measured_allowed_bytes_on_the_wire }
             else { (measured_allowed_bytes_on_the_wire*125/100).max(measured_allowed_bytes_on_the_wire + tu_bytes) };
         
         if time_of_last_status_print.elapsed() > std::time::Duration::from_millis(1000) {
@@ -89,39 +156,46 @@ pub fn do_the_test_program(port: u16, reflector_ip: Ipv6Addr, reflector_port: u1
             //println!("{} < m: {} t: {}", bytes_on_the_wire, measured_allowed_bytes_on_the_wire, allowed_bytes_on_the_wire);
         }
     
-        while drop_cursor < serial_number { // The drop back edge.
-            let (packet_size_bytes, send_timestamp_ns, _ecn_marked, acked) = decompress_packet_info(packet_buffer[drop_cursor as usize % PACKET_HISTORY_BUFFER_LEN]);
-            let time_since_send_ns = subtract_22_bit_timestamps_with_a_known_more_recent(drop_back_edge_timestamp_ns, send_timestamp_ns);
-            if time_since_send_ns < data_delivery_bucket_time * bytes_delivered_buckets.len() as u64 { break; }
-            if acked == false {
-                bytes_on_the_wire -= packet_size_bytes as u64;
+        while send_state.drop_cursor < send_state.serial_number { // The drop back edge.
+            let stored_int = send_state.packet_buffer[send_state.drop_cursor as usize % PACKET_HISTORY_BUFFER_LEN];
+            if stored_int != u32::MAX {
+                let (packet_size_bytes, send_timestamp_ns, _ecn_marked, acked) = decompress_packet_info(stored_int);
+                let time_since_send_ns = subtract_22_bit_timestamps_with_a_known_more_recent(drop_back_edge_timestamp_ns, send_timestamp_ns);
+                if time_since_send_ns < data_delivery_bucket_time * bytes_delivered_buckets.len() as u64 { break; }
+                if acked == false {
+                    bytes_on_the_wire -= packet_size_bytes as u64;
+                }
             }
-            drop_cursor += 1;
+            send_state.drop_cursor += 1;
         }
     
         let mut cannot_send_should_sleep = false;
-        if serial_number + 1 >= drop_cursor + (PACKET_HISTORY_BUFFER_LEN as u64) {
+        if send_state.serial_number + 1 >= send_state.drop_cursor + (PACKET_HISTORY_BUFFER_LEN as u64) {
             eprintln!("Error! PACKET_HISTORY_BUFFER_LEN is too small.\n");
             cannot_send_should_sleep = true;
         }
         else {
             let to_send_len_compressed = decompress_packet_size_to_8_bits(compress_packet_size_to_8_bits(tu_bytes as u16)) as u64;
             if to_send_len_compressed + bytes_on_the_wire <= allowed_bytes_on_the_wire {
-                store_u64(&mut buf[0..8], serial_number);
-                buf[8] = 1;
-                let packet_size = tu_bytes as usize;
-                let res = udp_send_with_congestion_and_dscp(socket, reflector_ip, reflector_port, &buf[0..8+packet_size], Dscp::Af11);
-                if let Ok(timestamp_ns) = res {
-                    packet_buffer[serial_number as usize % PACKET_HISTORY_BUFFER_LEN] = compress_packet_info(packet_size as u16, timestamp_ns, false, false);
-                    serial_number += 1;
-                    bytes_on_the_wire += to_send_len_compressed;
+                if let Some((beam_to_ip, beam_to_port)) = beam_to {
+                    store_u64(&mut buf[0..8], send_state.serial_number);
+                    buf[8] = 1;
+                    let packet_size = tu_bytes as usize;
+                    let res = udp_send_with_congestion_and_dscp(send_state.socket, beam_to_ip, beam_to_port, &buf[0..8+packet_size], Dscp::Af11);
+                    if let Ok(timestamp_ns) = res {
+                        send_state.packet_buffer[send_state.serial_number as usize % PACKET_HISTORY_BUFFER_LEN] = compress_packet_info(packet_size as u16, timestamp_ns, false, false);
+                        send_state.serial_number += 1;
+                        bytes_on_the_wire += to_send_len_compressed;
+                    }
+                } else {
+                    cannot_send_should_sleep = true;
                 }
             } else {
                 cannot_send_should_sleep = true;
             }
         }
     
-        let res = udp_recv_with_congestion_and_dscp(socket, &mut buf);
+        let res = udp_recv_with_congestion_and_dscp(send_state.socket, &mut buf);
         if matches!(res, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock) { continue; }
         //println!("{}: res = {:?}", port, res);
         if res.is_err() {
@@ -151,23 +225,23 @@ pub fn do_the_test_program(port: u16, reflector_ip: Ipv6Addr, reflector_port: u1
                 o += 3;
                 let ecn_marked = val & 0x80_0000 != 0;
                 let ack_number = ack_base + (val & 0x7f_ffff) as u64;
-                if ack_number >= serial_number {
+                if ack_number >= send_state.serial_number {
                     eprintln!("Error! Ack number out of range. Too new. {}\n", ack_number);
                     continue;
                 }
-                if ack_number + (PACKET_HISTORY_BUFFER_LEN as u64) < serial_number {
+                if ack_number + (PACKET_HISTORY_BUFFER_LEN as u64) < send_state.serial_number {
                     eprintln!("Error! Ack number out of range. Too old for buffer. {}\n", ack_number);
                     continue;
                 }
-                let (packet_size_bytes, send_timestamp_ns, is_mtu_poll, acked) = decompress_packet_info(packet_buffer[ack_number as usize % PACKET_HISTORY_BUFFER_LEN]);
+                let (packet_size_bytes, send_timestamp_ns, is_mtu_poll, acked) = decompress_packet_info(send_state.packet_buffer[ack_number as usize % PACKET_HISTORY_BUFFER_LEN]);
                 if acked {
                     eprintln!("Error! Already recieved ack for {}\n", ack_number);
                     continue;
                 }
-                packet_buffer[ack_number as usize % PACKET_HISTORY_BUFFER_LEN] |= 1;
+                send_state.packet_buffer[ack_number as usize % PACKET_HISTORY_BUFFER_LEN] |= 1;
                 let rtt_ns = subtract_22_bit_timestamps_with_a_known_more_recent(timestamp_ns, send_timestamp_ns);
                 min_rtt_this_ack = min_rtt_this_ack.min(rtt_ns);
-                if ack_number >= drop_cursor {
+                if ack_number >= send_state.drop_cursor {
                     total_bytes_acked_this_ack += packet_size_bytes as u64;
                 }
                 
@@ -194,81 +268,23 @@ pub fn do_the_test_program(port: u16, reflector_ip: Ipv6Addr, reflector_port: u1
             }
         }
         else {
-            println!("{}: data = {:?}", port, packet_plaintext);
-        }
-    }
-}
-
-pub fn do_the_reflector(port: u16) {
-    let socket = setup_and_bind_udp_socket(port);
-    
-    let mut saved_other_ip_addr = Ipv6Addr::LOCALHOST;
-    let mut saved_other_port = 0;
-    
-    let mut serial_number = 2000;
-    
-    let mut acks_in_waiting_min = 0_u64;
-    let mut acks_in_waiting_buf = [(0_u64, false); ASSUMED_ACK_CAPACITY];
-    let mut acks_in_waiting_count = 0;
-    let mut first_waiting_ack_time_ns = 0_u64;
-    let mut ack_send_buf = [0_u8; 8+ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE];
-    
-    let mut buf = [0_u8; 16384];
-    loop {
-        if acks_in_waiting_count > 0 && monotonic_clock_ns() - first_waiting_ack_time_ns > MAX_WAIT_BEFORE_SENDING_NON_FULL_ACK {
-            store_u64(&mut ack_send_buf[0..8], serial_number);
-            ack_send_buf[8] = 2;
-            serial_number += 1;
-            let mut o = 9;
-            store_u64(&mut ack_send_buf[o..o+8], acks_in_waiting_min);
-            o += 8;
-            for i in 0..acks_in_waiting_count {
-                let val = ((acks_in_waiting_buf[i].0 - acks_in_waiting_min) as u32 & 0x7f_ffff) | ((acks_in_waiting_buf[i].1 as u32) << 23);
-                store_u24(&mut ack_send_buf[o..o+3], val);
-                o += 3;
+            if ecn_marked { println!("ECN!"); }
+            
+            ack_state.saved_other_ip_addr = other_ip_addr;
+            ack_state.saved_other_port = other_port;
+            
+            if ack_state.acks_in_waiting_count == 0 {
+                ack_state.acks_in_waiting_min = packet_serial;
+                ack_state.first_waiting_ack_time_ns = timestamp_ns;
             }
-            let res = udp_send_with_congestion_and_dscp(socket, saved_other_ip_addr, saved_other_port, &ack_send_buf[0..o], Dscp::Af21);
-            acks_in_waiting_count = 0;
-        }
-    
-        let res = udp_recv_with_congestion_and_dscp(socket, &mut buf);
-        if matches!(res, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock) { std::thread::yield_now(); continue; }
-        //println!("{}: res = {:?}", port, res);
-        if res.is_err() { continue; }
-        let (buf_len, other_ip_addr, other_port, ecn_marked, _ecn_enabled, _service_class, timestamp_ns) = res.unwrap();
-        if buf_len < 8 { continue; }
-        let packet_serial = load_u64(&buf[0..8]);
-        let packet_plaintext = &buf[8..buf_len];
-        //println!("{}: data = {:?}", port, packet_plaintext);
-        
-        if ecn_marked { println!("ECN!"); }
-        
-        saved_other_ip_addr = other_ip_addr;
-        saved_other_port = other_port;
-        
-        if acks_in_waiting_count == 0 {
-            acks_in_waiting_min = packet_serial;
-            first_waiting_ack_time_ns = timestamp_ns;
-        }
-        else {
-            acks_in_waiting_min = acks_in_waiting_min.min(packet_serial);
-        }
-        acks_in_waiting_buf[acks_in_waiting_count] = (packet_serial, ecn_marked);
-        acks_in_waiting_count += 1;
-        if acks_in_waiting_count == ASSUMED_ACK_CAPACITY || monotonic_clock_ns() - first_waiting_ack_time_ns > MIN_WAIT_BEFORE_SENDING_NON_FULL_ACK {
-            store_u64(&mut ack_send_buf[0..8], serial_number);
-            ack_send_buf[8] = 2;
-            serial_number += 1;
-            let mut o = 9;
-            store_u64(&mut ack_send_buf[o..o+8], (acks_in_waiting_min & 0x7fff_ffff_ffff_ffff) | ((_ecn_enabled as u64) << 63));
-            o += 8;
-            for i in 0..acks_in_waiting_count {
-                let val = ((acks_in_waiting_buf[i].0 - acks_in_waiting_min) as u32 & 0x7f_ffff) | ((acks_in_waiting_buf[i].1 as u32) << 23);
-                store_u24(&mut ack_send_buf[o..o+3], val);
-                o += 3;
+            else {
+                ack_state.acks_in_waiting_min = ack_state.acks_in_waiting_min.min(packet_serial);
             }
-            let res = udp_send_with_congestion_and_dscp(socket, saved_other_ip_addr, saved_other_port, &ack_send_buf[0..o], Dscp::Af21);
-            acks_in_waiting_count = 0;
+            ack_state.acks_in_waiting_buf[ack_state.acks_in_waiting_count] = (packet_serial, ecn_marked);
+            ack_state.acks_in_waiting_count += 1;
+            if ack_state.acks_in_waiting_count == ASSUMED_ACK_CAPACITY || monotonic_clock_ns() - ack_state.first_waiting_ack_time_ns > MIN_WAIT_BEFORE_SENDING_NON_FULL_ACK {
+                send_acks_helper(&mut ack_state, &mut send_state, ecn_down);
+            }
         }
     }
 }

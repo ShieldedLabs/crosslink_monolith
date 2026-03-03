@@ -4,7 +4,7 @@ fn main() {
         if args[1] == "reflector" {
             let port : u16 = args[2].parse().unwrap();
             println!("running reflector on port: {}", port);
-            tenderlink::bandwidth_test::do_the_reflector(port);
+            tenderlink::bandwidth_test::do_the_test_program(port, None);
             return;
         }
         if args[1] == "beamer" {
@@ -13,7 +13,7 @@ fn main() {
             let other_port : u16 = args[4].parse().unwrap();
             println!("running beamer on port: {}", port);
             println!("connecting to {} port {}", other_addr, other_port);
-            tenderlink::bandwidth_test::do_the_test_program(port, other_addr, other_port);
+            tenderlink::bandwidth_test::do_the_test_program(port, Some((other_addr, other_port)));
             return;
         }
     }
