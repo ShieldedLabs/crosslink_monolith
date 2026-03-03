@@ -26,7 +26,7 @@ pub fn do_the_test_program(port: u16, reflector_ip: Ipv6Addr, reflector_port: u1
     let mut rtt_bucket_cursor = 0_u64;
     let mut rtt_bucket_cursor_last_time = 0_u64;
     
-    let mut bytes_delivered_buckets = [0_u64; 10];
+    let mut bytes_delivered_buckets = [0_u64; 20];
     let mut bytes_delivered_bucket_cursor = 0_u64;
     let mut bytes_delivered_bucket_cursor_last_time = 0_u64;
     
@@ -54,9 +54,14 @@ pub fn do_the_test_program(port: u16, reflector_ip: Ipv6Addr, reflector_port: u1
             let c = bytes_delivered_buckets[4].max(bytes_delivered_buckets[5]);
             let d = bytes_delivered_buckets[6].max(bytes_delivered_buckets[7]);
             let e = bytes_delivered_buckets[8].max(bytes_delivered_buckets[9]);
-            a.max(b).max(c).max(d).max(e)
+            let f = bytes_delivered_buckets[10].max(bytes_delivered_buckets[11]);
+            let g = bytes_delivered_buckets[12].max(bytes_delivered_buckets[13]);
+            let h = bytes_delivered_buckets[14].max(bytes_delivered_buckets[15]);
+            let i = bytes_delivered_buckets[16].max(bytes_delivered_buckets[17]);
+            let j = bytes_delivered_buckets[18].max(bytes_delivered_buckets[19]);
+            a.max(b).max(c).max(d).max(e).max(f).max(g).max(h).max(i).max(j)
         };
-        let data_delivery_bucket_time = current_min_rtt_on_connection_ns / 3;
+        let data_delivery_bucket_time = current_min_rtt_on_connection_ns / 4;
         
         let tu_bytes = 0_u64.max(ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE as u64);
     
@@ -69,14 +74,13 @@ pub fn do_the_test_program(port: u16, reflector_ip: Ipv6Addr, reflector_port: u1
             state_machine_cursor += 1;
             state_machine_cursor_last_time = drop_back_edge_timestamp_ns;
         }
-        if measured_allowed_bytes_on_the_wire > old_measured_allowed_bytes_on_the_wire*110/100 { state_machine_cursor = 0; println!("GROW"); }
+        if measured_allowed_bytes_on_the_wire > old_measured_allowed_bytes_on_the_wire*124/100 { state_machine_cursor = 0; println!("GROW"); }
         old_measured_allowed_bytes_on_the_wire = measured_allowed_bytes_on_the_wire;
         if state_machine_cursor >= 12 { state_machine_cursor = 2; }
         
         let allowed_bytes_on_the_wire =
-            if state_machine_cursor < 2 { (measured_allowed_bytes_on_the_wire*2).max(measured_allowed_bytes_on_the_wire + tu_bytes*10) }
-            else if state_machine_cursor < 8 { measured_allowed_bytes_on_the_wire }
-            else if state_machine_cursor < 10 { measured_allowed_bytes_on_the_wire*75/100 }
+            if state_machine_cursor < 2 { (measured_allowed_bytes_on_the_wire*170/100).max(measured_allowed_bytes_on_the_wire + tu_bytes*10) }
+            else if state_machine_cursor < 9 { measured_allowed_bytes_on_the_wire*97/100 }
             else { (measured_allowed_bytes_on_the_wire*125/100).max(measured_allowed_bytes_on_the_wire + tu_bytes) };
         
         if time_of_last_status_print.elapsed() > std::time::Duration::from_millis(1000) {
