@@ -110,7 +110,7 @@ pub fn do_the_test_program(port: u16, reflector_ip: Ipv6Addr, reflector_port: u1
                 store_u64(&mut buf[0..8], serial_number);
                 buf[8] = 1;
                 let packet_size = tu_bytes as usize;
-                let res = udp_send_with_congestion_and_dscp(socket, reflector_ip, reflector_port, &buf[0..8+packet_size], Dscp::Af21);
+                let res = udp_send_with_congestion_and_dscp(socket, reflector_ip, reflector_port, &buf[0..8+packet_size], Dscp::Af11);
                 if let Ok(timestamp_ns) = res {
                     packet_buffer[serial_number as usize % PACKET_HISTORY_BUFFER_LEN] = compress_packet_info(packet_size as u16, timestamp_ns, false, false);
                     serial_number += 1;
@@ -227,7 +227,7 @@ pub fn do_the_reflector(port: u16) {
                 store_u24(&mut ack_send_buf[o..o+3], val);
                 o += 3;
             }
-            let res = udp_send_with_congestion_and_dscp(socket, saved_other_ip_addr, saved_other_port, &ack_send_buf[0..o], Dscp::BestEffort);
+            let res = udp_send_with_congestion_and_dscp(socket, saved_other_ip_addr, saved_other_port, &ack_send_buf[0..o], Dscp::Af21);
             acks_in_waiting_count = 0;
         }
     
@@ -871,18 +871,120 @@ pub use macos::*;
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
-    
+
     #[inline]
     pub fn monotonic_clock_ns() -> u64 {
-        panic!("Not implemented");
+        unsafe {
+            let time = libc::mach_absolute_time();
+
+            let mut info = std::mem::zeroed::<libc::mach_timebase_info>();
+            libc::mach_timebase_info(&mut info);
+
+            time * info.numer as u64 / info.denom as u64
+        }
     }
     
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-    pub struct SockHandle(u64);
+    pub struct SockHandle(libc::c_int);
     
     pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle {
-        panic!("Not implemented");
+        // Create an IPv6 UDP socket (we'll run it dual-stack via IPV6_V6ONLY=0).
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP) };
+        if fd < 0 {
+            panic!("socket() failed: {}", std::io::Error::last_os_error());
+        }
+
+        // Make socket non-blocking.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 {
+                panic!("fcntl(F_GETFL) failed: {}", std::io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                panic!("fcntl(F_SETFL) failed: {}", std::io::Error::last_os_error());
+            }
+        }
+
+        // Dual-stack: allow IPv4-mapped IPv6 addresses (::ffff:a.b.c.d).
+        unsafe {
+            let zero: libc::c_int = 0;
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                &zero as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&zero) as libc::socklen_t,
+            ) != 0
+            {
+                panic!(
+                    "Failed to disable IPV6_V6ONLY: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        // Bind [::]:port
+        unsafe {
+            let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
+            addr.sin6_family = libc::AF_INET6 as _;
+            addr.sin6_port = port.to_be();
+            addr.sin6_addr = libc::in6addr_any;
+
+            if libc::bind(
+                fd,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            ) != 0
+            {
+                panic!("bind() failed: {}", std::io::Error::last_os_error());
+            }
+        }
+
+        unsafe {
+            let one: libc::c_int = 1;
+
+            // macOS: receive IPv6 Traffic Class as a cmsg (type IPV6_TCLASS).
+            // On a dual-stack IPv6 socket this is the supported way to read DSCP/ECN.
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_RECVTCLASS,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            ) != 0
+            {
+                panic!(
+                    "Failed to enable IPV6_RECVTCLASS: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            // Receive IPV6_PKTINFO cmsg (dst addr + ifindex) on recvmsg (and usable for sendmsg).
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_RECVPKTINFO,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            ) != 0
+            {
+                panic!(
+                    "Failed to enable IPV6_RECVPKTINFO: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        SockHandle(fd)
     }
+
+    /// macOS-only:
+    /// SEND one UDP packet to (dst_ip6, dst_port) on a dual-stack IPv6 socket.
+    ///
+    /// - Sets SO_NET_SERVICE_TYPE based on DSCP (inlined mapping).
+    /// - Sets per-packet IPV6_TCLASS (DSCP + ECN).
+    /// - Works for IPv6 and IPv4-mapped IPv6 destinations.
+    /// Return value is a nanosecond timestamp of the send.
     pub fn udp_send_with_congestion_and_dscp(
         udp_socket: SockHandle,
         dst_ip6: Ipv6Addr,
@@ -890,13 +992,203 @@ mod macos {
         payload: &[u8],
         dscp: Dscp,
     ) -> std::io::Result<u64> {
-        panic!("Not implemented");
+        // Darwin constants (not always exposed by Rust libc)
+        const SO_NET_SERVICE_TYPE: libc::c_int = 0x1116;
+
+        const NET_SERVICE_TYPE_BE: libc::c_int = 0;
+        const NET_SERVICE_TYPE_BK: libc::c_int = 1;
+        const NET_SERVICE_TYPE_SIG: libc::c_int = 2;
+        const NET_SERVICE_TYPE_VO: libc::c_int = 4;
+
+        let fd = udp_socket.0;
+
+        // 1) Set SO_NET_SERVICE_TYPE (per-socket QoS intent) — inlined DSCP mapping.
+        unsafe {
+            let svc: libc::c_int = match dscp {
+                Dscp::BestEffort => NET_SERVICE_TYPE_BK,
+                Dscp::Af11       => NET_SERVICE_TYPE_BE,
+                Dscp::Af21       => NET_SERVICE_TYPE_SIG,
+                Dscp::Ef         => NET_SERVICE_TYPE_VO,
+            };
+
+            if libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                SO_NET_SERVICE_TYPE,
+                &svc as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&svc) as libc::socklen_t,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        // 2) Destination: always sockaddr_in6 (works for IPv6 and IPv4-mapped IPv6).
+        let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        sin6.sin6_family = libc::AF_INET6 as _;
+        sin6.sin6_port = dst_port.to_be();
+        sin6.sin6_addr = libc::in6_addr { s6_addr: dst_ip6.octets() };
+
+        let mut iov = libc::iovec {
+            iov_base: payload.as_ptr() as *mut libc::c_void,
+            iov_len: payload.len(),
+        };
+
+        // 3) Control buffer for one IPV6_TCLASS cmsg carrying an int.
+        let cmsg_space =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) } as usize;
+        let mut cbuf = vec![0u8; cmsg_space];
+
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_name = (&mut sin6 as *mut libc::sockaddr_in6).cast::<libc::c_void>();
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+        msg.msg_iov = &mut iov as *mut libc::iovec;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr().cast::<libc::c_void>();
+        msg.msg_controllen = cbuf.len() as u32;
+
+        // 4) DSCP + ECN (ECT(0) = 0b10).
+        let tclass_byte: u8 = ((dscp as u8) << 2) | 0b10;
+
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg as *const _ as *mut _);
+            if cmsg.is_null() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "CMSG_FIRSTHDR returned null",
+                ));
+            }
+
+            (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
+            (*cmsg).cmsg_type = libc::IPV6_TCLASS;
+            (*cmsg).cmsg_len =
+                libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as _;
+
+            let data = libc::CMSG_DATA(cmsg).cast::<libc::c_int>();
+            *data = tclass_byte as libc::c_int;
+
+            msg.msg_controllen =
+                libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) as _;
+
+            let timestamp_ns = monotonic_clock_ns();
+            let n = libc::sendmsg(fd, &msg as *const _ as *mut _, 0);
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            if n as usize != payload.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!("partial UDP send: {n} of {}", payload.len()),
+                ));
+            }
+
+            Ok(timestamp_ns)
+        }
     }
+
+    /// macOS-only:
+    /// RECV one UDP packet, returning:
+    /// (len, src_ip6, src_port, congested, ecn_enabled, dscp, timestamp_ns)
+    ///
+    /// - If the peer is IPv4, it is returned as an IPv4-mapped IPv6 address (::ffff:a.b.c.d).
+    /// - congested=true iff ECN == CE (0b11).
+    /// - If no TCLASS cmsg was provided by the kernel, returns congested=false, ecn_enabled=false,
+    ///   and dscp=BestEffort.
     pub fn udp_recv_with_congestion_and_dscp(
         udp_socket: SockHandle,
         buf: &mut [u8],
     ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, bool, Dscp, u64)> {
-        panic!("Not implemented");
+        let fd = udp_socket.0;
+
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+
+        let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+
+        // Control buffer: room for at least one IPV6_TCLASS (int) cmsg (plus some slack).
+        let mut cbuf = [0u8; 128];
+
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_name = (&mut addr_storage as *mut _) as *mut libc::c_void;
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        msg.msg_iov = &mut iov as *mut libc::iovec;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cbuf.len() as _; // macOS expects u32-ish, not usize
+
+        let n = unsafe { libc::recvmsg(fd, &mut msg as *mut libc::msghdr, 0) };
+        let timestamp_ns = monotonic_clock_ns();
+
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        if (msg.msg_flags & libc::MSG_TRUNC) != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "UDP datagram truncated (buffer too small)",
+            ));
+        }
+
+        // Peer address -> always return IPv6 (IPv4 becomes v4-mapped IPv6)
+        let (src_ip6, src_port) = if (addr_storage.ss_family as i32) == libc::AF_INET {
+            let sin: &libc::sockaddr_in =
+                unsafe { &*(&addr_storage as *const _ as *const libc::sockaddr_in) };
+            // s_addr is in network byte order; from(u32) expects big-endian representation.
+            let ip4 = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            let port = u16::from_be(sin.sin_port);
+            (ip4.to_ipv6_mapped(), port)
+        } else if (addr_storage.ss_family as i32) == libc::AF_INET6 {
+            let sin6: &libc::sockaddr_in6 =
+                unsafe { &*(&addr_storage as *const _ as *const libc::sockaddr_in6) };
+            let ip6 = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            let port = u16::from_be(sin6.sin6_port);
+            (ip6, port)
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unknown sockaddr family",
+            ));
+        };
+
+        // Defaults if no cmsg
+        let mut congested = false;
+        let mut ecn_enabled = false;
+        let mut dscp = Dscp::BestEffort;
+
+        // macOS: Traffic Class arrives as IPV6_TCLASS with an `int` payload when IPV6_RECVTCLASS is enabled.
+        unsafe {
+            let mut cmsg_ptr = libc::CMSG_FIRSTHDR(&msg as *const _ as *mut _);
+            while !cmsg_ptr.is_null() {
+                let cmsg = &*cmsg_ptr;
+
+                if cmsg.cmsg_level == libc::IPPROTO_IPV6 && cmsg.cmsg_type == libc::IPV6_TCLASS {
+                    let data = libc::CMSG_DATA(cmsg_ptr) as *const libc::c_int;
+                    let tclass = (*data as u32 & 0xFF) as u8;
+
+                    let ecn_bits = tclass & 0b11;
+                    congested = ecn_bits == 0b11; // CE
+                    ecn_enabled = ecn_bits != 0;
+                    dscp = Dscp::from_u8(tclass >> 2);
+                    break;
+                }
+
+                cmsg_ptr = libc::CMSG_NXTHDR(&msg as *const _ as *mut _, cmsg_ptr);
+            }
+        }
+
+        Ok((
+            n as usize,
+            src_ip6,
+            src_port,
+            congested,
+            ecn_enabled,
+            dscp,
+            timestamp_ns,
+        ))
     }
 }
 
