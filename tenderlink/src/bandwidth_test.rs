@@ -444,6 +444,9 @@ mod linux {
                 panic!("getifaddrs failed: {}", std::io::Error::last_os_error());
             }
     
+            let mut index = 0;
+            let mut first_is_loopback = false;
+            
             let mut cur = ifap;
             while !cur.is_null() {
                 let ifa = &*cur;
@@ -451,12 +454,14 @@ mod linux {
                 if !ifa.ifa_addr.is_null()
                     && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET6
                 {
+                    index += 1;
                     let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
                     let addr = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
     
                     // Skip loopback (::1)
                     if addr.is_loopback() {
                         cur = (*cur).ifa_next;
+                        if index == 1 { first_is_loopback = true; }
                         continue;
                     }
     
@@ -480,6 +485,12 @@ mod linux {
                     }
     
                     libc::freeifaddrs(ifap);
+                    
+                    if index == 2 && first_is_loopback {
+                        // This is a normally configured Linux box and we do not need the workaround.
+                        return None;
+                    }
+                    eprintln!("[WARNING] This linux machine has incorrectly configured it's ipv6 addresses causing a bug when sending ipv6 packets. We will be overriding the sender ip field with '{}' in order to try and work around this issue.", addr);
                     return Some(addr);
                 }
     
