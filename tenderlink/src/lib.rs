@@ -7,7 +7,7 @@
 const PRINT_PROTOCOL:       bool = 1 == 1;
 const PRINT_PROTOCOL_TAG:   bool = 0 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
-const PRINT_ROSTER_CMD:     bool = 1 == 1;
+const PRINT_ROSTER_CMD:     bool = 0 == 1;
 const PRINT_NETWORK_STATS:  bool = 1 == 1;
 const PRINT_PEERS:          bool = 0 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
@@ -1792,8 +1792,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         my_endpoint.map(|endpoint| EndpointEvidence { endpoint, root_public_bft_key: my_root_public_bft_key.into() })
     };
 
-    let mut unknown_peers: Vec<Peer> = Vec::new();
-
     const ONE_SECOND: tokio::time::Duration = tokio::time::Duration::from_secs(1);
     let mut net_stats_window_start = tokio::time::Instant::now();
     let mut net_stats = NetworkStats::default();
@@ -1808,9 +1806,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         {
             let mut peers = peers.iter().map(|p| p.info()).collect::<Vec<PeerInfo>>();
-            for upeer in &unknown_peers {
-                peers.push(upeer.info());
-            }
             bft_state.update_peers_cmd_closure.0(peers).await;
         }
 
@@ -2052,12 +2047,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         if was_now > next_tick_time {
             loop {
                 // TICK CODE
-                unknown_peers.retain(|peer| {
-                    if peer.watch_dog.elapsed() > TIMEOUT_DURATION {
-                        if PRINT_PROTOCOL { println!("{:05}: Disconnected from unknown peer {:?}", my_port, peer.endpoint); }
-                        false
-                    } else { true }
-                });
                 for peer in &mut peers {
                     if peer.watch_dog.elapsed() > TIMEOUT_DURATION {
                         if peer.snow_state.is_some() {
@@ -2185,9 +2174,9 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                 if peers.iter().position(|p| p.root_public_bft_key == server_a_pub_key).is_none() && server_a_pub_key != my_root_private_key.as_ref() {
                     let (a, b) = goofy_addr_string_to_stuff("45.76.30.90:8234");
                     let evidence = EndpointEvidence { endpoint: b, root_public_bft_key: server_a_pub_key };
-                    roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
-                    roster_endpoint_evidence.push(evidence);
-                    peers.push(Peer { root_public_bft_key: server_a_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
+                    // roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
+                    // roster_endpoint_evidence.push(evidence);
+                    // peers.push(Peer { root_public_bft_key: server_a_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
                 }
 
                 let server_b_pub_key = {
@@ -2205,24 +2194,9 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                 if peers.iter().position(|p| p.root_public_bft_key == server_b_pub_key).is_none() && server_b_pub_key != my_root_private_key.as_ref() {
                     let (a, b) = goofy_addr_string_to_stuff("70.34.201.202:8234");
                     let evidence = EndpointEvidence { endpoint: b, root_public_bft_key: server_b_pub_key };
-                    roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
-                    roster_endpoint_evidence.push(evidence);
-                    peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
-                }
-
-                {
-                    let active_roster = &roster[..active_roster_len(&roster)];
-                    // Drop those who are not in the active roster. And not the backup p2p servers.
-                    peers.retain(|p| p.root_public_bft_key == server_a_pub_key || p.root_public_bft_key == server_b_pub_key || active_roster.iter().position(|rp| rp.pub_key.0 == p.root_public_bft_key).is_some());
-                    for rp in active_roster {
-                        if peers.iter().position(|p| p.root_public_bft_key == rp.pub_key.0).is_none() && rp.pub_key.0 != my_root_private_key.as_ref() {
-                            let mut peer = Peer { root_public_bft_key: rp.pub_key.0, ..Peer::default() };
-                            if let Some(evidence) = roster_endpoint_evidence.iter().find(|evidence| evidence.root_public_bft_key == rp.pub_key.0) {
-                                peer.endpoint = Some(evidence.endpoint);
-                            }
-                            peers.push(peer);
-                        }
-                    }
+                    // roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
+                    // roster_endpoint_evidence.push(evidence);
+                    // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
                 }
 
                 fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer_transport: &mut PeerTransport, peer_endpoint: SecureUdpEndpoint, peer_snow_state: &mut snow::StatelessTransportState, peer_root_public_bft_key: [u8; 32], sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
@@ -2416,8 +2390,9 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                     }
                 }
 
-                for peer_i in 0..unknown_peers.len() {
-                    let peer = &mut unknown_peers[peer_i];
+                for peer_i in 0..peers.len() {
+                    if peers[peer_i].root_public_bft_key == [0; 32] { continue; }
+                    let peer = &mut peers[peer_i];
                     if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
                     if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
                         peer.latest_status_request_height = None;
@@ -2539,9 +2514,6 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                 }
             }
         }
-        for peer in &mut unknown_peers {
-            timeout_drop(&mut peer.transport);
-        }
         for peer in &mut peers {
             timeout_drop(&mut peer.transport);
         }
@@ -2562,7 +2534,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
         let from_port = addr.port();
 
         // DECRYPT
-        let mut peer_index = 0;
+        let mut peer_index: Option<usize> = None;
         let mut peer_knowledge = ConnectionKnowledge::Known;
         let mut nonce = 0;
         let mut msg: Option<&[u8]> = None;
@@ -2578,7 +2550,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                     if let Ok(length) = snow_state.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         if nonce_is_ok(nonce, peer.transport.ack_latest, peer.transport.ack_field) {
                             msg        = Some(&recv_buf2[0..length]);
-                            peer_index = i;
+                            peer_index = Some(i);
                         }
                         break;
                     }
@@ -2734,8 +2706,8 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
             }
         } else {
             loop {
-                if let Some(i) = unknown_peers.iter().position(|p| p.endpoint.is_some() && p.endpoint.unwrap().ip_address == from_ip && p.endpoint.unwrap().port == from_port) {
-                    let peer = &mut unknown_peers[i];
+                if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == [0; 32] && p.endpoint.is_some() && p.endpoint.unwrap().ip_address == from_ip && p.endpoint.unwrap().port == from_port) {
+                    let peer = &mut peers[i];
                     nonce = u64::from_le_bytes(raw_msg[..8].try_into().unwrap());
                     if let Ok(length) = peer.snow_state.as_ref().unwrap().read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
@@ -2759,7 +2731,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
 
                         if nonce_is_ok(nonce, peer.transport.ack_latest, peer.transport.ack_field) {
                             msg             = Some(&header_and_local_msg);
-                            peer_index      = i;
+                            peer_index      = Some(i);
                             peer_knowledge  = ConnectionKnowledge::Unknown;
                         }
                         break;
@@ -2799,7 +2771,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                             print_packet_tag_send(header);
                             send_sock_msg(&ctx_str, &mut transport, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
                             transport.nonce += 1;
-                            unknown_peers.push(Peer {
+                            peers.push(Peer {
                                 root_public_bft_key: [0; 32],
 
                                 endpoint: Some(client_endpoint),
@@ -2902,35 +2874,45 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
             }
         }
 
-        if peer_knowledge == ConnectionKnowledge::Unknown {
-            let peer = &mut unknown_peers[peer_index];
-            peer.watch_dog = Instant::now();
-            nonce_update(nonce, &mut peer.transport.ack_latest, &mut peer.transport.ack_field);
+        let mut duplicate_peer_identity_to_remove: Option<[u8; 32]> = None;
+        let mut peer_index_to_retain = 0;
 
-            process_acks(&mut peer.transport, header);
+        if let Some(peer_index) = peer_index && peer_knowledge == ConnectionKnowledge::Unknown {
+            let peer_from_which_i_have_received_the_packet = &mut peers[peer_index];
+            peer_from_which_i_have_received_the_packet.watch_dog = Instant::now();
+            nonce_update(nonce, &mut peer_from_which_i_have_received_the_packet.transport.ack_latest, &mut peer_from_which_i_have_received_the_packet.transport.ack_field);
+
+            process_acks(&mut peer_from_which_i_have_received_the_packet.transport, header);
 
             if let Some(status) = status {
-                peer.latest_status_request_height = Some(status.height);
-                peer.latest_status_request_powlink = Some((status.powlink_hash, status.powlink_chunk_i));
+                peer_from_which_i_have_received_the_packet.latest_status_request_height = Some(status.height);
+                peer_from_which_i_have_received_the_packet.latest_status_request_powlink = Some((status.powlink_hash, status.powlink_chunk_i));
             }
 
             match packet_type {
                 PACKET_TYPE_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[read_o..]) {
-                    Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == evidence.root_public_bft_key) {
-                        peers[i].endpoint = Some(evidence.endpoint);
-                        if peer.endpoint == Some(evidence.endpoint) {
-                            if PRINT_PROTOCOL { println!("{:05}: Promoting unknown peer connection {:?}", my_port, peer.endpoint); }
-                            let peer = unknown_peers.remove(peer_index);
-                            peers[i].outgoing_handshake_state      = None;
-                            peers[i].pending_client_ack_snow_state = None;
-                            peers[i].snow_state                    = peer.snow_state;
-                            peers[i].watch_dog                     = Instant::now();
-                            peers[i].transport                     = peer.transport;
-                            peers[i].connection_knowledge          = ConnectionKnowledge::Known;
+
+                    Ok(evidence) => if (&roster[..active_roster_len(&roster)]).iter().position(|m| m.pub_key.0 == evidence.root_public_bft_key).is_some() {
+                        if peer_from_which_i_have_received_the_packet.endpoint == Some(evidence.endpoint) {
+                            if PRINT_PROTOCOL {
+                                println!("{:05}: Promoting unknown peer connection {:?}", my_port, peer_from_which_i_have_received_the_packet.endpoint);
+                            }
+
+                            // Remove the peer with this BFT identity if they were already elsewhere on the list
+                            duplicate_peer_identity_to_remove = Some(evidence.root_public_bft_key);
+                            peer_index_to_retain = peer_index;
+
+                            peer_from_which_i_have_received_the_packet.root_public_bft_key           = evidence.root_public_bft_key;
+                            peer_from_which_i_have_received_the_packet.outgoing_handshake_state      = None;
+                            peer_from_which_i_have_received_the_packet.pending_client_ack_snow_state = None;
+                            peer_from_which_i_have_received_the_packet.watch_dog                     = Instant::now();
+                            peer_from_which_i_have_received_the_packet.connection_knowledge          = ConnectionKnowledge::Known;
                         }
+
                         roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
                         roster_endpoint_evidence.push(evidence);
                     }
+
                     Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
                 },
                 PACKET_TYPE_ROSTER_CMD => if msg[read_o..].len() > 0 {
@@ -2939,10 +2921,9 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                 PACKET_TYPE_EMPTY => (),
                 _ => (), //println!("{:05}:  From unknown peer!   field={:016X} packet_type=0x{:X} Got '{:?}' from {}", my_port, peer.transport.ack_field, packet_type, msg, addr),
             }
-            continue;
         }
 
-        else {
+        else if let Some(peer_index) = peer_index && peer_knowledge == ConnectionKnowledge::Known {
             let peer = &mut peers[peer_index];
             peer.watch_dog = Instant::now();
             nonce_update(nonce, &mut peer.transport.ack_latest, &mut peer.transport.ack_field);
@@ -3019,7 +3000,25 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                 PACKET_TYPE_EMPTY => {}
                 _ => {} // println!("{}:  From known peer!   field={:016X} Got '{:?}' from {}", my_port, peer.transport.ack_field, msg, addr);
             }
-            continue;
+        }
+
+        if let Some(bft_key) = duplicate_peer_identity_to_remove {
+            let mut peer_to_remove_i: Option<usize> = None;
+
+            for i in 0..peers.len() {
+                if i == peer_index_to_retain {
+                    continue;
+                }
+
+                if peers[i].root_public_bft_key == bft_key {
+                    peer_to_remove_i = Some(i);
+                    break;
+                }
+            }
+
+            if let Some(i) = peer_to_remove_i {
+                peers.remove(i);
+            }
         }
     }
 }
@@ -3545,7 +3544,7 @@ pub fn run_instances(i: usize) {
     rt.block_on(std::future::pending::<()>())
 }
 
-pub mod bandwidth_test;
+// pub mod bandwidth_test;
 
 #[cfg(test)]
 mod tests {
