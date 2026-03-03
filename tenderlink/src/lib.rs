@@ -1918,7 +1918,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             let rand_t = bytes_in_flight as f64 / target_bytes_in_flight as f64;
             if rand::random::<f64>() < rand_t {
                 // if PRINT_PROTOCOL { println!("Dropping packet because of congestion control."); }
-                return;
+                // return;
             }
 
             // println!("Packet: {} bytes", msg.len());
