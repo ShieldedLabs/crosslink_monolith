@@ -7,7 +7,6 @@
 const PRINT_PROTOCOL:       bool = 1 == 1;
 const PRINT_PROTOCOL_TAG:   bool = 0 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
-const PRINT_ROSTER_CMD:     bool = 1 == 1;
 const PRINT_NETWORK_STATS:  bool = 1 == 1;
 const PRINT_PEERS:          bool = 0 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
@@ -54,6 +53,8 @@ use tokio::time::Instant;
 
 const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(300);
 const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_millis(10000);
+
+// NOTE: Sam and Phillip discussed forward jumps; Noise trial decryption already protects connectsions against replay attacks.
 const NONCE_FORWARD_JUMP_TOLERANCE: u64 = 512;
 
 fn is_timeout(e: std::io::ErrorKind) -> bool{
@@ -635,8 +636,6 @@ struct TMState {
     is_pow_in_chain_closure: ClosureIsPoWInChain,
     push_pow_closure: ClosureToPushPow,
 
-    roster_cmd: Option<String>,
-    update_roster_cmd_closure: ClosureToUpdateRosterCmd,
     update_peers_cmd_closure: ClosureToUpdatePeers,
 
     pow_submit_block_queue: Vec<Arc<zebra_chain::block::Block>>,
@@ -653,7 +652,6 @@ impl TMState {
         parse_pow_closure: ClosureToParsePow,
         is_pow_in_chain_closure: ClosureIsPoWInChain,
         push_pow_closure: ClosureToPushPow,
-        update_roster_cmd_closure: ClosureToUpdateRosterCmd,
         update_peers_cmd_closure: ClosureToUpdatePeers,
     ) -> Self {
         Self {
@@ -678,8 +676,6 @@ impl TMState {
             parse_pow_closure,
             is_pow_in_chain_closure,
             push_pow_closure,
-            roster_cmd: None,
-            update_roster_cmd_closure,
             update_peers_cmd_closure,
 
             pow_submit_block_queue: Vec::new(),
@@ -1653,9 +1649,12 @@ async fn instance(
         ClosureToValidateProposedBlock(Arc::new(move |block| {
             Box::pin(async move {
                 if block.0.len() == 0 { (TMStatus::Fail, TMStatusReason::None) }
-                else if block.0[0] % 2 == 0 { (TMStatus::Pass, TMStatusReason::None) }
-                //else if block.0[0] % 3 == 1 { (TMStatus::Indeterminate, TMStatusReason::None) }
-                else { (TMStatus::Fail, TMStatusReason::None) }
+                else                  { (TMStatus::Pass, TMStatusReason::None) }
+
+                // if block.0.len() == 0 { (TMStatus::Fail, TMStatusReason::None) }
+                // else if block.0[0] % 2 == 0 { (TMStatus::Pass, TMStatusReason::None) }
+                // //else if block.0[0] % 3 == 1 { (TMStatus::Indeterminate, TMStatusReason::None) }
+                // else { (TMStatus::Fail, TMStatusReason::None) }
             })
         })),
         ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, _tender_proposal_sigs| {
@@ -1693,9 +1692,6 @@ async fn instance(
             Box::pin(async move {
             })
         })),
-        ClosureToUpdateRosterCmd(Arc::new(move |_str| { Box::pin(async move {
-            Some(format!("{:?}", pub_key))
-        })})),
         ClosureToUpdatePeers(Arc::new(move |_all_peers| { Box::pin(async move {
         })})),
 
@@ -1717,7 +1713,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          parse_pow_closure: ClosureToParsePow,
                          is_pow_in_chain_closure: ClosureIsPoWInChain,
                          push_pow_closure: ClosureToPushPow,
-                         roster_cmd_closure: ClosureToUpdateRosterCmd,
                          peer_cmd_closure: ClosureToUpdatePeers,
                          ingest_startup_data: Vec<RoundData>,
                         ) -> std::io::Result<()> {
@@ -1777,7 +1772,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         parse_pow_closure,
         is_pow_in_chain_closure,
         push_pow_closure,
-        roster_cmd_closure,
         peer_cmd_closure,
     ); // TODO: double-check this is the right key
 
@@ -1791,8 +1785,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     } else {
         my_endpoint.map(|endpoint| EndpointEvidence { endpoint, root_public_bft_key: my_root_public_bft_key.into() })
     };
-
-    let mut unknown_peers: Vec<Peer> = Vec::new();
 
     const ONE_SECOND: tokio::time::Duration = tokio::time::Duration::from_secs(1);
     let mut net_stats_window_start = tokio::time::Instant::now();
@@ -1808,9 +1800,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         {
             let mut peers = peers.iter().map(|p| p.info()).collect::<Vec<PeerInfo>>();
-            for upeer in &unknown_peers {
-                peers.push(upeer.info());
-            }
             bft_state.update_peers_cmd_closure.0(peers).await;
         }
 
@@ -1929,7 +1918,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             let rand_t = bytes_in_flight as f64 / target_bytes_in_flight as f64;
             if rand::random::<f64>() < rand_t {
                 // if PRINT_PROTOCOL { println!("Dropping packet because of congestion control."); }
-                return;
+                // return;
             }
 
             // println!("Packet: {} bytes", msg.len());
@@ -2052,12 +2041,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         if was_now > next_tick_time {
             loop {
                 // TICK CODE
-                unknown_peers.retain(|peer| {
-                    if peer.watch_dog.elapsed() > TIMEOUT_DURATION {
-                        if PRINT_PROTOCOL { println!("{:05}: Disconnected from unknown peer {:?}", my_port, peer.endpoint); }
-                        false
-                    } else { true }
-                });
                 for peer in &mut peers {
                     if peer.watch_dog.elapsed() > TIMEOUT_DURATION {
                         if peer.snow_state.is_some() {
@@ -2185,9 +2168,9 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                 if peers.iter().position(|p| p.root_public_bft_key == server_a_pub_key).is_none() && server_a_pub_key != my_root_private_key.as_ref() {
                     let (a, b) = goofy_addr_string_to_stuff("45.76.30.90:8234");
                     let evidence = EndpointEvidence { endpoint: b, root_public_bft_key: server_a_pub_key };
-                    roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
-                    roster_endpoint_evidence.push(evidence);
-                    peers.push(Peer { root_public_bft_key: server_a_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
+                    // roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
+                    // roster_endpoint_evidence.push(evidence);
+                    // peers.push(Peer { root_public_bft_key: server_a_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
                 }
 
                 let server_b_pub_key = {
@@ -2205,24 +2188,9 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                 if peers.iter().position(|p| p.root_public_bft_key == server_b_pub_key).is_none() && server_b_pub_key != my_root_private_key.as_ref() {
                     let (a, b) = goofy_addr_string_to_stuff("70.34.201.202:8234");
                     let evidence = EndpointEvidence { endpoint: b, root_public_bft_key: server_b_pub_key };
-                    roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
-                    roster_endpoint_evidence.push(evidence);
-                    peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
-                }
-
-                {
-                    let active_roster = &roster[..active_roster_len(&roster)];
-                    // Drop those who are not in the active roster. And not the backup p2p servers.
-                    peers.retain(|p| p.root_public_bft_key == server_a_pub_key || p.root_public_bft_key == server_b_pub_key || active_roster.iter().position(|rp| rp.pub_key.0 == p.root_public_bft_key).is_some());
-                    for rp in active_roster {
-                        if peers.iter().position(|p| p.root_public_bft_key == rp.pub_key.0).is_none() && rp.pub_key.0 != my_root_private_key.as_ref() {
-                            let mut peer = Peer { root_public_bft_key: rp.pub_key.0, ..Peer::default() };
-                            if let Some(evidence) = roster_endpoint_evidence.iter().find(|evidence| evidence.root_public_bft_key == rp.pub_key.0) {
-                                peer.endpoint = Some(evidence.endpoint);
-                            }
-                            peers.push(peer);
-                        }
-                    }
+                    // roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
+                    // roster_endpoint_evidence.push(evidence);
+                    // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
                 }
 
                 fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer_transport: &mut PeerTransport, peer_endpoint: SecureUdpEndpoint, peer_snow_state: &mut snow::StatelessTransportState, peer_root_public_bft_key: [u8; 32], sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
@@ -2381,10 +2349,6 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                     (PubKeyID(p.root_public_bft_key), p.latest_status.clone(), p.connection_knowledge)
                 ).collect::<Vec<_>>()); }
 
-                if let Some(cmd) = &bft_state.roster_cmd && PRINT_ROSTER_CMD { eprintln!("{ctx_str} recv roster cmd: \"{}\"", cmd); }
-                let roster_cmd = bft_state.update_roster_cmd_closure.0(bft_state.roster_cmd.take()).await;
-                if let Some(cmd) = &roster_cmd && PRINT_ROSTER_CMD { eprintln!("{ctx_str} send roster cmd: \"{}\"", cmd); }
-
                 for peer_i in 0..peers.len() {
                     let peer = &mut peers[peer_i];
                     if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
@@ -2406,18 +2370,11 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                     } else {
                         eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: round_data array was empty", ctx_str);
                     }
-
-                    if let Some(cmd) = &roster_cmd {
-                        let header = PacketHeader::new::<PACKET_TYPE_ROSTER_CMD>(peer.transport.ack_latest, peer.transport.ack_field);
-                        let mut o = write_header_and_maybe_status(header, false, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
-                        o        += cmd.as_bytes().write_to(&mut send_buf1[o..]);
-                        print_packet_tag_send(header);
-                        send_noise_msg(&ctx_str, &mut peer.transport, peer.snow_state.as_mut().unwrap(), &sock, peer.endpoint.unwrap(), &mut send_buf2, &send_buf1[..o], &mut net_stats);
-                    }
                 }
 
-                for peer_i in 0..unknown_peers.len() {
-                    let peer = &mut unknown_peers[peer_i];
+                for peer_i in 0..peers.len() {
+                    if peers[peer_i].root_public_bft_key == [0; 32] { continue; }
+                    let peer = &mut peers[peer_i];
                     if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
                     if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
                         peer.latest_status_request_height = None;
@@ -2426,14 +2383,6 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                     if let Some((hash, chunk_i)) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
                         peer.latest_status_request_powlink = None;
                         powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &sock, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash, chunk_i).await;
-                    }
-
-                    if let Some(cmd) = &roster_cmd {
-                        let header = PacketHeader::new::<PACKET_TYPE_ROSTER_CMD>(peer.transport.ack_latest, peer.transport.ack_field);
-                        let mut o = write_header_and_maybe_status(header, false, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
-                        o        += cmd.as_bytes().write_to(&mut send_buf1[o..]);
-                        print_packet_tag_send(header);
-                        send_noise_msg(&ctx_str, &mut peer.transport, peer.snow_state.as_mut().unwrap(), &sock, peer.endpoint.unwrap(), &mut send_buf2, &send_buf1[..o], &mut net_stats);
                     }
                 }
 
@@ -2539,9 +2488,6 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                 }
             }
         }
-        for peer in &mut unknown_peers {
-            timeout_drop(&mut peer.transport);
-        }
         for peer in &mut peers {
             timeout_drop(&mut peer.transport);
         }
@@ -2562,7 +2508,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
         let from_port = addr.port();
 
         // DECRYPT
-        let mut peer_index = 0;
+        let mut peer_index: Option<usize> = None;
         let mut peer_knowledge = ConnectionKnowledge::Known;
         let mut nonce = 0;
         let mut msg: Option<&[u8]> = None;
@@ -2578,7 +2524,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                     if let Ok(length) = snow_state.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         if nonce_is_ok(nonce, peer.transport.ack_latest, peer.transport.ack_field) {
                             msg        = Some(&recv_buf2[0..length]);
-                            peer_index = i;
+                            peer_index = Some(i);
                         }
                         break;
                     }
@@ -2734,8 +2680,8 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
             }
         } else {
             loop {
-                if let Some(i) = unknown_peers.iter().position(|p| p.endpoint.is_some() && p.endpoint.unwrap().ip_address == from_ip && p.endpoint.unwrap().port == from_port) {
-                    let peer = &mut unknown_peers[i];
+                if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == [0; 32] && p.endpoint.is_some() && p.endpoint.unwrap().ip_address == from_ip && p.endpoint.unwrap().port == from_port) {
+                    let peer = &mut peers[i];
                     nonce = u64::from_le_bytes(raw_msg[..8].try_into().unwrap());
                     if let Ok(length) = peer.snow_state.as_ref().unwrap().read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
                         let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
@@ -2759,7 +2705,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
 
                         if nonce_is_ok(nonce, peer.transport.ack_latest, peer.transport.ack_field) {
                             msg             = Some(&header_and_local_msg);
-                            peer_index      = i;
+                            peer_index      = Some(i);
                             peer_knowledge  = ConnectionKnowledge::Unknown;
                         }
                         break;
@@ -2799,7 +2745,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                             print_packet_tag_send(header);
                             send_sock_msg(&ctx_str, &mut transport, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
                             transport.nonce += 1;
-                            unknown_peers.push(Peer {
+                            peers.push(Peer {
                                 root_public_bft_key: [0; 32],
 
                                 endpoint: Some(client_endpoint),
@@ -2902,47 +2848,53 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
             }
         }
 
-        if peer_knowledge == ConnectionKnowledge::Unknown {
-            let peer = &mut unknown_peers[peer_index];
-            peer.watch_dog = Instant::now();
-            nonce_update(nonce, &mut peer.transport.ack_latest, &mut peer.transport.ack_field);
+        let mut duplicate_peer_identity_to_remove: Option<[u8; 32]> = None;
+        let mut peer_index_to_retain = 0;
 
-            process_acks(&mut peer.transport, header);
+        if let Some(peer_index) = peer_index && peer_knowledge == ConnectionKnowledge::Unknown {
+            let peer_from_which_i_have_received_the_packet = &mut peers[peer_index];
+            peer_from_which_i_have_received_the_packet.watch_dog = Instant::now();
+            nonce_update(nonce, &mut peer_from_which_i_have_received_the_packet.transport.ack_latest, &mut peer_from_which_i_have_received_the_packet.transport.ack_field);
+
+            process_acks(&mut peer_from_which_i_have_received_the_packet.transport, header);
 
             if let Some(status) = status {
-                peer.latest_status_request_height = Some(status.height);
-                peer.latest_status_request_powlink = Some((status.powlink_hash, status.powlink_chunk_i));
+                peer_from_which_i_have_received_the_packet.latest_status_request_height = Some(status.height);
+                peer_from_which_i_have_received_the_packet.latest_status_request_powlink = Some((status.powlink_hash, status.powlink_chunk_i));
             }
 
             match packet_type {
                 PACKET_TYPE_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[read_o..]) {
-                    Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == evidence.root_public_bft_key) {
-                        peers[i].endpoint = Some(evidence.endpoint);
-                        if peer.endpoint == Some(evidence.endpoint) {
-                            if PRINT_PROTOCOL { println!("{:05}: Promoting unknown peer connection {:?}", my_port, peer.endpoint); }
-                            let peer = unknown_peers.remove(peer_index);
-                            peers[i].outgoing_handshake_state      = None;
-                            peers[i].pending_client_ack_snow_state = None;
-                            peers[i].snow_state                    = peer.snow_state;
-                            peers[i].watch_dog                     = Instant::now();
-                            peers[i].transport                     = peer.transport;
-                            peers[i].connection_knowledge          = ConnectionKnowledge::Known;
+
+                    Ok(evidence) => if (&roster[..active_roster_len(&roster)]).iter().position(|m| m.pub_key.0 == evidence.root_public_bft_key).is_some() {
+                        if peer_from_which_i_have_received_the_packet.endpoint == Some(evidence.endpoint) {
+                            if PRINT_PROTOCOL {
+                                println!("{:05}: Promoting unknown peer connection {:?}", my_port, peer_from_which_i_have_received_the_packet.endpoint);
+                            }
+
+                            // Remove the peer with this BFT identity if they were already elsewhere on the list
+                            duplicate_peer_identity_to_remove = Some(evidence.root_public_bft_key);
+                            peer_index_to_retain = peer_index;
+
+                            peer_from_which_i_have_received_the_packet.root_public_bft_key           = evidence.root_public_bft_key;
+                            peer_from_which_i_have_received_the_packet.outgoing_handshake_state      = None;
+                            peer_from_which_i_have_received_the_packet.pending_client_ack_snow_state = None;
+                            peer_from_which_i_have_received_the_packet.watch_dog                     = Instant::now();
+                            peer_from_which_i_have_received_the_packet.connection_knowledge          = ConnectionKnowledge::Known;
                         }
+
                         roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
                         roster_endpoint_evidence.push(evidence);
                     }
+
                     Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
-                },
-                PACKET_TYPE_ROSTER_CMD => if msg[read_o..].len() > 0 {
-                    if let Ok(cmd) = String::from_utf8(msg[read_o..].to_vec()) { bft_state.roster_cmd = Some(cmd); }
                 },
                 PACKET_TYPE_EMPTY => (),
                 _ => (), //println!("{:05}:  From unknown peer!   field={:016X} packet_type=0x{:X} Got '{:?}' from {}", my_port, peer.transport.ack_field, packet_type, msg, addr),
             }
-            continue;
         }
 
-        else {
+        else if let Some(peer_index) = peer_index && peer_knowledge == ConnectionKnowledge::Known {
             let peer = &mut peers[peer_index];
             peer.watch_dog = Instant::now();
             nonce_update(nonce, &mut peer.transport.ack_latest, &mut peer.transport.ack_field);
@@ -3013,13 +2965,28 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                     Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_tag(packet_type), err),
                 }
 
-                PACKET_TYPE_ROSTER_CMD => if msg[read_o..].len() > 0 {
-                    if let Ok(cmd) = String::from_utf8(msg[read_o..].to_vec()) { bft_state.roster_cmd = Some(cmd); }
-                },
                 PACKET_TYPE_EMPTY => {}
                 _ => {} // println!("{}:  From known peer!   field={:016X} Got '{:?}' from {}", my_port, peer.transport.ack_field, msg, addr);
             }
-            continue;
+        }
+
+        if let Some(bft_key) = duplicate_peer_identity_to_remove {
+            let mut peer_to_remove_i: Option<usize> = None;
+
+            for i in 0..peers.len() {
+                if i == peer_index_to_retain {
+                    continue;
+                }
+
+                if peers[i].root_public_bft_key == bft_key {
+                    peer_to_remove_i = Some(i);
+                    break;
+                }
+            }
+
+            if let Some(i) = peer_to_remove_i {
+                peers.remove(i);
+            }
         }
     }
 }
@@ -3037,9 +3004,8 @@ const PACKET_TYPE_PROPOSAL_CHUNK:       u8 =  7;
 const PACKET_TYPE_PREVOTE_SIGNATURES:   u8 =  8;
 const PACKET_TYPE_PRECOMMIT_SIGNATURES: u8 =  9;
 // misc
-const PACKET_TYPE_ROSTER_CMD:           u8 = 10;
-const PACKET_TYPE_POWLINK_CHUNK:        u8 = 11;
-const PACKET_TYPE_COUNT:                u8 = 12;
+const PACKET_TYPE_POWLINK_CHUNK:        u8 = 10;
+const PACKET_TYPE_COUNT:                u8 = 11;
 
 
 const PACKET_TYPE_BITS:                 u8 =  7;
@@ -3064,9 +3030,8 @@ const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     names[PACKET_TYPE_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",           "STATUS+PROPOSAL_CHUNK"];
     names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES",     "STATUS+PRECOMMIT_SIGNATURES"];
-    names[PACKET_TYPE_ROSTER_CMD           as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_POWLINK_CHUNK        as usize] = ["PACKET_TYPE_POWLINK_CHUNK","STATUS+PACKET_TYPE_POWLINK_CHUNK"];
-    const_assert!(PACKET_TYPE_COUNT == 12); // keep names array updated when adding other tags
+    const_assert!(PACKET_TYPE_COUNT == 11); // keep names array updated when adding other tags
     names
 };
 fn packet_name_from_tag(packet_tag: u8) -> &'static str {
