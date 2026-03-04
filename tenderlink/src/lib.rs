@@ -8,7 +8,7 @@ const PRINT_PROTOCOL:       bool = 1 == 1;
 const PRINT_PROTOCOL_TAG:   bool = 0 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
 const PRINT_NETWORK_STATS:  bool = 1 == 1;
-const PRINT_PEERS:          bool = 0 == 1;
+const PRINT_PEERS:          bool = 1 == 1;
 const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
@@ -1395,7 +1395,7 @@ impl Default for Peer {
             watch_dog: Instant::now(),
             transport: PeerTransport::default(),
 
-            connection_knowledge: ConnectionKnowledge::Known,
+            connection_knowledge: ConnectionKnowledge::Unknown,
             latest_status_request_height: None,
             latest_status_request_powlink: None,
             latest_status: None,
@@ -1749,12 +1749,27 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let my_port = sock.local_addr().unwrap().port();
 
-    let mut peers : Vec<Peer> = roster.iter().filter(|m| m.pub_key.0 != my_root_public_bft_key.as_ref())
-        .map(|m| Peer { root_public_bft_key: m.pub_key.0, ..Peer::default() }).collect();
+    let mut peers : Vec<Peer> = Vec::new();
 
     for evidence in &roster_endpoint_evidence {
-        if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == evidence.root_public_bft_key) {
-            peers[i].endpoint = Some(evidence.endpoint);
+
+        let (root_public_bft_key, endpoint) = (evidence.root_public_bft_key, Some(evidence.endpoint));
+
+        // skip myself
+        if root_public_bft_key == my_root_public_bft_key.as_ref() {
+            continue;
+        }
+
+        // add this key as a peer if not already present and also in the active roster
+        if (&roster[..active_roster_len(&roster)]).iter().position(|m| m.pub_key.0           == root_public_bft_key).is_some()
+                                          && peers.iter().position(|p| p.root_public_bft_key == root_public_bft_key).is_none() {
+            peers.push(Peer {
+                root_public_bft_key,
+                endpoint,
+                pending_client_ack: true,
+                connection_knowledge: ConnectionKnowledge::Unknown,
+                ..Peer::default()
+            });
         }
     }
     if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>()); }
@@ -2067,14 +2082,14 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                             }
                         }
+
                         let header = PacketHeader::new::<PACKET_TYPE_EMPTY>(peer.transport.ack_latest, peer.transport.ack_field);
                         let mut o  = 0;
                         o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
                         print_packet_tag_send(header);
                         send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                     }
-                }
-                for peer in &mut peers {
+
                     if let Some(peer_endpoint) = peer.endpoint {
                         if peer.snow_state.is_none() && peer.outgoing_handshake_state.is_none() && peer.pending_client_ack_snow_state.is_none() {
                             let mut outgoing_state: snow::HandshakeState = snow::Builder::new(noise_params.clone())
@@ -2192,6 +2207,13 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                     // roster_endpoint_evidence.push(evidence);
                     // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
                 }
+
+                peers.retain(|p| {
+                    let active_roster = &roster[..active_roster_len(&roster)];
+                    let in_roster = active_roster.iter().position(|rp| rp.pub_key.0 == p.root_public_bft_key).is_some();
+                    let connected = p.snow_state.is_some();
+                    in_roster || connected
+                });
 
                 fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer_transport: &mut PeerTransport, peer_endpoint: SecureUdpEndpoint, peer_snow_state: &mut snow::StatelessTransportState, peer_root_public_bft_key: [u8; 32], sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
                     let height = round_data.height;
@@ -2852,6 +2874,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
         let mut peer_index_to_retain = 0;
 
         if let Some(peer_index) = peer_index && peer_knowledge == ConnectionKnowledge::Unknown {
+        {
             let peer_from_which_i_have_received_the_packet = &mut peers[peer_index];
             peer_from_which_i_have_received_the_packet.watch_dog = Instant::now();
             nonce_update(nonce, &mut peer_from_which_i_have_received_the_packet.transport.ack_latest, &mut peer_from_which_i_have_received_the_packet.transport.ack_field);
@@ -2862,29 +2885,35 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                 peer_from_which_i_have_received_the_packet.latest_status_request_height = Some(status.height);
                 peer_from_which_i_have_received_the_packet.latest_status_request_powlink = Some((status.powlink_hash, status.powlink_chunk_i));
             }
-
+        }
             match packet_type {
                 PACKET_TYPE_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[read_o..]) {
 
-                    Ok(evidence) => if (&roster[..active_roster_len(&roster)]).iter().position(|m| m.pub_key.0 == evidence.root_public_bft_key).is_some() {
-                        if peer_from_which_i_have_received_the_packet.endpoint == Some(evidence.endpoint) {
-                            if PRINT_PROTOCOL {
-                                println!("{:05}: Promoting unknown peer connection {:?}", my_port, peer_from_which_i_have_received_the_packet.endpoint);
+                    Ok(evidence) => {
+                        if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == evidence.root_public_bft_key) {
+                            peers[i].endpoint = Some(evidence.endpoint);
+                        }
+                        if (&roster[..active_roster_len(&roster)]).iter().position(|m| m.pub_key.0 == evidence.root_public_bft_key).is_some() {
+                            if peers[peer_index].endpoint == Some(evidence.endpoint) {
+                                let peer_from_which_i_have_received_the_packet = &mut peers[peer_index];
+                                if PRINT_PROTOCOL {
+                                    println!("{:05}: Promoting unknown peer connection {:?}", my_port, peer_from_which_i_have_received_the_packet.endpoint);
+                                }
+
+                                // Remove the peer with this BFT identity if they were already elsewhere on the list
+                                duplicate_peer_identity_to_remove = Some(evidence.root_public_bft_key);
+                                peer_index_to_retain = peer_index;
+
+                                peer_from_which_i_have_received_the_packet.root_public_bft_key           = evidence.root_public_bft_key;
+                                peer_from_which_i_have_received_the_packet.outgoing_handshake_state      = None;
+                                peer_from_which_i_have_received_the_packet.pending_client_ack_snow_state = None;
+                                peer_from_which_i_have_received_the_packet.watch_dog                     = Instant::now();
+                                peer_from_which_i_have_received_the_packet.connection_knowledge          = ConnectionKnowledge::Known;
                             }
 
-                            // Remove the peer with this BFT identity if they were already elsewhere on the list
-                            duplicate_peer_identity_to_remove = Some(evidence.root_public_bft_key);
-                            peer_index_to_retain = peer_index;
-
-                            peer_from_which_i_have_received_the_packet.root_public_bft_key           = evidence.root_public_bft_key;
-                            peer_from_which_i_have_received_the_packet.outgoing_handshake_state      = None;
-                            peer_from_which_i_have_received_the_packet.pending_client_ack_snow_state = None;
-                            peer_from_which_i_have_received_the_packet.watch_dog                     = Instant::now();
-                            peer_from_which_i_have_received_the_packet.connection_knowledge          = ConnectionKnowledge::Known;
+                            roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
+                            roster_endpoint_evidence.push(evidence);
                         }
-
-                        roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
-                        roster_endpoint_evidence.push(evidence);
                     }
 
                     Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
@@ -2916,10 +2945,14 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
             const_assert!(PACKET_TYPE_PREVOTE_SIGNATURES + 1 == PACKET_TYPE_PRECOMMIT_SIGNATURES);
             match packet_type {
                 PACKET_TYPE_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[read_o..]) {
-                    Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == evidence.root_public_bft_key) {
-                        peers[i].endpoint = Some(evidence.endpoint);
-                        roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
-                        roster_endpoint_evidence.push(evidence);
+                    Ok(evidence) => {
+                        if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == evidence.root_public_bft_key) {
+                            peers[i].endpoint = Some(evidence.endpoint);
+                        }
+                        if (&roster[..active_roster_len(&roster)]).iter().position(|m| m.pub_key.0 == evidence.root_public_bft_key).is_some() {
+                            roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
+                            roster_endpoint_evidence.push(evidence);
+                        }
                     }
                     Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
                 }
