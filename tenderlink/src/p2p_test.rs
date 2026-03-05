@@ -47,15 +47,33 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
     loop {
         let now = monotonic_clock_ns();
 
-        // Send HELLO to all peers every second.
+        let peer_addresses_list: Vec<IpAddress> = (&peers[0..peers.len().min(64)]).iter().map(|p| p.address).collect(); // 1153 byte packet (1 byte header + 64 * 18 byte addresses)
+
         for peer in &mut peers {
             if (now - peer.send_time) > 500_000_000 {
+
+                // Send HELLO to all peers.
                 let (mut buf, mut o) = ([0u8; 2048], 0);
                 o += PACKET_TYPE_HELLO.write_to(&mut buf[o..]);
 
                 // println!("Sending HELLO to: {:?}.", peer.address);
 
                 peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+
+                // Send PEER_LIST to all connected peers.
+                if peer.state == PeerState::Connected {
+                    let (mut buf, mut o) = ([0u8; 2048], 0);
+                    o += PACKET_TYPE_PEER_LIST.write_to(&mut buf[o..]);
+
+                    for address in &peer_addresses_list {
+                        o += address.0.octets().write_to(&mut buf[o..]);
+                        o += address.1         .write_to(&mut buf[o..]);
+                    }
+
+                    println!("Sending PEER_LIST to: {:?}.", peer.address);
+
+                    peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+                }
             }
         }
 
