@@ -3511,6 +3511,7 @@ pub fn run_instances(i: usize) {
 }
 
 pub mod bandwidth_test;
+pub mod p2p_test;
 
 #[cfg(test)]
 mod tests {
