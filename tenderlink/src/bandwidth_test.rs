@@ -23,13 +23,15 @@ fn handshake_test() {
     let kp3 = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
     
     let _handle = std::thread::spawn(|| {
-        do_the_test_program2(32845, kp1, None);
+        let mut kp1_but_plaintext = kp1.clone();
+        kp1_but_plaintext.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
+        do_the_test_program2(32845, kp1.clone(), vec![kp1, kp1_but_plaintext], None);
     });
     std::thread::sleep(std::time::Duration::from_millis(100));
     let _handle = std::thread::spawn(|| {
-        do_the_test_program2(29854, kp2, Some((Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_PLAIN_TEXT, kp1_pub)));
+        do_the_test_program2(29854, kp2.clone(), vec![kp2], Some((Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_PLAIN_TEXT, kp1_pub)));
     });
-    do_the_test_program2(29853, kp3, Some((Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, kp1_pub2)));
+    do_the_test_program2(29853, kp3.clone(), vec![kp3], Some((Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, kp1_pub2)));
 }
 
 const ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE: usize = 15972;
@@ -70,42 +72,38 @@ pub struct IdentityKeyPair {
     pub public: Vec<u8>,
 }
 
-pub fn do_the_test_program2(my_port: u16, my_keypair: IdentityKeyPair, beam_to: Option<(Ipv6Addr, u16, u64, Vec<u8>)>) {
+pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, my_listen_keypairs: Vec<IdentityKeyPair>, beam_to: Option<(Ipv6Addr, u16, u64, Vec<u8>)>) {
     let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
     let mut packet_memory_recv = new_packet_memory(); // Incoming Decrypted
     let mut packet_memory_send = new_packet_memory(); // Outgoing Decrypted
     
     let socket = setup_and_bind_udp_socket(my_port);
     if let Some(beam_to) = beam_to {
-        assert!(my_keypair.magic1 == beam_to.2);
-    
-        let mut virtual_header = [0u8; 16+16+2+2];
-        // virtual_header[0..16].copy_from_slice(&source_ip.octets()); // TODO
-        virtual_header[16..32].copy_from_slice(&beam_to.0.octets());
-        virtual_header[32..34].copy_from_slice(&my_port.to_be_bytes());
-        virtual_header[34..36].copy_from_slice(&beam_to.1.to_be_bytes());
+        assert!(my_connect_keypair.magic1 == beam_to.2);
         
         // TODO list of supported Application Level protocols for e.g. zcash network upgrades.
+        // packet_memory_send
+        let list_of_protocols_len_bytes = 0;
     
-        store_u48(&mut packet_memory_encrypted[0..6], my_keypair.magic1);
+        store_u48(&mut packet_memory_encrypted[0..6], my_connect_keypair.magic1);
         
-        if my_keypair.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-            let handshake_size = virtual_header.len();
-            packet_memory_encrypted[6..6+handshake_size].copy_from_slice(&virtual_header[..]);
-            
-            udp_send_with_congestion_and_dscp(socket, beam_to.0, beam_to.1, &packet_memory_encrypted[0..6+handshake_size], Dscp::BestEffort);
-            // TODO add connection to tracking
+        if my_connect_keypair.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
+            assert_eq!(my_connect_keypair.public.len(), 32);
+            packet_memory_encrypted[6..6+32].copy_from_slice(&my_connect_keypair.public[..]);
+            packet_memory_encrypted[6+32..6+32+list_of_protocols_len_bytes].copy_from_slice(&packet_memory_send[0..list_of_protocols_len_bytes]);
+            udp_send_with_congestion_and_dscp(socket, beam_to.0, beam_to.1, &packet_memory_encrypted[0..6+32+list_of_protocols_len_bytes], Dscp::Af21);
+            // TODO add connection to tracking -- Tracking must include continued handshake state. It does not imply a finished connection. And we have to handle two people connecting to each other gracefully for the hole punch. Tracking state is a hash table where the key is (ip_addr, port, first 15 bits of the identity key)
         }
         else {
-            let mut handshake = snow::Builder::new(noise_string_from_connect_magic1(my_keypair.magic1).unwrap().parse().unwrap())
+            let mut handshake = snow::Builder::new(noise_string_from_connect_magic1(my_connect_keypair.magic1).unwrap().parse().unwrap())
                 .prologue(&packet_memory_encrypted[0..6]).unwrap()
-                .local_private_key(&my_keypair.private[..]).unwrap()
+                .local_private_key(&my_connect_keypair.private[..]).unwrap()
                 .remote_public_key(&beam_to.3[..]).unwrap()
                 .build_initiator().unwrap();
-            let handshake_size = handshake.write_message(&virtual_header[..], &mut packet_memory_encrypted[6..]).unwrap();
+            let handshake_size = handshake.write_message(&packet_memory_send[0..list_of_protocols_len_bytes], &mut packet_memory_encrypted[6..]).unwrap();
             
-            udp_send_with_congestion_and_dscp(socket, beam_to.0, beam_to.1, &packet_memory_encrypted[0..6+handshake_size], Dscp::BestEffort);
-            // TODO add connection to tracking
+            udp_send_with_congestion_and_dscp(socket, beam_to.0, beam_to.1, &packet_memory_encrypted[0..6+handshake_size], Dscp::Af21);
+            // TODO add connection to tracking -- Tracking must include continued handshake state. It does not imply a finished connection. And we have to handle two people connecting to each other gracefully for the hole punch. Tracking state is a hash table where the key is (ip_addr, port, first 15 bits of the identity key)
         }
     }
     
@@ -114,8 +112,39 @@ pub fn do_the_test_program2(my_port: u16, my_keypair: IdentityKeyPair, beam_to: 
             if buf_len >= 6 {
                 let magic1 = load_u48(&packet_memory_encrypted[0..6]);
                 if magic1 & 1 != 0 { // Client Hello
-                    if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
+                
+                    if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
+                        println!("incoming plaintext");
+                        if buf_len >= 6 + 32 {
+                            let client_key = &packet_memory_encrypted[6..6+32];
+                            let list_of_protocols_len_bytes = buf_len - 6 - 32;
+                            assert_eq!(list_of_protocols_len_bytes, 0); // temp
+                            // TODO list of supported Application Level protocols for e.g. zcash network upgrades.
+                            println!("plaintext success with {:?}", client_key);
+                            
+                            // TODO add connection to tracking -- Tracking must include continued handshake state. It does not imply a finished connection. And we have to handle two people connecting to each other gracefully for the hole punch. Tracking state is a hash table where the key is (ip_addr, port, first 15 bits of the identity key)
+                        }
+                    }
+                    else if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
                         println!("incoming {}", noise_string);
+                        for key_i in 0..my_listen_keypairs.len() {
+                            let my_kp = &my_listen_keypairs[key_i];
+                            if my_kp.magic1 == magic1 {
+                                let mut handshake = snow::Builder::new(noise_string.parse().unwrap())
+                                    .prologue(&packet_memory_encrypted[0..6]).unwrap()
+                                    .local_private_key(&my_kp.private).unwrap()
+                                    .build_responder().unwrap();
+                                if let Ok(list_of_protocols_len_bytes) = handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
+                                    if let Some(client_key) = handshake.get_remote_static() {
+                                        assert_eq!(list_of_protocols_len_bytes, 0); // temp
+                                        // TODO list of supported Application Level protocols for e.g. zcash network upgrades.
+                                        println!("success with {:?}", client_key);
+                                        
+                                        // TODO add connection to tracking -- Tracking must include continued handshake state. It does not imply a finished connection. And we have to handle two people connecting to each other gracefully for the hole punch. Tracking state is a hash table where the key is (ip_addr, port, first 15 bits of the identity key)
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
