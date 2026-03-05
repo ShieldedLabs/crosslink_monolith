@@ -1162,21 +1162,6 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     (tfl_handle7.call.force_feed_pow)(block.clone()).await;
                 })
             })),
-            tenderlink::ClosureToUpdateRosterCmd(Arc::new(move |str| {
-                let tfl_handle = tfl_handle4.clone();
-                Box::pin(async move {
-                    let mut internal = tfl_handle.internal.lock().await;
-                    // ours overrides
-                    if internal.our_set_bft_string.is_some() {
-                        internal.our_set_bft_string.take()
-                    } else {
-                        if let Some(str) = str {
-                            internal.active_bft_string = Some(str)
-                        }
-                        None
-                    }
-                })
-            })),
             tenderlink::ClosureToUpdatePeers(Arc::new(move |all_peers| {
                 let tfl_handle = tfl_handle8.clone();
                 Box::pin(async move {
@@ -1187,7 +1172,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                         internal.peer_strings.push(format!("{} {} ({}) - ({}, {})",
                             if let Some(pubkey) = peer.root_public_bft_key { tenderlink::PubKeyID(pubkey).to_string() } else { "unknown peer".to_string() },
                             if peer.connected { "connected" } else { "disconnected" },
-                            if peer.connection_is_unknown { "unknown" } else { "known" },
+                            if peer.connection_knowledge == tenderlink::ConnectionKnowledge::Unknown { "unknown" } else { "known" },
                             peer.latest_status_request_height,
                             peer.latest_status_request_powlink_id
                         ));
