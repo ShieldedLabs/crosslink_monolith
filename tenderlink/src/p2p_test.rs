@@ -42,7 +42,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
     let rng = rand_chacha::ChaCha20Rng::seed_from_u64(monotonic_clock_ns());
 
-    let mut peers: Vec<Peer> = peer_addresses.iter().map(|address| Peer { address: *address, ..Peer::default() }).collect();
+    let mut peers: Vec<Peer> = peer_addresses.iter().map(|address| Peer { address: *address, recv_time: monotonic_clock_ns(), ..Peer::default() }).collect();
 
     loop {
         let now = monotonic_clock_ns();
@@ -60,12 +60,19 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
         }
 
         // Timeout peers.
-        for peer in &peers {
-            if (now - peer.recv_time) >= 5_000_000_000 {
-                println!("Disconnected from: {:?}.", peer.address);
+        peers.retain(|p| {
+            let timeout = (now - p.recv_time) >= 5_000_000_000;
+
+            let is_a_seeder = peer_addresses.iter().any(|address| p.address == *address);
+
+            let should_keep = !timeout || is_a_seeder;
+
+            if !should_keep {
+                println!("Disconnected from: {:?}.", p.address);
             }
-        }
-        peers.retain(|p| (now - p.recv_time) < 5_000_000_000 || peer_addresses.iter().any(|address| p.address == *address));
+
+            should_keep
+        });
 
         // Receive
         loop {
@@ -108,9 +115,12 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 }
                 peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
             } else if buf[0] == PACKET_TYPE_HELLO_ACK {
-                peer.state = PeerState::Connected;
 
-                println!("Connected to: {:?}.", peer.address);
+                if peer.state == PeerState::Punching {
+                    peer.state = PeerState::Connected;
+                    println!("Connected to: {:?}.", peer.address);
+                }
+
             }
         }
 
