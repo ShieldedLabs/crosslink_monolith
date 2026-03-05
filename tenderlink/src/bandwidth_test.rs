@@ -124,7 +124,8 @@ pub fn do_the_test_program2(my_port: u16, my_keypair: IdentityKeyPair, beam_to: 
 }
 
 pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
-    
+    monotonic_clock_setup();
+
     let mut time_of_last_status_print = std::time::Instant::now();
     let mut ecn_up = false;
     let mut ecn_down = false;
@@ -537,7 +538,9 @@ pub use linux::*;
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    
+
+    pub fn monotonic_clock_setup() {}
+
     #[inline]
     pub fn monotonic_clock_ns() -> u64 {
         unsafe {
@@ -977,12 +980,30 @@ pub use windows::*;
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
-    
+
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn QueryPerformanceCounter(counter:     *mut i64) -> i32;
+        fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
+    }
+
+    static mut QPC_INV_FREQ_SCALE: u128 = 0;
+
+    pub fn monotonic_clock_setup() {
+        unsafe {
+            let mut freq: i64 = 0; QueryPerformanceFrequency(&mut freq);
+            QPC_INV_FREQ_SCALE = ((1_000_000_000u128 << 64) / freq as u128);
+        }
+    }
+
     #[inline]
     pub fn monotonic_clock_ns() -> u64 {
-        panic!("Not implemented");
+        unsafe {
+            let mut counter: i64 = 0; QueryPerformanceCounter(&mut counter);
+            ((counter as u128 * QPC_INV_FREQ_SCALE) >> 64) as u64
+        }
     }
-    
+
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     pub struct SockHandle(u64);
     
@@ -1011,6 +1032,8 @@ pub use macos::*;
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
+
+    pub fn monotonic_clock_setup() {}
 
     #[inline]
     pub fn monotonic_clock_ns() -> u64 {
