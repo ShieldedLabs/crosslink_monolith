@@ -56,16 +56,14 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
         for peer in &mut peers {
             if (now - peer.send_time) > 500_000_000 {
 
-                // Send HELLO to all peers.
-                let (mut buf, mut o) = ([0u8; 2048], 0);
-                o += PACKET_TYPE_HELLO.write_to(&mut buf[o..]);
+                if peer.state == PeerState::Punching {
+                    // Send HELLO punch hole with peers.
+                    let (mut buf, mut o) = ([0u8; 2048], 0);
+                    o += PACKET_TYPE_HELLO.write_to(&mut buf[o..]);
 
-                // println!("Sending HELLO to: {:?}.", peer.address);
-
-                peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
-
-                // Send PEER_LIST to all connected peers.
-                if peer.state == PeerState::Connected {
+                    peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+                } else if peer.state == PeerState::Connected {
+                    // Send PEER_LIST to all connected peers.
                     let (mut buf, mut o) = ([0u8; 2048], 0);
                     o += PACKET_TYPE_PEER_LIST.write_to(&mut buf[o..]);
 
@@ -134,17 +132,12 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 let (mut buf, mut o) = ([0u8; 2048], 0);
                 o += PACKET_TYPE_HELLO_ACK.write_to(&mut buf[o..]);
 
-                if let Ok(when) = udp_send_with_congestion_and_dscp(socket, address.0, address.1, &buf[..o], Dscp::BestEffort) {
-                    peer.send_time = when;
-                }
                 peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
             } else if buf[0] == PACKET_TYPE_HELLO_ACK {
-
                 if peer.state == PeerState::Punching {
                     peer.state = PeerState::Connected;
                     println!("Connected to: {:?}.", peer.address);
                 }
-
             } else if peer.state == PeerState::Connected {
                 if buf[0] == PACKET_TYPE_PEER_LIST {
                     let buf = &buf[1..];
