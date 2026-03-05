@@ -70,7 +70,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                         o += address.1         .write_to(&mut buf[o..]);
                     }
 
-                    println!("Sending PEER_LIST to: {:?}.", peer.address);
+                    // println!("Sending PEER_LIST to: {:?}.", peer.address);
 
                     peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
                 }
