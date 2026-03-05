@@ -12,6 +12,117 @@ fn bwdth_test() {
     do_the_test_program(29453, Some((Ipv6Addr::LOCALHOST, 32345)));
 }
 
+#[test]
+fn handshake_test() {
+    println!("Begin the test!");
+    
+    let kp1 = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+    let kp1_pub = kp1.public.clone();
+    let kp1_pub2 = kp1.public.clone();
+    let kp2 = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
+    let kp3 = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+    
+    let _handle = std::thread::spawn(|| {
+        do_the_test_program2(32845, kp1, None);
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _handle = std::thread::spawn(|| {
+        do_the_test_program2(29854, kp2, Some((Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_PLAIN_TEXT, kp1_pub)));
+    });
+    do_the_test_program2(29853, kp3, Some((Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, kp1_pub2)));
+}
+
+const ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE: usize = 15972;
+const ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY: usize = 1200;
+
+type PacketMemory = Box<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE]>;
+// Note(Sam): We will be reusing this memory across packets so we already do not have memory safety with regards to contents.
+fn new_packet_memory() -> PacketMemory { unsafe { Box::<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE]>::new_uninit().assume_init() } }
+
+// LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
+const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s: u64 = 0x7193_c304_f8d5;
+const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b: u64 = 0xbe53_b364_1ce1;
+const CONNECT_MAGIC1_PLAIN_TEXT: u64 = 0x5bb2_2856_ae53;
+fn noise_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
+    match magic {
+        CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s => Some("Noise_IK_25519_ChaChaPoly_BLAKE2s"),
+        CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b => Some("Noise_IK_25519_ChaChaPoly_BLAKE2b"),
+        CONNECT_MAGIC1_PLAIN_TEXT => Some("plaintext"),
+        _ => None,
+    }
+}
+
+fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
+    if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
+        let mut ret = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+        ret.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
+        return Some(ret);
+    }
+    if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
+        let kp = snow::Builder::new(noise_string.parse().unwrap()).generate_keypair().unwrap();
+        Some(IdentityKeyPair { magic1, private: kp.private, public: kp.public })
+    } else { None }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct IdentityKeyPair {
+    pub magic1: u64,
+    pub private: Vec<u8>,
+    pub public: Vec<u8>,
+}
+
+pub fn do_the_test_program2(my_port: u16, my_keypair: IdentityKeyPair, beam_to: Option<(Ipv6Addr, u16, u64, Vec<u8>)>) {
+    let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
+    let mut packet_memory_recv = new_packet_memory(); // Incoming Decrypted
+    let mut packet_memory_send = new_packet_memory(); // Outgoing Decrypted
+    
+    let socket = setup_and_bind_udp_socket(my_port);
+    if let Some(beam_to) = beam_to {
+        assert!(my_keypair.magic1 == beam_to.2);
+    
+        let mut virtual_header = [0u8; 16+16+2+2];
+        // virtual_header[0..16].copy_from_slice(&source_ip.octets()); // TODO
+        virtual_header[16..32].copy_from_slice(&beam_to.0.octets());
+        virtual_header[32..34].copy_from_slice(&my_port.to_be_bytes());
+        virtual_header[34..36].copy_from_slice(&beam_to.1.to_be_bytes());
+        
+        // TODO list of supported Application Level protocols for e.g. zcash network upgrades.
+    
+        store_u48(&mut packet_memory_encrypted[0..6], my_keypair.magic1);
+        
+        if my_keypair.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
+            let handshake_size = virtual_header.len();
+            packet_memory_encrypted[6..6+handshake_size].copy_from_slice(&virtual_header[..]);
+            
+            udp_send_with_congestion_and_dscp(socket, beam_to.0, beam_to.1, &packet_memory_encrypted[0..6+handshake_size], Dscp::BestEffort);
+            // TODO add connection to tracking
+        }
+        else {
+            let mut handshake = snow::Builder::new(noise_string_from_connect_magic1(my_keypair.magic1).unwrap().parse().unwrap())
+                .prologue(&packet_memory_encrypted[0..6]).unwrap()
+                .local_private_key(&my_keypair.private[..]).unwrap()
+                .remote_public_key(&beam_to.3[..]).unwrap()
+                .build_initiator().unwrap();
+            let handshake_size = handshake.write_message(&virtual_header[..], &mut packet_memory_encrypted[6..]).unwrap();
+            
+            udp_send_with_congestion_and_dscp(socket, beam_to.0, beam_to.1, &packet_memory_encrypted[0..6+handshake_size], Dscp::BestEffort);
+            // TODO add connection to tracking
+        }
+    }
+    
+    loop {
+        if let Ok((buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns)) = udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
+            if buf_len >= 6 {
+                let magic1 = load_u48(&packet_memory_encrypted[0..6]);
+                if magic1 & 1 != 0 { // Client Hello
+                    if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
+                        println!("incoming {}", noise_string);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
     
     let mut time_of_last_status_print = std::time::Instant::now();
@@ -393,6 +504,19 @@ pub fn store_u64(buf: &mut [u8], value: u64) {
 pub fn load_u64(buf: &[u8]) -> u64 {
     assert!(buf.len() == 8);
     u64::from_le_bytes(buf[..8].try_into().unwrap())
+}
+#[inline]
+pub fn store_u48(buf: &mut [u8], value: u64) {
+    assert!(buf.len() == 6);
+    buf.copy_from_slice(&value.to_le_bytes()[..6]);
+}
+#[inline]
+pub fn load_u48(buf: &[u8]) -> u64 {
+    assert!(buf.len() == 6);
+
+    let mut tmp = [0u8; 8];
+    tmp[..6].copy_from_slice(buf);
+    u64::from_le_bytes(tmp)
 }
 #[inline]
 pub fn store_u24(buf: &mut [u8], value: u32) {
@@ -994,7 +1118,6 @@ mod macos {
         SockHandle(fd)
     }
 
-    /// macOS-only:
     /// SEND one UDP packet to (dst_ip6, dst_port) on a dual-stack IPv6 socket.
     ///
     /// - Sets SO_NET_SERVICE_TYPE based on DSCP (inlined mapping).
@@ -1103,7 +1226,6 @@ mod macos {
         }
     }
 
-    /// macOS-only:
     /// RECV one UDP packet, returning:
     /// (len, src_ip6, src_port, congested, ecn_enabled, dscp, timestamp_ns)
     ///
