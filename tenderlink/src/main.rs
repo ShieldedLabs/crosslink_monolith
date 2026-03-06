@@ -17,15 +17,18 @@ fn main() {
             return;
         }
     }
+
+    const P2P_PORT: u16 = 18234;
+
     if args.len() > 1 {
         if args[1] == "p2p" {
-            let port : u16 = args.get(2).map(|a| a.parse().unwrap()).unwrap_or(0);
+            let port : u16 = args.get(2).map(|a| a.parse().unwrap()).unwrap_or(P2P_PORT);
             tenderlink::p2p_test::p2p(port, vec![]);
             return;
         }
     }
 
-    let peers = vec![tenderlink::p2p_test::IpAddress("0000:0000:0000:0000:0000:ffff:4622:f29b".parse().unwrap(), 18234)]; // @Temporary
+    let peers = vec![tenderlink::p2p_test::IpAddress("0000:0000:0000:0000:0000:ffff:4622:f29b".parse().unwrap(), P2P_PORT)]; // @Temporary
     if args.len() == 1 {
         tenderlink::p2p_test::p2p(0, peers);
         return;

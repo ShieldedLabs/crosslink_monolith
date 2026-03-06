@@ -6,6 +6,11 @@ use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
+use std::io;
+
+const PRINT_PEER_LIST :bool=0!= (0);
+const PRINT_HELLO     :bool=0!= (0);
+
 
 const MAX_MTU: usize = 15972;
 const MIN_MTU: usize =  1232;
@@ -13,6 +18,12 @@ const MIN_MTU: usize =  1232;
 const PACKET_TYPE_HELLO:     u8 = 0;
 const PACKET_TYPE_HELLO_ACK: u8 = 1;
 const PACKET_TYPE_PEER_LIST: u8 = 2;
+const PACKET_TYPE_CHAT:      u8 = 3;
+
+use std::sync::mpsc;
+use std::thread;
+use std::io::BufRead;
+
 
 trait SliceWrite          { fn write_to(&self, buf: &mut [u8]) -> usize; }
 impl  SliceWrite for u128 { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..16].copy_from_slice(&u128::to_le_bytes(*self)); 16 } }
@@ -54,6 +65,23 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
     let mut peers: Vec<Peer> = peer_addresses.iter().map(|address| Peer { address: *address, recv_time: monotonic_clock_ns(), ..Peer::default() }).collect();
 
+    println!("Choose a name (max 64 bytes): ");
+    let mut name = String::new();
+    io::stdin().read_line(&mut name).unwrap();
+    name.truncate(64);
+    name = name.trim().to_string(); // strip trailing newline
+
+    let (stdin_tx, stdin_rx) = mpsc::channel::<String>();
+
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            if let Ok(line) = line {
+                if stdin_tx.send(line).is_err() { break; }
+            }
+        }
+    });
+
     loop {
         let now = monotonic_clock_ns();
 
@@ -73,7 +101,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     o += PACKET_TYPE_HELLO.write_to(&mut buf[o..]);
                     o += node_id          .write_to(&mut buf[o..]);
 
-                    // println!("Sending HELLO to: {:?}.", peer.address);
+                    if PRINT_HELLO { println!("Sending HELLO to: {:?}.", peer.address); }
 
                     peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
                 } else if peer.state == PeerState::Connected {
@@ -89,6 +117,24 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                     // println!("Sending PEER_LIST to: {:?}. It contains {} addresses.", peer.address, peer_addresses_list.len());
 
+                    peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+                }
+            }
+        }
+
+        let mut chat_line = stdin_rx.try_recv();
+        if let Ok(ref mut line) = chat_line && line.len() > 0 {
+            line.truncate(1024);
+
+            // Send CHAT to all connected peers.
+            let (mut buf, mut o) = ([0u8; 2048], 0);
+            o += PACKET_TYPE_CHAT.write_to(&mut buf[o..]);
+            name.as_bytes().write_to(&mut buf[o..]);
+            o += 64;
+            o += line.as_bytes() .write_to(&mut buf[o..]);
+
+            for peer in &mut peers {
+                if peer.state == PeerState::Connected {
                     peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
                 }
             }
@@ -157,7 +203,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     continue;
                 }
 
-                // println!("Sending HELLO_ACK to: {:?}.", peer.address);
+                if PRINT_HELLO { println!("Sending HELLO_ACK to: {:?}.", peer.address); }
 
                 let (mut buf, mut o) = ([0u8; 2048], 0);
                 o += PACKET_TYPE_HELLO_ACK.write_to(&mut buf[o..]);
@@ -200,7 +246,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                     let chunks = buf.chunks_exact(34);
 
-                    // print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses:", chunks.len());
+                    if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses:", chunks.len()); }
 
                     peer.recv_time = recv_time;
 
@@ -211,7 +257,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                         let address = IpAddress(ip, port);
 
-                        // print!("{:?}, ", (id >> 120, address));
+                        if PRINT_PEER_LIST { print!("{:?}, ", (id >> 120, address)); }
 
                         if id == node_id {
                             continue;
@@ -223,7 +269,20 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                         }
                     }
 
-                    // println!("");
+                    if PRINT_PEER_LIST { println!(""); }
+                } else if buf[0] == PACKET_TYPE_CHAT {
+                    let buf = &buf[1..];
+
+                    if buf.len() < 64 { continue; }
+
+                    let name = &buf[..64];
+
+                    let buf = &buf[64..];
+
+                    println!("ID {} ({}): {}",
+                             peer.node_id >> 120,
+                             std::str::from_utf8(name).unwrap_or("?").trim_end_matches('\0'),
+                             std::str::from_utf8(buf).unwrap_or("?").trim_end_matches('\0'));
                 }
             }
         }
