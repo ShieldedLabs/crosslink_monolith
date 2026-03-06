@@ -615,21 +615,6 @@ mod linux {
             (ipv4, ipv6)
         }
     }
-    
-    //#[test]
-    fn test_network_switch() {
-        let socket = setup_and_bind_udp_socket(0);
-        loop {
-            std::thread::yield_now();
-            let time_before = monotonic_clock_ns();
-            let (ipv4, ipv6) = udp_probe_source_addresses(socket);
-            let time_after = monotonic_clock_ns();
-            println!("{:?} {:?} took {} ns", ipv4, ipv6, time_after - time_before);
-            /*  RESULTS
-                Sams Laptop running manjaro: 13-18 us
-            */
-        }
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1068,6 +1053,13 @@ mod windows {
 
         Ok((nbytes as usize, src_ip6, src_port, congested, ecn_enabled, dscp, timestamp_ns))
     }
+
+    #[inline]
+    pub fn udp_probe_source_addresses(
+        _udp_socket: SockHandle,
+    ) -> (Option<Ipv6Addr>, Option<Ipv6Addr>) {
+        (None, None)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1400,5 +1392,173 @@ mod macos {
             dscp,
             timestamp_ns,
         ))
+    }
+
+    #[inline]
+    pub fn udp_probe_source_addresses(
+        _udp_socket: SockHandle,
+    ) -> (Option<Ipv6Addr>, Option<Ipv6Addr>) {
+        unsafe {
+            let ipv4 = {
+                let ipv4_probe_fd = libc::socket(
+                    libc::AF_INET,
+                    libc::SOCK_DGRAM,
+                    libc::IPPROTO_UDP,
+                );
+                if ipv4_probe_fd < 0 {
+                    panic!("socket() failed: {}", std::io::Error::last_os_error());
+                }
+
+                let mut dst: libc::sockaddr_in = std::mem::zeroed();
+                dst.sin_family = libc::AF_INET as _;
+                dst.sin_port = 53u16.to_be();
+                dst.sin_addr = libc::in_addr {
+                    s_addr: u32::from_be_bytes([1, 1, 1, 1]),
+                };
+
+                let ret = if libc::connect(
+                    ipv4_probe_fd,
+                    &dst as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                ) != 0
+                {
+                    let err = std::io::Error::last_os_error();
+                    match err.raw_os_error() {
+                        Some(libc::ENETUNREACH)
+                        | Some(libc::EHOSTUNREACH)
+                        | Some(libc::EADDRNOTAVAIL) => None,
+                        _ => panic!("ipv4 probe connect() failed: {}", err),
+                    }
+                } else {
+                    let mut local: libc::sockaddr_in = std::mem::zeroed();
+                    let mut local_len =
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+
+                    if libc::getsockname(
+                        ipv4_probe_fd,
+                        &mut local as *mut _ as *mut libc::sockaddr,
+                        &mut local_len as *mut _,
+                    ) != 0
+                    {
+                        panic!(
+                            "ipv4 probe getsockname() failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+
+                    let addr = std::net::Ipv4Addr::from(
+                        u32::from_be(local.sin_addr.s_addr)
+                    )
+                    .to_ipv6_mapped();
+
+                    if addr.is_unspecified()
+                        || addr.is_loopback()
+                        || addr.is_unicast_link_local()
+                    {
+                        None
+                    } else {
+                        Some(addr)
+                    }
+                };
+
+                if libc::close(ipv4_probe_fd) != 0 {
+                    panic!("close() failed: {}", std::io::Error::last_os_error());
+                }
+                ret
+            };
+
+            let ipv6 = {
+                let ipv6_probe_fd = libc::socket(
+                    libc::AF_INET6,
+                    libc::SOCK_DGRAM,
+                    libc::IPPROTO_UDP,
+                );
+                if ipv6_probe_fd < 0 {
+                    panic!("socket() failed: {}", std::io::Error::last_os_error());
+                }
+
+                let mut dst: libc::sockaddr_in6 = std::mem::zeroed();
+                dst.sin6_family = libc::AF_INET6 as _;
+                dst.sin6_port = 53u16.to_be();
+                dst.sin6_addr = libc::in6_addr {
+                    // 2606:4700:4700::1111
+                    s6_addr: [
+                        0x26, 0x06, 0x47, 0x00,
+                        0x47, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x11, 0x11,
+                    ],
+                };
+
+                let ret = if libc::connect(
+                    ipv6_probe_fd,
+                    &dst as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                ) != 0
+                {
+                    let err = std::io::Error::last_os_error();
+                    match err.raw_os_error() {
+                        Some(libc::ENETUNREACH)
+                        | Some(libc::EHOSTUNREACH)
+                        | Some(libc::EADDRNOTAVAIL) => None,
+                        _ => panic!("ipv6 probe connect() failed: {}", err),
+                    }
+                } else {
+                    let mut local: libc::sockaddr_in6 = std::mem::zeroed();
+                    let mut local_len =
+                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+
+                    if libc::getsockname(
+                        ipv6_probe_fd,
+                        &mut local as *mut _ as *mut libc::sockaddr,
+                        &mut local_len as *mut _,
+                    ) != 0
+                    {
+                        panic!(
+                            "ipv6 probe getsockname() failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+
+                    let addr = Ipv6Addr::from(local.sin6_addr.s6_addr);
+                    let seg = addr.segments();
+
+                    if addr.is_unspecified()
+                        || addr.is_loopback()
+                        || addr.is_multicast()
+                        || addr.is_unicast_link_local()
+                        || (seg[4] == 0 && seg[5] == 0 && seg[6] == 0 && seg[7] == 0)
+                    {
+                        None
+                    } else {
+                        Some(addr)
+                    }
+                };
+
+                if libc::close(ipv6_probe_fd) != 0 {
+                    panic!("close() failed: {}", std::io::Error::last_os_error());
+                }
+                ret
+            };
+
+            (ipv4, ipv6)
+        }
+    }
+    
+}
+
+//#[test]
+fn test_network_switch() {
+    let socket = setup_and_bind_udp_socket(0);
+    loop {
+        std::thread::yield_now();
+        let time_before = monotonic_clock_ns();
+        let (ipv4, ipv6) = udp_probe_source_addresses(socket);
+        let time_after = monotonic_clock_ns();
+        println!("{:?} {:?} took {} ns", ipv4, ipv6, time_after - time_before);
+        /*  RESULTS
+            Sams Laptop running manjaro: 13-18 us
+            Sams m4 super mac: 100 us ish
+        */
     }
 }
