@@ -1,4 +1,6 @@
 
+use std::collections::HashMap;
+
 #[test]
 fn bwdth_test() {
     println!("Begin the test!");
@@ -35,15 +37,6 @@ fn handshake_test() {
     do_the_test_program2(29853, kp3.clone(), vec![kp3], Some((Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, kp1_pub2)));
 }
 
-const ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE: usize = 15972;
-const ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY: usize = 1200;
-
-type PacketMemory = Box<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE]>;
-
-// Note(Sam): We will be reusing this memory across packets so we already do not have memory safety with regards to contents.
-#[allow(unsafe_code)]
-fn new_packet_memory() -> PacketMemory { unsafe { Box::<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE]>::new_uninit().assume_init() } }
-
 // LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
 const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s: u64 = 0x7193_c304_f8d5;
 const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b: u64 = 0xbe53_b364_1ce1;
@@ -75,10 +68,29 @@ pub struct IdentityKeyPair {
     pub public: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConnectionKey {
+    ip: Ipv6Addr,
+    port: u16,
+    key_15_bits: u16, // LSB is just always 1.
+}
+
+#[derive(Debug)]
+pub struct ConnectionTrackingData {
+    creation_time_ns: u64,
+    my_ip: Ipv6Addr,
+    my_transport_identity_keypair: IdentityKeyPair,
+    other_ip: Ipv6Addr,
+    other_port: u16,
+    other_transport_identity: Vec<u8>,
+}
+
 pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, my_listen_keypairs: Vec<IdentityKeyPair>, beam_to: Option<(Ipv6Addr, u16, u64, Vec<u8>)>) {
     let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
     let mut packet_memory_recv = new_packet_memory(); // Incoming Decrypted
     let mut packet_memory_send = new_packet_memory(); // Outgoing Decrypted
+    
+    let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
 
     let socket = setup_and_bind_udp_socket(my_port);
     if let Some(beam_to) = beam_to {
@@ -96,6 +108,19 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
             packet_memory_encrypted[6+32..6+32+list_of_protocols_len_bytes].copy_from_slice(&packet_memory_send[0..list_of_protocols_len_bytes]);
             udp_send_with_congestion_and_dscp(socket, beam_to.0, beam_to.1, &packet_memory_encrypted[0..6+32+list_of_protocols_len_bytes], Dscp::Af21);
             // TODO add connection to tracking -- Tracking must include continued handshake state. It does not imply a finished connection. And we have to handle two people connecting to each other gracefully for the hole punch. Tracking state is a hash table where the key is (ip_addr, port, first 15 bits of the identity key)
+            
+            let my_ip = if beam_to.0.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
+            connections_map.insert(
+                ConnectionKey { ip: beam_to.0, port: beam_to.1, key_15_bits: 1 | (load_u16(&beam_to.3[0..2]) << 1) },
+                ConnectionTrackingData {
+                    creation_time_ns: monotonic_clock_ns(),
+                    my_ip,
+                    my_transport_identity_keypair: my_connect_keypair,
+                    other_ip: beam_to.0,
+                    other_port: beam_to.1,
+                    other_transport_identity: beam_to.3.clone(),
+                },
+            );
         }
         else {
             let mut handshake = snow::Builder::new(noise_string_from_connect_magic1(my_connect_keypair.magic1).unwrap().parse().unwrap())
@@ -109,6 +134,8 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
             // TODO add connection to tracking -- Tracking must include continued handshake state. It does not imply a finished connection. And we have to handle two people connecting to each other gracefully for the hole punch. Tracking state is a hash table where the key is (ip_addr, port, first 15 bits of the identity key)
         }
     }
+    
+    println!("{:#?}", connections_map);
 
     loop {
         if let Ok((buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns)) = udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {

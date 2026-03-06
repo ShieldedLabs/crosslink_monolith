@@ -1,5 +1,14 @@
 pub use std::net::Ipv6Addr;
 
+pub const ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE: usize = 15972;
+pub const ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY: usize = 1200;
+
+pub type PacketMemory = Box<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE]>;
+
+// Note(Sam): We will be reusing this memory across packets so we already do not have memory safety with regards to contents.
+#[allow(unsafe_code)]
+pub fn new_packet_memory() -> PacketMemory { unsafe { Box::<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE]>::new_uninit().assume_init() } }
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Dscp {
