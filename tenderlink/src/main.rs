@@ -25,7 +25,7 @@ fn main() {
         }
     }
 
-    let peers = vec![tenderlink::p2p_test::IpAddress("::1".parse().unwrap(), 18234)]; // @Temporary
+    let peers = vec![tenderlink::p2p_test::IpAddress("0000:0000:0000:0000:0000:ffff:4622:f29b".parse().unwrap(), 18234)]; // @Temporary
     if args.len() == 1 {
         tenderlink::p2p_test::p2p(0, peers);
         return;
