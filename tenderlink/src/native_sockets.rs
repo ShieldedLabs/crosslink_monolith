@@ -29,12 +29,12 @@ mod linux {
     use super::*;
 
     #[inline]
-    pub fn socket_setup() {}
+    pub fn socket_setup() {} // Linux
     #[inline]
-    pub fn monotonic_clock_setup() {}
+    pub fn monotonic_clock_setup() {} // Linux
 
     #[inline]
-    pub fn monotonic_clock_ns() -> u64 {
+    pub fn monotonic_clock_ns() -> u64 { // Linux
         unsafe {
             let mut ts: libc::timespec = std::mem::zeroed();
             if libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) != 0 {
@@ -45,7 +45,7 @@ mod linux {
     }
     
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-    pub struct SockHandle(libc::c_int, Option<Ipv6Addr>);
+    pub struct SockHandle(libc::c_int, Option<Ipv6Addr>); // Linux
     
     /*
         This procedure is needed because on some vps' the ipv6 setup is wrong so that
@@ -139,7 +139,7 @@ mod linux {
     }
 
     #[inline]
-    pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle {
+    pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle { // Linux
         let fd = unsafe {
             libc::socket(
                 libc::AF_INET6,
@@ -250,7 +250,7 @@ mod linux {
     /// - Otherwise sends to IPv6 using sockaddr_in6 and IPV6_TCLASS cmsg.
     /// Return value is a nanosecond timestamp of the send.
     #[inline]
-    pub fn udp_send_with_congestion_and_dscp(
+    pub fn udp_send_with_congestion_and_dscp( // Linux
         udp_socket: SockHandle,
         dst_ip6: Ipv6Addr,
         dst_port: u16,
@@ -379,7 +379,7 @@ mod linux {
     /// - `congested=true` iff ECN == CE (0b11).
     /// - If no TOS/TCLASS cmsg was provided by the kernel, returns congested=false and dscp=BestEffort.
     #[inline]
-    pub fn udp_recv_with_congestion_and_dscp(
+    pub fn udp_recv_with_congestion_and_dscp( // Linux
         udp_socket: SockHandle,
         buf: &mut [u8],
     ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, bool, Dscp, u64)> {
@@ -728,7 +728,7 @@ mod windows {
     static mut QPC_INV_FREQ_SCALE: u128 = 0;
 
     #[inline]
-    pub fn socket_setup() {
+    pub fn socket_setup() { // Windows
         unsafe {
             let mut data: WSADATA = zeroed();
             // MAKEWORD(2,2)
@@ -741,7 +741,7 @@ mod windows {
     }
     
     #[inline]
-    pub fn monotonic_clock_setup() {
+    pub fn monotonic_clock_setup() { // Windows
         unsafe {
             let mut freq: u128 = 0; QueryPerformanceFrequency(&mut freq as *mut _ as *mut i64);
             QPC_INV_FREQ_SCALE = ((1_000_000_000u128 << 64) / freq);
@@ -749,7 +749,7 @@ mod windows {
     }
 
     #[inline]
-    pub fn monotonic_clock_ns() -> u64 {
+    pub fn monotonic_clock_ns() -> u64 { // Windows
         unsafe {
             let mut counter: u128 = 0; QueryPerformanceCounter(&mut counter as *mut _ as *mut i64);
             ((counter * QPC_INV_FREQ_SCALE) >> 64) as u64
@@ -757,10 +757,7 @@ mod windows {
     }
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-    pub struct SockHandle {
-        sock: SOCKET,
-        recvmsg: WsaRecvMsgFn,
-    }
+    pub struct SockHandle(SOCKET, WsaRecvMsgFn); // Windows
 
     #[inline]
     fn get_wsarecvmsg(sock: SOCKET) -> WsaRecvMsgFn {
@@ -789,7 +786,7 @@ mod windows {
     }
 
     #[inline]
-    pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle {
+    pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle { // Windows
         let sock = unsafe { socket(AF_INET6 as i32, SOCK_DGRAM as i32, IPPROTO_UDP as i32) };
         if sock == INVALID_SOCKET {
             panic!("socket(AF_INET6, SOCK_DGRAM, UDP) failed: {}", wsa_last_error());
@@ -848,18 +845,18 @@ mod windows {
 
         let recvmsg = get_wsarecvmsg(sock);
 
-        SockHandle { sock, recvmsg }
+        SockHandle(sock, recvmsg)
     }
 
     #[inline]
-    pub fn udp_send_with_congestion_and_dscp(
+    pub fn udp_send_with_congestion_and_dscp( // Windows
         udp_socket: SockHandle,
         dst_ip6: Ipv6Addr,
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
     ) -> std::io::Result<u64> {
-        let sock = udp_socket.sock;
+        let sock = udp_socket.0;
 
         // full TCLASS/TOS byte: DSCP in upper 6 bits, ECN=ECT(0) (0b10)
         let tclass_byte: u8 = ((dscp as u8) << 2) | 0b10;
@@ -919,11 +916,11 @@ mod windows {
     }
 
     #[inline]
-    pub fn udp_recv_with_congestion_and_dscp(
+    pub fn udp_recv_with_congestion_and_dscp( // Windows
         udp_socket: SockHandle,
         buf: &mut [u8],
     ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, bool, Dscp, u64)> {
-        let sock = udp_socket.sock;
+        let sock = udp_socket.0;
 
         let mut data_wsa = WSABUF {
             len: buf.len() as u32,
@@ -947,7 +944,7 @@ mod windows {
 
         let mut nbytes: u32 = 0;
         let rc = unsafe {
-            (udp_socket.recvmsg)(
+            (udp_socket.1)(
                 sock,
                 &mut msg as *mut WSAMSG,
                 &mut nbytes as *mut u32,
@@ -1081,12 +1078,12 @@ mod macos {
     use super::*;
 
     #[inline]
-    pub fn socket_setup() {}
+    pub fn socket_setup() {} // Mac
     #[inline]
-    pub fn monotonic_clock_setup() {}
+    pub fn monotonic_clock_setup() {} // Mac
 
     #[inline]
-    pub fn monotonic_clock_ns() -> u64 {
+    pub fn monotonic_clock_ns() -> u64 { // Mac
         unsafe {
             let time = libc::mach_absolute_time();
 
@@ -1098,10 +1095,10 @@ mod macos {
     }
     
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-    pub struct SockHandle(libc::c_int);
+    pub struct SockHandle(libc::c_int); // Mac
     
     #[inline]
-    pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle {
+    pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle { // Mac
         // Create an IPv6 UDP socket (we'll run it dual-stack via IPV6_V6ONLY=0).
         let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP) };
         if fd < 0 {
@@ -1199,7 +1196,7 @@ mod macos {
     /// - Works for IPv6 and IPv4-mapped IPv6 destinations.
     /// Return value is a nanosecond timestamp of the send.
     #[inline]
-    pub fn udp_send_with_congestion_and_dscp(
+    pub fn udp_send_with_congestion_and_dscp( // Mac
         udp_socket: SockHandle,
         dst_ip6: Ipv6Addr,
         dst_port: u16,
@@ -1309,7 +1306,7 @@ mod macos {
     /// - If no TCLASS cmsg was provided by the kernel, returns congested=false, ecn_enabled=false,
     ///   and dscp=BestEffort.
     #[inline]
-    pub fn udp_recv_with_congestion_and_dscp(
+    pub fn udp_recv_with_congestion_and_dscp( // Mac
         udp_socket: SockHandle,
         buf: &mut [u8],
     ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, bool, Dscp, u64)> {

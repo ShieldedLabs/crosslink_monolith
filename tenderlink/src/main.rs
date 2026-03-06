@@ -20,14 +20,14 @@ fn main() {
     if args.len() > 1 {
         if args[1] == "p2p" {
             let port : u16 = args.get(2).map(|a| a.parse().unwrap()).unwrap_or(0);
-            tenderlink::p2p_test::p2p(port, &mut vec![]);
+            tenderlink::p2p_test::p2p(port, vec![]);
             return;
         }
     }
 
     let peers = vec![tenderlink::p2p_test::IpAddress("::1".parse().unwrap(), 18234)]; // @Temporary
     if args.len() == 1 {
-        tenderlink::p2p_test::p2p(0, &mut vec![]);
+        tenderlink::p2p_test::p2p(0, peers);
         return;
     }
     let mut i: usize = usize::MAX;

@@ -54,7 +54,8 @@ zcash_primitives = { workspace = true }
 
 static_assertions = { workspace = true }
 
-snow = { version = "0.10.0", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
+# snow = { version = "0.10.0", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
+
 
 macroquad = { version = "0.4.14", optional = true, default-features = false }
 macroquad-profiler = { version = "0.2.0", optional = true }
@@ -77,3 +78,14 @@ audio = []
 
 [build-dependencies]
 prost-build = "0.13"
+
+[dependencies.snow]
+git = "https://github.com/ShieldedLabs/snow.git"
+rev = "54369eb3829d6563ef7e5d5f17c09b08a77bca6e"
+default-features = false
+features = [
+    "use-curve25519",
+    "use-chacha20poly1305",
+    "use-blake2",
+    "use-getrandom"
+]

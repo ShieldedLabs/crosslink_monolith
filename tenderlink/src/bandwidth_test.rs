@@ -2,7 +2,7 @@
 #[test]
 fn bwdth_test() {
     println!("Begin the test!");
-    
+
     let _handle = std::thread::spawn(|| {
         do_the_test_program(32345, None);
     });
@@ -13,7 +13,7 @@ fn bwdth_test() {
 #[test]
 fn handshake_test() {
     println!("Begin the test!");
-    
+
     let kp1 = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
     let kp1_pub = kp1.public.clone();
     let kp1_pub2 = kp1.public.clone();
@@ -39,7 +39,9 @@ const ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE: usize = 15972;
 const ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY: usize = 1200;
 
 type PacketMemory = Box<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE]>;
+
 // Note(Sam): We will be reusing this memory across packets so we already do not have memory safety with regards to contents.
+#[allow(unsafe_code)]
 fn new_packet_memory() -> PacketMemory { unsafe { Box::<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE]>::new_uninit().assume_init() } }
 
 // LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
@@ -77,17 +79,17 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
     let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
     let mut packet_memory_recv = new_packet_memory(); // Incoming Decrypted
     let mut packet_memory_send = new_packet_memory(); // Outgoing Decrypted
-    
+
     let socket = setup_and_bind_udp_socket(my_port);
     if let Some(beam_to) = beam_to {
         assert!(my_connect_keypair.magic1 == beam_to.2);
-        
+
         // TODO list of supported Application Level protocols for e.g. zcash network upgrades.
         // packet_memory_send
         let list_of_protocols_len_bytes = 0;
-    
+
         store_u48(&mut packet_memory_encrypted[0..6], my_connect_keypair.magic1);
-        
+
         if my_connect_keypair.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
             assert_eq!(my_connect_keypair.public.len(), 32);
             packet_memory_encrypted[6..6+32].copy_from_slice(&my_connect_keypair.public[..]);
@@ -102,18 +104,18 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                 .remote_public_key(&beam_to.3[..]).unwrap()
                 .build_initiator().unwrap();
             let handshake_size = handshake.write_message(&packet_memory_send[0..list_of_protocols_len_bytes], &mut packet_memory_encrypted[6..]).unwrap();
-            
+
             udp_send_with_congestion_and_dscp(socket, beam_to.0, beam_to.1, &packet_memory_encrypted[0..6+handshake_size], Dscp::Af21);
             // TODO add connection to tracking -- Tracking must include continued handshake state. It does not imply a finished connection. And we have to handle two people connecting to each other gracefully for the hole punch. Tracking state is a hash table where the key is (ip_addr, port, first 15 bits of the identity key)
         }
     }
-    
+
     loop {
         if let Ok((buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns)) = udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
             if buf_len >= 6 {
                 let magic1 = load_u48(&packet_memory_encrypted[0..6]);
                 if magic1 & 1 != 0 { // Client Hello
-                
+
                     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
                         println!("incoming plaintext");
                         if buf_len >= 6 + 32 {
@@ -122,7 +124,7 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                             assert_eq!(list_of_protocols_len_bytes, 0); // temp
                             // TODO list of supported Application Level protocols for e.g. zcash network upgrades.
                             println!("plaintext success with {:?}", client_key);
-                            
+
                             // TODO add connection to tracking -- Tracking must include continued handshake state. It does not imply a finished connection. And we have to handle two people connecting to each other gracefully for the hole punch. Tracking state is a hash table where the key is (ip_addr, port, first 15 bits of the identity key)
                         }
                     }
@@ -140,7 +142,7 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                                         assert_eq!(list_of_protocols_len_bytes, 0); // temp
                                         // TODO list of supported Application Level protocols for e.g. zcash network upgrades.
                                         println!("success with {:?}", client_key);
-                                        
+
                                         // TODO add connection to tracking -- Tracking must include continued handshake state. It does not imply a finished connection. And we have to handle two people connecting to each other gracefully for the hole punch. Tracking state is a hash table where the key is (ip_addr, port, first 15 bits of the identity key)
                                     }
                                 }
@@ -160,7 +162,7 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
     let mut time_of_last_status_print = std::time::Instant::now();
     let mut ecn_up = false;
     let mut ecn_down = false;
-    
+
     struct SendState {
         socket: SockHandle,
         drop_cursor: u64,
@@ -173,25 +175,25 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
         serial_number: 50,
         packet_buffer: vec![0; PACKET_HISTORY_BUFFER_LEN],
     };
-    
+
     let mut bytes_on_the_wire = 0_u64;
-    
+
     let mut min_seen_rtt_buckets = [u64::MAX; 10];
     let mut rtt_bucket_cursor = 0_u64;
     let mut rtt_bucket_cursor_last_time = 0_u64;
-    
+
     let mut bytes_delivered_buckets = [0_u64; 20];
     let mut bytes_delivered_bucket_cursor = 0_u64;
     let mut bytes_delivered_bucket_cursor_last_time = 0_u64;
-    
+
     let mut state_machine_cursor = 0_u64;
     let mut state_machine_cursor_last_time = 0_u64;
     let mut old_measured_allowed_bytes_on_the_wire = 0_u64;
-    
-    
+
+
     let mut buf = [0_u8; 16384];
-    
-    
+
+
     struct AckState {
         // temp
         saved_other_ip_addr: Ipv6Addr,
@@ -217,12 +219,12 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
     };
     fn send_acks_helper(ack_state: &mut AckState, send_state: &mut SendState, ecn_down: bool) {
         assert!(ack_state.acks_in_waiting_count > 0);
-        
+
         if send_state.serial_number + 1 >= send_state.drop_cursor + (PACKET_HISTORY_BUFFER_LEN as u64) {
             eprintln!("Error! PACKET_HISTORY_BUFFER_LEN is too small.\n");
             return;
         }
-        
+
         store_u64(&mut ack_state.ack_send_buf[0..8], send_state.serial_number);
         ack_state.ack_send_buf[8] = 2;
         let mut o = 9;
@@ -240,14 +242,14 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
         }
         ack_state.acks_in_waiting_count = 0;
     };
-    
-    
+
+
     loop {
         // Send non full ack packet if needed.
         if ack_state.acks_in_waiting_count > 0 && monotonic_clock_ns() - ack_state.first_waiting_ack_time_ns > MAX_WAIT_BEFORE_SENDING_NON_FULL_ACK {
             send_acks_helper(&mut ack_state, &mut send_state, ecn_down);
         }
-    
+
         let current_min_rtt_on_connection_ns = {
             let a = min_seen_rtt_buckets[0].min(min_seen_rtt_buckets[1]);
             let b = min_seen_rtt_buckets[2].min(min_seen_rtt_buckets[3]);
@@ -272,14 +274,14 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
             a.max(b).max(c).max(d).max(e).max(f).max(g).max(h).max(i).max(j)
         };
         let data_delivery_bucket_time = current_min_rtt_on_connection_ns / 4;
-        
+
         let tu_bytes = 0_u64.max(ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE as u64);
-    
+
         let bottleneck_bandwidth_Bps = (current_max_delivered_bucket_bytes*1_000_000_000) / data_delivery_bucket_time;
         let measured_allowed_bytes_on_the_wire = (((bottleneck_bandwidth_Bps as u128 * current_min_rtt_on_connection_ns as u128) / 1_000_000_000) as u64).max(tu_bytes);
-        
+
         let drop_back_edge_timestamp_ns = monotonic_clock_ns();
-        
+
         if drop_back_edge_timestamp_ns > state_machine_cursor_last_time + data_delivery_bucket_time {
             state_machine_cursor += 1;
             state_machine_cursor_last_time = drop_back_edge_timestamp_ns;
@@ -287,18 +289,18 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
         if measured_allowed_bytes_on_the_wire > old_measured_allowed_bytes_on_the_wire*124/100 { state_machine_cursor = 0; println!("GROW"); }
         old_measured_allowed_bytes_on_the_wire = measured_allowed_bytes_on_the_wire;
         if state_machine_cursor >= 12 { state_machine_cursor = 2; }
-        
+
         let allowed_bytes_on_the_wire =
             if state_machine_cursor < 2 { (measured_allowed_bytes_on_the_wire*130/100).max(measured_allowed_bytes_on_the_wire + tu_bytes*10) }
             else if state_machine_cursor < 10 { measured_allowed_bytes_on_the_wire }
             else { (measured_allowed_bytes_on_the_wire*125/100).max(measured_allowed_bytes_on_the_wire + tu_bytes) };
-        
+
         if time_of_last_status_print.elapsed() > std::time::Duration::from_millis(1000) {
             time_of_last_status_print = std::time::Instant::now();
             println!("ecn up/down:{}/{} rtt: {} us MaxBucket: {} B bottleneck bandwidth: {}", ecn_up as u8, ecn_down as u8, current_min_rtt_on_connection_ns / 1000, current_max_delivered_bucket_bytes, BytesPerSecond(bottleneck_bandwidth_Bps));
             //println!("{} < m: {} t: {}", bytes_on_the_wire, measured_allowed_bytes_on_the_wire, allowed_bytes_on_the_wire);
         }
-    
+
         while send_state.drop_cursor < send_state.serial_number { // The drop back edge.
             let stored_int = send_state.packet_buffer[send_state.drop_cursor as usize % PACKET_HISTORY_BUFFER_LEN];
             if stored_int != u32::MAX {
@@ -311,7 +313,7 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
             }
             send_state.drop_cursor += 1;
         }
-    
+
         let mut cannot_send_should_sleep = false;
         if send_state.serial_number + 1 >= send_state.drop_cursor + (PACKET_HISTORY_BUFFER_LEN as u64) {
             eprintln!("Error! PACKET_HISTORY_BUFFER_LEN is too small.\n");
@@ -337,7 +339,7 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
                 cannot_send_should_sleep = true;
             }
         }
-    
+
         let res = udp_recv_with_congestion_and_dscp(send_state.socket, &mut buf);
         if matches!(res, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock) { continue; }
         //println!("{}: res = {:?}", port, res);
@@ -350,7 +352,7 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
         if buf_len < 8 { continue; }
         let packet_serial = load_u64(&buf[0..8]);
         let packet_plaintext = &buf[8..buf_len];
-        
+
         if packet_plaintext[0] == 2 {
             if packet_plaintext.len() < 1+8+3 || (packet_plaintext.len()-1-8) % 3 != 0 {
                 eprintln!("Error! Bad Ack. data = {}\n", hex::encode(packet_plaintext));
@@ -358,7 +360,7 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
             }
             let mut min_rtt_this_ack = u64::MAX;
             let mut total_bytes_acked_this_ack = 0_u64;
-            
+
             let ack_base_and_ecn_info = load_u64(&packet_plaintext[1..9]);
             let ack_base = ack_base_and_ecn_info & 0x7fff_ffff_ffff_ffff;
             ecn_up = ack_base_and_ecn_info & (1 << 63) != 0;
@@ -387,21 +389,21 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
                 if ack_number >= send_state.drop_cursor {
                     total_bytes_acked_this_ack += packet_size_bytes as u64;
                 }
-                
+
                 if ecn_marked { println!("ECN"); }
             }
             if total_bytes_acked_this_ack > 0 {
                 bytes_on_the_wire -= total_bytes_acked_this_ack;
-                
+
                 let current_time_ns = monotonic_clock_ns();
-                
+
                 if current_time_ns > rtt_bucket_cursor_last_time + 1_000_000_000 {
                     rtt_bucket_cursor += 1;
                     min_seen_rtt_buckets[rtt_bucket_cursor as usize % min_seen_rtt_buckets.len()] = u64::MAX;
                     rtt_bucket_cursor_last_time = current_time_ns;
                 }
                 min_seen_rtt_buckets[rtt_bucket_cursor as usize % min_seen_rtt_buckets.len()] = min_seen_rtt_buckets[rtt_bucket_cursor as usize % min_seen_rtt_buckets.len()].min(min_rtt_this_ack);
-                
+
                 if current_time_ns > bytes_delivered_bucket_cursor_last_time + data_delivery_bucket_time {
                     bytes_delivered_bucket_cursor += 1;
                     bytes_delivered_buckets[bytes_delivered_bucket_cursor as usize % bytes_delivered_buckets.len()] = 0;
@@ -412,10 +414,10 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
         }
         else {
             if ecn_marked { println!("ECN!"); }
-            
+
             ack_state.saved_other_ip_addr = other_ip_addr;
             ack_state.saved_other_port = other_port;
-            
+
             if ack_state.acks_in_waiting_count == 0 {
                 ack_state.acks_in_waiting_min = packet_serial;
                 ack_state.first_waiting_ack_time_ns = timestamp_ns;
