@@ -73,7 +73,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     o += PACKET_TYPE_HELLO.write_to(&mut buf[o..]);
                     o += node_id          .write_to(&mut buf[o..]);
 
-                    // println!("Sending HELLO to: {:?}.", peer.address);
+                    println!("Sending HELLO to: {:?}.", peer.address);
 
                     peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
                 } else if peer.state == PeerState::Connected {
@@ -95,16 +95,19 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
         }
 
         // Timeout peers.
-        peers.retain_mut(|p| {
-            let timeout = (now - p.recv_time) >= 5_000_000_000;
+        for peer in &mut peers {
+            let timeout = (now - peer.recv_time) >= 5_000_000_000;
+            if timeout && peer.state == PeerState::Connected {
+                println!("Disconnected from: {:?}.", peer.address);
 
-            if timeout && p.state == PeerState::Connected {
-                println!("Disconnected from: {:?}.", p.address);
+                peer.state = PeerState::Punching;
             }
+        }
+        peers.retain(|peer| {
+            let connected = peer.state == PeerState::Connected;
+            let is_a_seeder = peer_addresses.iter().any(|address| peer.address == *address);
 
-            let is_a_seeder = peer_addresses.iter().any(|address| p.address == *address);
-
-            let should_keep = !timeout || is_a_seeder;
+            let should_keep = connected || is_a_seeder;
 
             should_keep
         });
@@ -154,7 +157,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     continue;
                 }
 
-                // println!("Sending HELLO_ACK to: {:?}.", peer.address);
+                println!("Sending HELLO_ACK to: {:?}.", peer.address);
 
                 let (mut buf, mut o) = ([0u8; 2048], 0);
                 o += PACKET_TYPE_HELLO_ACK.write_to(&mut buf[o..]);
@@ -194,18 +197,20 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 if buf[0] == PACKET_TYPE_PEER_LIST {
                     let buf = &buf[1..];
 
-                    // println!("Received {} peer addresses.", buf.chunks_exact(18).len());
+                    let chunks = buf.chunks_exact(34);
+
+                    print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses:", chunks.len());
 
                     peer.recv_time = recv_time;
 
-                    for chunk in buf.chunks_exact(34) {
+                    for chunk in chunks {
                         let id   =      u128::from_le_bytes(<[u8; 16]>::try_from(&chunk[ 0..16]).unwrap());
                         let ip   = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[16..32]).unwrap());
                         let port =       u16::from_le_bytes(<[u8;  2]>::try_from(&chunk[32..34]).unwrap());
 
                         let address = IpAddress(ip, port);
 
-                        // println!("{:?}", address);
+                        print!("{:?}, ", (id >> 120, address));
 
                         if id == node_id {
                             continue;
@@ -216,6 +221,8 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                             peers.push(Peer { node_id: id, address, recv_time, ..Peer::default() });
                         }
                     }
+
+                    println!("");
                 }
             }
         }
