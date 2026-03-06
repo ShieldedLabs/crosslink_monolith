@@ -73,7 +73,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     o += PACKET_TYPE_HELLO.write_to(&mut buf[o..]);
                     o += node_id          .write_to(&mut buf[o..]);
 
-                    println!("Sending HELLO to: {:?}.", peer.address);
+                    // println!("Sending HELLO to: {:?}.", peer.address);
 
                     peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
                 } else if peer.state == PeerState::Connected {
@@ -157,7 +157,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     continue;
                 }
 
-                println!("Sending HELLO_ACK to: {:?}.", peer.address);
+                // println!("Sending HELLO_ACK to: {:?}.", peer.address);
 
                 let (mut buf, mut o) = ([0u8; 2048], 0);
                 o += PACKET_TYPE_HELLO_ACK.write_to(&mut buf[o..]);
@@ -192,14 +192,15 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                 peer.state = PeerState::Connected;
                 peer.node_id = peer_node_id;
-                println!("Connected to: {:?}.", peer.address);
+
+                println!("Connected to: {:?}. Now connected to {} peers.", address, peers.iter().filter(|peer| peer.state == PeerState::Connected).enumerate().count());
             } else if peer.state == PeerState::Connected {
                 if buf[0] == PACKET_TYPE_PEER_LIST {
                     let buf = &buf[1..];
 
                     let chunks = buf.chunks_exact(34);
 
-                    print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses:", chunks.len());
+                    // print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses:", chunks.len());
 
                     peer.recv_time = recv_time;
 
@@ -210,7 +211,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                         let address = IpAddress(ip, port);
 
-                        print!("{:?}, ", (id >> 120, address));
+                        // print!("{:?}, ", (id >> 120, address));
 
                         if id == node_id {
                             continue;
@@ -222,7 +223,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                         }
                     }
 
-                    println!("");
+                    // println!("");
                 }
             }
         }
