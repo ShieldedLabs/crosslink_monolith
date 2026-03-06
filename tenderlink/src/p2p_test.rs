@@ -56,7 +56,10 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
     loop {
         let now = monotonic_clock_ns();
 
-        let peer_addresses_list: Vec<IpAddress> = (&peers[0..peers.len().min(32)]).iter().filter(|p| p.state == PeerState::Connected).map(|p| p.address).collect(); // 1088 byte packet (1 byte header + 64 * 18 byte addresses)
+        // Don't connect to myself.
+        peers.retain(|p| p.node_id != node_id);
+
+        let peer_addresses_list: Vec<(u128, IpAddress)> = (&peers[0..peers.len().min(32)]).iter().filter(|p| p.state == PeerState::Connected).map(|p| (p.node_id, p.address)).collect(); // 1088 byte packet (1 byte header + 64 * 18 byte addresses)
 
         for peer in &mut peers {
             if (now - peer.send_time) > 250_000_000 {
@@ -75,7 +78,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     let (mut buf, mut o) = ([0u8; 2048], 0);
                     o += PACKET_TYPE_PEER_LIST.write_to(&mut buf[o..]);
 
-                    for address in &peer_addresses_list {
+                    for (node_id, address) in &peer_addresses_list {
                         o += node_id           .write_to(&mut buf[o..]);
                         o += address.0.octets().write_to(&mut buf[o..]);
                         o += address.1         .write_to(&mut buf[o..]);
@@ -144,6 +147,10 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                 let buf = &buf[16..];
 
+                if peer_node_id == node_id {
+                    continue;
+                }
+
                 println!("Sending HELLO_ACK to: {:?}.", peer.address);
 
                 let (mut buf, mut o) = ([0u8; 2048], 0);
@@ -201,7 +208,8 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                             continue;
                         }
 
-                        if peers.iter().find(|p| p.node_id == id || p.address == address).is_none() {
+                        // @Note: Allows for the same node on different addresses in case a new path will be discovered.
+                        if peers.iter().find(|p| p.address == address).is_none() {
                             peers.push(Peer { node_id: id, address, recv_time, ..Peer::default() });
                         }
                     }
