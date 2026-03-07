@@ -1,22 +1,22 @@
 
 #[inline]
 pub fn store_u64(buf: &mut [u8], value: u64) {
-    assert!(buf.len() == 8);
+    debug_assert!(buf.len() == 8);
     buf[..8].copy_from_slice(&value.to_le_bytes());
 }
 #[inline]
 pub fn load_u64(buf: &[u8]) -> u64 {
-    assert!(buf.len() == 8);
+    debug_assert!(buf.len() == 8);
     u64::from_le_bytes(buf[..8].try_into().unwrap())
 }
 #[inline]
 pub fn store_u48(buf: &mut [u8], value: u64) {
-    assert!(buf.len() == 6);
+    debug_assert!(buf.len() == 6);
     buf.copy_from_slice(&value.to_le_bytes()[..6]);
 }
 #[inline]
 pub fn load_u48(buf: &[u8]) -> u64 {
-    assert!(buf.len() == 6);
+    debug_assert!(buf.len() == 6);
 
     let mut tmp = [0u8; 8];
     tmp[..6].copy_from_slice(buf);
@@ -24,16 +24,29 @@ pub fn load_u48(buf: &[u8]) -> u64 {
 }
 #[inline]
 pub fn store_u24(buf: &mut [u8], value: u32) {
-    assert!(buf.len() == 3);
+    debug_assert!(buf.len() == 3);
     buf.copy_from_slice(&value.to_le_bytes()[..3]);
 }
 #[inline]
 pub fn load_u24(buf: &[u8]) -> u32 {
-    assert!(buf.len() == 3);
+    debug_assert!(buf.len() == 3);
 
     let mut tmp = [0u8; 4];
     tmp[..3].copy_from_slice(buf);
     u32::from_le_bytes(tmp)
+}
+#[inline]
+pub fn store_u16(buf: &mut [u8], value: u16) {
+    debug_assert!(buf.len() == 2);
+    buf.copy_from_slice(&value.to_le_bytes()[..2]);
+}
+#[inline]
+pub fn load_u16(buf: &[u8]) -> u16 {
+    debug_assert!(buf.len() == 2);
+
+    let mut tmp = [0u8; 2];
+    tmp[..2].copy_from_slice(buf);
+    u16::from_le_bytes(tmp)
 }
 
 /// Bytes per second, formatted in binary units (KiB/MiB/GiB/TiB).
