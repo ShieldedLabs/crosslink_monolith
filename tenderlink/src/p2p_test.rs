@@ -37,6 +37,7 @@ pub fn tick(buf: &mut String) -> Option<String> {
     if !poll(std::time::Duration::ZERO).unwrap() { return None; }
     if let Event::Key(k) = read().unwrap() && k.kind == KeyEventKind::Press {
         match k.code {
+            KeyCode::Char('c') if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => { std::process::exit(0); }
             KeyCode::Char(c)   => { buf.push(c); redraw(buf); }
             KeyCode::Backspace => { buf.pop();   redraw(buf); }
             KeyCode::Enter     => { let s = buf.clone(); buf.clear(); redraw(""); return Some(s); }
