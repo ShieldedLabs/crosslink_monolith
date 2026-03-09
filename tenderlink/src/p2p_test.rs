@@ -31,13 +31,14 @@ struct RawModePanicSafe;
 impl RawModePanicSafe { fn new() -> Self { crossterm::terminal::enable_raw_mode().unwrap(); RawModePanicSafe } }
 impl Drop for RawModePanicSafe { fn drop(&mut self) { crossterm::terminal::disable_raw_mode().unwrap(); } }
 
-fn redraw(buf: &str) { print!("\r\x1b[2K> {}", buf); stdout().flush().unwrap(); }
-pub fn recv(msg: &str, buf: &str) { print!("\r\x1b[2K{}\n", msg); redraw(buf); }
+pub fn clear_line() { print!("\x1b[1K\r"); }
+pub fn redraw(buf: &str) { clear_line(); print!("> {}", buf); stdout().flush().unwrap(); }
 pub fn tick(buf: &mut String) -> Option<String> {
     if !poll(std::time::Duration::ZERO).unwrap() { return None; }
     if let Event::Key(k) = read().unwrap() && k.kind == KeyEventKind::Press {
         match k.code {
-            KeyCode::Char('c') if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => { std::process::exit(0); }
+            KeyCode::Char('C') |
+            KeyCode::Char('c') => { if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) { std::process::exit(0); } }
             KeyCode::Char(c)   => { buf.push(c); redraw(buf); }
             KeyCode::Backspace => { buf.pop();   redraw(buf); }
             KeyCode::Enter     => { let s = buf.clone(); buf.clear(); redraw(""); return Some(s); }
@@ -49,7 +50,7 @@ pub fn tick(buf: &mut String) -> Option<String> {
 
 macro_rules! println_redraw {
     ($buf:expr, $($arg:tt)*) => {{
-        print!("\r\x1b[2K");
+        clear_line();
         println!($($arg)*);
         redraw(&$buf);
     }}
@@ -271,6 +272,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                     let chunks = buf.chunks_exact(34);
 
+                    clear_line();
                     if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses:", chunks.len()); }
 
                     peer.recv_time = recv_time;
@@ -294,7 +296,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                         }
                     }
 
-                    if PRINT_PEER_LIST { println_redraw!(chat_buf, ""); }
+                    if PRINT_PEER_LIST { println!(""); redraw(&chat_buf); }
                 } else if buf[0] == PACKET_TYPE_CHAT {
                     let buf = &buf[1..];
 

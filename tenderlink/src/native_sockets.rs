@@ -478,7 +478,7 @@ mod linux {
     }
     
     #[inline]
-    pub fn udp_probe_source_addresses(
+    pub fn udp_probe_source_addresses( // Linux
         udp_socket: SockHandle,
     ) -> (Option<Ipv6Addr>, Option<Ipv6Addr>) {
         unsafe {
@@ -1064,7 +1064,7 @@ mod windows {
     }
 
     #[inline]
-    pub fn udp_probe_source_addresses(
+    pub fn udp_probe_source_addresses( // Windows
         _udp_socket: SockHandle,
     ) -> (Option<Ipv6Addr>, Option<Ipv6Addr>) {
         (None, None)
@@ -1404,7 +1404,7 @@ mod macos {
     }
 
     #[inline]
-    pub fn udp_probe_source_addresses(
+    pub fn udp_probe_source_addresses( // 
         _udp_socket: SockHandle,
     ) -> (Option<Ipv6Addr>, Option<Ipv6Addr>) {
         unsafe {
