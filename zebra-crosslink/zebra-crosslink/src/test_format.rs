@@ -613,7 +613,7 @@ pub(crate) async fn handle_instr(
             let mut internal = internal_handle.internal.lock().await;
             internal
                 .validators_at_current_height
-                .push(crate::MalValidator { public_key:pub_key.into(), voting_power: 1 });
+                .push(crate::MalValidator { public_key:pub_key.into(), voting_power: stake });
         }
     }
 }
