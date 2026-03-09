@@ -1,5 +1,6 @@
 
 use std::net::Ipv6Addr;
+use static_assertions::const_assert;
 
 use rand::RngCore;
 use rand_chacha::ChaCha20Rng;
@@ -8,8 +9,9 @@ use rand::seq::SliceRandom;
 
 use std::io;
 
-const PRINT_PEER_LIST :bool=0!= (0);
+const PRINT_RECEIVES  :bool=0!= (1);
 const PRINT_HELLO     :bool=0!= (0);
+const PRINT_PEER_LIST :bool=0!= (0);
 
 
 const MAX_MTU: usize = 15972;
@@ -19,6 +21,17 @@ const PACKET_TYPE_HELLO:     u8 = 0;
 const PACKET_TYPE_HELLO_ACK: u8 = 1;
 const PACKET_TYPE_PEER_LIST: u8 = 2;
 const PACKET_TYPE_CHAT:      u8 = 3;
+const PACKET_TYPE_COUNT:     u8 = 4;
+
+const PACKET_TYPE_NAMES: [&str; PACKET_TYPE_COUNT as usize] = {
+    let mut names = ["<MISSING>"; PACKET_TYPE_COUNT as usize];
+    names[PACKET_TYPE_HELLO       as usize] = "PACKET_TYPE_HELLO";
+    names[PACKET_TYPE_HELLO_ACK   as usize] = "PACKET_TYPE_HELLO_ACK";
+    names[PACKET_TYPE_PEER_LIST   as usize] = "PACKET_TYPE_PEER_LIST";
+    names[PACKET_TYPE_CHAT        as usize] = "PACKET_TYPE_CHAT";
+    const_assert!(PACKET_TYPE_COUNT == 4); // keep names array updated when adding other tags
+    names
+};
 
 use std::sync::mpsc;
 use std::thread;
@@ -214,6 +227,8 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     &mut peers.last_mut().unwrap()
                 }
             };
+
+            if PRINT_RECEIVES { println_redraw!(chat_buf, "Got {} from: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize], peer.address); }
 
             // Reply to all HELLOs with a HELLO_ACK.
             if buf[0] == PACKET_TYPE_HELLO {
