@@ -6,6 +6,11 @@ use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
+use std::io;
+
+const PRINT_PEER_LIST :bool=0!= (0);
+const PRINT_HELLO     :bool=0!= (0);
+
 
 const MAX_MTU: usize = 15972;
 const MIN_MTU: usize =  1232;
@@ -13,6 +18,43 @@ const MIN_MTU: usize =  1232;
 const PACKET_TYPE_HELLO:     u8 = 0;
 const PACKET_TYPE_HELLO_ACK: u8 = 1;
 const PACKET_TYPE_PEER_LIST: u8 = 2;
+const PACKET_TYPE_CHAT:      u8 = 3;
+
+use std::sync::mpsc;
+use std::thread;
+use std::io::BufRead;
+
+use crossterm::{event::{poll, read, Event, KeyCode, KeyEventKind}, terminal};
+use std::io::{stdout, Write};
+
+struct RawModePanicSafe;
+impl RawModePanicSafe { fn new() -> Self { crossterm::terminal::enable_raw_mode().unwrap(); RawModePanicSafe } }
+impl Drop for RawModePanicSafe { fn drop(&mut self) { crossterm::terminal::disable_raw_mode().unwrap(); } }
+
+fn redraw(buf: &str) { print!("\r\x1b[2K> {}", buf); stdout().flush().unwrap(); }
+pub fn recv(msg: &str, buf: &str) { print!("\r\x1b[2K{}\n", msg); redraw(buf); }
+pub fn tick(buf: &mut String) -> Option<String> {
+    if !poll(std::time::Duration::ZERO).unwrap() { return None; }
+    if let Event::Key(k) = read().unwrap() && k.kind == KeyEventKind::Press {
+        match k.code {
+            KeyCode::Char('c') if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => { std::process::exit(0); }
+            KeyCode::Char(c)   => { buf.push(c); redraw(buf); }
+            KeyCode::Backspace => { buf.pop();   redraw(buf); }
+            KeyCode::Enter     => { let s = buf.clone(); buf.clear(); redraw(""); return Some(s); }
+            _ => {}
+        }
+    }
+    None
+}
+
+macro_rules! println_redraw {
+    ($buf:expr, $($arg:tt)*) => {{
+        print!("\r\x1b[2K");
+        println!($($arg)*);
+        redraw(&$buf);
+    }}
+}
+
 
 trait SliceWrite          { fn write_to(&self, buf: &mut [u8]) -> usize; }
 impl  SliceWrite for u128 { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..16].copy_from_slice(&u128::to_le_bytes(*self)); 16 } }
@@ -54,6 +96,16 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
     let mut peers: Vec<Peer> = peer_addresses.iter().map(|address| Peer { address: *address, recv_time: monotonic_clock_ns(), ..Peer::default() }).collect();
 
+    println!("Choose a name (max 64 bytes): ");
+    let mut name = String::new();
+    io::stdin().read_line(&mut name).unwrap();
+    name.truncate(64);
+    name = name.trim().to_string(); // strip trailing newline
+
+    let _raw = RawModePanicSafe::new();
+
+    let mut chat_buf = String::default();
+
     loop {
         let now = monotonic_clock_ns();
 
@@ -73,7 +125,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     o += PACKET_TYPE_HELLO.write_to(&mut buf[o..]);
                     o += node_id          .write_to(&mut buf[o..]);
 
-                    // println!("Sending HELLO to: {:?}.", peer.address);
+                    if PRINT_HELLO { println_redraw!(chat_buf, "Sending HELLO to: {:?}.", peer.address); }
 
                     peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
                 } else if peer.state == PeerState::Connected {
@@ -87,18 +139,37 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                         o += address.1         .write_to(&mut buf[o..]);
                     }
 
-                    // println!("Sending PEER_LIST to: {:?}. It contains {} addresses.", peer.address, peer_addresses_list.len());
+                    // println_redraw!(chat_buf, "Sending PEER_LIST to: {:?}. It contains {} addresses.", peer.address, peer_addresses_list.len());
 
                     peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
                 }
             }
         }
 
+        if let Some(mut line) = tick(&mut chat_buf) {
+            line.truncate(1024);
+
+            // Send CHAT to all connected peers.
+            let (mut buf, mut o) = ([0u8; 2048], 0);
+            o += PACKET_TYPE_CHAT.write_to(&mut buf[o..]);
+            name.as_bytes().write_to(&mut buf[o..]);
+            o += 64;
+            o += line.as_bytes() .write_to(&mut buf[o..]);
+
+            for peer in &mut peers {
+                if peer.state == PeerState::Connected {
+                    peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+                }
+            }
+
+            println_redraw!(chat_buf, "{} ({}): {}", name, node_id >> 120, line);
+        }
+
         // Timeout peers.
         for peer in &mut peers {
             let timeout = (now - peer.recv_time) >= 5_000_000_000;
             if timeout && peer.state == PeerState::Connected {
-                println!("Disconnected from: {:?}.", peer.address);
+                println_redraw!(chat_buf, "Disconnected from: {:?}.", peer.address);
 
                 peer.state = PeerState::Punching;
             }
@@ -122,7 +193,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     },
                     Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => { break; },
                     Err(e) => {
-                        // println!("{:?}", e);
+                        // println_redraw!(chat_buf, "{:?}", e);
                         continue;
                     },
                 }
@@ -157,7 +228,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     continue;
                 }
 
-                // println!("Sending HELLO_ACK to: {:?}.", peer.address);
+                if PRINT_HELLO { println_redraw!(chat_buf, "Sending HELLO_ACK to: {:?}.", peer.address); }
 
                 let (mut buf, mut o) = ([0u8; 2048], 0);
                 o += PACKET_TYPE_HELLO_ACK.write_to(&mut buf[o..]);
@@ -193,14 +264,14 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 peer.state = PeerState::Connected;
                 peer.node_id = peer_node_id;
 
-                println!("Connected to: {:?}. Now connected to {} peers.", address, peers.iter().filter(|peer| peer.state == PeerState::Connected).enumerate().count());
+                println_redraw!(chat_buf, "Connected to: {:?}. Now connected to {} peers.", address, peers.iter().filter(|peer| peer.state == PeerState::Connected).enumerate().count());
             } else if peer.state == PeerState::Connected {
                 if buf[0] == PACKET_TYPE_PEER_LIST {
                     let buf = &buf[1..];
 
                     let chunks = buf.chunks_exact(34);
 
-                    // print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses:", chunks.len());
+                    if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses:", chunks.len()); }
 
                     peer.recv_time = recv_time;
 
@@ -211,7 +282,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                         let address = IpAddress(ip, port);
 
-                        // print!("{:?}, ", (id >> 120, address));
+                        if PRINT_PEER_LIST { print!("{:?}, ", (id >> 120, address)); }
 
                         if id == node_id {
                             continue;
@@ -223,7 +294,20 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                         }
                     }
 
-                    // println!("");
+                    if PRINT_PEER_LIST { println_redraw!(chat_buf, ""); }
+                } else if buf[0] == PACKET_TYPE_CHAT {
+                    let buf = &buf[1..];
+
+                    if buf.len() < 64 { continue; }
+
+                    let name = &buf[..64];
+
+                    let buf = &buf[64..];
+
+                    println_redraw!(chat_buf, "{} ({}): {}",
+                                    std::str::from_utf8(name).unwrap_or("?").trim_end_matches('\0'),
+                                    peer.node_id >> 120,
+                                    std::str::from_utf8(buf).unwrap_or("?").trim_end_matches('\0'));
                 }
             }
         }
