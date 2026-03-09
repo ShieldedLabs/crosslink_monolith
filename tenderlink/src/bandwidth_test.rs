@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 
 #[test]
-fn bwdth_test() {
+pub fn bwdth_test() {
     println!("Begin the test!");
 
     let _handle = std::thread::spawn(|| {
@@ -13,7 +13,7 @@ fn bwdth_test() {
 }
 
 #[test]
-fn handshake_test() {
+pub fn handshake_test() {
     println!("Begin the test!");
 
     let kp1 = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
@@ -56,10 +56,10 @@ fn contested_test() {
 }
 
 // LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
-const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s: u64 = 0x7193_c304_f8d5;
-const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b: u64 = 0xbe53_b364_1ce1;
-const CONNECT_MAGIC1_PLAIN_TEXT: u64 = 0x5bb2_2856_ae53;
-fn noise_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
+pub const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s: u64 = 0x7193_c304_f8d5;
+pub const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b: u64 = 0xbe53_b364_1ce1;
+pub const CONNECT_MAGIC1_PLAIN_TEXT: u64 = 0x5bb2_2856_ae53;
+pub fn noise_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     match magic {
         CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s => Some("Noise_IK_25519_ChaChaPoly_BLAKE2s"),
         CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b => Some("Noise_IK_25519_ChaChaPoly_BLAKE2b"),
@@ -68,7 +68,7 @@ fn noise_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     }
 }
 
-fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
+pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
         let mut ret = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
         ret.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
@@ -79,6 +79,11 @@ fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
         Some(IdentityKeyPair { magic1, private: kp.private, public: kp.public })
     } else { None }
 }
+
+#[derive(Debug, Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
+pub struct STPAddress(pub Ipv6Addr, pub u16, pub u64, pub Vec<u8>);
+impl Default for STPAddress { fn default() -> Self { Self(Ipv6Addr::UNSPECIFIED, 0, 0, Vec::new()) } }
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct IdentityKeyPair {
     pub magic1: u64,
@@ -127,7 +132,7 @@ pub enum ConnectionState {
     },
 }
 
-pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, my_listen_keypairs: Vec<IdentityKeyPair>, beam_to: Option<(Ipv6Addr, u16, u64, Vec<u8>)>) {
+pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, my_listen_keypairs: Vec<IdentityKeyPair>, beam_to: Option<STPAddress>) {
     let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
     let mut packet_memory_recv = new_packet_memory(); // Incoming Decrypted
     let mut packet_memory_send = new_packet_memory(); // Outgoing Decrypted
@@ -143,7 +148,8 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
     //println!("{:#?}", connections_map);
 
     loop {
-        service_connections(&mut connections_map, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_connect_keypair, &my_listen_keypairs);
+        let mut _unused = Vec::new();
+        service_connections(&mut connections_map, &mut _unused, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_connect_keypair, &my_listen_keypairs);
     }
 }
 
@@ -154,7 +160,7 @@ pub fn connect_to_endpoint(connections_map: &mut HashMap::<ConnectionKey, Connec
                            socket: SockHandle,
                            my_connect_keypair: &IdentityKeyPair,
                            my_listen_keypairs: &Vec<IdentityKeyPair>,
-                           beam_to: (Ipv6Addr, u16, u64, Vec<u8>)) {
+                           beam_to: STPAddress) {
     if let beam_to = beam_to {
         assert!(my_connect_keypair.magic1 == beam_to.2);
 
@@ -216,6 +222,7 @@ pub fn connect_to_endpoint(connections_map: &mut HashMap::<ConnectionKey, Connec
 
 
 pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
+                           packets_received_this_call: &mut Vec<(STPAddress, u64, Vec<u8>)>,
                            packet_memory_encrypted: &mut PacketMemory,
                            packet_memory_recv: &mut PacketMemory,
                            packet_memory_send: &mut PacketMemory,
@@ -338,6 +345,14 @@ pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, Connec
                                     payload = &packet_memory_encrypted[6..buf_len];
                                 }
                                 println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload);
+
+                                let address = STPAddress(existing_connection.other_ip,
+                                                         existing_connection.other_port,
+                                                         existing_connection.my_transport_identity_keypair.magic1,
+                                                         existing_connection.other_transport_identity.clone());
+                                let recv_time = timestamp_ns;
+
+                                packets_received_this_call.push((address, recv_time, Vec::from(payload)));
                             }
                         }
                         break;
@@ -455,7 +470,7 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
 
         ack_send_buf: [0; 8 + ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE],
     };
-    fn send_acks_helper(ack_state: &mut AckState, send_state: &mut SendState, ecn_down: bool) {
+    pub fn send_acks_helper(ack_state: &mut AckState, send_state: &mut SendState, ecn_down: bool) {
         assert!(ack_state.acks_in_waiting_count > 0);
 
         if send_state.serial_number + 1 >= send_state.drop_cursor + (PACKET_HISTORY_BUFFER_LEN as u64) {
