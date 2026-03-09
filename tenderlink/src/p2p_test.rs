@@ -18,19 +18,19 @@ const PRINT_PEER_LIST :bool=0!= (0);
 const MAX_MTU: usize = 15972;
 const MIN_MTU: usize =  1232;
 
-const PACKET_TYPE_HELLO:     u8 = 0;
-const PACKET_TYPE_HELLO_ACK: u8 = 1;
-const PACKET_TYPE_PEER_LIST: u8 = 2;
-const PACKET_TYPE_CHAT:      u8 = 3;
-const PACKET_TYPE_COUNT:     u8 = 4;
+const PACKET_TYPE_HELLO:     u8 = 1;
+const PACKET_TYPE_HELLO_ACK: u8 = 2;
+const PACKET_TYPE_PEER_LIST: u8 = 3;
+const PACKET_TYPE_CHAT:      u8 = 4;
+const PACKET_TYPE_COUNT:     u8 = 5;
 
 const PACKET_TYPE_NAMES: [&str; PACKET_TYPE_COUNT as usize] = {
-    let mut names = ["<MISSING>"; PACKET_TYPE_COUNT as usize];
+    let mut names = ["<INVALID>"; PACKET_TYPE_COUNT as usize];
     names[PACKET_TYPE_HELLO       as usize] = "PACKET_TYPE_HELLO";
     names[PACKET_TYPE_HELLO_ACK   as usize] = "PACKET_TYPE_HELLO_ACK";
     names[PACKET_TYPE_PEER_LIST   as usize] = "PACKET_TYPE_PEER_LIST";
     names[PACKET_TYPE_CHAT        as usize] = "PACKET_TYPE_CHAT";
-    const_assert!(PACKET_TYPE_COUNT == 4); // keep names array updated when adding other tags
+    const_assert!(PACKET_TYPE_COUNT == 5); // keep names array updated when adding other tags
     names
 };
 
@@ -100,7 +100,7 @@ pub struct Peer {
 }
 
 pub fn send_to(socket: SockHandle, chat_buf: &String, name: &str, node_id: u128, peer: &Peer, buf: &[u8]) -> u64 {
-    if PRINT_RECEIVES { println_redraw!(chat_buf, name, node_id, "Sent {} to: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize], peer.address); }
+    if PRINT_RECEIVES { println_redraw!(chat_buf, name, node_id, "Sent {} to: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize >> 1], peer.address); }
     udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, buf, Dscp::BestEffort).unwrap_or(peer.send_time)
 }
 
@@ -142,7 +142,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 if peer.state == PeerState::Punching {
                     // Send HELLO punch hole with peers.
                     let (mut buf, mut o) = ([0u8; 2048], 0);
-                    o += PACKET_TYPE_HELLO.write_to(&mut buf[o..]);
+                    o += (PACKET_TYPE_HELLO << 1).write_to(&mut buf[o..]);
                     o += node_id          .write_to(&mut buf[o..]);
 
                     if PRINT_HELLO { println_redraw!(chat_buf, name, node_id, "Sending HELLO to: {:?}.", (peer.node_id >> 120, peer.address)); }
@@ -151,7 +151,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 } else if peer.state == PeerState::Connected {
                     // Send PEER_LIST to all connected peers.
                     let (mut buf, mut o) = ([0u8; 2048], 0);
-                    o += PACKET_TYPE_PEER_LIST.write_to(&mut buf[o..]);
+                    o += (PACKET_TYPE_PEER_LIST << 1).write_to(&mut buf[o..]);
 
                     for (node_id, address) in &peer_addresses_list {
                         o += node_id           .write_to(&mut buf[o..]);
@@ -171,8 +171,8 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
             // Send CHAT to all connected peers.
             let (mut buf, mut o) = ([0u8; 2048], 0);
-            o += PACKET_TYPE_CHAT.write_to(&mut buf[o..]);
-            name.as_bytes().write_to(&mut buf[o..]);
+            o += (PACKET_TYPE_CHAT << 1).write_to(&mut buf[o..]);
+            name.as_bytes()             .write_to(&mut buf[o..]);
             o += 64;
             o += line.as_bytes() .write_to(&mut buf[o..]);
 
@@ -234,10 +234,10 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 }
             };
 
-            if PRINT_RECEIVES { println_redraw!(chat_buf, name, node_id, "Got {} from: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize], peer.address); }
+            if PRINT_RECEIVES { println_redraw!(chat_buf, name, node_id, "Got {} from: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize >> 1], peer.address); }
 
             // Reply to all HELLOs with a HELLO_ACK.
-            if buf[0] == PACKET_TYPE_HELLO {
+            if buf[0] >> 1 == PACKET_TYPE_HELLO {
                 let buf = &buf[1..];
 
                 if buf.len() < 16 { continue; }
@@ -253,13 +253,13 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 if PRINT_HELLO { println_redraw!(chat_buf, name, node_id, "Sending HELLO_ACK to: {:?}.", (peer_node_id >> 120, peer.address)); }
 
                 let (mut buf, mut o) = ([0u8; 2048], 0);
-                o += PACKET_TYPE_HELLO_ACK.write_to(&mut buf[o..]);
-                o += node_id              .write_to(&mut buf[o..]);
-                o += peer_node_id         .write_to(&mut buf[o..]);
+                o += (PACKET_TYPE_HELLO_ACK << 1).write_to(&mut buf[o..]);
+                o += node_id                     .write_to(&mut buf[o..]);
+                o += peer_node_id                .write_to(&mut buf[o..]);
 
                 peer.recv_time = recv_time;
                 peer.send_time = send_to(socket, &chat_buf, &name, node_id, peer, &buf[..o]);
-            } else if buf[0] == PACKET_TYPE_HELLO_ACK {
+            } else if buf[0] >> 1 == PACKET_TYPE_HELLO_ACK {
                 let buf = &buf[1..];
 
                 if buf.len() < 16 { continue; }
@@ -288,7 +288,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                 println_redraw!(chat_buf, name, node_id, "Connected to: {:?}. Now connected to {} peers.", (peer_node_id >> 120, address), peers.iter().filter(|peer| peer.state == PeerState::Connected).enumerate().count());
             } else if peer.state == PeerState::Connected {
-                if buf[0] == PACKET_TYPE_PEER_LIST {
+                if buf[0] >> 1 == PACKET_TYPE_PEER_LIST {
                     let buf = &buf[1..];
 
                     let chunks = buf.chunks_exact(34);
@@ -319,7 +319,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     }
 
                     if PRINT_PEER_LIST { println!(""); redraw(&chat_buf, &name, node_id); }
-                } else if buf[0] == PACKET_TYPE_CHAT {
+                } else if buf[0] >> 1 == PACKET_TYPE_CHAT {
                     let buf = &buf[1..];
 
                     if buf.len() < 64 { continue; }
