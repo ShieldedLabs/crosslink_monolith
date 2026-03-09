@@ -80,6 +80,7 @@ pub struct ConnectionTrackingData {
     creation_time_ns: u64,
     my_ip: Ipv6Addr,
     my_transport_identity_keypair: IdentityKeyPair,
+    two_byte_send_prefix: u16,
     other_ip: Ipv6Addr,
     other_port: u16,
     other_transport_identity: Vec<u8>,
@@ -96,6 +97,14 @@ pub enum ConnectionState {
         last_sent_time_ns: u64,
         hello_packet_payload: Vec<u8>,
         handshake: snow::HandshakeState,
+    },
+    SendingServerHelloPlaintext {
+        last_sent_time_ns: u64,
+        hello_packet_payload: Vec<u8>,
+    },
+    ConnectedPlaintext {
+        send_sequence_number: u64,
+        last_sent_keep_alive_time_ns: u64,
     },
 }
 
@@ -124,11 +133,12 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
             
             let my_ip = if beam_to.0.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
-                ConnectionKey { ip: beam_to.0, port: beam_to.1, key_15_bits: 1 | (load_u16(&beam_to.3[0..2]) << 1) },
+                ConnectionKey { ip: beam_to.0, port: beam_to.1, key_15_bits: load_u16(&beam_to.3[0..2]) << 1 },
                 ConnectionTrackingData {
                     creation_time_ns: monotonic_clock_ns(),
                     my_ip,
-                    my_transport_identity_keypair: my_connect_keypair,
+                    my_transport_identity_keypair: my_connect_keypair.clone(),
+                    two_byte_send_prefix: load_u16(&my_connect_keypair.public[0..2]) << 1,
                     other_ip: beam_to.0,
                     other_port: beam_to.1,
                     other_transport_identity: beam_to.3.clone(),
@@ -147,11 +157,12 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
             
             let my_ip = if beam_to.0.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
-                ConnectionKey { ip: beam_to.0, port: beam_to.1, key_15_bits: 1 | (load_u16(&beam_to.3[0..2]) << 1) },
+                ConnectionKey { ip: beam_to.0, port: beam_to.1, key_15_bits: load_u16(&beam_to.3[0..2]) << 1 },
                 ConnectionTrackingData {
                     creation_time_ns: monotonic_clock_ns(),
                     my_ip,
-                    my_transport_identity_keypair: my_connect_keypair,
+                    my_transport_identity_keypair: my_connect_keypair.clone(),
+                    two_byte_send_prefix: load_u16(&my_connect_keypair.public[0..2]) << 1,
                     other_ip: beam_to.0,
                     other_port: beam_to.1,
                     other_transport_identity: beam_to.3.clone(),
@@ -170,15 +181,42 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                 if magic1 & 1 != 0 { // Client Hello
 
                     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-                        println!("incoming plaintext");
-                        if buf_len >= 6 + 32 {
-                            let client_key = &packet_memory_encrypted[6..6+32];
-                            let list_of_protocols_len_bytes = buf_len - 6 - 32;
-                            assert_eq!(list_of_protocols_len_bytes, 0); // temp
-                            // TODO list of supported Application Level protocols for e.g. zcash network upgrades.
-                            println!("plaintext success with {:?}", client_key);
-
-                            // TODO add connection to tracking -- Tracking must include continued handshake state. It does not imply a finished connection. And we have to handle two people connecting to each other gracefully for the hole punch. Tracking state is a hash table where the key is (ip_addr, port, first 15 bits of the identity key)
+                        for key_i in 0..my_listen_keypairs.len() {
+                            let my_kp = &my_listen_keypairs[key_i];
+                            if my_kp.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
+                                if buf_len >= 6 + 32 {
+                                    let client_key = &packet_memory_encrypted[6..6+32];
+                                    let list_of_protocols_len_bytes = buf_len - 6 - 32;
+                                    assert_eq!(list_of_protocols_len_bytes, 0); // temp
+                                    // TODO list of supported Application Level protocols for e.g. zcash network upgrades.
+                                    
+                                    let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
+                                    if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
+                                        println!("TODO DUAL WAY HANDSHAKE");
+                                    }
+                                    else {
+                                        store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
+                                        packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
+                                        // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
+                                        let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32]);
+                                        
+                                        let my_ip = if other_ip_addr.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
+                                        connections_map.insert(
+                                            connection_key,
+                                            ConnectionTrackingData {
+                                                creation_time_ns: monotonic_clock_ns(),
+                                                my_ip,
+                                                my_transport_identity_keypair: my_kp.clone(),
+                                                two_byte_send_prefix: load_u16(&my_kp.public[0..2]) << 1,
+                                                other_ip: other_ip_addr,
+                                                other_port: other_port,
+                                                other_transport_identity: Vec::from(client_key),
+                                                connection_state: ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
+                                            },
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                     else if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
@@ -201,6 +239,40 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                                 }
                             }
                         }
+                    }
+                }
+                else { // Not client hello
+                    loop { // just for early out
+                        let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: magic1 as u16 };
+                        if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
+                            if let ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut existing_connection.connection_state {
+                                if magic1 >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
+                                    let server_key = &packet_memory_encrypted[6..6+32];
+                                    if server_key == existing_connection.other_transport_identity {
+                                        println!("Connected to new server {:?}", server_key);
+                                        existing_connection.connection_state = ConnectionState::ConnectedPlaintext {
+                                            send_sequence_number: 0,
+                                            last_sent_keep_alive_time_ns: 0,
+                                        };
+                                    }
+                                }
+                                break;
+                            }
+                            if let ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut existing_connection.connection_state {
+                                println!("Connected to new client {:?}", existing_connection.other_transport_identity);
+                                existing_connection.connection_state = ConnectionState::ConnectedPlaintext {
+                                    send_sequence_number: 0,
+                                    last_sent_keep_alive_time_ns: 0,
+                                };
+                                // FALLTHROUGH TO PLAINTEXT CONNECTED
+                            }
+                            
+                            if let ConnectionState::ConnectedPlaintext { send_sequence_number, last_sent_keep_alive_time_ns } = &mut existing_connection.connection_state {
+                                let unencrypted_payload = &packet_memory_encrypted[6..buf_len];
+                                println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, unencrypted_payload);
+                            }
+                        }
+                        break;
                     }
                 }
             }
@@ -226,6 +298,26 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                 }
                 if connection_tracking_data.creation_time_ns + 15_000_000_000 < current_time_now_ns {
                     return false;
+                }
+            }
+            if let ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut connection_tracking_data.connection_state {
+                if *last_sent_time_ns + 1_000_000_000 < current_time_now_ns {
+                    udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
+                    *last_sent_time_ns = current_time_now_ns;
+                    return true;
+                }
+                if connection_tracking_data.creation_time_ns + 15_000_000_000 < current_time_now_ns {
+                    return false;
+                }
+            }
+            if let ConnectionState::ConnectedPlaintext { send_sequence_number, last_sent_keep_alive_time_ns } = &mut connection_tracking_data.connection_state {
+                if *last_sent_keep_alive_time_ns + 5_000_000_000 < current_time_now_ns {
+                    store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
+                    store_u32(&mut packet_memory_encrypted[2..6], (*send_sequence_number) as u32);
+                    *send_sequence_number += 1;
+                    udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6], Dscp::Af21);
+                    *last_sent_keep_alive_time_ns = current_time_now_ns;
+                    return true;
                 }
             }
             true

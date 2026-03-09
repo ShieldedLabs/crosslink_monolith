@@ -23,6 +23,19 @@ pub fn load_u48(buf: &[u8]) -> u64 {
     u64::from_le_bytes(tmp)
 }
 #[inline]
+pub fn store_u32(buf: &mut [u8], value: u32) {
+    debug_assert!(buf.len() == 4);
+    buf.copy_from_slice(&value.to_le_bytes()[..4]);
+}
+#[inline]
+pub fn load_u32(buf: &[u8]) -> u32 {
+    debug_assert!(buf.len() == 4);
+
+    let mut tmp = [0u8; 4];
+    tmp[..4].copy_from_slice(buf);
+    u32::from_le_bytes(tmp)
+}
+#[inline]
 pub fn store_u24(buf: &mut [u8], value: u32) {
     debug_assert!(buf.len() == 3);
     buf.copy_from_slice(&value.to_le_bytes()[..3]);
