@@ -10,8 +10,9 @@ use rand::seq::SliceRandom;
 use std::io;
 
 const PRINT_RECEIVES  :bool=0!= (1);
-const PRINT_HELLO     :bool=0!= (0);
-const PRINT_PEER_LIST :bool=0!= (0);
+const PRINT_SENDS     :bool=0!= (1);
+const PRINT_HELLO     :bool=0!= (1);
+const PRINT_PEER_LIST :bool=0!= (1);
 
 
 const MAX_MTU: usize = 15972;
@@ -98,6 +99,11 @@ pub struct Peer {
     pub address: IpAddress,
 }
 
+pub fn send_to(socket: SockHandle, chat_buf: &String, peer: &Peer, buf: &[u8]) -> u64 {
+    if PRINT_RECEIVES { println_redraw!(chat_buf, "Sent {} to: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize], peer.address); }
+    udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, buf, Dscp::BestEffort).unwrap_or(peer.send_time)
+}
+
 pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
     socket_setup();
     monotonic_clock_setup();
@@ -141,7 +147,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                     if PRINT_HELLO { println_redraw!(chat_buf, "Sending HELLO to: {:?}.", (peer.node_id >> 120, peer.address)); }
 
-                    peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+                    peer.send_time = send_to(socket, &chat_buf, peer, &buf[..o]);
                 } else if peer.state == PeerState::Connected {
                     // Send PEER_LIST to all connected peers.
                     let (mut buf, mut o) = ([0u8; 2048], 0);
@@ -155,7 +161,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                     // println_redraw!(chat_buf, "Sending PEER_LIST to: {:?}. It contains {} addresses.", (peer.node_id >> 120, peer.address), peer_addresses_list.len());
 
-                    peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+                    peer.send_time = send_to(socket, &chat_buf, peer, &buf[..o]);
                 }
             }
         }
@@ -172,7 +178,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
             for peer in &mut peers {
                 if peer.state == PeerState::Connected {
-                    peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+                    peer.send_time = send_to(socket, &chat_buf, peer, &buf[..o]);
                 }
             }
 
@@ -252,7 +258,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 o += peer_node_id         .write_to(&mut buf[o..]);
 
                 peer.recv_time = recv_time;
-                peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+                peer.send_time = send_to(socket, &chat_buf, peer, &buf[..o]);
             } else if buf[0] == PACKET_TYPE_HELLO_ACK {
                 let buf = &buf[1..];
 
@@ -292,6 +298,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                     peer.recv_time = recv_time;
 
+                    let mut comma = false;
                     for chunk in chunks {
                         let id   =      u128::from_le_bytes(<[u8; 16]>::try_from(&chunk[ 0..16]).unwrap());
                         let ip   = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[16..32]).unwrap());
@@ -299,7 +306,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                         let address = IpAddress(ip, port);
 
-                        if PRINT_PEER_LIST { print!("{:?}, ", (id >> 120, address)); }
+                        if PRINT_PEER_LIST { if comma { print!(", "); } else { comma = true; } print!("{:?}", (id >> 120, address)); }
 
                         if id == node_id {
                             continue;
