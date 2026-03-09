@@ -271,8 +271,14 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                             }
                             
                             if let ConnectionState::Connected { handshake, send_sequence_number, last_sent_keep_alive_time_ns } = &mut existing_connection.connection_state {
-                                let unencrypted_payload = &packet_memory_encrypted[6..buf_len];
-                                println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, unencrypted_payload);
+                                let payload;
+                                if let Some(handshake) = handshake {
+                                    panic!("Not implemented");
+                                }
+                                else {
+                                    payload = &packet_memory_encrypted[6..buf_len];
+                                }
+                                println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload);
                             }
                         }
                         break;
