@@ -83,6 +83,20 @@ pub struct ConnectionTrackingData {
     other_ip: Ipv6Addr,
     other_port: u16,
     other_transport_identity: Vec<u8>,
+    connection_state: ConnectionState,
+}
+
+#[derive(Debug)]
+pub enum ConnectionState {
+    SendingClientHelloPlaintext {
+        last_sent_time_ns: u64,
+        hello_packet_payload: Vec<u8>,
+    },
+    SendingClientHello {
+        last_sent_time_ns: u64,
+        hello_packet_payload: Vec<u8>,
+        handshake: snow::HandshakeState,
+    },
 }
 
 pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, my_listen_keypairs: Vec<IdentityKeyPair>, beam_to: Option<(Ipv6Addr, u16, u64, Vec<u8>)>) {
@@ -106,8 +120,7 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
             assert_eq!(my_connect_keypair.public.len(), 32);
             packet_memory_encrypted[6..6+32].copy_from_slice(&my_connect_keypair.public[..]);
             packet_memory_encrypted[6+32..6+32+list_of_protocols_len_bytes].copy_from_slice(&packet_memory_send[0..list_of_protocols_len_bytes]);
-            udp_send_with_congestion_and_dscp(socket, beam_to.0, beam_to.1, &packet_memory_encrypted[0..6+32+list_of_protocols_len_bytes], Dscp::Af21);
-            // TODO add connection to tracking -- Tracking must include continued handshake state. It does not imply a finished connection. And we have to handle two people connecting to each other gracefully for the hole punch. Tracking state is a hash table where the key is (ip_addr, port, first 15 bits of the identity key)
+            let hello_packet_payload = Vec::from(&packet_memory_encrypted[0..6+32+list_of_protocols_len_bytes]);
             
             let my_ip = if beam_to.0.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
@@ -119,6 +132,7 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                     other_ip: beam_to.0,
                     other_port: beam_to.1,
                     other_transport_identity: beam_to.3.clone(),
+                    connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
                 },
             );
         }
@@ -129,13 +143,25 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                 .remote_public_key(&beam_to.3[..]).unwrap()
                 .build_initiator().unwrap();
             let handshake_size = handshake.write_message(&packet_memory_send[0..list_of_protocols_len_bytes], &mut packet_memory_encrypted[6..]).unwrap();
-
-            udp_send_with_congestion_and_dscp(socket, beam_to.0, beam_to.1, &packet_memory_encrypted[0..6+handshake_size], Dscp::Af21);
-            // TODO add connection to tracking -- Tracking must include continued handshake state. It does not imply a finished connection. And we have to handle two people connecting to each other gracefully for the hole punch. Tracking state is a hash table where the key is (ip_addr, port, first 15 bits of the identity key)
+            let hello_packet_payload = Vec::from(&packet_memory_encrypted[0..6+handshake_size]);
+            
+            let my_ip = if beam_to.0.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
+            connections_map.insert(
+                ConnectionKey { ip: beam_to.0, port: beam_to.1, key_15_bits: 1 | (load_u16(&beam_to.3[0..2]) << 1) },
+                ConnectionTrackingData {
+                    creation_time_ns: monotonic_clock_ns(),
+                    my_ip,
+                    my_transport_identity_keypair: my_connect_keypair,
+                    other_ip: beam_to.0,
+                    other_port: beam_to.1,
+                    other_transport_identity: beam_to.3.clone(),
+                    connection_state: ConnectionState::SendingClientHello { last_sent_time_ns: 0, hello_packet_payload, handshake },
+                },
+            );
         }
     }
     
-    println!("{:#?}", connections_map);
+    //println!("{:#?}", connections_map);
 
     loop {
         if let Ok((buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns)) = udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
@@ -179,6 +205,31 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                 }
             }
         }
+        
+        let current_time_now_ns = monotonic_clock_ns();
+        connections_map.retain(|connection_key, connection_tracking_data| {
+            if let ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut connection_tracking_data.connection_state {
+                if *last_sent_time_ns + 1_000_000_000 < current_time_now_ns {
+                    udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
+                    *last_sent_time_ns = current_time_now_ns;
+                    return true;
+                }
+                if connection_tracking_data.creation_time_ns + 15_000_000_000 < current_time_now_ns {
+                    return false;
+                }
+            }
+            if let ConnectionState::SendingClientHello { last_sent_time_ns, hello_packet_payload, handshake } = &mut connection_tracking_data.connection_state {
+                if *last_sent_time_ns + 1_000_000_000 < current_time_now_ns {
+                    udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
+                    *last_sent_time_ns = current_time_now_ns;
+                    return true;
+                }
+                if connection_tracking_data.creation_time_ns + 15_000_000_000 < current_time_now_ns {
+                    return false;
+                }
+            }
+            true
+        });
     }
 }
 
