@@ -131,11 +131,31 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
     let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
     let mut packet_memory_recv = new_packet_memory(); // Incoming Decrypted
     let mut packet_memory_send = new_packet_memory(); // Outgoing Decrypted
-    
+
     let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
 
     let socket = setup_and_bind_udp_socket(my_port);
+
     if let Some(beam_to) = beam_to {
+        connect_to_endpoint(&mut connections_map, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_connect_keypair, &my_listen_keypairs, beam_to);
+    }
+
+    //println!("{:#?}", connections_map);
+
+    loop {
+        service_connections(&mut connections_map, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_connect_keypair, &my_listen_keypairs);
+    }
+}
+
+pub fn connect_to_endpoint(connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
+                           packet_memory_encrypted: &mut PacketMemory,
+                           packet_memory_recv: &mut PacketMemory,
+                           packet_memory_send: &mut PacketMemory,
+                           socket: SockHandle,
+                           my_connect_keypair: &IdentityKeyPair,
+                           my_listen_keypairs: &Vec<IdentityKeyPair>,
+                           beam_to: (Ipv6Addr, u16, u64, Vec<u8>)) {
+    if let beam_to = beam_to {
         assert!(my_connect_keypair.magic1 == beam_to.2);
 
         // TODO list of supported Application Level protocols for e.g. zcash network upgrades.
@@ -192,10 +212,18 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
             );
         }
     }
-    
-    //println!("{:#?}", connections_map);
+}
 
-    loop {
+
+pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
+                           packet_memory_encrypted: &mut PacketMemory,
+                           packet_memory_recv: &mut PacketMemory,
+                           packet_memory_send: &mut PacketMemory,
+                           socket: SockHandle,
+                           my_connect_keypair: &IdentityKeyPair,
+                           my_listen_keypairs: &Vec<IdentityKeyPair>) {
+
+    {
         if let Ok((buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns)) = udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
             if buf_len >= 6 {
                 let magic1 = load_u48(&packet_memory_encrypted[0..6]);

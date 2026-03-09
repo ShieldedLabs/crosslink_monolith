@@ -1145,7 +1145,7 @@ mod windows {
                     size_of::<SockAddrIn6Raw>() as i32,
                 ) == SOCKET_ERROR
                 {
-                    match unsafe { WSAGetLastError() } {
+                    match WSAGetLastError() {
                         WSAENETUNREACH | WSAEHOSTUNREACH | WSAEADDRNOTAVAIL => None,
                         e => panic!("ipv6 probe connect() failed: {}", std::io::Error::from_raw_os_error(e)),
                     }
@@ -1177,7 +1177,9 @@ mod windows {
                     }
                 };
 
-                closesocket(probe_sock);
+                if closesocket(probe_sock) == SOCKET_ERROR {
+                    panic!("closesocket() failed: {}", wsa_last_error());
+                }
                 ret
             };
 
