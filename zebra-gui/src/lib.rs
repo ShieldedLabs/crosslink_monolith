@@ -18,6 +18,41 @@ pub use viz_gui::*;
 
 const TURN_OFF_HASH_BASED_LAZY_RENDER: usize = 0;
 
+#[derive(Clone, Copy, PartialOrd, PartialEq, Ord, Eq, Debug, Default)]
+#[repr(u8)]
+pub enum InteractiveVizOp {
+    #[default]
+    None,
+
+    // on PoW
+    LF,
+    // fin,
+    candidate,
+
+    // on PoS
+    bft_last_final,
+    origbft_last_final,
+    snapshot,
+}
+impl InteractiveVizOp {
+    pub fn valid_for_bc(&self) -> bool {
+        InteractiveVizOp::LF <= *self && *self <= InteractiveVizOp::candidate
+    }
+    pub fn valid_for_bft(&self) -> bool {
+        InteractiveVizOp::bft_last_final <= *self && *self <= InteractiveVizOp::snapshot
+    }
+    pub fn cycle_next(&self) -> Self {
+        match self {
+            InteractiveVizOp::None           => InteractiveVizOp::LF,
+            InteractiveVizOp::LF             => InteractiveVizOp::bft_last_final,
+            InteractiveVizOp::bft_last_final => InteractiveVizOp::snapshot,
+            InteractiveVizOp::snapshot       => InteractiveVizOp::candidate,
+            _ => InteractiveVizOp::None,
+        }
+    }
+}
+
+
 #[allow(unused_imports)]
 use std::{alloc::{alloc, dealloc, Layout}, hash::Hasher, hint::spin_loop, mem::{swap, transmute, MaybeUninit}, ptr::{copy_nonoverlapping, slice_from_raw_parts}, rc::Rc, sync::{atomic::{AtomicU32, Ordering}, Barrier}, time::{Duration, Instant}, u32};
 use twox_hash::xxhash3_64;

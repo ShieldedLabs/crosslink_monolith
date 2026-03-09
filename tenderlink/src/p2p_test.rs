@@ -1,5 +1,6 @@
 
 use std::net::Ipv6Addr;
+use static_assertions::const_assert;
 
 use rand::RngCore;
 use rand_chacha::ChaCha20Rng;
@@ -8,8 +9,10 @@ use rand::seq::SliceRandom;
 
 use std::io;
 
-const PRINT_PEER_LIST :bool=0!= (0);
+const PRINT_RECEIVES  :bool=0!= (0);
+const PRINT_SENDS     :bool=0!= (0);
 const PRINT_HELLO     :bool=0!= (0);
+const PRINT_PEER_LIST :bool=0!= (0);
 
 
 const MAX_MTU: usize = 15972;
@@ -19,6 +22,17 @@ const PACKET_TYPE_HELLO:     u8 = 0;
 const PACKET_TYPE_HELLO_ACK: u8 = 1;
 const PACKET_TYPE_PEER_LIST: u8 = 2;
 const PACKET_TYPE_CHAT:      u8 = 3;
+const PACKET_TYPE_COUNT:     u8 = 4;
+
+const PACKET_TYPE_NAMES: [&str; PACKET_TYPE_COUNT as usize] = {
+    let mut names = ["<MISSING>"; PACKET_TYPE_COUNT as usize];
+    names[PACKET_TYPE_HELLO       as usize] = "PACKET_TYPE_HELLO";
+    names[PACKET_TYPE_HELLO_ACK   as usize] = "PACKET_TYPE_HELLO_ACK";
+    names[PACKET_TYPE_PEER_LIST   as usize] = "PACKET_TYPE_PEER_LIST";
+    names[PACKET_TYPE_CHAT        as usize] = "PACKET_TYPE_CHAT";
+    const_assert!(PACKET_TYPE_COUNT == 4); // keep names array updated when adding other tags
+    names
+};
 
 use std::sync::mpsc;
 use std::thread;
@@ -32,16 +46,16 @@ impl RawModePanicSafe { fn new() -> Self { crossterm::terminal::enable_raw_mode(
 impl Drop for RawModePanicSafe { fn drop(&mut self) { crossterm::terminal::disable_raw_mode().unwrap(); } }
 
 pub fn clear_line() { print!("\x1b[1K\r"); }
-pub fn redraw(buf: &str) { clear_line(); print!("> {}", buf); stdout().flush().unwrap(); }
-pub fn tick(buf: &mut String) -> Option<String> {
+pub fn redraw(buf: &str, name: &str, node_id: u128) { clear_line(); print!("{} ({})> {}", name, node_id >> 120, buf); stdout().flush().unwrap(); }
+pub fn tick(buf: &mut String, name: &str, node_id: u128) -> Option<String> {
     if !poll(std::time::Duration::ZERO).unwrap() { return None; }
     if let Event::Key(k) = read().unwrap() && k.kind == KeyEventKind::Press {
         match k.code {
-            KeyCode::Char('C') |
-            KeyCode::Char('c') => { if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) { std::process::exit(0); } }
-            KeyCode::Char(c)   => { buf.push(c); redraw(buf); }
-            KeyCode::Backspace => { buf.pop();   redraw(buf); }
-            KeyCode::Enter     => { let s = buf.clone(); buf.clear(); redraw(""); return Some(s); }
+            (KeyCode::Char('C') |
+             KeyCode::Char('c')) if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => { crossterm::terminal::disable_raw_mode(); std::process::exit(0); }
+            KeyCode::Char(c)   => { buf.push(c); redraw(buf, name, node_id); }
+            KeyCode::Backspace => { buf.pop();   redraw(buf, name, node_id); }
+            KeyCode::Enter     => { let s = buf.clone(); buf.clear(); redraw("", name, node_id); return Some(s); }
             _ => {}
         }
     }
@@ -49,10 +63,10 @@ pub fn tick(buf: &mut String) -> Option<String> {
 }
 
 macro_rules! println_redraw {
-    ($buf:expr, $($arg:tt)*) => {{
+    ($buf:expr, $name:expr, $node_id:expr, $($arg:tt)*) => {{
         clear_line();
         println!($($arg)*);
-        redraw(&$buf);
+        redraw(&$buf, &$name, $node_id);
     }}
 }
 
@@ -83,6 +97,11 @@ pub struct Peer {
     pub send_time: u64,
     pub recv_time: u64,
     pub address: IpAddress,
+}
+
+pub fn send_to(socket: SockHandle, chat_buf: &String, name: &str, node_id: u128, peer: &Peer, buf: &[u8]) -> u64 {
+    if PRINT_RECEIVES { println_redraw!(chat_buf, name, node_id, "Sent {} to: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize], peer.address); }
+    udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, buf, Dscp::BestEffort).unwrap_or(peer.send_time)
 }
 
 pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
@@ -126,9 +145,9 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     o += PACKET_TYPE_HELLO.write_to(&mut buf[o..]);
                     o += node_id          .write_to(&mut buf[o..]);
 
-                    if PRINT_HELLO { println_redraw!(chat_buf, "Sending HELLO to: {:?}.", peer.address); }
+                    if PRINT_HELLO { println_redraw!(chat_buf, name, node_id, "Sending HELLO to: {:?}.", (peer.node_id >> 120, peer.address)); }
 
-                    peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+                    peer.send_time = send_to(socket, &chat_buf, &name, node_id, peer, &buf[..o]);
                 } else if peer.state == PeerState::Connected {
                     // Send PEER_LIST to all connected peers.
                     let (mut buf, mut o) = ([0u8; 2048], 0);
@@ -140,14 +159,14 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                         o += address.1         .write_to(&mut buf[o..]);
                     }
 
-                    // println_redraw!(chat_buf, "Sending PEER_LIST to: {:?}. It contains {} addresses.", peer.address, peer_addresses_list.len());
+                    // println_redraw!(chat_buf, name, node_id, "Sending PEER_LIST to: {:?}. It contains {} addresses.", (peer.node_id >> 120, peer.address), peer_addresses_list.len());
 
-                    peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+                    peer.send_time = send_to(socket, &chat_buf, &name, node_id, peer, &buf[..o]);
                 }
             }
         }
 
-        if let Some(mut line) = tick(&mut chat_buf) {
+        if let Some(mut line) = tick(&mut chat_buf, &name, node_id) {
             line.truncate(1024);
 
             // Send CHAT to all connected peers.
@@ -159,18 +178,18 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
             for peer in &mut peers {
                 if peer.state == PeerState::Connected {
-                    peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+                    peer.send_time = send_to(socket, &chat_buf, &name, node_id, peer, &buf[..o]);
                 }
             }
 
-            println_redraw!(chat_buf, "{} ({}): {}", name, node_id >> 120, line);
+            println_redraw!(chat_buf, name, node_id, "{} ({}): {}", name, node_id >> 120, line);
         }
 
         // Timeout peers.
         for peer in &mut peers {
             let timeout = (now - peer.recv_time) >= 5_000_000_000;
             if timeout && peer.state == PeerState::Connected {
-                println_redraw!(chat_buf, "Disconnected from: {:?}.", peer.address);
+                println_redraw!(chat_buf, name, node_id, "Disconnected from: {:?}.", (peer.node_id >> 120, peer.address));
 
                 peer.state = PeerState::Punching;
             }
@@ -194,7 +213,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     },
                     Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => { break; },
                     Err(e) => {
-                        // println_redraw!(chat_buf, "{:?}", e);
+                        // println_redraw!(chat_buf, name, node_id, "{:?}", e);
                         continue;
                     },
                 }
@@ -215,6 +234,8 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 }
             };
 
+            if PRINT_RECEIVES { println_redraw!(chat_buf, name, node_id, "Got {} from: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize], peer.address); }
+
             // Reply to all HELLOs with a HELLO_ACK.
             if buf[0] == PACKET_TYPE_HELLO {
                 let buf = &buf[1..];
@@ -229,7 +250,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     continue;
                 }
 
-                if PRINT_HELLO { println_redraw!(chat_buf, "Sending HELLO_ACK to: {:?}.", peer.address); }
+                if PRINT_HELLO { println_redraw!(chat_buf, name, node_id, "Sending HELLO_ACK to: {:?}.", (peer_node_id >> 120, peer.address)); }
 
                 let (mut buf, mut o) = ([0u8; 2048], 0);
                 o += PACKET_TYPE_HELLO_ACK.write_to(&mut buf[o..]);
@@ -237,7 +258,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 o += peer_node_id         .write_to(&mut buf[o..]);
 
                 peer.recv_time = recv_time;
-                peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
+                peer.send_time = send_to(socket, &chat_buf, &name, node_id, peer, &buf[..o]);
             } else if buf[0] == PACKET_TYPE_HELLO_ACK {
                 let buf = &buf[1..];
 
@@ -265,7 +286,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 peer.state = PeerState::Connected;
                 peer.node_id = peer_node_id;
 
-                println_redraw!(chat_buf, "Connected to: {:?}. Now connected to {} peers.", address, peers.iter().filter(|peer| peer.state == PeerState::Connected).enumerate().count());
+                println_redraw!(chat_buf, name, node_id, "Connected to: {:?}. Now connected to {} peers.", (peer_node_id >> 120, address), peers.iter().filter(|peer| peer.state == PeerState::Connected).enumerate().count());
             } else if peer.state == PeerState::Connected {
                 if buf[0] == PACKET_TYPE_PEER_LIST {
                     let buf = &buf[1..];
@@ -273,10 +294,11 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     let chunks = buf.chunks_exact(34);
 
                     clear_line();
-                    if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses:", chunks.len()); }
+                    if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses: ", chunks.len()); }
 
                     peer.recv_time = recv_time;
 
+                    let mut comma = false;
                     for chunk in chunks {
                         let id   =      u128::from_le_bytes(<[u8; 16]>::try_from(&chunk[ 0..16]).unwrap());
                         let ip   = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[16..32]).unwrap());
@@ -284,7 +306,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
 
                         let address = IpAddress(ip, port);
 
-                        if PRINT_PEER_LIST { print!("{:?}, ", (id >> 120, address)); }
+                        if PRINT_PEER_LIST { if comma { print!(", "); } else { comma = true; } print!("{:?}", (id >> 120, address)); }
 
                         if id == node_id {
                             continue;
@@ -296,18 +318,18 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                         }
                     }
 
-                    if PRINT_PEER_LIST { println!(""); redraw(&chat_buf); }
+                    if PRINT_PEER_LIST { println!(""); redraw(&chat_buf, &name, node_id); }
                 } else if buf[0] == PACKET_TYPE_CHAT {
                     let buf = &buf[1..];
 
                     if buf.len() < 64 { continue; }
 
-                    let name = &buf[..64];
+                    let peer_name = &buf[..64];
 
                     let buf = &buf[64..];
 
-                    println_redraw!(chat_buf, "{} ({}): {}",
-                                    std::str::from_utf8(name).unwrap_or("?").trim_end_matches('\0'),
+                    println_redraw!(chat_buf, name, node_id, "{} ({}): {}",
+                                    std::str::from_utf8(peer_name).unwrap_or("?").trim_end_matches('\0'),
                                     peer.node_id >> 120,
                                     std::str::from_utf8(buf).unwrap_or("?").trim_end_matches('\0'));
                 }
