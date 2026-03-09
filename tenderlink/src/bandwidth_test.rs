@@ -37,6 +37,24 @@ fn handshake_test() {
     do_the_test_program2(29853, kp3.clone(), vec![kp3], Some((Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, kp1_pub2)));
 }
 
+#[test]
+fn contested_test() {
+    println!("Begin the test!");
+
+    let kp1 = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
+    let kp1_pub = kp1.public.clone();
+    let kp2 = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
+    let kp2_pub = kp2.public.clone();
+
+    socket_setup();
+    monotonic_clock_setup();
+
+    let _handle = std::thread::spawn(|| {
+        do_the_test_program2(32845, kp1.clone(), vec![kp1], Some((Ipv6Addr::LOCALHOST, 29853, CONNECT_MAGIC1_PLAIN_TEXT, kp2_pub)));
+    });
+    do_the_test_program2(29853, kp2.clone(), vec![kp2], Some((Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_PLAIN_TEXT, kp1_pub)));
+}
+
 // LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
 const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s: u64 = 0x7193_c304_f8d5;
 const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b: u64 = 0xbe53_b364_1ce1;
@@ -143,7 +161,8 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                     other_ip: beam_to.0,
                     other_port: beam_to.1,
                     other_transport_identity: beam_to.3.clone(),
-                    connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
+                    // later when not testing last_sent_time_ns should be zero
+                    connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: monotonic_clock_ns(), hello_packet_payload },
                 },
             );
         }
@@ -167,7 +186,8 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                     other_ip: beam_to.0,
                     other_port: beam_to.1,
                     other_transport_identity: beam_to.3.clone(),
-                    connection_state: ConnectionState::SendingClientHello { last_sent_time_ns: 0, hello_packet_payload, handshake },
+                    // later when not testing last_sent_time_ns should be zero
+                    connection_state: ConnectionState::SendingClientHello { last_sent_time_ns: monotonic_clock_ns(), hello_packet_payload, handshake },
                 },
             );
         }
@@ -193,7 +213,18 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                                     
                                     let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
                                     if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
-                                        println!("TODO DUAL WAY HANDSHAKE");
+                                        if &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key {
+                                            if let ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut existing_connection.connection_state {
+                                                if *client_key < *my_kp.public {
+                                                    store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
+                                                    packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
+                                                    // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
+                                                    let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32]);
+                                                    
+                                                    existing_connection.connection_state = ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload };
+                                                }
+                                            }
+                                        }
                                     }
                                     else {
                                         store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
