@@ -102,7 +102,8 @@ pub enum ConnectionState {
         last_sent_time_ns: u64,
         hello_packet_payload: Vec<u8>,
     },
-    ConnectedPlaintext {
+    Connected {
+        handshake: Option<snow::HandshakeState>,
         send_sequence_number: u64,
         last_sent_keep_alive_time_ns: u64,
     },
@@ -250,7 +251,8 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                                     let server_key = &packet_memory_encrypted[6..6+32];
                                     if server_key == existing_connection.other_transport_identity {
                                         println!("Connected to new server {:?}", server_key);
-                                        existing_connection.connection_state = ConnectionState::ConnectedPlaintext {
+                                        existing_connection.connection_state = ConnectionState::Connected {
+                                            handshake: None,
                                             send_sequence_number: 0,
                                             last_sent_keep_alive_time_ns: 0,
                                         };
@@ -260,14 +262,15 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                             }
                             if let ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut existing_connection.connection_state {
                                 println!("Connected to new client {:?}", existing_connection.other_transport_identity);
-                                existing_connection.connection_state = ConnectionState::ConnectedPlaintext {
+                                existing_connection.connection_state = ConnectionState::Connected {
+                                    handshake: None,
                                     send_sequence_number: 0,
                                     last_sent_keep_alive_time_ns: 0,
                                 };
                                 // FALLTHROUGH TO PLAINTEXT CONNECTED
                             }
                             
-                            if let ConnectionState::ConnectedPlaintext { send_sequence_number, last_sent_keep_alive_time_ns } = &mut existing_connection.connection_state {
+                            if let ConnectionState::Connected { handshake, send_sequence_number, last_sent_keep_alive_time_ns } = &mut existing_connection.connection_state {
                                 let unencrypted_payload = &packet_memory_encrypted[6..buf_len];
                                 println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, unencrypted_payload);
                             }
@@ -310,7 +313,7 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
                     return false;
                 }
             }
-            if let ConnectionState::ConnectedPlaintext { send_sequence_number, last_sent_keep_alive_time_ns } = &mut connection_tracking_data.connection_state {
+            if let ConnectionState::Connected { handshake, send_sequence_number, last_sent_keep_alive_time_ns } = &mut connection_tracking_data.connection_state {
                 if *last_sent_keep_alive_time_ns + 5_000_000_000 < current_time_now_ns {
                     store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
                     store_u32(&mut packet_memory_encrypted[2..6], (*send_sequence_number) as u32);
