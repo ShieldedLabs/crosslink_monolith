@@ -38,7 +38,7 @@ pub fn tick(buf: &mut String) -> Option<String> {
     if let Event::Key(k) = read().unwrap() && k.kind == KeyEventKind::Press {
         match k.code {
             (KeyCode::Char('C') |
-            KeyCode::Char('c')) if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => { std::process::exit(0); }
+             KeyCode::Char('c')) if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => { crossterm::terminal::disable_raw_mode(); std::process::exit(0); }
             KeyCode::Char(c)   => { buf.push(c); redraw(buf); }
             KeyCode::Backspace => { buf.pop();   redraw(buf); }
             KeyCode::Enter     => { let s = buf.clone(); buf.clear(); redraw(""); return Some(s); }
@@ -126,7 +126,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     o += PACKET_TYPE_HELLO.write_to(&mut buf[o..]);
                     o += node_id          .write_to(&mut buf[o..]);
 
-                    if PRINT_HELLO { println_redraw!(chat_buf, "Sending HELLO to: {:?}.", peer.address); }
+                    if PRINT_HELLO { println_redraw!(chat_buf, "Sending HELLO to: {:?}.", (peer.node_id >> 120, peer.address)); }
 
                     peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
                 } else if peer.state == PeerState::Connected {
@@ -140,7 +140,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                         o += address.1         .write_to(&mut buf[o..]);
                     }
 
-                    // println_redraw!(chat_buf, "Sending PEER_LIST to: {:?}. It contains {} addresses.", peer.address, peer_addresses_list.len());
+                    // println_redraw!(chat_buf, "Sending PEER_LIST to: {:?}. It contains {} addresses.", (peer.node_id >> 120, peer.address), peer_addresses_list.len());
 
                     peer.send_time = udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, &buf[..o], Dscp::BestEffort).unwrap_or(peer.send_time);
                 }
@@ -170,7 +170,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
         for peer in &mut peers {
             let timeout = (now - peer.recv_time) >= 5_000_000_000;
             if timeout && peer.state == PeerState::Connected {
-                println_redraw!(chat_buf, "Disconnected from: {:?}.", peer.address);
+                println_redraw!(chat_buf, "Disconnected from: {:?}.", (peer.node_id >> 120, peer.address));
 
                 peer.state = PeerState::Punching;
             }
@@ -229,7 +229,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     continue;
                 }
 
-                if PRINT_HELLO { println_redraw!(chat_buf, "Sending HELLO_ACK to: {:?}.", peer.address); }
+                if PRINT_HELLO { println_redraw!(chat_buf, "Sending HELLO_ACK to: {:?}.", (peer_node_id >> 120, peer.address)); }
 
                 let (mut buf, mut o) = ([0u8; 2048], 0);
                 o += PACKET_TYPE_HELLO_ACK.write_to(&mut buf[o..]);
@@ -265,7 +265,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                 peer.state = PeerState::Connected;
                 peer.node_id = peer_node_id;
 
-                println_redraw!(chat_buf, "Connected to: {:?}. Now connected to {} peers.", address, peers.iter().filter(|peer| peer.state == PeerState::Connected).enumerate().count());
+                println_redraw!(chat_buf, "Connected to: {:?}. Now connected to {} peers.", (peer_node_id >> 120, address), peers.iter().filter(|peer| peer.state == PeerState::Connected).enumerate().count());
             } else if peer.state == PeerState::Connected {
                 if buf[0] == PACKET_TYPE_PEER_LIST {
                     let buf = &buf[1..];
@@ -273,7 +273,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<IpAddress>) {
                     let chunks = buf.chunks_exact(34);
 
                     clear_line();
-                    if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses:", chunks.len()); }
+                    if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses: ", chunks.len()); }
 
                     peer.recv_time = recv_time;
 
