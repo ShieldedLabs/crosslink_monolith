@@ -1067,7 +1067,122 @@ mod windows {
     pub fn udp_probe_source_addresses( // Windows
         _udp_socket: SockHandle,
     ) -> (Option<Ipv6Addr>, Option<Ipv6Addr>) {
-        (None, None)
+        unsafe {
+            let ipv4 = {
+                let probe_sock = socket(AF_INET as i32, SOCK_DGRAM as i32, IPPROTO_UDP as i32);
+                if probe_sock == INVALID_SOCKET {
+                    panic!("socket(AF_INET) failed: {}", wsa_last_error());
+                }
+
+                let dst = SockAddrInRaw {
+                    sin_family: AF_INET as u16,
+                    sin_port: 53u16.to_be(),
+                    sin_addr: [1, 1, 1, 1],
+                    sin_zero: [0; 8],
+                };
+
+                let ret = if connect(
+                    probe_sock,
+                    &dst as *const _ as *const SOCKADDR,
+                    size_of::<SockAddrInRaw>() as i32,
+                ) == SOCKET_ERROR
+                {
+                    match WSAGetLastError() {
+                        WSAENETUNREACH | WSAEHOSTUNREACH | WSAEADDRNOTAVAIL => None,
+                        e => panic!("ipv4 probe connect() failed: {}", std::io::Error::from_raw_os_error(e)),
+                    }
+                } else {
+                    let mut local: SockAddrInRaw = zeroed();
+                    let mut local_len = size_of::<SockAddrInRaw>() as i32;
+
+                    if getsockname(
+                        probe_sock,
+                        &mut local as *mut _ as *mut SOCKADDR,
+                        &mut local_len as *mut _,
+                    ) == SOCKET_ERROR
+                    {
+                        panic!("ipv4 probe getsockname() failed: {}", wsa_last_error());
+                    }
+
+                    let addr = std::net::Ipv4Addr::from(local.sin_addr).to_ipv6_mapped();
+
+                    if addr.is_unspecified() || addr.is_loopback() || addr.is_unicast_link_local() {
+                        None
+                    } else {
+                        Some(addr)
+                    }
+                };
+
+                if closesocket(probe_sock) == SOCKET_ERROR {
+                    panic!("closesocket() failed: {}", wsa_last_error());
+                }
+                ret
+            };
+
+            let ipv6 = {
+                let probe_sock = socket(AF_INET6 as i32, SOCK_DGRAM as i32, IPPROTO_UDP as i32);
+                if probe_sock == INVALID_SOCKET {
+                    panic!("socket(AF_INET6) failed: {}", wsa_last_error());
+                }
+
+                let dst = SockAddrIn6Raw {
+                    sin6_family: AF_INET6 as u16,
+                    sin6_port: 53u16.to_be(),
+                    sin6_flowinfo: 0,
+                    // 2606:4700:4700::1111
+                    sin6_addr: [
+                        0x26, 0x06, 0x47, 0x00,
+                        0x47, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x11, 0x11,
+                    ],
+                    sin6_scope_id: 0,
+                };
+
+                let ret = if connect(
+                    probe_sock,
+                    &dst as *const _ as *const SOCKADDR,
+                    size_of::<SockAddrIn6Raw>() as i32,
+                ) == SOCKET_ERROR
+                {
+                    match unsafe { WSAGetLastError() } {
+                        WSAENETUNREACH | WSAEHOSTUNREACH | WSAEADDRNOTAVAIL => None,
+                        e => panic!("ipv6 probe connect() failed: {}", std::io::Error::from_raw_os_error(e)),
+                    }
+                } else {
+                    let mut local: SockAddrIn6Raw = zeroed();
+                    let mut local_len = size_of::<SockAddrIn6Raw>() as i32;
+
+                    if getsockname(
+                        probe_sock,
+                        &mut local as *mut _ as *mut SOCKADDR,
+                        &mut local_len as *mut _,
+                    ) == SOCKET_ERROR
+                    {
+                        panic!("ipv6 probe getsockname() failed: {}", wsa_last_error());
+                    }
+
+                    let addr = Ipv6Addr::from(local.sin6_addr);
+                    let seg = addr.segments();
+
+                    if addr.is_unspecified()
+                        || addr.is_loopback()
+                        || addr.is_multicast()
+                        || addr.is_unicast_link_local()
+                        || (seg[4] == 0 && seg[5] == 0 && seg[6] == 0 && seg[7] == 0)
+                    {
+                        None
+                    } else {
+                        Some(addr)
+                    }
+                };
+
+                closesocket(probe_sock);
+                ret
+            };
+
+            (ipv4, ipv6)
+        }
     }
 }
 
