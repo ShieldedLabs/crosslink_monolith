@@ -28,13 +28,13 @@ pub fn handshake_test() {
     let _handle = std::thread::spawn(|| {
         let mut kp1_but_plaintext = kp1.clone();
         kp1_but_plaintext.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
-        do_the_test_program2(32845, kp1.clone(), vec![kp1, kp1_but_plaintext], None);
+        do_the_test_program2(32845, vec![kp1, kp1_but_plaintext], None);
     });
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let _handle = std::thread::spawn(|| {
-        do_the_test_program2(29854, kp2.clone(), vec![kp2], Some((Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_PLAIN_TEXT, kp1_pub)));
+    let _handle = std::thread::spawn(move || {
+        do_the_test_program2(29854, vec![kp2.clone()], Some((&kp2, &STPAddress(Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_PLAIN_TEXT, kp1_pub))));
     });
-    do_the_test_program2(29853, kp3.clone(), vec![kp3], Some((Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, kp1_pub2)));
+    do_the_test_program2(29853, vec![kp3.clone()], Some((&kp3, &STPAddress(Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, kp1_pub2))));
 }
 
 #[test]
@@ -49,10 +49,10 @@ fn contested_test() {
     socket_setup();
     monotonic_clock_setup();
 
-    let _handle = std::thread::spawn(|| {
-        do_the_test_program2(32845, kp1.clone(), vec![kp1], Some((Ipv6Addr::LOCALHOST, 29853, CONNECT_MAGIC1_PLAIN_TEXT, kp2_pub)));
+    let _handle = std::thread::spawn(move || {
+        do_the_test_program2(32845, vec![kp1.clone()], Some((&kp1, &STPAddress(Ipv6Addr::LOCALHOST, 29853, CONNECT_MAGIC1_PLAIN_TEXT, kp2_pub))));
     });
-    do_the_test_program2(29853, kp2.clone(), vec![kp2], Some((Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_PLAIN_TEXT, kp1_pub)));
+    do_the_test_program2(29853, vec![kp2.clone()], Some((&kp2, &STPAddress(Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_PLAIN_TEXT, kp1_pub))));
 }
 
 // LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
@@ -132,7 +132,7 @@ pub enum ConnectionState {
     },
 }
 
-pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, my_listen_keypairs: Vec<IdentityKeyPair>, beam_to: Option<STPAddress>) {
+pub fn do_the_test_program2(my_port: u16, my_listen_keypairs: Vec<IdentityKeyPair>, beam_to: Option<(&IdentityKeyPair, &STPAddress)>) {
     let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
     let mut packet_memory_recv = new_packet_memory(); // Incoming Decrypted
     let mut packet_memory_send = new_packet_memory(); // Outgoing Decrypted
@@ -141,40 +141,38 @@ pub fn do_the_test_program2(my_port: u16, my_connect_keypair: IdentityKeyPair, m
 
     let socket = setup_and_bind_udp_socket(my_port);
 
-    if let Some(beam_to) = beam_to {
-        connect_to_endpoint(&mut connections_map, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_connect_keypair, &my_listen_keypairs, beam_to);
+    if let Some((my_connect_keypair, beam_to)) = beam_to {
+        connect_to_endpoint(socket, &mut connections_map, my_connect_keypair, beam_to);
     }
 
     //println!("{:#?}", connections_map);
 
     loop {
         let mut _unused = Vec::new();
-        service_connections(&mut connections_map, &mut _unused, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_connect_keypair, &my_listen_keypairs);
+        service_connections(&mut connections_map, &mut _unused, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_listen_keypairs);
     }
 }
 
-pub fn connect_to_endpoint(connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
-                           packet_memory_encrypted: &mut PacketMemory,
-                           packet_memory_recv: &mut PacketMemory,
-                           packet_memory_send: &mut PacketMemory,
-                           socket: SockHandle,
-                           my_connect_keypair: &IdentityKeyPair,
-                           my_listen_keypairs: &Vec<IdentityKeyPair>,
-                           beam_to: STPAddress) {
+pub fn connect_to_endpoint(
+    socket: SockHandle,
+    connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
+    my_connect_keypair: &IdentityKeyPair,
+    beam_to: &STPAddress,
+) {
     if let beam_to = beam_to {
         assert!(my_connect_keypair.magic1 == beam_to.2);
 
         // TODO list of supported Application Level protocols for e.g. zcash network upgrades.
         // packet_memory_send
-        let list_of_protocols_len_bytes = 0;
-
-        store_u48(&mut packet_memory_encrypted[0..6], my_connect_keypair.magic1);
+        let list_of_protocols_len_bytes = 0usize;
 
         if my_connect_keypair.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
+            let mut hello_packet_payload = vec![0u8; 6+32+0];
+            store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1);
             assert_eq!(my_connect_keypair.public.len(), 32);
-            packet_memory_encrypted[6..6+32].copy_from_slice(&my_connect_keypair.public[..]);
-            packet_memory_encrypted[6+32..6+32+list_of_protocols_len_bytes].copy_from_slice(&packet_memory_send[0..list_of_protocols_len_bytes]);
-            let hello_packet_payload = Vec::from(&packet_memory_encrypted[0..6+32+list_of_protocols_len_bytes]);
+            hello_packet_payload[6..6+32].copy_from_slice(&my_connect_keypair.public[..]);
+            assert_eq!(list_of_protocols_len_bytes, 0,); // temp
+            //hello_packet_payload[6+32..6+32+list_of_protocols_len_bytes].copy_from_slice(&packet_memory_send[0..list_of_protocols_len_bytes]);
             
             let my_ip = if beam_to.0.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
@@ -193,13 +191,18 @@ pub fn connect_to_endpoint(connections_map: &mut HashMap::<ConnectionKey, Connec
             );
         }
         else {
+            let mut hello_packet_payload = vec![0u8; 1024];
+            store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1);
             let mut handshake = snow::Builder::new(noise_string_from_connect_magic1(my_connect_keypair.magic1).unwrap().parse().unwrap())
-                .prologue(&packet_memory_encrypted[0..6]).unwrap()
+                .prologue(&hello_packet_payload[0..6]).unwrap()
                 .local_private_key(&my_connect_keypair.private[..]).unwrap()
                 .remote_public_key(&beam_to.3[..]).unwrap()
                 .build_initiator().unwrap();
-            let handshake_size = handshake.write_message(&packet_memory_send[0..list_of_protocols_len_bytes], &mut packet_memory_encrypted[6..]).unwrap();
-            let hello_packet_payload = Vec::from(&packet_memory_encrypted[0..6+handshake_size]);
+            
+            // TODO list protocols
+            let handshake_size = handshake.write_message(&[], &mut hello_packet_payload[6..]).unwrap();
+            hello_packet_payload.truncate(6+handshake_size);
+            hello_packet_payload.shrink_to_fit();
             
             let my_ip = if beam_to.0.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
@@ -227,7 +230,6 @@ pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, Connec
                            packet_memory_recv: &mut PacketMemory,
                            packet_memory_send: &mut PacketMemory,
                            socket: SockHandle,
-                           my_connect_keypair: &IdentityKeyPair,
                            my_listen_keypairs: &Vec<IdentityKeyPair>) {
 
     {

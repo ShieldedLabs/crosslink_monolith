@@ -3510,7 +3510,7 @@ pub fn run_instances(i: usize) {
     rt.block_on(std::future::pending::<()>())
 }
 
-// pub mod bandwidth_test;
+pub mod bandwidth_test;
 pub mod p2p_test_plaintext;
 pub mod native_sockets;
 pub mod helpers;
