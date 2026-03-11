@@ -79,6 +79,13 @@ impl  SliceWrite for u16  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0.
 impl  SliceWrite for u8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] = *self;                                         1 } }
 impl  SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..self.len()].copy_from_slice(self);      self.len() } }
 
+
+#[derive(Debug, Default, Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Peer {
+    pub send_time: u64,
+    pub address: STPAddress,
+}
+
 pub fn send_to(socket: SockHandle, packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>, chat_buf: &String, name: &str, connection_key: &ConnectionKey, buf: &[u8]) {
     if PRINT_SENDS {
         println_redraw!(chat_buf, name, "Sent {} to: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize >> 1], connection_key);
@@ -136,7 +143,14 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
     // println!("Choose a name (max 64 bytes): ");
     // let mut name = String::new();
     // io::stdin().read_line(&mut name).unwrap();
-    let mut name = "asdfghjkl".to_string();
+
+    // let mut name = "asdfghjkl".to_string();
+
+    let mut name = if peer_addresses.len() > 0 { // I'm not The Seeder
+        "plebian"
+    } else {
+        "seeder"
+    }.to_string();
     name.truncate(64);
     name = name.trim().to_string(); // strip trailing newline
 
@@ -148,37 +162,44 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
     let mut packet_memory_recv = new_packet_memory(); // Incoming Decrypted
     let mut packet_memory_send = new_packet_memory(); // Outgoing Decrypted
 
+    let mut peers = HashMap::<ConnectionKey, Peer>::new();
+
     loop {
         let now = monotonic_clock_ns();
 
-        let mut packets_to_send: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
+        let mut packets_to_send = Vec::new();
 
         let mut peer_addresses_list: Vec<STPAddress> = connections_map.iter().filter(|(connection_key, connection)| is_connected(*connection)).map(|(connection_key, connection)| connection.address()).collect();
         peer_addresses_list.shuffle(&mut rng);
         peer_addresses_list.truncate(20); // 1160 bytes of peers
 
-        for (connection_key, connection) in &mut connections_map {
+        // Send PEER_LIST to all connected peers.
+        for (connection_key, peer) in &mut peers {
+            let Some(ref mut connection) = get_connected_mut(&mut connections_map, connection_key)
+            else { continue; };
+
             let address = connection.address();
-            if let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &connection.connection_state {
-                if (now - last_sent_keep_alive_time_ns) > 250_000_000 {
-                    // Send PEER_LIST to all connected peers.
-                    let (mut buf, mut o) = ([0u8; 2048], 0);
-                    o += (PACKET_TYPE_PEER_LIST << 1).write_to(&mut buf[o..]);
-
-                    for address in &peer_addresses_list {
-                        let key = &address.key[..32];
-
-                        o += address.ip.octets().write_to(&mut buf[o..]);
-                        o += address.port       .write_to(&mut buf[o..]);
-                        o += address.magic1     .write_to(&mut buf[o..]);
-                        o += key                .write_to(&mut buf[o..]);
-                    }
-
-                    // println_redraw!(chat_buf, name, "Sending PEER_LIST to: {:?}. It contains {} addresses.", address, peer_addresses_list.len());
-
-                    send_to(socket, &mut packets_to_send, &chat_buf, &name, &connection_key, &buf[..o]);
-                }
+            if (now - peer.send_time) <= 250_000_000 {
+                continue;
             }
+
+            peer.send_time = now;
+
+            let (mut buf, mut o) = ([0u8; 2048], 0);
+            o += (PACKET_TYPE_PEER_LIST << 1).write_to(&mut buf[o..]);
+
+            for address in &peer_addresses_list {
+                let key = &address.key[..32];
+
+                o += address.ip.octets().write_to(&mut buf[o..]);
+                o += address.port       .write_to(&mut buf[o..]);
+                o += address.magic1     .write_to(&mut buf[o..]);
+                o += key                .write_to(&mut buf[o..]);
+            }
+
+            // println_redraw!(chat_buf, name, "Sending PEER_LIST to: {:?}. It contains {} addresses.", address, peer_addresses_list.len());
+
+            send_to(socket, &mut packets_to_send, &chat_buf, &name, &connection_key, &buf[..o]);
         }
 
         if let Some(mut line) = tick(&mut chat_buf, &name) {
@@ -189,7 +210,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
             o += (PACKET_TYPE_CHAT << 1).write_to(&mut buf[o..]);
             name.as_bytes()             .write_to(&mut buf[o..]);
             o += 64;
-            o += line.as_bytes() .write_to(&mut buf[o..]);
+            o += line.as_bytes()        .write_to(&mut buf[o..]);
 
             for (connection_key, connection) in &mut connections_map {
                 if is_connected(connection) {
@@ -200,9 +221,36 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
             println_redraw!(chat_buf, name, "{}: {}", name, line);
         }
 
-        let mut packets_received_this_tick: Vec<(STPAddress, Vec<u8>)> = Vec::new();
+        let mut packets_received_this_tick = Vec::new();
 
         service_connections(&mut connections_map, &mut packets_received_this_tick, &packets_to_send, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_listen_keypairs);
+
+        // Remove peers that have been disconnected.
+        peers.retain(|connection_key, peer| {
+            if connections_map.get(connection_key).is_some() {
+                true
+            } else {
+                println_redraw!(chat_buf, name, "Disconnected from {:?}.", peer.address);
+                false
+            }
+        });
+
+        // Add peers that have connected.
+        for (connection_key, connection) in &connections_map {
+            if peers.get(connection_key).is_some() {
+                continue; // Already exists in the peer map.
+            }
+
+            let address = connection.address();
+
+            println_redraw!(chat_buf, name, "Connected to {:?}.", address.clone());
+            // New connection; insert peer.
+            peers.insert(*connection_key, Peer {
+                send_time: now,
+                address,
+                ..Default::default()
+            });
+        }
 
         // Receive
         for (address, data) in &packets_received_this_tick {

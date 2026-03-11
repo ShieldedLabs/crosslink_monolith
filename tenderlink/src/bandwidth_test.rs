@@ -105,7 +105,16 @@ pub struct STPAddress {
     pub magic1: u64,
     pub key: Vec<u8>,
 }
-impl Default for STPAddress { fn default() -> Self { Self { ip: Ipv6Addr::UNSPECIFIED, ..Default::default() } } }
+impl Default for STPAddress {
+    fn default() -> Self {
+        Self {
+            ip:     Ipv6Addr::UNSPECIFIED,
+            port:   0,
+            magic1: 0,
+            key:    Vec::default(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct IdentityKeyPair {
@@ -141,6 +150,7 @@ impl ConnectionTrackingData {
             key:    self.other_transport_identity.clone()
         }
     }
+    pub fn is_connected(&self) -> bool { self.connection_state.is_connected() }
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +206,20 @@ pub enum ConnectionState {
         last_sent_keep_alive_time_ns: u64,
         recv_time_ns: u64,
     },
+}
+impl ConnectionState {
+    pub fn is_connected(&self) -> bool { if let ConnectionState::Connected { .. } = self { true } else { false } }
+}
+
+pub fn get_connected<'a>(m: &'a HashMap::<ConnectionKey, ConnectionTrackingData>, k: &ConnectionKey) -> Option<&'a ConnectionTrackingData> {
+    let connection = m.get(k)?;
+    if !connection.is_connected() { return None; }
+    Some(connection)
+}
+pub fn get_connected_mut<'a>(m: &'a mut HashMap::<ConnectionKey, ConnectionTrackingData>, k: &ConnectionKey) -> Option<&'a mut ConnectionTrackingData> {
+    let connection = m.get_mut(k)?;
+    if !connection.is_connected() { return None; }
+    Some(connection)
 }
 
 pub fn connection_state_string(state: &ConnectionState) -> &'static str {
@@ -297,10 +321,14 @@ pub fn connect_to_endpoint(
     }
 }
 
+const        VERBOSE                :bool=0!=                (0);
+const OVERLY_VERBOSE                :bool=0!=                (0);
+
+
 
 pub fn service_connections(
     connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
-    packets_received_this_call: &mut Vec<(STPAddress, Vec<u8>)>,
+    packets_received_this_call: &mut Vec<(ConnectionKey, Vec<u8>)>,
     packets_to_send: &Vec<(ConnectionKey, Vec<u8>)>,
     packet_memory_encrypted: &mut PacketMemory,
     packet_memory_recv: &mut PacketMemory,
@@ -313,9 +341,9 @@ pub fn service_connections(
             if buf_len >= 6 {
                 let magic1 = load_u48(&packet_memory_encrypted[0..6]);
                 if magic1 & 1 != 0 { // Client Hello
-                    println!("Got a HELLO.");
+                    if OVERLY_VERBOSE { println!("Got a HELLO."); }
                 } else {
-                    println!("Got a non-hello.");
+                    if OVERLY_VERBOSE { println!("Got a non-hello."); }
                 }
                 if magic1 & 1 != 0 { // Client Hello
 
@@ -340,16 +368,16 @@ pub fn service_connections(
                                                     let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32]);
                                                     
                                                     existing_connection.connection_state = ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload };
-                                                    println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits);
+                                                    if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
                                                 } else {
-                                                    println!("Did NOT respond to connection {}: Lost the lexicographic compare.", connection_key.key_15_bits);
+                                                    if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: Lost the lexicographic compare.", connection_key.key_15_bits); }
                                                 }
                                             } else {
                                                 let state_str = connection_state_string(&existing_connection.connection_state);
-                                                println!("Did NOT respond to connection {}: We were not in SendingClientHelloPlaintext state. We are in {} state.", connection_key.key_15_bits, state_str);
+                                                if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: We were not in SendingClientHelloPlaintext state. We are in {} state.", connection_key.key_15_bits, state_str); }
                                             }
                                         } else {
-                                            println!("Did NOT respond to connection {}: Failed condition \"&existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key\"", connection_key.key_15_bits);
+                                            if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: Failed condition \"&existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key\"", connection_key.key_15_bits); }
                                         }
                                     }
                                     else {
@@ -373,10 +401,10 @@ pub fn service_connections(
                                                 connection_state: ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
                                             },
                                         );
-                                        println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits);
+                                        if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
                                     }
                                 } else {
-                                    println!("Did NOT respond to connection: The packet did not contain 32 bytes of key. It was {} bytes.", buf_len);
+                                    if OVERLY_VERBOSE { println!("Did NOT respond to connection: The packet did not contain 32 bytes of key. It was {} bytes.", buf_len); }
                                 }
                             }
                         }
@@ -453,7 +481,7 @@ pub fn service_connections(
                                     if server_key == existing_connection.other_transport_identity {
                                         assert_eq!(buf_len, 6 + 32);
                                         // TODO receive and validate selected magic2
-                                        println!("Connected to new server {:?}", server_key);
+                                        if VERBOSE { println!("Connected to new server {:?}", server_key); }
                                         existing_connection.connection_state = ConnectionState::Connected {
                                             cipher: None,
                                             send_sequence_number: 0,
@@ -470,7 +498,7 @@ pub fn service_connections(
                                         debug_assert!(handshake.is_handshake_finished());
                                         assert_eq!(payload_len, 0);
                                         // TODO receive and validate selected magic2
-                                        println!("Connected to new server {:?}", handshake.get_remote_static().unwrap());
+                                        if VERBOSE { println!("Connected to new server {:?}", handshake.get_remote_static().unwrap()); }
                                         
                                         // Borrow Checker crazyness required here.
                                         let new_state = ConnectionState::Connected {
@@ -489,7 +517,7 @@ pub fn service_connections(
                                 break;
                             }
                             if let ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut existing_connection.connection_state {
-                                println!("Connected to new client {:?}", existing_connection.other_transport_identity);
+                                if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
                                 existing_connection.connection_state = ConnectionState::Connected {
                                     cipher: None,
                                     send_sequence_number: 0,
@@ -507,7 +535,7 @@ pub fn service_connections(
                                 can_decrypt |= cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
                                 if can_decrypt == false { break; }
                                 
-                                println!("Connected to new client {:?}", existing_connection.other_transport_identity);
+                                if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
                                 existing_connection.connection_state = ConnectionState::Connected {
                                     cipher: Some(cipher.clone()),
                                     send_sequence_number: 0,
@@ -541,11 +569,9 @@ pub fn service_connections(
 
                                 *recv_time_ns = timestamp_ns;
 
-                                println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload);
+                                if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
 
-                                let address = existing_connection.address();
-
-                                packets_received_this_call.push((address, Vec::from(payload)));
+                                packets_received_this_call.push((connection_key, Vec::from(payload)));
                             }
                         }
                         // else {
@@ -619,7 +645,7 @@ pub fn service_connections(
                     return true;
                 }
                 if *recv_time_ns + 15_000_000_000 < current_time_now_ns {
-                    println!("Disconnected from: {:?}.", connection_tracking_data.other_transport_identity);
+                    if VERBOSE { println!("Disconnected from: {:?}.", connection_tracking_data.other_transport_identity); }
                     return false; // connection timeout
                 }
             }
@@ -633,7 +659,27 @@ pub fn service_connections(
             let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &mut connection.connection_state
             else { continue; };
 
-            // TODO send
+            if data.len() > ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE - 6 {
+                panic!("You shouldn't have created a packet this big in the current test");
+                continue;
+            }
+
+            // Send
+            let virtual_nonce = *send_sequence_number;
+            store_u16(&mut packet_memory_encrypted[0..2], connection.two_byte_send_prefix);
+            store_u32(&mut packet_memory_encrypted[2..6], virtual_nonce as u32);
+            *send_sequence_number += 1;
+
+            let packet_len;
+            if let Some(cipher) = cipher {
+                packet_len = cipher.current.write_message(virtual_nonce, &data, &mut packet_memory_encrypted[6..]).unwrap();
+            }
+            else {
+                packet_len = data.len();
+                (&mut packet_memory_encrypted[6..6+data.len()]).copy_from_slice(&data);
+            }
+
+            udp_send_with_congestion_and_dscp(socket, connection.other_ip, connection.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort);
         }
     }
 }
