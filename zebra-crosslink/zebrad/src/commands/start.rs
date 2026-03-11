@@ -325,6 +325,7 @@ impl StartCmd {
         // Create a channel to send mined blocks to the gossip task
         let submit_block_channel = SubmitBlockChannel::new();
 
+        // Note(Sam): We do not need the whole GBT thing. We just need block_verifier_router. Andrew should use this for new sync.
         let gbt_for_force_feeding_pow = Arc::new(
             zebra_rpc::methods::types::get_block_template::GetBlockTemplateHandler::new(
                 &config.network.network.clone(),
