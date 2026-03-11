@@ -2142,6 +2142,7 @@ dependencies = [
 name = "tenderlink"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "blake3",
  "byteorder",
  "crossterm",

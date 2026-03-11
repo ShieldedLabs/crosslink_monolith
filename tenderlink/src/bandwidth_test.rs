@@ -98,7 +98,16 @@ pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
     } else { None }
 }
 
-#[derive(Debug, Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
+pub fn fmt_magic1_pubkey_b64(magic1: u64, key: &Vec<u8>) -> String {
+    let mut tmp = Vec::with_capacity(8 + key.len());
+    tmp.extend_from_slice(&magic1.to_le_bytes());
+    tmp.extend_from_slice(&key);
+
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&tmp)
+}
+
+#[derive(Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
 pub struct STPAddress {
     pub ip: Ipv6Addr,
     pub port: u16,
@@ -113,6 +122,11 @@ impl Default for STPAddress {
             magic1: 0,
             key:    Vec::default(),
         }
+    }
+}
+impl std::fmt::Debug for STPAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "[{:?}]:{}/{}", self.ip, self.port, fmt_magic1_pubkey_b64(self.magic1, &self.key))
     }
 }
 
