@@ -113,10 +113,7 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
 
     let my_keypair = keypair.unwrap_or(new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap());
     let my_listen_keypair_encrypted = my_keypair.clone();
-    let my_listen_keypair_plaintext = IdentityKeyPair {
-        magic1: CONNECT_MAGIC1_PLAIN_TEXT,
-        ..my_keypair.clone()
-    };
+    let my_listen_keypair_plaintext = IdentityKeyPair { magic1: CONNECT_MAGIC1_PLAIN_TEXT, ..my_keypair.clone() };
 
     let my_listen_keypairs = vec![my_listen_keypair_plaintext.clone(), my_listen_keypair_encrypted.clone()];
 
@@ -270,7 +267,8 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
                     let magic1 =       u64::from_le_bytes(<[u8;  8]>::try_from(&chunk[18..26]).unwrap());
                     let key    =                                     Vec::from(&chunk[26..58]);
 
-                    let is_myself = (magic1 == my_keypair.magic1) && (key == my_keypair.public);
+                    let is_myself = ((magic1 == my_listen_keypair_plaintext.magic1) && (key == my_listen_keypair_plaintext.public)) ||
+                                    ((magic1 == my_listen_keypair_encrypted.magic1) && (key == my_listen_keypair_encrypted.public));
 
                     let address = STPAddress { ip, port, magic1, key };
 
@@ -296,7 +294,13 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
                     new_peers.push(address.clone());
 
                     // Discovered new peer! Connect.
-                    connect_to_endpoint(socket, &mut connections_map, &my_keypair, &address);
+                    if address.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
+                        connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[0], &address);
+                    } else if address.magic1 == CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s {
+                        connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[1], &address);
+                    } else {
+                        // println!("Error: Can't connect to given peer: {:?}.", address);
+                    }
                 }
 
                 if PRINT_PEER_LIST { println!(""); redraw(&chat_buf, &name); }
