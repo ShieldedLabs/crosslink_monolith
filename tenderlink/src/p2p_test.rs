@@ -101,7 +101,7 @@ pub fn is_connected(connection: &ConnectionTrackingData) -> bool {
     }
 }
 
-pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
+pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPAddress>) {
     socket_setup();
     monotonic_clock_setup();
 
@@ -111,36 +111,21 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
 
     let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
 
-    let my_connect_keypair = if peer_addresses.len() == 0 { // I am The Seeder
-        IdentityKeyPair {
-            magic1:  CONNECT_MAGIC1_PLAIN_TEXT,
-            private: vec![0xAAu8; 32],
-            public:  vec![0xAAu8; 32],
-        }
-    } else { // I'm not The Seeder
-        new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()
+    let my_keypair = keypair.unwrap_or(new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap());
+    let my_listen_keypair_encrypted = my_keypair.clone();
+    let my_listen_keypair_plaintext = IdentityKeyPair {
+        magic1: CONNECT_MAGIC1_PLAIN_TEXT,
+        ..my_keypair.clone()
     };
-    let my_listen_keypair_plaintext = my_connect_keypair.clone();
-    let my_listen_keypair_encrypted = my_connect_keypair.clone();
 
-    let my_listen_keypairs = vec![my_listen_keypair_plaintext, my_listen_keypair_encrypted];
+    let my_listen_keypairs = vec![my_listen_keypair_plaintext.clone(), my_listen_keypair_encrypted.clone()];
 
-    for address in &peer_addresses {
-        if address.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-            connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[0], address);
-        } else {
-            panic!("Dev: Plaintext only for now!!!"); // @Debug @Temporary @Remove
-            if address.magic1 == CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s {
-                connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[1], address);
-            }
-        }
-    }
-
-    println!("Choose a name (max 64 bytes): ");
-    let mut name = String::new();
-    io::stdin().read_line(&mut name).unwrap();
-    name = name.trim().to_string(); // strip trailing newline
-    name.truncate(64);
+    let name = format!("{:?}", &my_listen_keypair_encrypted.public[..1]).to_string();
+    // println!("Choose a name (max 64 bytes): ");
+    // let mut name = String::new();
+    // io::stdin().read_line(&mut name).unwrap();
+    // name = name.trim().to_string(); // strip trailing newline
+    // name.truncate(64);
 
     let _raw = RawModePanicSafe::new();
 
@@ -153,6 +138,16 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
 
     println_redraw!(chat_buf, name, "");
+
+    for address in &peer_addresses {
+        if address.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
+            connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[0], address);
+        } else if address.magic1 == CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s {
+            connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[1], address);
+        } else {
+            println!("Error: Can't connect to given peer: {:?}.", address);
+        }
+    }
 
     loop {
         let now = monotonic_clock_ns();
@@ -275,7 +270,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
                     let magic1 =       u64::from_le_bytes(<[u8;  8]>::try_from(&chunk[18..26]).unwrap());
                     let key    =                                     Vec::from(&chunk[26..58]);
 
-                    let is_myself = (magic1 == my_connect_keypair.magic1) && (key == my_connect_keypair.public);
+                    let is_myself = (magic1 == my_keypair.magic1) && (key == my_keypair.public);
 
                     let address = STPAddress { ip, port, magic1, key };
 
@@ -301,11 +296,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
                     new_peers.push(address.clone());
 
                     // Discovered new peer! Connect.
-
-                    if magic1 != CONNECT_MAGIC1_PLAIN_TEXT {
-                        panic!("Dev: Plaintext only for now!!!"); // @Debug @Temporary @Remove
-                    }
-                    connect_to_endpoint(socket, &mut connections_map, &my_connect_keypair, &address);
+                    connect_to_endpoint(socket, &mut connections_map, &my_keypair, &address);
                 }
 
                 if PRINT_PEER_LIST { println!(""); redraw(&chat_buf, &name); }
