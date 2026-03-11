@@ -250,7 +250,6 @@ pub fn connect_to_endpoint(
                     other_ip: beam_to.ip,
                     other_port: beam_to.port,
                     other_transport_identity: beam_to.key.clone(),
-                    // later when not testing last_sent_time_ns should be zero
                     connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
                 },
             );
@@ -280,7 +279,6 @@ pub fn connect_to_endpoint(
                     other_ip: beam_to.ip,
                     other_port: beam_to.port,
                     other_transport_identity: beam_to.key.clone(),
-                    // later when not testing last_sent_time_ns should be zero
                     connection_state: ConnectionState::SendingClientHello { last_sent_time_ns: 0, hello_packet_payload, handshake },
                 },
             );
@@ -289,15 +287,16 @@ pub fn connect_to_endpoint(
 }
 
 
-pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
-                           packets_received_this_call: &mut Vec<(STPAddress, Vec<u8>)>,
-                           packets_to_send: &Vec<(ConnectionKey, Vec<u8>)>,
-                           packet_memory_encrypted: &mut PacketMemory,
-                           packet_memory_recv: &mut PacketMemory,
-                           packet_memory_send: &mut PacketMemory,
-                           socket: SockHandle,
-                           my_listen_keypairs: &Vec<IdentityKeyPair>) {
-
+pub fn service_connections(
+    connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
+    packets_received_this_call: &mut Vec<(STPAddress, Vec<u8>)>,
+    packets_to_send: &Vec<(ConnectionKey, Vec<u8>)>,
+    packet_memory_encrypted: &mut PacketMemory,
+    packet_memory_recv: &mut PacketMemory,
+    packet_memory_send: &mut PacketMemory,
+    socket: SockHandle,
+    my_listen_keypairs: &Vec<IdentityKeyPair>,
+) {
     {
         if let Ok((buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns)) = udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
             if buf_len >= 6 {
