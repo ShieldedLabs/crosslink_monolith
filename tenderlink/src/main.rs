@@ -28,23 +28,8 @@ fn main() {
 
     const SEEDER_CRYPTO: u64 = bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 
-    let sk: [u8; 32] = [
-          7,  11,  99, 220, 101, 143, 113,   4,
-        242, 136,  58, 150, 223, 186, 106, 203,
-         67,  18,  48,  96, 176,  69, 152, 173,
-        224,  46, 206, 156, 217,  31, 170, 165,
-    ];
-
-    // let noise_params = {
-    //     use bandwidth_test::*;
-    //     noise_string_from_connect_magic1(SEEDER_CRYPTO).unwrap().parse().unwrap()
-    // };
-    // let seeder_keypair_snow = snow::Builder::new(noise_params).local_private_key(&sk).unwrap().generate_keypair().unwrap();
-    // let seeder_keypair = bandwidth_test::IdentityKeyPair {
-    //     magic1:  SEEDER_CRYPTO,
-    //     private: seeder_keypair_snow.private,
-    //     public:  seeder_keypair_snow.public
-    // };
+    let sk = [7, 11, 99, 220, 101, 143, 113,   4, 242, 136,  58, 150, 223, 186, 106, 203,
+             67, 18, 48,  96, 176,  69, 152, 173, 224,  46, 206, 156, 217,  31, 170, 165];
 
     let seeder_keypair = bandwidth_test::IdentityKeyPair {
         magic1: SEEDER_CRYPTO,
@@ -52,10 +37,10 @@ fn main() {
         public: x25519_dalek::x25519(sk, x25519_dalek::X25519_BASEPOINT_BYTES).to_vec(),
     };
 
-    let seeder_keypair = bandwidth_test::IdentityKeyPair {
-        magic1:  bandwidth_test::CONNECT_MAGIC1_PLAIN_TEXT,
-        ..seeder_keypair
-    };
+    // let seeder_keypair = bandwidth_test::IdentityKeyPair {
+    //     magic1:  bandwidth_test::CONNECT_MAGIC1_PLAIN_TEXT,
+    //     ..seeder_keypair
+    // };
 
     if args.len() > 1 {
         if args[1] == "p2p" {

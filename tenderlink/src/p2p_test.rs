@@ -101,6 +101,17 @@ pub fn is_connected(connection: &ConnectionTrackingData) -> bool {
     }
 }
 
+pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, my_keypairs: &Vec<&IdentityKeyPair>, address: &STPAddress) -> Result<(), String> {
+    for keypair in my_keypairs {
+        if address.magic1 == keypair.magic1 {
+            connect_to_endpoint(socket, connections_map, keypair, address);
+            return Ok(());
+        }
+    }
+
+    Err(format!("Error: Can't connect to given peer: {:?}. No compatible keypair.", address).to_string())
+}
+
 pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPAddress>) {
     socket_setup();
     monotonic_clock_setup();
@@ -111,13 +122,12 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
 
     let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
 
-    let my_keypair = keypair.unwrap_or(new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap());
-    let my_listen_keypair_encrypted = my_keypair.clone();
-    let my_listen_keypair_plaintext = IdentityKeyPair { magic1: CONNECT_MAGIC1_PLAIN_TEXT, ..my_keypair.clone() };
+    let my_keypair_encrypted = keypair.unwrap_or(new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap());
+    let my_keypair_plaintext = IdentityKeyPair { magic1: CONNECT_MAGIC1_PLAIN_TEXT, ..my_keypair_encrypted.clone() };
 
-    let my_listen_keypairs = vec![my_listen_keypair_plaintext.clone(), my_listen_keypair_encrypted.clone()];
+    let my_keypairs = vec![&my_keypair_encrypted, &my_keypair_plaintext];
 
-    let name = format!("{:?}", &my_listen_keypair_encrypted.public[..1]).to_string();
+    let name = format!("{:?}", &my_keypair_encrypted.public[..1]).to_string();
     // println!("Choose a name (max 64 bytes): ");
     // let mut name = String::new();
     // io::stdin().read_line(&mut name).unwrap();
@@ -134,17 +144,13 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
 
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
 
-    println_redraw!(chat_buf, name, "");
-
     for address in &peer_addresses {
-        if address.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-            connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[0], address);
-        } else if address.magic1 == CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s {
-            connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[1], address);
-        } else {
-            println!("Error: Can't connect to given peer: {:?}.", address);
+        if let Err(s) = connect_to(socket, &mut connections_map, &my_keypairs, address) {
+            println_redraw!(chat_buf, name, "{}", s);
         }
     }
+
+    println_redraw!(chat_buf, name, "");
 
     loop {
         let now = monotonic_clock_ns();
@@ -205,7 +211,7 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
 
         let mut packets_received_this_tick = Vec::new();
 
-        service_connections(&mut connections_map, &mut packets_received_this_tick, &packets_to_send, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_listen_keypairs);
+        service_connections(&mut connections_map, &mut packets_received_this_tick, &packets_to_send, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_keypairs);
 
         // Remove peers that have been disconnected.
         peers.retain(|connection_key, peer| {
@@ -267,8 +273,13 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
                     let magic1 =       u64::from_le_bytes(<[u8;  8]>::try_from(&chunk[18..26]).unwrap());
                     let key    =                                     Vec::from(&chunk[26..58]);
 
-                    let is_myself = ((magic1 == my_listen_keypair_plaintext.magic1) && (key == my_listen_keypair_plaintext.public)) ||
-                                    ((magic1 == my_listen_keypair_encrypted.magic1) && (key == my_listen_keypair_encrypted.public));
+                    let mut is_myself = false;
+                    for keypair in &my_keypairs {
+                        if (magic1 == keypair.magic1) && (key == keypair.public) {
+                            is_myself = true;
+                            break;
+                        }
+                    }
 
                     let address = STPAddress { ip, port, magic1, key };
 
@@ -291,22 +302,18 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
 
                     if PRINT_PEER_LIST { print!(" (new!)"); }
 
-                    new_peers.push(address.clone());
-
                     // Discovered new peer! Connect.
-                    if address.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-                        connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[0], &address);
-                    } else if address.magic1 == CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s {
-                        connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[1], &address);
-                    } else {
-                        // println!("Error: Can't connect to given peer: {:?}.", address);
-                    }
+
+                    new_peers.push((address.clone(), connect_to(socket, &mut connections_map, &my_keypairs, &address)));
                 }
 
                 if PRINT_PEER_LIST { println!(""); redraw(&chat_buf, &name); }
 
-                for new_peer in new_peers {
+                for (new_peer, connect_result) in new_peers {
                     println_redraw!(chat_buf, name, "Discovered new peer: {:?}", new_peer);
+                    if let Err(s) = connect_result {
+                        println_redraw!(chat_buf, name, "{}", s);
+                    }
                 }
             } else if buf[0] == PACKET_TYPE_CHAT {
                 let buf = &buf[1..];
