@@ -198,6 +198,17 @@ pub enum ConnectionState {
     },
 }
 
+pub fn connection_state_string(state: &ConnectionState) -> &'static str {
+    match state {
+        ConnectionState::SendingClientHelloPlaintext { .. } => { return "SendingClientHelloPlaintext"; },
+        ConnectionState::SendingClientHello          { .. } => { return "SendingClientHello"; },
+        ConnectionState::SendingServerHelloPlaintext { .. } => { return "SendingServerHelloPlaintext"; },
+        ConnectionState::SendingServerHello          { .. } => { return "SendingServerHello"; },
+        ConnectionState::Connected                   { .. } => { return "Connected"; },
+    };
+    return "<INVALID>";
+}
+
 pub fn do_the_test_program2(my_port: u16, my_listen_keypairs: Vec<IdentityKeyPair>, beam_to: Option<(&IdentityKeyPair, &STPAddress)>) {
     let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
     let mut packet_memory_recv = new_packet_memory(); // Incoming Decrypted
@@ -302,6 +313,11 @@ pub fn service_connections(
             if buf_len >= 6 {
                 let magic1 = load_u48(&packet_memory_encrypted[0..6]);
                 if magic1 & 1 != 0 { // Client Hello
+                    println!("Got a HELLO.");
+                } else {
+                    println!("Got a non-hello.");
+                }
+                if magic1 & 1 != 0 { // Client Hello
 
                     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
                         for key_i in 0..my_listen_keypairs.len() {
@@ -324,8 +340,16 @@ pub fn service_connections(
                                                     let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32]);
                                                     
                                                     existing_connection.connection_state = ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload };
+                                                    println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits);
+                                                } else {
+                                                    println!("Did NOT respond to connection {}: Lost the lexicographic compare.", connection_key.key_15_bits);
                                                 }
+                                            } else {
+                                                let state_str = connection_state_string(&existing_connection.connection_state);
+                                                println!("Did NOT respond to connection {}: We were not in SendingClientHelloPlaintext state. We are in {} state.", connection_key.key_15_bits, state_str);
                                             }
+                                        } else {
+                                            println!("Did NOT respond to connection {}: Failed condition \"&existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key\"", connection_key.key_15_bits);
                                         }
                                     }
                                     else {
@@ -349,7 +373,10 @@ pub fn service_connections(
                                                 connection_state: ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
                                             },
                                         );
+                                        println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits);
                                     }
+                                } else {
+                                    println!("Did NOT respond to connection: The packet did not contain 32 bytes of key. It was {} bytes.", buf_len);
                                 }
                             }
                         }
