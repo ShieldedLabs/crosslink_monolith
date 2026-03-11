@@ -11,23 +11,18 @@ use std::io;
 
 const PRINT_RECEIVES  :bool=0!= (0);
 const PRINT_SENDS     :bool=0!= (0);
-const PRINT_HELLO     :bool=0!= (0);
 const PRINT_PEER_LIST :bool=0!= (0);
 
 
 const MAX_MTU: usize = 15972;
 const MIN_MTU: usize =  1232;
 
-const PACKET_TYPE_HELLO:     u8 = 1;
-const PACKET_TYPE_HELLO_ACK: u8 = 2;
 const PACKET_TYPE_PEER_LIST: u8 = 3;
 const PACKET_TYPE_CHAT:      u8 = 4;
 const PACKET_TYPE_COUNT:     u8 = 5;
 
 const PACKET_TYPE_NAMES: [&str; PACKET_TYPE_COUNT as usize] = {
     let mut names = ["<INVALID>"; PACKET_TYPE_COUNT as usize];
-    names[PACKET_TYPE_HELLO       as usize] = "PACKET_TYPE_HELLO";
-    names[PACKET_TYPE_HELLO_ACK   as usize] = "PACKET_TYPE_HELLO_ACK";
     names[PACKET_TYPE_PEER_LIST   as usize] = "PACKET_TYPE_PEER_LIST";
     names[PACKET_TYPE_CHAT        as usize] = "PACKET_TYPE_CHAT";
     const_assert!(PACKET_TYPE_COUNT == 5); // keep names array updated when adding other tags
@@ -50,16 +45,16 @@ impl RawModePanicSafe { fn new() -> Self { crossterm::terminal::enable_raw_mode(
 impl Drop for RawModePanicSafe { fn drop(&mut self) { crossterm::terminal::disable_raw_mode().unwrap(); } }
 
 pub fn clear_line() { print!("\x1b[1K\r"); }
-pub fn redraw(buf: &str, name: &str, node_id: u128) { clear_line(); print!("{} ({})> {}", name, node_id >> 120, buf); stdout().flush().unwrap(); }
-pub fn tick(buf: &mut String, name: &str, node_id: u128) -> Option<String> {
+pub fn redraw(buf: &str, name: &str) { clear_line(); print!("{}> {}", name, buf); stdout().flush().unwrap(); }
+pub fn tick(buf: &mut String, name: &str) -> Option<String> {
     if !poll(std::time::Duration::ZERO).unwrap() { return None; }
     if let Event::Key(k) = read().unwrap() && k.kind == KeyEventKind::Press {
         match k.code {
             (KeyCode::Char('C') |
              KeyCode::Char('c')) if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => { crossterm::terminal::disable_raw_mode(); std::process::exit(0); }
-            KeyCode::Char(c)   => { buf.push(c); redraw(buf, name, node_id); }
-            KeyCode::Backspace => { buf.pop();   redraw(buf, name, node_id); }
-            KeyCode::Enter     => { let s = buf.clone(); buf.clear(); redraw("", name, node_id); return Some(s); }
+            KeyCode::Char(c)   => { buf.push(c); redraw(buf, name); }
+            KeyCode::Backspace => { buf.pop();   redraw(buf, name); }
+            KeyCode::Enter     => { let s = buf.clone(); buf.clear(); redraw("", name); return Some(s); }
             _ => {}
         }
     }
@@ -67,10 +62,10 @@ pub fn tick(buf: &mut String, name: &str, node_id: u128) -> Option<String> {
 }
 
 macro_rules! println_redraw {
-    ($buf:expr, $name:expr, $node_id:expr, $($arg:tt)*) => {{
+    ($buf:expr, $name:expr, $($arg:tt)*) => {{
         clear_line();
         println!($($arg)*);
-        redraw(&$buf, &$name, $node_id);
+        redraw(&$buf, &$name);
     }}
 }
 
@@ -84,24 +79,19 @@ impl  SliceWrite for u16  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0.
 impl  SliceWrite for u8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] = *self;                                         1 } }
 impl  SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..self.len()].copy_from_slice(self);      self.len() } }
 
-#[derive(Debug, Default, Copy, Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
-pub enum PeerState {
-    #[default] Punching,
-    Connected
+pub fn send_to(socket: SockHandle, packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>, chat_buf: &String, name: &str, connection_key: &ConnectionKey, buf: &[u8]) {
+    if PRINT_SENDS {
+        println_redraw!(chat_buf, name, "Sent {} to: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize >> 1], connection_key);
+    }
+    packets_to_send.push((*connection_key, Vec::from(buf)));
 }
 
-#[derive(Debug, Default, Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Peer {
-    pub state: PeerState,
-    pub node_id: u128,
-    pub send_time: u64,
-    pub recv_time: u64,
-    pub address: STPAddress,
-}
-
-pub fn send_to(socket: SockHandle, chat_buf: &String, name: &str, node_id: u128, peer: &Peer, buf: &[u8]) -> u64 {
-    if PRINT_RECEIVES { println_redraw!(chat_buf, name, node_id, "Sent {} to: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize >> 1], peer.address); }
-    udp_send_with_congestion_and_dscp(socket, peer.address.0, peer.address.1, buf, Dscp::BestEffort).unwrap_or(peer.send_time)
+pub fn is_connected(connection: &ConnectionTrackingData) -> bool {
+    if let ConnectionState::Connected { .. } = connection.connection_state {
+        true
+    } else {
+        false
+    }
 }
 
 pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
@@ -112,13 +102,27 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
 
     let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(monotonic_clock_ns());
 
-    let node_id: u128 = ((rng.next_u64() as u128) << 64) | (rng.next_u64() as u128);
+    let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
 
-    let mut peers: Vec<Peer> = peer_addresses.iter().map(|address| Peer { address: *address, recv_time: monotonic_clock_ns(), ..Peer::default() }).collect();
+    let my_connect_keypair = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+    let mut my_listen_keypair_plaintext = my_connect_keypair.clone();
+    my_listen_keypair_plaintext.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
+    let my_listen_keypair_encrypted = my_connect_keypair.clone();
 
-    println!("Choose a name (max 64 bytes): ");
-    let mut name = String::new();
-    io::stdin().read_line(&mut name).unwrap();
+    let my_listen_keypairs = vec![my_listen_keypair_plaintext, my_listen_keypair_encrypted];
+
+    for address in &peer_addresses {
+        if address.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
+            connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[0], address);
+        } else if address.magic1 == CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s {
+            connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[1], address);
+        }
+    }
+
+    // println!("Choose a name (max 64 bytes): ");
+    // let mut name = String::new();
+    // io::stdin().read_line(&mut name).unwrap();
+    let mut name = "asdfghjkl".to_string();
     name.truncate(64);
     name = name.trim().to_string(); // strip trailing newline
 
@@ -130,67 +134,40 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
     let mut packet_memory_recv = new_packet_memory(); // Incoming Decrypted
     let mut packet_memory_send = new_packet_memory(); // Outgoing Decrypted
 
-    let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
-
-    let my_connect_keypair = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
-    let mut my_listen_keypair_plaintext = my_connect_keypair.clone();
-    my_listen_keypair_plaintext.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
-    let my_listen_keypair_encrypted = my_connect_keypair.clone();
-
-    let my_listen_keypairs = vec![my_listen_keypair_plaintext, my_listen_keypair_encrypted];
-
-    socket_setup();
-    monotonic_clock_setup();
-
     loop {
         let now = monotonic_clock_ns();
 
-        let mut packets_received_this_tick: Vec<(STPAddress, u64, Vec<u8>)> = Vec::new();
+        let mut packets_to_send: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
 
-        service_connections(&mut connections_map, &mut packets_received_this_tick, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_connect_keypair, &my_listen_keypairs);
-
-        // Don't connect to myself.
-        peers.retain(|p| p.node_id != node_id);
-
-        let mut peer_addresses_list: Vec<(u128, STPAddress)> = peers.iter().filter(|p| p.state == PeerState::Connected).map(|p| (p.node_id, p.address)).collect();
+        let mut peer_addresses_list: Vec<STPAddress> = connections_map.iter().filter(|(connection_key, connection)| is_connected(*connection)).map(|(connection_key, connection)| connection.address()).collect();
         peer_addresses_list.shuffle(&mut rng);
-        peer_addresses_list.truncate(32); // 1088 bytes of peers
+        peer_addresses_list.truncate(20); // 1160 bytes of peers
 
-        for peer in &mut peers {
-            if (now - peer.send_time) > 250_000_000 {
-
-                if peer.state == PeerState::Punching {
-                    // Send HELLO punch hole with peers.
-                    let (mut buf, mut o) = ([0u8; 2048], 0);
-                    o += (PACKET_TYPE_HELLO << 1).write_to(&mut buf[o..]);
-                    o += node_id                 .write_to(&mut buf[o..]);
-
-                    if PRINT_HELLO { println_redraw!(chat_buf, name, node_id, "Sending HELLO to: {:?}.", (peer.node_id >> 120, peer.address)); }
-
-                    peer.send_time = send_to(socket, &chat_buf, &name, node_id, peer, &buf[..o]);
-
-                    let endpoint: STPAddress = peer.address;
-                    connect_to_endpoint(&mut connections_map, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_connect_keypair, &my_listen_keypairs, endpoint);
-
-                } else if peer.state == PeerState::Connected {
+        for (connection_key, connection) in &mut connections_map {
+            let address = connection.address();
+            if let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &connection.connection_state {
+                if (now - last_sent_keep_alive_time_ns) > 250_000_000 {
                     // Send PEER_LIST to all connected peers.
                     let (mut buf, mut o) = ([0u8; 2048], 0);
                     o += (PACKET_TYPE_PEER_LIST << 1).write_to(&mut buf[o..]);
 
-                    for (node_id, address) in &peer_addresses_list {
-                        o += node_id           .write_to(&mut buf[o..]);
-                        o += address.0.octets().write_to(&mut buf[o..]);
-                        o += address.1         .write_to(&mut buf[o..]);
+                    for address in &peer_addresses_list {
+                        let key = &address.key[..32];
+
+                        o += address.ip.octets().write_to(&mut buf[o..]);
+                        o += address.port       .write_to(&mut buf[o..]);
+                        o += address.magic1     .write_to(&mut buf[o..]);
+                        o += key                .write_to(&mut buf[o..]);
                     }
 
-                    // println_redraw!(chat_buf, name, node_id, "Sending PEER_LIST to: {:?}. It contains {} addresses.", (peer.node_id >> 120, peer.address), peer_addresses_list.len());
+                    // println_redraw!(chat_buf, name, "Sending PEER_LIST to: {:?}. It contains {} addresses.", address, peer_addresses_list.len());
 
-                    peer.send_time = send_to(socket, &chat_buf, &name, node_id, peer, &buf[..o]);
+                    send_to(socket, &mut packets_to_send, &chat_buf, &name, &connection_key, &buf[..o]);
                 }
             }
         }
 
-        if let Some(mut line) = tick(&mut chat_buf, &name, node_id) {
+        if let Some(mut line) = tick(&mut chat_buf, &name) {
             line.truncate(1024);
 
             // Send CHAT to all connected peers.
@@ -200,49 +177,21 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
             o += 64;
             o += line.as_bytes() .write_to(&mut buf[o..]);
 
-            for peer in &mut peers {
-                if peer.state == PeerState::Connected {
-                    peer.send_time = send_to(socket, &chat_buf, &name, node_id, peer, &buf[..o]);
+            for (connection_key, connection) in &mut connections_map {
+                if is_connected(connection) {
+                    send_to(socket, &mut packets_to_send, &chat_buf, &name, &connection_key, &buf[..o]);
                 }
             }
 
-            println_redraw!(chat_buf, name, node_id, "{} ({}): {}", name, node_id >> 120, line);
+            println_redraw!(chat_buf, name, "{}: {}", name, line);
         }
 
-        // Timeout peers.
-        for peer in &mut peers {
-            let timeout = (now - peer.recv_time) >= 5_000_000_000;
-            if timeout && peer.state == PeerState::Connected {
-                println_redraw!(chat_buf, name, node_id, "Disconnected from: {:?}.", (peer.node_id >> 120, peer.address));
+        let mut packets_received_this_tick: Vec<(STPAddress, Vec<u8>)> = Vec::new();
 
-                peer.state = PeerState::Punching;
-            }
-        }
-        peers.retain(|peer| {
-            let connected = peer.state == PeerState::Connected;
-            let is_a_seeder = peer_addresses.iter().any(|address| peer.address == *address);
-
-            let should_keep = connected || is_a_seeder;
-
-            should_keep
-        });
+        service_connections(&mut connections_map, &mut packets_received_this_tick, &packets_to_send, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_listen_keypairs);
 
         // Receive
-        for (address, recv_time, data) in &packets_received_this_tick {
-            // let mut buf = [0u8; MAX_MTU];
-            // let (address, recv_time, n) = {
-            //     match udp_recv_with_congestion_and_dscp(socket, &mut buf) {
-            //         Ok((n, src_ip6, src_port, _congested, _ecn_enabled, _dscp, recv_time)) => {
-            //             ((src_ip6, src_port), recv_time, n)
-            //         },
-            //         Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => { break; },
-            //         Err(e) => {
-            //             // println_redraw!(chat_buf, name, node_id, "{:?}", e);
-            //             continue;
-            //         },
-            //     }
-            // };
-
+        for (address, data) in &packets_received_this_tick {
             let n = data.len();
 
             if n <= 0 {
@@ -251,114 +200,51 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
 
             let buf = &data[..n];
 
-            let peer = {
-                if let Some(mut peer) = peers.iter_mut().find(|p| p.address == address) {
-                    peer
-                } else {
-                    peers.push(Peer { address, ..Peer::default() });
-                    &mut peers.last_mut().unwrap()
-                }
-            };
+            if PRINT_RECEIVES {
+                println_redraw!(chat_buf, name, "Got {} from: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize >> 1], address);
+            }
 
-            if PRINT_RECEIVES { println_redraw!(chat_buf, name, node_id, "Got {} from: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize >> 1], peer.address); }
-
-            // Reply to all HELLOs with a HELLO_ACK.
-            if buf[0] >> 1 == PACKET_TYPE_HELLO {
+            if buf[0] >> 1 == PACKET_TYPE_PEER_LIST {
                 let buf = &buf[1..];
 
-                if buf.len() < 16 { continue; }
+                let chunks = buf.chunks_exact(58);
 
-                let peer_node_id = u128::from_le_bytes(<[u8; 16]>::try_from(&buf[..16]).unwrap());
+                clear_line();
+                if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses: ", chunks.len()); }
 
-                let buf = &buf[16..];
+                let mut comma = false;
+                for chunk in chunks {
+                    let ip     = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[ 0..16]).unwrap());
+                    let port   =       u16::from_le_bytes(<[u8;  2]>::try_from(&chunk[16..18]).unwrap());
+                    let magic1 =       u64::from_le_bytes(<[u8;  8]>::try_from(&chunk[18..26]).unwrap());
+                    let key    =                                     Vec::from(&chunk[26..58]);
 
-                if peer_node_id == node_id {
-                    continue;
-                }
+                    let address = STPAddress { ip, port, magic1, key };
 
-                if PRINT_HELLO { println_redraw!(chat_buf, name, node_id, "Sending HELLO_ACK to: {:?}.", (peer_node_id >> 120, peer.address)); }
-
-                let (mut buf, mut o) = ([0u8; 2048], 0);
-                o += (PACKET_TYPE_HELLO_ACK << 1).write_to(&mut buf[o..]);
-                o += node_id                     .write_to(&mut buf[o..]);
-                o += peer_node_id                .write_to(&mut buf[o..]);
-
-                peer.recv_time = recv_time;
-                peer.send_time = send_to(socket, &chat_buf, &name, node_id, peer, &buf[..o]);
-            } else if buf[0] >> 1 == PACKET_TYPE_HELLO_ACK {
-                let buf = &buf[1..];
-
-                if buf.len() < 16 { continue; }
-
-                let peer_node_id     = u128::from_le_bytes(<[u8; 16]>::try_from(&buf[..16]).unwrap());
-
-                let buf = &buf[16..];
-
-                if buf.len() < 16 { continue; }
-
-                let mirrored_node_id = u128::from_le_bytes(<[u8; 16]>::try_from(&buf[..16]).unwrap());
-
-                let buf = &buf[16..];
-
-                if peer_node_id == node_id {
-                    continue;
-                }
-                if mirrored_node_id != node_id {
-                    continue;
-                }
-
-                peer.recv_time = recv_time;
-
-                peer.state = PeerState::Connected;
-                peer.node_id = peer_node_id;
-
-                println_redraw!(chat_buf, name, node_id, "Connected to: {:?}. Now connected to {} peers.", (peer_node_id >> 120, address), peers.iter().filter(|peer| peer.state == PeerState::Connected).enumerate().count());
-            } else if peer.state == PeerState::Connected {
-                if buf[0] >> 1 == PACKET_TYPE_PEER_LIST {
-                    let buf = &buf[1..];
-
-                    let chunks = buf.chunks_exact(34);
-
-                    clear_line();
-                    if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses: ", chunks.len()); }
-
-                    peer.recv_time = recv_time;
-
-                    let mut comma = false;
-                    for chunk in chunks {
-                        let id   =      u128::from_le_bytes(<[u8; 16]>::try_from(&chunk[ 0..16]).unwrap());
-                        let ip   = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[16..32]).unwrap());
-                        let port =       u16::from_le_bytes(<[u8;  2]>::try_from(&chunk[32..34]).unwrap());
-
-                        let address = STPAddress(ip, port);
-
-                        if PRINT_PEER_LIST { if comma { print!(", "); } else { comma = true; } print!("{:?}", (id >> 120, address)); }
-
-                        if id == node_id {
-                            continue;
-                        }
-
-                        // @Note: Allows for the same node on different addresses in case a new path will be discovered.
-                        if peers.iter().find(|p| p.address == address).is_none() {
-                            peers.push(Peer { node_id: id, address, recv_time, ..Peer::default() });
-                        }
+                    if PRINT_PEER_LIST {
+                        if comma { print!(", "); } else { comma = true; }
+                        print!("{:?}", address);
                     }
 
-                    if PRINT_PEER_LIST { println!(""); redraw(&chat_buf, &name, node_id); }
-                } else if buf[0] >> 1 == PACKET_TYPE_CHAT {
-                    let buf = &buf[1..];
-
-                    if buf.len() < 64 { continue; }
-
-                    let peer_name = &buf[..64];
-
-                    let buf = &buf[64..];
-
-                    println_redraw!(chat_buf, name, node_id, "{} ({}): {}",
-                                    std::str::from_utf8(peer_name).unwrap_or("?").trim_end_matches('\0'),
-                                    peer.node_id >> 120,
-                                    std::str::from_utf8(buf).unwrap_or("?").trim_end_matches('\0'));
+                    // @Note: Allows for the same node on different addresses in case a new path will be discovered.
+                    if connections_map.iter().find(|(connection_key, connection)| connection.address() == address).is_none() {
+                        connect_to_endpoint(socket, &mut connections_map, &my_connect_keypair, &address);
+                    }
                 }
+
+                if PRINT_PEER_LIST { println!(""); redraw(&chat_buf, &name); }
+            } else if buf[0] >> 1 == PACKET_TYPE_CHAT {
+                let buf = &buf[1..];
+
+                if buf.len() < 64 { continue; }
+
+                let peer_name = &buf[..64];
+
+                let buf = &buf[64..];
+
+                println_redraw!(chat_buf, name, "{}: {}",
+                                std::str::from_utf8(peer_name).unwrap_or("?").trim_end_matches('\0'),
+                                std::str::from_utf8(buf).unwrap_or("?").trim_end_matches('\0'));
             }
         }
 

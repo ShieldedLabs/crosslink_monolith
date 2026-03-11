@@ -32,9 +32,9 @@ pub fn handshake_test() {
     });
     std::thread::sleep(std::time::Duration::from_millis(100));
     let _handle = std::thread::spawn(move || {
-        do_the_test_program2(29854, vec![kp2.clone()], Some((&kp2, &STPAddress(Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_PLAIN_TEXT, kp1_pub))));
+        do_the_test_program2(29854, vec![kp2.clone()], Some((&kp2, &STPAddress{ ip: Ipv6Addr::LOCALHOST, port: 32845, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: kp1_pub })));
     });
-    do_the_test_program2(29853, vec![kp3.clone()], Some((&kp3, &STPAddress(Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, kp1_pub2))));
+    do_the_test_program2(29853, vec![kp3.clone()], Some((&kp3, &STPAddress{ ip: Ipv6Addr::LOCALHOST, port: 32845, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp1_pub2 })));
 }
 
 #[test]
@@ -50,9 +50,9 @@ fn contested_test() {
     monotonic_clock_setup();
 
     let _handle = std::thread::spawn(move || {
-        do_the_test_program2(32845, vec![kp1.clone()], Some((&kp1, &STPAddress(Ipv6Addr::LOCALHOST, 29853, CONNECT_MAGIC1_PLAIN_TEXT, kp2_pub))));
+        do_the_test_program2(32845, vec![kp1.clone()], Some((&kp1, &STPAddress{ ip: Ipv6Addr::LOCALHOST, port: 29853, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: kp2_pub })));
     });
-    do_the_test_program2(29853, vec![kp2.clone()], Some((&kp2, &STPAddress(Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_PLAIN_TEXT, kp1_pub))));
+    do_the_test_program2(29853, vec![kp2.clone()], Some((&kp2, &STPAddress{ ip: Ipv6Addr::LOCALHOST, port: 32845, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: kp1_pub })));
 }
 
 #[test]
@@ -68,9 +68,9 @@ fn contested_encrypted_test() {
     monotonic_clock_setup();
 
     let _handle = std::thread::spawn(move || {
-        do_the_test_program2(32845, vec![kp1.clone()], Some((&kp1, &STPAddress(Ipv6Addr::LOCALHOST, 29853, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, kp2_pub))));
+        do_the_test_program2(32845, vec![kp1.clone()], Some((&kp1, &STPAddress{ ip: Ipv6Addr::LOCALHOST, port: 29853, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp2_pub })));
     });
-    do_the_test_program2(29853, vec![kp2.clone()], Some((&kp2, &STPAddress(Ipv6Addr::LOCALHOST, 32845, CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, kp1_pub))));
+    do_the_test_program2(29853, vec![kp2.clone()], Some((&kp2, &STPAddress{ ip: Ipv6Addr::LOCALHOST, port: 32845, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp1_pub })));
 }
 
 // LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
@@ -99,8 +99,13 @@ pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
 }
 
 #[derive(Debug, Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
-pub struct STPAddress(pub Ipv6Addr, pub u16, pub u64, pub Vec<u8>);
-impl Default for STPAddress { fn default() -> Self { Self(Ipv6Addr::UNSPECIFIED, 0, 0, Vec::new()) } }
+pub struct STPAddress {
+    pub ip: Ipv6Addr,
+    pub port: u16,
+    pub magic1: u64,
+    pub key: Vec<u8>,
+}
+impl Default for STPAddress { fn default() -> Self { Self { ip: Ipv6Addr::UNSPECIFIED, ..Default::default() } } }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct IdentityKeyPair {
@@ -111,21 +116,31 @@ pub struct IdentityKeyPair {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConnectionKey {
-    ip: Ipv6Addr,
-    port: u16,
-    key_15_bits: u16, // LSB is just always 1.
+    pub ip: Ipv6Addr,
+    pub port: u16,
+    pub key_15_bits: u16, // LSB is just always 1.
 }
 
 #[derive(Debug)]
 pub struct ConnectionTrackingData {
-    creation_time_ns: u64,
-    my_ip: Ipv6Addr,
-    my_transport_identity_keypair: IdentityKeyPair,
-    two_byte_send_prefix: u16,
-    other_ip: Ipv6Addr,
-    other_port: u16,
-    other_transport_identity: Vec<u8>,
-    connection_state: ConnectionState,
+    pub creation_time_ns: u64,
+    pub my_ip: Ipv6Addr,
+    pub my_transport_identity_keypair: IdentityKeyPair,
+    pub two_byte_send_prefix: u16,
+    pub other_ip: Ipv6Addr,
+    pub other_port: u16,
+    pub other_transport_identity: Vec<u8>,
+    pub connection_state: ConnectionState,
+}
+impl ConnectionTrackingData {
+    pub fn address(&self) -> STPAddress {
+        STPAddress {
+            ip:     self.other_ip,
+            port:   self.other_port,
+            magic1: self.my_transport_identity_keypair.magic1,
+            key:    self.other_transport_identity.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +194,7 @@ pub enum ConnectionState {
         cipher: Option<ConnectionCipherTriplet>,
         send_sequence_number: u64,
         last_sent_keep_alive_time_ns: u64,
+        recv_time_ns: u64,
     },
 }
 
@@ -198,8 +214,7 @@ pub fn do_the_test_program2(my_port: u16, my_listen_keypairs: Vec<IdentityKeyPai
     //println!("{:#?}", connections_map);
 
     loop {
-        let mut _unused = Vec::new();
-        service_connections(&mut connections_map, &mut _unused, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_listen_keypairs);
+        service_connections(&mut connections_map, &mut Vec::new(), &Vec::new(), &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_listen_keypairs);
     }
 }
 
@@ -210,7 +225,7 @@ pub fn connect_to_endpoint(
     beam_to: &STPAddress,
 ) {
     if let beam_to = beam_to {
-        assert!(my_connect_keypair.magic1 == beam_to.2);
+        assert!(my_connect_keypair.magic1 == beam_to.magic1);
 
         // TODO list of supported Application Level protocols for e.g. zcash network upgrades. Note: We will need to use a callback in order for application code on the server to select which magic2 we will use and whether to reject the client. This is because magic2's do not have a strict order preference and so we need to push that logic to the application layer.
         // packet_memory_send
@@ -224,19 +239,19 @@ pub fn connect_to_endpoint(
             assert_eq!(list_of_protocols_len_bytes, 0,); // temp
             //hello_packet_payload[6+32..6+32+list_of_protocols_len_bytes].copy_from_slice(&packet_memory_send[0..list_of_protocols_len_bytes]);
             
-            let my_ip = if beam_to.0.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
+            let my_ip = if beam_to.ip.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
-                ConnectionKey { ip: beam_to.0, port: beam_to.1, key_15_bits: load_u16(&beam_to.3[0..2]) << 1 },
+                ConnectionKey { ip: beam_to.ip, port: beam_to.port, key_15_bits: load_u16(&beam_to.key[0..2]) << 1 },
                 ConnectionTrackingData {
                     creation_time_ns: monotonic_clock_ns(),
                     my_ip,
                     my_transport_identity_keypair: my_connect_keypair.clone(),
                     two_byte_send_prefix: load_u16(&my_connect_keypair.public[0..2]) << 1,
-                    other_ip: beam_to.0,
-                    other_port: beam_to.1,
-                    other_transport_identity: beam_to.3.clone(),
+                    other_ip: beam_to.ip,
+                    other_port: beam_to.port,
+                    other_transport_identity: beam_to.key.clone(),
                     // later when not testing last_sent_time_ns should be zero
-                    connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: monotonic_clock_ns(), hello_packet_payload },
+                    connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
                 },
             );
         }
@@ -246,7 +261,7 @@ pub fn connect_to_endpoint(
             let mut handshake = snow::Builder::new(noise_string_from_connect_magic1(my_connect_keypair.magic1).unwrap().parse().unwrap())
                 .prologue(&hello_packet_payload[0..6]).unwrap()
                 .local_private_key(&my_connect_keypair.private[..]).unwrap()
-                .remote_public_key(&beam_to.3[..]).unwrap()
+                .remote_public_key(&beam_to.key[..]).unwrap()
                 .build_initiator().unwrap();
             
             // TODO list protocols
@@ -254,19 +269,19 @@ pub fn connect_to_endpoint(
             hello_packet_payload.truncate(6+handshake_size);
             hello_packet_payload.shrink_to_fit();
             
-            let my_ip = if beam_to.0.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
+            let my_ip = if beam_to.ip.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
-                ConnectionKey { ip: beam_to.0, port: beam_to.1, key_15_bits: load_u16(&beam_to.3[0..2]) << 1 },
+                ConnectionKey { ip: beam_to.ip, port: beam_to.port, key_15_bits: load_u16(&beam_to.key[0..2]) << 1 },
                 ConnectionTrackingData {
                     creation_time_ns: monotonic_clock_ns(),
                     my_ip,
                     my_transport_identity_keypair: my_connect_keypair.clone(),
                     two_byte_send_prefix: load_u16(&my_connect_keypair.public[0..2]) << 1,
-                    other_ip: beam_to.0,
-                    other_port: beam_to.1,
-                    other_transport_identity: beam_to.3.clone(),
+                    other_ip: beam_to.ip,
+                    other_port: beam_to.port,
+                    other_transport_identity: beam_to.key.clone(),
                     // later when not testing last_sent_time_ns should be zero
-                    connection_state: ConnectionState::SendingClientHello { last_sent_time_ns: monotonic_clock_ns(), hello_packet_payload, handshake },
+                    connection_state: ConnectionState::SendingClientHello { last_sent_time_ns: 0, hello_packet_payload, handshake },
                 },
             );
         }
@@ -275,7 +290,8 @@ pub fn connect_to_endpoint(
 
 
 pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
-                           packets_received_this_call: &mut Vec<(STPAddress, u64, Vec<u8>)>,
+                           packets_received_this_call: &mut Vec<(STPAddress, Vec<u8>)>,
+                           packets_to_send: &Vec<(ConnectionKey, Vec<u8>)>,
                            packet_memory_encrypted: &mut PacketMemory,
                            packet_memory_recv: &mut PacketMemory,
                            packet_memory_send: &mut PacketMemory,
@@ -416,6 +432,7 @@ pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, Connec
                                             cipher: None,
                                             send_sequence_number: 0,
                                             last_sent_keep_alive_time_ns: 0,
+                                            recv_time_ns: timestamp_ns,
                                         };
                                     }
                                 }
@@ -434,6 +451,7 @@ pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, Connec
                                             cipher: None,
                                             send_sequence_number: 0,
                                             last_sent_keep_alive_time_ns: 0,
+                                            recv_time_ns: timestamp_ns,
                                         };
                                         let old_state = std::mem::replace(&mut existing_connection.connection_state, new_state);
                                         
@@ -450,6 +468,7 @@ pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, Connec
                                     cipher: None,
                                     send_sequence_number: 0,
                                     last_sent_keep_alive_time_ns: 0,
+                                    recv_time_ns: timestamp_ns,
                                 };
                                 // FALLTHROUGH TO PLAINTEXT CONNECTED
                             }
@@ -467,11 +486,12 @@ pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, Connec
                                     cipher: Some(cipher.clone()),
                                     send_sequence_number: 0,
                                     last_sent_keep_alive_time_ns: 0,
+                                    recv_time_ns: timestamp_ns,
                                 };
                                 // FALLTHROUGH TO CONNECTED
                             }
                             
-                            if let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns } = &mut existing_connection.connection_state {
+                            if let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &mut existing_connection.connection_state {
                                 let non_virtual_nonce = magic1 >> 16; // Todo convert this to virtual.
                             
                                 // TODO acks etc
@@ -492,15 +512,14 @@ pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, Connec
                                 else {
                                     payload = &packet_memory_encrypted[6..buf_len];
                                 }
+
+                                *recv_time_ns = timestamp_ns;
+
                                 println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload);
 
-                                let address = STPAddress(existing_connection.other_ip,
-                                                         existing_connection.other_port,
-                                                         existing_connection.my_transport_identity_keypair.magic1,
-                                                         existing_connection.other_transport_identity.clone());
-                                let recv_time = timestamp_ns;
+                                let address = existing_connection.address();
 
-                                packets_received_this_call.push((address, recv_time, Vec::from(payload)));
+                                packets_received_this_call.push((address, Vec::from(payload)));
                             }
                         }
                         break;
@@ -551,7 +570,7 @@ pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, Connec
                     return false;
                 }
             }
-            if let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns } = &mut connection_tracking_data.connection_state {
+            if let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &mut connection_tracking_data.connection_state {
                 if *last_sent_keep_alive_time_ns + 5_000_000_000 < current_time_now_ns {
                     let virtual_nonce = *send_sequence_number;
                     store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
@@ -570,9 +589,23 @@ pub fn service_connections(connections_map: &mut HashMap::<ConnectionKey, Connec
                     *last_sent_keep_alive_time_ns = current_time_now_ns;
                     return true;
                 }
+                if *recv_time_ns + 15_000_000_000 < current_time_now_ns {
+                    println!("Disconnected from: {:?}.", connection_tracking_data.other_transport_identity);
+                    return false; // connection timeout
+                }
             }
             true
         });
+
+        for (connection_key, data) in packets_to_send {
+            let Some(ref mut connection) = connections_map.get_mut(connection_key)
+            else { continue; };
+
+            let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &mut connection.connection_state
+            else { continue; };
+
+            // TODO send
+        }
     }
 }
 
