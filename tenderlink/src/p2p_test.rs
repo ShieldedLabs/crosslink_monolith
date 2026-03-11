@@ -9,9 +9,9 @@ use rand::seq::SliceRandom;
 
 use std::io;
 
-const PRINT_RECEIVES  :bool=0!= (0);
-const PRINT_SENDS     :bool=0!= (0);
-const PRINT_PEER_LIST :bool=0!= (0);
+const PRINT_RECEIVES                 :bool=0!=                (0);
+const PRINT_SENDS                    :bool=0!=                (0);
+const PRINT_PEER_LIST                :bool=0!=                (0);
 
 
 const MAX_MTU: usize = 15972;
@@ -88,7 +88,7 @@ pub struct Peer {
 
 pub fn send_to(socket: SockHandle, packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>, chat_buf: &String, name: &str, connection_key: &ConnectionKey, buf: &[u8]) {
     if PRINT_SENDS {
-        println_redraw!(chat_buf, name, "Sent {} to: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize >> 1], connection_key);
+        println_redraw!(chat_buf, name, "Sent {} to: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize], connection_key);
     }
     packets_to_send.push((*connection_key, Vec::from(buf)));
 }
@@ -111,18 +111,14 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
 
     let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
 
-    let my_connect_keypair = if peer_addresses.len() > 0 { // I'm not The Seeder
+    let my_connect_keypair = if peer_addresses.len() == 0 { // I am The Seeder
         IdentityKeyPair {
             magic1:  CONNECT_MAGIC1_PLAIN_TEXT,
-            private: vec![0x01u8; 32],
-            public:  vec![0x01u8; 32],
+            private: vec![0xAAu8; 32],
+            public:  vec![0xAAu8; 32],
         }
-    } else {
-        IdentityKeyPair { // I am The Seeder
-            magic1:  CONNECT_MAGIC1_PLAIN_TEXT,
-            private: vec![0x00u8; 32],
-            public:  vec![0x00u8; 32],
-        }
+    } else { // I'm not The Seeder
+        new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap()
     };
     let my_listen_keypair_plaintext = my_connect_keypair.clone();
     let my_listen_keypair_encrypted = my_connect_keypair.clone();
@@ -133,7 +129,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
         if address.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
             connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[0], address);
         } else {
-            panic!("Dev: Plaintext only for now!!!");
+            panic!("Dev: Plaintext only for now!!!"); // @Debug @Temporary @Remove
             if address.magic1 == CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s {
                 connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[1], address);
             }
@@ -186,7 +182,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
             peer.send_time = now;
 
             let (mut buf, mut o) = ([0u8; 2048], 0);
-            o += (PACKET_TYPE_PEER_LIST << 1).write_to(&mut buf[o..]);
+            o += PACKET_TYPE_PEER_LIST.write_to(&mut buf[o..]);
 
             for address in &peer_addresses_list {
                 let key = &address.key[..32];
@@ -197,7 +193,7 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
                 o += key                .write_to(&mut buf[o..]);
             }
 
-            // println_redraw!(chat_buf, name, "Sending PEER_LIST to: {:?}. It contains {} addresses.", address, peer_addresses_list.len());
+            // if PRINT_PEER_LIST { println_redraw!(chat_buf, name, "Sending PEER_LIST to: {:?}. It contains {} addresses.", address, peer_addresses_list.len()); }
 
             send_to(socket, &mut packets_to_send, &chat_buf, &name, &connection_key, &buf[..o]);
         }
@@ -207,10 +203,10 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
 
             // Send CHAT to all connected peers.
             let (mut buf, mut o) = ([0u8; 2048], 0);
-            o += (PACKET_TYPE_CHAT << 1).write_to(&mut buf[o..]);
-            name.as_bytes()             .write_to(&mut buf[o..]);
+            o += PACKET_TYPE_CHAT.write_to(&mut buf[o..]);
+            name.as_bytes()      .write_to(&mut buf[o..]);
             o += 64;
-            o += line.as_bytes()        .write_to(&mut buf[o..]);
+            o += line.as_bytes() .write_to(&mut buf[o..]);
 
             for (connection_key, connection) in &mut connections_map {
                 if is_connected(connection) {
@@ -263,16 +259,18 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
             let buf = &data[..n];
 
             if PRINT_RECEIVES {
-                println_redraw!(chat_buf, name, "Got {} from: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize >> 1], address);
+                println_redraw!(chat_buf, name, "Got {} from: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize], address);
             }
 
-            if buf[0] >> 1 == PACKET_TYPE_PEER_LIST {
+            if buf[0] == PACKET_TYPE_PEER_LIST {
                 let buf = &buf[1..];
 
                 let chunks = buf.chunks_exact(58);
 
                 clear_line();
                 if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses: ", chunks.len()); }
+
+                let mut new_peers = Vec::new();
 
                 let mut comma = false;
                 for chunk in chunks {
@@ -281,24 +279,45 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
                     let magic1 =       u64::from_le_bytes(<[u8;  8]>::try_from(&chunk[18..26]).unwrap());
                     let key    =                                     Vec::from(&chunk[26..58]);
 
+                    let is_myself = (magic1 == my_connect_keypair.magic1) && (key == my_connect_keypair.public);
+
                     let address = STPAddress { ip, port, magic1, key };
 
                     if PRINT_PEER_LIST {
                         if comma { print!(", "); } else { comma = true; }
-                        print!("{:?}", address);
+                        print!("({}, {}, {})", address.ip, address.port, address.key[0]);
                     }
 
-                    // @Note: Allows for the same node on different addresses in case a new path will be discovered.
-                    if connections_map.iter().find(|(connection_key, connection)| connection.address() == address).is_none() {
-                        if magic1 != CONNECT_MAGIC1_PLAIN_TEXT {
-                            panic!("Dev: Plaintext only for now!!!");
+                    // @Note: Allows for anything about the addresses to differ, in case a new path will be discovered.
+                    let already_exists = connections_map.iter().find(|(connection_key, connection)| connection.address() == address).is_some();
+
+                    let skip = is_myself || already_exists;
+
+                    if skip {
+                        if is_myself {
+                            print!(" (me)");
                         }
-                        connect_to_endpoint(socket, &mut connections_map, &my_connect_keypair, &address);
+                        continue;
                     }
+
+                    print!(" (new!)");
+
+                    new_peers.push(address.clone());
+
+                    // Discovered new peer! Connect.
+
+                    if magic1 != CONNECT_MAGIC1_PLAIN_TEXT {
+                        panic!("Dev: Plaintext only for now!!!"); // @Debug @Temporary @Remove
+                    }
+                    connect_to_endpoint(socket, &mut connections_map, &my_connect_keypair, &address);
                 }
 
                 if PRINT_PEER_LIST { println!(""); redraw(&chat_buf, &name); }
-            } else if buf[0] >> 1 == PACKET_TYPE_CHAT {
+
+                for new_peer in new_peers {
+                    println_redraw!(chat_buf, name, "Discovered new peer: {:?}", new_peer);
+                }
+            } else if buf[0] == PACKET_TYPE_CHAT {
                 let buf = &buf[1..];
 
                 if buf.len() < 64 { continue; }
