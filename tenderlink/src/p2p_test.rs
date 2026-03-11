@@ -136,19 +136,11 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
         }
     }
 
-    // println!("Choose a name (max 64 bytes): ");
-    // let mut name = String::new();
-    // io::stdin().read_line(&mut name).unwrap();
-
-    // let mut name = "asdfghjkl".to_string();
-
-    let mut name = if peer_addresses.len() > 0 { // I'm not The Seeder
-        "plebian"
-    } else {
-        "seeder"
-    }.to_string();
-    name.truncate(64);
+    println!("Choose a name (max 64 bytes): ");
+    let mut name = String::new();
+    io::stdin().read_line(&mut name).unwrap();
     name = name.trim().to_string(); // strip trailing newline
+    name.truncate(64);
 
     let _raw = RawModePanicSafe::new();
 
@@ -159,6 +151,8 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
     let mut packet_memory_send = new_packet_memory(); // Outgoing Decrypted
 
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
+
+    println_redraw!(chat_buf, name, "");
 
     loop {
         let now = monotonic_clock_ns();
@@ -239,13 +233,15 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
 
             let address = connection.address();
 
-            println_redraw!(chat_buf, name, "Connected to {:?}.", address.clone());
-            // New connection; insert peer.
-            peers.insert(*connection_key, Peer {
-                send_time: now,
-                address,
-                ..Default::default()
-            });
+            if connection.is_connected() {
+                println_redraw!(chat_buf, name, "Connected to {:?}.", address.clone());
+                // New connection; insert peer.
+                peers.insert(*connection_key, Peer {
+                    send_time: now,
+                    address,
+                    ..Default::default()
+                });
+            }
         }
 
         // Receive
@@ -295,12 +291,12 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
 
                     if skip {
                         if is_myself {
-                            print!(" (me)");
+                            if PRINT_PEER_LIST { print!(" (me)"); }
                         }
                         continue;
                     }
 
-                    print!(" (new!)");
+                    if PRINT_PEER_LIST { print!(" (new!)"); }
 
                     new_peers.push(address.clone());
 
