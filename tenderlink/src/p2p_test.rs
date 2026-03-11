@@ -104,9 +104,20 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
 
     let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
 
-    let my_connect_keypair = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
-    let mut my_listen_keypair_plaintext = my_connect_keypair.clone();
-    my_listen_keypair_plaintext.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
+    let my_connect_keypair = if peer_addresses.len() > 0 { // I'm not The Seeder
+        IdentityKeyPair {
+            magic1:  CONNECT_MAGIC1_PLAIN_TEXT,
+            private: vec![0x01u8; 32],
+            public:  vec![0x01u8; 32],
+        }
+    } else {
+        IdentityKeyPair { // I am The Seeder
+            magic1:  CONNECT_MAGIC1_PLAIN_TEXT,
+            private: vec![0x00u8; 32],
+            public:  vec![0x00u8; 32],
+        }
+    };
+    let my_listen_keypair_plaintext = my_connect_keypair.clone();
     let my_listen_keypair_encrypted = my_connect_keypair.clone();
 
     let my_listen_keypairs = vec![my_listen_keypair_plaintext, my_listen_keypair_encrypted];
@@ -114,8 +125,11 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
     for address in &peer_addresses {
         if address.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
             connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[0], address);
-        } else if address.magic1 == CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s {
-            connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[1], address);
+        } else {
+            panic!("Dev: Plaintext only for now!!!");
+            if address.magic1 == CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s {
+                connect_to_endpoint(socket, &mut connections_map, &my_listen_keypairs[1], address);
+            }
         }
     }
 
@@ -228,6 +242,9 @@ pub fn p2p(port: u16, peer_addresses: Vec<STPAddress>) {
 
                     // @Note: Allows for the same node on different addresses in case a new path will be discovered.
                     if connections_map.iter().find(|(connection_key, connection)| connection.address() == address).is_none() {
+                        if magic1 != CONNECT_MAGIC1_PLAIN_TEXT {
+                            panic!("Dev: Plaintext only for now!!!");
+                        }
                         connect_to_endpoint(socket, &mut connections_map, &my_connect_keypair, &address);
                     }
                 }

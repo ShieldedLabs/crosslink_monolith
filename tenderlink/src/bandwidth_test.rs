@@ -548,9 +548,9 @@ pub fn service_connections(
                                 packets_received_this_call.push((address, Vec::from(payload)));
                             }
                         }
-                        else {
-                            panic!("INTERLOPER: Got a non-hello packet from someone I don't recognize! @Todo @Temporary"); // @Todo @Temporary
-                        }
+                        // else {
+                        //     panic!("INTERLOPER: Got a non-hello packet from someone I don't recognize! @Todo @Temporary"); // @Todo @Temporary
+                        // }
                         break;
                     }
                 }

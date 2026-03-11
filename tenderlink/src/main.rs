@@ -32,7 +32,7 @@ fn main() {
     }
 
     // let peers = vec![tenderlink::p2p_test::IpAddress("0000:0000:0000:0000:0000:ffff:4622:f29b".parse().unwrap(), P2P_PORT)]; // @Temporary
-    let peers = vec![tenderlink::bandwidth_test::STPAddress { ip: "::1".parse().unwrap(), port: P2P_PORT, magic1: tenderlink::bandwidth_test::CONNECT_MAGIC1_PLAIN_TEXT, key: Vec::from(&[0xABu8; 32]) }];
+    let peers = vec![tenderlink::bandwidth_test::STPAddress { ip: "::1".parse().unwrap(), port: P2P_PORT, magic1: tenderlink::bandwidth_test::CONNECT_MAGIC1_PLAIN_TEXT, key: Vec::from(&[0x00u8; 32]) }];
     if args.len() == 1 {
         tenderlink::p2p_test::p2p(0, peers);
         return;
