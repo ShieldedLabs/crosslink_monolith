@@ -127,7 +127,7 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
 
     let my_keypairs = vec![&my_keypair_encrypted, &my_keypair_plaintext];
 
-    let name = fmt_magic1_pubkey_b64(my_keypair_encrypted.magic1, &my_keypair_encrypted.public);
+    let name = b64(&my_keypair_encrypted.public);
     assert!(name.len() <= 64);
     // println!("Choose a name (max 64 bytes): ");
     // let mut name = String::new();
