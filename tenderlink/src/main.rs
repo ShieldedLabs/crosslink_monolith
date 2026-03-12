@@ -50,9 +50,13 @@ fn main() {
         }
     }
 
-    let ip = "0000:0000:0000:0000:0000:ffff:4622:f29b".parse().unwrap(); // @Temporary
+    let ip = "::ffff:4622:f29b".parse().unwrap(); // @Temporary
+    let ip2 = "2a05:f480:2400:13a9:5400:05ff:fefb:77ae".parse().unwrap(); // @Temporary
     // let ip = "::1".parse().unwrap(); // @Temporary
-    let peers = vec![bandwidth_test::STPAddress { ip, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public }];
+    let peers = vec![
+        bandwidth_test::STPAddress { ip, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() },
+        bandwidth_test::STPAddress { ip: ip2, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() },
+    ];
     if args.len() == 1 {
         p2p_test::p2p(0, None, peers);
         return;
