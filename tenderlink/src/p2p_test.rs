@@ -310,12 +310,12 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
 
                 if PRINT_PEER_LIST { println!(""); redraw(&chat_buf, &name); }
 
-                for (new_peer, connect_result) in new_peers {
-                    println_redraw!(chat_buf, name, "Discovered new peer: {:?}", new_peer);
-                    if let Err(s) = connect_result {
-                        println_redraw!(chat_buf, name, "{}", s);
-                    }
-                }
+                // for (new_peer, connect_result) in new_peers {
+                //     println_redraw!(chat_buf, name, "Discovered new peer: {:?}", new_peer);
+                //     if let Err(s) = connect_result {
+                //         println_redraw!(chat_buf, name, "{}", s);
+                //     }
+                // }
             } else if buf[0] == PACKET_TYPE_CHAT {
                 let buf = &buf[1..];
 
