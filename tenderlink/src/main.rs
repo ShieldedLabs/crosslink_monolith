@@ -3,7 +3,6 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
-    //*
     if args.len() > 2 {
         use bandwidth_test::*;
         if args[1] == "reflector" {
@@ -22,7 +21,6 @@ fn main() {
             return;
         }
     }
-    // */
 
     const P2P_PORT: u16 = 18234;
 
@@ -45,18 +43,29 @@ fn main() {
     if args.len() > 1 {
         if args[1] == "p2p" {
             let port : u16 = args.get(2).map(|a| a.parse().unwrap()).unwrap_or(P2P_PORT);
-            p2p_test::p2p(port, Some(seeder_keypair), vec![]);
+            p2p_test::p2p(port, Some(seeder_keypair), vec![], true, true);
             return;
         }
     }
 
-    // let ip = "::1".parse().unwrap(); // @Temporary
+    let use_ipv4 = !args.contains(&"-no_ipv4".to_string());
+    let use_ipv6 = !args.contains(&"-no_ipv6".to_string());
+    let localhost = args.contains(&"-localhost".to_string());
+
+    let (ip4, ip6) = if localhost {
+        ("::ffff:127.0.0.1", "::1")
+    } else {
+        ("::ffff:70.34.242.155", "2a05:f480:2400:13a9:5400:05ff:fefb:77ae")
+    };
+    let (ip4, ip6) = (ip4.parse().unwrap(), ip6.parse().unwrap());
     let peers = vec![
-        bandwidth_test::STPAddress { ip:                        "::ffff:4622:f29b".parse().unwrap(), port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() },
-        // bandwidth_test::STPAddress { ip: "2a05:f480:2400:13a9:5400:05ff:fefb:77ae".parse().unwrap(), port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() },
+        bandwidth_test::STPAddress { ip: ip4, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() },
+        bandwidth_test::STPAddress { ip: ip6, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() },
     ];
-    if args.len() == 1 {
-        p2p_test::p2p(0, None, peers);
+    let peers = Vec::from(if !use_ipv6 { &peers[..1] } else if !use_ipv4 { &peers[1..] } else { &peers[..] });
+
+    if args.len() == 1 || !use_ipv4 || !use_ipv6 || localhost {
+        p2p_test::p2p(0, None, peers, use_ipv4, use_ipv6);
         return;
     }
     let mut i: usize = usize::MAX;

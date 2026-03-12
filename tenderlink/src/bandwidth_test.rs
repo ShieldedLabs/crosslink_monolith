@@ -107,9 +107,7 @@ pub fn fmt_magic1_pubkey_b64(magic1: u64, key: &Vec<u8>) -> String {
     let mut tmp = Vec::with_capacity(8 + key.len());
     tmp.extend_from_slice(&magic1.to_le_bytes()[..6]);
     tmp.extend_from_slice(&key);
-
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&tmp)
+    b64(&tmp)
 }
 
 #[derive(Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
@@ -118,6 +116,10 @@ pub struct STPAddress {
     pub port: u16,
     pub magic1: u64,
     pub key: Vec<u8>,
+}
+impl STPAddress {
+    pub fn is_ipv4(&self) -> bool { self.ip.to_ipv4_mapped().is_some() }
+    pub fn is_ipv6(&self) -> bool { self.ip.to_ipv4_mapped().is_none() }
 }
 impl Default for STPAddress {
     fn default() -> Self {
@@ -293,7 +295,7 @@ pub fn connect_to_endpoint(
             assert_eq!(list_of_protocols_len_bytes, 0,); // temp
             //hello_packet_payload[6+32..6+32+list_of_protocols_len_bytes].copy_from_slice(&packet_memory_send[0..list_of_protocols_len_bytes]);
             
-            let my_ip = if beam_to.ip.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
+            let my_ip = if beam_to.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
                 ConnectionKey { ip: beam_to.ip, port: beam_to.port, key_15_bits: load_u16(&beam_to.key[0..2]) << 1 },
                 ConnectionTrackingData {
@@ -322,7 +324,7 @@ pub fn connect_to_endpoint(
             hello_packet_payload.truncate(6+handshake_size);
             hello_packet_payload.shrink_to_fit();
             
-            let my_ip = if beam_to.ip.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
+            let my_ip = if beam_to.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
                 ConnectionKey { ip: beam_to.ip, port: beam_to.port, key_15_bits: load_u16(&beam_to.key[0..2]) << 1 },
                 ConnectionTrackingData {

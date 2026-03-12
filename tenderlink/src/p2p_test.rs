@@ -112,7 +112,7 @@ pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKe
     Err(format!("Error: Can't connect to given peer: {:?}. No compatible keypair.", address).to_string())
 }
 
-pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPAddress>) {
+pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPAddress>, use_ipv4: bool, use_ipv6: bool) {
     socket_setup();
     monotonic_clock_setup();
 
@@ -146,6 +146,12 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
 
     for address in &peer_addresses {
+        if !use_ipv4 && address.is_ipv4() {
+            continue;
+        }
+        if !use_ipv6 && address.is_ipv6() {
+            continue;
+        }
         if let Err(s) = connect_to(socket, &mut connections_map, &my_keypairs, address) {
             println_redraw!(chat_buf, name, "{}", s);
         }
@@ -244,12 +250,19 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
         }
 
         // Receive
-        for (address, data) in &packets_received_this_tick {
+        for (connection_key, data) in &packets_received_this_tick {
             let n = data.len();
 
             if n <= 0 {
                 continue;
             }
+
+            let Some(connection) = get_connected(&connections_map, connection_key)
+            else {
+                continue;
+            };
+
+            let address = connection.address();
 
             let buf = &data[..n];
 
@@ -304,7 +317,12 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
                     if PRINT_PEER_LIST { print!(" (new!)"); }
 
                     // Discovered new peer! Connect.
-
+                    if !use_ipv4 && address.is_ipv4() {
+                        continue;
+                    }
+                    if !use_ipv6 && address.is_ipv6() {
+                        continue;
+                    }
                     new_peers.push((address.clone(), connect_to(socket, &mut connections_map, &my_keypairs, &address)));
                 }
 
@@ -325,8 +343,9 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
 
                 let buf = &buf[64..];
 
-                println_redraw!(chat_buf, name, "{}: {}",
-                                std::str::from_utf8(peer_name).unwrap_or("?").trim_end_matches('\0'),
+                println_redraw!(chat_buf, name, "{:?}: {}",
+                                address,
+                                // std::str::from_utf8(peer_name).unwrap_or("?").trim_end_matches('\0'),
                                 std::str::from_utf8(buf).unwrap_or("?").trim_end_matches('\0'));
             }
         }
