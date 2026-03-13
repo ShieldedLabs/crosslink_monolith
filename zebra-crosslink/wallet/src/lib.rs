@@ -1305,8 +1305,9 @@ impl ManualWallet {
             wallet_tx.status = TxStatus::HardFail(wallet_tx.h, err_buf); // i.e. built but not sent
             wallet_tx.h = self.chain_tip_h; // TODO: this should maybe be "sync'd height"
         } else {
+            let tx_size = raw_tx.data.len();
             let res = client.send_transaction(raw_tx).await;
-            if DUMP_TX_SEND { println!("******* res for {:?}: {:?}", tx.txid(), res); }
+            if DUMP_TX_SEND { println!("******* res for {:?} ({} B): {:?}", tx.txid(), tx_size, res); }
             // TODO: distinguish sends that weren't network issues
             if res.is_ok() {
                 wallet_tx.h = BlockHeight::SENT;

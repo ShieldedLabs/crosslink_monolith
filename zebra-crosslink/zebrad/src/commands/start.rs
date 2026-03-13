@@ -274,6 +274,15 @@ impl StartCmd {
             )
             .await;
 
+        #[cfg(feature = "new-net")]
+        {
+            let sync_state = state.clone();
+            let sync_read_state = read_only_state_service.clone();
+            tokio::task::spawn_blocking(move ||{
+                zebra_state::new_network::sync(sync_read_state, sync_state, tokio::runtime::Handle::current())
+            });
+        }
+
         info!("initializing syncer");
         let (mut syncer, sync_status) = ChainSync::new(
             &config,

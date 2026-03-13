@@ -20,6 +20,8 @@ pub mod config;
 // Most constants are exported by default
 pub mod constants;
 
+pub mod new_network;
+
 // Allow use in external tests
 #[cfg(any(test, feature = "proptest-impl"))]
 pub mod arbitrary;

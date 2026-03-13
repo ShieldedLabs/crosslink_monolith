@@ -46,6 +46,7 @@ features = [
     "filter-reload",
     "flamegraph",
     "journald",
+    "new-net",
     "prometheus",
     "sentry",
     "indexer",
