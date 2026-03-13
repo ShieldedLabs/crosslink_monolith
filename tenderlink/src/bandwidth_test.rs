@@ -278,10 +278,10 @@ pub fn connect_to_endpoint(
     socket: SockHandle,
     connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
     my_connect_keypair: &IdentityKeyPair,
-    beam_to: &STPAddress,
+    endpoint: &STPAddress,
 ) {
-    if let beam_to = beam_to {
-        assert!(my_connect_keypair.magic1 == beam_to.magic1);
+    {
+        assert!(my_connect_keypair.magic1 == endpoint.magic1);
 
         // TODO list of supported Application Level protocols for e.g. zcash network upgrades. Note: We will need to use a callback in order for application code on the server to select which magic2 we will use and whether to reject the client. This is because magic2's do not have a strict order preference and so we need to push that logic to the application layer.
         // packet_memory_send
@@ -295,17 +295,17 @@ pub fn connect_to_endpoint(
             assert_eq!(list_of_protocols_len_bytes, 0,); // temp
             //hello_packet_payload[6+32..6+32+list_of_protocols_len_bytes].copy_from_slice(&packet_memory_send[0..list_of_protocols_len_bytes]);
             
-            let my_ip = if beam_to.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
+            let my_ip = if endpoint.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
-                ConnectionKey { ip: beam_to.ip, port: beam_to.port, key_15_bits: load_u16(&beam_to.key[0..2]) << 1 },
+                ConnectionKey { ip: endpoint.ip, port: endpoint.port, key_15_bits: load_u16(&endpoint.key[0..2]) << 1 },
                 ConnectionTrackingData {
                     creation_time_ns: monotonic_clock_ns(),
                     my_ip,
                     my_transport_identity_keypair: my_connect_keypair.clone(),
                     two_byte_send_prefix: load_u16(&my_connect_keypair.public[0..2]) << 1,
-                    other_ip: beam_to.ip,
-                    other_port: beam_to.port,
-                    other_transport_identity: beam_to.key.clone(),
+                    other_ip: endpoint.ip,
+                    other_port: endpoint.port,
+                    other_transport_identity: endpoint.key.clone(),
                     connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
                 },
             );
@@ -316,7 +316,7 @@ pub fn connect_to_endpoint(
             let mut handshake = snow::Builder::new(noise_string_from_connect_magic1(my_connect_keypair.magic1).unwrap().parse().unwrap())
                 .prologue(&hello_packet_payload[0..6]).unwrap()
                 .local_private_key(&my_connect_keypair.private[..]).unwrap()
-                .remote_public_key(&beam_to.key[..]).unwrap()
+                .remote_public_key(&endpoint.key[..]).unwrap()
                 .build_initiator().unwrap();
             
             // TODO list protocols
@@ -324,17 +324,17 @@ pub fn connect_to_endpoint(
             hello_packet_payload.truncate(6+handshake_size);
             hello_packet_payload.shrink_to_fit();
             
-            let my_ip = if beam_to.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
+            let my_ip = if endpoint.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
-                ConnectionKey { ip: beam_to.ip, port: beam_to.port, key_15_bits: load_u16(&beam_to.key[0..2]) << 1 },
+                ConnectionKey { ip: endpoint.ip, port: endpoint.port, key_15_bits: load_u16(&endpoint.key[0..2]) << 1 },
                 ConnectionTrackingData {
                     creation_time_ns: monotonic_clock_ns(),
                     my_ip,
                     my_transport_identity_keypair: my_connect_keypair.clone(),
                     two_byte_send_prefix: load_u16(&my_connect_keypair.public[0..2]) << 1,
-                    other_ip: beam_to.ip,
-                    other_port: beam_to.port,
-                    other_transport_identity: beam_to.key.clone(),
+                    other_ip: endpoint.ip,
+                    other_port: endpoint.port,
+                    other_transport_identity: endpoint.key.clone(),
                     connection_state: ConnectionState::SendingClientHello { last_sent_time_ns: 0, hello_packet_payload, handshake },
                 },
             );
