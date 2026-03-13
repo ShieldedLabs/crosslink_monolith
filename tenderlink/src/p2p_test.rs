@@ -9,6 +9,7 @@ use rand::seq::SliceRandom;
 
 use std::io;
 
+const PRINT_UNKNOWN_CHAR             :bool=0!=                (0);
 const PRINT_RECEIVES                 :bool=0!=                (0);
 const PRINT_SENDS                    :bool=0!=                (0);
 const PRINT_PEER_LIST                :bool=0!=                (0);
@@ -44,6 +45,14 @@ struct RawModePanicSafe;
 impl RawModePanicSafe { fn new() -> Self { crossterm::terminal::enable_raw_mode().unwrap(); RawModePanicSafe } }
 impl Drop for RawModePanicSafe { fn drop(&mut self) { crossterm::terminal::disable_raw_mode().unwrap(); } }
 
+macro_rules! println_redraw {
+    ($buf:expr, $name:expr, $($arg:tt)*) => {{
+        clear_line();
+        println!($($arg)*);
+        redraw(&$buf, &$name);
+    }}
+}
+
 pub fn clear_line() { print!("\x1b[1K\r"); }
 pub fn redraw(buf: &str, name: &str) { clear_line(); print!("{}> {}", name, buf); stdout().flush().unwrap(); }
 pub fn tick(buf: &mut String, name: &str) -> Option<String> {
@@ -55,18 +64,10 @@ pub fn tick(buf: &mut String, name: &str) -> Option<String> {
             KeyCode::Char(c)   => { buf.push(c); redraw(buf, name); }
             KeyCode::Backspace => { buf.pop();   redraw(buf, name); }
             KeyCode::Enter     => { let s = buf.clone(); buf.clear(); redraw("", name); return Some(s); }
-            _ => {}
+            ch => if PRINT_UNKNOWN_CHAR { println_redraw!(buf, name, "** hit unexpected char: {ch:?}"); }
         }
     }
     None
-}
-
-macro_rules! println_redraw {
-    ($buf:expr, $name:expr, $($arg:tt)*) => {{
-        clear_line();
-        println!($($arg)*);
-        redraw(&$buf, &$name);
-    }}
 }
 
 
