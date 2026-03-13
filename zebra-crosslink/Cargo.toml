@@ -183,8 +183,8 @@ allow-branch = ["main"]
 panic = "abort"
 
 # Optimise all non-workspace dependencies (crates.io deps)
-[profile.dev.package."*"]
-opt-level = 1
+# [profile.dev.package."*"]
+# opt-level = 1
 
 # Speed up tests by optimizing performance-critical crates
 

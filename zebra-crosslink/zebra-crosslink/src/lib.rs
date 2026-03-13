@@ -525,38 +525,36 @@ async fn new_decided_bft_block_from_malachite(
     fat_pointer: &FatPointerToBftBlock2,
     tender_proposal_sigs: Vec<tenderlink::TMSig>,
 ) -> Vec<tenderlink::SortedRosterMember> {
-    let call = tfl_handle.call.clone();
-    let params = &PROTOTYPE_PARAMETERS;
+    // CHECK PRECONDITIONS
+    {
+        if fat_pointer.points_at_block_hash() != new_block.blake3_hash() {
+            error!(
+                "Fat Pointer hash does not match block hash. fp: {} block: {}",
+                fat_pointer.points_at_block_hash(),
+                new_block.blake3_hash()
+            );
+            panic!();
+        }
+        // TODO: check public keys on the fat pointer against the roster
+        if fat_pointer.validate_signatures() == false {
+            error!("Signatures are not valid. Rejecting block.");
+            panic!();
+        }
 
-    let mut internal = tfl_handle.internal.lock().await;
-
-    if fat_pointer.points_at_block_hash() != new_block.blake3_hash() {
-        error!(
-            "Fat Pointer hash does not match block hash. fp: {} block: {}",
-            fat_pointer.points_at_block_hash(),
-            new_block.blake3_hash()
+        assert_eq!(
+            validate_bft_block_from_malachite(&tfl_handle, new_block)
+                .await,
+            (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None)
         );
-        panic!();
-    }
-    // TODO: check public keys on the fat pointer against the roster
-    if fat_pointer.validate_signatures() == false {
-        error!("Signatures are not valid. Rejecting block.");
-        panic!();
     }
 
-    drop(internal);
-    assert_eq!(
-        validate_bft_block_from_malachite(&tfl_handle, new_block)
-            .await,
-        (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None)
-    );
-
+    let call = tfl_handle.call.clone();
     let new_final_hash = new_block.headers.first().expect("at least 1 header").hash();
     let new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
     // assert_eq!(new_final_height.0, new_block.finalization_candidate_height);
     let insert_i = new_block.height as usize - 1;
 
-    internal = tfl_handle.internal.lock().await;
+    let mut internal = tfl_handle.internal.lock().await;
 
     // HACK: ensure there are enough blocks to overwrite this at the correct index
     for i in internal.bft_blocks.len()..=insert_i {
@@ -674,7 +672,6 @@ async fn validate_bft_block_from_malachite(
 ) -> (tenderlink::TMStatus, tenderlink::TMStatusReason) {
     let mut internal = tfl_handle.internal.lock().await;
     let call = tfl_handle.call.clone();
-    let params = &PROTOTYPE_PARAMETERS;
 
     if new_block.previous_block_fat_ptr.points_at_block_hash()
         != internal.fat_pointer_to_tip.points_at_block_hash()

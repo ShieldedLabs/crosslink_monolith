@@ -165,7 +165,7 @@ impl StartCmd {
         // workshop-specific key seed
         let global_seed = loop {
             use std::{fs::File, io::Read, io::Write};
-            use rand::{Rng, RngCore, SeedableRng};
+            use rand::Rng;
 
             let mut key_path = config.state.cache_dir.clone();
             let _ = std::fs::create_dir_all(key_path.clone());
@@ -176,7 +176,7 @@ impl StartCmd {
             if let Ok(mut f) = File::open(key_path.clone()) {
                 match f.read_exact(&mut seed) {
                     Ok(()) => break seed,
-                    Err(err) => warn!("couldn't read seed at {key_path:?}; creating a new one"),
+                    Err(err) => warn!("couldn't read seed at {key_path:?} ({err:?}); creating a new one"),
                 }
             }
 
