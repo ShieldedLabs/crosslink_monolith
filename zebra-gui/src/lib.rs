@@ -33,13 +33,14 @@ pub enum InteractiveVizOp {
     bft_last_final,
     origbft_last_final,
     snapshot,
+    tip,
 }
 impl InteractiveVizOp {
     pub fn valid_for_bc(&self) -> bool {
         InteractiveVizOp::LF <= *self && *self <= InteractiveVizOp::candidate
     }
     pub fn valid_for_bft(&self) -> bool {
-        InteractiveVizOp::bft_last_final <= *self && *self <= InteractiveVizOp::snapshot
+        InteractiveVizOp::bft_last_final <= *self && *self <= InteractiveVizOp::tip
     }
     pub fn cycle_next(&self) -> Self {
         match self {
@@ -47,6 +48,7 @@ impl InteractiveVizOp {
             InteractiveVizOp::LF             => InteractiveVizOp::bft_last_final,
             InteractiveVizOp::bft_last_final => InteractiveVizOp::snapshot,
             InteractiveVizOp::snapshot       => InteractiveVizOp::candidate,
+            InteractiveVizOp::candidate      => InteractiveVizOp::tip,
             _ => InteractiveVizOp::None,
         }
     }

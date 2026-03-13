@@ -326,6 +326,7 @@ pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Ve
         return Vec::new();
     }
 
+    const TMP_SIGMA: u64 = 3;
     match op {
         InteractiveVizOp::None => {},
 
@@ -344,7 +345,6 @@ pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Ve
                 return Vec::new();
             }
 
-            const TMP_SIGMA: u64 = 3;
             let sigma_block = bc_at_h(state, state.bc_tip_height.saturating_sub(TMP_SIGMA));
 
             let lca = viz_block_lca(state, snap[0], sigma_block);
@@ -356,6 +356,10 @@ pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Ve
             res.extend(snap);
             res.extend(lca);
         },
+
+        InteractiveVizOp::tip => {
+            res.push(*bft.unwrap().block.proving_blocks.last().unwrap_or(&Hash32::from_u64(0)));
+        }
 
         InteractiveVizOp::bft_last_final => res.push(bft.unwrap().block.parent_hash),
         InteractiveVizOp::origbft_last_final => todo!(),
