@@ -220,6 +220,9 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
 
         service_connections(&mut connections_map, &mut packets_received_this_tick, &packets_to_send, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_keypairs);
 
+        // Remove peers connecting through a disabled protocol. This is a @Dev feature for testing ipv4/ipv6 issues.
+        connections_map.retain(|connection_key, _| (use_ipv4 || !connection_key.is_ipv4()) && (use_ipv6 || !connection_key.is_ipv6()));
+
         // Remove peers that have been disconnected.
         peers.retain(|connection_key, peer| {
             if connections_map.get(connection_key).is_some() {

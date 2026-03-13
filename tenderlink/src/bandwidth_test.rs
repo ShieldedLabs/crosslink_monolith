@@ -150,6 +150,10 @@ pub struct ConnectionKey {
     pub port: u16,
     pub key_15_bits: u16, // LSB is just always 1.
 }
+impl ConnectionKey {
+    pub fn is_ipv4(&self) -> bool { self.ip.to_ipv4_mapped().is_some() }
+    pub fn is_ipv6(&self) -> bool { self.ip.to_ipv4_mapped().is_none() }
+}
 
 #[derive(Debug)]
 pub struct ConnectionTrackingData {

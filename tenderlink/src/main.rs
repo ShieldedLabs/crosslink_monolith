@@ -1,7 +1,14 @@
+use tenderlink::*;
+
 fn main() {
-    use tenderlink::*;
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("panic: {info}");
+        #[cfg(all(windows, debug_assertions))] unsafe { unsafe extern "system" { fn DebugBreak(); } DebugBreak(); }
+        // #[cfg(all(unix, debug_assertions))]    unsafe { libc::raise(libc::SIGTRAP); }
+    }));
 
     let args: Vec<String> = std::env::args().collect();
+    // println!("Command line: {:?}", args);
 
     if args.len() > 2 {
         use bandwidth_test::*;
@@ -22,7 +29,7 @@ fn main() {
         }
     }
 
-    const P2P_PORT: u16 = 18234;
+    const P2P_PORT: u16 = 12345;
 
     const SEEDER_CRYPTO: u64 = bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 
@@ -40,17 +47,23 @@ fn main() {
     //     ..seeder_keypair
     // };
 
-    if args.len() > 1 {
-        if args[1] == "p2p" {
-            let port : u16 = args.get(2).map(|a| a.parse().unwrap()).unwrap_or(P2P_PORT);
-            p2p_test::p2p(port, Some(seeder_keypair), vec![], true, true);
-            return;
+    let port: u16 = {
+        if let Some(i) = args.iter().position(|x| x == "-port") {
+            args.get(i + 1).map(|a| a.parse().unwrap()).unwrap_or(P2P_PORT)
+        } else {
+            P2P_PORT
         }
-    }
+    };
 
+    let p2p_seeder = args.len() > 1 && args[1] == "p2p";
     let use_ipv4 = !args.contains(&"-no_ipv4".to_string());
     let use_ipv6 = !args.contains(&"-no_ipv6".to_string());
     let localhost = args.contains(&"-localhost".to_string());
+
+    if p2p_seeder {
+        p2p_test::p2p(port, Some(seeder_keypair), vec![], true, true);
+        return;
+    }
 
     let (ip4, ip6) = if localhost {
         ("::ffff:127.0.0.1", "::1")
@@ -58,21 +71,11 @@ fn main() {
         ("::ffff:70.34.242.155", "2a05:f480:2400:13a9:5400:05ff:fefb:77ae")
     };
     let (ip4, ip6) = (ip4.parse().unwrap(), ip6.parse().unwrap());
-    let peers = vec![
-        bandwidth_test::STPAddress { ip: ip4, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() },
-        bandwidth_test::STPAddress { ip: ip6, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() },
-    ];
-    let peers = Vec::from(if !use_ipv6 { &peers[..1] } else if !use_ipv4 { &peers[1..] } else { &peers[..] });
 
-    if args.len() == 1 || !use_ipv4 || !use_ipv6 || localhost {
-        p2p_test::p2p(0, None, peers, use_ipv4, use_ipv6);
-        return;
-    }
-    let mut i: usize = usize::MAX;
-    if args.len() > 1 {
-        i = args[1].parse().unwrap_or(usize::MAX);
-    }
-    println!("Command line: {:?}", args);
-    run_instances(i);
+    let mut peers = Vec::with_capacity(2);
+    if use_ipv4 { peers.push(bandwidth_test::STPAddress { ip: ip4, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() }); }
+    if use_ipv6 { peers.push(bandwidth_test::STPAddress { ip: ip6, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() }); }
+
+    p2p_test::p2p(0, None, peers, use_ipv4, use_ipv6);
 }
 
