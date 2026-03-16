@@ -21,7 +21,7 @@ if "%config%"=="Release" (
 )
 
 if "%project%"=="zebra-crosslink" (
-    set "flags=%flags% -Fviz_gui"
+    set "flags=%flags% -Fviz_gui -Fnew-net"
 )
 
 pushd %root%\%project%\

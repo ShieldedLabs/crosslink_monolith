@@ -53,6 +53,9 @@ features = [
 ]
 
 [features]
+
+new-net = []
+
 # In release builds, don't compile debug logging code, to improve performance.
 default-release-binaries = ["release_max_level_info", "progress-bar", "prometheus", "sentry"]
 viz_gui = ["zebra-crosslink/viz_gui"]
