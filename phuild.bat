@@ -25,7 +25,8 @@ if "%project%"=="zebra-crosslink" (
 )
 
 pushd %root%\%project%\
-cargo build %flags%
+cargo sweep --time 1
+cargo build -j 5 %flags%
 popd
 
 if %errorlevel% neq 0 exit /b %errorlevel%
