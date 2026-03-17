@@ -57,7 +57,6 @@ impl InteractiveVizOp {
 
 #[allow(unused_imports)]
 use std::{alloc::{alloc, dealloc, Layout}, hash::Hasher, hint::spin_loop, mem::{swap, transmute, MaybeUninit}, ptr::{copy_nonoverlapping, slice_from_raw_parts}, rc::Rc, sync::{atomic::{AtomicU32, Ordering}, Barrier}, time::{Duration, Instant}, u32};
-use twox_hash::xxhash3_64;
 use winit::{dpi::Size, keyboard::KeyCode};
 
 use rustybuzz::{shape, Face as RbFace, UnicodeBuffer};
@@ -1672,7 +1671,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                                     *saved = got_hash;
                                                                 }
                                                             }
-                                                            let mut hasher = xxhash3_64::Hasher::new();
+                                                            let mut hasher = ahash::AHasher::default();
                                                             let draw_commands = (*ctx.draw_ctx).draw_command_buffer;
                                                             let draw_command_count = *(*ctx.draw_ctx).draw_command_count;
                                                             for cmd_i in 0..draw_command_count {
@@ -2012,7 +2011,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
 
                                             let need_buffer_flip;
                                             {
-                                                let mut hasher = xxhash3_64::Hasher::new();
+                                                let mut hasher = ahash::AHasher::default();
                                                 hasher.write_usize(window_width);
                                                 hasher.write_usize(window_height);
                                                 for th in &saved_tile_hashes { hasher.write_u64(*th); }
