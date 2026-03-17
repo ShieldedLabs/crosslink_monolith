@@ -1,0 +1,36 @@
+# LaTeX intermediate files
+*.aux
+*.log
+*.bbl
+*.blg
+*.brf
+*.out
+*.toc
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.bcf
+*.run.xml
+*.dvi
+
+# Temporary files
+.emacs.desktop
+.~lock.*
+*.swp
+*.save
+*.save.*
+*~
+*.html.temp
+
+.Makefile.uptodate
+.zipfilelist.*
+.draftfilelist.*
+
+MultiMarkdown-6
+
+base_ref
+protocol/aux/
+protocol/protocol.ver
+
+rendered/
+temp/
