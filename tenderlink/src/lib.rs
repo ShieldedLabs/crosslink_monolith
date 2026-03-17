@@ -583,8 +583,8 @@ fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 pub struct HashKey(pub [u8; 32]);
 impl HashKey { const NIL: Self = Self([0;32]); }
 impl HashKey {
-    fn hasher(&self)            -> blake3::Hasher { blake3::Hasher::new_keyed(&self.0) }
-    fn hash(&self, data: &[u8]) -> [u8; 32]       { *blake3::keyed_hash(&self.0, data).as_bytes() }
+    pub fn hasher(&self)            -> blake3::Hasher { blake3::Hasher::new_keyed(&self.0) }
+    pub fn hash(&self, data: &[u8]) -> [u8; 32]       { *blake3::keyed_hash(&self.0, data).as_bytes() }
 }
 
 #[derive(Debug)]

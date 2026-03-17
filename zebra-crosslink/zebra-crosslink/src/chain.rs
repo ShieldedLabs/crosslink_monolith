@@ -163,16 +163,11 @@ impl BftBlock {
 
 impl<'a> From<&'a BftBlock> for Blake3Hash {
     fn from(block: &'a BftBlock) -> Self {
-        let mut hash_writer = if *crate::TEST_MODE.lock().unwrap() {
-            // Note(Sam): Only until we regenerate the test data.
-            blake3::Hasher::new()
-        } else {
-            blake3::Hasher::new_keyed(&tenderlink::HashKeys::default().value_id.0)
-        };
+        let mut hasher = tenderlink::HashKeys::default().value_id.hasher();
         block
-            .zcash_serialize(&mut hash_writer)
+            .zcash_serialize(&mut hasher)
             .expect("Sha256dWriter is infallible");
-        Self(hash_writer.finalize().into())
+        Self(hasher.finalize().into())
     }
 }
 
