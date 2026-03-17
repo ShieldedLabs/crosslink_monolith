@@ -23,7 +23,8 @@ members = [
         "zebra-utils",
         "zebra-crosslink",
         "tower-batch-control",
-        "tower-fallback", "zebra-crosslink"
+        "tower-fallback",
+        "zebra-crosslink"
 ]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
@@ -181,10 +182,22 @@ allow-branch = ["main"]
 
 [profile.dev]
 panic = "abort"
+codegen-units = 1
+
+[profile.dev.build-override]
+debug = false # when possible
+codegen-units = 1
+opt-level = 0 # >=1 adds more crates somehow
 
 # Optimise all non-workspace dependencies (crates.io deps)
-# [profile.dev.package."*"]
+# Disable debug info for all but a few packages
+[profile.dev.package."*"]
+debug = false
+codegen-units = 1
 # opt-level = 1
+
+[profile.dev.package.tenderlink]
+debug = true
 
 # Speed up tests by optimizing performance-critical crates
 
@@ -233,9 +246,6 @@ codegen-units = 1
 [profile.dev.package.clay-layout]
 opt-level = 3
 codegen-units = 1
-
-[profile.dev.build-override]
-opt-level = 3
 
 [profile.release]
 panic = "abort"
