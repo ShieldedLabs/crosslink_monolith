@@ -417,7 +417,7 @@ fn test_check(flags: u32, condition: bool, message: &str) {
 
     if condition != should_succeed {
         let test_instr_i = *TEST_INSTR_C.lock().unwrap();
-        TEST_FAILED_INSTR_IDXS.lock().unwrap().push(test_instr_i);
+        TEST_FAILED_INSTR_IDXS.lock().unwrap().push((test_instr_i, message.to_string()));
 
         if *TEST_CHECK_ASSERT.lock().unwrap() {
             panic!(

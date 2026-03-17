@@ -52,7 +52,7 @@ use tokio::sync::Mutex as TokioMutex;
 pub static TEST_INSTR_C: Mutex<usize> = Mutex::new(0);
 pub static TEST_MODE: Mutex<bool> = Mutex::new(false);
 pub static TEST_FAILED: Mutex<i32> = Mutex::new(0);
-pub static TEST_FAILED_INSTR_IDXS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+pub static TEST_FAILED_INSTR_IDXS: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
 pub static TEST_CHECK_ASSERT: Mutex<bool> = Mutex::new(false);
 pub static TEST_INSTR_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 pub static TEST_INSTR_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
@@ -80,21 +80,25 @@ pub fn dump_test_instrs() {
     let bytes_lock = TEST_INSTR_BYTES.lock().unwrap();
     let bytes = bytes_lock.as_ref();
     for instr_i in 0..instrs.len() {
-        let col = if failed_instr_idx_i < failed_instr_idxs.len()
-            && instr_i == failed_instr_idxs[failed_instr_idx_i]
+        let (col, msg) = if failed_instr_idx_i < failed_instr_idxs.len()
+            && instr_i == failed_instr_idxs[failed_instr_idx_i].0
         {
+            let msg = Some(failed_instr_idxs[failed_instr_idx_i].1.clone());
             failed_instr_idx_i += 1;
-            "\x1b[91m F  " // red
+            ("\x1b[91m F  ", msg) // red
         } else if instr_i < done_instr_c {
-            "\x1b[92m P  " // green
+            ("\x1b[92m P  ", None) // green
         } else {
-            "\x1b[37m    " // grey
+            ("\x1b[37m    ", None) // grey
         };
         eprintln!(
             "  {}{}\x1b[0;0m",
             col,
             &test_format::TFInstr::string_from_instr(bytes, &instrs[instr_i])
         );
+        if let Some(msg) = msg {
+            eprintln!("    {}", msg);
+        }
     }
 }
 
