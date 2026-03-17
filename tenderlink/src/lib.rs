@@ -231,6 +231,7 @@ DATA LAYOUT FOR VOTE
 32 byte blake3 hash of value, or all zeroes to indicate Nil vote
 8 byte height
 4 byte round where MSB is used to indicate is_commit for the vote type. 1 bit is_commit, 31 bits round index
+// TODO: do we want height, round, vote type?
 
 TOTAL: 76 B
 

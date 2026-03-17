@@ -275,3 +275,21 @@ impl ZcashSerialize for BftBlockAndFatPointerToIt {
         Ok(())
     }
 }
+
+impl BftBlockAndFatPointerToIt {
+    /// Generate a bundle of the block hash and signatures affirming its validity
+    pub fn from_parts(block: BftBlock, height: u64, round: u32, signatures: &[crate::FatPointerSignature2]) -> Self {
+        let hash = block.blake3_hash();
+        let mut vote_for_block_without_finalizer_public_key = [0_u8; 76 - 32]; // 76-32 = 44
+        vote_for_block_without_finalizer_public_key[..32].copy_from_slice(&hash.0);
+        vote_for_block_without_finalizer_public_key[32..40].copy_from_slice(&height.to_le_bytes());
+        vote_for_block_without_finalizer_public_key[40..44].copy_from_slice(&(round | 0x80000000).to_le_bytes());
+        Self {
+            block,
+            fat_ptr: FatPointerToBftBlock2 {
+                vote_for_block_without_finalizer_public_key,
+                signatures: signatures.to_vec(),
+            },
+        }
+    }
+}
