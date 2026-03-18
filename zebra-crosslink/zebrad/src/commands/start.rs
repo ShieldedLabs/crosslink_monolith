@@ -390,8 +390,8 @@ impl StartCmd {
 
                             let block_verifier_router_response =
                                 block_verifier_router.ready().await;
-                            if block_verifier_router_response.is_err() {
-                                return false;
+                            if let Err(err) = block_verifier_router_response {
+                                return Err(format!("{err:?}"));
                             }
                             let block_verifier_router_response =
                                 block_verifier_router_response.unwrap();
@@ -416,7 +416,7 @@ impl StartCmd {
                                     //     .unwrap();
 
                                     // return Ok(submit_block::Response::Accepted);
-                                    true
+                                    Ok(())
                                 }
 
                                 // Turns BoxError into Result<VerifyChainError, BoxError>,
@@ -434,24 +434,23 @@ impl StartCmd {
                                     );
 
                                     // error
-                                    false
+                                    Err(format!("submit block failed verification: {error:?}"))
                                 }
                             }
                         })
                         .await;
 
                         match attempt_result {
-                            Ok(success) => {
-                                return success;
-                            }
-                            Err(_) => {
+                            Ok(success) => success,
+                            Err(err) => {
                                 tracing::error!(
                                     ?height,
                                     ?block_hash,
                                     ?parent_hash,
                                     "submit block timed out"
                                 );
-                                return false;
+                                // return Err("submit block timed out".to_string());
+                                Err(format!("{err:?}"))
                             }
                         }
                     })

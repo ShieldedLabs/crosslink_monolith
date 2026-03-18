@@ -90,7 +90,7 @@ pub(crate) type MempoolServiceProcedure = Arc<
 /// A pinned-in-memory, heap-allocated, reference-counted, thread-safe, asynchronous function
 /// pointer that takes an `Arc<Block>` as input and returns `()` as its output.
 pub(crate) type ForceFeedPoWBlockProcedure = Arc<
-    dyn Fn(Arc<zebra_chain::block::Block>) -> Pin<Box<dyn Future<Output = bool> + Send>>
+    dyn Fn(Arc<zebra_chain::block::Block>) -> Pin<Box<dyn Future<Output = Result<(),String>> + Send>>
         + Send
         + Sync,
 >;
