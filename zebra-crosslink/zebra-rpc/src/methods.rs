@@ -58,7 +58,7 @@ use tracing::Instrument;
 
 use zcash_address::{unified::Encoding, TryFromAddress};
 use zcash_protocol::consensus::Parameters;
-use zcash_primitives::transaction::{RosterMember, StakeTxId};
+use zcash_primitives::transaction::RosterMember;
 
 use zebra_chain::{
     amount::{self, Amount, NegativeAllowed, NonNegative},

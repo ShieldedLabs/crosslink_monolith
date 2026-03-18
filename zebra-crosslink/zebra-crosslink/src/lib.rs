@@ -14,7 +14,7 @@ use strum_macros::{EnumCount, EnumIter};
 
 use tenderlink::SortedRosterMember;
 use tracing_futures::WithSubscriber;
-use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
+use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind};
 use ed25519_zebra::VerificationKeyBytes;
 use zebra_chain::serialization::{
     SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
@@ -97,7 +97,7 @@ pub fn dump_test_instrs() {
             &test_format::TFInstr::string_from_instr(bytes, &instrs[instr_i])
         );
         if let Some(msg) = msg {
-            eprintln!("    {}", msg);
+            eprintln!("      {}", msg);
         }
     }
 }

@@ -528,9 +528,11 @@ pub(crate) async fn handle_instr(
             // let mut file = std::fs::File::create(&path).expect("valid file");
             // file.write_all(instr.data_slice(bytes)).expect("write success");
 
-            let force_feed_ok =
-                (internal_handle.call.force_feed_pos)(Arc::new(block), fat_ptr).await;
-            test_check(flags, force_feed_ok, "PoS force feed ok");
+            let (force_feed_ok, msg) = match (internal_handle.call.force_feed_pos)(Arc::new(block), fat_ptr).await {
+                Ok(()) => (true, "PoS force feed ok".to_string()),
+                Err(msg) => (false, msg),
+            };
+            test_check(flags, force_feed_ok, &msg);
         }
 
         TestInstr::SetParams(_) => {

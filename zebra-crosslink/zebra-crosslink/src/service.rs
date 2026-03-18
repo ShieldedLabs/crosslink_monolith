@@ -28,7 +28,6 @@ use crate::FatPointerToBftBlock2;
 use crate::{
     rng_private_public_key_from_address, tfl_service_incoming_request, TFLBlockFinality,
     TFLServiceInternal,
-    StakeTxId,
 };
 
 use tower::Service;
@@ -99,7 +98,7 @@ pub(crate) type ForceFeedPoWBlockProcedure = Arc<
 /// A pinned-in-memory, heap-allocated, reference-counted, thread-safe, asynchronous function
 /// pointer that takes an `Arc<Block>` as input and returns `()` as its output.
 pub(crate) type ForceFeedPoSBlockProcedure = Arc<
-    dyn Fn(Arc<BftBlock>, FatPointerToBftBlock2) -> Pin<Box<dyn Future<Output = bool> + Send>>
+    dyn Fn(Arc<BftBlock>, FatPointerToBftBlock2) -> Pin<Box<dyn Future<Output = Result<(),String>> + Send>>
         + Send
         + Sync,
 >;
@@ -193,20 +192,24 @@ pub fn spawn_new_tfl_service(
         Box::pin(async move {
             let fat_pointer_hash = fat_pointer.points_at_block_hash();
             let block_hash       = block.blake3_hash();
-            let accepted = if fat_pointer_hash == block_hash {
-                crate::validate_bft_block_from_malachite(&handle, block.as_ref()).await.0
-                    == tenderlink::TMStatus::Pass
-            } else {
-                false
+            if fat_pointer_hash != block_hash {
+                return Err(format!("block ({block_hash}) is not the one signed for ({fat_pointer_hash})"));
             };
-            if accepted {
-                info!("Successfully force-fed BFT block");
-                crate::new_decided_bft_block_from_malachite(&handle, block.as_ref(), &fat_pointer, Vec::new())
-                    .await;
-                true
-            } else {
-                error!("Failed to force-feed BFT block");
-                false
+
+            let (status, reason) = crate::validate_bft_block_from_malachite(&handle, block.as_ref()).await;
+            match status {
+                tenderlink::TMStatus::Pass => {
+                    info!("Successfully force-fed BFT block");
+                    crate::new_decided_bft_block_from_malachite(&handle, block.as_ref(), &fat_pointer, Vec::new())
+                        .await;
+                    Ok(())
+                },
+
+                tenderlink::TMStatus::Indeterminate |
+                tenderlink::TMStatus::Fail => {
+                    error!("Failed to force-feed BFT block");
+                    Err(format!("PoS validation = {status:?}: {reason:?}"))
+                },
             }
         })
     });
