@@ -5,6 +5,8 @@ VisualStudioVersion = 17.11.35208.52
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "zebra_crosslink", "zebra_crosslink.vcxproj", "{DD83DC11-00BE-441F-AB8B-1B1AB09C13BB}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "zebra_crosslink_1", "zebra_crosslink_1.vcxproj", "{DD83DC11-01BE-441F-AB8B-1B1AB09C13BB}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -13,6 +15,10 @@ Global
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
 		{DD83DC11-00BE-441F-AB8B-1B1AB09C13BB}.Debug|x64.ActiveCfg = Debug|x64
 		{DD83DC11-00BE-441F-AB8B-1B1AB09C13BB}.Release|x64.ActiveCfg = Release|x64
+		{DD83DC11-01BE-441F-AB8B-1B1AB09C13BB}.Debug|x64.ActiveCfg = Debug|x64
+		{DD83DC11-01BE-441F-AB8B-1B1AB09C13BB}.Debug|x64.Build.0 = Debug|x64
+		{DD83DC11-01BE-441F-AB8B-1B1AB09C13BB}.Release|x64.ActiveCfg = Release|x64
+		{DD83DC11-01BE-441F-AB8B-1B1AB09C13BB}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

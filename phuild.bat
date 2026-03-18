@@ -36,6 +36,6 @@ if "%project%"=="zebra-crosslink" (
     rem copy /Y  "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe"                "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_2.exe"
     rem start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_1.exe" "-c" "%root%\zebra-crosslink\testnet_1.toml"
     rem start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_2.exe" "-c" "%root%\zebra-crosslink\testnet_2.toml"
-    start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe" "-c" "%root%\zebra-crosslink\.AA_0.local.toml"
-    start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe" "-c" "%root%\zebra-crosslink\.AA_1.local.toml"
+    rem start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe" "-c" "%root%\zebra-crosslink\.AA_0.local.toml"
+    rem start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe" "-c" "%root%\zebra-crosslink\.AA_1.local.toml"
 )

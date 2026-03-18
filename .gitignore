@@ -2,6 +2,8 @@
 .vs
 *.vcxproj.user
 */x64/Release
+*/*/x64/Release
+*/*/*/x64/Release
 *.idea
 *.scratch
 *.DS_Store
@@ -10,6 +12,6 @@ zebra-gui/icon-font/fontello-*/
 zebra-crosslink/zebra_testnet.zip
 zebra-crosslink/zebra_testnet
 tenderlink/tenderlink.slnLaunch.user
-zebra-crosslink/ZZ_0
-zebra-crosslink/ZZ_1
-zebra-crosslink/.AA_regtest.zip
+zebra-crosslink/ZZ*
+zebra-crosslink/.AA*
+zebra-crosslink/zebra_crosslink.slnLaunch.user
