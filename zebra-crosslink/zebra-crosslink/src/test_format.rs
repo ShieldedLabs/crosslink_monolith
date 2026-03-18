@@ -419,20 +419,20 @@ fn test_check(flags: u32, condition: bool, message: &str) {
         let test_instr_i = *TEST_INSTR_C.lock().unwrap();
         TEST_FAILED_INSTR_IDXS.lock().unwrap().push((test_instr_i, message.to_string()));
 
-        if *TEST_CHECK_ASSERT.lock().unwrap() {
-            panic!(
-                "test check should {} but actually {}ed (and TEST_CHECK_ASSERT == true), message:\n{}",
-                SUCCESS_STRS[should_succeed as usize],
-                SUCCESS_STRS[!should_succeed as usize],
-                message
-            );
-        } else {
-            error!(
+        match *TEST_CHECK_ASSERT.lock().unwrap() {
+            0 => {},
+            1 => error!(
                 "test check should {} but actually {}ed, message:\n{}",
                 SUCCESS_STRS[should_succeed as usize],
                 SUCCESS_STRS[!should_succeed as usize],
                 message
-            );
+            ),
+            _ => panic!(
+                "test check should {} but actually {}ed (and TEST_CHECK_ASSERT enabled), message:\n{}",
+                SUCCESS_STRS[should_succeed as usize],
+                SUCCESS_STRS[!should_succeed as usize],
+                message
+            ),
         }
     }
 }

@@ -60,6 +60,7 @@ pub fn test_start() {
             Some(std::sync::Arc::new(base))
         };
         *zebra_crosslink::TEST_MODE.lock().unwrap() = true;
+        *zebra_crosslink::TEST_CHECK_ASSERT.lock().unwrap() = 0;
         *zebra_crosslink::TEST_SHUTDOWN_FN.lock().unwrap() = || {
             zebra_crosslink::dump_test_instrs();
             // APPLICATION.shutdown(abscissa_core::Shutdown::Graceful);
