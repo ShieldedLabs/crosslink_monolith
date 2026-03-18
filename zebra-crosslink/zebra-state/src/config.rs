@@ -115,6 +115,9 @@ pub struct Config {
     #[cfg(feature = "elasticsearch")]
     /// The elasticsearch database password.
     pub elasticsearch_password: String,
+    
+    /// New Networking
+    pub network_identity_seed_string: Option<String>,
 }
 
 fn gen_temp_path(prefix: &str) -> PathBuf {

@@ -98,6 +98,19 @@ pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
     } else { None }
 }
 
+pub fn new_keypair_from_connect_magic1_with_seed(magic1: u64, seed: [u8; 32]) -> Option<IdentityKeyPair> {
+    if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
+        let mut ret = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
+        ret.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
+        return Some(ret);
+    }
+    if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
+        let kp = snow::Builder::new(noise_string.parse().unwrap()).generate_keypair_with_rng().unwrap();
+        Some(IdentityKeyPair { magic1, private: kp.private, public: kp.public })
+    } else { None }
+}
+
 pub fn b64(s: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s)

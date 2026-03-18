@@ -276,10 +276,11 @@ impl StartCmd {
 
         #[cfg(feature = "new-net")]
         {
+            let state_config_copy = Arc::clone(&config);
             let sync_state = state.clone();
             let sync_read_state = read_only_state_service.clone();
             tokio::task::spawn_blocking(move ||{
-                zebra_state::new_network::sync(sync_read_state, sync_state, tokio::runtime::Handle::current())
+                zebra_state::new_network::sync(&state_config_copy.state, sync_read_state, sync_state, tokio::runtime::Handle::current())
             });
         }
 
