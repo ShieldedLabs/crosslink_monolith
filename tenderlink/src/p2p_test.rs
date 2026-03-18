@@ -113,7 +113,7 @@ pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKe
     Err(format!("Error: Can't connect to given peer: {:?}. No compatible keypair.", address).to_string())
 }
 
-pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPAddress>, use_ipv4: bool, use_ipv6: bool) {
+pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPAddress>, use_ipv4: bool, use_ipv6: bool) {
     socket_setup();
     monotonic_clock_setup();
 
@@ -123,7 +123,7 @@ pub fn p2p(port: u16, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPA
 
     let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
 
-    let my_keypair_encrypted = keypair.unwrap_or(new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap());
+    let my_keypair_encrypted = keypair.unwrap_or(new_keypair_from_connect_magic1(crypto).unwrap());
     let my_keypair_plaintext = IdentityKeyPair { magic1: CONNECT_MAGIC1_PLAIN_TEXT, ..my_keypair_encrypted.clone() };
 
     let my_keypairs = vec![&my_keypair_encrypted, &my_keypair_plaintext];

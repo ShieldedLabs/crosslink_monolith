@@ -31,7 +31,7 @@ fn main() {
 
     const P2P_PORT: u16 = 12345;
 
-    const SEEDER_CRYPTO: u64 = bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+    const SEEDER_CRYPTO: u64 = bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 
     let sk = [7, 11, 99, 220, 101, 143, 113,   4, 242, 136,  58, 150, 223, 186, 106, 203,
              67, 18, 48,  96, 176,  69, 152, 173, 224,  46, 206, 156, 217,  31, 170, 165];
@@ -76,6 +76,6 @@ fn main() {
     if use_ipv4 { peers.push(bandwidth_test::STPAddress { ip: ip4, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() }); }
     if use_ipv6 { peers.push(bandwidth_test::STPAddress { ip: ip6, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() }); }
 
-    p2p_test::p2p(0, None, peers, use_ipv4, use_ipv6);
+    p2p_test::p2p(0, SEEDER_CRYPTO, None, peers, use_ipv4, use_ipv6);
 }
 

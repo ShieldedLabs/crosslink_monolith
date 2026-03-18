@@ -188,10 +188,12 @@ pub fn spawn_new_tfl_service(
     let handle_mtx = Arc::new(std::sync::Mutex::new(None));
 
     let handle_mtx2 = handle_mtx.clone();
-    let force_feed_pos: ForceFeedPoSBlockProcedure = Arc::new(move |block, fat_pointer| {
+    let force_feed_pos: ForceFeedPoSBlockProcedure = Arc::new(move |block: Arc<BftBlock>, fat_pointer: FatPointerToBftBlock2| {
         let handle = handle_mtx2.lock().unwrap().clone().unwrap();
         Box::pin(async move {
-            let accepted = if fat_pointer.points_at_block_hash() == block.blake3_hash() {
+            let fat_pointer_hash = fat_pointer.points_at_block_hash();
+            let block_hash       = block.blake3_hash();
+            let accepted = if fat_pointer_hash == block_hash {
                 crate::validate_bft_block_from_malachite(&handle, block.as_ref()).await.0
                     == tenderlink::TMStatus::Pass
             } else {

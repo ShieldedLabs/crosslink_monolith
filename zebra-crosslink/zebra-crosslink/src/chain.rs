@@ -163,16 +163,11 @@ impl BftBlock {
 
 impl<'a> From<&'a BftBlock> for Blake3Hash {
     fn from(block: &'a BftBlock) -> Self {
-        let mut hash_writer = if *crate::TEST_MODE.lock().unwrap() {
-            // Note(Sam): Only until we regenerate the test data.
-            blake3::Hasher::new()
-        } else {
-            blake3::Hasher::new_keyed(&tenderlink::HashKeys::default().value_id.0)
-        };
+        let mut hasher = tenderlink::HashKeys::default().value_id.hasher();
         block
-            .zcash_serialize(&mut hash_writer)
+            .zcash_serialize(&mut hasher)
             .expect("Sha256dWriter is infallible");
-        Self(hash_writer.finalize().into())
+        Self(hasher.finalize().into())
     }
 }
 
@@ -278,5 +273,23 @@ impl ZcashSerialize for BftBlockAndFatPointerToIt {
         self.block.zcash_serialize(&mut writer);
         self.fat_ptr.zcash_serialize(&mut writer);
         Ok(())
+    }
+}
+
+impl BftBlockAndFatPointerToIt {
+    /// Generate a bundle of the block hash and signatures affirming its validity
+    pub fn from_parts(block: BftBlock, height: u64, round: u32, signatures: &[crate::FatPointerSignature2]) -> Self {
+        let hash = block.blake3_hash();
+        let mut vote_for_block_without_finalizer_public_key = [0_u8; 76 - 32]; // 76-32 = 44
+        vote_for_block_without_finalizer_public_key[..32].copy_from_slice(&hash.0);
+        vote_for_block_without_finalizer_public_key[32..40].copy_from_slice(&height.to_le_bytes());
+        vote_for_block_without_finalizer_public_key[40..44].copy_from_slice(&(round | 0x80000000).to_le_bytes());
+        Self {
+            block,
+            fat_ptr: FatPointerToBftBlock2 {
+                vote_for_block_without_finalizer_public_key,
+                signatures: signatures.to_vec(),
+            },
+        }
     }
 }

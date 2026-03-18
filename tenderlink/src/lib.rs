@@ -231,6 +231,7 @@ DATA LAYOUT FOR VOTE
 32 byte blake3 hash of value, or all zeroes to indicate Nil vote
 8 byte height
 4 byte round where MSB is used to indicate is_commit for the vote type. 1 bit is_commit, 31 bits round index
+// TODO: do we want height, round, vote type?
 
 TOTAL: 76 B
 
@@ -583,8 +584,8 @@ fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 pub struct HashKey(pub [u8; 32]);
 impl HashKey { const NIL: Self = Self([0;32]); }
 impl HashKey {
-    fn hasher(&self)            -> blake3::Hasher { blake3::Hasher::new_keyed(&self.0) }
-    fn hash(&self, data: &[u8]) -> [u8; 32]       { *blake3::keyed_hash(&self.0, data).as_bytes() }
+    pub fn hasher(&self)            -> blake3::Hasher { blake3::Hasher::new_keyed(&self.0) }
+    pub fn hash(&self, data: &[u8]) -> [u8; 32]       { *blake3::keyed_hash(&self.0, data).as_bytes() }
 }
 
 #[derive(Debug)]

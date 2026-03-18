@@ -8,7 +8,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use zcash_keys::address::Address;
 use zebra_chain::{
     block::{
-        Block, CommandBuf, FatPointerToBftBlock, Hash as BlockHash, Header as BlockHeader,
+        Block, FatPointerToBftBlock, Hash as BlockHash, Header as BlockHeader,
         Height as BlockHeight,
     },
     fmt::HexDebug,
@@ -696,18 +696,13 @@ fn create_pos_and_ptr_to_finalize_pow(
     )
     .expect("valid PoS block");
 
-    // let cert = MalCommitCertificate {
-    //     height: MalHeight::new(bft_height.into()),
-    //     round: MalRound::new(1),
-    //     value_id: MalValue::new_block(&block).id(),
-    //     commit_signatures: Vec::new(), // TODO
-    // };
+    // TODO:
+    let _sig = zebra_crosslink::FatPointerSignature2 {
+        public_key: [0xabu8; 32],
+        vote_signature: [0xbcu8; 64],
+    };
 
-    // BftBlockAndFatPointerToIt {
-    //     block,
-    //     fat_ptr: (&cert).into(),
-    // }
-    panic!();
+    BftBlockAndFatPointerToIt::from_parts(block, bft_height.into(), 1, &[])
 }
 
 #[test]
@@ -733,6 +728,7 @@ fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
 
     for _ in 4..7 {
         tf.push_instr_load_pow(&gen.next_block(&miner_address), 0);
+        // push bft pointer
     }
     tf.push_instr_expect_pow_chain_length(7, 0);
 
@@ -780,6 +776,7 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
 
     let mut pow_common = vec![gen.tip.clone()];
     for _ in 2..4 {
+        // TODO: push a staking action
         pow_common.push(gen.next_block(&miner_address));
     }
     for block in &pow_common[0..3] {

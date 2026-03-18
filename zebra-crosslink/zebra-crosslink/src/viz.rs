@@ -3838,7 +3838,7 @@ pub async fn viz_main(
 
                         for instr_i in 0..edit_tf.1.len() {
                             let col = if failed_instr_idx_i < failed_instr_idxs.len()
-                                && instr_i == failed_instr_idxs[failed_instr_idx_i]
+                                && instr_i == failed_instr_idxs[failed_instr_idx_i].0
                             {
                                 failed_instr_idx_i += 1;
                                 RED
