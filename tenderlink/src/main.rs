@@ -11,7 +11,7 @@ fn main() {
     // println!("Command line: {:?}", args);
 
     if args.len() > 2 {
-        use bandwidth_test::*;
+        use crate::bandwidth_test::*;
         if args[1] == "reflector" {
             let port : u16 = args[2].parse().unwrap();
             println!("running reflector on port: {}", port);

@@ -94,25 +94,6 @@ pub fn send_to(socket: SockHandle, packets_to_send: &mut Vec<(ConnectionKey, Vec
     packets_to_send.push((*connection_key, Vec::from(buf)));
 }
 
-pub fn is_connected(connection: &ConnectionTrackingData) -> bool {
-    if let ConnectionState::Connected { .. } = connection.connection_state {
-        true
-    } else {
-        false
-    }
-}
-
-pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, my_keypairs: &Vec<&IdentityKeyPair>, address: &STPAddress) -> Result<(), String> {
-    for keypair in my_keypairs {
-        if address.magic1 == keypair.magic1 {
-            connect_to_endpoint(socket, connections_map, keypair, address);
-            return Ok(());
-        }
-    }
-
-    Err(format!("Error: Can't connect to given peer: {:?}. No compatible keypair.", address).to_string())
-}
-
 pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPAddress>, use_ipv4: bool, use_ipv6: bool) {
     socket_setup();
     monotonic_clock_setup();
@@ -165,7 +146,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
 
         let mut packets_to_send = Vec::new();
 
-        let mut peer_addresses_list: Vec<STPAddress> = connections_map.iter().filter(|(connection_key, connection)| is_connected(*connection)).map(|(connection_key, connection)| connection.address()).collect();
+        let mut peer_addresses_list: Vec<STPAddress> = connections_map.iter().filter(|(connection_key, connection)| connection.is_connected()).map(|(connection_key, connection)| connection.address()).collect();
         peer_addresses_list.shuffle(&mut rng);
         peer_addresses_list.truncate(20); // 1160 bytes of peers
 
@@ -204,7 +185,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
             o += line.as_bytes() .write_to(&mut buf[o..]);
 
             for (connection_key, connection) in &mut connections_map {
-                if is_connected(connection) {
+                if connection.is_connected() {
                     send_to(socket, &mut packets_to_send, &chat_buf, &name, &connection_key, &buf[..o]);
                 }
             }

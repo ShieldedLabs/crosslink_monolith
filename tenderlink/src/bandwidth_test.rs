@@ -234,6 +234,18 @@ impl ConnectionTrackingData {
     pub fn is_connected(&self) -> bool { self.connection_state.is_connected() }
 }
 
+pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, my_keypairs: &Vec<&IdentityKeyPair>, address: &STPAddress) -> Result<(), String> {
+    for keypair in my_keypairs {
+        if address.magic1 == keypair.magic1 {
+            connect_to_endpoint(socket, connections_map, keypair, address);
+            return Ok(());
+        }
+    }
+
+    Err(format!("Error: Can't connect to given peer: {:?}. No compatible keypair.", address).to_string())
+}
+
+
 #[derive(Debug, Clone)]
 pub struct ConnectionCipherTriplet {
     pub old: snow::StatelessTransportState,
