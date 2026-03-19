@@ -272,8 +272,7 @@ fn crosslink_expect_pos_height_after_push() {
     }
     tf.push_instr_expect_pow_chain_length(8, 0);
 
-    let fat_ptr = &mut FatPointerToBftBlock2::null();
-    let pos_h = &mut 0;
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
     for i in 1..5 {
         let bft = next_pos(pos_h, fat_ptr, &pow_common[i..i+3], &[]);
         tf.push_instr_load_pos(&bft, 0);
@@ -304,8 +303,7 @@ fn crosslink_expect_pos_out_of_order() {
     }
     tf.push_instr_expect_pow_chain_length(6, 0);
 
-    let fat_ptr = &mut FatPointerToBftBlock2::null();
-    let pos_h = &mut 0;
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
     let pos = [
         next_pos(pos_h, fat_ptr, &pow_common[0..=2], &[]),
         next_pos(pos_h, fat_ptr, &pow_common[1..=3], &[]),
@@ -320,17 +318,29 @@ fn crosslink_expect_pos_out_of_order() {
     test_bytes(tf.write_to_bytes());
 }
 
-// failing
 #[test]
 fn crosslink_expect_pos_push_same_block_twice_only_accepted_once() {
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    for i in 0..REGTEST_BLOCK_BYTES.len() {
-        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
+    let nw = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen = BlockGen::init_at_genesis_plus_1(nw, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+
+    let mut pow_common = vec![gen.tip.clone()];
+    for _ in 2..4 {
+        pow_common.push(gen.next_block(&miner_addr));
     }
-    tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[0], 0);
-    tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[0], SHOULD_FAIL);
+    for pow in &pow_common {
+        tf.push_instr_load_pow(pow, 0);
+    }
+    tf.push_instr_expect_pow_chain_length(4, 0);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let pos = next_pos(pos_h, fat_ptr, &pow_common[0..=2], &[]);
+
+    tf.push_instr_load_pos(&pos, 0);
+    tf.push_instr_load_pos(&pos, SHOULD_FAIL);
     tf.push_instr_expect_pos_chain_length(1, 0);
 
     test_bytes(tf.write_to_bytes());
@@ -838,8 +848,7 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
         tf.push_instr_load_pow(block, 0);
     }
 
-    let fat_ptr = &mut FatPointerToBftBlock2::null();
-    let pos_h = &mut 0;
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
     let bft = next_pos(pos_h, fat_ptr, &pow_common[0..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
