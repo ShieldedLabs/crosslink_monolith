@@ -889,7 +889,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
     internal_handle.internal.lock().await.my_public_key = my_public_key;
 
     {
-        use tenderlink::{SecureUdpEndpoint, StaticDHKeyPair};
+        use tenderlink::{SecureUdpEndpoint, bandwidth_test::IdentityKeyPair};
 
         use std::net::{Ipv6Addr, SocketAddr};
 
@@ -909,26 +909,20 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             Ok((ip6.octets(), port))
         }
 
-        fn addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint) {
+        fn addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, SecureUdpEndpoint) {
             let mut hasher = DefaultHasher::new();
             hasher.write(addr.as_bytes());
             let seed = hasher.finish();
 
-            let kp = snow::Builder::with_resolver(
-                "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap(),
-                Box::new(tenderlink::SnowRngResolver::seed_from_u64(seed)),
-            )
-            .generate_keypair()
-            .unwrap();
-            let static_keypair = tenderlink::StaticDHKeyPair {
-                private: kp.private.try_into().unwrap(),
-                public: kp.public.try_into().unwrap(),
-            };
+            let mut sk = [0; 32];
+            rand_chacha::ChaCha20Rng::seed_from_u64(seed).fill(&mut sk);
+            let static_keypair = tenderlink::bandwidth_test::new_keypair_from_connect_magic1_with_secret(tenderlink::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, sk).unwrap();
+
             let (ip, port) = parse_to_ipv6_bytes(addr).unwrap();
             (
-                static_keypair,
+                static_keypair.clone(),
                 SecureUdpEndpoint {
-                    public_key: static_keypair.public,
+                    public_key: static_keypair.clone().public.try_into().unwrap(),
                     ip_address: ip,
                     port,
                 },

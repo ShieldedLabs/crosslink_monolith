@@ -25,7 +25,7 @@ if "%project%"=="zebra-crosslink" (
 )
 
 pushd "%root%/%project%"
-cargo sweep --time 1
+cargo sweep --time 3
 cargo build -j 5 %flags%
 popd
 

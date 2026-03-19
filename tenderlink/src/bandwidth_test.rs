@@ -1,5 +1,7 @@
 
 use std::collections::HashMap;
+use rand::SeedableRng;
+use static_assertions::const_assert;
 
 #[test]
 pub fn bwdth_test() {
@@ -86,6 +88,10 @@ pub fn noise_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     }
 }
 
+// Quantum-resilient key sizes
+pub const MAX_SECRET_KEY_SIZE: usize = 8188;
+pub const MAX_PUBLIC_KEY_SIZE: usize = 8188;
+
 pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
         let mut ret = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
@@ -98,16 +104,18 @@ pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
     } else { None }
 }
 
-pub fn new_keypair_from_connect_magic1_with_seed(magic1: u64, seed: [u8; 32]) -> Option<IdentityKeyPair> {
+pub fn new_keypair_from_connect_magic1_with_secret(magic1: u64, sk: [u8; 32]) -> Option<IdentityKeyPair> {
     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-        let mut ret = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
+        let mut ret = new_keypair_from_connect_magic1_with_secret(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, sk).unwrap();
         ret.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
         return Some(ret);
     }
     if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
-        let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
-        let kp = snow::Builder::new(noise_string.parse().unwrap()).generate_keypair_with_rng().unwrap();
-        Some(IdentityKeyPair { magic1, private: kp.private, public: kp.public })
+        Some(IdentityKeyPair {
+            magic1,
+            private: sk.to_vec(),
+            public: x25519_dalek::x25519(sk, x25519_dalek::X25519_BASEPOINT_BYTES).to_vec(),
+        })
     } else { None }
 }
 
@@ -150,12 +158,46 @@ impl std::fmt::Debug for STPAddress {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+
+pub fn fmt_byte_str(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
+    let n = usize::min(bytes.len(), f.precision().unwrap_or(bytes.len()));
+    for i in 0..n { write!(f, "{:02x}", bytes[i])?; }
+    Ok(())
+}
+
+pub fn fmt_byte_str_rev(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
+    let n = usize::min(bytes.len(), f.precision().unwrap_or(bytes.len()));
+    for i in 0..n { write!(f, "{:02x}", bytes[n-(i+1)])?; }
+    Ok(())
+}
+
+pub fn fmt_prefixed_byte_str(f: &mut std::fmt::Formatter<'_>, pre: &str, bytes: &[u8]) -> std::fmt::Result {
+    write!(f, "{}", pre)?;
+    fmt_byte_str(f, bytes)
+}
+
+pub fn fmt_prefixed_byte_str_rev(f: &mut std::fmt::Formatter<'_>, pre: &str, bytes: &[u8]) -> std::fmt::Result {
+    write!(f, "{}", pre)?;
+    fmt_byte_str_rev(f, bytes)
+}
+
+impl std::fmt::Debug for IdentityKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format!("IdentityKeyPair {{ magic1: {}, private: \"", self.magic1);
+        fmt_byte_str(f, &self.private)?;
+        fmt_prefixed_byte_str(f, "\", public: \"",                &self.public)?;
+        write!(f, "\" }}")
+    }
+}
+
+// TODO: rename private key to secret key
+#[derive(/* Copy, */ Clone, PartialEq, Eq, Hash)]
 pub struct IdentityKeyPair {
     pub magic1: u64,
-    pub private: Vec<u8>,
-    pub public: Vec<u8>,
+    pub private: Vec<u8>, // [u8; MAX_SECRET_KEY_SIZE],
+    pub public:  Vec<u8>, // [u8; MAX_PUBLIC_KEY_SIZE],
 }
+// const_assert!(size_of::<IdentityKeyPair>().is_power_of_two());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConnectionKey {

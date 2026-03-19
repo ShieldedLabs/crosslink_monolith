@@ -42,11 +42,6 @@ fn main() {
         public: x25519_dalek::x25519(sk, x25519_dalek::X25519_BASEPOINT_BYTES).to_vec(),
     };
 
-    // let seeder_keypair = bandwidth_test::IdentityKeyPair {
-    //     magic1:  bandwidth_test::CONNECT_MAGIC1_PLAIN_TEXT,
-    //     ..seeder_keypair
-    // };
-
     let port: u16 = {
         if let Some(i) = args.iter().position(|x| x == "-port") {
             args.get(i + 1).map(|a| a.parse().unwrap()).unwrap_or(P2P_PORT)
@@ -61,7 +56,7 @@ fn main() {
     let localhost = args.contains(&"-localhost".to_string());
 
     if p2p_seeder {
-        p2p_test::p2p(port, Some(seeder_keypair), vec![], true, true);
+        p2p_test::p2p(port, SEEDER_CRYPTO, Some(seeder_keypair), vec![], true, true);
         return;
     }
 

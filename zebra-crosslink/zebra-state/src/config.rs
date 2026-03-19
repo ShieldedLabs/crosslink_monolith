@@ -183,6 +183,7 @@ impl Default for Config {
             delete_old_database: true,
             debug_stop_at_height: None,
             debug_validity_check_interval: None,
+            network_identity_seed_string: None,
             #[cfg(feature = "elasticsearch")]
             elasticsearch_url: "https://localhost:9200".to_string(),
             #[cfg(feature = "elasticsearch")]

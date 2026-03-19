@@ -23,7 +23,7 @@ pub fn sync(
         + 'static,
         rt: tokio::runtime::Handle,
 ) {
-    if let Some() = config.network_identity_seed_string This is broken, phillip fix.
+    // if let Some() = config.network_identity_seed_string This is broken, phillip fix.
 /*
     The Plan.
 1. Call new_keypair_from_connect_magic1_with_seed to generate a key or new_keypair_from_connect_magic1 if none.
