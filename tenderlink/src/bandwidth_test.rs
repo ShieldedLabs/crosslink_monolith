@@ -70,9 +70,9 @@ fn contested_encrypted_test() {
     monotonic_clock_setup();
 
     let _handle = std::thread::spawn(move || {
-        do_the_test_program2(32845, vec![&kp1], Some((&kp1, &STPAddress{ ip: Ipv6Addr::LOCALHOST, port: 29853, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp2_pub })));
+        do_the_test_program2(32845, vec![&kp1], Some((&kp1, &STPAddress { ip: Ipv6Addr::LOCALHOST, port: 29853, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp2_pub })));
     });
-    do_the_test_program2(29853, vec![&kp2], Some((&kp2, &STPAddress{ ip: Ipv6Addr::LOCALHOST, port: 32845, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp1_pub })));
+    do_the_test_program2(29853, vec![&kp2], Some((&kp2, &STPAddress { ip: Ipv6Addr::LOCALHOST, port: 32845, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp1_pub })));
 }
 
 // LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
@@ -94,26 +94,26 @@ pub const MAX_PUBLIC_KEY_SIZE: usize = 8000;
 
 pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-        let mut ret = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
+        let mut ret = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s)?;
         ret.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
         return Some(ret);
     }
     if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
-        let kp = snow::Builder::new(noise_string.parse().unwrap()).generate_keypair().unwrap();
+        let kp = snow::Builder::new(noise_string.parse().ok()?).generate_keypair().ok()?;
         Some(IdentityKeyPair { magic1, private: kp.private, public: kp.public })
     } else { None }
 }
 
 pub fn new_keypair_from_connect_magic1_with_seed(magic1: u64, seed: [u8; 32]) -> Option<IdentityKeyPair> {
     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-        let mut ret = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
+        let mut ret = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed)?;
         ret.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
         return Some(ret);
     }
     if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
         use rand::SeedableRng;
         let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
-        let kp = snow::Builder::with_resolver(noise_string.parse().unwrap(), Box::new(SnowRngResolver { rng: RustIsBadRngWrapper(rng) })).generate_keypair().unwrap();
+        let kp = snow::Builder::with_resolver(noise_string.parse().ok()?, Box::new(SnowRngResolver { rng: RustIsBadRngWrapper(rng) })).generate_keypair().ok()?;
         Some(IdentityKeyPair { magic1, private: kp.private, public: kp.public })
     } else { None }
 }
