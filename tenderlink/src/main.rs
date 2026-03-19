@@ -11,7 +11,7 @@ fn main() {
     // println!("Command line: {:?}", args);
 
     if args.len() > 2 {
-        use bandwidth_test::*;
+        use crate::bandwidth_test::*;
         if args[1] == "reflector" {
             let port : u16 = args[2].parse().unwrap();
             println!("running reflector on port: {}", port);
@@ -33,6 +33,8 @@ fn main() {
 
     const SEEDER_CRYPTO: u64 = bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 
+    tenderlink::run_instances(if args.contains(&"p2p".to_string()) { 0 } else { 1 });
+
     let sk = [7, 11, 99, 220, 101, 143, 113,   4, 242, 136,  58, 150, 223, 186, 106, 203,
              67, 18, 48,  96, 176,  69, 152, 173, 224,  46, 206, 156, 217,  31, 170, 165];
 
@@ -41,11 +43,6 @@ fn main() {
         private: sk.to_vec(),
         public: x25519_dalek::x25519(sk, x25519_dalek::X25519_BASEPOINT_BYTES).to_vec(),
     };
-
-    // let seeder_keypair = bandwidth_test::IdentityKeyPair {
-    //     magic1:  bandwidth_test::CONNECT_MAGIC1_PLAIN_TEXT,
-    //     ..seeder_keypair
-    // };
 
     let port: u16 = {
         if let Some(i) = args.iter().position(|x| x == "-port") {
@@ -61,7 +58,7 @@ fn main() {
     let localhost = args.contains(&"-localhost".to_string());
 
     if p2p_seeder {
-        p2p_test::p2p(port, Some(seeder_keypair), vec![], true, true);
+        p2p_test::p2p(port, SEEDER_CRYPTO, Some(seeder_keypair), vec![], true, true);
         return;
     }
 
@@ -73,8 +70,8 @@ fn main() {
     let (ip4, ip6) = (ip4.parse().unwrap(), ip6.parse().unwrap());
 
     let mut peers = Vec::with_capacity(2);
-    if use_ipv4 { peers.push(bandwidth_test::STPAddress { ip: ip4, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() }); }
-    if use_ipv6 { peers.push(bandwidth_test::STPAddress { ip: ip6, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() }); }
+    if use_ipv4 { peers.push(bandwidth_test::STPAddress::from(ip4, P2P_PORT, &seeder_keypair)); }
+    if use_ipv6 { peers.push(bandwidth_test::STPAddress::from(ip6, P2P_PORT, &seeder_keypair)); }
 
     p2p_test::p2p(0, SEEDER_CRYPTO, None, peers, use_ipv4, use_ipv6);
 }

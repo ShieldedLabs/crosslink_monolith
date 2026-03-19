@@ -94,25 +94,6 @@ pub fn send_to(socket: SockHandle, packets_to_send: &mut Vec<(ConnectionKey, Vec
     packets_to_send.push((*connection_key, Vec::from(buf)));
 }
 
-pub fn is_connected(connection: &ConnectionTrackingData) -> bool {
-    if let ConnectionState::Connected { .. } = connection.connection_state {
-        true
-    } else {
-        false
-    }
-}
-
-pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, my_keypairs: &Vec<&IdentityKeyPair>, address: &STPAddress) -> Result<(), String> {
-    for keypair in my_keypairs {
-        if address.magic1 == keypair.magic1 {
-            connect_to_endpoint(socket, connections_map, keypair, address);
-            return Ok(());
-        }
-    }
-
-    Err(format!("Error: Can't connect to given peer: {:?}. No compatible keypair.", address).to_string())
-}
-
 pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPAddress>, use_ipv4: bool, use_ipv6: bool) {
     socket_setup();
     monotonic_clock_setup();
@@ -165,7 +146,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
 
         let mut packets_to_send = Vec::new();
 
-        let mut peer_addresses_list: Vec<STPAddress> = connections_map.iter().filter(|(connection_key, connection)| is_connected(*connection)).map(|(connection_key, connection)| connection.address()).collect();
+        let mut peer_addresses_list: Vec<STPAddress> = connections_map.iter().filter(|(connection_key, connection)| connection.is_connected()).map(|(connection_key, connection)| connection.address()).collect();
         peer_addresses_list.shuffle(&mut rng);
         peer_addresses_list.truncate(20); // 1160 bytes of peers
 
@@ -185,12 +166,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
             o += PACKET_TYPE_PEER_LIST.write_to(&mut buf[o..]);
 
             for address in &peer_addresses_list {
-                let key = &address.key[..32];
-
-                o += address.ip.octets().write_to(&mut buf[o..]);
-                o += address.port       .write_to(&mut buf[o..]);
-                o += address.magic1     .write_to(&mut buf[o..]);
-                o += key                .write_to(&mut buf[o..]);
+                o += address.write_to(&mut buf[o..]);
             }
 
             // if PRINT_PEER_LIST { println_redraw!(chat_buf, name, "Sending PEER_LIST to: {:?}. It contains {} addresses.", address, peer_addresses_list.len()); }
@@ -209,7 +185,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
             o += line.as_bytes() .write_to(&mut buf[o..]);
 
             for (connection_key, connection) in &mut connections_map {
-                if is_connected(connection) {
+                if connection.is_connected() {
                     send_to(socket, &mut packets_to_send, &chat_buf, &name, &connection_key, &buf[..o]);
                 }
             }
@@ -277,7 +253,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
             if buf[0] == PACKET_TYPE_PEER_LIST {
                 let buf = &buf[1..];
 
-                let chunks = buf.chunks_exact(58);
+                let chunks = buf.chunks_exact(56);
 
                 clear_line();
                 if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses: ", chunks.len()); }
@@ -286,20 +262,19 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
 
                 let mut comma = false;
                 for chunk in chunks {
-                    let ip     = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[ 0..16]).unwrap());
-                    let port   =       u16::from_le_bytes(<[u8;  2]>::try_from(&chunk[16..18]).unwrap());
-                    let magic1 =       u64::from_le_bytes(<[u8;  8]>::try_from(&chunk[18..26]).unwrap());
-                    let key    =                                     Vec::from(&chunk[26..58]);
+                    let mut cur = std::io::Cursor::new(&chunk[..]);
+                    let Ok(address) = STPAddress::read_from(&mut cur)
+                    else {
+                        continue
+                    };
 
                     let mut is_myself = false;
                     for keypair in &my_keypairs {
-                        if (magic1 == keypair.magic1) && (key == keypair.public) {
+                        if (address.magic1 == keypair.magic1) && (address.key == keypair.public) {
                             is_myself = true;
                             break;
                         }
                     }
-
-                    let address = STPAddress { ip, port, magic1, key };
 
                     if PRINT_PEER_LIST {
                         if comma { print!(", "); } else { comma = true; }

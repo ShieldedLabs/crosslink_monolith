@@ -1,5 +1,7 @@
 
 use std::collections::HashMap;
+use rand::SeedableRng;
+use static_assertions::const_assert;
 
 #[test]
 pub fn bwdth_test() {
@@ -86,6 +88,10 @@ pub fn noise_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     }
 }
 
+// Quantum-resilient key sizes
+pub const MAX_SECRET_KEY_SIZE: usize = 8000;
+pub const MAX_PUBLIC_KEY_SIZE: usize = 8000;
+
 pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
         let mut ret = new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap();
@@ -134,6 +140,7 @@ pub struct STPAddress {
 impl STPAddress {
     pub fn is_ipv4(&self) -> bool { self.ip.to_ipv4_mapped().is_some() }
     pub fn is_ipv6(&self) -> bool { self.ip.to_ipv4_mapped().is_none() }
+    pub fn from(ip: Ipv6Addr, port: u16, kp: &IdentityKeyPair) -> Self { Self { ip, port, magic1: kp.magic1, key: kp.public.clone() } }
 }
 impl Default for STPAddress {
     fn default() -> Self {
@@ -151,12 +158,46 @@ impl std::fmt::Debug for STPAddress {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+
+pub fn fmt_byte_str(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
+    let n = usize::min(bytes.len(), f.precision().unwrap_or(bytes.len()));
+    for i in 0..n { write!(f, "{:02x}", bytes[i])?; }
+    Ok(())
+}
+
+pub fn fmt_byte_str_rev(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
+    let n = usize::min(bytes.len(), f.precision().unwrap_or(bytes.len()));
+    for i in 0..n { write!(f, "{:02x}", bytes[n-(i+1)])?; }
+    Ok(())
+}
+
+pub fn fmt_prefixed_byte_str(f: &mut std::fmt::Formatter<'_>, pre: &str, bytes: &[u8]) -> std::fmt::Result {
+    write!(f, "{}", pre)?;
+    fmt_byte_str(f, bytes)
+}
+
+pub fn fmt_prefixed_byte_str_rev(f: &mut std::fmt::Formatter<'_>, pre: &str, bytes: &[u8]) -> std::fmt::Result {
+    write!(f, "{}", pre)?;
+    fmt_byte_str_rev(f, bytes)
+}
+
+impl std::fmt::Debug for IdentityKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format!("IdentityKeyPair {{ magic1: {}, private: \"", self.magic1);
+        fmt_byte_str(f, &self.private)?;
+        fmt_prefixed_byte_str(f, "\", public: \"",                &self.public)?;
+        write!(f, "\" }}")
+    }
+}
+
+// TODO: rename private key to secret key
+#[derive(/* Copy, */ Clone, PartialEq, Eq, Hash)]
 pub struct IdentityKeyPair {
     pub magic1: u64,
-    pub private: Vec<u8>,
-    pub public: Vec<u8>,
+    pub private: Vec<u8>, // [u8; MAX_SECRET_KEY_SIZE],
+    pub public:  Vec<u8>, // [u8; MAX_PUBLIC_KEY_SIZE],
 }
+// const_assert!(size_of::<IdentityKeyPair>().is_power_of_two());
 impl std::fmt::Display for IdentityKeyPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         write!(f, "magic1: {} sk: REDACTED pk: {}", b64(&self.magic1.to_le_bytes()[..6]), b64(&self.public))
@@ -196,6 +237,18 @@ impl ConnectionTrackingData {
     }
     pub fn is_connected(&self) -> bool { self.connection_state.is_connected() }
 }
+
+pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, my_keypairs: &Vec<&IdentityKeyPair>, address: &STPAddress) -> Result<(), String> {
+    for keypair in my_keypairs {
+        if address.magic1 == keypair.magic1 {
+            connect_to_endpoint(socket, connections_map, keypair, address);
+            return Ok(());
+        }
+    }
+
+    Err(format!("Error: Can't connect to given peer: {:?}. No compatible keypair.", address).to_string())
+}
+
 
 #[derive(Debug, Clone)]
 pub struct ConnectionCipherTriplet {

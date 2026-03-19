@@ -1423,12 +1423,13 @@ impl SliceWrite for u16  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..
 impl SliceWrite for u8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] = *self;                                      1 } }
 impl SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..self.len()].copy_from_slice(self);   self.len() } }
 
-
-#[derive(Clone, Copy)]
-pub struct StaticDHKeyPair {
-    pub private: [u8; 32],
-    pub public: [u8; 32],
-}
+pub use crate::bandwidth_test::IdentityKeyPair;
+pub use crate::bandwidth_test::STPAddress;
+pub use crate::bandwidth_test::fmt_byte_str;
+pub use crate::bandwidth_test::fmt_byte_str_rev;
+pub use crate::bandwidth_test::fmt_prefixed_byte_str;
+pub use crate::bandwidth_test::fmt_prefixed_byte_str_rev;
+pub use crate::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub struct SecureUdpEndpoint {
@@ -1459,6 +1460,32 @@ impl SecureUdpEndpoint {
     }
 }
 
+pub const MAX_P2P_DISCOVERY_PUBKEY_SIZE: usize = 32;
+
+impl STPAddress {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let key             = &self.key[..MAX_P2P_DISCOVERY_PUBKEY_SIZE];
+        let port_and_magic1 = (self.port as u64 | self.magic1 << 16);
+
+        let mut o = 0;
+        o += self.ip.octets().write_to(&mut buf[o..]);
+        o += port_and_magic1 .write_to(&mut buf[o..]);
+        o += self.key        .write_to(&mut buf[o..]);
+        o
+    }
+
+    pub fn read_from<R: std::io::Read>(mut r: R) -> std::io::Result<Self> {
+        let mut address = STPAddress::default();
+        address.key.resize(MAX_P2P_DISCOVERY_PUBKEY_SIZE, 0);
+        r.read_exact(&mut address.ip.octets())?;
+        let port_and_magic1 = r.read_u64::<byteorder::LittleEndian>()?;
+        address.port   = port_and_magic1 as u16;
+        address.magic1 = port_and_magic1 >> 16;
+        r.read_exact(&mut address.key)?;
+        Ok(address)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct EndpointEvidence {
     pub endpoint: SecureUdpEndpoint,
@@ -1482,36 +1509,6 @@ impl EndpointEvidence {
         let mut key_bytes = [0_u8; 32];
         r.read_exact(&mut key_bytes)?;
         Ok(EndpointEvidence { endpoint, root_public_bft_key: key_bytes })
-    }
-}
-
-fn fmt_byte_str(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
-    let n = usize::min(bytes.len(), f.precision().unwrap_or(bytes.len()));
-    for i in 0..n { write!(f, "{:02x}", bytes[i])?; }
-    Ok(())
-}
-
-fn fmt_byte_str_rev(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
-    let n = usize::min(bytes.len(), f.precision().unwrap_or(bytes.len()));
-    for i in 0..n { write!(f, "{:02x}", bytes[n-(i+1)])?; }
-    Ok(())
-}
-
-fn fmt_prefixed_byte_str(f: &mut std::fmt::Formatter<'_>, pre: &str, bytes: &[u8]) -> std::fmt::Result {
-    write!(f, "{}", pre)?;
-    fmt_byte_str(f, bytes)
-}
-
-fn fmt_prefixed_byte_str_rev(f: &mut std::fmt::Formatter<'_>, pre: &str, bytes: &[u8]) -> std::fmt::Result {
-    write!(f, "{}", pre)?;
-    fmt_byte_str_rev(f, bytes)
-}
-
-impl std::fmt::Debug for StaticDHKeyPair {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fmt_prefixed_byte_str(f, "StaticDHKeyPair { private: \"", &self.private)?;
-        fmt_prefixed_byte_str(f, "\", public: \"",                &self.public)?;
-        write!(f, "\" }}")
     }
 }
 
@@ -1615,7 +1612,7 @@ pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize
 
 async fn instance(
     my_root_private_key: SigningKey,
-    my_static_keypair: Option<StaticDHKeyPair>,
+    my_static_keypair: Option<IdentityKeyPair>,
     my_endpoint: Option<SecureUdpEndpoint>,
     roster: Vec<SortedRosterMember>,
     roster_endpoint_evidence: Vec<EndpointEvidence>,
@@ -1701,7 +1698,7 @@ async fn instance(
 }
 
 pub async fn entry_point(my_root_private_key: SigningKey,
-                         my_static_keypair: Option<StaticDHKeyPair>,
+                         my_static_keypair: Option<IdentityKeyPair>,
                          my_endpoint: Option<SecureUdpEndpoint>,
                          mut roster: Vec<SortedRosterMember>,
                          mut roster_endpoint_evidence: Vec<EndpointEvidence>,
@@ -1718,6 +1715,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          ingest_startup_data: Vec<RoundData>,
                         ) -> std::io::Result<()> {
     hook_fail_on_panic();
+
     let mut base_rng = {
         let seed : u128 = maybe_seed.unwrap_or_else(|| {
             let mut seed_rng = rand::rng();
@@ -1734,12 +1732,14 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         for i in 0..key.len() { print!("{:02x}", key[i]); }
         println!("\"");
     }
-    let my_static_keypair = my_static_keypair.unwrap_or_else(|| {
-        let kp = snow::Builder::new(noise_params.clone()).generate_keypair().unwrap();
-        StaticDHKeyPair { private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
-    });
 
-    let sock = {
+    let my_static_keypair = my_static_keypair.unwrap_or(new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap());
+
+    use crate::bandwidth_test::*;
+    use crate::native_sockets::*;
+
+    let sock = 
+    {
         use socket2::{Domain, Protocol, Socket, Type};
         let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
         socket.set_nonblocking(true).unwrap();
@@ -1747,6 +1747,22 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         socket.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, my_endpoint.map(|e|e.port).unwrap_or(0), 0, 0).into()).unwrap();
         tokio::net::UdpSocket::from_std(socket.into()).unwrap()
     };
+
+    // STP setup
+    socket_setup();
+    monotonic_clock_setup();
+
+    let socket = setup_and_bind_udp_socket(0);
+
+    let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
+
+    let my_keypairs = vec![&my_static_keypair];
+
+    let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
+    let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
+    let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
+
+    let mut peers = HashMap::<ConnectionKey, Peer>::new();
 
     let my_port = sock.local_addr().unwrap().port();
 
@@ -2127,7 +2143,7 @@ fn parse_to_ipv6_bytes(s: &str) -> Result<([u8; 16], u16), std::net::AddrParseEr
 
     Ok((ip6.octets(), port))
 }
-fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint) {
+fn goofy_addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, SecureUdpEndpoint) {
     use std::hash::Hasher;
     let mut hasher = DefaultHasher::new();
     hasher.write(addr.as_bytes());
@@ -2139,15 +2155,16 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
     )
     .generate_keypair()
     .unwrap();
-    let static_keypair = StaticDHKeyPair {
+    let static_keypair = IdentityKeyPair {
+        magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s,
         private: kp.private.try_into().unwrap(),
         public: kp.public.try_into().unwrap(),
     };
     let (ip, port) = parse_to_ipv6_bytes(addr).unwrap();
     (
-        static_keypair,
+        static_keypair.clone(),
         SecureUdpEndpoint {
-            public_key: static_keypair.public,
+            public_key: static_keypair.public.clone().try_into().unwrap(),
             ip_address: ip,
             port,
         },
@@ -2593,7 +2610,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (StaticDHKeyPair, SecureUdpEndpoint
                         } else if packet_type == PACKET_TYPE_SERVER_UNKNOWN_HELLO && local_msg.len() == 18 {
                             let my_apparent_ip       = &local_msg[  ..16];
                             let my_apparent_port     = &local_msg[16..18];
-                            let my_apparent_endpoint = SecureUdpEndpoint { ip_address: my_apparent_ip.try_into().unwrap(), port: u16::from_le_bytes(my_apparent_port.try_into().unwrap()), public_key: my_static_keypair.public };
+                            let my_apparent_endpoint = SecureUdpEndpoint { ip_address: my_apparent_ip.try_into().unwrap(), port: u16::from_le_bytes(my_apparent_port.try_into().unwrap()), public_key: my_static_keypair.public.clone().try_into().unwrap() };
                             // TODO hash
                             if let Ok(snow_state) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                 if PRINT_PROTOCOL { println!("{:05}: Finished outgoing unknown handshake and got nonce {} with {}, I am percieved as {:?}", my_port, nonce, addr, my_apparent_endpoint); }
@@ -3435,14 +3452,14 @@ pub fn run_instances(i: usize) {
 
     let static_keypair_zero = {
         let kp = snow::Builder::with_resolver("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap(), Box::new(SnowRngResolver { rng: RustIsBadRngWrapper(crypto_rng.clone()) })).generate_keypair().unwrap();
-        StaticDHKeyPair { private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
+        IdentityKeyPair { magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
     };
 
     let endpoint_zero : SecureUdpEndpoint = {
         let port : u16 = 3030;
         // let ip = "::1".parse::<std::net::Ipv6Addr>().unwrap();
         let ip = "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped();
-        SecureUdpEndpoint { ip_address: ip.octets(), port, public_key: static_keypair_zero.public }
+        SecureUdpEndpoint { ip_address: ip.octets(), port, public_key: static_keypair_zero.public.clone().try_into().unwrap() }
     };
 
     let evidence_zero = {
@@ -3453,7 +3470,7 @@ pub fn run_instances(i: usize) {
         // let _joins: [; N];
         for j in 0..N {
             if j == 0 {
-                rt.spawn(instance(static_private_keys[j], Some(static_keypair_zero), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
+                rt.spawn(instance(static_private_keys[j], Some(static_keypair_zero.clone()), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
             } else {
                 rt.spawn(instance(static_private_keys[j], None, None, roster.clone(), vec![evidence_zero], None));
             }
@@ -3462,7 +3479,7 @@ pub fn run_instances(i: usize) {
         // let _joins: [; N];
         for j in 0..N - 1 {
             if j == 0 {
-                rt.spawn(instance(static_private_keys[j], Some(static_keypair_zero), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
+                rt.spawn(instance(static_private_keys[j], Some(static_keypair_zero.clone()), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
             } else {
                 rt.spawn(instance(static_private_keys[j], None, None, roster.clone(), vec![evidence_zero], None));
             }
@@ -3484,7 +3501,7 @@ pub fn run_instances(i: usize) {
 }
 
 pub mod bandwidth_test;
-// pub mod p2p_test;
+pub mod p2p_test;
 pub mod native_sockets;
 pub mod helpers;
 
