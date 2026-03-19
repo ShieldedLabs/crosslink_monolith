@@ -1715,6 +1715,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          ingest_startup_data: Vec<RoundData>,
                         ) -> std::io::Result<()> {
     hook_fail_on_panic();
+
     let mut base_rng = {
         let seed : u128 = maybe_seed.unwrap_or_else(|| {
             let mut seed_rng = rand::rng();
@@ -1731,16 +1732,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         for i in 0..key.len() { print!("{:02x}", key[i]); }
         println!("\"");
     }
-    let my_static_keypair = my_static_keypair.unwrap_or_else(|| {
-        let kp = snow::Builder::new(noise_params.clone()).generate_keypair().unwrap();
-        IdentityKeyPair {
-            magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s,
-            private: kp.private.try_into().unwrap(),
-            public: kp.public.try_into().unwrap(),
-        }
-    });
+
+    let my_static_keypair = my_static_keypair.unwrap_or(new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap());
 
     use crate::bandwidth_test::*;
+    use crate::native_sockets::*;
 
     let sock = 
     {
@@ -1751,6 +1747,22 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         socket.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, my_endpoint.map(|e|e.port).unwrap_or(0), 0, 0).into()).unwrap();
         tokio::net::UdpSocket::from_std(socket.into()).unwrap()
     };
+
+    // STP setup
+    socket_setup();
+    monotonic_clock_setup();
+
+    let socket = setup_and_bind_udp_socket(0);
+
+    let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
+
+    let my_keypairs = vec![&my_static_keypair];
+
+    let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
+    let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
+    let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
+
+    let mut peers = HashMap::<ConnectionKey, Peer>::new();
 
     let my_port = sock.local_addr().unwrap().port();
 
