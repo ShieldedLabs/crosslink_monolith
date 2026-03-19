@@ -104,18 +104,17 @@ pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
     } else { None }
 }
 
-pub fn new_keypair_from_connect_magic1_with_secret(magic1: u64, sk: [u8; 32]) -> Option<IdentityKeyPair> {
+pub fn new_keypair_from_connect_magic1_with_seed(magic1: u64, seed: [u8; 32]) -> Option<IdentityKeyPair> {
     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-        let mut ret = new_keypair_from_connect_magic1_with_secret(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, sk).unwrap();
+        let mut ret = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
         ret.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
         return Some(ret);
     }
     if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
-        Some(IdentityKeyPair {
-            magic1,
-            private: sk.to_vec(),
-            public: x25519_dalek::x25519(sk, x25519_dalek::X25519_BASEPOINT_BYTES).to_vec(),
-        })
+        use rand::SeedableRng;
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
+        let kp = snow::Builder::with_resolver(noise_string.parse().unwrap(), Box::new(SnowRngResolver { rng: RustIsBadRngWrapper(rng) })).generate_keypair().unwrap();
+        Some(IdentityKeyPair { magic1, private: kp.private, public: kp.public })
     } else { None }
 }
 
@@ -199,6 +198,11 @@ pub struct IdentityKeyPair {
     pub public:  Vec<u8>, // [u8; MAX_PUBLIC_KEY_SIZE],
 }
 // const_assert!(size_of::<IdentityKeyPair>().is_power_of_two());
+impl std::fmt::Display for IdentityKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "magic1: {} sk: REDACTED pk: {}", b64(&self.magic1.to_le_bytes()[..6]), b64(&self.public))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConnectionKey {

@@ -914,9 +914,9 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             hasher.write(addr.as_bytes());
             let seed = hasher.finish();
 
-            let mut sk = [0; 32];
-            rand_chacha::ChaCha20Rng::seed_from_u64(seed).fill(&mut sk);
-            let static_keypair = tenderlink::bandwidth_test::new_keypair_from_connect_magic1_with_secret(tenderlink::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, sk).unwrap();
+            let mut other_seed = [0; 32];
+            rand_chacha::ChaCha20Rng::seed_from_u64(seed).fill(&mut other_seed);
+            let static_keypair = tenderlink::bandwidth_test::new_keypair_from_connect_magic1_with_seed(tenderlink::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, other_seed).unwrap();
 
             let (ip, port) = parse_to_ipv6_bytes(addr).unwrap();
             (
