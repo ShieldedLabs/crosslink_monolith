@@ -254,14 +254,25 @@ fn crosslink_expect_pos_not_pushed_if_pow_blocks_not_present() {
     test_bytes(tf.write_to_bytes());
 }
 
+// failing
 #[test]
 fn crosslink_expect_pos_height_after_push() {
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    for i in 0..REGTEST_BLOCK_BYTES.len() {
-        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
+    let nw = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen = BlockGen::init_at_genesis_plus_1(nw, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+
+    tf.push_instr_load_pow(&gen.tip, 0);
+    for _ in 2..8 {
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
     }
+    tf.push_instr_expect_pow_chain_length(8, 0);
+
+    // for i in 0..REGTEST_BLOCK_BYTES.len() {
+    //     tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
+    // }
     for i in 0..REGTEST_POS_BLOCK_BYTES.len() {
         tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[i], 0);
         tf.push_instr_expect_pos_chain_length(1 + i, 0);
@@ -272,6 +283,7 @@ fn crosslink_expect_pos_height_after_push() {
     test_bytes(tf.write_to_bytes());
 }
 
+// failing
 #[test]
 fn crosslink_expect_pos_out_of_order() {
     set_test_name(function_name!());
@@ -289,6 +301,7 @@ fn crosslink_expect_pos_out_of_order() {
     test_bytes(tf.write_to_bytes());
 }
 
+// failing
 #[test]
 fn crosslink_expect_pos_push_same_block_twice_only_accepted_once() {
     set_test_name(function_name!());
@@ -332,6 +345,7 @@ fn crosslink_reject_pos_with_signature_on_different_data() {
     test_bytes(tf.write_to_bytes());
 }
 
+// failing
 #[test]
 fn crosslink_test_basic_finality() {
     set_test_name(function_name!());
@@ -412,6 +426,7 @@ fn reject_pos_block_with_lt_sigma_headers() {
     tf.push_instr_expect_pos_chain_length(0, 0);
 }
 
+// failing
 #[test]
 fn crosslink_test_pow_to_pos_link() {
     set_test_name(function_name!());
@@ -464,6 +479,7 @@ fn crosslink_test_pow_to_pos_link() {
     test_bytes(tf.write_to_bytes());
 }
 
+// failing
 #[test]
 fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized_pow_chain() {
     set_test_name(function_name!());
@@ -472,6 +488,7 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     ));
 }
 
+// failing
 #[test]
 fn crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists() {
     set_test_name(function_name!());
@@ -677,23 +694,26 @@ fn crosslink_gen_pow_fork() {
 
 fn create_pos_and_ptr_to_finalize_pow(
     bft_height: u32,
+    parent_fat_ptr: FatPointerToBftBlock2,
     pow_blocks: &[Arc<Block>],
+    sigs: &[zebra_crosslink::FatPointerSignature2],
 ) -> BftBlockAndFatPointerToIt {
     assert_eq!(
         pow_blocks.len(),
         PROTOTYPE_PARAMETERS.bc_confirmation_depth_sigma as usize
     );
 
+    let mut hdrs = Vec::with_capacity(pow_blocks.len());
+    for pow_block in pow_blocks {
+        hdrs.push(pow_block.header.as_ref().clone());
+    }
+
     let block = BftBlock::try_from(
         &PROTOTYPE_PARAMETERS,
         bft_height,
-        FatPointerToBftBlock2::null(),
+        parent_fat_ptr,
         pow_blocks[0].coinbase_height().expect("valid height").0,
-        vec![
-            pow_blocks[0].header.as_ref().clone(),
-            pow_blocks[1].header.as_ref().clone(),
-            pow_blocks[2].header.as_ref().clone(),
-        ],
+        hdrs,
     )
     .expect("valid PoS block");
 
@@ -703,7 +723,19 @@ fn create_pos_and_ptr_to_finalize_pow(
         vote_signature: [0xbcu8; 64],
     };
 
-    BftBlockAndFatPointerToIt::from_parts(block, bft_height.into(), 1, &[])
+    BftBlockAndFatPointerToIt::from_parts(block, bft_height.into(), 1, sigs)
+}
+
+fn next_pos(
+    cur_bft_height: &mut u32,
+    cur_fat_ptr: &mut FatPointerToBftBlock2,
+    pow_blocks: &[Arc<Block>],
+    sigs: &[zebra_crosslink::FatPointerSignature2],
+) ->BftBlockAndFatPointerToIt {
+    *cur_bft_height += 1;
+    let bft = create_pos_and_ptr_to_finalize_pow(*cur_bft_height, cur_fat_ptr.clone(), pow_blocks, sigs);
+    *cur_fat_ptr = bft.fat_ptr.clone();
+    bft
 }
 
 #[test]
@@ -724,7 +756,9 @@ fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
         tf.push_instr_load_pow(block, 0);
     }
 
-    let bft = create_pos_and_ptr_to_finalize_pow(1, &pow_common[0..3]);
+    let fat_ptr = &mut FatPointerToBftBlock2::null();
+    let pos_h = &mut 0;
+    let bft = next_pos(pos_h, fat_ptr, &pow_common[0..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     for _ in 4..7 {
@@ -753,6 +787,7 @@ fn crosslink_force_roster() {
     test_bytes(tf.write_to_bytes());
 }
 
+// failing
 #[test]
 fn crosslink_add_newcomer_to_roster_via_pow() {
     set_test_name(function_name!());
@@ -784,7 +819,9 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
         tf.push_instr_load_pow(block, 0);
     }
 
-    let bft = create_pos_and_ptr_to_finalize_pow(1, &pow_common[0..3]);
+    let fat_ptr = &mut FatPointerToBftBlock2::null();
+    let pos_h = &mut 0;
+    let bft = next_pos(pos_h, fat_ptr, &pow_common[0..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     let (_, _prv_key, pub_key) =
