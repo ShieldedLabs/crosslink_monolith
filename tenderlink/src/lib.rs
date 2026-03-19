@@ -2073,17 +2073,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     }
 
                     if let (Some(peer_endpoint), Some(snow_state)) = (peer.endpoint, &mut peer.snow_state) {
-                        if peer.connection_knowledge == ConnectionKnowledge::Unknown {
-                            // Gossip evidence in order to trigger upgrade
-                            if let Some(evidence) = my_endpoint_evidence {
-                                let header = PacketHeader::new::<PACKET_TYPE_ENDPOINT_EVIDENCE>(peer.transport.ack_latest, peer.transport.ack_field); // @TodoHeaderAndStatus
-                                let mut o  = 0;
-                                o += header  .write_to(&mut send_buf1[o..]);
-                                o += evidence.write_to(&mut send_buf1[o..]);
-                                print_packet_tag_send(header);
-                                send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
-                            }
-                        }
                         let header = PacketHeader::new::<PACKET_TYPE_EMPTY>(peer.transport.ack_latest, peer.transport.ack_field);
                         let mut o  = 0;
                         o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
@@ -2107,16 +2096,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             print_packet_tag_send(header);
                             send_sock_msg(&ctx_str, &mut peer.transport, &sock, peer_endpoint, &send_buf2[..n], &mut net_stats);
                             peer.outgoing_handshake_state = Some(outgoing_state);
-                        }
-
-                        if let (Some(snow_state), Some(evidence)) =
-                            (&mut peer.snow_state, roster_endpoint_evidence.choose(&mut base_rng)) {
-                            let header = PacketHeader::new::<PACKET_TYPE_ENDPOINT_EVIDENCE>(peer.transport.ack_latest, peer.transport.ack_field); // @TodoHeaderAndStatus
-                            let mut o = 0;
-                            o += header  .write_to(&mut send_buf1[o..]);
-                            o += evidence.write_to(&mut send_buf1[o..]);
-                            print_packet_tag_send(header);
-                            send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
                         }
                     }
                 }
@@ -2388,20 +2367,6 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, SecureUdpEndpoint
                         }
                     } else {
                         eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: round_data array was empty", ctx_str);
-                    }
-                }
-
-                for peer_i in 0..peers.len() {
-                    if peers[peer_i].root_public_bft_key == [0; 32] { continue; }
-                    let peer = &mut peers[peer_i];
-                    if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
-                    if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
-                        peer.latest_status_request_height = None;
-                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), [0; 32], &sock, &mut net_stats);
-                    }
-                    if let Some((hash, chunk_i)) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
-                        // peer.latest_status_request_powlink = None;
-                        // powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &sock, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash, chunk_i).await;
                     }
                 }
 
@@ -2887,31 +2852,6 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, SecureUdpEndpoint
             }
 
             match packet_type {
-                PACKET_TYPE_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[read_o..]) {
-
-                    Ok(evidence) => if (&roster[..active_roster_len(&roster)]).iter().position(|m| m.pub_key.0 == evidence.root_public_bft_key).is_some() {
-                        if peer_from_which_i_have_received_the_packet.endpoint == Some(evidence.endpoint) {
-                            if PRINT_PROTOCOL {
-                                println!("{:05}: Promoting unknown peer connection {:?}", my_port, peer_from_which_i_have_received_the_packet.endpoint);
-                            }
-
-                            // Remove the peer with this BFT identity if they were already elsewhere on the list
-                            duplicate_peer_identity_to_remove = Some(evidence.root_public_bft_key);
-                            peer_index_to_retain = peer_index;
-
-                            peer_from_which_i_have_received_the_packet.root_public_bft_key           = evidence.root_public_bft_key;
-                            peer_from_which_i_have_received_the_packet.outgoing_handshake_state      = None;
-                            peer_from_which_i_have_received_the_packet.pending_client_ack_snow_state = None;
-                            peer_from_which_i_have_received_the_packet.watch_dog                     = Instant::now();
-                            peer_from_which_i_have_received_the_packet.connection_knowledge          = ConnectionKnowledge::Known;
-                        }
-
-                        roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
-                        roster_endpoint_evidence.push(evidence);
-                    }
-
-                    Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
-                },
                 PACKET_TYPE_EMPTY => (),
                 _ => (), //println!("{:05}:  From unknown peer!   field={:016X} packet_type=0x{:X} Got '{:?}' from {}", my_port, peer.transport.ack_field, packet_type, msg, addr),
             }
@@ -2938,15 +2878,6 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, SecureUdpEndpoint
 
             const_assert!(PACKET_TYPE_PREVOTE_SIGNATURES + 1 == PACKET_TYPE_PRECOMMIT_SIGNATURES);
             match packet_type {
-                PACKET_TYPE_ENDPOINT_EVIDENCE => match EndpointEvidence::read_from(&msg[read_o..]) {
-                    Ok(evidence) => if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == evidence.root_public_bft_key) {
-                        peers[i].endpoint = Some(evidence.endpoint);
-                        roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
-                        roster_endpoint_evidence.push(evidence);
-                    }
-                    Err(err) => eprintln!("{:05}: couldn't read endpoint evidence: {}", my_port, err),
-                }
-
                 PACKET_TYPE_PROPOSAL_CHUNK => {
                     let hdr = match PacketProposalChunkHeader::read_from(&msg[read_o..]) { Ok(v)=>v, Err(err)=>{
                         eprintln!("{:05}: couldn't read proposal header: {}", my_port, err);
@@ -3021,7 +2952,6 @@ const PACKET_TYPE_CLIENT_UNKNOWN_ACK:   u8 =  2;
 const PACKET_TYPE_CLIENT_ACK:           u8 =  3;
 const PACKET_TYPE_SERVER_UNKNOWN_HELLO: u8 =  4;
 const PACKET_TYPE_SERVER_HELLO:         u8 =  5;
-const PACKET_TYPE_ENDPOINT_EVIDENCE:    u8 =  6;
 // consensus
 const PACKET_TYPE_PROPOSAL_CHUNK:       u8 =  7;
 const PACKET_TYPE_PREVOTE_SIGNATURES:   u8 =  8;
@@ -3049,7 +2979,6 @@ const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     names[PACKET_TYPE_CLIENT_ACK           as usize] = ["CLIENT_ACK",               "STATUS+CLIENT_ACK"];
     names[PACKET_TYPE_SERVER_UNKNOWN_HELLO as usize] = ["SERVER_UNKNOWN_HELLO",     "STATUS+SERVER_UNKNOWN_HELLO"];
     names[PACKET_TYPE_SERVER_HELLO         as usize] = ["SERVER_HELLO",             "STATUS+SERVER_HELLO"];
-    names[PACKET_TYPE_ENDPOINT_EVIDENCE    as usize] = ["ENDPOINT_EVIDENCE",        "STATUS+ENDPOINT_EVIDENCE"];
     names[PACKET_TYPE_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",           "STATUS+PROPOSAL_CHUNK"];
     names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES",     "STATUS+PRECOMMIT_SIGNATURES"];
