@@ -89,8 +89,8 @@ pub fn noise_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
 }
 
 // Quantum-resilient key sizes
-pub const MAX_SECRET_KEY_SIZE: usize = 8188;
-pub const MAX_PUBLIC_KEY_SIZE: usize = 8188;
+pub const MAX_SECRET_KEY_SIZE: usize = 8000;
+pub const MAX_PUBLIC_KEY_SIZE: usize = 8000;
 
 pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
     if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
@@ -141,6 +141,7 @@ pub struct STPAddress {
 impl STPAddress {
     pub fn is_ipv4(&self) -> bool { self.ip.to_ipv4_mapped().is_some() }
     pub fn is_ipv6(&self) -> bool { self.ip.to_ipv4_mapped().is_none() }
+    pub fn from(ip: Ipv6Addr, port: u16, kp: &IdentityKeyPair) -> Self { Self { ip, port, magic1: kp.magic1, key: kp.public.clone() } }
 }
 impl Default for STPAddress {
     fn default() -> Self {

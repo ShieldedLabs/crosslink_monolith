@@ -185,12 +185,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
             o += PACKET_TYPE_PEER_LIST.write_to(&mut buf[o..]);
 
             for address in &peer_addresses_list {
-                let key = &address.key[..32];
-
-                o += address.ip.octets().write_to(&mut buf[o..]);
-                o += address.port       .write_to(&mut buf[o..]);
-                o += address.magic1     .write_to(&mut buf[o..]);
-                o += key                .write_to(&mut buf[o..]);
+                o += address.write_to(&mut buf[o..]);
             }
 
             // if PRINT_PEER_LIST { println_redraw!(chat_buf, name, "Sending PEER_LIST to: {:?}. It contains {} addresses.", address, peer_addresses_list.len()); }
@@ -277,7 +272,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
             if buf[0] == PACKET_TYPE_PEER_LIST {
                 let buf = &buf[1..];
 
-                let chunks = buf.chunks_exact(58);
+                let chunks = buf.chunks_exact(56);
 
                 clear_line();
                 if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses: ", chunks.len()); }
@@ -286,20 +281,19 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
 
                 let mut comma = false;
                 for chunk in chunks {
-                    let ip     = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[ 0..16]).unwrap());
-                    let port   =       u16::from_le_bytes(<[u8;  2]>::try_from(&chunk[16..18]).unwrap());
-                    let magic1 =       u64::from_le_bytes(<[u8;  8]>::try_from(&chunk[18..26]).unwrap());
-                    let key    =                                     Vec::from(&chunk[26..58]);
+                    let mut cur = std::io::Cursor::new(&chunk[..]);
+                    let Ok(address) = STPAddress::read_from(&mut cur)
+                    else {
+                        continue
+                    };
 
                     let mut is_myself = false;
                     for keypair in &my_keypairs {
-                        if (magic1 == keypair.magic1) && (key == keypair.public) {
+                        if (address.magic1 == keypair.magic1) && (address.key == keypair.public) {
                             is_myself = true;
                             break;
                         }
                     }
-
-                    let address = STPAddress { ip, port, magic1, key };
 
                     if PRINT_PEER_LIST {
                         if comma { print!(", "); } else { comma = true; }

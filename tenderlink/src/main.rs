@@ -68,8 +68,8 @@ fn main() {
     let (ip4, ip6) = (ip4.parse().unwrap(), ip6.parse().unwrap());
 
     let mut peers = Vec::with_capacity(2);
-    if use_ipv4 { peers.push(bandwidth_test::STPAddress { ip: ip4, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() }); }
-    if use_ipv6 { peers.push(bandwidth_test::STPAddress { ip: ip6, port: P2P_PORT, magic1: seeder_keypair.magic1, key: seeder_keypair.public.clone() }); }
+    if use_ipv4 { peers.push(bandwidth_test::STPAddress::from(ip4, P2P_PORT, &seeder_keypair)); }
+    if use_ipv6 { peers.push(bandwidth_test::STPAddress::from(ip6, P2P_PORT, &seeder_keypair)); }
 
     p2p_test::p2p(0, SEEDER_CRYPTO, None, peers, use_ipv4, use_ipv6);
 }

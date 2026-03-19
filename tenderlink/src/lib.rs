@@ -1460,6 +1460,32 @@ impl SecureUdpEndpoint {
     }
 }
 
+pub const MAX_P2P_DISCOVERY_PUBKEY_SIZE: usize = 32;
+
+impl STPAddress {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let key             = &self.key[..MAX_P2P_DISCOVERY_PUBKEY_SIZE];
+        let port_and_magic1 = (self.port as u64 | self.magic1 << 16);
+
+        let mut o = 0;
+        o += self.ip.octets().write_to(&mut buf[o..]);
+        o += port_and_magic1 .write_to(&mut buf[o..]);
+        o += self.key        .write_to(&mut buf[o..]);
+        o
+    }
+
+    pub fn read_from<R: std::io::Read>(mut r: R) -> std::io::Result<Self> {
+        let mut address = STPAddress::default();
+        address.key.resize(MAX_P2P_DISCOVERY_PUBKEY_SIZE, 0);
+        r.read_exact(&mut address.ip.octets())?;
+        let port_and_magic1 = r.read_u64::<byteorder::LittleEndian>()?;
+        address.port   = port_and_magic1 as u16;
+        address.magic1 = port_and_magic1 >> 16;
+        r.read_exact(&mut address.key)?;
+        Ok(address)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct EndpointEvidence {
     pub endpoint: SecureUdpEndpoint,
