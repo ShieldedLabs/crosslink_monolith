@@ -105,8 +105,9 @@ pub fn new_keypair_from_connect_magic1_with_seed(magic1: u64, seed: [u8; 32]) ->
         return Some(ret);
     }
     if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
+        use rand::SeedableRng;
         let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
-        let kp = snow::Builder::new(noise_string.parse().unwrap()).generate_keypair_with_rng().unwrap();
+        let kp = snow::Builder::with_resolver(noise_string.parse().unwrap(), Box::new(SnowRngResolver { rng: RustIsBadRngWrapper(rng) })).generate_keypair().unwrap();
         Some(IdentityKeyPair { magic1, private: kp.private, public: kp.public })
     } else { None }
 }
@@ -155,6 +156,11 @@ pub struct IdentityKeyPair {
     pub magic1: u64,
     pub private: Vec<u8>,
     pub public: Vec<u8>,
+}
+impl std::fmt::Display for IdentityKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "magic1: {} sk: REDACTED pk: {}", b64(&self.magic1.to_le_bytes()[..6]), b64(&self.public))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

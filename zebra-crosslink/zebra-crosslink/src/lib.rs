@@ -916,7 +916,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
             let kp = snow::Builder::with_resolver(
                 "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap(),
-                Box::new(tenderlink::SnowRngResolver::seed_from_u64(seed)),
+                Box::new(tenderlink::helpers::SnowRngResolver::seed_from_u64(seed)),
             )
             .generate_keypair()
             .unwrap();

@@ -10021,6 +10021,7 @@ name = "zebra-state"
 version = "2.0.0"
 dependencies = [
  "bincode",
+ "blake3",
  "chrono",
  "color-eyre",
  "crossbeam-channel",
@@ -10054,6 +10055,7 @@ dependencies = [
  "serde_json",
  "spandoc",
  "tempfile",
+ "tenderlink",
  "thiserror 2.0.16",
  "tinyvec",
  "tokio",

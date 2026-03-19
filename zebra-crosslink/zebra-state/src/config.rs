@@ -189,6 +189,7 @@ impl Default for Config {
             elasticsearch_username: "elastic".to_string(),
             #[cfg(feature = "elasticsearch")]
             elasticsearch_password: "".to_string(),
+            network_identity_seed_string: None,
         }
     }
 }

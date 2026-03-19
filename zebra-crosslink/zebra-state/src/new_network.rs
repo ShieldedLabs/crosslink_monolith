@@ -3,6 +3,8 @@ use crate::{Request, Response, ReadRequest, ReadResponse};
 use tower::ServiceExt;
 use zebra_chain::serialization::ZcashSerialize;
 
+use tenderlink::bandwidth_test::*;
+
 pub fn sync(
         config: &crate::config::Config,
         read_state: impl tower::Service<
@@ -23,15 +25,17 @@ pub fn sync(
         + 'static,
         rt: tokio::runtime::Handle,
 ) {
-    if let Some() = config.network_identity_seed_string This is broken, phillip fix.
-/*
-    The Plan.
-1. Call new_keypair_from_connect_magic1_with_seed to generate a key or new_keypair_from_connect_magic1 if none.
-2. Run the chat program ish from here. With peer discovery.
-3. Every tick, iterate all chains, gather all [this_hash, parent_hash].
-4. Gossip/Share status to others.
-5. Implement reliable streams and stream blocks. One is unprompted the other is a request to be streamed to.
-*/
+    let network_keypair;
+    if let Some(string_seed) = &config.network_identity_seed_string {
+        let hash = *blake3::hash(string_seed.as_bytes()).as_bytes();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&hash);
+        network_keypair = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_PLAIN_TEXT, seed).unwrap();
+    }
+    else {
+        network_keypair = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
+    }
+    println!("NETWORK KEYPAIR: {}", network_keypair);
 
     let mut nfs_rx = rt.block_on(async {
         let res = read_state.clone().oneshot(ReadRequest::NonFinalizedBlocksListener).await;
