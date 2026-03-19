@@ -1740,6 +1740,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         }
     });
 
+    use bandwidth_test::*;
+
     let sock = {
         use socket2::{Domain, Protocol, Socket, Type};
         let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
