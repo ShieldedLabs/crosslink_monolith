@@ -254,7 +254,6 @@ fn crosslink_expect_pos_not_pushed_if_pow_blocks_not_present() {
     test_bytes(tf.write_to_bytes());
 }
 
-// failing
 #[test]
 fn crosslink_expect_pos_height_after_push() {
     set_test_name(function_name!());
@@ -264,18 +263,21 @@ fn crosslink_expect_pos_height_after_push() {
     let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let mut gen = BlockGen::init_at_genesis_plus_1(nw, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
 
-    tf.push_instr_load_pow(&gen.tip, 0);
+    let mut pow_common = vec![gen.tip.clone()];
     for _ in 2..8 {
-        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+        pow_common.push(gen.next_block(&miner_addr));
+    }
+    for pow in &pow_common {
+        tf.push_instr_load_pow(pow, 0);
     }
     tf.push_instr_expect_pow_chain_length(8, 0);
 
-    // for i in 0..REGTEST_BLOCK_BYTES.len() {
-    //     tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
-    // }
-    for i in 0..REGTEST_POS_BLOCK_BYTES.len() {
-        tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[i], 0);
-        tf.push_instr_expect_pos_chain_length(1 + i, 0);
+    let fat_ptr = &mut FatPointerToBftBlock2::null();
+    let pos_h = &mut 0;
+    for i in 1..5 {
+        let bft = next_pos(pos_h, fat_ptr, &pow_common[i..i+3], &[]);
+        tf.push_instr_load_pos(&bft, 0);
+        tf.push_instr_expect_pos_chain_length((*pos_h).try_into().unwrap(), 0);
     }
 
     // let write_ok = tf.write_to_file(Path::new("crosslink_expect_pos_height_after_push.zeccltf"));
@@ -531,7 +533,7 @@ impl BlockGen {
     pub fn init_at_genesis_plus_1(
         network: Network,
         genesis_hash: BlockHash,
-        miner_address: &Address,
+        miner_addr: &Address,
     ) -> Self {
         let history_tree = HistoryTree::default();
         let time = chrono::DateTime::<Utc>::from_timestamp(1758127904, 0).expect("valid time");
@@ -542,7 +544,7 @@ impl BlockGen {
 
         let tip = BlockGen::create_block(
             &network,
-            miner_address,
+            miner_addr,
             BlockHeight(1),
             genesis_hash,
             time,
@@ -560,7 +562,7 @@ impl BlockGen {
 
     pub fn create_block(
         network: &Network,
-        miner_address: &Address,
+        miner_addr: &Address,
         height: BlockHeight,
         previous_block_hash: BlockHash,
         time: DateTime<Utc>,
@@ -571,7 +573,7 @@ impl BlockGen {
             zebra_rpc::methods::types::get_block_template::standard_coinbase_outputs(
                 network,
                 height,
-                miner_address,
+                miner_addr,
                 zebra_chain::amount::Amount::new(0), // TODO: update if we want to sim transactions
             );
 
@@ -615,7 +617,7 @@ impl BlockGen {
         })
     }
 
-    pub fn next_block(&mut self, miner_address: &Address) -> Arc<zebra_chain::block::Block> {
+    pub fn next_block(&mut self, miner_addr: &Address) -> Arc<zebra_chain::block::Block> {
         // NOTE: it's not completely obvious where this should be done. Having it here allows for
         // tip modification by the user, but means that the history_tree is never visibly
         // up-to-date.
@@ -636,7 +638,7 @@ impl BlockGen {
             CompactDifficulty::from_bytes_in_display_order(&[0x20, 0x0f, 0x0f, 0x0f]).unwrap();
         self.tip = BlockGen::create_block(
             &self.network,
-            miner_address,
+            miner_addr,
             height,
             hash,
             time,
@@ -654,18 +656,18 @@ fn crosslink_gen_pow_fork() {
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
-    let miner_address = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_address);
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
     tf.push_instr_load_pow(&gen.tip, 0);
 
     for _ in 2..4 {
-        tf.push_instr_load_pow(&gen.next_block(&miner_address), 0);
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
     }
     let mut genb = gen.clone();
 
     for _ in 4..7 {
-        tf.push_instr_load_pow(&gen.next_block(&miner_address), 0);
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
     }
     tf.push_instr_expect_pow_chain_length(7, 0);
 
@@ -744,13 +746,13 @@ fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
-    let miner_address = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_address);
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
 
     let mut pow_common = vec![gen.tip.clone()];
     for _ in 2..4 {
-        pow_common.push(gen.next_block(&miner_address));
+        pow_common.push(gen.next_block(&miner_addr));
     }
     for block in &pow_common {
         tf.push_instr_load_pow(block, 0);
@@ -762,7 +764,7 @@ fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
     tf.push_instr_load_pos(&bft, 0);
 
     for _ in 4..7 {
-        tf.push_instr_load_pow(&gen.next_block(&miner_address), 0);
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
         // push bft pointer
     }
     tf.push_instr_expect_pow_chain_length(7, 0);
@@ -799,9 +801,9 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     // tf.push_instr_expect_roster_includes(pub_key, 42000, SHOULD_FAIL);
 
     let network = Network::new_regtest(Default::default());
-    let miner_address = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_address);
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
 
     gen.tip = Arc::new(Block {
         header: Arc::new(BlockHeader {
@@ -813,7 +815,7 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     let mut pow_common = vec![gen.tip.clone()];
     for _ in 2..4 {
         // TODO: push a staking action
-        pow_common.push(gen.next_block(&miner_address));
+        pow_common.push(gen.next_block(&miner_addr));
     }
     for block in &pow_common[0..3] {
         tf.push_instr_load_pow(block, 0);
