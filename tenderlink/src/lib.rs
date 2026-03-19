@@ -1423,12 +1423,13 @@ impl SliceWrite for u16  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..
 impl SliceWrite for u8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] = *self;                                      1 } }
 impl SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..self.len()].copy_from_slice(self);   self.len() } }
 
-use bandwidth_test::IdentityKeyPair;
-use bandwidth_test::fmt_byte_str;
-use bandwidth_test::fmt_byte_str_rev;
-use bandwidth_test::fmt_prefixed_byte_str;
-use bandwidth_test::fmt_prefixed_byte_str_rev;
-use bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+pub use bandwidth_test::IdentityKeyPair;
+pub use bandwidth_test::STPAddress;
+pub use bandwidth_test::fmt_byte_str;
+pub use bandwidth_test::fmt_byte_str_rev;
+pub use bandwidth_test::fmt_prefixed_byte_str;
+pub use bandwidth_test::fmt_prefixed_byte_str_rev;
+pub use bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub struct SecureUdpEndpoint {
