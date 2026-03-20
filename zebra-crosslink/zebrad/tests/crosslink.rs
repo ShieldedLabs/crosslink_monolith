@@ -517,13 +517,63 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     ));
 }
 
-// failing
+// NOTE: this behaviour appears to differ from Daira-Emma's expectations
 #[test]
 fn crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists() {
     set_test_name(function_name!());
-    test_path(PathBuf::from(
-        "../crosslink-test-data/wrong_branch_test2_long_short_pos.zeccltf",
-    ));
+    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut pow = vec![gen.tip.clone()];
+    tf.push_instr_load_pow(&gen.tip, 0);
+
+    for _ in 2..8 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+
+    for i in 0..3 {
+        let bft = next_pos(pos_h, fat_ptr, &pow[i..i+3], &[]);
+        tf.push_instr_load_pos(&bft, 0);
+    }
+
+    for _ in 8..10 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+    let mut genb = gen.clone(); // fork
+
+    for _ in 10..19 {
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+    }
+    tf.push_instr_expect_pow_chain_length(19, 0);
+
+    // small sidechain
+    let miner_addr2 = zcash_keys::address::Address::Tex([1; 20]);
+    for _ in 10..13 {
+        pow.push(genb.next_block(&miner_addr2));
+        tf.push_instr_load_pow(&genb.tip, 0);
+    }
+    // small sidechain currently ignored
+    tf.push_instr_expect_pow_chain_length(19, 0);
+
+    // finalize the small sidechain
+    let bft = next_pos(pos_h, fat_ptr, &pow[9..12], &[]);
+    tf.push_instr_load_pos(&bft, 0);
+
+    tf.push_instr_expect_pow_chain_length(13, 0);
+
+    tf.push_instr_load_pow(&gen.next_block(&miner_addr), SHOULD_FAIL);
+    tf.push_instr_expect_pow_chain_length(13, 0);
+
+    tf.push_instr_load_pow(&genb.next_block(&miner_addr2), 0);
+    tf.push_instr_expect_pow_chain_length(14, 0);
+
+    test_bytes(tf.write_to_bytes());
 }
 
 // NOTE: this is very similar to the RPC get_block_template code
@@ -698,9 +748,9 @@ fn crosslink_gen_pow_fork() {
     }
     tf.push_instr_expect_pow_chain_length(7, 0);
 
-    let miner_address2 = zcash_keys::address::Address::Tex([1; 20]);
+    let miner_addr2 = zcash_keys::address::Address::Tex([1; 20]);
     for _ in 4..8 {
-        tf.push_instr_load_pow(&genb.next_block(&miner_address2), 0);
+        tf.push_instr_load_pow(&genb.next_block(&miner_addr2), 0);
     }
     tf.push_instr_expect_pow_chain_length(8, 0);
 
