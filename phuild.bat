@@ -8,12 +8,11 @@ set "SOURCE_DATE_EPOCH=0"
 
 set "project=%1"
 
-if "%project%"=="" (
-    echo No project specified!
-    exit /b 1
-)
+if "%project%"=="" ( echo No project specified! && exit /b 1 )
+if "%project%"=="Debug" ( echo No project specified! && exit /b 1 )
+if "%project%"=="Release" ( echo No project specified! && exit /b 1 )
 
-set "config=%1"
+set "config=%2"
 set "flags=-j 5"
 
 if "%config%"=="Release" (
