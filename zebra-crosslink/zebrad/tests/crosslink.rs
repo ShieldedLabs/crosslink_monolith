@@ -380,18 +380,34 @@ fn crosslink_test_basic_finality() {
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    let hashes = regtest_block_hashes();
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
 
-    for i2 in 0..REGTEST_BLOCK_BYTES.len() {
-        tf.push_instr_expect_pow_block_finality(&hashes[i2], None, 0);
+    let miner_addr2 = zcash_keys::address::Address::Tex([1; 20]);
+    let n = 18; // TODO: this fails with higher numbers due to block verification
+    let mut pow = vec![gen.tip.clone()];
+    let mut side: Vec<Arc<Block>> = vec![];
+    let mut genb = gen.clone();
+    for i2 in 1..n+1 {
+        if i2 == 2 {
+            pow.push(genb.next_block(&miner_addr2));
+        } else {
+            pow.push(gen.next_block(&miner_addr));
+        }
+        genb = gen.clone()
     }
 
-    // let hashes = Vec::with_capacity(REGTEST_BLOCK_BYTES.len());
-    for i in 0..REGTEST_BLOCK_BYTES.len() {
-        // hashes.push()
-        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
+    for i2 in 0..n {
+        tf.push_instr_expect_pow_block_finality(&pow[i2].hash(), None, 0);
+    }
 
-        for i2 in 0..REGTEST_BLOCK_BYTES.len() {
+    for i in 0..n {
+        tf.push_instr_load_pow(&pow[i], 0);
+
+        for i2 in 0..n {
             let finality = if i2 > i {
                 None
             } else if i2 == 3 && i == 3 {
@@ -401,14 +417,16 @@ fn crosslink_test_basic_finality() {
             } else {
                 Some(TFLBlockFinality::NotYetFinalized)
             };
-            tf.push_instr_expect_pow_block_finality(&hashes[i2], finality, 0);
+            tf.push_instr_expect_pow_block_finality(&pow[i2].hash(), finality, 0);
         }
     }
 
-    for i in 0..REGTEST_POS_BLOCK_BYTES.len() {
-        tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[i], 0);
+    const LINKS: &[usize] = &[1, 4, 6, 10, 13, 16];//, 18];
+    for i in 0..LINKS.len() {
+        let bft = next_pos(pos_h, fat_ptr, &pow[LINKS[i]..LINKS[i]+3], &[]);
+        tf.push_instr_load_pos(&bft, 0);
 
-        for i2 in 0..REGTEST_BLOCK_BYTES.len() {
+        for i2 in 0..n {
             let finality = if i2 == 2 {
                 // unpicked sidechain
                 if i < 1 {
@@ -417,12 +435,12 @@ fn crosslink_test_basic_finality() {
                     // Some(TFLBlockFinality::CantBeFinalized)
                     None
                 }
-            } else if i2 <= REGTEST_POW_IDX_FINALIZED_BY_POS_BLOCK[i] {
+            } else if i2 <= LINKS[i] {
                 Some(TFLBlockFinality::Finalized)
             } else {
                 Some(TFLBlockFinality::NotYetFinalized)
             };
-            tf.push_instr_expect_pow_block_finality(&hashes[i2], finality, 0);
+            tf.push_instr_expect_pow_block_finality(&pow[i2].hash(), finality, 0);
         }
     }
 
