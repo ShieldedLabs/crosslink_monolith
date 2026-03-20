@@ -14,7 +14,7 @@
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{dd83dc11-00be-441f-ab8b-1b1ab09c13bb}</ProjectGuid>
-    <RootNamespace>zebra_crosslink</RootNamespace>
+    <RootNamespace>zebra-crosslink</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
