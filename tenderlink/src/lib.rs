@@ -41,6 +41,9 @@ const PATH_MTU: usize = ETHERNET_FRAME_SIZE - MAX_PATH_HEADERS_SIZE;
 const MAX_BANDWIDTH_BYTES_PER_SECOND: usize = 1_000_000;
 
 
+pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+
+
 use static_assertions::{const_assert};
 use std::{hash::DefaultHasher, io::{Cursor, Read}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, sync::{Arc, Mutex}};
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -374,13 +377,13 @@ pub enum TMStatusReason {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub struct ValueId(pub [u8; 32]);
 impl ValueId { pub const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
 impl std::fmt::Debug   for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "VId{", &self.0)?; write!(f, "}}") } }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PubKeyID(pub [u8; 32]);
 impl PubKeyID { const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str_rev(f, &self.0) } }
@@ -1429,6 +1432,7 @@ pub use crate::bandwidth_test::fmt_byte_str;
 pub use crate::bandwidth_test::fmt_byte_str_rev;
 pub use crate::bandwidth_test::fmt_prefixed_byte_str;
 pub use crate::bandwidth_test::fmt_prefixed_byte_str_rev;
+pub use crate::bandwidth_test::new_keypair_from_connect_magic1_with_seed;
 pub use crate::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -1440,6 +1444,14 @@ pub struct SecureUdpEndpoint {
 impl Default for SecureUdpEndpoint {
     fn default() -> SecureUdpEndpoint {
         SecureUdpEndpoint { public_key: [0_u8; 32], ip_address: [0_u8; 16], port: 0 }
+    }
+}
+
+impl std::fmt::Debug for SecureUdpEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt_prefixed_byte_str(f, "SecureUdpEndpoint { public_key: \"", &self.public_key)?;
+        fmt_prefixed_byte_str(f, "\", ip_address: \"",                 &self.ip_address)?;
+        write!(f, "\", port: {:05} }}", self.port)
     }
 }
 
@@ -1486,47 +1498,10 @@ impl STPAddress {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct EndpointEvidence {
-    pub endpoint: SecureUdpEndpoint,
-    pub root_public_bft_key: [u8; 32],
-}
-impl Default for EndpointEvidence {
-    fn default() -> EndpointEvidence {
-        EndpointEvidence { endpoint: SecureUdpEndpoint::default(), root_public_bft_key: [0_u8; 32] }
-    }
-}
-impl EndpointEvidence {
-    pub fn write_to(&self, buf: &mut [u8]) -> usize {
-        let mut o = 0;
-        o += self.endpoint       .write_to(&mut buf[o..]);
-        o += self.root_public_bft_key.write_to(&mut buf[o..]);
-        o
-    }
-
-    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
-        let endpoint = SecureUdpEndpoint::read_from(&mut r)?;
-        let mut key_bytes = [0_u8; 32];
-        r.read_exact(&mut key_bytes)?;
-        Ok(EndpointEvidence { endpoint, root_public_bft_key: key_bytes })
-    }
-}
-
-impl std::fmt::Debug for EndpointEvidence {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EndpointEvidence {{ endpoint: ")?;
-        self.endpoint.fmt(f)?;
-        fmt_prefixed_byte_str(f, ", root_public_bft_key: \"", &self.root_public_bft_key)?;
-        write!(f, "\" }}")
-    }
-}
-
-impl std::fmt::Debug for SecureUdpEndpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fmt_prefixed_byte_str(f, "SecureUdpEndpoint { public_key: \"", &self.public_key)?;
-        fmt_prefixed_byte_str(f, "\", ip_address: \"",                 &self.ip_address)?;
-        write!(f, "\", port: {:05} }}", self.port)
-    }
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FinalizerPeerAddress {
+    pub bft_pk: PubKeyID,
+    pub address: STPAddress,
 }
 
 // returns true if a is initiator
@@ -1612,10 +1587,10 @@ pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize
 
 async fn instance(
     my_root_private_key: SigningKey,
-    my_static_keypair: Option<IdentityKeyPair>,
-    my_endpoint: Option<SecureUdpEndpoint>,
+    my_stp_keypair: Option<IdentityKeyPair>,
+    my_endpoint: Option<STPAddress>,
     roster: Vec<SortedRosterMember>,
-    roster_endpoint_evidence: Vec<EndpointEvidence>,
+    finalizer_peer_addresses: Vec<FinalizerPeerAddress>,
     maybe_seed: Option<u128>,
 ) -> std::io::Result<()> {
     let block_rng = Arc::new(Mutex::new({
@@ -1634,7 +1609,7 @@ async fn instance(
     let roster2 = roster.clone();
     let pub_key = PubKeyID(VerificationKeyBytes::from(&my_root_private_key.clone()).into());
 
-    entry_point(my_root_private_key, my_static_keypair, my_endpoint, roster, roster_endpoint_evidence, maybe_seed,
+    entry_point(my_root_private_key, my_stp_keypair, my_endpoint, roster, finalizer_peer_addresses, maybe_seed,
         ClosureToProposeNewBlock(Arc::new(move || {
             let block_rng = Arc::clone(&block_rng);
             Box::pin(async move {
@@ -1697,11 +1672,50 @@ async fn instance(
     ).await
 }
 
+/// Parses "IP[:port]" (IPv4 or bracketed IPv6 with port) into (16-byte IPv6, port)
+pub fn parse_to_ipv6_bytes(s: &str) -> Result<(Ipv6Addr, u16), std::net::AddrParseError> {
+    let sa: SocketAddr = s.parse()?;
+
+    let (ip6, port) = match sa {
+        SocketAddr::V4(v4) => {
+            // Map IPv4 to IPv6-mapped ::ffff:a.b.c.d
+            (v4.ip().to_ipv6_mapped(), v4.port())
+            // (Alternatively on newer Rust: (v4.ip().to_ipv6_mapped(), v4.port()))
+        }
+        SocketAddr::V6(v6) => (*v6.ip(), v6.port()),
+    };
+
+    Ok((ip6.octets().into(), port))
+}
+
+use std::hash::Hasher;
+pub fn addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, STPAddress) {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(addr.as_bytes());
+    let seed = hasher.finish();
+
+    let mut other_seed = [0; 32];
+    rand_chacha::ChaCha20Rng::seed_from_u64(seed).fill(&mut other_seed);
+    let static_keypair = new_keypair_from_connect_magic1_with_seed(CRYPTO_MAGIC, other_seed).unwrap();
+
+    let (ip, port) = parse_to_ipv6_bytes(addr).unwrap();
+    (
+        static_keypair.clone(),
+        STPAddress {
+            ip,
+            port,
+            magic1: CRYPTO_MAGIC,
+            key: static_keypair.clone().public.try_into().unwrap(),
+        },
+    )
+}
+
+
 pub async fn entry_point(my_root_private_key: SigningKey,
-                         my_static_keypair: Option<IdentityKeyPair>,
-                         my_endpoint: Option<SecureUdpEndpoint>,
-                         mut roster: Vec<SortedRosterMember>,
-                         mut roster_endpoint_evidence: Vec<EndpointEvidence>,
+                         my_stp_keypair: Option<IdentityKeyPair>,
+                         my_endpoint: Option<STPAddress>,
+                         roster: Vec<SortedRosterMember>,
+                         finalizer_peer_addresses: Vec<FinalizerPeerAddress>,
                          maybe_seed: Option<u128>,
                          propose_closure: ClosureToProposeNewBlock,
                          validate_closure: ClosureToValidateProposedBlock,
@@ -1715,6 +1729,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          ingest_startup_data: Vec<RoundData>,
                         ) -> std::io::Result<()> {
     hook_fail_on_panic();
+
+    let mut roster = roster.clone();
 
     let mut base_rng = {
         let seed : u128 = maybe_seed.unwrap_or_else(|| {
@@ -1733,12 +1749,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         println!("\"");
     }
 
-    let my_static_keypair = my_static_keypair.unwrap_or(new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap());
+    let my_stp_keypair = my_stp_keypair.unwrap_or(new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap());
 
     use crate::bandwidth_test::*;
     use crate::native_sockets::*;
 
-    let sock = 
+    let sock =
     {
         use socket2::{Domain, Protocol, Socket, Type};
         let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
@@ -1756,7 +1772,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
 
-    let my_keypairs = vec![&my_static_keypair];
+    let my_keypairs = vec![&my_stp_keypair];
 
     let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
     let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
@@ -1769,9 +1785,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut peers : Vec<Peer> = roster.iter().filter(|m| m.pub_key.0 != my_root_public_bft_key.as_ref())
         .map(|m| Peer { root_public_bft_key: m.pub_key.0, ..Peer::default() }).collect();
 
-    for evidence in &roster_endpoint_evidence {
-        if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == evidence.root_public_bft_key) {
-            peers[i].endpoint = Some(evidence.endpoint);
+    for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
+        if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == bft_pk.0) {
+            peers[i].endpoint = Some(SecureUdpEndpoint {
+                public_key: address.key.clone().try_into().expect("wrong crypto scheme"),
+                ip_address: address.ip.octets().into(),
+                port: address.port,
+            });
         }
     }
     if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>()); }
@@ -1796,12 +1816,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     bft_state.recent_commit_round_cache = ingest_startup_data;
 
     bft_state.start_round(&roster, Instant::now(), 0).await;
-
-    let mut my_endpoint_evidence = if let Some(i) = roster_endpoint_evidence.iter().position(|e| &e.root_public_bft_key == my_root_public_bft_key.as_ref()) {
-        Some(roster_endpoint_evidence[i])
-    } else {
-        my_endpoint.map(|endpoint| EndpointEvidence { endpoint, root_public_bft_key: my_root_public_bft_key.into() })
-    };
 
     const ONE_SECOND: tokio::time::Duration = tokio::time::Duration::from_secs(1);
     let mut net_stats_window_start = tokio::time::Instant::now();
@@ -2084,7 +2098,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     if let Some(peer_endpoint) = peer.endpoint {
                         if peer.snow_state.is_none() && peer.outgoing_handshake_state.is_none() && peer.pending_client_ack_snow_state.is_none() {
                             let mut outgoing_state: snow::HandshakeState = snow::Builder::new(noise_params.clone())
-                                .local_private_key(&my_static_keypair.private).unwrap()
+                                .local_private_key(&my_stp_keypair.private).unwrap()
                                 .remote_public_key(&peer_endpoint.public_key).unwrap()
                                 .build_initiator().unwrap();
                             peer.transport = PeerTransport::default();
@@ -2106,50 +2120,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 // Note(Sam): I am going to emulate the future production p2p network by always adding the two ShieldedLabs servers as known validator peers with zero voting power if they are not
                 // already in the roster.
-
-
-fn parse_to_ipv6_bytes(s: &str) -> Result<([u8; 16], u16), std::net::AddrParseError> {
-    let sa: SocketAddr = s.parse()?;
-
-    let (ip6, port) = match sa {
-        SocketAddr::V4(v4) => {
-            // Map IPv4 to IPv6-mapped ::ffff:a.b.c.d
-            (v4.ip().to_ipv6_mapped(), v4.port())
-            // (Alternatively on newer Rust: (v4.ip().to_ipv6_mapped(), v4.port()))
-        }
-        SocketAddr::V6(v6) => (*v6.ip(), v6.port()),
-    };
-
-    Ok((ip6.octets(), port))
-}
-fn goofy_addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, SecureUdpEndpoint) {
-    use std::hash::Hasher;
-    let mut hasher = DefaultHasher::new();
-    hasher.write(addr.as_bytes());
-    let seed = hasher.finish();
-
-    let kp = snow::Builder::with_resolver(
-        "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap(),
-        Box::new(SnowRngResolver::seed_from_u64(seed)),
-    )
-    .generate_keypair()
-    .unwrap();
-    let static_keypair = IdentityKeyPair {
-        magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s,
-        private: kp.private.try_into().unwrap(),
-        public: kp.public.try_into().unwrap(),
-    };
-    let (ip, port) = parse_to_ipv6_bytes(addr).unwrap();
-    (
-        static_keypair.clone(),
-        SecureUdpEndpoint {
-            public_key: static_keypair.public.clone().try_into().unwrap(),
-            ip_address: ip,
-            port,
-        },
-    )
-}
-
                 let server_a_pub_key = {
                     let mut bytes = [0u8; 32];
 
@@ -2163,10 +2133,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, SecureUdpEndpoint
                 };
 
                 if peers.iter().position(|p| p.root_public_bft_key == server_a_pub_key).is_none() && server_a_pub_key != my_root_private_key.as_ref() {
-                    let (a, b) = goofy_addr_string_to_stuff("45.76.30.90:8234");
-                    let evidence = EndpointEvidence { endpoint: b, root_public_bft_key: server_a_pub_key };
-                    // roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
-                    // roster_endpoint_evidence.push(evidence);
+                    let (a, b) = addr_string_to_stuff("45.76.30.90:8234");
                     // peers.push(Peer { root_public_bft_key: server_a_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
                 }
 
@@ -2183,10 +2150,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, SecureUdpEndpoint
                 };
 
                 if peers.iter().position(|p| p.root_public_bft_key == server_b_pub_key).is_none() && server_b_pub_key != my_root_private_key.as_ref() {
-                    let (a, b) = goofy_addr_string_to_stuff("70.34.201.202:8234");
-                    let evidence = EndpointEvidence { endpoint: b, root_public_bft_key: server_b_pub_key };
-                    // roster_endpoint_evidence.retain(|e| e.root_public_bft_key != evidence.root_public_bft_key);
-                    // roster_endpoint_evidence.push(evidence);
+                    let (a, b) = addr_string_to_stuff("70.34.201.202:8234");
                     // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
                 }
 
@@ -2575,16 +2539,10 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, SecureUdpEndpoint
                         } else if packet_type == PACKET_TYPE_SERVER_UNKNOWN_HELLO && local_msg.len() == 18 {
                             let my_apparent_ip       = &local_msg[  ..16];
                             let my_apparent_port     = &local_msg[16..18];
-                            let my_apparent_endpoint = SecureUdpEndpoint { ip_address: my_apparent_ip.try_into().unwrap(), port: u16::from_le_bytes(my_apparent_port.try_into().unwrap()), public_key: my_static_keypair.public.clone().try_into().unwrap() };
+                            let my_apparent_endpoint = SecureUdpEndpoint { ip_address: my_apparent_ip.try_into().unwrap(), port: u16::from_le_bytes(my_apparent_port.try_into().unwrap()), public_key: my_stp_keypair.public.clone().try_into().unwrap() };
                             // TODO hash
                             if let Ok(snow_state) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                 if PRINT_PROTOCOL { println!("{:05}: Finished outgoing unknown handshake and got nonce {} with {}, I am percieved as {:?}", my_port, nonce, addr, my_apparent_endpoint); }
-
-                                if my_endpoint_evidence.is_none() {
-                                    let evidence = EndpointEvidence { endpoint: my_apparent_endpoint, root_public_bft_key: my_root_public_bft_key.into() };
-                                    if PRINT_PROTOCOL { println!("{:05}: I am locking in the endpoint evidence {:?}", my_port, evidence); }
-                                    my_endpoint_evidence = Some(evidence);
-                                }
 
                                 finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, peer_endpoint, peer, snow_state, nonce, ConnectionKnowledge::Unknown, &mut net_stats);
                             }
@@ -2615,7 +2573,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, SecureUdpEndpoint
                     }
                 }
                 let mut incoming_state: snow::HandshakeState = snow::Builder::new(noise_params.clone())
-                    .local_private_key(&my_static_keypair.private).unwrap()
+                    .local_private_key(&my_stp_keypair.private).unwrap()
                     .build_responder().unwrap();
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
                     let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
@@ -2699,7 +2657,7 @@ fn goofy_addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, SecureUdpEndpoint
                     }
                 }
                 let mut incoming_state: snow::HandshakeState = snow::Builder::new(noise_params.clone())
-                    .local_private_key(&my_static_keypair.private).unwrap()
+                    .local_private_key(&my_stp_keypair.private).unwrap()
                     .build_responder().unwrap();
                 if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
                     let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
@@ -3363,67 +3321,61 @@ pub fn run_instances(i: usize) {
     const N: usize = 4;
 
     let mut crypto_rng = ChaCha20Rng::seed_from_u64(seed);
-    let static_private_keys : Vec<_> = (0..N).map(|_| {
+    let bft_kps : Vec<_> = (0..N).map(|_| {
         // NOTE: doing this manually to avoid CryptoRng incompatibilities between different rand_core versions
         let mut secret_key = [0u8; 32];
         crypto_rng.fill_bytes(&mut secret_key);
         SigningKey::from(secret_key)
     }).collect();
+    let bft_pks : Vec<_> = bft_kps.iter().map(|sk| PubKeyID(sk.verification_key().into())).collect();
     let mut cumulative_stake = 0;
-    let roster : Vec<SortedRosterMember> = static_private_keys.iter().enumerate().map(|(i, sk)| {
+    let roster : Vec<SortedRosterMember> = bft_pks.iter().enumerate().map(|(i, pk)| {
         let stake = 2000 * (N - 1 - i) as u64;
         cumulative_stake += stake;
-        SortedRosterMember { pub_key: PubKeyID(sk.verification_key().into()), stake, cumulative_stake }
+        SortedRosterMember { pub_key: *pk, stake, cumulative_stake }
     }).collect();
     assert!(roster.is_sorted_by(|a,b| a.stake >= b.stake)); // descending
 
     if PRINT_ROSTER { println!("Roster: {:?}", roster); }
 
-    let static_keypair_zero = {
-        let kp = snow::Builder::with_resolver("Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap(), Box::new(SnowRngResolver { rng: RustIsBadRngWrapper(crypto_rng.clone()) })).generate_keypair().unwrap();
-        IdentityKeyPair { magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, private: kp.private.try_into().unwrap(), public: kp.public.try_into().unwrap(), }
+    let stp_key_zero = {
+        let mut seed = [0u8; 32];
+        crypto_rng.fill_bytes(&mut seed);
+        new_keypair_from_connect_magic1_with_seed(CRYPTO_MAGIC, seed).unwrap()
     };
 
-    let endpoint_zero : SecureUdpEndpoint = {
+    let endpoint_zero = {
         let port : u16 = 3030;
         // let ip = "::1".parse::<std::net::Ipv6Addr>().unwrap();
         let ip = "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap().to_ipv6_mapped();
-        SecureUdpEndpoint { ip_address: ip.octets(), port, public_key: static_keypair_zero.public.clone().try_into().unwrap() }
+        STPAddress::from(ip, port, &stp_key_zero)
     };
 
-    let evidence_zero = {
-        EndpointEvidence { endpoint: endpoint_zero, root_public_bft_key: static_private_keys[0].verification_key().into() }
-    };
+    let finalizer_peer_addresses = vec![FinalizerPeerAddress { bft_pk: PubKeyID(bft_kps[0].verification_key().into()), address: endpoint_zero.clone() }];
 
     if i == usize::MAX {
         // let _joins: [; N];
-        for j in 0..N {
-            if j == 0 {
-                rt.spawn(instance(static_private_keys[j], Some(static_keypair_zero.clone()), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
-            } else {
-                rt.spawn(instance(static_private_keys[j], None, None, roster.clone(), vec![evidence_zero], None));
-            }
+        rt.spawn(instance(bft_kps[0], Some(stp_key_zero), Some(endpoint_zero), roster.clone(), finalizer_peer_addresses.clone(), None));
+        for j in 1..N {
+            rt.spawn(instance(bft_kps[j], None, None, roster.clone(), finalizer_peer_addresses.clone(), None));
         }
     } else if i == 999 {
         // let _joins: [; N];
-        for j in 0..N - 1 {
-            if j == 0 {
-                rt.spawn(instance(static_private_keys[j], Some(static_keypair_zero.clone()), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
-            } else {
-                rt.spawn(instance(static_private_keys[j], None, None, roster.clone(), vec![evidence_zero], None));
-            }
+        rt.spawn(instance(bft_kps[0], Some(stp_key_zero), Some(endpoint_zero), roster.clone(), finalizer_peer_addresses.clone(), None));
+        for j in 1..N - 1 {
+            rt.spawn(instance(bft_kps[j], None, None, roster.clone(), finalizer_peer_addresses.clone(), None));
         }
     } else {
         if i == 0 {
-            rt.spawn(instance(static_private_keys[i], Some(static_keypair_zero), Some(endpoint_zero), roster.clone(), vec![evidence_zero], None));
+            rt.spawn(instance(bft_kps[i], Some(stp_key_zero), Some(endpoint_zero), roster.clone(), finalizer_peer_addresses.clone(), None));
         }
         else if i < N {
-            rt.spawn(instance(static_private_keys[i], None, None, roster.clone(), vec![evidence_zero], None));
+            rt.spawn(instance(bft_kps[i], None, None, roster.clone(), finalizer_peer_addresses.clone(), None));
         }
         else {
             let mut secret_key = [0u8; 32];
             crypto_rng.fill_bytes(&mut secret_key);
-            rt.spawn(instance(SigningKey::from(secret_key), None, None, roster.clone(), vec![evidence_zero], None));
+            rt.spawn(instance(SigningKey::from(secret_key), None, None, roster.clone(), finalizer_peer_addresses.clone(), None));
         }
     }
     rt.block_on(std::future::pending::<()>())
