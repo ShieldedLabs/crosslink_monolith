@@ -455,56 +455,66 @@ fn reject_pos_block_with_lt_sigma_headers() {
     tf.push_instr_expect_pos_chain_length(0, 0);
 }
 
-// failing
 #[test]
 fn crosslink_test_pow_to_pos_link() {
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[0], 0);
-    tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[1], 0);
-    tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[2], 0);
-    tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[3], 0);
-    tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[4], 0);
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut pow = vec![gen.tip.clone()];
+    tf.push_instr_load_pow(&gen.tip, 0);
 
-    // TODO: maybe have push_instr return data?
-    tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[0], 0);
-    let pos_0 = BftBlockAndFatPointerToIt::zcash_deserialize(REGTEST_POS_BLOCK_BYTES[0]).unwrap();
-    let pos_0_fat_ptr = zebra_chain::block::FatPointerToBftBlock {
-        vote_for_block_without_finalizer_public_key: pos_0
+    for _ in 2..5 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+
+    // TODO: push
+
+    let bft = next_pos(pos_h, fat_ptr, &pow[1..4], &[]);
+    tf.push_instr_load_pos(&bft, 0);
+
+    let fat_pointer_to_bft_block = zebra_chain::block::FatPointerToBftBlock {
+        vote_for_block_without_finalizer_public_key: bft
             .fat_ptr
             .vote_for_block_without_finalizer_public_key,
-        signatures: pos_0
-            .fat_ptr
-            .signatures
-            .iter()
-            .map(|sig| zebra_chain::block::FatPointerSignature {
-                public_key: sig.public_key,
-                vote_signature: sig.vote_signature,
-            })
-            .collect(),
+            signatures: bft
+                .fat_ptr
+                .signatures
+                .iter()
+                .map(|sig| zebra_chain::block::FatPointerSignature {
+                    public_key: sig.public_key,
+                    vote_signature: sig.vote_signature,
+                })
+        .collect(),
     };
 
-    let mut pow_5 = Block::zcash_deserialize(REGTEST_BLOCK_BYTES[5]).unwrap();
-    pow_5.header = Arc::new(BlockHeader {
-        version: 5,
-        fat_pointer_to_bft_block: pos_0_fat_ptr.clone(),
-        ..*pow_5.header
+    pow.push(gen.next_block(&miner_addr));
+    gen.tip = Arc::new(Block {
+        header: Arc::new(BlockHeader {
+            version: 5,
+            fat_pointer_to_bft_block: fat_pointer_to_bft_block.clone(),
+            ..*gen.tip.header
+        }),
+        ..gen.tip.as_ref().clone()
     });
-    // let pow_5_hash = pow_5.hash();
-    tf.push_instr_load_pow(&pow_5, 0);
+    tf.push_instr_load_pow(&gen.tip, 0);
 
-    // let mut pow_6 = Block::zcash_deserialize(REGTEST_BLOCK_BYTES[6]).unwrap();
-    // pow_6.header = Arc::new(BlockHeader {
-    //     version: 5,
-    //     fat_pointer_to_bft_block: pos_0_fat_ptr.clone(),
-    //     previous_block_hash: pow_5_hash,
-    //     ..*pow_6.header
-    // });
-    // // let pow5_hash = pow_5.hash();
-    // tf.push_instr_load_pow(&pow_6, 0);
+    pow.push(gen.next_block(&miner_addr));
+    gen.tip = Arc::new(Block {
+        header: Arc::new(BlockHeader {
+            version: 5,
+            fat_pointer_to_bft_block,
+            ..*gen.tip.header
+        }),
+        ..gen.tip.as_ref().clone()
+    });
+    tf.push_instr_load_pow(&gen.tip, 0);
 
-    // tf.write_to_file(&Path::new(&format!("{}.zeccltf", function_name!())));
     test_bytes(tf.write_to_bytes());
 }
 
