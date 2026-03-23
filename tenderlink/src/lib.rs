@@ -20,7 +20,6 @@ const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
 const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
-const PRINT_POWLINK:        bool = 1 == 1;
 
 
 // MTU discovery is an option, but for now we're adopting a very conservative and VPN-friendly fixed-value MTU.
@@ -190,37 +189,6 @@ pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftB
 impl std::fmt::Debug for ClosureToPushDecidedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushDecidedBlock(..)") }
 }
-#[derive(Clone)]
-pub struct ClosureToGetHistoricalBlock(pub Arc<dyn Fn(u64)-> core::pin::Pin<Box<dyn Future<Output = (BlockValue, FatPointerToBftBlock3)> + Send>> + Send + Sync + 'static>);
-impl std::fmt::Debug for ClosureToGetHistoricalBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToGetHistoricalBlock(..)") }
-}
-#[derive(Clone)]
-pub struct ClosureToGetPow(pub Arc<dyn Fn([u8; 32])-> core::pin::Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>> + Send + Sync + 'static>); // @Phillip
-impl std::fmt::Debug for ClosureToGetPow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToGetPow(..)") }
-}
-#[derive(Clone)]
-pub struct ClosureToParsePow(pub Arc<dyn Fn([u8; 32], Vec<u8>)-> core::pin::Pin<Box<dyn Future<Output =     Option<Arc<zebra_chain::block::Block>>     > + Send>> + Send + Sync + 'static>); // @Phillip
-impl std::fmt::Debug for ClosureToParsePow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToParsePow(..)") }
-}
-#[derive(Clone)]
-pub struct ClosureIsPoWInChain(pub Arc<dyn Fn([u8; 32])-> core::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>); // @Phillip
-impl std::fmt::Debug for ClosureIsPoWInChain {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureIsPoWInChain(..)") }
-}
-#[derive(Clone)]
-pub struct ClosureToPushPow(pub Arc<dyn Fn(Arc<zebra_chain::block::Block>)-> core::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>); // @Phillip
-impl std::fmt::Debug for ClosureToPushPow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushPow(..)") }
-}
-#[derive(Clone)]
-pub struct ClosureToUpdateRosterCmd(pub Arc<dyn Fn(Option<String>)-> core::pin::Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync + 'static>);
-impl std::fmt::Debug for ClosureToUpdateRosterCmd {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToUpdateRosterCmd(..)") }
-}
-
 #[derive(Clone)]
 pub struct ClosureToUpdatePeers(pub Arc<dyn Fn(Vec<PeerInfo>) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToUpdatePeers {
@@ -633,17 +601,8 @@ struct TMState {
     propose_closure: ClosureToProposeNewBlock,
     validate_closure: ClosureToValidateProposedBlock,
     push_block_closure: ClosureToPushDecidedBlock,
-    get_block_closure: ClosureToGetHistoricalBlock,
-
-    get_pow_closure: ClosureToGetPow,
-    parse_pow_closure: ClosureToParsePow,
-    is_pow_in_chain_closure: ClosureIsPoWInChain,
-    push_pow_closure: ClosureToPushPow,
 
     update_peers_cmd_closure: ClosureToUpdatePeers,
-
-    pow_submit_block_queue: Vec<Arc<zebra_chain::block::Block>>,
-    current_powlink: Option<(BlockHash, Powlink)>,
 }
 impl TMState {
     fn init(
@@ -651,11 +610,6 @@ impl TMState {
         propose_closure: ClosureToProposeNewBlock,
         validate_closure: ClosureToValidateProposedBlock,
         push_block_closure: ClosureToPushDecidedBlock,
-        get_block_closure: ClosureToGetHistoricalBlock,
-        get_pow_closure: ClosureToGetPow,
-        parse_pow_closure: ClosureToParsePow,
-        is_pow_in_chain_closure: ClosureIsPoWInChain,
-        push_pow_closure: ClosureToPushPow,
         update_peers_cmd_closure: ClosureToUpdatePeers,
     ) -> Self {
         Self {
@@ -675,15 +629,7 @@ impl TMState {
             propose_closure,
             validate_closure,
             push_block_closure,
-            get_block_closure,
-            get_pow_closure,
-            parse_pow_closure,
-            is_pow_in_chain_closure,
-            push_pow_closure,
             update_peers_cmd_closure,
-
-            pow_submit_block_queue: Vec::new(),
-            current_powlink: None,
         }
     }
 
@@ -1098,7 +1044,9 @@ impl TMState {
         format!("{:05}-{:?}-{:>8}.{:3}.{:3}.{:9}", self.my_port, self.my_pub_key, format!("{:?}", roster_i_from_pub_key(roster, self.my_pub_key)), self.height, self.round, format!("{:?}", self.step))
     }
     fn name_str_other(roster: &[SortedRosterMember], peer: &Peer) -> String {
-        format!("{:05}-{:?}-{:?}", peer.endpoint.unwrap_or_default().port, PubKeyID(peer.root_public_bft_key), roster_i_from_pub_key(roster, PubKeyID(peer.root_public_bft_key)))
+        let mut port = 0;
+        if let Some(endpoint) = &peer.endpoint { port = endpoint.port; }
+        format!("{:05}-{:?}-{:?}", port, PubKeyID(peer.root_public_bft_key), roster_i_from_pub_key(roster, PubKeyID(peer.root_public_bft_key)))
     }
 
     async fn bft_update(&mut self, roster: &mut Vec<SortedRosterMember>) {
@@ -1311,18 +1259,9 @@ impl TMState {
             {
                 match self.rounds_data[i].proposal_checked_validity.1 {
                     TMStatusReason::NeedsBlock { hash } => {
-                        if self.current_powlink.is_none() {
-                            self.current_powlink = Some((BlockHash(hash), Powlink::default()));
-                            self.pow_submit_block_queue.truncate(0);
-
-                            let len = self.pow_submit_block_queue.len() + 1;
-                            if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash); }
-                            if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
-                        }
+                        println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash);
                     },
                     _ => {
-                        self.current_powlink = None;
-                        self.pow_submit_block_queue.truncate(0);
                     }
                 }
             }
@@ -1362,7 +1301,7 @@ pub enum ConnectionKnowledge {
 #[derive(Debug)]
 pub struct Peer {
     pub root_public_bft_key: [u8; 32],
-    pub endpoint: Option<SecureUdpEndpoint>,
+    pub endpoint: Option<STPAddress>,
     pub outgoing_handshake_state: Option<snow::HandshakeState>,
     pub pending_client_ack_snow_state: Option<snow::StatelessTransportState>,
     pub pending_client_ack: bool,
@@ -1371,19 +1310,15 @@ pub struct Peer {
     pub transport: PeerTransport,
     pub connection_knowledge: ConnectionKnowledge,
     pub latest_status_request_height: Option<u64>,
-    pub latest_status_request_powlink: Option<(BlockHash, u16)>,
     pub latest_status: Option<PacketStatus>,
 }
 impl Peer {
     fn info(&self) -> PeerInfo {
-        let latest_status_request_powlink = self.latest_status_request_powlink.unwrap_or_default();
         return PeerInfo {
             connected: self.snow_state.is_some(),
             connection_knowledge: self.connection_knowledge,
             root_public_bft_key: Some(self.root_public_bft_key),
             latest_status_request_height: self.latest_status_request_height.unwrap_or_default(),
-            latest_status_request_powlink_hash: latest_status_request_powlink.0,
-            latest_status_request_powlink_id: latest_status_request_powlink.1,
         };
     }
 }
@@ -1401,7 +1336,6 @@ impl Default for Peer {
 
             connection_knowledge: ConnectionKnowledge::Known,
             latest_status_request_height: None,
-            latest_status_request_powlink: None,
             latest_status: None,
         }
     }
@@ -1413,8 +1347,6 @@ pub struct PeerInfo {
     pub connection_knowledge: ConnectionKnowledge,
     pub root_public_bft_key: Option<[u8; 32]>,
     pub latest_status_request_height: u64,
-    pub latest_status_request_powlink_hash: BlockHash,
-    pub latest_status_request_powlink_id: u16, // id?
 }
 
 // NOTE: buf can be open-ended
@@ -1435,42 +1367,6 @@ pub use crate::bandwidth_test::fmt_prefixed_byte_str_rev;
 pub use crate::bandwidth_test::new_keypair_from_connect_magic1_with_seed;
 pub use crate::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-pub struct SecureUdpEndpoint {
-    pub public_key: [u8; 32],
-    pub ip_address: [u8; 16],
-    pub port: u16,
-}
-impl Default for SecureUdpEndpoint {
-    fn default() -> SecureUdpEndpoint {
-        SecureUdpEndpoint { public_key: [0_u8; 32], ip_address: [0_u8; 16], port: 0 }
-    }
-}
-
-impl std::fmt::Debug for SecureUdpEndpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fmt_prefixed_byte_str(f, "SecureUdpEndpoint { public_key: \"", &self.public_key)?;
-        fmt_prefixed_byte_str(f, "\", ip_address: \"",                 &self.ip_address)?;
-        write!(f, "\", port: {:05} }}", self.port)
-    }
-}
-
-impl SecureUdpEndpoint {
-    fn write_to(&self, buf: &mut [u8]) -> usize {
-        self.public_key.write_to(&mut buf[..]);
-        self.ip_address.write_to(&mut buf[32..]);
-        self.port      .write_to(&mut buf[32+16..]);
-        32+16+2
-    }
-
-    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
-        let mut endpoint = SecureUdpEndpoint::default();
-        r.read_exact(&mut endpoint.public_key)?;
-        r.read_exact(&mut endpoint.ip_address)?;
-        endpoint.port = r.read_u16::<LittleEndian>()?;
-        Ok(endpoint)
-    }
-}
 
 pub const MAX_P2P_DISCOVERY_PUBKEY_SIZE: usize = 32;
 
@@ -1640,31 +1536,6 @@ async fn instance(
                 ret
             })
         })),
-        ClosureToGetHistoricalBlock(Arc::new(move |height| {
-            let decisions = Arc::clone(&decisions2);
-            Box::pin(async move {
-                decisions.lock().unwrap()[height as usize].clone()
-            })
-        })),
-        ClosureToGetPow(Arc::new(move |hash| { // @Phillip
-            Box::pin(async move {
-                None
-            })
-        })),
-        ClosureToParsePow(Arc::new(move |hash, bytes| { // @Phillip
-            Box::pin(async move {
-                None
-            })
-        })),
-        ClosureIsPoWInChain(Arc::new(move |block| { // @Phillip
-            Box::pin(async move {
-                true
-            })
-        })),
-        ClosureToPushPow(Arc::new(move |block| { // @Phillip
-            Box::pin(async move {
-            })
-        })),
         ClosureToUpdatePeers(Arc::new(move |_all_peers| { Box::pin(async move {
         })})),
 
@@ -1720,11 +1591,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          propose_closure: ClosureToProposeNewBlock,
                          validate_closure: ClosureToValidateProposedBlock,
                          push_block_closure: ClosureToPushDecidedBlock,
-                         get_block_closure: ClosureToGetHistoricalBlock,
-                         get_pow_closure: ClosureToGetPow,
-                         parse_pow_closure: ClosureToParsePow,
-                         is_pow_in_chain_closure: ClosureIsPoWInChain,
-                         push_pow_closure: ClosureToPushPow,
                          peer_cmd_closure: ClosureToUpdatePeers,
                          ingest_startup_data: Vec<RoundData>,
                         ) -> std::io::Result<()> {
@@ -1787,14 +1653,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
         if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == bft_pk.0) {
-            peers[i].endpoint = Some(SecureUdpEndpoint {
-                public_key: address.key.clone().try_into().expect("wrong crypto scheme"),
-                ip_address: address.ip.octets().into(),
-                port: address.port,
-            });
+            peers[i].endpoint = Some(address.clone());
         }
     }
-    if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>()); }
+    if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint.clone()).collect::<Vec<_>>()); }
 
     // TODO: only convert private to public in 1 location
     let mut bft_state = TMState::init(
@@ -1804,11 +1666,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         propose_closure,
         validate_closure,
         push_block_closure,
-        get_block_closure,
-        get_pow_closure,
-        parse_pow_closure,
-        is_pow_in_chain_closure,
-        push_pow_closure,
         peer_cmd_closure,
     ); // TODO: double-check this is the right key
 
@@ -1863,15 +1720,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     round: bft_state.round,
                     need_proposal_chunk_rngs: [[0, 0]],
                     need_vote_rngs: [[[0, active_roster_len(roster) as u16]]; 2],
-                    powlink_hash: BlockHash::NIL,
-                    powlink_chunk_i: 0,
                 };
-                if let Some((hash, powlink)) = &bft_state.current_powlink {
-                    if powlink.block.is_none() {
-                        status.powlink_hash = *hash;
-                        status.powlink_chunk_i = powlink.chunk_i;
-                    }
-                }
 
 
                 // TODO: scope down required ranges
@@ -1914,7 +1763,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
             o
         }
-        fn send_sock_msg(ctx_str: &str, transport: &mut PeerTransport, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, msg: &[u8], stats: &mut NetworkStats) {
+        fn send_sock_msg(ctx_str: &str, transport: &mut PeerTransport, sock: &tokio::net::UdpSocket, peer_endpoint: &STPAddress, msg: &[u8], stats: &mut NetworkStats) {
             // TODO(phil) move this code
             let bytes_in_flight = {
                 let mut bytes_in_flight = 0;
@@ -1953,7 +1802,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
 
             // println!("Packet: {} bytes", msg.len());
-            let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0));
+            let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip), peer_endpoint.port, 0, 0));
             match sock.try_send_to(msg, addr) {
                 Ok(_) => {
                     stats.packets_sent += 1;
@@ -1968,69 +1817,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 Err(error) => eprintln!("{} Socket error: {:?} sending to addr: {:?}", ctx_str, error, addr),
             }
         }
-        fn send_noise_msg(ctx_str: &str, transport: &mut PeerTransport, snow_state: &mut snow::StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, send_buf2: &mut [u8], msg: &[u8], stats: &mut NetworkStats) {
+        fn send_noise_msg(ctx_str: &str, transport: &mut PeerTransport, snow_state: &mut snow::StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: &STPAddress, send_buf2: &mut [u8], msg: &[u8], stats: &mut NetworkStats) {
             let mut o = 0;
             o += transport.nonce.write_to(                           &mut send_buf2[o..]);
             o += snow_state     .write_message(transport.nonce, msg, &mut send_buf2[o..]).unwrap();
             send_sock_msg(ctx_str, transport, sock, peer_endpoint, &send_buf2[..o], stats);
 
             transport.nonce += 1;
-        }
-
-        async fn powlink_peer(bft_state: &TMState, // @Phillip
-                              ctx_str: &str,
-                              stats: &mut NetworkStats,
-                              send_buf1: &mut [u8],
-                              send_buf2: &mut [u8],
-                              sock: &tokio::net::UdpSocket,
-                              peer_transport: &mut PeerTransport,
-                              peer_endpoint: SecureUdpEndpoint,
-                              peer_snow_state: &mut snow::StatelessTransportState,
-                              hash: BlockHash,
-                              chunk_needed_i: u16) -> std::io::Result<()> {
-            let chunk_needed_i = chunk_needed_i as usize;
-
-            if hash == BlockHash::NIL {
-                return Ok(());
-            }
-
-            let bytes = {
-                if let Some(bytes) = bft_state.get_pow_closure.0(hash.0).await {
-                    bytes
-                } else {
-                    return Ok(()); // @TODO: return error result i guess
-                }
-            };
-
-            // eprintln!("PowLink: PoW bytes obtained. Hash: {:?}", hash);
-
-            let chunks_n = powlink_chunks_n(bytes.len());
-            if chunk_needed_i >= chunks_n {
-                return Ok(()); // all bytes sent
-            }
-
-            let block_size = bytes.len().try_into().unwrap();
-            let bytes      = &bytes[..];
-
-            for chunk_i in chunk_needed_i..(chunk_needed_i + 2).min(chunks_n) {
-                let (chunk_o, chunk_size) = powlink_chunk_o_size(bytes.len(), chunk_i);
-                let chunk_i: u16          = chunk_i.try_into().unwrap();
-                let chunk                 = PacketPowlinkChunkHeader { hash, block_size, chunk_i };
-                let data                  = &bytes[chunk_o..chunk_o + chunk_size];
-
-                let header = PacketHeader::new::<PACKET_TYPE_POWLINK_CHUNK>(peer_transport.ack_latest, peer_transport.ack_field); // @TodoHeaderAndStatus
-
-                let mut o  = 0;
-                o += header.write_to(&mut send_buf1[o..]);
-                o += chunk .write_to(&mut send_buf1[o..]);
-                o += data  .write_to(&mut send_buf1[o..]);
-
-                if PRINT_POWLINK { eprintln!("{} PowLink: sending PoW block hash {:?} chunk {} to {:?}", ctx_str, hash, chunk_i, peer_endpoint); }
-                print_packet_tag_send(header);
-                send_noise_msg(&ctx_str, peer_transport, peer_snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
-            }
-
-            Ok(())
         }
 
         fn process_acks(transport: &mut PeerTransport, header: PacketHeader) {
@@ -2082,11 +1875,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         peer.snow_state                     = None;
                         peer.watch_dog                      = Instant::now();
                         peer.latest_status_request_height   = None;
-                        peer.latest_status_request_powlink  = None;
                         peer.latest_status                  = None;
                     }
 
-                    if let (Some(peer_endpoint), Some(snow_state)) = (peer.endpoint, &mut peer.snow_state) {
+                    if let (Some(peer_endpoint), Some(snow_state)) = (&peer.endpoint, &mut peer.snow_state) {
                         let header = PacketHeader::new::<PACKET_TYPE_EMPTY>(peer.transport.ack_latest, peer.transport.ack_field);
                         let mut o  = 0;
                         o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
@@ -2095,11 +1887,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     }
                 }
                 for peer in &mut peers {
-                    if let Some(peer_endpoint) = peer.endpoint {
+                    if let Some(peer_endpoint) = &peer.endpoint {
                         if peer.snow_state.is_none() && peer.outgoing_handshake_state.is_none() && peer.pending_client_ack_snow_state.is_none() {
                             let mut outgoing_state: snow::HandshakeState = snow::Builder::new(noise_params.clone())
                                 .local_private_key(&my_stp_keypair.private).unwrap()
-                                .remote_public_key(&peer_endpoint.public_key).unwrap()
+                                .remote_public_key(&peer_endpoint.key).unwrap()
                                 .build_initiator().unwrap();
                             peer.transport = PeerTransport::default();
                             let header = PacketHeader::new::<PACKET_TYPE_CLIENT_HELLO>(peer.transport.ack_latest, peer.transport.ack_field); // @TodoHeaderAndStatus
@@ -2108,7 +1900,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             let n = outgoing_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
                             // TODO: no nonce?
                             print_packet_tag_send(header);
-                            send_sock_msg(&ctx_str, &mut peer.transport, &sock, peer_endpoint, &send_buf2[..n], &mut net_stats);
+                            send_sock_msg(&ctx_str, &mut peer.transport, &sock, &peer_endpoint, &send_buf2[..n], &mut net_stats);
                             peer.outgoing_handshake_state = Some(outgoing_state);
                         }
                     }
@@ -2154,7 +1946,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
                 }
 
-                fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer_transport: &mut PeerTransport, peer_endpoint: SecureUdpEndpoint, peer_snow_state: &mut snow::StatelessTransportState, peer_root_public_bft_key: [u8; 32], sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
+                fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer_transport: &mut PeerTransport, peer_endpoint: &STPAddress, peer_snow_state: &mut snow::StatelessTransportState, peer_root_public_bft_key: [u8; 32], sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
                     let height = round_data.height;
                     let round  = round_data.round;
 
@@ -2315,19 +2107,14 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
                     if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
                         peer.latest_status_request_height = None;
-                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
-                    }
-                    if let Some((hash, chunk_i)) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
-                        // Note(Sam): Disable PoWLink while working on new PoW sync in zebra.
-                        // peer.latest_status_request_powlink = None;
-                        // powlink_peer(&bft_state, &ctx_str, &mut net_stats, &mut send_buf1, &mut send_buf2, &sock, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), hash, chunk_i).await;
+                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, &peer.endpoint.as_ref().unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
                     }
                     else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                     {
                         for round_i in (current_height_start_i..bft_state.rounds_data.len()).rev()
                         {
                             let round_data = &bft_state.rounds_data[round_i];
-                            send_round_data_to_peer(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
+                            send_round_data_to_peer(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, &peer.endpoint.as_ref().unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
                         }
                     } else {
                         eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: round_data array was empty", ctx_str);
@@ -2352,54 +2139,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     }
                 }
 
-/*
-                // POWLINK UPDATE
-                if let Some((hash, powlink)) = bft_state.current_powlink.as_mut() {
-                    let hash = *hash;
-                    if powlink.block.is_none() && powlink.data.len() != 0 && powlink.chunk_i as usize == powlink_chunks_n(powlink.data.len()) {
-                        if PRINT_POWLINK { println!("{}: PowLink: Block {:?} is DONE!", ctx_str, hash); }
-
-                        let bytes = &powlink.data;
-                        if let Some(block) = bft_state.parse_pow_closure.0(hash.0, bytes.clone()).await {
-                            powlink.block = Some(block.clone());
-                        }
-                    }
-
-                    if let Some(block) = powlink.block.take() {
-                        bft_state.current_powlink = None;
-
-                        let prev_hash = block.header.previous_block_hash.0;
-                        bft_state.pow_submit_block_queue.push(block);
-                        if bft_state.is_pow_in_chain_closure.0(prev_hash).await {
-                            let mut push_buffer = Vec::new();
-                            std::mem::swap(&mut push_buffer, &mut bft_state.pow_submit_block_queue);
-                            for block in push_buffer.into_iter().rev() {
-                                if PRINT_POWLINK { println!("{}: PowLink: \x1b[92mFLUSHING POW\x1b[0;0m hash: {:?}...", ctx_str, block.hash()); }
-                                bft_state.push_pow_closure.0(block).await;
-                            }
-                        } else {
-                            bft_state.current_powlink = Some((BlockHash(prev_hash), Powlink::default()));
-                            let len = bft_state.pow_submit_block_queue.len() + 1;
-                            if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, prev_hash); }
-                            if PRINT_POWLINK { println!("{}: PowLink: \x1b[93mBLOCK NEEDED\x1b[0m count: {:?}...", ctx_str, len); }
-                        }
-                    } else {
-                        if bft_state.pow_submit_block_queue.len() > 0 {
-                            if bft_state.is_pow_in_chain_closure.0(bft_state.pow_submit_block_queue[bft_state.pow_submit_block_queue.len()-1].hash().0).await {
-                                bft_state.current_powlink = None;
-                                let mut push_buffer = Vec::new();
-                                std::mem::swap(&mut push_buffer, &mut bft_state.pow_submit_block_queue);
-                                push_buffer.truncate(push_buffer.len() - 1);
-                                for block in push_buffer.into_iter().rev() {
-                                    if PRINT_POWLINK { println!("{}: PowLink: \x1b[92mFLUSHING POW\x1b[0;0m hash: {:?}...", ctx_str, block.hash()); }
-                                    bft_state.push_pow_closure.0(block).await;
-                                }
-                            }
-                        }
-                    }
-                }
-*/
-                
                 break;
             }
 
@@ -2466,8 +2205,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         //  NOTE(Security): Actually we would need to loop because a peer could sign a message claiming to own an IP and PORT that it actually does not own. That also means falling back on
         //      the unknown connections array since that also shouldn't be able to be blocked.
-        if let Some(i) = peers.iter().map(|p| p.endpoint.unwrap_or_default()).position(|endpoint| endpoint.ip_address == from_ip && endpoint.port == from_port) {
-            let peer_endpoint = peers[i].endpoint.unwrap();
+        if let Some(i) = peers.iter().map(|p| p.endpoint.clone().unwrap_or_default()).position(|endpoint| endpoint.ip.octets() == from_ip && endpoint.port == from_port) {
+            let peer_endpoint = peers[i].endpoint.clone().unwrap();
             loop {
                 let peer = &mut peers[i];
                 if let Some(snow_state) = &mut peer.snow_state {
@@ -2483,7 +2222,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 if let Some(outgoing) = &mut peer.outgoing_handshake_state {
                     if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
-                        fn finish_outgoing_handshake(ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut snow_state: snow::StatelessTransportState, nonce: u64, connection_knowledge: ConnectionKnowledge, stats: &mut NetworkStats) {
+                        fn finish_outgoing_handshake(ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: &STPAddress, peer: &mut Peer, mut snow_state: snow::StatelessTransportState, nonce: u64, connection_knowledge: ConnectionKnowledge, stats: &mut NetworkStats) {
                             let packet_type = if connection_knowledge == ConnectionKnowledge::Unknown { PACKET_TYPE_CLIENT_UNKNOWN_ACK } else { PACKET_TYPE_CLIENT_ACK };
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
@@ -2532,19 +2271,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             if peer.pending_client_ack_snow_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_bft_key.into(), &peer.root_public_bft_key) {
                                 if let Ok(snow_state) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                     if PRINT_PROTOCOL { println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr); }
-                                    finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, peer_endpoint, peer, snow_state, nonce, ConnectionKnowledge::Known, &mut net_stats);
+                                    finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, &peer_endpoint, peer, snow_state, nonce, ConnectionKnowledge::Known, &mut net_stats);
                                 }
                                 break;
                             }
                         } else if packet_type == PACKET_TYPE_SERVER_UNKNOWN_HELLO && local_msg.len() == 18 {
-                            let my_apparent_ip       = &local_msg[  ..16];
-                            let my_apparent_port     = &local_msg[16..18];
-                            let my_apparent_endpoint = SecureUdpEndpoint { ip_address: my_apparent_ip.try_into().unwrap(), port: u16::from_le_bytes(my_apparent_port.try_into().unwrap()), public_key: my_stp_keypair.public.clone().try_into().unwrap() };
                             // TODO hash
                             if let Ok(snow_state) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
-                                if PRINT_PROTOCOL { println!("{:05}: Finished outgoing unknown handshake and got nonce {} with {}, I am percieved as {:?}", my_port, nonce, addr, my_apparent_endpoint); }
+                                if PRINT_PROTOCOL { println!("{:05}: Finished outgoing unknown handshake and got nonce {} with {}", my_port, nonce, addr); }
 
-                                finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, peer_endpoint, peer, snow_state, nonce, ConnectionKnowledge::Unknown, &mut net_stats);
+                                finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, &peer_endpoint, peer, snow_state, nonce, ConnectionKnowledge::Unknown, &mut net_stats);
                             }
                             break;
                         }
@@ -2585,7 +2321,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     process_acks(&mut peer.transport, header);
 
                     if packet_type == PACKET_TYPE_CLIENT_HELLO {
-                        let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
+                        let client_endpoint = STPAddress { magic1: CRYPTO_MAGIC, key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip: from_ip.into(), port: from_port };
                         if PRINT_PROTOCOL { println!("{:05}: Server received client hello from static key = {:?}", my_port, client_endpoint); }
                         {
                             let them: &[u8; 32] = &peer.root_public_bft_key;
@@ -2613,7 +2349,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             if let Ok(snow_state) = incoming_state.into_stateless_transport_mode() {
                                 peer.transport.nonce = start_nonce; // @Cleanup @Lazy.
                                 print_packet_tag_send(header);
-                                send_sock_msg(&ctx_str, &mut peer.transport, &sock, peer_endpoint, &send_buf2[..n], &mut net_stats);
+                                send_sock_msg(&ctx_str, &mut peer.transport, &sock, &peer_endpoint, &send_buf2[..n], &mut net_stats);
                                 peer.transport.nonce += 1;
                                 peer.pending_client_ack_snow_state = Some(snow_state);
                             }
@@ -2625,7 +2361,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
         } else {
             loop {
-                if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == [0; 32] && p.endpoint.is_some() && p.endpoint.unwrap().ip_address == from_ip && p.endpoint.unwrap().port == from_port) {
+                if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == [0; 32] && p.endpoint.is_some() && p.endpoint.as_ref().unwrap().ip.octets() == from_ip && p.endpoint.as_ref().unwrap().port == from_port) {
                     let peer = &mut peers[i];
                     nonce = u64::from_le_bytes(raw_msg[..8].try_into().unwrap());
                     if let Ok(length) = peer.snow_state.as_ref().unwrap().read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
@@ -2667,7 +2403,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     print_packet_tag_recv(header);
 
                     if packet_type == PACKET_TYPE_CLIENT_HELLO {
-                        let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
+                        let client_endpoint = STPAddress { magic1: CRYPTO_MAGIC, key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip: from_ip.into(), port: from_port };
                         if PRINT_PROTOCOL { println!("{:05}: Server received client hello from unknown peer with static key = {:?}", my_port, client_endpoint); }
 
                         // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
@@ -2688,7 +2424,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             let mut transport = PeerTransport::default();
                             transport.nonce = start_nonce;
                             print_packet_tag_send(header);
-                            send_sock_msg(&ctx_str, &mut transport, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
+                            send_sock_msg(&ctx_str, &mut transport, &sock, &client_endpoint, &send_buf2[..n], &mut net_stats);
                             transport.nonce += 1;
                             peers.push(Peer {
                                 root_public_bft_key: [0; 32],
@@ -2702,7 +2438,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 transport,
                                 connection_knowledge: ConnectionKnowledge::Unknown,
                                 latest_status_request_height: None,
-                                latest_status_request_powlink: None,
                                 latest_status: None,
                             });
                         }
@@ -2720,79 +2455,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         };
         let packet_type = header.type_();
 
-        if packet_type == PACKET_TYPE_POWLINK_CHUNK {
-            continue; // Note(Sam): Disable PoWLink.
-            let ctx_str = bft_state.ctx_str(&roster);
-
-            let hdr = match PacketPowlinkChunkHeader::read_from(&msg[read_o..]) {
-                Ok(v) => v,
-                Err(err) => {
-                    eprintln!("{}: PowLink: couldn't read chunk header: {}", ctx_str, err);
-                    continue;
-                }
-            };
-            let hash        = hdr.hash;
-            let block_size  = hdr.block_size as usize;
-            let chunk_i     = hdr.chunk_i    as usize;
-            let chunk_size  = usize::min(POWLINK_CHUNK_DATA_SIZE, block_size - chunk_i * POWLINK_CHUNK_DATA_SIZE);
-            let packet_size = PACKET_HEADER_SIZE + PacketPowlinkChunkHeader::SERIALIZED_SIZE + chunk_size;
-            let chunks_n    = powlink_chunks_n(block_size);
-
-            if hdr.block_size as usize > POWLINK_MAX_DATA_SIZE {
-                eprintln!("{}: PowLink: Block was too big: {} bytes (max 2,000,000)", ctx_str, hdr.block_size);
-                continue;
-            }
-            if chunk_i >= chunks_n {
-                eprintln!("{}: PowLink: Chunk index #{} out of bounds (maximum {} -- the block size is {})", ctx_str, chunk_i, chunks_n, block_size);
-                continue;
-            }
-
-            if msg.len() != packet_size {
-                eprintln!("{}: PowLink: Couldn't read chunk #{}: incorrect size {} (wanted {})", ctx_str, chunk_i, msg.len(), packet_size);
-                continue;
-            }
-
-            if bft_state.current_powlink.is_some() && bft_state.current_powlink.as_ref().unwrap().0 == hash {
-                let powlink = &mut bft_state.current_powlink.as_mut().unwrap().1;
-                if (powlink.chunk_i as usize) < chunk_i {
-                    eprintln!("{}: PowLink: Unfortunately dropping chunk {} for block {:?} because it is {} chunks ahead of our current edge {}", ctx_str, chunk_i, hash, (chunk_i - powlink.chunk_i as usize), powlink.chunk_i);
-                    continue;
-                }
-                if (powlink.chunk_i as usize) > chunk_i {
-                    eprintln!("{}: PowLink: Discarding redundant chunk {} for block {:?} because it is {} chunks behind our current edge {}", ctx_str, chunk_i, hash, (powlink.chunk_i as usize - chunk_i), powlink.chunk_i);
-                    continue;
-                }
-
-                // Just expand or shrink to "new" block size. PowLink is not trustless anyway, so nothing important is worth doing here to ward off adversaries.
-                if powlink.data.len() != 0 &&
-                   powlink.data.len() != block_size {
-                    eprintln!("{}: PowLink: Warning: Block size changed for hash {:?}. Shenanigans afoot.", ctx_str, hash);
-                }
-
-                powlink.data.resize(block_size, 0);
-
-                let (chunk_src_o, chunk_src_size) = (packet_size - chunk_size, chunk_size);
-                let (chunk_dst_o, chunk_dst_size) = powlink_chunk_o_size(block_size, chunk_i);
-
-                debug_assert!(chunk_dst_size == chunk_src_size);
-                if chunk_dst_size != chunk_src_size {
-                    eprintln!("{}: PowLink Error: Destination size and source size differ - {} vs {}. Hash is {:?}", ctx_str, chunk_dst_size, chunk_src_size, hash);
-                    continue;
-                }
-
-                let chunk_src_data = &             msg[chunk_src_o..chunk_src_o + chunk_src_size];
-                let chunk_dst_data = &mut powlink.data[chunk_dst_o..chunk_dst_o + chunk_dst_size];
-
-                // if PRINT_POWLINK { println!("{}: PowLink: Received chunk #{} ({} bytes) of block! Hash: {:?}", ctx_str, chunk_i, chunk_dst_size, hash); }
-
-                // Download!
-                chunk_src_data.write_to(chunk_dst_data);
-                powlink.chunk_i += 1;
-            } else {
-                eprintln!("{}: PowLink: Discarding unneeded block {:?}", ctx_str, hash);
-                continue;
-            }
-        }
 
         let mut duplicate_peer_identity_to_remove: Option<[u8; 32]> = None;
         let mut peer_index_to_retain = 0;
@@ -2806,7 +2468,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
             if let Some(status) = status {
                 peer_from_which_i_have_received_the_packet.latest_status_request_height = Some(status.height);
-                peer_from_which_i_have_received_the_packet.latest_status_request_powlink = Some((status.powlink_hash, status.powlink_chunk_i));
             }
 
             match packet_type {
@@ -2830,7 +2491,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 }
 
                 peer.latest_status_request_height = Some(status.height);
-                peer.latest_status_request_powlink = Some((status.powlink_hash, status.powlink_chunk_i));
                 peer.latest_status = Some(status);
             }
 
@@ -2915,7 +2575,6 @@ const PACKET_TYPE_PROPOSAL_CHUNK:       u8 =  7;
 const PACKET_TYPE_PREVOTE_SIGNATURES:   u8 =  8;
 const PACKET_TYPE_PRECOMMIT_SIGNATURES: u8 =  9;
 // misc
-const PACKET_TYPE_POWLINK_CHUNK:        u8 = 10;
 const PACKET_TYPE_COUNT:                u8 = 11;
 
 
@@ -2940,7 +2599,6 @@ const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     names[PACKET_TYPE_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",           "STATUS+PROPOSAL_CHUNK"];
     names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES",     "STATUS+PRECOMMIT_SIGNATURES"];
-    names[PACKET_TYPE_POWLINK_CHUNK        as usize] = ["PACKET_TYPE_POWLINK_CHUNK","STATUS+PACKET_TYPE_POWLINK_CHUNK"];
     const_assert!(PACKET_TYPE_COUNT == 11); // keep names array updated when adding other tags
     names
 };
@@ -2972,9 +2630,7 @@ struct PacketStatus {
     height: u64,
     round:  u32, // as context for following request ranges
     need_proposal_chunk_rngs: [ProposalRng; STATUS_PROPOSAL_RNGS_N],
-    need_vote_rngs: [[VoteRng; STATUS_VOTE_RNGS_N]; 2], // 1 for prevote, 1 for precommit
-    powlink_hash: BlockHash, // block needed
-    powlink_chunk_i: u16, // my next needed index into the stream of chunks of the block
+    need_vote_rngs: [[VoteRng; STATUS_VOTE_RNGS_N]; 2], // 1 for prevote, 1 for precommi
 }
 impl PacketStatus {
     pub fn write_to(&self, buf: &mut[u8]) -> usize {
@@ -2991,8 +2647,6 @@ impl PacketStatus {
                 o += vote_rng[1].write_to(&mut buf[o..]);
             }
         }
-        o += self.powlink_hash.0.write_to(&mut buf[o..]);
-        o += self.powlink_chunk_i.write_to(&mut buf[o..]);
         o
     }
 
@@ -3001,8 +2655,6 @@ impl PacketStatus {
             height: 0, round: 0,
             need_proposal_chunk_rngs: [[0;2]; STATUS_PROPOSAL_RNGS_N],
             need_vote_rngs: [[[0;2]; STATUS_VOTE_RNGS_N]; 2],
-            powlink_hash: BlockHash::NIL,
-            powlink_chunk_i: 0,
         };
         packet.height = r.read_u64::<LittleEndian>()?;
         packet.round = r.read_u32::<LittleEndian>()?;
@@ -3016,8 +2668,6 @@ impl PacketStatus {
                 vote_rng[1] = r.read_u16::<LittleEndian>()?;
             }
         }
-        r.read_exact(&mut packet.powlink_hash.0)?;
-        packet.powlink_chunk_i = r.read_u16::<LittleEndian>()?;
         Ok(packet)
     }
 }
@@ -3180,61 +2830,6 @@ impl PacketProposalChunkHeader {
 
 use std::collections::HashMap;
 
-const POWLINK_MAX_DATA_SIZE:   usize = 2_000_000;
-const POWLINK_CHUNK_DATA_SIZE: usize =     1_000;
-
-// @Todo: This is not secure to adversarial sync-servers who give you false PoW block data. We don't isolate streams to individual peers yet.
-//        However, as this is meant as just an optimization, we can safely fallback to Zebra sync.
-// #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Powlink {
-    pub chunk_i: u16,  // download-stream chunk index
-    pub data: Vec<u8>, // the block as bytes
-    pub block: Option<Arc<zebra_chain::block::Block>>,
-}
-fn powlink_chunks_n(len: usize) -> usize {
-    len.div_ceil(POWLINK_CHUNK_DATA_SIZE)
-}
-fn powlink_chunk_o_size(len: usize, chunk_i: usize) -> (usize, usize) {
-    let o = chunk_i * POWLINK_CHUNK_DATA_SIZE;
-    (o, usize::min(POWLINK_CHUNK_DATA_SIZE, len - o))
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PacketPowlinkChunkHeader {
-    pub hash:       BlockHash,
-    pub block_size: u32,
-    pub chunk_i:    u16,
-}
-impl Default for PacketPowlinkChunkHeader {
-    fn default() -> Self {
-        Self {
-            hash:       BlockHash::NIL,
-            block_size: 0,
-            chunk_i:    0,
-        }
-    }
-}
-impl PacketPowlinkChunkHeader {
-    const SERIALIZED_SIZE: usize = 32 + 4 + 2; // 38
-
-    fn write_to(&self, buf: &mut [u8]) -> usize {
-        let mut o = 0;
-        o += self.hash    .0.write_to(&mut buf[o..]);
-        o += self.block_size.write_to(&mut buf[o..]);
-        o += self.chunk_i   .write_to(&mut buf[o..]);
-        o
-    }
-
-    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
-        let mut packet = PacketPowlinkChunkHeader::default();
-        r.read_exact(&mut packet.hash.0)?;
-        packet.block_size = r.read_u32::<LittleEndian>()?;
-        packet.chunk_i    = r.read_u16::<LittleEndian>()?;
-
-        Ok(packet)
-    }
-}
 
 fn hook_fail_on_panic() {
     std::panic::set_hook(Box::new(|panic_info| {
