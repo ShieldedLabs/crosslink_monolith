@@ -91,73 +91,6 @@ struct TMDecision {
     //signatures: Vec<TMSig>, // ability to prove to others e.g. those catching up
 }
 
-#[derive(Debug, Copy, Clone)]
-struct SentPacket {
-    bytes: usize,
-    time_sent: tokio::time::Instant,
-}
-impl Default for SentPacket {
-    fn default() -> Self {
-        Self {
-            bytes: 0,
-            time_sent: Instant::now(),
-        }
-    }
-}
-
-#[derive(Debug, Default, Copy, Clone)]
-struct ReceivedPacket {
-    bytes: usize,
-}
-
-#[derive(Debug, Default, Copy, Clone)]
-struct AcknowledgedSentPacket {
-    bytes: usize,
-    rtt: f64,
-}
-
-#[derive(Debug, Default, Copy, Clone)]
-struct Slot<T> {
-    index: usize,
-    value: T
-}
-
-#[derive(Debug)]
-struct RingStream<T: Default, const N: usize> {
-    slots: [Slot<T>; N],
-}
-impl<T: Default + Copy, const N: usize> Default for RingStream<T, N> {
-    fn default() -> Self {
-        Self {
-            slots: [Slot::<T>::default(); N],
-        }
-    }
-}
-impl<T: Default, const N: usize> RingStream<T, N> {
-    pub fn at<'a>(&'a mut self, index: usize) -> Option<&'a mut T> {
-        let slot_index = index % N;
-        if self.slots[slot_index].index == index {
-            Some((&mut self.slots[slot_index].value))
-        } else {
-            None
-        }
-    }
-    pub fn at_immut<'a>(&'a self, index: usize) -> Option<&'a T> {
-        let slot_index = index % N;
-        if self.slots[slot_index].index == index {
-            Some((&self.slots[slot_index].value))
-        } else {
-            None
-        }
-    }
-    pub fn set(&mut self, value: T, index: usize) {
-        let slot_index = index % N;
-        self.slots[slot_index].index = index;
-        self.slots[slot_index].value = value;
-    }
-}
-
-
 struct TMVote {
     approve: bool,
     todo_sign_bytes: [u8; 96],
@@ -1045,7 +978,7 @@ impl TMState {
     }
     fn name_str_other(roster: &[SortedRosterMember], peer: &Peer) -> String {
         let mut port = 0;
-        if let Some(endpoint) = &peer.endpoint { port = endpoint.port; }
+        if let Some(endpoint) = &peer.address { port = endpoint.port; }
         format!("{:05}-{:?}-{:?}", port, PubKeyID(peer.root_public_bft_key), roster_i_from_pub_key(roster, PubKeyID(peer.root_public_bft_key)))
     }
 
@@ -1269,28 +1202,6 @@ impl TMState {
     }
 }
 
-#[derive(Debug)]
-struct PeerTransport {
-    ack_latest: u64,
-    ack_field: u64,
-    nonce: u64,
-    sent_packets:              RingStream<SentPacket, 1024>,
-    received_packets:          RingStream<ReceivedPacket, 1024>,
-    acknowledged_sent_packets: RingStream<AcknowledgedSentPacket, 1024>,
-}
-impl Default for PeerTransport {
-    fn default() -> Self {
-        Self {
-            ack_latest: 0,
-            ack_field: 0,
-            nonce: 0,
-            sent_packets:              RingStream::<SentPacket, 1024>::default(),
-            received_packets:          RingStream::<ReceivedPacket, 1024>::default(),
-            acknowledged_sent_packets: RingStream::<AcknowledgedSentPacket, 1024>::default(),
-        }
-    }
-}
-
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConnectionKnowledge {
     #[default] Known,
@@ -1301,13 +1212,8 @@ pub enum ConnectionKnowledge {
 #[derive(Debug)]
 pub struct Peer {
     pub root_public_bft_key: [u8; 32],
-    pub endpoint: Option<STPAddress>,
-    pub outgoing_handshake_state: Option<snow::HandshakeState>,
-    pub pending_client_ack_snow_state: Option<snow::StatelessTransportState>,
-    pub pending_client_ack: bool,
-    pub snow_state: Option<snow::StatelessTransportState>,
-    pub watch_dog: Instant,
-    pub transport: PeerTransport,
+    pub connection_key: ConnectionKey,
+    pub address: Option<STPAddress>,
     pub connection_knowledge: ConnectionKnowledge,
     pub latest_status_request_height: Option<u64>,
     pub latest_status: Option<PacketStatus>,
@@ -1315,7 +1221,7 @@ pub struct Peer {
 impl Peer {
     fn info(&self) -> PeerInfo {
         return PeerInfo {
-            connected: self.snow_state.is_some(),
+            connected: true,
             connection_knowledge: self.connection_knowledge,
             root_public_bft_key: Some(self.root_public_bft_key),
             latest_status_request_height: self.latest_status_request_height.unwrap_or_default(),
@@ -1326,13 +1232,8 @@ impl Default for Peer {
     fn default() -> Self {
         Self {
             root_public_bft_key: [0_u8; 32],
-            endpoint: None,
-            outgoing_handshake_state: None,
-            pending_client_ack_snow_state: None,
-            pending_client_ack: true,
-            snow_state: None,
-            watch_dog: Instant::now(),
-            transport: PeerTransport::default(),
+            address: None,
+            connection_key: Default::default(),
 
             connection_knowledge: ConnectionKnowledge::Known,
             latest_status_request_height: None,
@@ -1359,6 +1260,7 @@ impl SliceWrite for u8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] 
 impl SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..self.len()].copy_from_slice(self);   self.len() } }
 
 pub use crate::bandwidth_test::IdentityKeyPair;
+pub use crate::bandwidth_test::ConnectionKey;
 pub use crate::bandwidth_test::STPAddress;
 pub use crate::bandwidth_test::fmt_byte_str;
 pub use crate::bandwidth_test::fmt_byte_str_rev;
@@ -1398,48 +1300,6 @@ impl STPAddress {
 pub struct FinalizerPeerAddress {
     pub bft_pk: PubKeyID,
     pub address: STPAddress,
-}
-
-// returns true if a is initiator
-fn contended_noise_is_initiator(hash_keys: &HashKeys, a: &[u8; 32], b: &[u8; 32]) -> bool {
-    // TODO: do we want a fast insecure hash for this kind of thing?
-    let a_to_b_hash = hash_keys.connect_contention.hasher().update(a).update(b).finalize();
-    let b_to_a_hash = hash_keys.connect_contention.hasher().update(b).update(a).finalize();
-    a_to_b_hash.as_bytes() < b_to_a_hash.as_bytes()
-}
-
-fn nonce_is_ok2(nonce: u64, ack_latest: u64, ack_field: u64) -> bool {(
-    ack_latest <= nonce + 64 && // TODO: do we want to completely drop these or just exclude from heartbeat
-    nonce != ack_latest &&
-    nonce <= ack_latest + NONCE_FORWARD_JUMP_TOLERANCE &&
-    (ack_latest < nonce || ack_field >> (ack_latest - nonce) & 1 == 0)
-)}
-
-fn nonce_is_ok(nonce: u64, ack_latest: u64, ack_field: u64) -> bool {
-    if nonce > ack_latest && nonce > ack_latest + NONCE_FORWARD_JUMP_TOLERANCE { return false; }
-    if nonce == ack_latest                                                     { return false; }
-    if nonce + 64 < ack_latest                                                 { return false; }
-    // NOTE: this shift can overflow if we don't return before
-    if nonce < ack_latest && ack_field >> (ack_latest - nonce) & 1 != 0        { return false; }
-    true
-}
-
-fn nonce_update(nonce: u64, ack_latest: &mut u64, ack_field: &mut u64) {
-    // Update nonce tracking
-    if nonce > *ack_latest {
-        *ack_latest += 1;
-        *ack_field <<= 1;
-        *ack_field |= 1;
-        let shift_amount = nonce - *ack_latest;
-        if shift_amount >= 64 {
-            *ack_field = 0;
-        } else if shift_amount != 0 {
-            *ack_field <<= shift_amount;
-            *ack_latest = nonce;
-        }
-    } else {
-        *ack_field |= 1_u64 << (*ack_latest - nonce);
-    }
 }
 
 fn make_vote_sign_datas(pub_key: [u8; 32], is_precommit: bool, height: u64, round: u32, value_id: ValueId) -> [[u8; 76]; 2] {
@@ -1620,21 +1480,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     use crate::bandwidth_test::*;
     use crate::native_sockets::*;
 
-    let sock =
-    {
-        use socket2::{Domain, Protocol, Socket, Type};
-        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-        socket.set_nonblocking(true).unwrap();
-        socket.set_only_v6(false).unwrap(); // Sets IPV6_V6ONLY to 0 for dual-stack (required for win32)
-        socket.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, my_endpoint.map(|e|e.port).unwrap_or(0), 0, 0).into()).unwrap();
-        tokio::net::UdpSocket::from_std(socket.into()).unwrap()
-    };
-
     // STP setup
     socket_setup();
     monotonic_clock_setup();
 
-    let socket = setup_and_bind_udp_socket(0);
+    let my_port = my_endpoint.map(|e|e.port).unwrap_or(0); // @Todo! Get local port after sock creation! @@@
+
+    let socket = setup_and_bind_udp_socket(my_port);
 
     let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
 
@@ -1644,19 +1496,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
     let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
 
+    let mut packets_to_send:  Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
+    let mut packets_received: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
+
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
 
-    let my_port = sock.local_addr().unwrap().port();
-
-    let mut peers : Vec<Peer> = roster.iter().filter(|m| m.pub_key.0 != my_root_public_bft_key.as_ref())
-        .map(|m| Peer { root_public_bft_key: m.pub_key.0, ..Peer::default() }).collect();
-
     for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
-        if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == bft_pk.0) {
-            peers[i].endpoint = Some(address.clone());
-        }
+        let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
     }
-    if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint.clone()).collect::<Vec<_>>()); }
+
+    if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|(_,p)|p.address.clone()).collect::<Vec<_>>()); }
 
     // TODO: only convert private to public in 1 location
     let mut bft_state = TMState::init(
@@ -1678,16 +1527,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut net_stats_window_start = tokio::time::Instant::now();
     let mut net_stats = NetworkStats::default();
 
-    let mut recv_buf1 = [0; 2048];
-    let mut recv_buf2 = [0; 2048];
-    let mut send_buf1 = [0; 2048];
-    let mut send_buf2 = [0; 2048];
+    let mut send_buf1 = [0u8; 2048];
     let mut next_tick_time = tokio::time::Instant::now();
     loop {
         let ctx_str = bft_state.ctx_str(&roster);
 
         {
-            let mut peers = peers.iter().map(|p| p.info()).collect::<Vec<PeerInfo>>();
+            let mut peers = peers.iter().map(|(_,p)| p.info()).collect::<Vec<PeerInfo>>();
             bft_state.update_peers_cmd_closure.0(peers).await;
         }
 
@@ -1709,7 +1555,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         fn write_header_and_maybe_status(header_: PacketHeader, include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8], peer_random: u64) -> usize {
             let mut header = header_;
-            header.tag_and_ack |= if include_status { PACKET_TAG_STATUS_FLAG as u64 } else { 0 };
+            header.tag |= if include_status { PACKET_TAG_STATUS_FLAG as u64 } else { 0 };
 
             let mut o = 0;
             o += header.write_to(&mut send_buf1[o..]);
@@ -1763,97 +1609,15 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
             o
         }
-        fn send_sock_msg(ctx_str: &str, transport: &mut PeerTransport, sock: &tokio::net::UdpSocket, peer_endpoint: &STPAddress, msg: &[u8], stats: &mut NetworkStats) {
-            // TODO(phil) move this code
-            let bytes_in_flight = {
-                let mut bytes_in_flight = 0;
-                for slot_i in 0..transport.sent_packets.slots.len() {
-                    bytes_in_flight += transport.sent_packets.slots[slot_i].value.bytes;
-                }
-                bytes_in_flight
-            };
-
-            let (_, mean_rtt) = {
-                let mut bytes_acknowledged = 0;
-                let mut rtt_sum   = 0.0;
-                let mut rtt_sum_n = 0.0;
-                for slot_i in 0..transport.acknowledged_sent_packets.slots.len() {
-                    let packet = transport.acknowledged_sent_packets.slots[slot_i].value;
-                    bytes_acknowledged += packet.bytes;
-                    if packet.rtt > 0.0 {
-                        rtt_sum   += packet.rtt;
-                        rtt_sum_n += 1.0;
-                    }
-                }
-                if rtt_sum_n <= 0.0 { rtt_sum_n = 1.0; }
-                (bytes_acknowledged, rtt_sum / rtt_sum_n)
-            };
-
-            // TODO(phil): Compute real bandwidth using sliding congestion windows, TCP-style
-            // const BANDWIDTH_SAFETY_MARGIN: f64 =     0.8;
-
-            let target_bytes_in_flight = ((MAX_BANDWIDTH_BYTES_PER_SECOND as f64 * mean_rtt.max(0.01)) as usize).max(PATH_MTU);
-
-            // NOTE(phil) probabilistically lerp down towards 0 likelihood of sending a packet as we approach bandwidth limit
-            let rand_t = bytes_in_flight as f64 / target_bytes_in_flight as f64;
-            if rand::random::<f64>() < rand_t {
-                // if PRINT_PROTOCOL { println!("Dropping packet because of congestion control."); }
-                // return;
-            }
-
-            // println!("Packet: {} bytes", msg.len());
-            let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip), peer_endpoint.port, 0, 0));
-            match sock.try_send_to(msg, addr) {
-                Ok(_) => {
-                    stats.packets_sent += 1;
-                    stats.bytes_sent += msg.len();
-
-                    // println!("Packet sent! Nonce: {}! {} bytes!", transport.nonce, msg.len());
-                    transport.sent_packets.set(SentPacket { bytes: msg.len(), time_sent: Instant::now() }, transport.nonce as usize);
-
-                    ()
-                },
-                Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => (), // not writable, drop
-                Err(error) => eprintln!("{} Socket error: {:?} sending to addr: {:?}", ctx_str, error, addr),
-            }
-        }
-        fn send_noise_msg(ctx_str: &str, transport: &mut PeerTransport, snow_state: &mut snow::StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: &STPAddress, send_buf2: &mut [u8], msg: &[u8], stats: &mut NetworkStats) {
-            let mut o = 0;
-            o += transport.nonce.write_to(                           &mut send_buf2[o..]);
-            o += snow_state     .write_message(transport.nonce, msg, &mut send_buf2[o..]).unwrap();
-            send_sock_msg(ctx_str, transport, sock, peer_endpoint, &send_buf2[..o], stats);
-
-            transport.nonce += 1;
-        }
-
-        fn process_acks(transport: &mut PeerTransport, header: PacketHeader) {
-            let now = Instant::now();
-
-            // println!("Packet ack! {}!", header.ack());
-
-            let mut ack_field = header.ack_field;
-            let ack = header.ack() as usize;
-
-            // TODO(Phil): figure out the off-by-one situation here...
-            if ack >= 64 {
-                for i in ack-64..ack+1 {
-                    let is_acknowledged = (ack_field >> 63) & 1 != 0;
-                    ack_field <<= 1;
-                    if !is_acknowledged { continue; }
-
-                    if let Some(sent_packet) = transport.sent_packets.at(i) &&
-                                sent_packet.bytes > 0 {
-                        transport.acknowledged_sent_packets.set(AcknowledgedSentPacket { bytes: sent_packet.bytes, rtt: now.duration_since(sent_packet.time_sent).as_secs_f64() }, i);
-
-                        // println!("Packet acked!: {} bytes! {}", sent_packet.bytes, i + 64 - ack);
-
-                        *sent_packet = SentPacket::default();
-                    }
-                }
-            }
-
-            // let rough_packet_loss = 1.0 - (header.ack_field.count_ones() as f64 / 64.0);
-            // println!("Packet loss: {}%.", rough_packet_loss * 100.0);
+        fn send_noise_msg(ctx_str: &str,
+                          socket: SockHandle,
+                          packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>,
+                          peer_connection: &ConnectionKey,
+                          msg: &[u8],
+                          stats: &mut NetworkStats) {
+            stats.packets_sent += 1;
+            stats.bytes_sent += msg.len();
+            packets_to_send.push((*peer_connection, Vec::from(msg)));
         }
 
         if net_stats_window_start.elapsed() >= ONE_SECOND {
@@ -1865,43 +1629,23 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         if was_now > next_tick_time {
             loop {
                 // TICK CODE
-                for peer in &mut peers {
-                    if peer.watch_dog.elapsed() > TIMEOUT_DURATION {
-                        if peer.snow_state.is_some() {
-                            if PRINT_PROTOCOL { println!("{:05}: Disconnected from peer {:?}", my_port, peer.endpoint); }
-                        }
-                        peer.outgoing_handshake_state       = None;
-                        peer.pending_client_ack_snow_state  = None;
-                        peer.snow_state                     = None;
-                        peer.watch_dog                      = Instant::now();
+                for (connection_key, peer) in &mut peers {
+                    if connections_map.get(connection_key).is_none() {
                         peer.latest_status_request_height   = None;
                         peer.latest_status                  = None;
+                        if peer.address.is_some() {
+                            println!("{:05}: Disconnected from peer {:?}.", my_port, peer.address);
+                            peer.address = None;
+                        }
                     }
+                };
 
-                    if let (Some(peer_endpoint), Some(snow_state)) = (&peer.endpoint, &mut peer.snow_state) {
-                        let header = PacketHeader::new::<PACKET_TYPE_EMPTY>(peer.transport.ack_latest, peer.transport.ack_field);
-                        let mut o  = 0;
-                        o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
-                        print_packet_tag_send(header);
-                        send_noise_msg(&ctx_str, &mut peer.transport, snow_state, &sock, peer_endpoint, &mut send_buf2, &send_buf1[..o], &mut net_stats);
-                    }
-                }
-                for peer in &mut peers {
-                    if let Some(peer_endpoint) = &peer.endpoint {
-                        if peer.snow_state.is_none() && peer.outgoing_handshake_state.is_none() && peer.pending_client_ack_snow_state.is_none() {
-                            let mut outgoing_state: snow::HandshakeState = snow::Builder::new(noise_params.clone())
-                                .local_private_key(&my_stp_keypair.private).unwrap()
-                                .remote_public_key(&peer_endpoint.key).unwrap()
-                                .build_initiator().unwrap();
-                            peer.transport = PeerTransport::default();
-                            let header = PacketHeader::new::<PACKET_TYPE_CLIENT_HELLO>(peer.transport.ack_latest, peer.transport.ack_field); // @TodoHeaderAndStatus
-                            let mut o = 0;
-                            o += header.write_to(&mut send_buf1[o..]);
-                            let n = outgoing_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
-                            // TODO: no nonce?
-                            print_packet_tag_send(header);
-                            send_sock_msg(&ctx_str, &mut peer.transport, &sock, &peer_endpoint, &send_buf2[..n], &mut net_stats);
-                            peer.outgoing_handshake_state = Some(outgoing_state);
+                // Try to reconnect to known but disconnected peers
+                for (_, peer) in &peers {
+                    if peer.address.is_none() {
+                        // @Todo: Track a bounded list of endpoint attestations and find this finalizer on that list
+                        if let Some(finalizer_peer_address) = finalizer_peer_addresses.iter().find(|fpa| fpa.bft_pk.0 == peer.root_public_bft_key) {
+                            let _ = connect_to(socket, &mut connections_map, &my_keypairs, &finalizer_peer_address.address);
                         }
                     }
                 }
@@ -1924,9 +1668,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     bytes
                 };
 
-                if peers.iter().position(|p| p.root_public_bft_key == server_a_pub_key).is_none() && server_a_pub_key != my_root_private_key.as_ref() {
+                if peers.iter().position(|(_,p)| p.root_public_bft_key == server_a_pub_key).is_none() && server_a_pub_key != my_root_private_key.as_ref() {
                     let (a, b) = addr_string_to_stuff("45.76.30.90:8234");
-                    // peers.push(Peer { root_public_bft_key: server_a_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
+                    // peers.push(Peer { root_public_bft_key: server_a_pub_key, endpoint: Some(evidence.address), ..Peer::default() });
                 }
 
                 let server_b_pub_key = {
@@ -1941,12 +1685,21 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     bytes
                 };
 
-                if peers.iter().position(|p| p.root_public_bft_key == server_b_pub_key).is_none() && server_b_pub_key != my_root_private_key.as_ref() {
+                if peers.iter().position(|(_,p)| p.root_public_bft_key == server_b_pub_key).is_none() && server_b_pub_key != my_root_private_key.as_ref() {
                     let (a, b) = addr_string_to_stuff("70.34.201.202:8234");
-                    // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
+                    // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.address), ..Peer::default() });
                 }
 
-                fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer_transport: &mut PeerTransport, peer_endpoint: &STPAddress, peer_snow_state: &mut snow::StatelessTransportState, peer_root_public_bft_key: [u8; 32], sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
+                fn send_round_data_to_peer(bft_state: &TMState,
+                                           should_send_prevotes: bool,
+                                           round_data: &RoundData,
+                                           ctx_str: &str,
+                                           packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>,
+                                           send_buf1: &mut [u8],
+                                           peer_connection: &ConnectionKey,
+                                           peer_root_public_bft_key: [u8; 32],
+                                           socket: SockHandle,
+                                           stats: &mut NetworkStats) {
                     let height = round_data.height;
                     let round  = round_data.round;
 
@@ -1967,7 +1720,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
                                 chunk_hdr.chunk_i = chunk_i as u32;
 
-                                let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>(peer_transport.ack_latest, peer_transport.ack_field); // @TodoHeaderAndStatus
+                                let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>(); // @TodoHeaderAndStatus
 
                                 let mut o = 0;
                                 o += header   .write_to(&mut send_buf1[o..]);
@@ -1990,7 +1743,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer_root_public_bft_key); }
                                 sent_chunk_cs += 1;
                                 print_packet_tag_send(header);
-                                send_noise_msg(&ctx_str, peer_transport, peer_snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
+                                send_noise_msg(&ctx_str,
+                                               socket,
+                                               packets_to_send,
+                                               peer_connection,
+                                               &send_buf1[..o],
+                                               stats);
                             }
                         }
                     }
@@ -2003,7 +1761,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             continue;
                         }
 
-                        let header = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit, peer_transport.ack_latest, peer_transport.ack_field); // @TodoHeaderAndStatus
+                        let header = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit); // @TodoHeaderAndStatus
                         let mut packet = PacketVotes {
                             height, round,
                             value_id: round_data.proposal_id,
@@ -2063,7 +1821,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                     let mut o = 0;
                                     o += header.write_to(&mut send_buf1[o..]);
                                     o += packet.write_to(&mut send_buf1[o..]);
-                                    send_noise_msg(ctx_str, peer_transport, peer_snow_state, sock, peer_endpoint, send_buf2, &send_buf1[..o], stats);
+                                    send_noise_msg(ctx_str,
+                                                   socket,
+                                                   packets_to_send,
+                                                   peer_connection,
+                                                   &send_buf1[..o],
+                                                   stats);
 
                                     packet.no_votes_n  = 0;
                                     packet.yes_votes_n = 0;
@@ -2089,7 +1852,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             o += packet.write_to(&mut send_buf1[o..]);
                             // TODO: maybe status
                             print_packet_tag_send(header);
-                            send_noise_msg(ctx_str, peer_transport, peer_snow_state, sock, peer_endpoint, send_buf2, &send_buf1[..o], stats);
+                            send_noise_msg(ctx_str,
+                                           socket,
+                                           packets_to_send,
+                                           peer_connection,
+                                           &send_buf1[..o],
+                                           stats);
                         }
                     }
 
@@ -2098,23 +1866,42 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     if PRINT_SEND_CS && sent_c[1]     > 0 { eprintln!("{} sent {} precommits",      ctx_str, sent_c[1]);     }
                 }
 
-                if PRINT_PEERS { println!("{} {:?}", ctx_str, peers.iter().map(|p|
+                if PRINT_PEERS { println!("{} {:?}", ctx_str, peers.iter().map(|(_,p)|
                     (PubKeyID(p.root_public_bft_key), p.latest_status.clone(), p.connection_knowledge)
                 ).collect::<Vec<_>>()); }
 
-                for peer_i in 0..peers.len() {
-                    let peer = &mut peers[peer_i];
-                    if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
+                for (connection_key, peer) in &mut peers {
+                    if peer.address.is_none() {
+                        continue;
+                    }
                     if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
                         peer.latest_status_request_height = None;
-                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, &peer.endpoint.as_ref().unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
+                        send_round_data_to_peer(&bft_state,
+                                                false,
+                                                &bft_state.recent_commit_round_cache[height as usize],
+                                                &ctx_str,
+                                                &mut packets_to_send,
+                                                &mut send_buf1,
+                                                connection_key,
+                                                peer.root_public_bft_key,
+                                                socket,
+                                                &mut net_stats);
                     }
                     else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                     {
                         for round_i in (current_height_start_i..bft_state.rounds_data.len()).rev()
                         {
                             let round_data = &bft_state.rounds_data[round_i];
-                            send_round_data_to_peer(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, &peer.endpoint.as_ref().unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
+                            send_round_data_to_peer(&bft_state,
+                                                    true,
+                                                    &round_data,
+                                                    &ctx_str,
+                                                    &mut packets_to_send,
+                                                    &mut send_buf1,
+                                                    connection_key,
+                                                    peer.root_public_bft_key,
+                                                    socket,
+                                                    &mut net_stats);
                         }
                     } else {
                         eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: round_data array was empty", ctx_str);
@@ -2150,381 +1937,103 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
         }
 
-        fn timeout_drop(transport: &mut PeerTransport) {
-            let mut rtt_sum   = 0.0;
-            let mut rtt_sum_n = 0.0;
-            for slot_i in 0..transport.acknowledged_sent_packets.slots.len() {
-                let packet = transport.acknowledged_sent_packets.slots[slot_i].value;
-                if packet.rtt > 0.0 {
-                    rtt_sum   += packet.rtt;
-                    rtt_sum_n += 1.0;
-                }
-            }
-
-            if rtt_sum_n > 0.0 {
-                let mean_rtt = rtt_sum / rtt_sum_n;
-
-                // NOTE(phil): timeout-drop packets.
-                // TODO(phil): be more intelligent
-                let now = Instant::now();
-                for slot_i in 0..transport.sent_packets.slots.len() {
-                    let sent_packet = &mut transport.sent_packets.slots[slot_i].value;
-                    if sent_packet.bytes > 0 {
-                        let time_since_sent = now.duration_since(sent_packet.time_sent).as_secs_f64();
-                        if time_since_sent > mean_rtt * 1.5 { // timeout-drop
-                            *sent_packet = SentPacket::default();
-                        }
-                    }
-                }
-            }
-        }
-        for peer in &mut peers {
-            timeout_drop(&mut peer.transport);
-        }
-
         let remaining = next_tick_time.saturating_duration_since(was_now);
-        let (length, addr) = match tokio::time::timeout(remaining, sock.recv_from(&mut recv_buf1)).await {
-            Err(_elapsed) => continue, // timeout
-            Ok(Err(error)) => { println!("Socket error: {:?}", error); continue; },
-            Ok(Ok(ret)) => ret,
-        };
-        if length < 8 + PACKET_HEADER_SIZE { continue; } // early out to simplify nonce code
-        let raw_msg = &recv_buf1[..length];
 
-        let from_ip = match addr {
-            SocketAddr::V4(v4) => v4.ip().to_ipv6_mapped().octets(),
-            SocketAddr::V6(v6) => v6.ip().octets(),
-        };
-        let from_port = addr.port();
+        service_connections(&mut connections_map,
+                            &mut packets_received,
+                            &packets_to_send,
+                            &mut packet_memory_encrypted,
+                            &mut packet_memory_recv,
+                            &mut packet_memory_send,
+                            socket,
+                            &my_keypairs);
+        packets_to_send.clear();
+
+        // Push any new connections to our peers list
+        for (key, connection) in &connections_map {
+            if peers.get(&key).is_none() {
+                peers.insert(*key, Peer {
+                    root_public_bft_key: [0u8; 32],
+                    connection_key: *key,
+                    address: Some(connection.address().clone()),
+                    connection_knowledge: ConnectionKnowledge::Unknown,
+                    latest_status_request_height: None,
+                    latest_status: None
+                });
+            }
+        }
 
         // DECRYPT
-        let mut peer_index: Option<usize> = None;
-        let mut peer_knowledge = ConnectionKnowledge::Known;
-        let mut nonce = 0;
-        let mut msg: Option<&[u8]> = None;
-
-        //  NOTE(Security): Actually we would need to loop because a peer could sign a message claiming to own an IP and PORT that it actually does not own. That also means falling back on
-        //      the unknown connections array since that also shouldn't be able to be blocked.
-        if let Some(i) = peers.iter().map(|p| p.endpoint.clone().unwrap_or_default()).position(|endpoint| endpoint.ip.octets() == from_ip && endpoint.port == from_port) {
-            let peer_endpoint = peers[i].endpoint.clone().unwrap();
-            loop {
-                let peer = &mut peers[i];
-                if let Some(snow_state) = &mut peer.snow_state {
-                    nonce = u64::from_le_bytes(raw_msg[0..8].try_into().unwrap());
-                    if let Ok(length) = snow_state.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
-                        if nonce_is_ok(nonce, peer.transport.ack_latest, peer.transport.ack_field) {
-                            msg        = Some(&recv_buf2[0..length]);
-                            peer_index = Some(i);
-                        }
-                        break;
-                    }
-                }
-
-                if let Some(outgoing) = &mut peer.outgoing_handshake_state {
-                    if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
-                        fn finish_outgoing_handshake(ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: &STPAddress, peer: &mut Peer, mut snow_state: snow::StatelessTransportState, nonce: u64, connection_knowledge: ConnectionKnowledge, stats: &mut NetworkStats) {
-                            let packet_type = if connection_knowledge == ConnectionKnowledge::Unknown { PACKET_TYPE_CLIENT_UNKNOWN_ACK } else { PACKET_TYPE_CLIENT_ACK };
-
-                            // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
-                            peer.transport.nonce = rand::random::<u64>() >> (PACKET_TAG_BITS + 1);
-
-                            let header = PacketHeader::new_(packet_type, 0, 0); // @TodoHeaderAndStatus
-                            let mut o = 0;
-                            o += header.write_to(&mut send_buf1[o..]);
-
-                            print_packet_tag_send(header);
-                            send_noise_msg(ctx_str, &mut peer.transport, &mut snow_state, sock, peer_endpoint, send_buf2, &send_buf1[..o], stats);
-
-                            peer.snow_state                    = Some(snow_state);
-                            peer.outgoing_handshake_state      = None;
-                            peer.pending_client_ack_snow_state = None;
-                            peer.transport.ack_latest          = nonce;
-                            peer.transport.ack_field           = !0;
-                            peer.connection_knowledge         = connection_knowledge;
-                        }
-
-                        if length < 8 + PACKET_HEADER_SIZE {
-                            break; // presumably we don't care about standalone nonces
-                        }
-
-                        nonce = u64::from_le_bytes(recv_buf2[..8].try_into().unwrap());
-
-                        let header_and_local_msg = &recv_buf2[8..length]; // @Duplicate
-                        let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
-                        let packet_type = header.type_();
-                        let local_msg = &header_and_local_msg[PACKET_HEADER_SIZE..];
-
-                        print_packet_tag_recv(header);
-
-                        process_acks(&mut peer.transport, header);
-
-                        if packet_type == PACKET_TYPE_SERVER_HELLO {
-                            {
-                                let them: &[u8; 32] = &peer.root_public_bft_key;
-                                let me:   &[u8; 32] = &my_root_public_bft_key.into();
-
-                                if them == me {
-                                    eprintln!("\x1b[91mKEY MATCH\x1b[0m: Received a SERVER_HELLO from a peer reporting the same key as me.");
-                                    break;
-                                }
-                            }
-                            if peer.pending_client_ack_snow_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_bft_key.into(), &peer.root_public_bft_key) {
-                                if let Ok(snow_state) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
-                                    if PRINT_PROTOCOL { println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr); }
-                                    finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, &peer_endpoint, peer, snow_state, nonce, ConnectionKnowledge::Known, &mut net_stats);
-                                }
-                                break;
-                            }
-                        } else if packet_type == PACKET_TYPE_SERVER_UNKNOWN_HELLO && local_msg.len() == 18 {
-                            // TODO hash
-                            if let Ok(snow_state) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
-                                if PRINT_PROTOCOL { println!("{:05}: Finished outgoing unknown handshake and got nonce {} with {}", my_port, nonce, addr); }
-
-                                finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, &peer_endpoint, peer, snow_state, nonce, ConnectionKnowledge::Unknown, &mut net_stats);
-                            }
-                            break;
-                        }
-                    }
-                }
-                if let Some(incoming) = &mut peer.pending_client_ack_snow_state {
-                    nonce = u64::from_le_bytes(raw_msg[..8].try_into().unwrap());
-                    if let Ok(length) = incoming.read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
-                        let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
-                        let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
-                        let packet_type = header.type_();
-
-                        print_packet_tag_recv(header);
-
-                        process_acks(&mut peer.transport, header);
-
-                        if packet_type == PACKET_TYPE_CLIENT_ACK {
-                            if PRINT_PROTOCOL { println!("{:05}: Finished incoming handshake and got nonce {} with {}", my_port, nonce, addr); }
-                            peer.snow_state          = peer.pending_client_ack_snow_state.take();
-                            peer.outgoing_handshake_state = None;
-                            peer.transport.ack_latest     = nonce;
-                            peer.transport.ack_field      = !0;
-                            peer.connection_knowledge    = ConnectionKnowledge::Known;
-                            break;
-                        }
-                    }
-                }
-                let mut incoming_state: snow::HandshakeState = snow::Builder::new(noise_params.clone())
-                    .local_private_key(&my_stp_keypair.private).unwrap()
-                    .build_responder().unwrap();
-                if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
-                    let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
-                    let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
-                    let packet_type = header.type_();
-
-                    print_packet_tag_recv(header);
-
-                    process_acks(&mut peer.transport, header);
-
-                    if packet_type == PACKET_TYPE_CLIENT_HELLO {
-                        let client_endpoint = STPAddress { magic1: CRYPTO_MAGIC, key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip: from_ip.into(), port: from_port };
-                        if PRINT_PROTOCOL { println!("{:05}: Server received client hello from static key = {:?}", my_port, client_endpoint); }
-                        {
-                            let them: &[u8; 32] = &peer.root_public_bft_key;
-                            let me:   &[u8; 32] = &my_root_public_bft_key.into();
-
-                            if them == me {
-                                eprintln!("\x1b[91mKEY MATCH\x1b[0m: Received a CLIENT_HELLO from a peer reporting the same key as me.");
-                                break;
-                            }
-                        }
-                        if peer.outgoing_handshake_state.is_none() || contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_bft_key.into(), &peer.root_public_bft_key) {
-
-                            // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
-                            let start_nonce = rand::random::<u64>() >> (PACKET_TAG_BITS + 1);
-
-                            let header = PacketHeader::new::<PACKET_TYPE_SERVER_HELLO>(0, 0); // @TodoHeaderAndStatus
-
-                            let mut o = 0;
-                            o += start_nonce.write_to(&mut send_buf1[o..]);
-                            o += header     .write_to(&mut send_buf1[o..]);
-
-                            let n = incoming_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
-
-                            // NOTE(Phillip): Let me know if there is an important reason to send the sock message when unsuccessfully entering stateless transport mode
-                            if let Ok(snow_state) = incoming_state.into_stateless_transport_mode() {
-                                peer.transport.nonce = start_nonce; // @Cleanup @Lazy.
-                                print_packet_tag_send(header);
-                                send_sock_msg(&ctx_str, &mut peer.transport, &sock, &peer_endpoint, &send_buf2[..n], &mut net_stats);
-                                peer.transport.nonce += 1;
-                                peer.pending_client_ack_snow_state = Some(snow_state);
-                            }
-                            break;
-                        }
-                    }
-                }
-                break;
-            }
-        } else {
-            loop {
-                if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == [0; 32] && p.endpoint.is_some() && p.endpoint.as_ref().unwrap().ip.octets() == from_ip && p.endpoint.as_ref().unwrap().port == from_port) {
-                    let peer = &mut peers[i];
-                    nonce = u64::from_le_bytes(raw_msg[..8].try_into().unwrap());
-                    if let Ok(length) = peer.snow_state.as_ref().unwrap().read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
-                        let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
-                        let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
-                        let packet_type = header.type_();
-
-                        print_packet_tag_recv(header);
-
-                        process_acks(&mut peer.transport, header);
-
-                        if peer.pending_client_ack {
-                            if packet_type == PACKET_TYPE_CLIENT_UNKNOWN_ACK {
-                                if PRINT_PROTOCOL { println!("{:05}: Finished incoming unknown handshake and got nonce {} with {}", my_port, nonce, addr); }
-                                peer.pending_client_ack = false;
-                                peer.transport.ack_latest   = nonce;
-                                peer.transport.ack_field    = !0;
-                                break;
-                            }
-                            break;
-                        }
-
-                        if nonce_is_ok(nonce, peer.transport.ack_latest, peer.transport.ack_field) {
-                            msg             = Some(&header_and_local_msg);
-                            peer_index      = Some(i);
-                            peer_knowledge  = ConnectionKnowledge::Unknown;
-                        }
-                        break;
-                    }
-                }
-                let mut incoming_state: snow::HandshakeState = snow::Builder::new(noise_params.clone())
-                    .local_private_key(&my_stp_keypair.private).unwrap()
-                    .build_responder().unwrap();
-                if let Ok(length) = incoming_state.read_message(raw_msg, &mut recv_buf2) {
-                    let header_and_local_msg = &recv_buf2[..length]; // @Duplicate
-                    let Ok(header) = PacketHeader::read_from(&header_and_local_msg[..]) else { break; }; // @TodoHeaderAndStatus
-                    let packet_type = header.type_();
-
-                    print_packet_tag_recv(header);
-
-                    if packet_type == PACKET_TYPE_CLIENT_HELLO {
-                        let client_endpoint = STPAddress { magic1: CRYPTO_MAGIC, key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip: from_ip.into(), port: from_port };
-                        if PRINT_PROTOCOL { println!("{:05}: Server received client hello from unknown peer with static key = {:?}", my_port, client_endpoint); }
-
-                        // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
-                        let start_nonce = rand::random::<u64>() >> (PACKET_TAG_BITS + 1);
-
-                        let header = PacketHeader::new::<PACKET_TYPE_SERVER_UNKNOWN_HELLO>(0, 0); // @TodoHeaderAndStatus
-
-                        let mut o = 0;
-                        o += start_nonce.write_to(&mut send_buf1[o..]);
-                        o += header     .write_to(&mut send_buf1[o..]);
-                        o += from_ip    .write_to(&mut send_buf1[o..]);
-                        o += from_port  .write_to(&mut send_buf1[o..]);
-
-                        let n = incoming_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
-
-                        // NOTE(Phillip): Let me know if there is an important reason to send the sock message when unsuccessfully entering stateless transport mode
-                        if let Ok(stateless_snow_state) = incoming_state.into_stateless_transport_mode() {
-                            let mut transport = PeerTransport::default();
-                            transport.nonce = start_nonce;
-                            print_packet_tag_send(header);
-                            send_sock_msg(&ctx_str, &mut transport, &sock, &client_endpoint, &send_buf2[..n], &mut net_stats);
-                            transport.nonce += 1;
-                            peers.push(Peer {
-                                root_public_bft_key: [0; 32],
-
-                                endpoint: Some(client_endpoint),
-                                outgoing_handshake_state: None,
-                                pending_client_ack_snow_state: None,
-                                pending_client_ack: true,
-                                snow_state: Some(stateless_snow_state),
-                                watch_dog: Instant::now(),
-                                transport,
-                                connection_knowledge: ConnectionKnowledge::Unknown,
-                                latest_status_request_height: None,
-                                latest_status: None,
-                            });
-                        }
-                        break;
-                    }
-                }
-                break;
-            }
+        if packets_received.is_empty() {
+            continue;
         }
-        if msg.is_none() { continue; }
-        let msg: &[u8] = msg.unwrap();
+        let (mut connection_key, mut peer, mut peer_knowledge, mut msg) = {
+            let (key, packet) = packets_received.remove(0);
+            (key, peers.get_mut(&key).unwrap(), ConnectionKnowledge::Unknown, packet)
+        };
+        let msg: &[u8] = &msg[..];
         if msg.len() == 0 { continue; }
         let Ok((header, status, read_o)) = read_header_and_maybe_status(&msg[..]) else {
             continue;
         };
         let packet_type = header.type_();
 
-
-        let mut duplicate_peer_identity_to_remove: Option<[u8; 32]> = None;
-        let mut peer_index_to_retain = 0;
-
-        if let Some(peer_index) = peer_index && peer_knowledge == ConnectionKnowledge::Unknown {
-            let peer_from_which_i_have_received_the_packet = &mut peers[peer_index];
-            peer_from_which_i_have_received_the_packet.watch_dog = Instant::now();
-            nonce_update(nonce, &mut peer_from_which_i_have_received_the_packet.transport.ack_latest, &mut peer_from_which_i_have_received_the_packet.transport.ack_field);
-
-            process_acks(&mut peer_from_which_i_have_received_the_packet.transport, header);
-
+        {
             if let Some(status) = status {
-                peer_from_which_i_have_received_the_packet.latest_status_request_height = Some(status.height);
-            }
-
-            match packet_type {
-                PACKET_TYPE_EMPTY => (),
-                _ => (), //println!("{:05}:  From unknown peer!   field={:016X} packet_type=0x{:X} Got '{:?}' from {}", my_port, peer.transport.ack_field, packet_type, msg, addr),
-            }
-        }
-
-        else if let Some(peer_index) = peer_index && peer_knowledge == ConnectionKnowledge::Known {
-            let peer = &mut peers[peer_index];
-            peer.watch_dog = Instant::now();
-            nonce_update(nonce, &mut peer.transport.ack_latest, &mut peer.transport.ack_field);
-
-            process_acks(&mut peer.transport, header);
-
-            // TODO: other TAGs should also cause this transition
-            if let Some(status) = status {
-                if peer.connection_knowledge == ConnectionKnowledge::Unknown {
-                    if PRINT_PROTOCOL { println!("{:05}: Got a status, this means that the other side does not consider me unknown anymore!", my_port); }
-                    peer.connection_knowledge = ConnectionKnowledge::Known;
-                }
-
                 peer.latest_status_request_height = Some(status.height);
                 peer.latest_status = Some(status);
             }
 
-            dispatch_bft_message(&mut bft_state, &roster, my_port, msg, read_o, packet_type);
-        }
-
-        if let Some(bft_key) = duplicate_peer_identity_to_remove {
-            let mut peer_to_remove_i: Option<usize> = None;
-
-            for i in 0..peers.len() {
-                if i == peer_index_to_retain {
+            const_assert!(PACKET_TYPE_PREVOTE_SIGNATURES + 1 == PACKET_TYPE_PRECOMMIT_SIGNATURES);
+            if packet_type == PACKET_TYPE_PROPOSAL_CHUNK {
+                let hdr = match PacketProposalChunkHeader::read_from(&msg[read_o..]) { Ok(v) => v, Err(err) => {
+                    eprintln!("{:05}: couldn't read proposal header: {}", my_port, err);
                     continue;
-                }
+                }};
+                let proposal_size = hdr.proposal_size as usize;
+                let chunk_i       = hdr.chunk_i       as usize;
+                let chunk_size = usize::min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_i * PROPOSAL_CHUNK_DATA_SIZE);
+                let packet_size = chunk_size + PROPOSAL_PACKET_EXTRA;
 
-                if peers[i].root_public_bft_key == bft_key {
-                    peer_to_remove_i = Some(i);
-                    break;
+                // NOTE: assume for the moment that this is the valid height, we'll check in the subsequent call
+                // ALT:  cache proposer for *current* round
+                if msg.len() == packet_size {
+                    if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
+                        let sig_o = PACKET_HEADER_SIZE + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
+                        bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
+                            &roster, roster_i, packet_type, &msg[read_o..sig_o], TMSig(msg[sig_o..sig_o+64].try_into().unwrap()));
+                    }
+                } else {
+                    eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
                 }
             }
 
-            if let Some(i) = peer_to_remove_i {
-                peers.remove(i);
+            else if packet_type == PACKET_TYPE_PREVOTE_SIGNATURES || packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES {
+                match PacketVotes::read_from(&msg[read_o..]) {
+                    Ok(packet) => {
+                        let is_precommit = packet_type - PACKET_TYPE_PREVOTE_SIGNATURES;
+                        let value_ids    = [ ValueId::NIL, packet.value_id ];
+
+                        for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
+                            // Note(Sam): We can change the format of votes to be cool and branchless after the workshop.
+                            if let Some(roster_member) = roster.get(packet.votes[vote_i].roster_i as usize) {
+                                let sign_datas   = make_vote_sign_datas(roster_member.pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
+                                let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
+                                bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
+                                    &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], TMSig(packet.votes[vote_i].sig.0));
+                            }
+                        }
+                    }
+                    Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_tag(packet_type), err),
+                }
+            }
+
+            else {
             }
         }
-    }
+   }
 }
 
-// network
-const PACKET_TYPE_EMPTY:                u8 =  0;
-const PACKET_TYPE_CLIENT_HELLO:         u8 =  1;
-const PACKET_TYPE_CLIENT_UNKNOWN_ACK:   u8 =  2;
-const PACKET_TYPE_CLIENT_ACK:           u8 =  3;
-const PACKET_TYPE_SERVER_UNKNOWN_HELLO: u8 =  4;
-const PACKET_TYPE_SERVER_HELLO:         u8 =  5;
 // consensus
 const PACKET_TYPE_PROPOSAL_CHUNK:       u8 =  7;
 const PACKET_TYPE_PREVOTE_SIGNATURES:   u8 =  8;
@@ -2545,12 +2054,6 @@ const PACKET_TAG_MASK:                  u8 = ((1 << PACKET_TAG_BITS as u64) - 1)
 
 const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     let mut names = [["<MISSING>"; 2]; PACKET_TYPE_COUNT as usize];
-    names[PACKET_TYPE_EMPTY                as usize] = ["<EMPTY>",                  "STATUS"];
-    names[PACKET_TYPE_CLIENT_HELLO         as usize] = ["CLIENT_HELLO",             "STATUS+CLIENT_HELLO"];
-    names[PACKET_TYPE_CLIENT_UNKNOWN_ACK   as usize] = ["CLIENT_UNKNOWN_ACK",       "STATUS+CLIENT_UNKNOWN_ACK"];
-    names[PACKET_TYPE_CLIENT_ACK           as usize] = ["CLIENT_ACK",               "STATUS+CLIENT_ACK"];
-    names[PACKET_TYPE_SERVER_UNKNOWN_HELLO as usize] = ["SERVER_UNKNOWN_HELLO",     "STATUS+SERVER_UNKNOWN_HELLO"];
-    names[PACKET_TYPE_SERVER_HELLO         as usize] = ["SERVER_HELLO",             "STATUS+SERVER_HELLO"];
     names[PACKET_TYPE_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",           "STATUS+PROPOSAL_CHUNK"];
     names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES",     "STATUS+PRECOMMIT_SIGNATURES"];
@@ -2630,44 +2133,36 @@ impl PacketStatus {
 const PACKET_HEADER_SIZE: usize = 8 + 8; // 16
 #[derive(Debug, Clone, Copy)]
 struct PacketHeader {
-    tag_and_ack: u64,
-    ack_field: u64,
+    tag: u64,
 }
 impl PacketHeader {
     const fn assert_valid_tag<const TAG: u8>() {
         assert!((TAG & ! PACKET_TYPE_MASK) == 0);
     }
 
-    pub fn new<const TAG: u8>(ack_latest: u64, ack_field: u64) -> PacketHeader {
+    pub fn new<const TAG: u8>() -> PacketHeader {
         Self::assert_valid_tag::<TAG>();
-        Self::new_(TAG, ack_latest, ack_field)
+        Self::new_(TAG)
     }
-    pub fn new_(tag: u8, ack_latest: u64, ack_field: u64) -> PacketHeader {
-        PacketHeader {
-            tag_and_ack: tag as u64 | (ack_latest << PACKET_TAG_BITS),
-            ack_field,
-        }
+    pub fn new_(tag: u8) -> PacketHeader {
+        PacketHeader { tag: tag as u64 }
     }
 
-    pub fn has_status(&self) -> bool { self.tag_and_ack as u8  & PACKET_TAG_STATUS_FLAG != 0 }
-    pub fn type_     (&self) -> u8   { self.tag_and_ack as u8  & PACKET_TYPE_MASK            }
-    pub fn tag       (&self) -> u8   { self.tag_and_ack as u8  & PACKET_TAG_MASK             }
-    pub fn ack       (&self) -> u64  { self.tag_and_ack       >> PACKET_TAG_BITS }
+    pub fn has_status(&self) -> bool { (self.tag as u8) & PACKET_TAG_STATUS_FLAG != 0 }
+    pub fn type_     (&self) -> u8   { (self.tag as u8) & PACKET_TYPE_MASK            }
+    pub fn tag       (&self) -> u8   { (self.tag as u8) & PACKET_TAG_MASK             }
 
     pub fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = 0;
-        o += self.tag_and_ack.write_to(&mut buf[o..]);
-        o += self.ack_field  .write_to(&mut buf[o..]);
+        o += self.tag.write_to(&mut buf[o..]);
+        o += 0u64.write_to(&mut buf[o..]);
         o
     }
 
     pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
-        let tag_and_ack = r.read_u64::<LittleEndian>()?;
-        let ack_field   = r.read_u64::<LittleEndian>()?;
-        Ok(Self {
-            tag_and_ack,
-            ack_field,
-        })
+        let tag = r.read_u64::<LittleEndian>()?;
+        r.read_u64::<LittleEndian>()?;
+        Ok(Self { tag })
     }
 }
 
@@ -2733,55 +2228,6 @@ impl PacketVotes {
 
 const PROPOSAL_PACKET_EXTRA:    usize = (PACKET_HEADER_SIZE + 56 + 64);
 const PROPOSAL_CHUNK_DATA_SIZE: usize = PATH_MTU - PROPOSAL_PACKET_EXTRA;
-
-fn dispatch_bft_message(bft_state: &mut TMState, roster: &[SortedRosterMember], my_port: u16, msg: &[u8], read_o: usize, packet_type: u8) {
-    const_assert!(PACKET_TYPE_PREVOTE_SIGNATURES + 1 == PACKET_TYPE_PRECOMMIT_SIGNATURES);
-    match packet_type {
-        PACKET_TYPE_PROPOSAL_CHUNK => {
-            let hdr = match PacketProposalChunkHeader::read_from(&msg[read_o..]) { Ok(v)=>v, Err(err)=>{
-                eprintln!("{:05}: couldn't read proposal header: {}", my_port, err);
-                return;
-            }};
-            let proposal_size = hdr.proposal_size as usize;
-            let chunk_i       = hdr.chunk_i       as usize;
-            let chunk_size = usize::min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_i * PROPOSAL_CHUNK_DATA_SIZE);
-            let packet_size = chunk_size + PROPOSAL_PACKET_EXTRA;
-
-            // NOTE: assume for the moment that this is the valid height, we'll check in the subsequent call
-            // ALT:  cache proposer for *current* round
-            if msg.len() == packet_size {
-                if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
-                    let sig_o = PACKET_HEADER_SIZE + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
-                    bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
-                        &roster, roster_i, packet_type, &msg[read_o..sig_o], TMSig(msg[sig_o..sig_o+64].try_into().unwrap()));
-                }
-            } else {
-                eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
-            }
-        }
-
-        PACKET_TYPE_PREVOTE_SIGNATURES | PACKET_TYPE_PRECOMMIT_SIGNATURES => match PacketVotes::read_from(&msg[read_o..]) {
-            Ok(packet) => {
-                let is_precommit = packet_type - PACKET_TYPE_PREVOTE_SIGNATURES;
-                let value_ids    = [ ValueId::NIL, packet.value_id ];
-
-                for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
-                    // Note(Sam): We can change the format of votes to be cool and branchless after the workshop.
-                    if let Some(roster_member) = roster.get(packet.votes[vote_i].roster_i as usize) {
-                        let sign_datas   = make_vote_sign_datas(roster_member.pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
-                        let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
-                        bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
-                            &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], TMSig(packet.votes[vote_i].sig.0));
-                    }
-                }
-            }
-            Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_tag(packet_type), err),
-        }
-
-        PACKET_TYPE_EMPTY => {}
-        _ => {}
-    }
-}
 
 // NOTE(azmr): this is:
 // - conservative in terms of max chunks, value_id, & arrival order
@@ -3049,13 +2495,6 @@ mod tests {
         }
         // let (Some(i), _) = TMState::proposer_from_height_round(&roster[..2], 100, heig) else { panic!(); };
         // println!("BFT Proposer at {}.{}: {}", 2, 2, i);
-    }
-
-    #[test]
-    fn check_nonce_is_ok() {
-        assert!(nonce_is_ok(124, 12, !0));
-        assert!(!nonce_is_ok(12, 124, !0));
-        assert!(nonce_is_ok(120, 124, 0xffff_ffff_ffff_ffef));
     }
 
     #[test]

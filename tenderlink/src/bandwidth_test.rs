@@ -214,6 +214,9 @@ impl ConnectionKey {
     pub fn is_ipv4(&self) -> bool { self.ip.to_ipv4_mapped().is_some() }
     pub fn is_ipv6(&self) -> bool { self.ip.to_ipv4_mapped().is_none() }
 }
+impl Default for ConnectionKey {
+    fn default() -> Self { Self { ip: Ipv6Addr::UNSPECIFIED, port: 0, key_15_bits: 0 } }
+}
 
 #[derive(Debug)]
 pub struct ConnectionTrackingData {
@@ -239,6 +242,15 @@ impl ConnectionTrackingData {
 }
 
 pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, my_keypairs: &Vec<&IdentityKeyPair>, address: &STPAddress) -> Result<(), String> {
+    let key = ConnectionKey {
+        ip: address.ip,
+        port: address.port,
+        key_15_bits: load_u16(&address.key[0..2]) << 1
+    };
+    if connections_map.contains_key(&key) {
+        return Err(format!("Error: Already connected to {:?}.", address)); // Ok(());
+    }
+
     for keypair in my_keypairs {
         if address.magic1 == keypair.magic1 {
             connect_to_endpoint(socket, connections_map, keypair, address);
