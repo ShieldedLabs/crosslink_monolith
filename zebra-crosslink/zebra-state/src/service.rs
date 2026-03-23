@@ -223,7 +223,7 @@ pub struct ReadStateService {
     /// once the queues have received all their parent blocks.
     ///
     /// Used to check for panics when writing blocks.
-    block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
+    block_write_task: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
 
 impl Drop for StateService {
@@ -279,11 +279,11 @@ impl Drop for ReadStateService {
                 debug!("waiting for the block write task to finish");
 
                 // TODO: move this into a check_for_panics() method
-                if let Err(thread_panic) = block_write_task_handle.join() {
-                    std::panic::resume_unwind(thread_panic);
-                } else {
-                    debug!("shutting down the state because the block write task has finished");
-                }
+                // if let Err(thread_panic) = block_write_task_handle.join() {
+                //     std::panic::resume_unwind(thread_panic);
+                // } else {
+                //     debug!("shutting down the state because the block write task has finished");
+                // }
             }
         } else {
             // Even if we're not the last database user, try shutting it down.
@@ -346,7 +346,7 @@ impl StateService {
 
         let read_service = ReadStateService::new(
             &finalized_state,
-            block_write_task,
+            block_write_task.map(|x| Arc::new(x)),
             non_finalized_state_receiver,
         );
 
@@ -915,7 +915,7 @@ impl ReadStateService {
     /// and a watch channel for updating the shared recent non-finalized chain.
     pub(crate) fn new(
         finalized_state: &FinalizedState,
-        block_write_task: Option<Arc<std::thread::JoinHandle<()>>>,
+        block_write_task: Option<Arc<tokio::task::JoinHandle<()>>>,
         non_finalized_state_receiver: watch::Receiver<NonFinalizedState>,
     ) -> Self {
         let read_service = Self {
@@ -1340,9 +1340,9 @@ impl Service<ReadRequest> for ReadStateService {
             if block_write_task.is_finished() {
                 if let Some(block_write_task) = Arc::into_inner(block_write_task) {
                     // We are the last state with a reference to this task, so we can propagate any panics
-                    if let Err(thread_panic) = block_write_task.join() {
-                        std::panic::resume_unwind(thread_panic);
-                    }
+                    // if let Err(thread_panic) = block_write_task.join() {
+                    //     std::panic::resume_unwind(thread_panic);
+                    // }
                 }
             } else {
                 // It hasn't finished, so we need to put it back

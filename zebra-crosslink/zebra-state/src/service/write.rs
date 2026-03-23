@@ -188,7 +188,7 @@ impl BlockWriteSender {
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
-        Option<Arc<std::thread::JoinHandle<()>>>,
+        Option<tokio::task::JoinHandle<()>>,
     ) {
         // Security: The number of blocks in these channels is limited by
         //           the syncer and inbound lookahead limits.
@@ -200,8 +200,9 @@ impl BlockWriteSender {
             tokio::sync::mpsc::unbounded_channel();
 
         let span = Span::current();
-        let task = std::thread::spawn(move || {
-            span.in_scope(|| {
+        
+        let task = tokio::spawn(async move {
+            span.in_scope(|| async {
                 WriteBlockWorkerTask {
                     finalized_block_write_receiver,
                     non_finalized_block_write_receiver,
@@ -212,7 +213,9 @@ impl BlockWriteSender {
                     non_finalized_state_sender,
                 }
                 .run()
+                .await
             })
+            .await
         });
 
         (
@@ -221,7 +224,7 @@ impl BlockWriteSender {
                 finalized: Some(finalized_block_write_sender),
             },
             invalid_block_write_reset_receiver,
-            Some(Arc::new(task)),
+            Some(task),
         )
     }
 }
@@ -237,7 +240,7 @@ impl WriteBlockWorkerTask {
             network = %self.non_finalized_state.network
         )
     )]
-    pub fn run(mut self) {
+    pub async fn run(mut self) {
         let Self {
             finalized_block_write_receiver,
             non_finalized_block_write_receiver,
@@ -253,7 +256,7 @@ impl WriteBlockWorkerTask {
 
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
-        while let Some(ordered_block) = finalized_block_write_receiver.blocking_recv() {
+        while let Some(ordered_block) = finalized_block_write_receiver.recv().await {
             // TODO: split these checks into separate functions
 
             if invalid_block_reset_sender.is_closed() {
@@ -336,7 +339,7 @@ impl WriteBlockWorkerTask {
         let mut parent_error_map: IndexMap<block::Hash, CommitSemanticallyVerifiedError> =
             IndexMap::new();
 
-        while let Some(msg) = non_finalized_block_write_receiver.blocking_recv() {
+        while let Some(msg) = non_finalized_block_write_receiver.recv().await {
             let queued_child_and_rsp_tx = match msg {
                 NonFinalizedWriteMessage::Commit(queued_child) => Some(queued_child),
                 NonFinalizedWriteMessage::CrosslinkFinalized(hash, rsp_tx) => {
@@ -353,6 +356,7 @@ impl WriteBlockWorkerTask {
                         info!("finalized {}, which implicitly finalizes:", hash);
                         for i in 0..newly_finalized_blocks.len() {
                             let finalizable_block = non_finalized_state.finalize();
+                            crate::new_network::push_block_event(crate::new_network::BlockEvent::CrosslinkFinalized(finalizable_block.inner_block().hash().0)).await;
                             match finalized_state.commit_finalized_direct(
                                 finalizable_block,
                                 None,
@@ -412,6 +416,7 @@ impl WriteBlockWorkerTask {
             };
 
             let child_hash = queued_child.hash;
+            crate::new_network::push_block_event(crate::new_network::BlockEvent::Dequeued(child_hash.0)).await;
             let parent_hash = queued_child.block.header.previous_block_hash;
             let parent_error = parent_error_map.get(&parent_hash);
 
@@ -453,6 +458,7 @@ impl WriteBlockWorkerTask {
                 // Skip the things we only need to do for successfully committed blocks
                 continue;
             }
+            crate::new_network::push_block_event(crate::new_network::BlockEvent::Committed(child_hash.0)).await;
 
             // Committing blocks to the finalized state keeps the same chain,
             // so we can update the chain seen by the rest of the application now.
@@ -477,6 +483,7 @@ impl WriteBlockWorkerTask {
             {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
+                crate::new_network::push_block_event(crate::new_network::BlockEvent::TradFinalized(contextually_verified_with_trees.inner_block().hash().0)).await;
                 prev_finalized_note_commitment_trees = finalized_state
                             .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), "commit contextually-verified request")
                             .expect(
