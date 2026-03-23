@@ -190,37 +190,6 @@ impl std::fmt::Debug for ClosureToPushDecidedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushDecidedBlock(..)") }
 }
 #[derive(Clone)]
-pub struct ClosureToGetHistoricalBlock(pub Arc<dyn Fn(u64)-> core::pin::Pin<Box<dyn Future<Output = (BlockValue, FatPointerToBftBlock3)> + Send>> + Send + Sync + 'static>);
-impl std::fmt::Debug for ClosureToGetHistoricalBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToGetHistoricalBlock(..)") }
-}
-#[derive(Clone)]
-pub struct ClosureToGetPow(pub Arc<dyn Fn([u8; 32])-> core::pin::Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>> + Send + Sync + 'static>); // @Phillip
-impl std::fmt::Debug for ClosureToGetPow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToGetPow(..)") }
-}
-#[derive(Clone)]
-pub struct ClosureToParsePow(pub Arc<dyn Fn([u8; 32], Vec<u8>)-> core::pin::Pin<Box<dyn Future<Output =     Option<Arc<zebra_chain::block::Block>>     > + Send>> + Send + Sync + 'static>); // @Phillip
-impl std::fmt::Debug for ClosureToParsePow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToParsePow(..)") }
-}
-#[derive(Clone)]
-pub struct ClosureIsPoWInChain(pub Arc<dyn Fn([u8; 32])-> core::pin::Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>); // @Phillip
-impl std::fmt::Debug for ClosureIsPoWInChain {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureIsPoWInChain(..)") }
-}
-#[derive(Clone)]
-pub struct ClosureToPushPow(pub Arc<dyn Fn(Arc<zebra_chain::block::Block>)-> core::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>); // @Phillip
-impl std::fmt::Debug for ClosureToPushPow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushPow(..)") }
-}
-#[derive(Clone)]
-pub struct ClosureToUpdateRosterCmd(pub Arc<dyn Fn(Option<String>)-> core::pin::Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync + 'static>);
-impl std::fmt::Debug for ClosureToUpdateRosterCmd {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToUpdateRosterCmd(..)") }
-}
-
-#[derive(Clone)]
 pub struct ClosureToUpdatePeers(pub Arc<dyn Fn(Vec<PeerInfo>) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToUpdatePeers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToUpdatePeers(..)") }
@@ -632,12 +601,6 @@ struct TMState {
     propose_closure: ClosureToProposeNewBlock,
     validate_closure: ClosureToValidateProposedBlock,
     push_block_closure: ClosureToPushDecidedBlock,
-    get_block_closure: ClosureToGetHistoricalBlock,
-
-    get_pow_closure: ClosureToGetPow,
-    parse_pow_closure: ClosureToParsePow,
-    is_pow_in_chain_closure: ClosureIsPoWInChain,
-    push_pow_closure: ClosureToPushPow,
 
     update_peers_cmd_closure: ClosureToUpdatePeers,
 }
@@ -647,11 +610,6 @@ impl TMState {
         propose_closure: ClosureToProposeNewBlock,
         validate_closure: ClosureToValidateProposedBlock,
         push_block_closure: ClosureToPushDecidedBlock,
-        get_block_closure: ClosureToGetHistoricalBlock,
-        get_pow_closure: ClosureToGetPow,
-        parse_pow_closure: ClosureToParsePow,
-        is_pow_in_chain_closure: ClosureIsPoWInChain,
-        push_pow_closure: ClosureToPushPow,
         update_peers_cmd_closure: ClosureToUpdatePeers,
     ) -> Self {
         Self {
@@ -671,11 +629,6 @@ impl TMState {
             propose_closure,
             validate_closure,
             push_block_closure,
-            get_block_closure,
-            get_pow_closure,
-            parse_pow_closure,
-            is_pow_in_chain_closure,
-            push_pow_closure,
             update_peers_cmd_closure,
         }
     }
@@ -1583,31 +1536,6 @@ async fn instance(
                 ret
             })
         })),
-        ClosureToGetHistoricalBlock(Arc::new(move |height| {
-            let decisions = Arc::clone(&decisions2);
-            Box::pin(async move {
-                decisions.lock().unwrap()[height as usize].clone()
-            })
-        })),
-        ClosureToGetPow(Arc::new(move |hash| { // @Phillip
-            Box::pin(async move {
-                None
-            })
-        })),
-        ClosureToParsePow(Arc::new(move |hash, bytes| { // @Phillip
-            Box::pin(async move {
-                None
-            })
-        })),
-        ClosureIsPoWInChain(Arc::new(move |block| { // @Phillip
-            Box::pin(async move {
-                true
-            })
-        })),
-        ClosureToPushPow(Arc::new(move |block| { // @Phillip
-            Box::pin(async move {
-            })
-        })),
         ClosureToUpdatePeers(Arc::new(move |_all_peers| { Box::pin(async move {
         })})),
 
@@ -1663,11 +1591,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          propose_closure: ClosureToProposeNewBlock,
                          validate_closure: ClosureToValidateProposedBlock,
                          push_block_closure: ClosureToPushDecidedBlock,
-                         get_block_closure: ClosureToGetHistoricalBlock,
-                         get_pow_closure: ClosureToGetPow,
-                         parse_pow_closure: ClosureToParsePow,
-                         is_pow_in_chain_closure: ClosureIsPoWInChain,
-                         push_pow_closure: ClosureToPushPow,
                          peer_cmd_closure: ClosureToUpdatePeers,
                          ingest_startup_data: Vec<RoundData>,
                         ) -> std::io::Result<()> {
@@ -1743,11 +1666,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         propose_closure,
         validate_closure,
         push_block_closure,
-        get_block_closure,
-        get_pow_closure,
-        parse_pow_closure,
-        is_pow_in_chain_closure,
-        push_pow_closure,
         peer_cmd_closure,
     ); // TODO: double-check this is the right key
 

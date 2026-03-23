@@ -1068,59 +1068,6 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     .await
                 })
             })),
-            tenderlink::ClosureToGetHistoricalBlock(Arc::new(move |height| {
-                Box::pin(async move {
-                    panic!();
-                })
-            })),
-            tenderlink::ClosureToGetPow(Arc::new(move |hash| { // @Phillip
-                let tfl_handle5 = tfl_handle5.clone();
-                Box::pin(async move {
-                    if let Some(block) = block_from_hash(&tfl_handle5.call, hash.into()).await {
-                        let mut serialized = Vec::new();
-                        if let Ok(()) = block.as_ref().zcash_serialize(&mut serialized) {
-                            let bytes = serialized.to_vec();
-                            Some(bytes)
-                        } else {
-                            eprintln!("PowLink: \x1b[93mSerializing failed\x1b[0m for PoW block with hash {:?}.", hash);
-                            None
-                        }
-                    } else {
-                        eprintln!("PowLink: \x1b[93mCouldn't find PoW block\x1b[0m  for hash {:?}.", hash);
-                        None
-                    }
-                })
-            })),
-            tenderlink::ClosureToParsePow(Arc::new(move |hash, bytes| { // @Phillip
-                Box::pin(async move {
-                    let mut slice = &bytes[..];
-                    // let slice_ref = &mut slice;
-                    if let Ok(block) = Block::zcash_deserialize(&mut slice) {
-                        let check_hash = block.hash();
-                        if check_hash.0 == hash {
-                            Some(Arc::new(block))
-                        } else {
-                            eprintln!("PowLink: Serializing the bytes succeeded but the \x1b[93mblock hash was different\x1b[0m.");
-                            None
-                        }
-                    } else {
-                        eprintln!("PowLink: Deserializing the bytes \x1b[93mfailed\x1b[0m.");
-                        None
-                    }
-                })
-            })),
-            tenderlink::ClosureIsPoWInChain(Arc::new(move |hash| { // @Phillip
-                let tfl_handle6 = tfl_handle6.clone();
-                Box::pin(async move {
-                    is_block_known(&tfl_handle6.call, BlockHash(hash)).await
-                })
-            })),
-            tenderlink::ClosureToPushPow(Arc::new(move |block| { // @Phillip
-                let tfl_handle7 = tfl_handle7.clone();
-                Box::pin(async move {
-                    (tfl_handle7.call.force_feed_pow)(block.clone()).await;
-                })
-            })),
             tenderlink::ClosureToUpdatePeers(Arc::new(move |all_peers| {
                 let tfl_handle = tfl_handle8.clone();
                 Box::pin(async move {
