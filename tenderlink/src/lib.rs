@@ -2494,52 +2494,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 peer.latest_status = Some(status);
             }
 
-            const_assert!(PACKET_TYPE_PREVOTE_SIGNATURES + 1 == PACKET_TYPE_PRECOMMIT_SIGNATURES);
-            match packet_type {
-                PACKET_TYPE_PROPOSAL_CHUNK => {
-                    let hdr = match PacketProposalChunkHeader::read_from(&msg[read_o..]) { Ok(v)=>v, Err(err)=>{
-                        eprintln!("{:05}: couldn't read proposal header: {}", my_port, err);
-                        continue;
-                    }};
-                    let proposal_size = hdr.proposal_size as usize;
-                    let chunk_i       = hdr.chunk_i       as usize;
-                    let chunk_size = usize::min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_i * PROPOSAL_CHUNK_DATA_SIZE);
-                    let packet_size = chunk_size + PROPOSAL_PACKET_EXTRA;
-
-                    // NOTE: assume for the moment that this is the valid height, we'll check in the subsequent call
-                    // ALT:  cache proposer for *current* round
-                    if msg.len() == packet_size {
-                        if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
-                            let sig_o = PACKET_HEADER_SIZE + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
-                            bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
-                                &roster, roster_i, packet_type, &msg[read_o..sig_o], TMSig(msg[sig_o..sig_o+64].try_into().unwrap()));
-                        }
-                    } else {
-                        eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
-                    }
-                }
-
-                PACKET_TYPE_PREVOTE_SIGNATURES | PACKET_TYPE_PRECOMMIT_SIGNATURES => match PacketVotes::read_from(&msg[read_o..]) {
-                    Ok(packet) => {
-                        let is_precommit = packet_type - PACKET_TYPE_PREVOTE_SIGNATURES;
-                        let value_ids    = [ ValueId::NIL, packet.value_id ];
-
-                        for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
-                            // Note(Sam): We can change the format of votes to be cool and branchless after the workshop.
-                            if let Some(roster_member) = roster.get(packet.votes[vote_i].roster_i as usize) {
-                                let sign_datas   = make_vote_sign_datas(roster_member.pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
-                                let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
-                                bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
-                                    &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], TMSig(packet.votes[vote_i].sig.0));
-                            }
-                        }
-                    }
-                    Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_tag(packet_type), err),
-                }
-
-                PACKET_TYPE_EMPTY => {}
-                _ => {} // println!("{}:  From known peer!   field={:016X} Got '{:?}' from {}", my_port, peer.transport.ack_field, msg, addr);
-            }
+            dispatch_bft_message(&mut bft_state, &roster, my_port, msg, read_o, packet_type);
         }
 
         if let Some(bft_key) = duplicate_peer_identity_to_remove {
@@ -2778,6 +2733,55 @@ impl PacketVotes {
 
 const PROPOSAL_PACKET_EXTRA:    usize = (PACKET_HEADER_SIZE + 56 + 64);
 const PROPOSAL_CHUNK_DATA_SIZE: usize = PATH_MTU - PROPOSAL_PACKET_EXTRA;
+
+fn dispatch_bft_message(bft_state: &mut TMState, roster: &[SortedRosterMember], my_port: u16, msg: &[u8], read_o: usize, packet_type: u8) {
+    const_assert!(PACKET_TYPE_PREVOTE_SIGNATURES + 1 == PACKET_TYPE_PRECOMMIT_SIGNATURES);
+    match packet_type {
+        PACKET_TYPE_PROPOSAL_CHUNK => {
+            let hdr = match PacketProposalChunkHeader::read_from(&msg[read_o..]) { Ok(v)=>v, Err(err)=>{
+                eprintln!("{:05}: couldn't read proposal header: {}", my_port, err);
+                return;
+            }};
+            let proposal_size = hdr.proposal_size as usize;
+            let chunk_i       = hdr.chunk_i       as usize;
+            let chunk_size = usize::min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_i * PROPOSAL_CHUNK_DATA_SIZE);
+            let packet_size = chunk_size + PROPOSAL_PACKET_EXTRA;
+
+            // NOTE: assume for the moment that this is the valid height, we'll check in the subsequent call
+            // ALT:  cache proposer for *current* round
+            if msg.len() == packet_size {
+                if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
+                    let sig_o = PACKET_HEADER_SIZE + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
+                    bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
+                        &roster, roster_i, packet_type, &msg[read_o..sig_o], TMSig(msg[sig_o..sig_o+64].try_into().unwrap()));
+                }
+            } else {
+                eprintln!("{:05}: couldn't read proposal chunk: incorrect size {}", my_port, msg.len());
+            }
+        }
+
+        PACKET_TYPE_PREVOTE_SIGNATURES | PACKET_TYPE_PRECOMMIT_SIGNATURES => match PacketVotes::read_from(&msg[read_o..]) {
+            Ok(packet) => {
+                let is_precommit = packet_type - PACKET_TYPE_PREVOTE_SIGNATURES;
+                let value_ids    = [ ValueId::NIL, packet.value_id ];
+
+                for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
+                    // Note(Sam): We can change the format of votes to be cool and branchless after the workshop.
+                    if let Some(roster_member) = roster.get(packet.votes[vote_i].roster_i as usize) {
+                        let sign_datas   = make_vote_sign_datas(roster_member.pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
+                        let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
+                        bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
+                            &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], TMSig(packet.votes[vote_i].sig.0));
+                    }
+                }
+            }
+            Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_tag(packet_type), err),
+        }
+
+        PACKET_TYPE_EMPTY => {}
+        _ => {}
+    }
+}
 
 // NOTE(azmr): this is:
 // - conservative in terms of max chunks, value_id, & arrival order
