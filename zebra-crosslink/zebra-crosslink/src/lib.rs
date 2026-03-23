@@ -14,7 +14,7 @@ use strum_macros::{EnumCount, EnumIter};
 
 use tenderlink::SortedRosterMember;
 use tracing_futures::WithSubscriber;
-use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
+use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind};
 use ed25519_zebra::VerificationKeyBytes;
 use zebra_chain::serialization::{
     SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
@@ -53,7 +53,7 @@ pub static TEST_INSTR_C: Mutex<usize> = Mutex::new(0);
 pub static TEST_MODE: Mutex<bool> = Mutex::new(false);
 pub static TEST_FAILED: Mutex<i32> = Mutex::new(0);
 pub static TEST_FAILED_INSTR_IDXS: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
-pub static TEST_CHECK_ASSERT: Mutex<bool> = Mutex::new(false);
+pub static TEST_CHECK_ASSERT: Mutex<u8> = Mutex::new(1);
 pub static TEST_INSTR_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 pub static TEST_INSTR_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 pub static TEST_INSTRS: Mutex<Vec<test_format::TFInstr>> = Mutex::new(Vec::new());
@@ -97,7 +97,7 @@ pub fn dump_test_instrs() {
             &test_format::TFInstr::string_from_instr(bytes, &instrs[instr_i])
         );
         if let Some(msg) = msg {
-            eprintln!("    {}", msg);
+            eprintln!("      {}", msg);
         }
     }
 }
@@ -890,44 +890,9 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
     {
         use tenderlink::{SecureUdpEndpoint, bandwidth_test::IdentityKeyPair};
+        use tenderlink::{parse_to_ipv6_bytes, addr_string_to_stuff};
 
         use std::net::{Ipv6Addr, SocketAddr};
-
-        /// Parses "IP[:port]" (IPv4 or bracketed IPv6 with port) into (16-byte IPv6, port)
-        fn parse_to_ipv6_bytes(s: &str) -> Result<([u8; 16], u16), std::net::AddrParseError> {
-            let sa: SocketAddr = s.parse()?;
-
-            let (ip6, port) = match sa {
-                SocketAddr::V4(v4) => {
-                    // Map IPv4 to IPv6-mapped ::ffff:a.b.c.d
-                    (v4.ip().to_ipv6_mapped(), v4.port())
-                    // (Alternatively on newer Rust: (v4.ip().to_ipv6_mapped(), v4.port()))
-                }
-                SocketAddr::V6(v6) => (*v6.ip(), v6.port()),
-            };
-
-            Ok((ip6.octets(), port))
-        }
-
-        fn addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, SecureUdpEndpoint) {
-            let mut hasher = DefaultHasher::new();
-            hasher.write(addr.as_bytes());
-            let seed = hasher.finish();
-
-            let mut other_seed = [0; 32];
-            rand_chacha::ChaCha20Rng::seed_from_u64(seed).fill(&mut other_seed);
-            let static_keypair = tenderlink::bandwidth_test::new_keypair_from_connect_magic1_with_seed(tenderlink::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, other_seed).unwrap();
-
-            let (ip, port) = parse_to_ipv6_bytes(addr).unwrap();
-            (
-                static_keypair.clone(),
-                SecureUdpEndpoint {
-                    public_key: static_keypair.clone().public.try_into().unwrap(),
-                    ip_address: ip,
-                    port,
-                },
-            )
-        }
 
         let mut static_keypair_maybe = None;
         let mut endpoint_maybe = None;
@@ -962,13 +927,12 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             .validators_at_current_height
             .clone();
 
+        use tenderlink::{FinalizerPeerAddress, PubKeyID};
         // Note(Sam): We do not support human names in the start config for now.
-        let evidence = unsorted_roster
+        let finalizer_peer_addresses: Vec<FinalizerPeerAddress> = unsorted_roster
             .iter()
             .enumerate()
             .map(|(i, m)| {
-                use tenderlink::EndpointEvidence;
-
                 let string = format!("{:?}", m);
                 let mut hasher = DefaultHasher::new();
                 hasher.write(string.as_bytes());
@@ -976,9 +940,9 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 let string = format!("127.0.0.1:{}", seed % 4000);
                 let (a, b) =
                     addr_string_to_stuff(&config.malachite_peers.get(i).unwrap_or_else(|| &string));
-                EndpointEvidence {
-                    endpoint: b,
-                    root_public_bft_key: m.public_key.into(),
+                FinalizerPeerAddress {
+                    bft_pk: PubKeyID(m.public_key.into()),
+                    address: b,
                 }
             })
             .collect();
@@ -1065,7 +1029,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             static_keypair_maybe,
             endpoint_maybe,
             roster,
-            evidence,
+            finalizer_peer_addresses,
             None,
             tenderlink::ClosureToProposeNewBlock(Arc::new(move || {
                 let tfl_handle1 = tfl_handle1.clone();

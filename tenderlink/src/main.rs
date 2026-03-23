@@ -35,14 +35,10 @@ fn main() {
 
     tenderlink::run_instances(if args.contains(&"p2p".to_string()) { 0 } else { 1 });
 
-    let sk = [7, 11, 99, 220, 101, 143, 113,   4, 242, 136,  58, 150, 223, 186, 106, 203,
-             67, 18, 48,  96, 176,  69, 152, 173, 224,  46, 206, 156, 217,  31, 170, 165];
+    let seed = [7, 11, 99, 220, 101, 143, 113,   4, 242, 136,  58, 150, 223, 186, 106, 203,
+               67, 18, 48,  96, 176,  69, 152, 173, 224,  46, 206, 156, 217,  31, 170, 165];
 
-    let seeder_keypair = bandwidth_test::IdentityKeyPair {
-        magic1: SEEDER_CRYPTO,
-        private: sk.to_vec(),
-        public: x25519_dalek::x25519(sk, x25519_dalek::X25519_BASEPOINT_BYTES).to_vec(),
-    };
+    let seeder_keypair = bandwidth_test::new_keypair_from_connect_magic1_with_seed(SEEDER_CRYPTO, seed).unwrap();
 
     let port: u16 = {
         if let Some(i) = args.iter().position(|x| x == "-port") {

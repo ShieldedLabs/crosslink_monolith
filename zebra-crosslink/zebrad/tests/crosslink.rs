@@ -60,6 +60,7 @@ pub fn test_start() {
             Some(std::sync::Arc::new(base))
         };
         *zebra_crosslink::TEST_MODE.lock().unwrap() = true;
+        *zebra_crosslink::TEST_CHECK_ASSERT.lock().unwrap() = 0;
         *zebra_crosslink::TEST_SHUTDOWN_FN.lock().unwrap() = || {
             zebra_crosslink::dump_test_instrs();
             // APPLICATION.shutdown(abscissa_core::Shutdown::Graceful);
@@ -258,12 +259,24 @@ fn crosslink_expect_pos_height_after_push() {
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    for i in 0..REGTEST_BLOCK_BYTES.len() {
-        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
+    let nw = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen = BlockGen::init_at_genesis_plus_1(nw, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+
+    let mut pow_common = vec![gen.tip.clone()];
+    for _ in 2..8 {
+        pow_common.push(gen.next_block(&miner_addr));
     }
-    for i in 0..REGTEST_POS_BLOCK_BYTES.len() {
-        tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[i], 0);
-        tf.push_instr_expect_pos_chain_length(1 + i, 0);
+    for pow in &pow_common {
+        tf.push_instr_load_pow(pow, 0);
+    }
+    tf.push_instr_expect_pow_chain_length(8, 0);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    for i in 1..5 {
+        let bft = next_pos(pos_h, fat_ptr, &pow_common[i..i+3], &[]);
+        tf.push_instr_load_pos(&bft, 0);
+        tf.push_instr_expect_pos_chain_length((*pos_h).try_into().unwrap(), 0);
     }
 
     // let write_ok = tf.write_to_file(Path::new("crosslink_expect_pos_height_after_push.zeccltf"));
@@ -276,13 +289,30 @@ fn crosslink_expect_pos_out_of_order() {
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    for i in 0..5 {
-        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
-    }
 
-    tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[0], 0);
-    tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[2], SHOULD_FAIL);
-    tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[1], 0);
+    let nw = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen = BlockGen::init_at_genesis_plus_1(nw, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+
+    let mut pow_common = vec![gen.tip.clone()];
+    for _ in 2..6 {
+        pow_common.push(gen.next_block(&miner_addr));
+    }
+    for pow in &pow_common {
+        tf.push_instr_load_pow(pow, 0);
+    }
+    tf.push_instr_expect_pow_chain_length(6, 0);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let pos = [
+        next_pos(pos_h, fat_ptr, &pow_common[0..=2], &[]),
+        next_pos(pos_h, fat_ptr, &pow_common[1..=3], &[]),
+        next_pos(pos_h, fat_ptr, &pow_common[2..=4], &[]),
+    ];
+
+    tf.push_instr_load_pos(&pos[0], 0);
+    tf.push_instr_load_pos(&pos[2], SHOULD_FAIL);
+    tf.push_instr_load_pos(&pos[1], 0);
     tf.push_instr_expect_pos_chain_length(2, 0);
 
     test_bytes(tf.write_to_bytes());
@@ -293,11 +323,24 @@ fn crosslink_expect_pos_push_same_block_twice_only_accepted_once() {
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    for i in 0..REGTEST_BLOCK_BYTES.len() {
-        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
+    let nw = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&nw, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen = BlockGen::init_at_genesis_plus_1(nw, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+
+    let mut pow_common = vec![gen.tip.clone()];
+    for _ in 2..4 {
+        pow_common.push(gen.next_block(&miner_addr));
     }
-    tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[0], 0);
-    tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[0], SHOULD_FAIL);
+    for pow in &pow_common {
+        tf.push_instr_load_pow(pow, 0);
+    }
+    tf.push_instr_expect_pow_chain_length(4, 0);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let pos = next_pos(pos_h, fat_ptr, &pow_common[0..=2], &[]);
+
+    tf.push_instr_load_pos(&pos, 0);
+    tf.push_instr_load_pos(&pos, SHOULD_FAIL);
     tf.push_instr_expect_pos_chain_length(1, 0);
 
     test_bytes(tf.write_to_bytes());
@@ -331,23 +374,40 @@ fn crosslink_reject_pos_with_signature_on_different_data() {
     test_bytes(tf.write_to_bytes());
 }
 
+// failing
 #[test]
 fn crosslink_test_basic_finality() {
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    let hashes = regtest_block_hashes();
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
 
-    for i2 in 0..REGTEST_BLOCK_BYTES.len() {
-        tf.push_instr_expect_pow_block_finality(&hashes[i2], None, 0);
+    let miner_addr2 = zcash_keys::address::Address::Tex([1; 20]);
+    let n = 18; // TODO: this fails with higher numbers due to block verification
+    let mut pow = vec![gen.tip.clone()];
+    let mut side: Vec<Arc<Block>> = vec![];
+    let mut genb = gen.clone();
+    for i2 in 1..n+1 {
+        if i2 == 2 {
+            pow.push(genb.next_block(&miner_addr2));
+        } else {
+            pow.push(gen.next_block(&miner_addr));
+        }
+        genb = gen.clone()
     }
 
-    // let hashes = Vec::with_capacity(REGTEST_BLOCK_BYTES.len());
-    for i in 0..REGTEST_BLOCK_BYTES.len() {
-        // hashes.push()
-        tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[i], 0);
+    for i2 in 0..n {
+        tf.push_instr_expect_pow_block_finality(&pow[i2].hash(), None, 0);
+    }
 
-        for i2 in 0..REGTEST_BLOCK_BYTES.len() {
+    for i in 0..n {
+        tf.push_instr_load_pow(&pow[i], 0);
+
+        for i2 in 0..n {
             let finality = if i2 > i {
                 None
             } else if i2 == 3 && i == 3 {
@@ -357,14 +417,16 @@ fn crosslink_test_basic_finality() {
             } else {
                 Some(TFLBlockFinality::NotYetFinalized)
             };
-            tf.push_instr_expect_pow_block_finality(&hashes[i2], finality, 0);
+            tf.push_instr_expect_pow_block_finality(&pow[i2].hash(), finality, 0);
         }
     }
 
-    for i in 0..REGTEST_POS_BLOCK_BYTES.len() {
-        tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[i], 0);
+    const LINKS: &[usize] = &[1, 4, 6, 10, 13, 16];//, 18];
+    for i in 0..LINKS.len() {
+        let bft = next_pos(pos_h, fat_ptr, &pow[LINKS[i]..LINKS[i]+3], &[]);
+        tf.push_instr_load_pos(&bft, 0);
 
-        for i2 in 0..REGTEST_BLOCK_BYTES.len() {
+        for i2 in 0..n {
             let finality = if i2 == 2 {
                 // unpicked sidechain
                 if i < 1 {
@@ -373,12 +435,12 @@ fn crosslink_test_basic_finality() {
                     // Some(TFLBlockFinality::CantBeFinalized)
                     None
                 }
-            } else if i2 <= REGTEST_POW_IDX_FINALIZED_BY_POS_BLOCK[i] {
+            } else if i2 <= LINKS[i] {
                 Some(TFLBlockFinality::Finalized)
             } else {
                 Some(TFLBlockFinality::NotYetFinalized)
             };
-            tf.push_instr_expect_pow_block_finality(&hashes[i2], finality, 0);
+            tf.push_instr_expect_pow_block_finality(&pow[i2].hash(), finality, 0);
         }
     }
 
@@ -416,67 +478,170 @@ fn crosslink_test_pow_to_pos_link() {
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[0], 0);
-    tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[1], 0);
-    tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[2], 0);
-    tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[3], 0);
-    tf.push_instr_load_pow_bytes(REGTEST_BLOCK_BYTES[4], 0);
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut pow = vec![gen.tip.clone()];
+    tf.push_instr_load_pow(&gen.tip, 0);
 
-    // TODO: maybe have push_instr return data?
-    tf.push_instr_load_pos_bytes(REGTEST_POS_BLOCK_BYTES[0], 0);
-    let pos_0 = BftBlockAndFatPointerToIt::zcash_deserialize(REGTEST_POS_BLOCK_BYTES[0]).unwrap();
-    let pos_0_fat_ptr = zebra_chain::block::FatPointerToBftBlock {
-        vote_for_block_without_finalizer_public_key: pos_0
+    for _ in 2..5 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+
+    // TODO: push
+
+    let bft = next_pos(pos_h, fat_ptr, &pow[1..4], &[]);
+    tf.push_instr_load_pos(&bft, 0);
+
+    let fat_pointer_to_bft_block = zebra_chain::block::FatPointerToBftBlock {
+        vote_for_block_without_finalizer_public_key: bft
             .fat_ptr
             .vote_for_block_without_finalizer_public_key,
-        signatures: pos_0
-            .fat_ptr
-            .signatures
-            .iter()
-            .map(|sig| zebra_chain::block::FatPointerSignature {
-                public_key: sig.public_key,
-                vote_signature: sig.vote_signature,
-            })
-            .collect(),
+            signatures: bft
+                .fat_ptr
+                .signatures
+                .iter()
+                .map(|sig| zebra_chain::block::FatPointerSignature {
+                    public_key: sig.public_key,
+                    vote_signature: sig.vote_signature,
+                })
+        .collect(),
     };
 
-    let mut pow_5 = Block::zcash_deserialize(REGTEST_BLOCK_BYTES[5]).unwrap();
-    pow_5.header = Arc::new(BlockHeader {
-        version: 5,
-        fat_pointer_to_bft_block: pos_0_fat_ptr.clone(),
-        ..*pow_5.header
+    pow.push(gen.next_block(&miner_addr));
+    gen.tip = Arc::new(Block {
+        header: Arc::new(BlockHeader {
+            version: 5,
+            fat_pointer_to_bft_block: fat_pointer_to_bft_block.clone(),
+            ..*gen.tip.header
+        }),
+        ..gen.tip.as_ref().clone()
     });
-    // let pow_5_hash = pow_5.hash();
-    tf.push_instr_load_pow(&pow_5, 0);
+    tf.push_instr_load_pow(&gen.tip, 0);
 
-    // let mut pow_6 = Block::zcash_deserialize(REGTEST_BLOCK_BYTES[6]).unwrap();
-    // pow_6.header = Arc::new(BlockHeader {
-    //     version: 5,
-    //     fat_pointer_to_bft_block: pos_0_fat_ptr.clone(),
-    //     previous_block_hash: pow_5_hash,
-    //     ..*pow_6.header
-    // });
-    // // let pow5_hash = pow_5.hash();
-    // tf.push_instr_load_pow(&pow_6, 0);
+    pow.push(gen.next_block(&miner_addr));
+    gen.tip = Arc::new(Block {
+        header: Arc::new(BlockHeader {
+            version: 5,
+            fat_pointer_to_bft_block,
+            ..*gen.tip.header
+        }),
+        ..gen.tip.as_ref().clone()
+    });
+    tf.push_instr_load_pow(&gen.tip, 0);
 
-    // tf.write_to_file(&Path::new(&format!("{}.zeccltf", function_name!())));
     test_bytes(tf.write_to_bytes());
 }
 
 #[test]
 fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized_pow_chain() {
     set_test_name(function_name!());
-    test_path(PathBuf::from(
-        "../crosslink-test-data/wrong_branch_test1_short_pos_long.zeccltf",
-    ));
+    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut pow = vec![gen.tip.clone()];
+    tf.push_instr_load_pow(&gen.tip, 0);
+
+    for _ in 2..9 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+
+    for i in 0..3 {
+        let bft = next_pos(pos_h, fat_ptr, &pow[2*i..2*i+3], &[]);
+        tf.push_instr_load_pos(&bft, 0);
+    }
+
+    for _ in 9..10 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+    let mut genb = gen.clone(); // fork
+
+    let bft = next_pos(pos_h, fat_ptr, &pow[6..9], &[]);
+    tf.push_instr_load_pos(&bft, 0);
+
+    for _ in 10..13 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+
+    let bft = next_pos(pos_h, fat_ptr, &pow[9..12], &[]);
+    tf.push_instr_load_pos(&bft, 0);
+
+    let miner_addr2 = zcash_keys::address::Address::Tex([1; 20]);
+    for _ in 10..18 {
+        tf.push_instr_load_pow(&genb.next_block(&miner_addr2), SHOULD_FAIL);
+    }
+    tf.push_instr_expect_pow_chain_length(13, 0);
+
+    test_bytes(tf.write_to_bytes());
 }
 
+// NOTE: this behaviour appears to differ from Daira-Emma's expectations
 #[test]
 fn crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists() {
     set_test_name(function_name!());
-    test_path(PathBuf::from(
-        "../crosslink-test-data/wrong_branch_test2_long_short_pos.zeccltf",
-    ));
+    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    let mut pow = vec![gen.tip.clone()];
+    tf.push_instr_load_pow(&gen.tip, 0);
+
+    for _ in 2..8 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+
+    for i in 0..3 {
+        let bft = next_pos(pos_h, fat_ptr, &pow[i..i+3], &[]);
+        tf.push_instr_load_pos(&bft, 0);
+    }
+
+    for _ in 8..10 {
+        pow.push(gen.next_block(&miner_addr));
+        tf.push_instr_load_pow(&gen.tip, 0);
+    }
+    let mut genb = gen.clone(); // fork
+
+    for _ in 10..19 {
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+    }
+    tf.push_instr_expect_pow_chain_length(19, 0);
+
+    // small sidechain
+    let miner_addr2 = zcash_keys::address::Address::Tex([1; 20]);
+    for _ in 10..13 {
+        pow.push(genb.next_block(&miner_addr2));
+        tf.push_instr_load_pow(&genb.tip, 0);
+    }
+    // small sidechain currently ignored
+    tf.push_instr_expect_pow_chain_length(19, 0);
+
+    // finalize the small sidechain
+    let bft = next_pos(pos_h, fat_ptr, &pow[9..12], &[]);
+    tf.push_instr_load_pos(&bft, 0);
+
+    tf.push_instr_expect_pow_chain_length(13, 0);
+
+    tf.push_instr_load_pow(&gen.next_block(&miner_addr), SHOULD_FAIL);
+    tf.push_instr_expect_pow_chain_length(13, 0);
+
+    tf.push_instr_load_pow(&genb.next_block(&miner_addr2), 0);
+    tf.push_instr_expect_pow_chain_length(14, 0);
+
+    test_bytes(tf.write_to_bytes());
 }
 
 // NOTE: this is very similar to the RPC get_block_template code
@@ -513,7 +678,7 @@ impl BlockGen {
     pub fn init_at_genesis_plus_1(
         network: Network,
         genesis_hash: BlockHash,
-        miner_address: &Address,
+        miner_addr: &Address,
     ) -> Self {
         let history_tree = HistoryTree::default();
         let time = chrono::DateTime::<Utc>::from_timestamp(1758127904, 0).expect("valid time");
@@ -524,7 +689,7 @@ impl BlockGen {
 
         let tip = BlockGen::create_block(
             &network,
-            miner_address,
+            miner_addr,
             BlockHeight(1),
             genesis_hash,
             time,
@@ -542,7 +707,7 @@ impl BlockGen {
 
     pub fn create_block(
         network: &Network,
-        miner_address: &Address,
+        miner_addr: &Address,
         height: BlockHeight,
         previous_block_hash: BlockHash,
         time: DateTime<Utc>,
@@ -553,7 +718,7 @@ impl BlockGen {
             zebra_rpc::methods::types::get_block_template::standard_coinbase_outputs(
                 network,
                 height,
-                miner_address,
+                miner_addr,
                 zebra_chain::amount::Amount::new(0), // TODO: update if we want to sim transactions
             );
 
@@ -597,7 +762,7 @@ impl BlockGen {
         })
     }
 
-    pub fn next_block(&mut self, miner_address: &Address) -> Arc<zebra_chain::block::Block> {
+    pub fn next_block(&mut self, miner_addr: &Address) -> Arc<zebra_chain::block::Block> {
         // NOTE: it's not completely obvious where this should be done. Having it here allows for
         // tip modification by the user, but means that the history_tree is never visibly
         // up-to-date.
@@ -618,7 +783,7 @@ impl BlockGen {
             CompactDifficulty::from_bytes_in_display_order(&[0x20, 0x0f, 0x0f, 0x0f]).unwrap();
         self.tip = BlockGen::create_block(
             &self.network,
-            miner_address,
+            miner_addr,
             height,
             hash,
             time,
@@ -636,24 +801,24 @@ fn crosslink_gen_pow_fork() {
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
-    let miner_address = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_address);
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
     tf.push_instr_load_pow(&gen.tip, 0);
 
     for _ in 2..4 {
-        tf.push_instr_load_pow(&gen.next_block(&miner_address), 0);
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
     }
     let mut genb = gen.clone();
 
     for _ in 4..7 {
-        tf.push_instr_load_pow(&gen.next_block(&miner_address), 0);
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
     }
     tf.push_instr_expect_pow_chain_length(7, 0);
 
-    let miner_address2 = zcash_keys::address::Address::Tex([1; 20]);
+    let miner_addr2 = zcash_keys::address::Address::Tex([1; 20]);
     for _ in 4..8 {
-        tf.push_instr_load_pow(&genb.next_block(&miner_address2), 0);
+        tf.push_instr_load_pow(&genb.next_block(&miner_addr2), 0);
     }
     tf.push_instr_expect_pow_chain_length(8, 0);
 
@@ -676,23 +841,26 @@ fn crosslink_gen_pow_fork() {
 
 fn create_pos_and_ptr_to_finalize_pow(
     bft_height: u32,
+    parent_fat_ptr: FatPointerToBftBlock2,
     pow_blocks: &[Arc<Block>],
+    sigs: &[zebra_crosslink::FatPointerSignature2],
 ) -> BftBlockAndFatPointerToIt {
     assert_eq!(
         pow_blocks.len(),
         PROTOTYPE_PARAMETERS.bc_confirmation_depth_sigma as usize
     );
 
+    let mut hdrs = Vec::with_capacity(pow_blocks.len());
+    for pow_block in pow_blocks {
+        hdrs.push(pow_block.header.as_ref().clone());
+    }
+
     let block = BftBlock::try_from(
         &PROTOTYPE_PARAMETERS,
         bft_height,
-        FatPointerToBftBlock2::null(),
+        parent_fat_ptr,
         pow_blocks[0].coinbase_height().expect("valid height").0,
-        vec![
-            pow_blocks[0].header.as_ref().clone(),
-            pow_blocks[1].header.as_ref().clone(),
-            pow_blocks[2].header.as_ref().clone(),
-        ],
+        hdrs,
     )
     .expect("valid PoS block");
 
@@ -702,7 +870,19 @@ fn create_pos_and_ptr_to_finalize_pow(
         vote_signature: [0xbcu8; 64],
     };
 
-    BftBlockAndFatPointerToIt::from_parts(block, bft_height.into(), 1, &[])
+    BftBlockAndFatPointerToIt::from_parts(block, bft_height.into(), 1, sigs)
+}
+
+fn next_pos(
+    cur_bft_height: &mut u32,
+    cur_fat_ptr: &mut FatPointerToBftBlock2,
+    pow_blocks: &[Arc<Block>],
+    sigs: &[zebra_crosslink::FatPointerSignature2],
+) ->BftBlockAndFatPointerToIt {
+    *cur_bft_height += 1;
+    let bft = create_pos_and_ptr_to_finalize_pow(*cur_bft_height, cur_fat_ptr.clone(), pow_blocks, sigs);
+    *cur_fat_ptr = bft.fat_ptr.clone();
+    bft
 }
 
 #[test]
@@ -711,23 +891,25 @@ fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
     let network = Network::new_regtest(Default::default());
-    let miner_address = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_address);
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
 
     let mut pow_common = vec![gen.tip.clone()];
     for _ in 2..4 {
-        pow_common.push(gen.next_block(&miner_address));
+        pow_common.push(gen.next_block(&miner_addr));
     }
     for block in &pow_common {
         tf.push_instr_load_pow(block, 0);
     }
 
-    let bft = create_pos_and_ptr_to_finalize_pow(1, &pow_common[0..3]);
+    let fat_ptr = &mut FatPointerToBftBlock2::null();
+    let pos_h = &mut 0;
+    let bft = next_pos(pos_h, fat_ptr, &pow_common[0..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     for _ in 4..7 {
-        tf.push_instr_load_pow(&gen.next_block(&miner_address), 0);
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
         // push bft pointer
     }
     tf.push_instr_expect_pow_chain_length(7, 0);
@@ -752,6 +934,7 @@ fn crosslink_force_roster() {
     test_bytes(tf.write_to_bytes());
 }
 
+// failing
 #[test]
 fn crosslink_add_newcomer_to_roster_via_pow() {
     set_test_name(function_name!());
@@ -763,9 +946,9 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     // tf.push_instr_expect_roster_includes(pub_key, 42000, SHOULD_FAIL);
 
     let network = Network::new_regtest(Default::default());
-    let miner_address = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_address);
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
 
     gen.tip = Arc::new(Block {
         header: Arc::new(BlockHeader {
@@ -777,13 +960,14 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     let mut pow_common = vec![gen.tip.clone()];
     for _ in 2..4 {
         // TODO: push a staking action
-        pow_common.push(gen.next_block(&miner_address));
+        pow_common.push(gen.next_block(&miner_addr));
     }
     for block in &pow_common[0..3] {
         tf.push_instr_load_pow(block, 0);
     }
 
-    let bft = create_pos_and_ptr_to_finalize_pow(1, &pow_common[0..3]);
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let bft = next_pos(pos_h, fat_ptr, &pow_common[0..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     let (_, _prv_key, pub_key) =

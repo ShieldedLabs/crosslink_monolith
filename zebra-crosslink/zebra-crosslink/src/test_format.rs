@@ -419,20 +419,20 @@ fn test_check(flags: u32, condition: bool, message: &str) {
         let test_instr_i = *TEST_INSTR_C.lock().unwrap();
         TEST_FAILED_INSTR_IDXS.lock().unwrap().push((test_instr_i, message.to_string()));
 
-        if *TEST_CHECK_ASSERT.lock().unwrap() {
-            panic!(
-                "test check should {} but actually {}ed (and TEST_CHECK_ASSERT == true), message:\n{}",
-                SUCCESS_STRS[should_succeed as usize],
-                SUCCESS_STRS[!should_succeed as usize],
-                message
-            );
-        } else {
-            error!(
+        match *TEST_CHECK_ASSERT.lock().unwrap() {
+            0 => {},
+            1 => error!(
                 "test check should {} but actually {}ed, message:\n{}",
                 SUCCESS_STRS[should_succeed as usize],
                 SUCCESS_STRS[!should_succeed as usize],
                 message
-            );
+            ),
+            _ => panic!(
+                "test check should {} but actually {}ed (and TEST_CHECK_ASSERT enabled), message:\n{}",
+                SUCCESS_STRS[should_succeed as usize],
+                SUCCESS_STRS[!should_succeed as usize],
+                message
+            ),
         }
     }
 }
@@ -518,8 +518,11 @@ pub(crate) async fn handle_instr(
             // let mut file = std::fs::File::create(&path).expect("valid file");
             // file.write_all(instr.data_slice(bytes));
 
-            let force_feed_ok = (internal_handle.call.force_feed_pow)(Arc::new(block)).await;
-            test_check(flags, force_feed_ok, "PoW force feed ok");
+            let (force_feed_ok, msg) = match (internal_handle.call.force_feed_pow)(Arc::new(block)).await {
+                Ok(()) => (true, "PoW force feed ok".to_string()),
+                Err(msg) => (false, msg),
+            };
+            test_check(flags, force_feed_ok, &msg);
         }
 
         TestInstr::LoadPoS((block, fat_ptr)) => {
@@ -528,9 +531,11 @@ pub(crate) async fn handle_instr(
             // let mut file = std::fs::File::create(&path).expect("valid file");
             // file.write_all(instr.data_slice(bytes)).expect("write success");
 
-            let force_feed_ok =
-                (internal_handle.call.force_feed_pos)(Arc::new(block), fat_ptr).await;
-            test_check(flags, force_feed_ok, "PoS force feed ok");
+            let (force_feed_ok, msg) = match (internal_handle.call.force_feed_pos)(Arc::new(block), fat_ptr).await {
+                Ok(()) => (true, "PoS force feed ok".to_string()),
+                Err(msg) => (false, msg),
+            };
+            test_check(flags, force_feed_ok, &msg);
         }
 
         TestInstr::SetParams(_) => {
