@@ -889,7 +889,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
     internal_handle.internal.lock().await.my_public_key = my_public_key;
 
     {
-        use tenderlink::{SecureUdpEndpoint, bandwidth_test::IdentityKeyPair};
+        use tenderlink::bandwidth_test::IdentityKeyPair;
         use tenderlink::{parse_to_ipv6_bytes, addr_string_to_stuff};
 
         use std::net::{Ipv6Addr, SocketAddr};
@@ -1128,12 +1128,11 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     internal.peer_strings.truncate(0);
 
                     for peer in &all_peers {
-                        internal.peer_strings.push(format!("{} {} ({}) - ({}, {})",
+                        internal.peer_strings.push(format!("{} {} ({}) - {}",
                             if let Some(pubkey) = peer.root_public_bft_key { tenderlink::PubKeyID(pubkey).to_string() } else { "unknown peer".to_string() },
                             if peer.connected { "connected" } else { "disconnected" },
                             if peer.connection_knowledge == tenderlink::ConnectionKnowledge::Unknown { "unknown" } else { "known" },
                             peer.latest_status_request_height,
-                            peer.latest_status_request_powlink_id
                         ));
                     }
                 })
