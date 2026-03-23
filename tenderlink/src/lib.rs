@@ -1098,7 +1098,9 @@ impl TMState {
         format!("{:05}-{:?}-{:>8}.{:3}.{:3}.{:9}", self.my_port, self.my_pub_key, format!("{:?}", roster_i_from_pub_key(roster, self.my_pub_key)), self.height, self.round, format!("{:?}", self.step))
     }
     fn name_str_other(roster: &[SortedRosterMember], peer: &Peer) -> String {
-        format!("{:05}-{:?}-{:?}", peer.endpoint.unwrap_or_default().port, PubKeyID(peer.root_public_bft_key), roster_i_from_pub_key(roster, PubKeyID(peer.root_public_bft_key)))
+        let mut port = 0;
+        if let Some(endpoint) = &peer.endpoint { port = endpoint.port; }
+        format!("{:05}-{:?}-{:?}", port, PubKeyID(peer.root_public_bft_key), roster_i_from_pub_key(roster, PubKeyID(peer.root_public_bft_key)))
     }
 
     async fn bft_update(&mut self, roster: &mut Vec<SortedRosterMember>) {
@@ -1362,7 +1364,7 @@ pub enum ConnectionKnowledge {
 #[derive(Debug)]
 pub struct Peer {
     pub root_public_bft_key: [u8; 32],
-    pub endpoint: Option<SecureUdpEndpoint>,
+    pub endpoint: Option<STPAddress>,
     pub outgoing_handshake_state: Option<snow::HandshakeState>,
     pub pending_client_ack_snow_state: Option<snow::StatelessTransportState>,
     pub pending_client_ack: bool,
@@ -1435,42 +1437,6 @@ pub use crate::bandwidth_test::fmt_prefixed_byte_str_rev;
 pub use crate::bandwidth_test::new_keypair_from_connect_magic1_with_seed;
 pub use crate::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-pub struct SecureUdpEndpoint {
-    pub public_key: [u8; 32],
-    pub ip_address: [u8; 16],
-    pub port: u16,
-}
-impl Default for SecureUdpEndpoint {
-    fn default() -> SecureUdpEndpoint {
-        SecureUdpEndpoint { public_key: [0_u8; 32], ip_address: [0_u8; 16], port: 0 }
-    }
-}
-
-impl std::fmt::Debug for SecureUdpEndpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fmt_prefixed_byte_str(f, "SecureUdpEndpoint { public_key: \"", &self.public_key)?;
-        fmt_prefixed_byte_str(f, "\", ip_address: \"",                 &self.ip_address)?;
-        write!(f, "\", port: {:05} }}", self.port)
-    }
-}
-
-impl SecureUdpEndpoint {
-    fn write_to(&self, buf: &mut [u8]) -> usize {
-        self.public_key.write_to(&mut buf[..]);
-        self.ip_address.write_to(&mut buf[32..]);
-        self.port      .write_to(&mut buf[32+16..]);
-        32+16+2
-    }
-
-    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
-        let mut endpoint = SecureUdpEndpoint::default();
-        r.read_exact(&mut endpoint.public_key)?;
-        r.read_exact(&mut endpoint.ip_address)?;
-        endpoint.port = r.read_u16::<LittleEndian>()?;
-        Ok(endpoint)
-    }
-}
 
 pub const MAX_P2P_DISCOVERY_PUBKEY_SIZE: usize = 32;
 
@@ -1787,14 +1753,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
         if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == bft_pk.0) {
-            peers[i].endpoint = Some(SecureUdpEndpoint {
-                public_key: address.key.clone().try_into().expect("wrong crypto scheme"),
-                ip_address: address.ip.octets().into(),
-                port: address.port,
-            });
+            peers[i].endpoint = Some(address.clone());
         }
     }
-    if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint).collect::<Vec<_>>()); }
+    if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|p|p.endpoint.clone()).collect::<Vec<_>>()); }
 
     // TODO: only convert private to public in 1 location
     let mut bft_state = TMState::init(
@@ -1914,7 +1876,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
             o
         }
-        fn send_sock_msg(ctx_str: &str, transport: &mut PeerTransport, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, msg: &[u8], stats: &mut NetworkStats) {
+        fn send_sock_msg(ctx_str: &str, transport: &mut PeerTransport, sock: &tokio::net::UdpSocket, peer_endpoint: &STPAddress, msg: &[u8], stats: &mut NetworkStats) {
             // TODO(phil) move this code
             let bytes_in_flight = {
                 let mut bytes_in_flight = 0;
@@ -1953,7 +1915,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
 
             // println!("Packet: {} bytes", msg.len());
-            let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip_address), peer_endpoint.port, 0, 0));
+            let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(peer_endpoint.ip), peer_endpoint.port, 0, 0));
             match sock.try_send_to(msg, addr) {
                 Ok(_) => {
                     stats.packets_sent += 1;
@@ -1968,7 +1930,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 Err(error) => eprintln!("{} Socket error: {:?} sending to addr: {:?}", ctx_str, error, addr),
             }
         }
-        fn send_noise_msg(ctx_str: &str, transport: &mut PeerTransport, snow_state: &mut snow::StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, send_buf2: &mut [u8], msg: &[u8], stats: &mut NetworkStats) {
+        fn send_noise_msg(ctx_str: &str, transport: &mut PeerTransport, snow_state: &mut snow::StatelessTransportState, sock: &tokio::net::UdpSocket, peer_endpoint: &STPAddress, send_buf2: &mut [u8], msg: &[u8], stats: &mut NetworkStats) {
             let mut o = 0;
             o += transport.nonce.write_to(                           &mut send_buf2[o..]);
             o += snow_state     .write_message(transport.nonce, msg, &mut send_buf2[o..]).unwrap();
@@ -1984,7 +1946,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                               send_buf2: &mut [u8],
                               sock: &tokio::net::UdpSocket,
                               peer_transport: &mut PeerTransport,
-                              peer_endpoint: SecureUdpEndpoint,
+                              peer_endpoint: STPAddress,
                               peer_snow_state: &mut snow::StatelessTransportState,
                               hash: BlockHash,
                               chunk_needed_i: u16) -> std::io::Result<()> {
@@ -2027,7 +1989,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 if PRINT_POWLINK { eprintln!("{} PowLink: sending PoW block hash {:?} chunk {} to {:?}", ctx_str, hash, chunk_i, peer_endpoint); }
                 print_packet_tag_send(header);
-                send_noise_msg(&ctx_str, peer_transport, peer_snow_state, &sock, peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
+                send_noise_msg(&ctx_str, peer_transport, peer_snow_state, &sock, &peer_endpoint, send_buf2, &mut send_buf1[..o], stats);
             }
 
             Ok(())
@@ -2086,7 +2048,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         peer.latest_status                  = None;
                     }
 
-                    if let (Some(peer_endpoint), Some(snow_state)) = (peer.endpoint, &mut peer.snow_state) {
+                    if let (Some(peer_endpoint), Some(snow_state)) = (&peer.endpoint, &mut peer.snow_state) {
                         let header = PacketHeader::new::<PACKET_TYPE_EMPTY>(peer.transport.ack_latest, peer.transport.ack_field);
                         let mut o  = 0;
                         o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[..], peer.transport.nonce);
@@ -2095,11 +2057,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     }
                 }
                 for peer in &mut peers {
-                    if let Some(peer_endpoint) = peer.endpoint {
+                    if let Some(peer_endpoint) = &peer.endpoint {
                         if peer.snow_state.is_none() && peer.outgoing_handshake_state.is_none() && peer.pending_client_ack_snow_state.is_none() {
                             let mut outgoing_state: snow::HandshakeState = snow::Builder::new(noise_params.clone())
                                 .local_private_key(&my_stp_keypair.private).unwrap()
-                                .remote_public_key(&peer_endpoint.public_key).unwrap()
+                                .remote_public_key(&peer_endpoint.key).unwrap()
                                 .build_initiator().unwrap();
                             peer.transport = PeerTransport::default();
                             let header = PacketHeader::new::<PACKET_TYPE_CLIENT_HELLO>(peer.transport.ack_latest, peer.transport.ack_field); // @TodoHeaderAndStatus
@@ -2108,7 +2070,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             let n = outgoing_state.write_message(&send_buf1[..o], &mut send_buf2).unwrap();
                             // TODO: no nonce?
                             print_packet_tag_send(header);
-                            send_sock_msg(&ctx_str, &mut peer.transport, &sock, peer_endpoint, &send_buf2[..n], &mut net_stats);
+                            send_sock_msg(&ctx_str, &mut peer.transport, &sock, &peer_endpoint, &send_buf2[..n], &mut net_stats);
                             peer.outgoing_handshake_state = Some(outgoing_state);
                         }
                     }
@@ -2154,7 +2116,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.endpoint), ..Peer::default() });
                 }
 
-                fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer_transport: &mut PeerTransport, peer_endpoint: SecureUdpEndpoint, peer_snow_state: &mut snow::StatelessTransportState, peer_root_public_bft_key: [u8; 32], sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
+                fn send_round_data_to_peer(bft_state: &TMState, should_send_prevotes: bool, round_data: &RoundData, ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], peer_transport: &mut PeerTransport, peer_endpoint: &STPAddress, peer_snow_state: &mut snow::StatelessTransportState, peer_root_public_bft_key: [u8; 32], sock: &tokio::net::UdpSocket, stats: &mut NetworkStats) {
                     let height = round_data.height;
                     let round  = round_data.round;
 
@@ -2315,7 +2277,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     if peer.endpoint.is_none() || peer.snow_state.is_none() { continue; }
                     if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
                         peer.latest_status_request_height = None;
-                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
+                        send_round_data_to_peer(&bft_state, false, &bft_state.recent_commit_round_cache[height as usize], &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, &peer.endpoint.as_ref().unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
                     }
                     if let Some((hash, chunk_i)) = peer.latest_status_request_powlink && !hash.eq(&BlockHash::NIL) {
                         // Note(Sam): Disable PoWLink while working on new PoW sync in zebra.
@@ -2327,7 +2289,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         for round_i in (current_height_start_i..bft_state.rounds_data.len()).rev()
                         {
                             let round_data = &bft_state.rounds_data[round_i];
-                            send_round_data_to_peer(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, peer.endpoint.unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
+                            send_round_data_to_peer(&bft_state, true, &round_data, &ctx_str, &mut send_buf1, &mut send_buf2, &mut peer.transport, &peer.endpoint.as_ref().unwrap(), peer.snow_state.as_mut().unwrap(), peer.root_public_bft_key, &sock, &mut net_stats);
                         }
                     } else {
                         eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: round_data array was empty", ctx_str);
@@ -2466,8 +2428,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         //  NOTE(Security): Actually we would need to loop because a peer could sign a message claiming to own an IP and PORT that it actually does not own. That also means falling back on
         //      the unknown connections array since that also shouldn't be able to be blocked.
-        if let Some(i) = peers.iter().map(|p| p.endpoint.unwrap_or_default()).position(|endpoint| endpoint.ip_address == from_ip && endpoint.port == from_port) {
-            let peer_endpoint = peers[i].endpoint.unwrap();
+        if let Some(i) = peers.iter().map(|p| p.endpoint.clone().unwrap_or_default()).position(|endpoint| endpoint.ip.octets() == from_ip && endpoint.port == from_port) {
+            let peer_endpoint = peers[i].endpoint.clone().unwrap();
             loop {
                 let peer = &mut peers[i];
                 if let Some(snow_state) = &mut peer.snow_state {
@@ -2483,7 +2445,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 if let Some(outgoing) = &mut peer.outgoing_handshake_state {
                     if let Ok(length) = outgoing.read_message(raw_msg, &mut recv_buf2) {
-                        fn finish_outgoing_handshake(ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: SecureUdpEndpoint, peer: &mut Peer, mut snow_state: snow::StatelessTransportState, nonce: u64, connection_knowledge: ConnectionKnowledge, stats: &mut NetworkStats) {
+                        fn finish_outgoing_handshake(ctx_str: &str, send_buf1: &mut [u8], send_buf2: &mut [u8], sock: &tokio::net::UdpSocket, peer_endpoint: &STPAddress, peer: &mut Peer, mut snow_state: snow::StatelessTransportState, nonce: u64, connection_knowledge: ConnectionKnowledge, stats: &mut NetworkStats) {
                             let packet_type = if connection_knowledge == ConnectionKnowledge::Unknown { PACKET_TYPE_CLIENT_UNKNOWN_ACK } else { PACKET_TYPE_CLIENT_ACK };
 
                             // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
@@ -2532,19 +2494,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             if peer.pending_client_ack_snow_state.is_none() || !contended_noise_is_initiator(&bft_state.hash_keys, &my_root_public_bft_key.into(), &peer.root_public_bft_key) {
                                 if let Ok(snow_state) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
                                     if PRINT_PROTOCOL { println!("{:05}: Finished outgoing handshake and got nonce {} with {}", my_port, nonce, addr); }
-                                    finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, peer_endpoint, peer, snow_state, nonce, ConnectionKnowledge::Known, &mut net_stats);
+                                    finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, &peer_endpoint, peer, snow_state, nonce, ConnectionKnowledge::Known, &mut net_stats);
                                 }
                                 break;
                             }
                         } else if packet_type == PACKET_TYPE_SERVER_UNKNOWN_HELLO && local_msg.len() == 18 {
-                            let my_apparent_ip       = &local_msg[  ..16];
-                            let my_apparent_port     = &local_msg[16..18];
-                            let my_apparent_endpoint = SecureUdpEndpoint { ip_address: my_apparent_ip.try_into().unwrap(), port: u16::from_le_bytes(my_apparent_port.try_into().unwrap()), public_key: my_stp_keypair.public.clone().try_into().unwrap() };
                             // TODO hash
                             if let Ok(snow_state) = peer.outgoing_handshake_state.take().unwrap().into_stateless_transport_mode() {
-                                if PRINT_PROTOCOL { println!("{:05}: Finished outgoing unknown handshake and got nonce {} with {}, I am percieved as {:?}", my_port, nonce, addr, my_apparent_endpoint); }
+                                if PRINT_PROTOCOL { println!("{:05}: Finished outgoing unknown handshake and got nonce {} with {}", my_port, nonce, addr); }
 
-                                finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, peer_endpoint, peer, snow_state, nonce, ConnectionKnowledge::Unknown, &mut net_stats);
+                                finish_outgoing_handshake(&ctx_str, &mut send_buf1, &mut send_buf2, &sock, &peer_endpoint, peer, snow_state, nonce, ConnectionKnowledge::Unknown, &mut net_stats);
                             }
                             break;
                         }
@@ -2585,7 +2544,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     process_acks(&mut peer.transport, header);
 
                     if packet_type == PACKET_TYPE_CLIENT_HELLO {
-                        let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
+                        let client_endpoint = STPAddress { magic1: CRYPTO_MAGIC, key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip: from_ip.into(), port: from_port };
                         if PRINT_PROTOCOL { println!("{:05}: Server received client hello from static key = {:?}", my_port, client_endpoint); }
                         {
                             let them: &[u8; 32] = &peer.root_public_bft_key;
@@ -2613,7 +2572,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             if let Ok(snow_state) = incoming_state.into_stateless_transport_mode() {
                                 peer.transport.nonce = start_nonce; // @Cleanup @Lazy.
                                 print_packet_tag_send(header);
-                                send_sock_msg(&ctx_str, &mut peer.transport, &sock, peer_endpoint, &send_buf2[..n], &mut net_stats);
+                                send_sock_msg(&ctx_str, &mut peer.transport, &sock, &peer_endpoint, &send_buf2[..n], &mut net_stats);
                                 peer.transport.nonce += 1;
                                 peer.pending_client_ack_snow_state = Some(snow_state);
                             }
@@ -2625,7 +2584,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
         } else {
             loop {
-                if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == [0; 32] && p.endpoint.is_some() && p.endpoint.unwrap().ip_address == from_ip && p.endpoint.unwrap().port == from_port) {
+                if let Some(i) = peers.iter().position(|p| p.root_public_bft_key == [0; 32] && p.endpoint.is_some() && p.endpoint.as_ref().unwrap().ip.octets() == from_ip && p.endpoint.as_ref().unwrap().port == from_port) {
                     let peer = &mut peers[i];
                     nonce = u64::from_le_bytes(raw_msg[..8].try_into().unwrap());
                     if let Ok(length) = peer.snow_state.as_ref().unwrap().read_message(nonce, &raw_msg[8..], &mut recv_buf2) {
@@ -2667,7 +2626,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     print_packet_tag_recv(header);
 
                     if packet_type == PACKET_TYPE_CLIENT_HELLO {
-                        let client_endpoint = SecureUdpEndpoint { public_key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip_address: from_ip, port: from_port };
+                        let client_endpoint = STPAddress { magic1: CRYPTO_MAGIC, key: incoming_state.get_remote_static().unwrap().try_into().unwrap(), ip: from_ip.into(), port: from_port };
                         if PRINT_PROTOCOL { println!("{:05}: Server received client hello from unknown peer with static key = {:?}", my_port, client_endpoint); }
 
                         // TODO: we should rate-limit new connections so adversaries can't exhaust your entropy pool by rapidly asking for new nonces
@@ -2688,7 +2647,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             let mut transport = PeerTransport::default();
                             transport.nonce = start_nonce;
                             print_packet_tag_send(header);
-                            send_sock_msg(&ctx_str, &mut transport, &sock, client_endpoint, &send_buf2[..n], &mut net_stats);
+                            send_sock_msg(&ctx_str, &mut transport, &sock, &client_endpoint, &send_buf2[..n], &mut net_stats);
                             transport.nonce += 1;
                             peers.push(Peer {
                                 root_public_bft_key: [0; 32],
