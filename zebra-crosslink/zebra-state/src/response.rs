@@ -245,6 +245,13 @@ impl NonFinalizedBlocksListener {
                 }
 
                 prev_non_finalized_state = latest_non_finalized_state;
+                
+                /*  Note(Sam): THIS IS A HUGE BUG WAITING TO HAPPEN. Since tokio scheduling is cooperative
+                    multitasking, it offers no fairness guarantees. It is under the assumption that we are
+                    always I/O bound and that the CPU is idle. There is always enough time to run all tasks.
+                    The moment this assumption breaks, which will happen as soon as the node is actually
+                    under load. This lack of correctness makes it unusable for our sync work.
+                */
 
                 // Wait for the next update to the non-finalized state
                 if let Err(error) = non_finalized_state_receiver.changed().await {

@@ -5,6 +5,21 @@ use zebra_chain::serialization::ZcashSerialize;
 
 use tenderlink::bandwidth_test::*;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BlockEvent {
+    Dequeued([u8; 32]),
+    Committed([u8; 32]),
+    TradFinalized([u8; 32]),
+    CrosslinkFinalized([u8; 32]),
+}
+static BLOCK_EVENT_QUEUE_SENDER: std::sync::OnceLock<tokio::sync::mpsc::Sender<BlockEvent>> = std::sync::OnceLock::new();
+
+pub async fn push_block_event(event: BlockEvent) {
+    if let Some(tx) = BLOCK_EVENT_QUEUE_SENDER.get() {
+        tx.send(event).await.unwrap();
+    }
+}
+
 pub fn sync(
         config: &crate::config::Config,
         read_state: impl tower::Service<
@@ -25,6 +40,9 @@ pub fn sync(
         + 'static,
         rt: tokio::runtime::Handle,
 ) {
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(500);
+    BLOCK_EVENT_QUEUE_SENDER.set(event_tx).unwrap();
+
     let network_keypair;
     if let Some(string_seed) = &config.network_identity_seed_string {
         let hash = *blake3::hash(string_seed.as_bytes()).as_bytes();
@@ -46,10 +64,20 @@ pub fn sync(
         }
     });
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut should_sleep = true;
+
+        match event_rx.try_recv() {
+            Ok(block_event) => {
+                should_sleep = false;
+                println!("block_event: {:?}", block_event);
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {},
+            Err(err) => tracing::error!("{err:?}"),
+        }
 
         match nfs_rx.try_recv() {
             Ok(nfs) => {
+                should_sleep = false;
                 println!("nfs: {:?}", nfs.0);
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {},
@@ -68,8 +96,9 @@ pub fn sync(
         //     Err(err) => panic!("sync start err: {err:?}"),
         //     _ => panic!("sync err: unhandled response: {res:?}"),
         // }
-
-        // println!("syncing! tip: {tip:?}");
-        println!("syncing! tip");
+        
+        if should_sleep {
+            std::thread::yield_now();
+        }
     }
 }

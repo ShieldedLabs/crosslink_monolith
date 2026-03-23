@@ -436,7 +436,6 @@ impl FinalizableBlock {
         }
     }
 
-    #[cfg(test)]
     /// Extract a [`Block`] from a [`FinalizableBlock`] variant.
     pub fn inner_block(&self) -> Arc<Block> {
         match self {
