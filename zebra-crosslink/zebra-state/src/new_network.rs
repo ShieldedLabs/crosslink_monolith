@@ -2,15 +2,16 @@ use std::time::Instant;
 use crate::{Request, Response, ReadRequest, ReadResponse};
 use tower::ServiceExt;
 use zebra_chain::serialization::ZcashSerialize;
+use zebra_chain::block::Hash;
 
 use tenderlink::bandwidth_test::*;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum BlockEvent {
-    Dequeued([u8; 32]),
-    Committed([u8; 32]),
-    TradFinalized([u8; 32]),
-    CrosslinkFinalized([u8; 32]),
+    Dequeued(Hash),
+    Committed(Hash),
+    TradFinalized(Hash),
+    CrosslinkFinalized(Hash),
 }
 static BLOCK_EVENT_QUEUE_SENDER: std::sync::OnceLock<tokio::sync::mpsc::Sender<BlockEvent>> = std::sync::OnceLock::new();
 
@@ -18,6 +19,12 @@ pub async fn push_block_event(event: BlockEvent) {
     if let Some(tx) = BLOCK_EVENT_QUEUE_SENDER.get() {
         tx.send(event).await.unwrap();
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShadowBlock {
+    this_hash: Hash,
+    parent_hash: Hash,
 }
 
 pub fn sync(
@@ -43,6 +50,25 @@ pub fn sync(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(500);
     BLOCK_EVENT_QUEUE_SENDER.set(event_tx).unwrap();
 
+    let mut finalized_tip_maybe = None;
+    loop {
+        finalized_tip_maybe = rt.block_on(async {
+            let res = read_state.clone().oneshot(ReadRequest::FinalizedTip).await;
+            match res {
+                Ok(ReadResponse::Tip(finalized_tip_maybe)) => finalized_tip_maybe,
+                Err(err) => panic!("sync start err: {err:?}"),
+                _ => panic!("sync err: unhandled response: {res:?}"),
+            }
+        });
+        if finalized_tip_maybe.is_none() {
+            std::thread::yield_now();
+            continue;
+        }
+        break;
+    }
+    let mut finalized_tip = finalized_tip_maybe.unwrap().1;
+    println!("NEW NETWORK: Starting with hash: {:?}", finalized_tip);
+    
     let network_keypair;
     if let Some(string_seed) = &config.network_identity_seed_string {
         let hash = *blake3::hash(string_seed.as_bytes()).as_bytes();
@@ -54,15 +80,15 @@ pub fn sync(
         network_keypair = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
     }
     println!("NETWORK KEYPAIR: {}", network_keypair);
+    let my_local_stp_address = STPAddress {
+        ip: "::1".parse().unwrap(),
+        port: config.network_local_port,
+        magic1: CONNECT_MAGIC1_PLAIN_TEXT,
+        key: network_keypair.public,
+    };
+    println!("NETWORK LOCALHOST STP ADDRESS: {}", my_local_stp_address);
+    println!("I need to connect to: {:?}", config.network_initial_peers);
 
-    let mut nfs_rx = rt.block_on(async {
-        let res = read_state.clone().oneshot(ReadRequest::NonFinalizedBlocksListener).await;
-        match res {
-            Ok(ReadResponse::NonFinalizedBlocksListener(rx)) => rx.unwrap(),
-            Err(err) => panic!("sync start err: {err:?}"),
-            _ => panic!("sync err: unhandled response: {res:?}"),
-        }
-    });
     loop {
         let mut should_sleep = true;
 
@@ -74,28 +100,6 @@ pub fn sync(
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {},
             Err(err) => tracing::error!("{err:?}"),
         }
-
-        match nfs_rx.try_recv() {
-            Ok(nfs) => {
-                should_sleep = false;
-                println!("nfs: {:?}", nfs.0);
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {},
-            Err(err) => tracing::error!("{err:?}"),
-        }
-
-        // let res = rt.block_on(read_state.clone().oneshot(ReadRequest::Block(zebra_chain::block::Height(0).into())));
-        // match res {
-        //     Ok(ReadResponse::Block(Some(block))) => {
-        //         let mut file = std::fs::File::create("testnet-genesis.pow").unwrap();
-        //         block.as_ref().zcash_serialize(&file);
-        //         println!("genesis written to file");
-        //         break;
-        //     },
-        //     Ok(ReadResponse::Block(None)) => println!("genesis not ready yet"),
-        //     Err(err) => panic!("sync start err: {err:?}"),
-        //     _ => panic!("sync err: unhandled response: {res:?}"),
-        // }
         
         if should_sleep {
             std::thread::yield_now();

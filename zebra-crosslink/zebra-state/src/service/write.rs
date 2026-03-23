@@ -356,7 +356,7 @@ impl WriteBlockWorkerTask {
                         info!("finalized {}, which implicitly finalizes:", hash);
                         for i in 0..newly_finalized_blocks.len() {
                             let finalizable_block = non_finalized_state.finalize();
-                            crate::new_network::push_block_event(crate::new_network::BlockEvent::CrosslinkFinalized(finalizable_block.inner_block().hash().0)).await;
+                            crate::new_network::push_block_event(crate::new_network::BlockEvent::CrosslinkFinalized(finalizable_block.inner_block().hash())).await;
                             match finalized_state.commit_finalized_direct(
                                 finalizable_block,
                                 None,
@@ -416,7 +416,7 @@ impl WriteBlockWorkerTask {
             };
 
             let child_hash = queued_child.hash;
-            crate::new_network::push_block_event(crate::new_network::BlockEvent::Dequeued(child_hash.0)).await;
+            crate::new_network::push_block_event(crate::new_network::BlockEvent::Dequeued(child_hash)).await;
             let parent_hash = queued_child.block.header.previous_block_hash;
             let parent_error = parent_error_map.get(&parent_hash);
 
@@ -458,7 +458,7 @@ impl WriteBlockWorkerTask {
                 // Skip the things we only need to do for successfully committed blocks
                 continue;
             }
-            crate::new_network::push_block_event(crate::new_network::BlockEvent::Committed(child_hash.0)).await;
+            crate::new_network::push_block_event(crate::new_network::BlockEvent::Committed(child_hash)).await;
 
             // Committing blocks to the finalized state keeps the same chain,
             // so we can update the chain seen by the rest of the application now.
@@ -483,7 +483,7 @@ impl WriteBlockWorkerTask {
             {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
-                crate::new_network::push_block_event(crate::new_network::BlockEvent::TradFinalized(contextually_verified_with_trees.inner_block().hash().0)).await;
+                crate::new_network::push_block_event(crate::new_network::BlockEvent::TradFinalized(contextually_verified_with_trees.inner_block().hash())).await;
                 prev_finalized_note_commitment_trees = finalized_state
                             .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), "commit contextually-verified request")
                             .expect(

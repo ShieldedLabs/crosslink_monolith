@@ -118,6 +118,8 @@ pub struct Config {
     
     /// New Networking
     pub network_identity_seed_string: Option<String>,
+    pub network_local_port: u16,
+    pub network_initial_peers: Vec<String>,
 }
 
 fn gen_temp_path(prefix: &str) -> PathBuf {
@@ -190,6 +192,8 @@ impl Default for Config {
             #[cfg(feature = "elasticsearch")]
             elasticsearch_password: "".to_string(),
             network_identity_seed_string: None,
+            network_local_port: 12001,
+            network_initial_peers: Vec::new(),
         }
     }
 }

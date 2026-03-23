@@ -1401,6 +1401,15 @@ impl Service<ReadRequest> for ReadStateService {
                 .wait_for_panics()
             }
 
+            ReadRequest::FinalizedTip => {
+                let state = self.clone();
+                
+                tokio::task::spawn_blocking(move || {
+                    Ok(ReadResponse::Tip(state.db.tip()))
+                })
+                .wait_for_panics()
+            }
+
             // Used by `getblockchaininfo` RPC method.
             ReadRequest::TipPoolValues => {
                 let state = self.clone();
