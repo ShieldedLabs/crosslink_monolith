@@ -141,6 +141,7 @@ impl STPAddress {
     pub fn is_ipv4(&self) -> bool { self.ip.to_ipv4_mapped().is_some() }
     pub fn is_ipv6(&self) -> bool { self.ip.to_ipv4_mapped().is_none() }
     pub fn from(ip: Ipv6Addr, port: u16, kp: &IdentityKeyPair) -> Self { Self { ip, port, magic1: kp.magic1, key: kp.public.clone() } }
+    pub fn connection_key(&self) -> ConnectionKey { ConnectionKey::from(self) }
 }
 impl Default for STPAddress {
     fn default() -> Self {
@@ -213,6 +214,9 @@ pub struct ConnectionKey {
 impl ConnectionKey {
     pub fn is_ipv4(&self) -> bool { self.ip.to_ipv4_mapped().is_some() }
     pub fn is_ipv6(&self) -> bool { self.ip.to_ipv4_mapped().is_none() }
+}
+impl From<&STPAddress> for ConnectionKey {
+    fn from(a: &STPAddress) -> Self { Self { ip: a.ip, port: a.port, key_15_bits: load_u16(&a.key[0..2]) << 1 } }
 }
 impl Default for ConnectionKey {
     fn default() -> Self { Self { ip: Ipv6Addr::UNSPECIFIED, port: 0, key_15_bits: 0 } }
@@ -385,7 +389,7 @@ pub fn connect_to_endpoint(
             
             let my_ip = if endpoint.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
-                ConnectionKey { ip: endpoint.ip, port: endpoint.port, key_15_bits: load_u16(&endpoint.key[0..2]) << 1 },
+                ConnectionKey::from(endpoint),
                 ConnectionTrackingData {
                     creation_time_ns: monotonic_clock_ns(),
                     my_ip,
@@ -414,7 +418,7 @@ pub fn connect_to_endpoint(
             
             let my_ip = if endpoint.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
-                ConnectionKey { ip: endpoint.ip, port: endpoint.port, key_15_bits: load_u16(&endpoint.key[0..2]) << 1 },
+                ConnectionKey::from(endpoint),
                 ConnectionTrackingData {
                     creation_time_ns: monotonic_clock_ns(),
                     my_ip,

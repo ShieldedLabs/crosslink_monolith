@@ -1202,27 +1202,19 @@ impl TMState {
     }
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ConnectionKnowledge {
-    #[default] Known,
-    Unknown,
-}
-
 // TODO: can we megastruct these and collapse the codepaths?
 #[derive(Debug)]
 pub struct Peer {
     pub root_public_bft_key: [u8; 32],
-    pub connection_key: ConnectionKey,
     pub address: Option<STPAddress>,
-    pub connection_knowledge: ConnectionKnowledge,
+    pub connection: Option<ConnectionKey>,
     pub latest_status_request_height: Option<u64>,
     pub latest_status: Option<PacketStatus>,
 }
 impl Peer {
     fn info(&self) -> PeerInfo {
         return PeerInfo {
-            connected: true,
-            connection_knowledge: self.connection_knowledge,
+            connected: self.connection.is_some(),
             root_public_bft_key: Some(self.root_public_bft_key),
             latest_status_request_height: self.latest_status_request_height.unwrap_or_default(),
         };
@@ -1233,9 +1225,8 @@ impl Default for Peer {
         Self {
             root_public_bft_key: [0_u8; 32],
             address: None,
-            connection_key: Default::default(),
+            connection: None,
 
-            connection_knowledge: ConnectionKnowledge::Known,
             latest_status_request_height: None,
             latest_status: None,
         }
@@ -1245,7 +1236,6 @@ impl Default for Peer {
 #[derive(Debug, Default, Copy, Clone)]
 pub struct PeerInfo {
     pub connected: bool,
-    pub connection_knowledge: ConnectionKnowledge,
     pub root_public_bft_key: Option<[u8; 32]>,
     pub latest_status_request_height: u64,
 }
@@ -1502,6 +1492,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
 
     for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
+        peers.insert(address.connection_key(), Peer {
+            root_public_bft_key: bft_pk.0,
+            connection: None,
+            address: Some(address.clone()),
+            latest_status_request_height: None,
+            latest_status: None
+        });
         let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
     }
 
@@ -1633,9 +1630,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     if connections_map.get(connection_key).is_none() {
                         peer.latest_status_request_height   = None;
                         peer.latest_status                  = None;
-                        if peer.address.is_some() {
+                        if peer.connection.is_some() {
                             println!("{:05}: Disconnected from peer {:?}.", my_port, peer.address);
-                            peer.address = None;
+                            peer.connection = None;
                         }
                     }
                 };
@@ -1867,7 +1864,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 }
 
                 if PRINT_PEERS { println!("{} {:?}", ctx_str, peers.iter().map(|(_,p)|
-                    (PubKeyID(p.root_public_bft_key), p.latest_status.clone(), p.connection_knowledge)
+                    (PubKeyID(p.root_public_bft_key), p.latest_status.clone())
                 ).collect::<Vec<_>>()); }
 
                 for (connection_key, peer) in &mut peers {
@@ -1953,10 +1950,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         for (key, connection) in &connections_map {
             if peers.get(&key).is_none() {
                 peers.insert(*key, Peer {
-                    root_public_bft_key: [0u8; 32],
-                    connection_key: *key,
+                    root_public_bft_key: [0u8; 32], // @Todo: BFT pk handshake
+                    connection: Some(*key),
                     address: Some(connection.address().clone()),
-                    connection_knowledge: ConnectionKnowledge::Unknown,
                     latest_status_request_height: None,
                     latest_status: None
                 });
@@ -1967,9 +1963,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         if packets_received.is_empty() {
             continue;
         }
-        let (mut connection_key, mut peer, mut peer_knowledge, mut msg) = {
+        let (mut connection_key, mut peer, mut msg) = {
             let (key, packet) = packets_received.remove(0);
-            (key, peers.get_mut(&key).unwrap(), ConnectionKnowledge::Unknown, packet)
+            (key, peers.get_mut(&key).unwrap(), packet)
         };
         let msg: &[u8] = &msg[..];
         if msg.len() == 0 { continue; }

@@ -86,7 +86,7 @@ pub fn sync(
         magic1: CONNECT_MAGIC1_PLAIN_TEXT,
         key: network_keypair.public,
     };
-    println!("NETWORK LOCALHOST STP ADDRESS: {}", my_local_stp_address);
+    println!("NETWORK LOCALHOST STP ADDRESS: {:?}", my_local_stp_address);
     println!("I need to connect to: {:?}", config.network_initial_peers);
 
     loop {
