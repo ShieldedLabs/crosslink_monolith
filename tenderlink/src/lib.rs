@@ -976,10 +976,9 @@ impl TMState {
         // format!("{:?} {:05}-{:?}-{:?}.{:3}.{:3}.{:9}", roster.into_iter().map(|m| m.pub_key).collect::<Vec<_>>(), self.my_port, self.my_pub_key, roster_i_from_pub_key(roster, self.my_pub_key), self.height, self.round, format!("{:?}", self.step))
         format!("{:05}-{:?}-{:>8}.{:3}.{:3}.{:9}", self.my_port, self.my_pub_key, format!("{:?}", roster_i_from_pub_key(roster, self.my_pub_key)), self.height, self.round, format!("{:?}", self.step))
     }
-    fn name_str_other(roster: &[SortedRosterMember], peer: &Peer) -> String {
-        let mut port = 0;
-        if let Some(endpoint) = &peer.address { port = endpoint.port; }
-        format!("{:05}-{:?}-{:?}", port, PubKeyID(peer.root_public_bft_key), roster_i_from_pub_key(roster, PubKeyID(peer.root_public_bft_key)))
+    fn name_str_other(roster: &[SortedRosterMember], bft_key: [u8; 32], address: Option<&STPAddress>) -> String {
+        let port = address.map_or(0, |a| a.port);
+        format!("{:05}-{:?}-{:?}", port, PubKeyID(bft_key), roster_i_from_pub_key(roster, PubKeyID(bft_key)))
     }
 
     async fn bft_update(&mut self, roster: &mut Vec<SortedRosterMember>) {
@@ -1203,33 +1202,19 @@ impl TMState {
 }
 
 // TODO: can we megastruct these and collapse the codepaths?
-#[derive(Debug)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Peer {
-    pub root_public_bft_key: [u8; 32],
-    pub address: Option<STPAddress>,
-    pub connection: Option<ConnectionKey>,
     pub latest_status_request_height: Option<u64>,
     pub latest_status: Option<PacketStatus>,
+    pub index_counter: u64, // for some peer randomness
 }
 impl Peer {
-    fn info(&self) -> PeerInfo {
+    fn info(&self, connected: bool, bft_key: [u8; 32]) -> PeerInfo {
         return PeerInfo {
-            connected: self.connection.is_some(),
-            root_public_bft_key: Some(self.root_public_bft_key),
+            connected,
+            root_public_bft_key: Some(bft_key),
             latest_status_request_height: self.latest_status_request_height.unwrap_or_default(),
         };
-    }
-}
-impl Default for Peer {
-    fn default() -> Self {
-        Self {
-            root_public_bft_key: [0_u8; 32],
-            address: None,
-            connection: None,
-
-            latest_status_request_height: None,
-            latest_status: None,
-        }
     }
 }
 
@@ -1478,8 +1463,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let socket = setup_and_bind_udp_socket(my_port);
 
-    let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
-
     let my_keypairs = vec![&my_stp_keypair];
 
     let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
@@ -1489,20 +1472,18 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut packets_to_send:  Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
     let mut packets_received: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
 
+    let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
+    let mut bft_key_to_address = HashMap::<[u8; 32], STPAddress>::new();
+    let mut address_to_bft_key = HashMap::<STPAddress, [u8; 32]>::new();
 
     for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
-        peers.insert(address.connection_key(), Peer {
-            root_public_bft_key: bft_pk.0,
-            connection: None,
-            address: Some(address.clone()),
-            latest_status_request_height: None,
-            latest_status: None
-        });
+        bft_key_to_address.insert(bft_pk.0, address.clone());
+        address_to_bft_key.insert(address.clone(), bft_pk.0);
         let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
     }
 
-    if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, peers.iter().map(|(_,p)|p.address.clone()).collect::<Vec<_>>()); }
+    if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, bft_key_to_address.values().collect::<Vec<_>>()); }
 
     // TODO: only convert private to public in 1 location
     let mut bft_state = TMState::init(
@@ -1530,7 +1511,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         let ctx_str = bft_state.ctx_str(&roster);
 
         {
-            let mut peers = peers.iter().map(|(_,p)| p.info()).collect::<Vec<PeerInfo>>();
+            let mut peers = peers.iter().map(|(ck, p)| {
+                let bft_key = connections_map.get(ck)
+                    .and_then(|c| address_to_bft_key.get(&c.address()))
+                    .copied()
+                    .unwrap_or([0u8; 32]);
+                p.info(true, bft_key)
+            }).collect::<Vec<PeerInfo>>();
             bft_state.update_peers_cmd_closure.0(peers).await;
         }
 
@@ -1550,7 +1537,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             Ok((header, status, o))
         }
 
-        fn write_header_and_maybe_status(header_: PacketHeader, include_status: bool, bft_state: &TMState, roster: &[SortedRosterMember], send_buf1: &mut [u8], peer_random: u64) -> usize {
+        fn write_header_and_maybe_status(header_: PacketHeader,
+                                         include_status: bool,
+                                         bft_state: &TMState,
+                                         roster: &[SortedRosterMember],
+                                         send_buf1: &mut [u8],
+                                         peer_random: u64) -> usize {
             let mut header = header_;
             header.tag |= if include_status { PACKET_TAG_STATUS_FLAG as u64 } else { 0 };
 
@@ -1606,15 +1598,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
             o
         }
-        fn send_noise_msg(ctx_str: &str,
-                          socket: SockHandle,
-                          packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>,
-                          peer_connection: &ConnectionKey,
+        fn send_noise_msg(packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>,
+                          connection_key: &ConnectionKey,
                           msg: &[u8],
                           stats: &mut NetworkStats) {
             stats.packets_sent += 1;
             stats.bytes_sent += msg.len();
-            packets_to_send.push((*peer_connection, Vec::from(msg)));
+            packets_to_send.push((*connection_key, Vec::from(msg)));
         }
 
         if net_stats_window_start.elapsed() >= ONE_SECOND {
@@ -1626,24 +1616,19 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         if was_now > next_tick_time {
             loop {
                 // TICK CODE
-                for (connection_key, peer) in &mut peers {
+                peers.retain(|connection_key, peer| {
                     if connections_map.get(connection_key).is_none() {
-                        peer.latest_status_request_height   = None;
-                        peer.latest_status                  = None;
-                        if peer.connection.is_some() {
-                            println!("{:05}: Disconnected from peer {:?}.", my_port, peer.address);
-                            peer.connection = None;
-                        }
+                        println!("{:05}: Disconnected from peer {:?}.", my_port, connection_key);
+                        false
+                    } else {
+                        true
                     }
-                };
+                });
 
                 // Try to reconnect to known but disconnected peers
-                for (_, peer) in &peers {
-                    if peer.address.is_none() {
-                        // @Todo: Track a bounded list of endpoint attestations and find this finalizer on that list
-                        if let Some(finalizer_peer_address) = finalizer_peer_addresses.iter().find(|fpa| fpa.bft_pk.0 == peer.root_public_bft_key) {
-                            let _ = connect_to(socket, &mut connections_map, &my_keypairs, &finalizer_peer_address.address);
-                        }
+                for (_bft_key, address) in &bft_key_to_address {
+                    if !connections_map.contains_key(&address.connection_key()) {
+                        let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
                     }
                 }
 
@@ -1665,7 +1650,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     bytes
                 };
 
-                if peers.iter().position(|(_,p)| p.root_public_bft_key == server_a_pub_key).is_none() && server_a_pub_key != my_root_private_key.as_ref() {
+                if !bft_key_to_address.contains_key(&server_a_pub_key) && server_a_pub_key != my_root_private_key.as_ref() {
                     let (a, b) = addr_string_to_stuff("45.76.30.90:8234");
                     // peers.push(Peer { root_public_bft_key: server_a_pub_key, endpoint: Some(evidence.address), ..Peer::default() });
                 }
@@ -1682,7 +1667,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     bytes
                 };
 
-                if peers.iter().position(|(_,p)| p.root_public_bft_key == server_b_pub_key).is_none() && server_b_pub_key != my_root_private_key.as_ref() {
+                if !bft_key_to_address.contains_key(&server_b_pub_key) && server_b_pub_key != my_root_private_key.as_ref() {
                     let (a, b) = addr_string_to_stuff("70.34.201.202:8234");
                     // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.address), ..Peer::default() });
                 }
@@ -1691,11 +1676,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                            should_send_prevotes: bool,
                                            round_data: &RoundData,
                                            ctx_str: &str,
+                                           roster: &[SortedRosterMember],
                                            packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>,
                                            send_buf1: &mut [u8],
-                                           peer_connection: &ConnectionKey,
-                                           peer_root_public_bft_key: [u8; 32],
-                                           socket: SockHandle,
+                                           peer: &mut Peer,
+                                           connection_key: &ConnectionKey,
+                                           peer_bft_key: [u8; 32],
                                            stats: &mut NetworkStats) {
                     let height = round_data.height;
                     let round  = round_data.round;
@@ -1717,10 +1703,18 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
                                 chunk_hdr.chunk_i = chunk_i as u32;
 
-                                let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>(); // @TodoHeaderAndStatus
-
                                 let mut o = 0;
-                                o += header   .write_to(&mut send_buf1[o..]);
+
+                                let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>();
+                                // @Todo @Speed: We should build the header once and save it for all chunks. Peers only obey the latest status anyway.
+                                o += write_header_and_maybe_status(header, true,
+                                                                   bft_state,
+                                                                   roster,
+                                                                   &mut send_buf1[o..],
+                                                                   peer.index_counter);
+                                peer.index_counter += 1;
+                                let signed_data_start = o; // past header+status
+
                                 o += chunk_hdr.write_to(&mut send_buf1[o..]);
 
                                 let (chunk_o, chunk_size) = round_data.proposal.chunk_o_size(chunk_i);
@@ -1729,7 +1723,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 o += round_data.proposal_sigs[chunk_i].0.write_to(&mut send_buf1[o..]);
 
                                 #[cfg(debug_assertions)] // self-check signatures as sanity check
-                                match round_data.proposal_sigs[chunk_i].verify(proposer_pub_key, &send_buf1[PACKET_HEADER_SIZE..sig_o]) {
+                                match round_data.proposal_sigs[chunk_i].verify(proposer_pub_key, &send_buf1[signed_data_start..sig_o]) {
                                     Ok(_) => {}
                                     Err((err, str)) => {
                                         eprintln!("{ctx_str}: \x1b[91mBFT FAULT\x1b[0m: {str} [..{}]: for proposal from {proposer_pub_key:?} {height}.{round}.{chunk_i}: {} {err}", sig_o-1, chunk_hdr.proposal_id);
@@ -1737,15 +1731,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                     }
                                 }
 
-                                if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer_root_public_bft_key); }
+                                if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer_bft_key); }
                                 sent_chunk_cs += 1;
                                 print_packet_tag_send(header);
-                                send_noise_msg(&ctx_str,
-                                               socket,
-                                               packets_to_send,
-                                               peer_connection,
-                                               &send_buf1[..o],
-                                               stats);
+                                send_noise_msg(packets_to_send, connection_key, &send_buf1[..o], stats);
                             }
                         }
                     }
@@ -1758,7 +1747,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             continue;
                         }
 
-                        let header = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit); // @TodoHeaderAndStatus
+                        let header = PacketHeader::new_(PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit);
                         let mut packet = PacketVotes {
                             height, round,
                             value_id: round_data.proposal_id,
@@ -1816,14 +1805,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                     dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet);
 
                                     let mut o = 0;
-                                    o += header.write_to(&mut send_buf1[o..]);
+                                    // @Todo @Speed: We should build the header once and save it for all votes. Peers only obey the latest status anyway.
+                                    o += write_header_and_maybe_status(header, true,
+                                                                       bft_state,
+                                                                       roster,
+                                                                       &mut send_buf1[o..],
+                                                                       peer.index_counter);
+                                    peer.index_counter += 1;
+
                                     o += packet.write_to(&mut send_buf1[o..]);
-                                    send_noise_msg(ctx_str,
-                                                   socket,
-                                                   packets_to_send,
-                                                   peer_connection,
-                                                   &send_buf1[..o],
-                                                   stats);
+                                    send_noise_msg(packets_to_send, connection_key, &send_buf1[..o], stats);
 
                                     packet.no_votes_n  = 0;
                                     packet.yes_votes_n = 0;
@@ -1845,16 +1836,18 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet);
 
                             let mut o = 0;
-                            o += header.write_to(&mut send_buf1[o..]);
+                            // @Todo @Speed: We should build the header once and save it for all votes. Peers only obey the latest status anyway.
+                            o += write_header_and_maybe_status(header, true,
+                                                               bft_state,
+                                                               roster,
+                                                               &mut send_buf1[o..],
+                                                               peer.index_counter);
+                            peer.index_counter += 1;
+
                             o += packet.write_to(&mut send_buf1[o..]);
                             // TODO: maybe status
                             print_packet_tag_send(header);
-                            send_noise_msg(ctx_str,
-                                           socket,
-                                           packets_to_send,
-                                           peer_connection,
-                                           &send_buf1[..o],
-                                           stats);
+                            send_noise_msg(packets_to_send, connection_key, &send_buf1[..o], stats);
                         }
                     }
 
@@ -1863,25 +1856,31 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     if PRINT_SEND_CS && sent_c[1]     > 0 { eprintln!("{} sent {} precommits",      ctx_str, sent_c[1]);     }
                 }
 
-                if PRINT_PEERS { println!("{} {:?}", ctx_str, peers.iter().map(|(_,p)|
-                    (PubKeyID(p.root_public_bft_key), p.latest_status.clone())
-                ).collect::<Vec<_>>()); }
+                if PRINT_PEERS { println!("{} {:?}", ctx_str, peers.iter().map(|(ck, p)| {
+                    let bft_key = connections_map.get(ck)
+                        .and_then(|c| address_to_bft_key.get(&c.address()))
+                        .copied()
+                        .unwrap_or([0u8; 32]);
+                    (PubKeyID(bft_key), p.latest_status.clone())
+                }).collect::<Vec<_>>()); }
 
                 for (connection_key, peer) in &mut peers {
-                    if peer.address.is_none() {
-                        continue;
-                    }
+                    let peer_bft_key = connections_map.get(connection_key)
+                        .and_then(|c| address_to_bft_key.get(&c.address()))
+                        .copied()
+                        .unwrap_or([0u8; 32]);
                     if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
                         peer.latest_status_request_height = None;
                         send_round_data_to_peer(&bft_state,
                                                 false,
                                                 &bft_state.recent_commit_round_cache[height as usize],
                                                 &ctx_str,
+                                                &roster,
                                                 &mut packets_to_send,
                                                 &mut send_buf1,
+                                                peer,
                                                 connection_key,
-                                                peer.root_public_bft_key,
-                                                socket,
+                                                peer_bft_key,
                                                 &mut net_stats);
                     }
                     else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
@@ -1893,11 +1892,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                     true,
                                                     &round_data,
                                                     &ctx_str,
+                                                    &roster,
                                                     &mut packets_to_send,
                                                     &mut send_buf1,
+                                                    peer,
                                                     connection_key,
-                                                    peer.root_public_bft_key,
-                                                    socket,
+                                                    peer_bft_key,
                                                     &mut net_stats);
                         }
                     } else {
@@ -1946,35 +1946,28 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             &my_keypairs);
         packets_to_send.clear();
 
-        // Push any new connections to our peers list
-        for (key, connection) in &connections_map {
-            if peers.get(&key).is_none() {
-                peers.insert(*key, Peer {
-                    root_public_bft_key: [0u8; 32], // @Todo: BFT pk handshake
-                    connection: Some(*key),
-                    address: Some(connection.address().clone()),
-                    latest_status_request_height: None,
-                    latest_status: None
-                });
-            }
+        // Ensure a Peer entry exists for every active connection
+        for key in connections_map.keys() {
+            peers.entry(*key).or_insert_with(|| Peer::default());
         }
 
-        // DECRYPT
-        if packets_received.is_empty() {
-            continue;
-        }
-        let (mut connection_key, mut peer, mut msg) = {
-            let (key, packet) = packets_received.remove(0);
-            (key, peers.get_mut(&key).unwrap(), packet)
-        };
-        let msg: &[u8] = &msg[..];
-        if msg.len() == 0 { continue; }
-        let Ok((header, status, read_o)) = read_header_and_maybe_status(&msg[..]) else {
-            continue;
-        };
-        let packet_type = header.type_();
+        // Remove peer entries for dropped connections
+        peers.retain(|key, _| connections_map.contains_key(key));
 
-        {
+        // READ
+        while packets_received.len() > 0 {
+            let (mut connection_key, mut peer, mut msg) = {
+                let (key, packet) = packets_received.remove(0);
+                (key, peers.get_mut(&key).unwrap(), packet)
+            };
+            let msg: &[u8] = &msg[..];
+            if msg.len() == 0 { continue; }
+            let Ok((header, status, read_o)) = read_header_and_maybe_status(&msg[..]) else {
+                continue;
+            };
+            let packet_type = header.type_();
+
+
             if let Some(status) = status {
                 peer.latest_status_request_height = Some(status.height);
                 peer.latest_status = Some(status);
@@ -1995,7 +1988,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 // ALT:  cache proposer for *current* round
                 if msg.len() == packet_size {
                     if let (Some(roster_i), _) = TMState::proposer_from_height_round(&bft_state.hash_keys, &roster, hdr.height, hdr.round) {
-                        let sig_o = PACKET_HEADER_SIZE + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
+                        let sig_o = read_o + PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size;
                         bft_state.check_and_incorporate_msg(hdr.height, hdr.round, hdr.chunk_i as usize, hdr.proposal_id, hdr.valid_round,
                             &roster, roster_i, packet_type, &msg[read_o..sig_o], TMSig(msg[sig_o..sig_o+64].try_into().unwrap()));
                     }
@@ -2079,7 +2072,7 @@ pub struct BlockHash(pub [u8; 32]);
 impl BlockHash { const NIL: Self = Self([0; 32]); }
 const STATUS_PROPOSAL_RNGS_N: usize = 1;
 const STATUS_VOTE_RNGS_N: usize = 1; // ALT: split prevote/precommit numbers
-#[derive(Clone, Debug)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct PacketStatus {
     height: u64,
     round:  u32, // as context for following request ranges
@@ -2127,6 +2120,7 @@ impl PacketStatus {
 }
 
 const PACKET_HEADER_SIZE: usize = 8 + 8; // 16
+const PACKET_STATUS_SIZE: usize = 8 /*height*/ + 4 /*round*/ + STATUS_PROPOSAL_RNGS_N * 8 + 2 * STATUS_VOTE_RNGS_N * 4; // 28
 #[derive(Debug, Clone, Copy)]
 struct PacketHeader {
     tag: u64,
@@ -2222,7 +2216,7 @@ impl PacketVotes {
     }
 }
 
-const PROPOSAL_PACKET_EXTRA:    usize = (PACKET_HEADER_SIZE + 56 + 64);
+const PROPOSAL_PACKET_EXTRA:    usize = (PACKET_HEADER_SIZE + PACKET_STATUS_SIZE + 56 + 64);
 const PROPOSAL_CHUNK_DATA_SIZE: usize = PATH_MTU - PROPOSAL_PACKET_EXTRA;
 
 // NOTE(azmr): this is:

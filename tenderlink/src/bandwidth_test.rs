@@ -252,7 +252,7 @@ pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKe
         key_15_bits: load_u16(&address.key[0..2]) << 1
     };
     if connections_map.contains_key(&key) {
-        return Err(format!("Error: Already connected to {:?}.", address)); // Ok(());
+        return Err(format!("Error: Already connected or connecting to {:?}.", address)); // Ok(());
     }
 
     for keypair in my_keypairs {
