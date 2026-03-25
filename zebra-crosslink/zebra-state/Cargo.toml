@@ -45,6 +45,8 @@ tx_v6 = ["zebra-chain/tx_v6"]
 [dependencies]
 tenderlink = { workspace = true }
 blake3 = "1.8.2"
+rand = { workspace = true }
+rand_chacha = { workspace = true }
 bincode = { workspace = true }
 chrono = { workspace = true, features = ["clock", "std"] }
 dirs = { workspace = true }

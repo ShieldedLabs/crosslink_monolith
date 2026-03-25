@@ -353,7 +353,7 @@ pub fn do_the_test_program2(my_port: u16, my_listen_keypairs: Vec<&IdentityKeyPa
 
     let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
 
-    let socket = setup_and_bind_udp_socket(my_port);
+    let socket = setup_and_bind_udp_socket(my_port).unwrap();
 
     if let Some((my_connect_keypair, beam_to)) = beam_to {
         connect_to_endpoint(socket, &mut connections_map, my_connect_keypair, beam_to);
@@ -812,7 +812,7 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
         packet_buffer: Vec<u32>,
     }
     let mut send_state = SendState {
-        socket: setup_and_bind_udp_socket(port),
+        socket: setup_and_bind_udp_socket(port).unwrap(),
         drop_cursor: 50,
         serial_number: 50,
         packet_buffer: vec![0; PACKET_HISTORY_BUFFER_LEN],

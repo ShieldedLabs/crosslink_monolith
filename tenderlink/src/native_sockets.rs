@@ -148,7 +148,7 @@ mod linux {
     }
 
     #[inline]
-    pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle { // Linux
+    pub fn setup_and_bind_udp_socket(port: u16) -> Option<SockHandle> { // Linux
         let fd = unsafe {
             libc::socket(
                 libc::AF_INET6,
@@ -157,23 +157,26 @@ mod linux {
             )
         };
         if fd < 0 {
-            panic!("socket() failed: {}", std::io::Error::last_os_error());
+            eprintln!("socket() failed: {}", std::io::Error::last_os_error());
+            return None;
         }
-        
+
         // Make socket non-blocking
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             if flags < 0 {
-                panic!("fcntl(F_GETFL) failed: {}", std::io::Error::last_os_error());
+                eprintln!("fcntl(F_GETFL) failed: {}", std::io::Error::last_os_error());
+                return None;
             }
             if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                panic!("fcntl(F_SETFL) failed: {}", std::io::Error::last_os_error());
+                eprintln!("fcntl(F_SETFL) failed: {}", std::io::Error::last_os_error());
+                return None;
             }
         }
-    
+
         unsafe {
             let zero: libc::c_int = 0;
-    
+
             // Dual-stack: allow IPv4-mapped IPv6 addresses.
             if libc::setsockopt(
                 fd,
@@ -183,10 +186,11 @@ mod linux {
                 std::mem::size_of_val(&zero) as libc::socklen_t,
             ) != 0
             {
-                panic!("Failed to disable IPV6_V6ONLY: {}", std::io::Error::last_os_error());
+                eprintln!("Failed to disable IPV6_V6ONLY: {}", std::io::Error::last_os_error());
+                return None;
             }
         }
-    
+
         let known_good_ipv6_address = first_usable_ipv6();
         // Bind [::]:port
         unsafe {
@@ -200,20 +204,21 @@ mod linux {
             //     Some(ip6) => libc::in6_addr { s6_addr: ip6.octets() },
             //     None => libc::in6_addr { s6_addr: [0; 16] },
             // };
-    
+
             if libc::bind(
                 fd,
                 &addr as *const _ as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
             ) != 0
             {
-                panic!("bind() failed: {}", std::io::Error::last_os_error());
+                eprintln!("bind([::]:{}) failed: {}", port, std::io::Error::last_os_error());
+                return None;
             }
         }
-    
+
         unsafe {
             let one: libc::c_int = 1;
-    
+
             // IPv4 TOS (includes ECN bits) as CMSG on recvmsg
             if libc::setsockopt(
                 fd,
@@ -250,9 +255,9 @@ mod linux {
                 panic!("Failed to Enable IPv6 PKTINFO, error: {}", std::io::Error::last_os_error());
             }
         }
-        SockHandle(fd, known_good_ipv6_address)
+        Some(SockHandle(fd, known_good_ipv6_address))
     }
-    
+
     /// SEND one UDP packet to (dst_ip6, dst_port) on a dual-stack socket.
     /// - If `dst_ip6` is IPv4-mapped (::ffff:a.b.c.d), it sends to IPv4 using sockaddr_in
     ///   and uses IP_TOS cmsg.
@@ -780,23 +785,26 @@ mod windows {
     }
 
     #[inline]
-    pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle { // Windows
+    pub fn setup_and_bind_udp_socket(port: u16) -> Option<SockHandle> { // Windows
         let sock = unsafe { socket(AF_INET6 as i32, SOCK_DGRAM as i32, IPPROTO_UDP as i32) };
         if sock == INVALID_SOCKET {
-            panic!("socket(AF_INET6, SOCK_DGRAM, UDP) failed: {}", wsa_last_error());
+            eprintln!("socket(AF_INET6, SOCK_DGRAM, UDP) failed: {}", wsa_last_error());
+            return None;
         }
 
         // non-blocking
         unsafe {
             let mut nonblocking: u32 = 1;
             if ioctlsocket(sock, FIONBIO as i32, &mut nonblocking as *mut u32) == SOCKET_ERROR {
-                panic!("ioctlsocket(FIONBIO) failed: {}", wsa_last_error());
+                eprintln!("ioctlsocket(FIONBIO) failed: {}", wsa_last_error());
+                return None;
             }
         }
 
         // dual-stack: IPV6_V6ONLY = 0
         if setsockopt_u32(sock, IPPROTO_IPV6 as i32, IPV6_V6ONLY as i32, 0) == SOCKET_ERROR {
-            panic!("setsockopt(IPV6_V6ONLY=0) failed: {}", wsa_last_error());
+            eprintln!("setsockopt(IPV6_V6ONLY=0) failed: {}", wsa_last_error());
+            return None;
         }
 
         // Bind [::]:port
@@ -816,7 +824,8 @@ mod windows {
             )
         };
         if rc == SOCKET_ERROR {
-            panic!("bind([::]:{}) failed: {}", port, wsa_last_error());
+            eprintln!("bind([::]:{}) failed: {}", port, wsa_last_error());
+            return None;
         }
 
         // Receive ancillary metadata:
@@ -829,17 +838,19 @@ mod windows {
         if rc_v4_tos == SOCKET_ERROR {
             let e = unsafe { WSAGetLastError() };
             if e != WSAEINVAL {
-                panic!("setsockopt(IP_RECVTOS=1) failed: {}", std::io::Error::from_raw_os_error(e));
+                eprintln!("setsockopt(IP_RECVTOS=1) failed: {}", std::io::Error::from_raw_os_error(e));
+                return None;
             }
         }
 
         if setsockopt_u32(sock, IPPROTO_IPV6 as i32, IPV6_RECVTCLASS as i32, 1) == SOCKET_ERROR {
-            panic!("setsockopt(IPV6_RECVTCLASS=1) failed: {}", wsa_last_error());
+            eprintln!("setsockopt(IPV6_RECVTCLASS=1) failed: {}", wsa_last_error());
+            return None;
         }
 
         let recvmsg = get_wsarecvmsg(sock);
 
-        SockHandle(sock, recvmsg)
+        Some(SockHandle(sock, recvmsg))
     }
 
     #[inline]
@@ -1216,21 +1227,24 @@ mod macos {
     pub struct SockHandle(libc::c_int); // Mac
     
     #[inline]
-    pub fn setup_and_bind_udp_socket(port: u16) -> SockHandle { // Mac
+    pub fn setup_and_bind_udp_socket(port: u16) -> Option<SockHandle> { // Mac
         // Create an IPv6 UDP socket (we'll run it dual-stack via IPV6_V6ONLY=0).
         let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP) };
         if fd < 0 {
-            panic!("socket() failed: {}", std::io::Error::last_os_error());
+            eprintln!("socket() failed: {}", std::io::Error::last_os_error());
+            return None;
         }
 
         // Make socket non-blocking.
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             if flags < 0 {
-                panic!("fcntl(F_GETFL) failed: {}", std::io::Error::last_os_error());
+                eprintln!("fcntl(F_GETFL) failed: {}", std::io::Error::last_os_error());
+                return None;
             }
             if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                panic!("fcntl(F_SETFL) failed: {}", std::io::Error::last_os_error());
+                eprintln!("fcntl(F_SETFL) failed: {}", std::io::Error::last_os_error());
+                return None;
             }
         }
 
@@ -1245,10 +1259,8 @@ mod macos {
                 std::mem::size_of_val(&zero) as libc::socklen_t,
             ) != 0
             {
-                panic!(
-                    "Failed to disable IPV6_V6ONLY: {}",
-                    std::io::Error::last_os_error()
-                );
+                eprintln!("Failed to disable IPV6_V6ONLY: {}", std::io::Error::last_os_error());
+                return None;
             }
         }
 
@@ -1265,7 +1277,8 @@ mod macos {
                 std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
             ) != 0
             {
-                panic!("bind() failed: {}", std::io::Error::last_os_error());
+                eprintln!("bind([::]:{}) failed: {}", port, std::io::Error::last_os_error());
+                return None;
             }
         }
 
@@ -1282,10 +1295,8 @@ mod macos {
                 std::mem::size_of_val(&one) as libc::socklen_t,
             ) != 0
             {
-                panic!(
-                    "Failed to enable IPV6_RECVTCLASS: {}",
-                    std::io::Error::last_os_error()
-                );
+                eprintln!("Failed to enable IPV6_RECVTCLASS: {}", std::io::Error::last_os_error());
+                return None;
             }
 
             // Receive IPV6_PKTINFO cmsg (dst addr + ifindex) on recvmsg (and usable for sendmsg).
@@ -1297,14 +1308,12 @@ mod macos {
                 std::mem::size_of_val(&one) as libc::socklen_t,
             ) != 0
             {
-                panic!(
-                    "Failed to enable IPV6_RECVPKTINFO: {}",
-                    std::io::Error::last_os_error()
-                );
+                eprintln!("Failed to enable IPV6_RECVPKTINFO: {}", std::io::Error::last_os_error());
+                return None;
             }
         }
 
-        SockHandle(fd)
+        Some(SockHandle(fd))
     }
 
     /// SEND one UDP packet to (dst_ip6, dst_port) on a dual-stack IPv6 socket.
@@ -1675,7 +1684,7 @@ mod macos {
 
 //#[test]
 fn test_network_switch() {
-    let socket = setup_and_bind_udp_socket(0);
+    let socket = setup_and_bind_udp_socket(0).unwrap();
     loop {
         std::thread::yield_now();
         let time_before = monotonic_clock_ns();

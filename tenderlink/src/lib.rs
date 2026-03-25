@@ -1451,7 +1451,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let my_port = my_endpoint.map(|e|e.port).unwrap_or(0); // @Todo! Get local port after sock creation! @@@
 
-    let socket = setup_and_bind_udp_socket(my_port);
+    let socket = setup_and_bind_udp_socket(my_port).unwrap();
 
     let my_keypairs = vec![&my_stp_keypair];
 

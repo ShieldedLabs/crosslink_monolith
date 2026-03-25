@@ -98,7 +98,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
     socket_setup();
     monotonic_clock_setup();
 
-    let socket = setup_and_bind_udp_socket(port);
+    let socket = setup_and_bind_udp_socket(port).unwrap();
 
     let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(monotonic_clock_ns());
 
