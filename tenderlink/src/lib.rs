@@ -350,6 +350,23 @@ impl RoundData {
     fn has_full_proposal(&self) -> bool {
         self.proposal_sigs_n > 0 && self.proposal_sigs_n == self.proposal_sigs.len()
     }
+
+    fn flush_for_amnesiac_proposer(&mut self, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], proposal_size: u32) {
+        let roster_n = active_roster_len(roster);
+        *self = RoundData {
+            height:               self.height,
+            round:                self.round,
+            proposal_id:          value_id,
+            proposal_valid_round: valid_round,
+            msg_val_sigs:         vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n],
+            roster:               Vec::from(&roster[0..roster_n]),
+            active_timeout:       self.active_timeout.clone(),
+            timeout_triggered:    self.timeout_triggered,
+            ..RoundData::EMPTY
+        };
+        self.proposal.0    = vec![0;          proposal_size as usize];
+        self.proposal_sigs = vec![TMSig::NIL; self.proposal.chunks_n()];
+    }
     fn has_enough_info_to_determine_validity(&self) -> bool {
         self.proposal_is_faulty || self.has_full_proposal()
     }
@@ -779,21 +796,7 @@ impl TMState {
                       (round_data.proposal.0.len() != hdr.proposal_size as usize ||
                        round_data.proposal_id != value_id ||
                        round_data.proposal_valid_round != valid_round) { // Amnesiac Proposer's Dilemma
-                        // Flush proposal id/votes. @Robustness @Duplicate: how to tersely flush the round?
-                        let roster_n = active_roster_len(roster);
-                        *round_data = RoundData {
-                            height:               round_data.height,
-                            round:                round_data.round,
-                            proposal_id:          value_id,
-                            proposal_valid_round: valid_round,
-                            msg_val_sigs:         vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
-                            roster:               Vec::from(&roster[0..roster_n]),
-                            active_timeout:       round_data.active_timeout.clone(),
-                            timeout_triggered:    round_data.timeout_triggered,
-                            ..RoundData::EMPTY
-                        };
-                        round_data.proposal.0    = vec![0;          hdr.proposal_size as usize];
-                        round_data.proposal_sigs = vec![TMSig::NIL; round_data.proposal.chunks_n()];
+                        round_data.flush_for_amnesiac_proposer(value_id, valid_round, roster, hdr.proposal_size);
                         eprintln!("{}: \x1b[93mAMNESIAC PROPOSER\x1b[0m at {}.{}.{}: Flushing proposal...", ctx_str, height, round, chunk_i);
                     } else {
                         if round_data.proposal.0.len() != hdr.proposal_size as usize {
@@ -872,21 +875,7 @@ impl TMState {
                     // TODO: include signed prevote & precommit for self?
                 } else if round_data.proposal_sigs[chunk_i] != sig { // TODO: check value/sig conformance
                     if is_my_proposal { // Amnesiac Proposer's Dilemma
-                        // Flush proposal id/votes. @Robustness @Duplicate: how to tersely flush the round?
-                        let roster_n = active_roster_len(roster);
-                        *round_data = RoundData {
-                            height:               round_data.height,
-                            round:                round_data.round,
-                            proposal_id:          value_id,
-                            proposal_valid_round: valid_round,
-                            msg_val_sigs:         vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
-                            roster:               Vec::from(&roster[0..roster_n]),
-                            active_timeout:       round_data.active_timeout.clone(),
-                            timeout_triggered:    round_data.timeout_triggered,
-                            ..RoundData::EMPTY
-                        };
-                        round_data.proposal.0    = vec![0;          hdr.proposal_size as usize];
-                        round_data.proposal_sigs = vec![TMSig::NIL; round_data.proposal.chunks_n()];
+                        round_data.flush_for_amnesiac_proposer(value_id, valid_round, roster, hdr.proposal_size);
                         eprintln!("{}: \x1b[93mAMNESIAC PROPOSER\x1b[0m at {}.{}.{}: Flushing proposal...", ctx_str, height, round, chunk_i);
                     } else {
                         // TODO: treat this as a failed is_valid & early out before awaiting full proposal
@@ -946,7 +935,8 @@ impl TMState {
                     println!("{}: update to {:?} (d: {:?})", ctx_str, round_data.counts, d);
                 }
 
-                if true {
+                #[cfg(debug_assertions)]
+                {
                     let mut check_counts = ConsensusCounts::ZERO;
                     for (i, sig) in round_data.msg_val_sigs.iter().enumerate() {
                         check_counts = check_counts + ConsensusCounts::from(&(*sig, roster[i].stake));
