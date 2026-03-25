@@ -162,7 +162,7 @@ impl std::fmt::Display for FatPointerToBftBlock3 {
         write!(f, " signatures:[")?;
         for (i, s) in self.signatures.iter().enumerate() {
             write!(f, "{{pk:")?;
-            for b in s.public_key {
+            for b in s.public_key.0 {
                 write!(f, "{:02x}", b)?;
             }
             write!(f, " sig:")?;
@@ -198,7 +198,7 @@ fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMembe
             .filter_map(|(roster_i, (value_id, commit_signature))| {
                 if *value_id == round_data.proposal_id && *commit_signature != TMSig::NIL {
                     Some(FatPointerSignature3 {
-                        public_key: roster[roster_i].pub_key.0,
+                        public_key: roster[roster_i].pub_key,
                         vote_signature: commit_signature.0,
                     })
                 } else { None }
@@ -244,20 +244,20 @@ impl FatPointerToBftBlock3 {
 /// A vote signature for a block
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)] //, serde::Serialize, serde::Deserialize)]
 pub struct FatPointerSignature3 {
-    pub public_key: [u8; 32],
+    pub public_key: PubKeyID,
     pub vote_signature: [u8; 64],
 }
 
 impl FatPointerSignature3 {
     pub fn to_bytes(&self) -> [u8; 32 + 64] {
         let mut buf = [0_u8; 32 + 64];
-        buf[0..32].copy_from_slice(&self.public_key);
+        buf[0..32].copy_from_slice(&self.public_key.0);
         buf[32..32 + 64].copy_from_slice(&self.vote_signature);
         buf
     }
     pub fn from_bytes(bytes: &[u8; 32 + 64]) -> FatPointerSignature3 {
         Self {
-            public_key: bytes[0..32].try_into().unwrap(),
+            public_key: PubKeyID(bytes[0..32].try_into().unwrap()),
             vote_signature: bytes[32..32 + 64].try_into().unwrap(),
         }
     }
@@ -614,7 +614,7 @@ impl TMState {
                 let is_precommit: u8 = if let TMMsgData::Precommit(..) = msg { 1 } else { 0 };
                 if PRINT_BFT_VOTE { println!("{} {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id); }
                 let packet_type = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit;
-                let signed_data = make_vote_sign_datas(roster[roster_i].pub_key.0, is_precommit != 0, height, round, value_id)[1];
+                let signed_data = make_vote_sign_datas(roster[roster_i].pub_key, is_precommit != 0, height, round, value_id)[1];
                 let sig         = TMSig(self.my_signing_key.sign(&signed_data).to_bytes());
                 if PRINT_SIGN { println!("{} signed {} with {:?}", self.ctx_str(roster), ["prevote", "precommit"][is_precommit as usize], sig) };
 
@@ -976,9 +976,9 @@ impl TMState {
         // format!("{:?} {:05}-{:?}-{:?}.{:3}.{:3}.{:9}", roster.into_iter().map(|m| m.pub_key).collect::<Vec<_>>(), self.my_port, self.my_pub_key, roster_i_from_pub_key(roster, self.my_pub_key), self.height, self.round, format!("{:?}", self.step))
         format!("{:05}-{:?}-{:>8}.{:3}.{:3}.{:9}", self.my_port, self.my_pub_key, format!("{:?}", roster_i_from_pub_key(roster, self.my_pub_key)), self.height, self.round, format!("{:?}", self.step))
     }
-    fn name_str_other(roster: &[SortedRosterMember], bft_key: [u8; 32], address: Option<&STPAddress>) -> String {
+    fn name_str_other(roster: &[SortedRosterMember], bft_key: PubKeyID, address: Option<&STPAddress>) -> String {
         let port = address.map_or(0, |a| a.port);
-        format!("{:05}-{:?}-{:?}", port, PubKeyID(bft_key), roster_i_from_pub_key(roster, PubKeyID(bft_key)))
+        format!("{:05}-{:?}-{:?}", port, bft_key, roster_i_from_pub_key(roster, bft_key))
     }
 
     async fn bft_update(&mut self, roster: &mut Vec<SortedRosterMember>) {
@@ -1209,7 +1209,7 @@ pub struct Peer {
     pub index_counter: u64, // for some peer randomness
 }
 impl Peer {
-    fn info(&self, connected: bool, bft_key: [u8; 32]) -> PeerInfo {
+    fn info(&self, connected: bool, bft_key: PubKeyID) -> PeerInfo {
         return PeerInfo {
             connected,
             root_public_bft_key: Some(bft_key),
@@ -1221,7 +1221,7 @@ impl Peer {
 #[derive(Debug, Default, Copy, Clone)]
 pub struct PeerInfo {
     pub connected: bool,
-    pub root_public_bft_key: Option<[u8; 32]>,
+    pub root_public_bft_key: Option<PubKeyID>,
     pub latest_status_request_height: u64,
 }
 
@@ -1277,9 +1277,9 @@ pub struct FinalizerPeerAddress {
     pub address: STPAddress,
 }
 
-fn make_vote_sign_datas(pub_key: [u8; 32], is_precommit: bool, height: u64, round: u32, value_id: ValueId) -> [[u8; 76]; 2] {
+fn make_vote_sign_datas(pub_key: PubKeyID, is_precommit: bool, height: u64, round: u32, value_id: ValueId) -> [[u8; 76]; 2] {
     let mut sign_data_no = [0; 76];
-    sign_data_no[0..32].copy_from_slice(&pub_key[..]);
+    sign_data_no[0..32].copy_from_slice(&pub_key.0[..]);
     height.write_to(&mut sign_data_no[64..]);
     (round + 0x8000_0000 * (is_precommit as u32)).write_to(&mut sign_data_no[72..]);
     let mut sign_data_yes = sign_data_no;
@@ -1474,12 +1474,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
-    let mut bft_key_to_address = HashMap::<[u8; 32], STPAddress>::new();
-    let mut address_to_bft_key = HashMap::<STPAddress, [u8; 32]>::new();
+    let mut bft_key_to_address = HashMap::<PubKeyID, STPAddress>::new();
+    let mut address_to_bft_key = HashMap::<STPAddress, PubKeyID>::new();
 
     for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
-        bft_key_to_address.insert(bft_pk.0, address.clone());
-        address_to_bft_key.insert(address.clone(), bft_pk.0);
+        bft_key_to_address.insert(*bft_pk, address.clone());
+        address_to_bft_key.insert(address.clone(), *bft_pk);
         let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
     }
 
@@ -1515,7 +1515,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let bft_key = connections_map.get(ck)
                     .and_then(|c| address_to_bft_key.get(&c.address()))
                     .copied()
-                    .unwrap_or([0u8; 32]);
+                    .unwrap_or(PubKeyID::NIL);
                 p.info(true, bft_key)
             }).collect::<Vec<PeerInfo>>();
             bft_state.update_peers_cmd_closure.0(peers).await;
@@ -1638,36 +1638,18 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 // Note(Sam): I am going to emulate the future production p2p network by always adding the two ShieldedLabs servers as known validator peers with zero voting power if they are not
                 // already in the roster.
-                let server_a_pub_key = {
-                    let mut bytes = [0u8; 32];
+                let server_a_pub_key = PubKeyID([0x73, 0xBC, 0xD5, 0x4F, 0x3C, 0x1C, 0x6B, 0x42, 0x28, 0x76, 0x9D, 0x7E, 0x75, 0x9B, 0xB2, 0x87,
+                                                 0x7A, 0x56, 0x29, 0x87, 0xC5, 0x35, 0xAC, 0xE9, 0xBA, 0x67, 0xF2, 0x0D, 0x74, 0x13, 0xA7, 0xCD]);
+                let server_b_pub_key = PubKeyID([0xE6, 0x00, 0x6A, 0x82, 0xD9, 0xA0, 0xDA, 0xB4, 0x6B, 0xD4, 0xC1, 0xDD, 0x69, 0x14, 0xF0, 0x3B,
+                                                 0xEC, 0x27, 0xB4, 0xEC, 0xD3, 0xD9, 0x09, 0xD1, 0x62, 0x34, 0x2D, 0xFD, 0xA5, 0x13, 0x78, 0x1E]);
 
-                    let s = "cda713740df267bae9ac35c58729567a87b29b757e9d7628426b1c3c4fd5bc73";
-                    for i in 0..32 {
-                        let start = i * 2;
-                        let b = u8::from_str_radix(&s[start..start + 2], 16).unwrap();
-                        bytes[31 - i] = b; // reverse order
-                    }
-                    bytes
-                };
-
-                if !bft_key_to_address.contains_key(&server_a_pub_key) && server_a_pub_key != my_root_private_key.as_ref() {
+                if !bft_key_to_address.contains_key(&server_a_pub_key) && server_a_pub_key != PubKeyID(my_root_public_bft_key.into()) {
                     let (a, b) = addr_string_to_stuff("45.76.30.90:8234");
+
                     // peers.push(Peer { root_public_bft_key: server_a_pub_key, endpoint: Some(evidence.address), ..Peer::default() });
                 }
 
-                let server_b_pub_key = {
-                    let mut bytes = [0u8; 32];
-
-                    let s = "1e7813a5fd2d3462d109d9d3ecb427ec3bf01469ddc1d46bb4daa0d9826a00e6";
-                    for i in 0..32 {
-                        let start = i * 2;
-                        let b = u8::from_str_radix(&s[start..start + 2], 16).unwrap();
-                        bytes[31 - i] = b; // reverse order
-                    }
-                    bytes
-                };
-
-                if !bft_key_to_address.contains_key(&server_b_pub_key) && server_b_pub_key != my_root_private_key.as_ref() {
+                if !bft_key_to_address.contains_key(&server_b_pub_key) && server_b_pub_key != PubKeyID(my_root_public_bft_key.into()) {
                     let (a, b) = addr_string_to_stuff("70.34.201.202:8234");
                     // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.address), ..Peer::default() });
                 }
@@ -1681,7 +1663,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                            send_buf1: &mut [u8],
                                            peer: &mut Peer,
                                            connection_key: &ConnectionKey,
-                                           peer_bft_key: [u8; 32],
+                                           peer_bft_key: PubKeyID,
                                            stats: &mut NetworkStats) {
                     let height = round_data.height;
                     let round  = round_data.round;
@@ -1764,7 +1746,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                     return;
                                 };
                                 let pub_key = member.pub_key;
-                                let sign_datas = make_vote_sign_datas(pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
+                                let sign_datas = make_vote_sign_datas(pub_key, is_precommit != 0, packet.height, packet.round, packet.value_id);
                                 let sign_data  = &sign_datas[(i >= packet.no_votes_n as usize) as usize];
                                 match sig.verify(pub_key, sign_data) { Ok(_)=>{} Err((err, str)) => {
                                     eprintln!("{ctx_str}: \x1b[91mBFT FAULT\x1b[0m: {str} [..{}]: for {} from {roster_i}-{pub_key:?} {}.{}: {} {err}",
@@ -1860,15 +1842,15 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let bft_key = connections_map.get(ck)
                         .and_then(|c| address_to_bft_key.get(&c.address()))
                         .copied()
-                        .unwrap_or([0u8; 32]);
-                    (PubKeyID(bft_key), p.latest_status.clone())
+                        .unwrap_or(PubKeyID::NIL);
+                    (bft_key, p.latest_status.clone())
                 }).collect::<Vec<_>>()); }
 
                 for (connection_key, peer) in &mut peers {
                     let peer_bft_key = connections_map.get(connection_key)
                         .and_then(|c| address_to_bft_key.get(&c.address()))
                         .copied()
-                        .unwrap_or([0u8; 32]);
+                        .unwrap_or(PubKeyID::NIL);
                     if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
                         peer.latest_status_request_height = None;
                         send_round_data_to_peer(&bft_state,
@@ -2006,7 +1988,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
                             // Note(Sam): We can change the format of votes to be cool and branchless after the workshop.
                             if let Some(roster_member) = roster.get(packet.votes[vote_i].roster_i as usize) {
-                                let sign_datas   = make_vote_sign_datas(roster_member.pub_key.0, is_precommit != 0, packet.height, packet.round, packet.value_id);
+                                let sign_datas   = make_vote_sign_datas(roster_member.pub_key, is_precommit != 0, packet.height, packet.round, packet.value_id);
                                 let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
                                 bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
                                     &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], TMSig(packet.votes[vote_i].sig.0));

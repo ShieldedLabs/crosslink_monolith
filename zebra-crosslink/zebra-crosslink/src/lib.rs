@@ -1076,7 +1076,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
                     for peer in &all_peers {
                         internal.peer_strings.push(format!("{} {} ({})",
-                            if let Some(pubkey) = peer.root_public_bft_key { tenderlink::PubKeyID(pubkey).to_string() } else { "unknown peer".to_string() },
+                            if let Some(pubkey) = peer.root_public_bft_key { pubkey.to_string() } else { "unknown peer".to_string() },
                             if peer.connected { "connected" } else { "disconnected" },
                             peer.latest_status_request_height,
                         ));
@@ -1684,7 +1684,7 @@ impl From<tenderlink::FatPointerToBftBlock3> for FatPointerToBftBlock2 {
                 .signatures
                 .into_iter()
                 .map(|s| FatPointerSignature2 {
-                    public_key: s.public_key,
+                    public_key: s.public_key.0,
                     vote_signature: s.vote_signature,
                 })
                 .collect(),
