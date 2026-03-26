@@ -44,8 +44,7 @@ pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 
 
 use static_assertions::{const_assert};
-use std::{hash::DefaultHasher, io::{Cursor, Read}, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, sync::{Arc, Mutex}};
-use byteorder::{LittleEndian, ReadBytesExt};
+use std::{hash::DefaultHasher, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, sync::{Arc, Mutex}};
 use ed25519_zebra::{Signature, SigningKey, VerificationKeyBytes, VerificationKey};
 use rand::{seq::{IndexedRandom}, Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -278,20 +277,21 @@ pub enum TMStatusReason {
     },
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValueId(pub [u8; 32]);
 impl ValueId { pub const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
 impl std::fmt::Debug   for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "VId{", &self.0)?; write!(f, "}}") } }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PubKeyID(pub [u8; 32]);
 impl PubKeyID { const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str_rev(f, &self.0) } }
 impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str_rev(f, "Pub{", &self.0[..2])?; write!(f, "}}") } }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TMSig(pub [u8; 64]);
+impl Default for TMSig { fn default() -> Self { Self::NIL } }
 impl TMSig {
     pub const NIL: Self = Self([0; 64]);
     fn verify(&self, pub_key: PubKeyID, signed_data: &[u8]) -> Result<(), (ed25519_zebra::Error, &str)> {
@@ -786,9 +786,8 @@ impl TMState {
 
         match packet_type {
             PACKET_TYPE_PROPOSAL_CHUNK => {
-                let Ok(hdr) = PacketProposalChunkHeader::read_from(signed_data) else {
-                    return TMStatus::Fail
-                };
+                let Some(hdr) = PacketProposalChunkHeader::read_from(&mut &signed_data[..])
+                else { return TMStatus::Fail; };
 
                 // "have they previously proposed a different value?"
                 if is_prev_seen_round && round_data.proposal_sigs_n > 0 {
@@ -1216,13 +1215,33 @@ pub struct PeerInfo {
 }
 
 // NOTE: buf can be open-ended
-trait SliceWrite         { fn write_to(&self, buf: &mut [u8]) -> usize; }
-impl SliceWrite for u64  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..8].copy_from_slice(&u64::to_le_bytes(*self)); 8 } }
-impl SliceWrite for i64  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..8].copy_from_slice(&i64::to_le_bytes(*self)); 8 } }
-impl SliceWrite for u32  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..4].copy_from_slice(&u32::to_le_bytes(*self)); 4 } }
-impl SliceWrite for u16  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..2].copy_from_slice(&u16::to_le_bytes(*self)); 2 } }
-impl SliceWrite for u8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] = *self;                                      1 } }
-impl SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..self.len()].copy_from_slice(self);   self.len() } }
+pub trait SliceWrite     { fn write_to(&self, buf: &mut [u8]) -> usize; }
+impl SliceWrite for u128 { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..16].copy_from_slice(&u128::to_le_bytes(*self)); 16 } }
+impl SliceWrite for i128 { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..16].copy_from_slice(&i128::to_le_bytes(*self)); 16 } }
+impl SliceWrite for u64  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0.. 8].copy_from_slice(& u64::to_le_bytes(*self));  8 } }
+impl SliceWrite for i64  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0.. 8].copy_from_slice(& i64::to_le_bytes(*self));  8 } }
+impl SliceWrite for u32  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0.. 4].copy_from_slice(& u32::to_le_bytes(*self));  4 } }
+impl SliceWrite for i32  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0.. 4].copy_from_slice(& i32::to_le_bytes(*self));  4 } }
+impl SliceWrite for u16  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0.. 2].copy_from_slice(& u16::to_le_bytes(*self));  2 } }
+impl SliceWrite for i16  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0.. 2].copy_from_slice(& i16::to_le_bytes(*self));  2 } }
+impl SliceWrite for u8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] = *self as u8;                                   1 } }
+impl SliceWrite for i8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] = *self as u8;                                   1 } }
+impl SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..self.len()].copy_from_slice(self);      self.len() } }
+
+pub trait SliceRead: Sized { fn read_from(buf: &mut &[u8]) -> Option<Self>; }
+impl SliceRead for u128    { fn read_from(buf: &mut &[u8]) -> Option<Self> { if buf.len() < 16 { return None; } let (b, rest) = buf.split_at(16); *buf = rest; Some(u128::from_le_bytes(b.try_into().unwrap())) } }
+impl SliceRead for i128    { fn read_from(buf: &mut &[u8]) -> Option<Self> { if buf.len() < 16 { return None; } let (b, rest) = buf.split_at(16); *buf = rest; Some(i128::from_le_bytes(b.try_into().unwrap())) } }
+impl SliceRead for u64     { fn read_from(buf: &mut &[u8]) -> Option<Self> { if buf.len() <  8 { return None; } let (b, rest) = buf.split_at( 8); *buf = rest; Some( u64::from_le_bytes(b.try_into().unwrap())) } }
+impl SliceRead for i64     { fn read_from(buf: &mut &[u8]) -> Option<Self> { if buf.len() <  8 { return None; } let (b, rest) = buf.split_at( 8); *buf = rest; Some( i64::from_le_bytes(b.try_into().unwrap())) } }
+impl SliceRead for u32     { fn read_from(buf: &mut &[u8]) -> Option<Self> { if buf.len() <  4 { return None; } let (b, rest) = buf.split_at( 4); *buf = rest; Some( u32::from_le_bytes(b.try_into().unwrap())) } }
+impl SliceRead for i32     { fn read_from(buf: &mut &[u8]) -> Option<Self> { if buf.len() <  4 { return None; } let (b, rest) = buf.split_at( 4); *buf = rest; Some( i32::from_le_bytes(b.try_into().unwrap())) } }
+impl SliceRead for u16     { fn read_from(buf: &mut &[u8]) -> Option<Self> { if buf.len() <  2 { return None; } let (b, rest) = buf.split_at( 2); *buf = rest; Some( u16::from_le_bytes(b.try_into().unwrap())) } }
+impl SliceRead for i16     { fn read_from(buf: &mut &[u8]) -> Option<Self> { if buf.len() <  2 { return None; } let (b, rest) = buf.split_at( 2); *buf = rest; Some( i16::from_le_bytes(b.try_into().unwrap())) } }
+impl SliceRead for u8      { fn read_from(buf: &mut &[u8]) -> Option<Self> { if buf.len() <  1 { return None; } let v = buf[0];        *buf = &buf[1..]; Some(v)       } }
+impl SliceRead for i8      { fn read_from(buf: &mut &[u8]) -> Option<Self> { if buf.len() <  1 { return None; } let v = buf[0] as i8;  *buf = &buf[1..]; Some(v)       } }
+impl<const N: usize> SliceRead for [u8; N] {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> { if buf.len() < N { return None; } let (b, rest) = buf.split_at(N); *buf = rest; Some(b.try_into().unwrap()) }
+}
 
 pub use crate::bandwidth_test::IdentityKeyPair;
 pub use crate::bandwidth_test::ConnectionKey;
@@ -1249,15 +1268,16 @@ impl STPAddress {
         o
     }
 
-    pub fn read_from<R: std::io::Read>(mut r: R) -> std::io::Result<Self> {
-        let mut address = STPAddress::default();
-        address.key.resize(MAX_P2P_DISCOVERY_PUBKEY_SIZE, 0);
-        r.read_exact(&mut address.ip.octets())?;
-        let port_and_magic1 = r.read_u64::<byteorder::LittleEndian>()?;
-        address.port   = port_and_magic1 as u16;
-        address.magic1 = port_and_magic1 >> 16;
-        r.read_exact(&mut address.key)?;
-        Ok(address)
+    pub fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        let ip_bytes: [u8; 16]                          = SliceRead::read_from(buf)?;
+        let port_and_magic1: u64                        = SliceRead::read_from(buf)?;
+        let key: [u8; MAX_P2P_DISCOVERY_PUBKEY_SIZE]    = SliceRead::read_from(buf)?;
+        Some(STPAddress {
+            ip:     Ipv6Addr::from(ip_bytes),
+            port:   port_and_magic1 as u16,
+            magic1: port_and_magic1 >> 16,
+            key:    key.to_vec(),
+        })
     }
 }
 
@@ -1526,20 +1546,19 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             bft_state.update_peers_cmd_closure.0(peers).await;
         }
 
-        fn read_header_and_maybe_status(msg: &[u8]) -> std::io::Result<(PacketHeader, Option<PacketStatus>, usize)> {
-            let mut o   = 0;
-            let mut cur = Cursor::new(&msg[o..]);
-            let header  = PacketHeader::read_from(&mut cur)?;
+        fn read_header_and_maybe_status(msg: &[u8]) -> Option<(PacketHeader, Option<PacketStatus>, usize)> {
+            let buf = &mut &msg[..];
+            let header = PacketHeader::read_from(buf)?;
 
             print_packet_tag_recv(header);
 
             let mut status = None;
             if header.has_status() {
                 // TODO: scope down required ranges
-                status = Some(PacketStatus::read_from(&mut cur)?);
+                status = Some(PacketStatus::read_from(buf)?);
             }
-            o += cur.position() as usize;
-            Ok((header, status, o))
+            let bytes_read = msg.len() - buf.len();
+            Some((header, status, bytes_read))
         }
 
         fn write_header_and_maybe_status(header_: PacketHeader,
@@ -1953,9 +1972,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             };
             let msg: &[u8] = &msg[..];
             if msg.len() == 0 { continue; }
-            let Ok((header, status, read_o)) = read_header_and_maybe_status(&msg[..]) else {
-                continue;
-            };
+            let Some((header, status, read_o)) = read_header_and_maybe_status(&msg[..])
+            else { continue; };
             let packet_type = header.type_();
 
 
@@ -1966,10 +1984,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
             const_assert!(PACKET_TYPE_PREVOTE_SIGNATURES + 1 == PACKET_TYPE_PRECOMMIT_SIGNATURES);
             if packet_type == PACKET_TYPE_PROPOSAL_CHUNK {
-                let hdr = match PacketProposalChunkHeader::read_from(&msg[read_o..]) { Ok(v) => v, Err(err) => {
-                    eprintln!("{:05}: couldn't read proposal header: {}", my_port, err);
+                let Some(hdr) = PacketProposalChunkHeader::read_from(&mut &msg[read_o..]) else {
+                    eprintln!("{:05}: couldn't read proposal header", my_port);
                     continue;
-                }};
+                };
                 let proposal_size = hdr.proposal_size as usize;
                 let chunk_i       = hdr.chunk_i       as usize;
                 let chunk_size = usize::min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_i * PROPOSAL_CHUNK_DATA_SIZE);
@@ -1989,22 +2007,21 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
 
             else if packet_type == PACKET_TYPE_PREVOTE_SIGNATURES || packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES {
-                match PacketVotes::read_from(&msg[read_o..]) {
-                    Ok(packet) => {
-                        let is_precommit = packet_type - PACKET_TYPE_PREVOTE_SIGNATURES;
-                        let value_ids    = [ ValueId::NIL, packet.value_id ];
+                if let Some(packet) = PacketVotes::read_from(&mut &msg[read_o..]) {
+                    let is_precommit = packet_type - PACKET_TYPE_PREVOTE_SIGNATURES;
+                    let value_ids    = [ ValueId::NIL, packet.value_id ];
 
-                        for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
-                            // Note(Sam): We can change the format of votes to be cool and branchless after the workshop.
-                            if let Some(roster_member) = roster.get(packet.votes[vote_i].roster_i as usize) {
-                                let sign_datas   = make_vote_sign_datas(roster_member.pub_key, is_precommit != 0, packet.height, packet.round, packet.value_id);
-                                let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
-                                bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
-                                    &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], TMSig(packet.votes[vote_i].sig.0));
-                            }
+                    for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
+                        // Note(Sam): We can change the format of votes to be cool and branchless after the workshop.
+                        if let Some(roster_member) = roster.get(packet.votes[vote_i].roster_i as usize) {
+                            let sign_datas   = make_vote_sign_datas(roster_member.pub_key, is_precommit != 0, packet.height, packet.round, packet.value_id);
+                            let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
+                            bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
+                                &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], TMSig(packet.votes[vote_i].sig.0));
                         }
                     }
-                    Err(err) => eprintln!("{:05}: couldn't read {}: {}", my_port, packet_name_from_tag(packet_type), err),
+                } else {
+                    eprintln!("{:05}: couldn't read {}", my_port, packet_name_from_tag(packet_type));
                 }
             }
 
@@ -2088,25 +2105,23 @@ impl PacketStatus {
         o
     }
 
-    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
-        let mut packet = Self {
-            height: 0, round: 0,
-            need_proposal_chunk_rngs: [[0;2]; STATUS_PROPOSAL_RNGS_N],
-            need_vote_rngs: [[[0;2]; STATUS_VOTE_RNGS_N]; 2],
+    pub fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        let mut packet = PacketStatus {
+            height: u64::read_from(buf)?,
+            round:  u32::read_from(buf)?,
+            ..Default::default()
         };
-        packet.height = r.read_u64::<LittleEndian>()?;
-        packet.round = r.read_u32::<LittleEndian>()?;
         for chunk_rng in &mut packet.need_proposal_chunk_rngs {
-            chunk_rng[0] = r.read_u32::<LittleEndian>()?;
-            chunk_rng[1] = r.read_u32::<LittleEndian>()?;
+            chunk_rng[0] = u32::read_from(buf)?;
+            chunk_rng[1] = u32::read_from(buf)?;
         }
         for is_precommit in 0..2 {
             for vote_rng in &mut packet.need_vote_rngs[is_precommit] {
-                vote_rng[0] = r.read_u16::<LittleEndian>()?;
-                vote_rng[1] = r.read_u16::<LittleEndian>()?;
+                vote_rng[0] = u16::read_from(buf)?;
+                vote_rng[1] = u16::read_from(buf)?;
             }
         }
-        Ok(packet)
+        Some(packet)
     }
 }
 
@@ -2140,14 +2155,14 @@ impl PacketHeader {
         o
     }
 
-    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
-        let tag = r.read_u64::<LittleEndian>()?;
-        r.read_u64::<LittleEndian>()?;
-        Ok(Self { tag })
+    pub fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        let tag = u64::read_from(buf)?;
+        let _   = u64::read_from(buf)?;
+        Some(Self { tag })
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct PubKeySig { roster_i: u16, sig: TMSig, }
 impl PubKeySig { const NIL: Self = Self{ roster_i: u16::MAX, sig: TMSig::NIL }; }
 
@@ -2156,7 +2171,7 @@ impl PubKeySig { const NIL: Self = Self{ roster_i: u16::MAX, sig: TMSig::NIL }; 
 // agnostic to prevote/precommit - communicated elsewhere
 // NOTE: all votes for the same value_id (or nil)
 // #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct PacketVotes {
     // header
     no_votes_n:  u8,
@@ -2188,22 +2203,20 @@ impl PacketVotes {
         o
     }
 
-    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
+    pub fn read_from(buf: &mut &[u8]) -> Option<Self> {
         let mut packet = PacketVotes {
-            no_votes_n: 0, yes_votes_n: 0, round: 0, height: 0,
-            value_id: ValueId::NIL,
-            votes: [PubKeySig::NIL; 18],
+            no_votes_n:   u8::read_from(buf)?,
+            yes_votes_n:  u8::read_from(buf)?,
+            round:       u32::read_from(buf)?,
+            height:      u64::read_from(buf)?,
+            value_id:    ValueId(SliceRead::read_from(buf)?),
+            ..Default::default()
         };
-        packet.no_votes_n  = r.read_u8()?;
-        packet.yes_votes_n = r.read_u8()?;
-        packet.round       = r.read_u32::<LittleEndian>()?;
-        packet.height      = r.read_u64::<LittleEndian>()?;
-        r.read_exact(&mut packet.value_id.0)?;
         for i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
-            packet.votes[i].roster_i = r.read_u16::<LittleEndian>()?;
-            r.read_exact(&mut packet.votes[i].sig.0)?;
+            packet.votes[i].roster_i = u16::read_from(buf)?;
+            packet.votes[i].sig.0    = SliceRead::read_from(buf)?;
         }
-        Ok(packet)
+        Some(packet)
     }
 }
 
@@ -2243,19 +2256,15 @@ impl PacketProposalChunkHeader {
         o
     }
 
-    pub fn read_from<R: Read>(mut r: R) -> std::io::Result<Self> {
-        let mut packet = PacketProposalChunkHeader {
-            chunk_i: 0, proposal_size: 0, round: 0, height: 0, valid_round: 0, proposal_id: ValueId::NIL
-        };
-        packet.chunk_i       = r.read_u32::<LittleEndian>()?;
-        packet.proposal_size = r.read_u32::<LittleEndian>()?;
-        packet.round         = r.read_u32::<LittleEndian>()?;
-        let valid_round      = r.read_u32::<LittleEndian>()?;
-        packet.height        = r.read_u64::<LittleEndian>()?;
-        r.read_exact(&mut packet.proposal_id.0)?;
-
-        packet.valid_round = if valid_round != u32::MAX { valid_round.into() } else { -1 };
-        Ok(packet)
+    pub fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(PacketProposalChunkHeader {
+            chunk_i:       u32::read_from(buf)?,
+            proposal_size: u32::read_from(buf)?,
+            round:         u32::read_from(buf)?,
+            valid_round:   if let v = u32::read_from(buf)? && v != u32::MAX { v.into() } else { -1 },
+            height:        u64::read_from(buf)?,
+            proposal_id:   ValueId(SliceRead::read_from(buf)?),
+        })
     }
 }
 

@@ -70,15 +70,7 @@ pub fn tick(buf: &mut String, name: &str) -> Option<String> {
     None
 }
 
-
-trait SliceWrite          { fn write_to(&self, buf: &mut [u8]) -> usize; }
-impl  SliceWrite for u128 { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..16].copy_from_slice(&u128::to_le_bytes(*self)); 16 } }
-impl  SliceWrite for u64  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0.. 8].copy_from_slice(& u64::to_le_bytes(*self));  8 } }
-impl  SliceWrite for i64  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0.. 8].copy_from_slice(& i64::to_le_bytes(*self));  8 } }
-impl  SliceWrite for u32  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0.. 4].copy_from_slice(& u32::to_le_bytes(*self));  4 } }
-impl  SliceWrite for u16  { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0.. 2].copy_from_slice(& u16::to_le_bytes(*self));  2 } }
-impl  SliceWrite for u8   { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0] = *self;                                         1 } }
-impl  SliceWrite for [u8] { fn write_to(&self, buf: &mut [u8]) -> usize { buf[0..self.len()].copy_from_slice(self);      self.len() } }
+use crate::SliceWrite;
 
 
 #[derive(Debug, Default, Clone, Hash, Eq, Ord, PartialEq, PartialOrd)]
@@ -262,8 +254,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
 
                 let mut comma = false;
                 for chunk in chunks {
-                    let mut cur = std::io::Cursor::new(&chunk[..]);
-                    let Ok(address) = STPAddress::read_from(&mut cur)
+                    let Some(address) = STPAddress::read_from(&mut &chunk[..])
                     else {
                         continue
                     };
