@@ -33,6 +33,7 @@ const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 // @Todo: more of these, merge with Tenderlink, reintroduce peer discovery from p2p, etc.
 const PACKET_TYPE_STATUS: u8 = 1;
+const PACKET_TYPE_BLOCK: u8 = 2;
 
 #[derive(Clone, Copy, Debug)]
 struct PacketStatus {
@@ -165,9 +166,22 @@ pub fn sync(
     let mut last_request_time = std::time::Instant::now();
     let tick_duration = std::time::Duration::from_millis(TICK_MS);
     let mut peer_statuses = HashMap::<ConnectionKey, PacketStatus>::new();
+    
+    let mut block_send_queue = Vec::<Vec<u8>>::new();
 
     // Main sync loop
     loop {
+    
+        let my_tip_height = rt.block_on(async {
+            let res = read_state.clone().oneshot(ReadRequest::Tip).await;
+            match res {
+                Ok(ReadResponse::Tip(tip_maybe)) => tip_maybe.unwrap(),
+                Err(err) => panic!("sync start err: {err:?}"),
+                _ => panic!("sync err: unhandled response: {res:?}"),
+            }
+        }).0.0;
+        println!("my tip height: {}", my_tip_height);
+    
         let loop_start = std::time::Instant::now();
 
         // Drain block events
@@ -208,7 +222,8 @@ pub fn sync(
         }
 
 
-        let our_status = PacketStatus { height: tip_height.0, hash: tip_hash };
+        //let our_status = PacketStatus { height: tip_height.0, hash: tip_hash };
+        let our_status = PacketStatus { height: my_tip_height.saturating_sub(5), hash: tip_hash };
         for (key, connection) in &connections_map {
             if !connection.is_connected() {
                 continue;
@@ -221,6 +236,19 @@ pub fn sync(
 
             packets_to_send.push((*key, Vec::from(&buf[..o])));
         }
+        
+        for block in &block_send_queue {
+            
+            let mut buf = [0u8; 1 + 20_000];
+            let mut o = 0;
+            o += PACKET_TYPE_BLOCK.write_to(&mut buf[o..]);
+            o += block.write_to(&mut buf[o..]);
+
+            for (key, connection) in &connections_map {
+                packets_to_send.push((*key, Vec::from(&buf[..o])));
+            }
+        }
+        block_send_queue.clear();
 
         // Service STP connections (send/recv)
         service_connections(&mut connections_map,
@@ -260,6 +288,22 @@ pub fn sync(
             if packet_type == PACKET_TYPE_STATUS {
                 let Some(status) = PacketStatus::read_from(&mut &msg[1..])
                 else { continue; };
+                
+                if block_send_queue.len() == 0 {
+                    for rq_h in status.height..status.height+10 {
+                        let maybe_block = rt.block_on(async {
+                            let res = read_state.clone().oneshot(ReadRequest::Block(crate::HashOrHeight::Height(Height(rq_h)))).await;
+                            match res {
+                                Ok(ReadResponse::Block(block_maybe)) => block_maybe,
+                                Err(err) => panic!("sync start err: {err:?}"),
+                                _ => panic!("sync err: unhandled response: {res:?}"),
+                            }
+                        });
+                        let Some(block) = maybe_block else { break; };
+                        let serialized = block.zcash_serialize_to_vec().unwrap();
+                        block_send_queue.push(serialized);
+                    }
+                }
 
                 let prev = peer_statuses.get(&connection_key).copied();
                 peer_statuses.insert(connection_key, status);
@@ -272,9 +316,18 @@ pub fn sync(
                         println!("NewNet: Peer {:?} is ahead of us ({} > {})", connection_key, status.height, tip_height.0);
                     }
                 }
+            } else if packet_type == PACKET_TYPE_BLOCK {
+                use zebra_chain::serialization::ZcashDeserializeInto;
+                if let Ok(block) = (&msg[1..]).zcash_deserialize_into::<Block>() {
+                    println!("got block hash: {}", block.hash());
+                    rt.block_on(async {
+                        let res = state.clone().oneshot(Request::CommitSemanticallyVerifiedBlock(crate::SemanticallyVerifiedBlock::from(std::sync::Arc::new(block)))).await;
+                    })
+                }
             } else {
                 println!("NewNet: Got unknown msg type={} len={}", packet_type, msg.len());
             }
+            
         }
 
         // Remove statuses for disconnected peers
