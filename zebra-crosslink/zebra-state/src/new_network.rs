@@ -86,7 +86,6 @@ pub fn sync(
         + 'static,
         rt: tokio::runtime::Handle,
 ) {
-    return;
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(500);
     BLOCK_EVENT_QUEUE_SENDER.set(event_tx).unwrap();
 
