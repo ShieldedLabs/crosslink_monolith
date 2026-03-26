@@ -1,5 +1,6 @@
 */target
 .vs
+.claude
 *.user
 */x64/Release
 */*/x64/Release
