@@ -7,6 +7,7 @@ use zebra_chain::serialization::{ZcashSerialize, ZcashDeserialize};
 use tenderlink::bandwidth_test::*;
 use tenderlink::native_sockets::*;
 use tenderlink::parse_to_ipv6_bytes;
+use tenderlink::{SliceWrite, SliceRead};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum BlockEvent {
@@ -31,6 +32,29 @@ const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 
 // @Todo: more of these, merge with Tenderlink, reintroduce peer discovery from p2p, etc.
 const PACKET_TYPE_STATUS: u8 = 1;
+
+#[derive(Clone, Copy, Debug)]
+struct PacketStatus {
+    height: u32,
+    hash: Hash,
+}
+const PACKET_STATUS_SIZE: usize = 4 /*height*/ + 32 /*hash*/;
+
+impl PacketStatus {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.height.write_to(&mut buf[o..]);
+        o += self.hash.0.write_to(&mut buf[o..]);
+        o
+    }
+
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(PacketStatus {
+            height: u32::read_from(buf)?,
+            hash:   Hash(SliceRead::read_from(buf)?)
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ShadowBlock {
@@ -64,24 +88,24 @@ pub fn sync(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(500);
     BLOCK_EVENT_QUEUE_SENDER.set(event_tx).unwrap();
 
-    let mut finalized_tip_maybe = None;
+    let mut tip_maybe = None;
     loop {
-        finalized_tip_maybe = rt.block_on(async {
-            let res = read_state.clone().oneshot(ReadRequest::FinalizedTip).await;
+        tip_maybe = rt.block_on(async {
+            let res = read_state.clone().oneshot(ReadRequest::Tip).await;
             match res {
-                Ok(ReadResponse::Tip(finalized_tip_maybe)) => finalized_tip_maybe,
+                Ok(ReadResponse::Tip(tip_maybe)) => tip_maybe,
                 Err(err) => panic!("sync start err: {err:?}"),
                 _ => panic!("sync err: unhandled response: {res:?}"),
             }
         });
-        if finalized_tip_maybe.is_none() {
+        if tip_maybe.is_none() {
             std::thread::yield_now();
             continue;
         }
         break;
     }
-    let (mut finalized_height, mut finalized_hash) = finalized_tip_maybe.unwrap();
-    println!("NewNet: Starting at height={} hash={:?}", finalized_height.0, finalized_hash);
+    let (mut tip_height, mut tip_hash) = tip_maybe.unwrap();
+    println!("NewNet: Starting at height={} hash={:?}", tip_height.0, tip_hash);
 
     // Keypair setup
     let network_keypair;
@@ -139,6 +163,7 @@ pub fn sync(
     let mut awaiting_blocks_from: Option<ConnectionKey> = None;
     let mut last_request_time = std::time::Instant::now();
     let tick_duration = std::time::Duration::from_millis(TICK_MS);
+    let mut peer_statuses = HashMap::<ConnectionKey, PacketStatus>::new();
 
     // Main sync loop
     loop {
@@ -176,21 +201,24 @@ pub fn sync(
         // @Todo: peer discovery
         for address in &peer_addresses {
             if !connections_map.contains_key(&address.connection_key()) {
+                println!("NewNet: Connecting to {:?}...", address);
                 let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
             }
         }
 
 
+        let our_status = PacketStatus { height: tip_height.0, hash: tip_hash };
         for (key, connection) in &connections_map {
             if !connection.is_connected() {
                 continue;
             }
 
-            let mut msg = [0u8; 8];
-            msg[0] = 0;
-            msg[1..8].copy_from_slice("Status!".as_bytes()); // @Debug
+            let mut buf = [0u8; 1 + PACKET_STATUS_SIZE];
+            let mut o = 0;
+            o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
+            o += our_status        .write_to(&mut buf[o..]);
 
-            packets_to_send.push((*key, Vec::from(msg)));
+            packets_to_send.push((*key, Vec::from(&buf[..o])));
         }
 
         // Service STP connections (send/recv)
@@ -226,12 +254,30 @@ pub fn sync(
                 continue;
             }
 
-            println!("NewNet: Got new msg: {:?}", msg[0]);
-            if msg.len() > 1 {
-                let msg = &msg[1..];
-                println!("NewNet: Msg had contents: {:?}", std::str::from_utf8(msg).unwrap_or("?").trim_end_matches('\0'));
+            let packet_type = msg[0];
+
+            if packet_type == PACKET_TYPE_STATUS {
+                let Some(status) = PacketStatus::read_from(&mut &msg[1..])
+                else { continue; };
+
+                let prev = peer_statuses.get(&connection_key).copied();
+                peer_statuses.insert(connection_key, status);
+
+                // Log when a peer's height changes or is first seen
+                let changed = prev.map_or(true, |p| p.height != status.height);
+                if changed {
+                    println!("NewNet: Peer {:?} at height={} hash={:?}", connection_key, status.height, status.hash);
+                    if status.height > tip_height.0 {
+                        println!("NewNet: Peer {:?} is ahead of us ({} > {})", connection_key, status.height, tip_height.0);
+                    }
+                }
+            } else {
+                println!("NewNet: Got unknown msg type={} len={}", packet_type, msg.len());
             }
         }
+
+        // Remove statuses for disconnected peers
+        peer_statuses.retain(|key, _| connections_map.contains_key(key));
 
         // Sleep remainder of tick
         let elapsed = loop_start.elapsed();
