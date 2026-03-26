@@ -392,6 +392,8 @@ pub fn connect_to_endpoint(
     my_connect_keypair: &IdentityKeyPair,
     endpoint: &STPAddress,
 ) {
+    if my_connect_keypair.public == endpoint.key
+    { return; }
     {
         assert!(my_connect_keypair.magic1 == endpoint.magic1);
 
@@ -469,56 +471,118 @@ pub fn service_connections(
     socket: SockHandle,
     my_listen_keypairs: &Vec<&IdentityKeyPair>,
 ) {
-    {
-        if let Ok((buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns)) = udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
-            if buf_len >= 6 {
-                let magic1 = load_u48(&packet_memory_encrypted[0..6]);
-                if magic1 & 1 != 0 { // Client Hello
-                    if OVERLY_VERBOSE { println!("Got a HELLO."); }
-                } else {
-                    if OVERLY_VERBOSE { println!("Got a non-hello."); }
-                }
-                if magic1 & 1 != 0 { // Client Hello
+    if let Ok((buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns)) = udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
+        if buf_len >= 6 {
+            let magic1 = load_u48(&packet_memory_encrypted[0..6]);
+            if magic1 & 1 != 0 { // Client Hello
+                if OVERLY_VERBOSE { println!("Got a HELLO."); }
+            } else {
+                if OVERLY_VERBOSE { println!("Got a non-hello."); }
+            }
+            if magic1 & 1 != 0 { // Client Hello
 
-                    if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-                        for key_i in 0..my_listen_keypairs.len() {
-                            let my_kp = my_listen_keypairs[key_i];
-                            if my_kp.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
-                                if buf_len >= 6 + 32 {
-                                    let client_key = &packet_memory_encrypted[6..6+32];
-                                    let list_of_protocols_len_bytes = buf_len - 6 - 32;
+                if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
+                    for key_i in 0..my_listen_keypairs.len() {
+                        let my_kp = my_listen_keypairs[key_i];
+                        if my_kp.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
+                            if buf_len >= 6 + 32 {
+                                let client_key = &packet_memory_encrypted[6..6+32];
+                                let list_of_protocols_len_bytes = buf_len - 6 - 32;
+                                assert_eq!(list_of_protocols_len_bytes, 0); // temp
+                                // TODO list of supported Application Level protocols for e.g. zcash network upgrades. Note: We will need to use a callback in order for application code on the server to select which magic2 we will use and whether to reject the client. This is because magic2's do not have a strict order preference and so we need to push that logic to the application layer.
+                                
+                                let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
+                                if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
+                                    if &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key {
+                                        if let ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut existing_connection.connection_state {
+                                            if *client_key < *my_kp.public {
+                                                store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
+                                                packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
+                                                // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
+                                                let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32]);
+                                                
+                                                existing_connection.connection_state = ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload };
+                                                if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
+                                            } else {
+                                                if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: Lost the lexicographic compare.", connection_key.key_15_bits); }
+                                            }
+                                        } else {
+                                            let state_str = connection_state_string(&existing_connection.connection_state);
+                                            if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: We were not in SendingClientHelloPlaintext state. We are in {} state.", connection_key.key_15_bits, state_str); }
+                                        }
+                                    } else {
+                                        if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: Failed condition \"&existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key\"", connection_key.key_15_bits); }
+                                    }
+                                }
+                                else {
+                                    let client_key = Vec::from(client_key);
+                                    store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
+                                    packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
+                                    // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
+                                    let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32]);
+                                    
+                                    let my_ip = if other_ip_addr.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
+                                    connections_map.insert(
+                                        connection_key,
+                                        ConnectionTrackingData {
+                                            creation_time_ns: monotonic_clock_ns(),
+                                            my_ip,
+                                            my_transport_identity_keypair: my_kp.clone(),
+                                            two_byte_send_prefix: load_u16(&my_kp.public[0..2]) << 1,
+                                            other_ip: other_ip_addr,
+                                            other_port: other_port,
+                                            other_transport_identity: client_key,
+                                            connection_state: ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
+                                        },
+                                    );
+                                    if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
+                                }
+                            } else {
+                                if OVERLY_VERBOSE { println!("Did NOT respond to connection: The packet did not contain 32 bytes of key. It was {} bytes.", buf_len); }
+                            }
+                        }
+                    }
+                }
+                else if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
+                    for key_i in 0..my_listen_keypairs.len() {
+                        let my_kp = my_listen_keypairs[key_i];
+                        if my_kp.magic1 == magic1 {
+                            let mut new_handshake = snow::Builder::new(noise_string.parse().unwrap())
+                                .prologue(&packet_memory_encrypted[0..6]).unwrap()
+                                .local_private_key(&my_kp.private).unwrap()
+                                .build_responder().unwrap();
+                            if let Ok(list_of_protocols_len_bytes) = new_handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
+                                if let Some(client_key) = new_handshake.get_remote_static() {
                                     assert_eq!(list_of_protocols_len_bytes, 0); // temp
                                     // TODO list of supported Application Level protocols for e.g. zcash network upgrades. Note: We will need to use a callback in order for application code on the server to select which magic2 we will use and whether to reject the client. This is because magic2's do not have a strict order preference and so we need to push that logic to the application layer.
-                                    
+
                                     let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
                                     if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
                                         if &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key {
-                                            if let ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut existing_connection.connection_state {
+                                            if let ConnectionState::SendingClientHello { last_sent_time_ns, hello_packet_payload, handshake } = &mut existing_connection.connection_state {
                                                 if *client_key < *my_kp.public {
                                                     store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
-                                                    packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
                                                     // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
-                                                    let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32]);
+                                                    let handshake_size = new_handshake.write_message(&[], &mut packet_memory_send[6..]).unwrap();
+                                                    let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
                                                     
-                                                    existing_connection.connection_state = ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload };
-                                                    if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
-                                                } else {
-                                                    if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: Lost the lexicographic compare.", connection_key.key_15_bits); }
+                                                    debug_assert!(new_handshake.is_handshake_finished());
+                                                    let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
+                                                    
+                                                    existing_connection.connection_state = ConnectionState::SendingServerHello { cipher, last_sent_time_ns: 0, hello_packet_payload };
                                                 }
-                                            } else {
-                                                let state_str = connection_state_string(&existing_connection.connection_state);
-                                                if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: We were not in SendingClientHelloPlaintext state. We are in {} state.", connection_key.key_15_bits, state_str); }
                                             }
-                                        } else {
-                                            if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: Failed condition \"&existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key\"", connection_key.key_15_bits); }
                                         }
                                     }
                                     else {
                                         let client_key = Vec::from(client_key);
                                         store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
-                                        packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
                                         // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
-                                        let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32]);
+                                        let handshake_size = new_handshake.write_message(&[], &mut packet_memory_send[6..]).unwrap();
+                                        let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
+                                        
+                                        debug_assert!(new_handshake.is_handshake_finished());
+                                        let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
                                         
                                         let my_ip = if other_ip_addr.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
                                         connections_map.insert(
@@ -531,289 +595,239 @@ pub fn service_connections(
                                                 other_ip: other_ip_addr,
                                                 other_port: other_port,
                                                 other_transport_identity: client_key,
-                                                connection_state: ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
+                                                connection_state: ConnectionState::SendingServerHello { cipher, last_sent_time_ns: 0, hello_packet_payload },
                                             },
                                         );
-                                        if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
-                                    }
-                                } else {
-                                    if OVERLY_VERBOSE { println!("Did NOT respond to connection: The packet did not contain 32 bytes of key. It was {} bytes.", buf_len); }
-                                }
-                            }
-                        }
-                    }
-                    else if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
-                        for key_i in 0..my_listen_keypairs.len() {
-                            let my_kp = my_listen_keypairs[key_i];
-                            if my_kp.magic1 == magic1 {
-                                let mut new_handshake = snow::Builder::new(noise_string.parse().unwrap())
-                                    .prologue(&packet_memory_encrypted[0..6]).unwrap()
-                                    .local_private_key(&my_kp.private).unwrap()
-                                    .build_responder().unwrap();
-                                if let Ok(list_of_protocols_len_bytes) = new_handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
-                                    if let Some(client_key) = new_handshake.get_remote_static() {
-                                        assert_eq!(list_of_protocols_len_bytes, 0); // temp
-                                        // TODO list of supported Application Level protocols for e.g. zcash network upgrades. Note: We will need to use a callback in order for application code on the server to select which magic2 we will use and whether to reject the client. This is because magic2's do not have a strict order preference and so we need to push that logic to the application layer.
-
-                                        let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
-                                        if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
-                                            if &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key {
-                                                if let ConnectionState::SendingClientHello { last_sent_time_ns, hello_packet_payload, handshake } = &mut existing_connection.connection_state {
-                                                    if *client_key < *my_kp.public {
-                                                        store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
-                                                        // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
-                                                        let handshake_size = new_handshake.write_message(&[], &mut packet_memory_send[6..]).unwrap();
-                                                        let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
-                                                        
-                                                        debug_assert!(new_handshake.is_handshake_finished());
-                                                        let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
-                                                        
-                                                        existing_connection.connection_state = ConnectionState::SendingServerHello { cipher, last_sent_time_ns: 0, hello_packet_payload };
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        else {
-                                            let client_key = Vec::from(client_key);
-                                            store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
-                                            // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
-                                            let handshake_size = new_handshake.write_message(&[], &mut packet_memory_send[6..]).unwrap();
-                                            let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
-                                            
-                                            debug_assert!(new_handshake.is_handshake_finished());
-                                            let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
-                                            
-                                            let my_ip = if other_ip_addr.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
-                                            connections_map.insert(
-                                                connection_key,
-                                                ConnectionTrackingData {
-                                                    creation_time_ns: monotonic_clock_ns(),
-                                                    my_ip,
-                                                    my_transport_identity_keypair: my_kp.clone(),
-                                                    two_byte_send_prefix: load_u16(&my_kp.public[0..2]) << 1,
-                                                    other_ip: other_ip_addr,
-                                                    other_port: other_port,
-                                                    other_transport_identity: client_key,
-                                                    connection_state: ConnectionState::SendingServerHello { cipher, last_sent_time_ns: 0, hello_packet_payload },
-                                                },
-                                            );
-                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-                else { // Not client hello
-                    loop { // just for early out
-                        let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: magic1 as u16 };
-                        if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
-                            if let ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut existing_connection.connection_state {
-                                if magic1 >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
-                                    let server_key = &packet_memory_encrypted[6..6+32];
-                                    if server_key == existing_connection.other_transport_identity {
-                                        assert_eq!(buf_len, 6 + 32);
-                                        // TODO receive and validate selected magic2
-                                        if VERBOSE { println!("Connected to new server {:?}", server_key); }
-                                        existing_connection.connection_state = ConnectionState::Connected {
-                                            cipher: None,
-                                            send_sequence_number: 0,
-                                            last_sent_keep_alive_time_ns: 0,
-                                            recv_time_ns: timestamp_ns,
-                                        };
-                                    }
+            }
+            else { // Not client hello
+                loop { // just for early out
+                    let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: magic1 as u16 };
+                    let Some(existing_connection) = connections_map.get_mut(&connection_key) else { break; };
+                    
+                    match &mut existing_connection.connection_state {
+                        ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
+                            if magic1 >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
+                                let server_key = &packet_memory_encrypted[6..6+32];
+                                if server_key == existing_connection.other_transport_identity {
+                                    assert_eq!(buf_len, 6 + 32);
+                                    // TODO receive and validate selected magic2
+                                    if VERBOSE { println!("Connected to new server {:?}", server_key); }
+                                    existing_connection.connection_state = ConnectionState::Connected {
+                                        cipher: None,
+                                        send_sequence_number: 0,
+                                        last_sent_keep_alive_time_ns: 0,
+                                        recv_time_ns: timestamp_ns,
+                                    };
                                 }
-                                break;
                             }
-                            if let ConnectionState::SendingClientHello { last_sent_time_ns, hello_packet_payload, handshake } = &mut existing_connection.connection_state {
-                                if magic1 >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
-                                    if let Ok(payload_len) = handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
-                                        debug_assert!(handshake.is_handshake_finished());
-                                        assert_eq!(payload_len, 0);
-                                        // TODO receive and validate selected magic2
-                                        if VERBOSE { println!("Connected to new server {:?}", handshake.get_remote_static().unwrap()); }
-                                        
-                                        // Borrow Checker crazyness required here.
-                                        let new_state = ConnectionState::Connected {
-                                            cipher: None,
-                                            send_sequence_number: 0,
-                                            last_sent_keep_alive_time_ns: 0,
-                                            recv_time_ns: timestamp_ns,
-                                        };
-                                        let old_state = std::mem::replace(&mut existing_connection.connection_state, new_state);
-                                        
-                                        let ConnectionState::SendingClientHello { handshake, .. } = old_state else { panic!(); };
-                                        let ConnectionState::Connected { cipher, .. } = &mut existing_connection.connection_state else { panic!(); };
-                                        *cipher = Some(ConnectionCipherTriplet::new_from_old_init_only(handshake.into_stateless_transport_mode().expect("Cannot fail given assert above.")));
-                                    }
-                                }
-                                break;
-                            }
-                            if let ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut existing_connection.connection_state {
-                                if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
-                                existing_connection.connection_state = ConnectionState::Connected {
-                                    cipher: None,
-                                    send_sequence_number: 0,
-                                    last_sent_keep_alive_time_ns: 0,
-                                    recv_time_ns: timestamp_ns,
-                                };
-                                // FALLTHROUGH TO PLAINTEXT CONNECTED
-                            }
-                            if let ConnectionState::SendingServerHello { cipher, last_sent_time_ns, hello_packet_payload } = &mut existing_connection.connection_state {
-                                let non_virtual_nonce = magic1 >> 16; // Todo convert this to virtual.
-                                
-                                let mut can_decrypt = false;
-                                // Optimization done here. It can never be cipher.old so we skip checking.
-                                can_decrypt |= cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
-                                can_decrypt |= cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
-                                if can_decrypt == false { break; }
-                                
-                                if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
-                                existing_connection.connection_state = ConnectionState::Connected {
-                                    cipher: Some(cipher.clone()),
-                                    send_sequence_number: 0,
-                                    last_sent_keep_alive_time_ns: 0,
-                                    recv_time_ns: timestamp_ns,
-                                };
-                                // FALLTHROUGH TO CONNECTED
-                            }
-                            
-                            if let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &mut existing_connection.connection_state {
-                                let non_virtual_nonce = magic1 >> 16; // Todo convert this to virtual.
-                            
-                                // TODO acks etc
-                                let payload;
-                                if let Some(cipher) = cipher {
-                                    if let Ok(payload_len) = cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
-                                        payload = &packet_memory_recv[0..payload_len];
-                                    }
-                                    else if let Ok(payload_len) = cipher.old.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
-                                        payload = &packet_memory_recv[0..payload_len];
-                                    }
-                                    else if let Ok(payload_len) = cipher.new.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
-                                        payload = &packet_memory_recv[0..payload_len];
-                                        cipher.ratchet_forward_incoming();
-                                    }
-                                    else { break; }
-                                }
-                                else {
-                                    payload = &packet_memory_encrypted[6..buf_len];
-                                }
-
-                                *recv_time_ns = timestamp_ns;
-
-                                if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
-
-                                packets_received_this_call.push((connection_key, Vec::from(payload)));
-                            }
+                            break;
                         }
-                        // else {
-                        //     panic!("INTERLOPER: Got a non-hello packet from someone I don't recognize! @Todo @Temporary"); // @Todo @Temporary
-                        // }
-                        break;
+                        ConnectionState::SendingClientHello { last_sent_time_ns, hello_packet_payload, handshake } => {
+                            if magic1 >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
+                                if let Ok(payload_len) = handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
+                                    debug_assert!(handshake.is_handshake_finished());
+                                    assert_eq!(payload_len, 0);
+                                    // TODO receive and validate selected magic2
+                                    if VERBOSE { println!("Connected to new server {:?}", handshake.get_remote_static().unwrap()); }
+                                    
+                                    // Borrow Checker crazyness required here.
+                                    let new_state = ConnectionState::Connected {
+                                        cipher: None,
+                                        send_sequence_number: 0,
+                                        last_sent_keep_alive_time_ns: 0,
+                                        recv_time_ns: timestamp_ns,
+                                    };
+                                    let old_state = std::mem::replace(&mut existing_connection.connection_state, new_state);
+                                    
+                                    let ConnectionState::SendingClientHello { handshake, .. } = old_state else { panic!(); };
+                                    let ConnectionState::Connected { cipher, .. } = &mut existing_connection.connection_state else { panic!(); };
+                                    *cipher = Some(ConnectionCipherTriplet::new_from_old_init_only(handshake.into_stateless_transport_mode().expect("Cannot fail given assert above.")));
+                                }
+                            }
+                            break;
+                        }
+                        ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
+                            if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
+                            existing_connection.connection_state = ConnectionState::Connected {
+                                cipher: None,
+                                send_sequence_number: 0,
+                                last_sent_keep_alive_time_ns: 0,
+                                recv_time_ns: timestamp_ns,
+                            };
+                            // FALLTHROUGH TO CONNECTED
+                        }
+                        ConnectionState::SendingServerHello { cipher, last_sent_time_ns, hello_packet_payload } => {
+                            let non_virtual_nonce = magic1 >> 16; // Todo convert this to virtual.
+                            
+                            let mut can_decrypt = false;
+                            // Optimization done here. It can never be cipher.old so we skip checking.
+                            can_decrypt |= cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
+                            can_decrypt |= cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
+                            if can_decrypt == false { break; }
+                            
+                            if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
+                            existing_connection.connection_state = ConnectionState::Connected {
+                                cipher: Some(cipher.clone()),
+                                send_sequence_number: 0,
+                                last_sent_keep_alive_time_ns: 0,
+                                recv_time_ns: timestamp_ns,
+                            };
+                            // FALLTHROUGH TO CONNECTED
+                        }
+                        ConnectionState::Connected { .. } => (),
                     }
+                    if let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &mut existing_connection.connection_state {
+                        let non_virtual_nonce = magic1 >> 16; // Todo convert this to virtual.
+                    
+                        // TODO acks etc
+                        let payload;
+                        if let Some(cipher) = cipher {
+                            if let Ok(payload_len) = cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
+                                payload = &packet_memory_recv[0..payload_len];
+                            }
+                            else if let Ok(payload_len) = cipher.old.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
+                                payload = &packet_memory_recv[0..payload_len];
+                            }
+                            else if let Ok(payload_len) = cipher.new.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
+                                payload = &packet_memory_recv[0..payload_len];
+                                cipher.ratchet_forward_incoming();
+                            }
+                            else { break; }
+                        }
+                        else {
+                            payload = &packet_memory_encrypted[6..buf_len];
+                        }
+
+                        *recv_time_ns = timestamp_ns;
+
+                        if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
+
+                        packets_received_this_call.push((connection_key, Vec::from(payload)));
+                    }
+                    break;
                 }
             }
         }
-        
-        let current_time_now_ns = monotonic_clock_ns();
-        connections_map.retain(|connection_key, connection_tracking_data| {
-            if let ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut connection_tracking_data.connection_state {
-                if *last_sent_time_ns + 1_000_000_000 < current_time_now_ns {
-                    udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
+    }
+    
+    let current_time_now_ns = monotonic_clock_ns();
+    connections_map.retain(|connection_key, connection_tracking_data| {match &mut connection_tracking_data.connection_state {
+        ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
+            if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
+                udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
+                if *last_sent_time_ns == 0 { // cheeky optimization
+                    *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
+                } else {
                     *last_sent_time_ns = current_time_now_ns;
-                    return true;
                 }
-                if connection_tracking_data.creation_time_ns + 15_000_000_000 < current_time_now_ns {
-                    return false;
-                }
+                return true;
             }
-            if let ConnectionState::SendingClientHello { last_sent_time_ns, hello_packet_payload, handshake } = &mut connection_tracking_data.connection_state {
-                if *last_sent_time_ns + 1_000_000_000 < current_time_now_ns {
-                    udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
-                    *last_sent_time_ns = current_time_now_ns;
-                    return true;
-                }
-                if connection_tracking_data.creation_time_ns + 15_000_000_000 < current_time_now_ns {
-                    return false;
-                }
+            if connection_tracking_data.creation_time_ns + 30_000_000_000 < current_time_now_ns {
+                return false;
             }
-            if let ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns, hello_packet_payload } = &mut connection_tracking_data.connection_state {
-                if *last_sent_time_ns + 1_000_000_000 < current_time_now_ns {
-                    udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
-                    *last_sent_time_ns = current_time_now_ns;
-                    return true;
-                }
-                if connection_tracking_data.creation_time_ns + 15_000_000_000 < current_time_now_ns {
-                    return false;
-                }
-            }
-            if let ConnectionState::SendingServerHello { cipher, last_sent_time_ns, hello_packet_payload } = &mut connection_tracking_data.connection_state {
-                if *last_sent_time_ns + 1_000_000_000 < current_time_now_ns {
-                    udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
-                    *last_sent_time_ns = current_time_now_ns;
-                    return true;
-                }
-                if connection_tracking_data.creation_time_ns + 15_000_000_000 < current_time_now_ns {
-                    return false;
-                }
-            }
-            if let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &mut connection_tracking_data.connection_state {
-                if *last_sent_keep_alive_time_ns + 5_000_000_000 < current_time_now_ns {
-                    let virtual_nonce = *send_sequence_number;
-                    store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
-                    store_u32(&mut packet_memory_encrypted[2..6], virtual_nonce as u32);
-                    *send_sequence_number += 1;
-                    
-                    let packet_len;
-                    if let Some(cipher) = cipher {
-                        packet_len = cipher.current.write_message(virtual_nonce, &[], &mut packet_memory_encrypted[6..]).unwrap();
-                    }
-                    else {
-                        packet_len = 0;
-                    }
-                    
-                    udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21);
-                    *last_sent_keep_alive_time_ns = current_time_now_ns;
-                    return true;
-                }
-                if *recv_time_ns + 15_000_000_000 < current_time_now_ns {
-                    if VERBOSE { println!("Disconnected from: {:?}.", connection_tracking_data.other_transport_identity); }
-                    return false; // connection timeout
-                }
-            }
-            true
-        });
-
-        for (connection_key, data) in packets_to_send {
-            let Some(ref mut connection) = connections_map.get_mut(connection_key)
-            else { continue; };
-
-            let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &mut connection.connection_state
-            else { continue; };
-
-            if data.len() > ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE - 6 {
-                panic!("You shouldn't have created a packet this big in the current test");
-                continue;
-            }
-
-            // Send
-            let virtual_nonce = *send_sequence_number;
-            store_u16(&mut packet_memory_encrypted[0..2], connection.two_byte_send_prefix);
-            store_u32(&mut packet_memory_encrypted[2..6], virtual_nonce as u32);
-            *send_sequence_number += 1;
-
-            let packet_len;
-            if let Some(cipher) = cipher {
-                packet_len = cipher.current.write_message(virtual_nonce, &data, &mut packet_memory_encrypted[6..]).unwrap();
-            }
-            else {
-                packet_len = data.len();
-                (&mut packet_memory_encrypted[6..6+data.len()]).copy_from_slice(&data);
-            }
-
-            udp_send_with_congestion_and_dscp(socket, connection.other_ip, connection.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort);
         }
+        ConnectionState::SendingClientHello { last_sent_time_ns, hello_packet_payload, handshake } => {
+            if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
+                udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
+                if *last_sent_time_ns == 0 { // cheeky optimization
+                    *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
+                } else {
+                    *last_sent_time_ns = current_time_now_ns;
+                }
+                return true;
+            }
+            if connection_tracking_data.creation_time_ns + 30_000_000_000 < current_time_now_ns {
+                return false;
+            }
+        }
+        ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
+            if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
+                udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
+                if *last_sent_time_ns == 0 { // cheeky optimization
+                    *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
+                } else {
+                    *last_sent_time_ns = current_time_now_ns;
+                }
+                return true;
+            }
+            if connection_tracking_data.creation_time_ns + 15_000_000_000 < current_time_now_ns {
+                return false;
+            }
+        }
+        ConnectionState::SendingServerHello { cipher, last_sent_time_ns, hello_packet_payload } => {
+            if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
+                udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
+                if *last_sent_time_ns == 0 { // cheeky optimization
+                    *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
+                } else {
+                    *last_sent_time_ns = current_time_now_ns;
+                }
+                return true;
+            }
+            if connection_tracking_data.creation_time_ns + 15_000_000_000 < current_time_now_ns {
+                return false;
+            }
+        }
+        ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } => {
+            if *last_sent_keep_alive_time_ns + 5_000_000_000 < current_time_now_ns {
+                let virtual_nonce = *send_sequence_number;
+                store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
+                store_u32(&mut packet_memory_encrypted[2..6], virtual_nonce as u32);
+                *send_sequence_number += 1;
+                
+                let packet_len;
+                if let Some(cipher) = cipher {
+                    packet_len = cipher.current.write_message(virtual_nonce, &[], &mut packet_memory_encrypted[6..]).unwrap();
+                }
+                else {
+                    packet_len = 0;
+                }
+                
+                udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21);
+                *last_sent_keep_alive_time_ns = current_time_now_ns;
+                return true;
+            }
+            if *recv_time_ns + 15_000_000_000 < current_time_now_ns {
+                if VERBOSE { println!("Disconnected from: {:?}.", connection_tracking_data.other_transport_identity); }
+                return false; // connection timeout
+            }
+        }
+    } true});
+
+    for (connection_key, data) in packets_to_send {
+        let Some(ref mut connection) = connections_map.get_mut(connection_key)
+        else { continue; };
+
+        let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &mut connection.connection_state
+        else { continue; };
+
+        if data.len() > ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE - 6 {
+            panic!("You shouldn't have created a packet this big in the current test");
+            continue;
+        }
+
+        // Send
+        let virtual_nonce = *send_sequence_number;
+        store_u16(&mut packet_memory_encrypted[0..2], connection.two_byte_send_prefix);
+        store_u32(&mut packet_memory_encrypted[2..6], virtual_nonce as u32);
+        *send_sequence_number += 1;
+
+        let packet_len;
+        if let Some(cipher) = cipher {
+            packet_len = cipher.current.write_message(virtual_nonce, &data, &mut packet_memory_encrypted[6..]).unwrap();
+        }
+        else {
+            packet_len = data.len();
+            (&mut packet_memory_encrypted[6..6+data.len()]).copy_from_slice(&data);
+        }
+
+        udp_send_with_congestion_and_dscp(socket, connection.other_ip, connection.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort);
     }
 }
 

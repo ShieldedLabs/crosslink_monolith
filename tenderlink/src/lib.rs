@@ -1396,7 +1396,6 @@ pub fn parse_to_ipv6_bytes(s: &str) -> Result<(Ipv6Addr, u16), std::net::AddrPar
         SocketAddr::V4(v4) => {
             // Map IPv4 to IPv6-mapped ::ffff:a.b.c.d
             (v4.ip().to_ipv6_mapped(), v4.port())
-            // (Alternatively on newer Rust: (v4.ip().to_ipv6_mapped(), v4.port()))
         }
         SocketAddr::V6(v6) => (*v6.ip(), v6.port()),
     };

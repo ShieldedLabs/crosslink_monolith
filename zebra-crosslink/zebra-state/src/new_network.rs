@@ -28,7 +28,8 @@ pub async fn push_block_event(event: BlockEvent) {
 // NewNet packet types // @Todo: share common messages/code with Tenderlink
 // ---------------------------------------------------------------------------
 
-const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
+//const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
+const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 // @Todo: more of these, merge with Tenderlink, reintroduce peer discovery from p2p, etc.
 const PACKET_TYPE_STATUS: u8 = 1;
@@ -62,8 +63,8 @@ struct ShadowBlock {
     parent_hash: Hash,
 }
 
-// @Todo: always only wait on real stuff, never sleeping for fixed amts like this
-const TICK_MS: u64 = 300;
+// @Todo: always only wait on real stuff, never sleeping for fixed amounts like this
+const TICK_MS: u64 = 500;
 
 pub fn sync(
         config: &crate::config::Config,
@@ -85,6 +86,7 @@ pub fn sync(
         + 'static,
         rt: tokio::runtime::Handle,
 ) {
+    return;
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(500);
     BLOCK_EVENT_QUEUE_SENDER.set(event_tx).unwrap();
 
