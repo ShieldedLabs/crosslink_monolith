@@ -67,46 +67,38 @@ struct ShadowBlock {
 // @Todo: always only wait on real stuff, never sleeping for fixed amounts like this
 const TICK_MS: u64 = 500;
 
+type ReadState = crate::service::ReadStateService;
+type State = tower::buffer::Buffer<tower::util::BoxService<Request, Response, crate::BoxError>, Request>;
+
+pub fn get_tip(read_state: &ReadState, rt: &tokio::runtime::Handle) -> Option<(Height, Hash)> {
+    let tip_maybe = rt.block_on(async {
+        let res = read_state.clone().oneshot(ReadRequest::Tip).await;
+        match res {
+            Ok(ReadResponse::Tip(tip_maybe)) => tip_maybe,
+            Err(err) => panic!("sync start err: {err:?}"),
+            _ => panic!("sync err: unhandled response: {res:?}"),
+        }
+    });
+    tip_maybe
+}
+
 pub fn sync(
         config: &crate::config::Config,
-        read_state: impl tower::Service<
-            ReadRequest,
-            Response = ReadResponse,
-            Error = crate::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-        state: impl tower::Service<
-            Request,
-            Response = Response,
-            Error = crate::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
+        read_state: ReadState,
+        state: State,
         rt: tokio::runtime::Handle,
 ) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(500);
     BLOCK_EVENT_QUEUE_SENDER.set(event_tx).unwrap();
 
-    let mut tip_maybe = None;
-    loop {
-        tip_maybe = rt.block_on(async {
-            let res = read_state.clone().oneshot(ReadRequest::Tip).await;
-            match res {
-                Ok(ReadResponse::Tip(tip_maybe)) => tip_maybe,
-                Err(err) => panic!("sync start err: {err:?}"),
-                _ => panic!("sync err: unhandled response: {res:?}"),
-            }
-        });
-        if tip_maybe.is_none() {
+    let (mut tip_height, mut tip_hash) = loop {
+        let Some(tip) = get_tip(&read_state, &rt)
+        else {
             std::thread::yield_now();
             continue;
-        }
-        break;
-    }
-    let (mut tip_height, mut tip_hash) = tip_maybe.unwrap();
+        };
+        break tip;
+    };
     println!("NewNet: Starting at height={} hash={:?}", tip_height.0, tip_hash);
 
     // Keypair setup
@@ -166,22 +158,16 @@ pub fn sync(
     let mut last_request_time = std::time::Instant::now();
     let tick_duration = std::time::Duration::from_millis(TICK_MS);
     let mut peer_statuses = HashMap::<ConnectionKey, PacketStatus>::new();
-    
+
     let mut block_send_queue = Vec::<Vec<u8>>::new();
 
     // Main sync loop
     loop {
-    
-        let my_tip_height = rt.block_on(async {
-            let res = read_state.clone().oneshot(ReadRequest::Tip).await;
-            match res {
-                Ok(ReadResponse::Tip(tip_maybe)) => tip_maybe.unwrap(),
-                Err(err) => panic!("sync start err: {err:?}"),
-                _ => panic!("sync err: unhandled response: {res:?}"),
-            }
-        }).0.0;
-        println!("my tip height: {}", my_tip_height);
-    
+        if let Some(tip) = get_tip(&read_state, &rt) {
+            (tip_height, tip_hash) = tip;
+        }
+        println!("tip height: {}", tip_height.0);
+
         let loop_start = std::time::Instant::now();
 
         // Drain block events
@@ -222,8 +208,7 @@ pub fn sync(
         }
 
 
-        //let our_status = PacketStatus { height: tip_height.0, hash: tip_hash };
-        let our_status = PacketStatus { height: my_tip_height.saturating_sub(5), hash: tip_hash };
+        let our_status = PacketStatus { height: tip_height.0.saturating_sub(5), hash: tip_hash };
         for (key, connection) in &connections_map {
             if !connection.is_connected() {
                 continue;
