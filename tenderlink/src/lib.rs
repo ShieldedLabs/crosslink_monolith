@@ -1384,7 +1384,7 @@ pub fn parse_to_ipv6_bytes(s: &str) -> Result<(Ipv6Addr, u16), std::net::AddrPar
     Ok((ip6.octets().into(), port))
 }
 
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 pub fn addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, STPAddress) {
     let mut hasher = DefaultHasher::new();
     hasher.write(addr.as_bytes());
@@ -1404,6 +1404,49 @@ pub fn addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, STPAddress) {
             key: static_keypair.clone().public.try_into().unwrap(),
         },
     )
+}
+
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TwoWayHashMap<L, R> where L: Clone + Eq + Hash, R: Clone + Eq + Hash { lr: HashMap<L, R>, rl: HashMap<R, L> }
+impl<L, R> TwoWayHashMap<L, R> where L: Clone + Eq + Hash, R: Clone + Eq + Hash {
+    pub fn new() -> Self { Self { lr: HashMap::new(), rl: HashMap::new() } }
+    pub fn insert(&mut self, l: &L, r: &R) {
+        if let Some(old) = self.lr.insert(l.clone(), r.clone()) { self.rl.remove(&old); }
+        if let Some(old) = self.rl.insert(r.clone(), l.clone()) { self.lr.remove(&old); }
+    }
+    pub fn get_by_left(&self,  l: &L) -> Option<&R> { self.lr.get(l) }
+    pub fn get_by_right(&self, r: &R) -> Option<&L> { self.rl.get(r) }
+    pub fn remove(&mut self, l: &L, r: &R) -> Option<(L, R)> {
+        if self.lr.get(l) != Some(r) { return None; }
+        Some((self.rl.remove(r).unwrap(), self.lr.remove(l).unwrap()))
+    }
+    pub fn remove_by_left(&mut self,  l: &L) -> Option<R> { let r = self.lr.remove(l)?; self.rl.remove(&r); Some(r) }
+    pub fn remove_by_right(&mut self, r: &R) -> Option<L> { let l = self.rl.remove(r)?; self.lr.remove(&l); Some(l) }
+    pub fn contains_left(&self,  l: &L) -> bool { self.lr.contains_key(l) }
+    pub fn contains_right(&self, r: &R) -> bool { self.rl.contains_key(r) }
+    pub fn contains(&self, p: (&L, &R)) -> bool { self.lr.get(p.0).is_some_and(|v| v == p.1) }
+    pub fn len(&self) -> usize { self.lr.len() }
+    pub fn is_empty(&self) -> bool { self.lr.is_empty() }
+    pub fn clear(&mut self) { self.lr.clear(); self.rl.clear(); }
+    pub fn pairs(&self)  -> impl Iterator<Item = (&L, &R)> { self.lr.iter() }
+    pub fn left_values(&self)  -> impl Iterator<Item = &L> { self.rl.values() }
+    pub fn right_values(&self) -> impl Iterator<Item = &R> { self.lr.values() }
+    pub fn retain(&mut self, mut f: impl FnMut(&L, &R) -> bool) {
+        let remove: Vec<_> = self.lr.iter().filter(|(l, r)| !f(l, r)).map(|(l, r)| (l.clone(), r.clone())).collect();
+        for (l, r) in &remove { self.lr.remove(l); self.rl.remove(r); }
+    }
+}
+pub struct TwoWayHashMapIter<'a, L, R>(std::collections::hash_map::Iter<'a, L, R>);
+impl<'a, L, R> Iterator for TwoWayHashMapIter<'a, L, R> {
+    type Item = (&'a L, &'a R);
+    fn next(&mut self) -> Option<Self::Item> { self.0.next() }
+    fn size_hint(&self) -> (usize, Option<usize>) { self.0.size_hint() }
+}
+impl<'a, L, R> IntoIterator for &'a TwoWayHashMap<L, R> where L: Clone + Eq + Hash, R: Clone + Eq + Hash {
+    type Item = (&'a L, &'a R);
+    type IntoIter = TwoWayHashMapIter<'a, L, R>;
+    fn into_iter(self) -> Self::IntoIter { TwoWayHashMapIter(self.lr.iter()) }
 }
 
 
@@ -1464,16 +1507,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
-    let mut bft_key_to_address = HashMap::<PubKeyID, STPAddress>::new();
-    let mut address_to_bft_key = HashMap::<STPAddress, PubKeyID>::new();
+    let mut bft_key_address_map = TwoWayHashMap::<PubKeyID, STPAddress>::new();
 
     for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
-        bft_key_to_address.insert(*bft_pk, address.clone());
-        address_to_bft_key.insert(address.clone(), *bft_pk);
-        let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
+        bft_key_address_map.insert(bft_pk, address);
     }
 
-    if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, bft_key_to_address.values().collect::<Vec<_>>()); }
+    if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, bft_key_address_map.pairs().collect::<Vec<_>>()); }
 
     // TODO: only convert private to public in 1 location
     let mut bft_state = TMState::init(
@@ -1503,7 +1543,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         {
             let mut peers = peers.iter().map(|(ck, p)| {
                 let bft_key = connections_map.get(ck)
-                    .and_then(|c| address_to_bft_key.get(&c.address()))
+                    .and_then(|c| bft_key_address_map.get_by_right(&c.address()))
                     .copied()
                     .unwrap_or(PubKeyID::NIL);
                 p.info(true, bft_key)
@@ -1616,7 +1656,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 });
 
                 // Try to reconnect to known but disconnected peers
-                for (_bft_key, address) in &bft_key_to_address {
+                for (_bft_key, address) in &bft_key_address_map {
                     if !connections_map.contains_key(&address.connection_key()) {
                         let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
                     }
@@ -1633,14 +1673,18 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let server_b_pub_key = PubKeyID([0xE6, 0x00, 0x6A, 0x82, 0xD9, 0xA0, 0xDA, 0xB4, 0x6B, 0xD4, 0xC1, 0xDD, 0x69, 0x14, 0xF0, 0x3B,
                                                  0xEC, 0x27, 0xB4, 0xEC, 0xD3, 0xD9, 0x09, 0xD1, 0x62, 0x34, 0x2D, 0xFD, 0xA5, 0x13, 0x78, 0x1E]);
 
-                if !bft_key_to_address.contains_key(&server_a_pub_key) && server_a_pub_key != PubKeyID(my_root_public_bft_key.into()) {
-                    let (a, b) = addr_string_to_stuff("45.76.30.90:8234");
+                if !bft_key_address_map.contains_left(&server_a_pub_key) && server_a_pub_key != PubKeyID(my_root_public_bft_key.into()) {
+                    let address = STPAddress::parse("[::ffff:45.76.30.90]:8234:AQAAAAAA:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(); // @Todo
+
+                    bft_key_address_map.insert(&server_a_pub_key, &address);
 
                     // peers.push(Peer { root_public_bft_key: server_a_pub_key, endpoint: Some(evidence.address), ..Peer::default() });
                 }
 
-                if !bft_key_to_address.contains_key(&server_b_pub_key) && server_b_pub_key != PubKeyID(my_root_public_bft_key.into()) {
-                    let (a, b) = addr_string_to_stuff("70.34.201.202:8234");
+                if !bft_key_address_map.contains_left(&server_b_pub_key) && server_b_pub_key != PubKeyID(my_root_public_bft_key.into()) {
+                    let address = STPAddress::parse("[::ffff:70.34.201.202]:8234:AQAAAAAA:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(); // @Todo
+
+                    bft_key_address_map.insert(&server_a_pub_key, &address);
                     // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.address), ..Peer::default() });
                 }
 
@@ -1830,7 +1874,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 if PRINT_PEERS { println!("{} {:?}", ctx_str, peers.iter().map(|(ck, p)| {
                     let bft_key = connections_map.get(ck)
-                        .and_then(|c| address_to_bft_key.get(&c.address()))
+                        .and_then(|c| bft_key_address_map.get_by_right(&c.address()))
                         .copied()
                         .unwrap_or(PubKeyID::NIL);
                     (bft_key, p.latest_status.clone())
@@ -1838,7 +1882,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 for (connection_key, peer) in &mut peers {
                     let peer_bft_key = connections_map.get(connection_key)
-                        .and_then(|c| address_to_bft_key.get(&c.address()))
+                        .and_then(|c| bft_key_address_map.get_by_right(&c.address()))
                         .copied()
                         .unwrap_or(PubKeyID::NIL);
                     if let Some(height) = peer.latest_status_request_height && height < bft_state.height {

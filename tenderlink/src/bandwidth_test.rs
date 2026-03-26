@@ -88,6 +88,9 @@ pub fn noise_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     }
 }
 
+pub const MIN_SECRET_KEY_SIZE: usize = 32;
+pub const MIN_PUBLIC_KEY_SIZE: usize = 32;
+
 // Quantum-resilient key sizes
 pub const MAX_SECRET_KEY_SIZE: usize = 8000;
 pub const MAX_PUBLIC_KEY_SIZE: usize = 8000;
@@ -142,6 +145,23 @@ impl STPAddress {
     pub fn is_ipv6(&self) -> bool { self.ip.to_ipv4_mapped().is_none() }
     pub fn from(ip: Ipv6Addr, port: u16, kp: &IdentityKeyPair) -> Self { Self { ip, port, magic1: kp.magic1, key: kp.public.clone() } }
     pub fn connection_key(&self) -> ConnectionKey { ConnectionKey::from(self) }
+
+    // Parse [ip]:port:magic1:key
+    pub fn parse(addr: &str) -> Option<STPAddress> {
+        use base64::Engine;
+        let     addr           = addr.strip_prefix('[')?;
+        let     (ip_str, rest) = addr.split_once("]:")?;
+        let     ip: Ipv6Addr   = ip_str.parse().ok()?;
+        let mut parts          = rest.splitn(3, ':');
+        let     port: u16      = parts.next()?.parse().ok()?;
+        let     b64_magic1     = parts.next()?; if b64_magic1.contains('=') { return None; }
+        let     b64_key        = parts.next()?; if b64_key   .contains('=') { return None; }
+        let     magic1_bytes   = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64_magic1).ok()?; if magic1_bytes.len() != 6 { return None; }
+        let     key            = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64_key).ok()?;    if key.len() < MIN_PUBLIC_KEY_SIZE || key.len() > MAX_PUBLIC_KEY_SIZE { return None; }
+        let mut buf            = [0u8; 8]; buf[..6].copy_from_slice(&magic1_bytes);
+        let     magic1         = u64::from_le_bytes(buf); if magic1 & 1 == 0 { return None; }
+        Some(STPAddress { ip, port, magic1, key })
+    }
 }
 impl Default for STPAddress {
     fn default() -> Self {

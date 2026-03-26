@@ -27,28 +27,10 @@ pub async fn push_block_event(event: BlockEvent) {
 // NewNet packet types // @Todo: share common messages/code with Tenderlink
 // ---------------------------------------------------------------------------
 
+const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
+
 // @Todo: more of these, merge with Tenderlink, reintroduce peer discovery from p2p, etc.
 const PACKET_TYPE_STATUS: u8 = 1;
-
-// @Todo: Use encryption; put real STP addresses in the
-// network_initial_peers instead of computing deterministic secrets from the adddress
-fn peer_string_to_stp_address(addr: &str) -> Option<STPAddress> {
-    let (ip, port) = parse_to_ipv6_bytes(addr).ok()?;
-    use std::hash::{Hash as StdHash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    addr.hash(&mut hasher);
-    let seed = hasher.finish();
-    use rand::{Rng, SeedableRng};
-    let mut other_seed = [0u8; 32];
-    rand_chacha::ChaCha20Rng::seed_from_u64(seed).fill(&mut other_seed);
-    let static_keypair = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_PLAIN_TEXT, other_seed)?;
-    Some(STPAddress {
-        ip,
-        port,
-        magic1: CONNECT_MAGIC1_PLAIN_TEXT,
-        key: static_keypair.public,
-    })
-}
 
 #[derive(Clone, Copy, Debug)]
 struct ShadowBlock {
@@ -107,10 +89,10 @@ pub fn sync(
         let hash = *blake3::hash(string_seed.as_bytes()).as_bytes();
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&hash);
-        network_keypair = new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_PLAIN_TEXT, seed).unwrap();
+        network_keypair = new_keypair_from_connect_magic1_with_seed(CRYPTO_MAGIC, seed).unwrap();
     }
     else {
-        network_keypair = new_keypair_from_connect_magic1(CONNECT_MAGIC1_PLAIN_TEXT).unwrap();
+        network_keypair = new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
     }
     println!("NETWORK KEYPAIR: {}", network_keypair);
 
@@ -142,7 +124,7 @@ pub fn sync(
     // Parse and connect to initial peers
     let mut peer_addresses: Vec<STPAddress> = Vec::new();
     for peer_str in &config.network_initial_peers {
-        if let Some(address) = peer_string_to_stp_address(peer_str) {
+        if let Some(address) = STPAddress::parse(peer_str) {
             println!("NewNet: Connecting to peer: {:?}", address);
             let _ = connect_to(socket, &mut connections_map, &my_keypairs, &address);
             peer_addresses.push(address);
@@ -215,15 +197,30 @@ pub fn sync(
         service_connections(&mut connections_map,
                             &mut packets_received,
                             &packets_to_send,
+                            // &packets_that_failed_to_send_due_to_congestion,
                             &mut packet_memory_encrypted,
                             &mut packet_memory_recv,
                             &mut packet_memory_send,
                             socket,
                             &my_keypairs);
+
+        // for packet in &packets_that_failed_to_send_due_to_congestion {
+        // }
+
         packets_to_send.clear();
 
+        // // hypothetical: something "we may want" to "avoid pessimal drop behaviour"
+        // packets_received.shuffle();
+
         // Process received packets
-        while let Some((connection_key, msg)) = packets_received.pop() {
+        while packets_received.len() > 0 {
+            let (connection_key, msg) = packets_received.remove(0);
+
+            // if time_limit_exceeded {
+            //     stp_library::signal_backpressure(PacketID(&msg));
+            //     break; // Congested! Drop remainder!
+            // }
+
             if msg.is_empty() {
                 // @Todo: disconnect this peer, likely denial of some kind or faulty
                 continue;
