@@ -1,0 +1,182 @@
+# Format: <SettingName>: <Settingvalue>
+# Setting name must appear at start of line and there must be whitespace after the colon.
+# Multiple values can be comma separated or on subsequent lines.
+#
+# Valid settings for colour rules:
+# REGEX()   A regular expression. Colours entire match or first group.
+# WORD()    Matches a word (case sensitive)
+# WORDI()   Matches a word (case insensitive)
+# TEXT()    Match any text in the line (case sensitive)
+# TEXTI()   Match any text in the line (case insensitive)
+
+#----------------------------------------------
+# settings
+
+Extensions:                 *.rs
+
+BlockCommentStart:          /*
+
+BlockCommentEnd:            */
+
+#----------------------------------------------
+# colour rules
+
+Language.Number:
+REGEX(\b[A-Z]\b)
+REGEX(\b[A-Z][A-Z_]\b)
+REGEX(\b[A-Z][A-Z_][A-Z_]\b)
+REGEX(\b[A-Z][A-Z_][A-Z_][A-Z_]\b)
+REGEX(\b[A-Z][A-Z_][A-Z_][A-Z_][A-Z_]\b)
+REGEX(\b[A-Z][A-Z_][A-Z_][A-Z_][A-Z_][A-Za-z0-9_]*\b)
+REGEX(\b[A-Z][A-Z_][A-Z_][A-Z_][A-Z_][A-Za-z0-9_]*\b)
+
+Language.Class:
+# This highlighting is mutually exclusive from MemberFunction highlighting in the case of Class::member_function().
+REGEX([A-Z][A-Za-z0-9_]+\s*::)
+REGEX([A-Z][A-Z][A-Za-z0-9_]+\s*::)
+REGEX([A-Z][A-Z][A-Z][A-Za-z0-9_]+\s*::)
+REGEX([A-Z][A-Z][A-Z][A-Z][A-Za-z0-9_]+\s*::)
+REGEX(\b[A-Z][a-z0-9_][A-Za-z0-9_]*\b)
+# REGEX([A-Z][A-Za-z0-9_]*)
+
+Language.Function:
+# We would like to use this to narrow Function to only non-members, but MemberFunction highlighting is mutually exclusive from Class highlighting in the case of class::memberfunction(), so we just match memberfunctions as functions for now.
+# REGEX(( |\()([a-z][A-Za-z0-9_]*)\s*\()
+REGEX([a-z][A-Za-z0-9_]*\s*(\(|::<|<))
+
+
+# Put strings before comments so // inside strings does not win.
+Language.String:
+REGEX((?:b)?\"(?:\\.|[^\"\\])*\")
+
+Language.Comment:
+REGEX(//.*)
+
+Language.Namespace:
+# This highlighting is mutually exclusive from MemberFunction highlighting if we enable MemberFunction trying to match the case of Class::member_function().
+REGEX([A-Za-z0-9_]+\s*::)
+REGEX(^\s*(?:use|mod)\s+([A-Za-z_][A-Za-z0-9_:]*))
+
+Language.Number:
+REGEX(\b0[xX][0-9A-Fa-f_]+(?:u8|i8|u16|i16|u32|i32|u64|i64|u128|i128|usize|isize)?\b)
+REGEX(\b0[oO][0-7_]+(?:u8|i8|u16|i16|u32|i32|u64|i64|u128|i128|usize|isize)?\b)
+REGEX(\b0[bB][01_]+(?:u8|i8|u16|i16|u32|i32|u64|i64|u128|i128|usize|isize)?\b)
+REGEX(\b[0-9][0-9_]*\.[0-9_]+(?:[eE][+-]?[0-9_]+)?(?:f32|f64)?\b)
+REGEX(\b[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)(?:f32|f64)?\b)
+REGEX(\b[0-9][0-9_]*(?:f32|f64)\b)
+REGEX(\b[0-9][0-9_]*(?:u8|i8|u16|i16|u32|i32|u64|i64|u128|i128|usize|isize)?\b)
+
+Language.Brace:
+TEXT({)
+TEXT(})
+
+Language.Bracket:
+TEXT(()
+TEXT())
+
+Language.SquareBracket:
+TEXT([)
+TEXT(])
+
+Language.SemiColon:
+TEXT(;)
+
+Language.Preprocessor:
+REGEX([A-Za-z0-9_]+!)
+REGEX(#\[.*\])
+
+Language.Comma:
+TEXT(,)
+
+Language.Keyword:
+WORD(as)
+WORD(async)
+WORD(await)
+WORD(break)
+WORD(const)
+WORD(continue)
+WORD(crate)
+WORD(dyn)
+WORD(else)
+WORD(enum)
+WORD(extern)
+WORD(false)
+WORD(fn)
+WORD(for)
+WORD(if)
+WORD(impl)
+WORD(in)
+WORD(let)
+WORD(loop)
+WORD(match)
+WORD(mod)
+WORD(move)
+WORD(mut)
+WORD(pub)
+WORD(ref)
+WORD(return)
+WORD(self)
+WORD(Self)
+WORD(static)
+WORD(struct)
+WORD(super)
+WORD(trait)
+WORD(true)
+WORD(type)
+WORD(unsafe)
+WORD(use)
+WORD(where)
+WORD(while)
+WORD(try)
+WORD(union)
+WORD(u8)
+WORD(u16)
+WORD(u32)
+WORD(u64)
+WORD(u128)
+WORD(i8)
+WORD(i16)
+WORD(i32)
+WORD(i64)
+WORD(i128)
+
+# Old reserved / historical / edition-dependent
+WORD(abstract)
+WORD(become)
+WORD(box)
+WORD(do)
+WORD(final)
+WORD(macro)
+WORD(override)
+WORD(priv)
+WORD(typeof)
+WORD(unsized)
+WORD(virtual)
+WORD(yield)
+
+# Only the one lifetime that is worth special-casing safely
+WORD('static)
+
+# We would like to use MemberFunction, but this is mutually exclusive from Class highlighting in the case of class::memberfunction(), so we just match memberfunctions as functions for now.
+# Language.MemberFunction:
+# REGEX((\.|::)\s*[A-Za-z0-9_]*\()
+# REGEX((\.|::)\s*[A-Za-z0-9_]*::<)
+
+Language.Operator:
+TEXT(.)
+TEXT(:)
+TEXT(-)
+TEXT(>)
+TEXT(=)
+TEXT(+)
+TEXT(*)
+TEXT(/)
+TEXT(%)
+TEXT(<)
+TEXT(!)
+TEXT(|)
+TEXT(&)
+TEXT(~)
+TEXT(?)
+TEXT(^)
+TEXT(;)
