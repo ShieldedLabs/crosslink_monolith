@@ -18,9 +18,9 @@ pub(crate) enum BlockEvent {
 }
 static BLOCK_EVENT_QUEUE_SENDER: std::sync::OnceLock<tokio::sync::mpsc::Sender<BlockEvent>> = std::sync::OnceLock::new();
 
-pub async fn push_block_event(event: BlockEvent) {
+pub fn push_block_event(event: BlockEvent) {
     if let Some(tx) = BLOCK_EVENT_QUEUE_SENDER.get() {
-        tx.send(event).await.unwrap();
+        tx.blocking_send(event).unwrap();
     }
 }
 

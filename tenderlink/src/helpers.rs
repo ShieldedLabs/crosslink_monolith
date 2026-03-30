@@ -139,6 +139,7 @@ pub struct RustIsBadRngWrapper(pub ChaCha20Rng);
 impl snow::types::Random for RustIsBadRngWrapper {
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), snow::Error> {
         self.0.fill(dest);
+        println!("Rust is bad wrapper debug: {:?}", dest);
         Ok(())
     }
 }
