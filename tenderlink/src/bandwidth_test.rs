@@ -432,12 +432,12 @@ pub fn connect_to_endpoint(
                 .local_private_key(&my_connect_keypair.private[..]).unwrap()
                 .remote_public_key(&endpoint.key[..]).unwrap()
                 .build_initiator().unwrap();
-            
+
             // TODO list protocols
             let handshake_size = handshake.write_message(&[], &mut hello_packet_payload[6..]).unwrap();
             hello_packet_payload.truncate(6+handshake_size);
             hello_packet_payload.shrink_to_fit();
-            
+
             let my_ip = if endpoint.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
                 ConnectionKey::from(endpoint),
@@ -459,7 +459,70 @@ pub fn connect_to_endpoint(
 const        VERBOSE                :bool=0!=                (0);
 const OVERLY_VERBOSE                :bool=0!=                (0);
 
+macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
 
+#[repr(u8)] pod! { pub enum PackletTag { #[default] Acknowledgements = 0, AnEntireDatagram = 1, OneJumboFragment = 2, ReliableStreamed = 3 } }
+#[repr(C)]  pod! { pub struct PackletHeader(u16); }
+#[repr(C)]  pod! { pub struct PackletAcknowledgements { pub hdr: PackletHeader } }
+#[repr(C)]  pod! { pub struct PackletAnEntireDatagram { pub hdr: PackletHeader } }
+#[repr(C)]  pod! { pub struct PackletOneJumboFragment { pub hdr: PackletHeader, pub id_idx: u32 } }
+#[repr(C)]  pod! { pub struct PackletReliableStreamed { pub hdr: PackletHeader, pub id: u16, pub seq: u32 } }
+
+impl PackletHeader {
+    pub fn new(tag: PackletTag, len: u16) -> Self { debug_assert!(len < (1 << 14)); Self((tag as u16) | (len << 2)) }
+    pub fn tag(self) -> PackletTag { unsafe { core::mem::transmute((self.0 & 0x3) as u8) } }
+    pub fn len(self) -> u16 { self.0 >> 2 }
+}
+
+impl PackletOneJumboFragment {
+    pub fn new(hdr: PackletHeader, id: u8, idx: u32) -> Self { debug_assert!(idx < (1 << 24)); Self { hdr, id_idx: (id as u32) | (idx << 8) } }
+    pub fn id(self) -> u8 { self.id_idx as u8 }
+    pub fn idx(self) -> u32 { self.id_idx >> 8 }
+}
+
+impl SliceRead  for PackletHeader           { fn       read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self(u16::read_from(buf)?)) } }
+impl SliceRead  for PackletAcknowledgements { fn       read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self { hdr: PackletHeader::read_from(buf)?, }) } }
+impl SliceRead  for PackletAnEntireDatagram { fn       read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self { hdr: PackletHeader::read_from(buf)?, }) } }
+impl SliceWrite for PackletHeader           { fn write_to(&self, buf: &mut  [u8]) -> usize        { self.0  .write_to(buf) } }
+impl SliceWrite for PackletAcknowledgements { fn write_to(&self, buf: &mut  [u8]) -> usize        { self.hdr.write_to(buf) } }
+impl SliceWrite for PackletAnEntireDatagram { fn write_to(&self, buf: &mut  [u8]) -> usize        { self.hdr.write_to(buf) } }
+
+
+impl SliceRead  for PackletOneJumboFragment {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(Self {
+            hdr:    PackletHeader::read_from(buf)?,
+            id_idx: u32          ::read_from(buf)?
+        })
+    }
+}
+impl SliceWrite for PackletOneJumboFragment {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.hdr   .write_to(&mut buf[o..]);
+        o += self.id_idx.write_to(&mut buf[o..]);
+        o
+    }
+}
+
+impl SliceRead  for PackletReliableStreamed {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(Self {
+            hdr: PackletHeader::read_from(buf)?,
+            id: u16::read_from(buf)?,
+            seq: u32::read_from(buf)?
+        })
+    }
+}
+impl SliceWrite for PackletReliableStreamed {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.hdr.write_to(&mut buf[o..]);
+        o += self.id .write_to(&mut buf[o..]);
+        o += self.seq.write_to(&mut buf[o..]);
+        o
+    }
+}
 
 pub fn service_connections(
     connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,

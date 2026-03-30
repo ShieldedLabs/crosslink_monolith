@@ -112,7 +112,7 @@ pub fn sync(
     else {
         network_keypair = new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
     }
-    println!("NETWORK KEYPAIR: {}", network_keypair);
+    println!("NewNet: KEYPAIR: {}", network_keypair);
 
     // STP networking setup
     socket_setup();

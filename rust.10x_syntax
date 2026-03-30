@@ -21,6 +21,9 @@ BlockCommentEnd:            */
 #----------------------------------------------
 # colour rules
 
+Language.Keyword:
+WORD(Self)
+
 Language.Number:
 REGEX(\b[A-Z]\b)
 REGEX(\b[A-Z][A-Z_]\b)
@@ -42,7 +45,7 @@ REGEX(\b[A-Z][a-z0-9_][A-Za-z0-9_]*\b)
 Language.Function:
 # We would like to use this to narrow Function to only non-members, but MemberFunction highlighting is mutually exclusive from Class highlighting in the case of class::memberfunction(), so we just match memberfunctions as functions for now.
 # REGEX(( |\()([a-z][A-Za-z0-9_]*)\s*\()
-REGEX([a-z][A-Za-z0-9_]*\s*(\(|::<|<))
+REGEX([a-z][A-Za-z0-9_]*(\s*\(|\s*::<|<))
 
 
 # Put strings before comments so // inside strings does not win.
@@ -116,7 +119,6 @@ WORD(pub)
 WORD(ref)
 WORD(return)
 WORD(self)
-WORD(Self)
 WORD(static)
 WORD(struct)
 WORD(super)
@@ -134,11 +136,13 @@ WORD(u16)
 WORD(u32)
 WORD(u64)
 WORD(u128)
+WORD(usize)
 WORD(i8)
 WORD(i16)
 WORD(i32)
 WORD(i64)
 WORD(i128)
+WORD(isize)
 
 # Old reserved / historical / edition-dependent
 WORD(abstract)
