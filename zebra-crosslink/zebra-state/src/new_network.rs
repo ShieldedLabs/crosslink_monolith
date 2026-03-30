@@ -38,18 +38,19 @@ const PACKET_TYPE_BLOCK: u8 = 2;
 #[derive(Clone, Copy, Debug)]
 struct PacketStatus {
     height: u32,
-    hash: Hash,
+    hash:   Hash,
 }
 const PACKET_STATUS_SIZE: usize = 4 /*height*/ + 32 /*hash*/;
 
-impl PacketStatus {
+impl SliceWrite for PacketStatus {
     fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = 0;
         o += self.height.write_to(&mut buf[o..]);
         o += self.hash.0.write_to(&mut buf[o..]);
         o
     }
-
+}
+impl SliceRead for PacketStatus {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
         Some(PacketStatus {
             height: u32::read_from(buf)?,
@@ -60,7 +61,7 @@ impl PacketStatus {
 
 #[derive(Clone, Copy, Debug)]
 struct ShadowBlock {
-    this_hash: Hash,
+    this_hash:   Hash,
     parent_hash: Hash,
 }
 
@@ -176,17 +177,7 @@ pub fn sync(
                 Ok(block_event) => {
                     match block_event {
                         BlockEvent::Committed(hash) => {
-                            // @Todo: real block stuff, put it in a data structure, repeatedly announce blocks, etc.
-                            let mut msg = [0u8; 11];
-                            msg[0] = hash.0[0] | 1;
-                            msg[1..11].copy_from_slice("New block!".as_bytes()); // @Debug
-
-                            for (key, connection) in &connections_map {
-                                if !connection.is_connected() {
-                                    continue;
-                                }
-                                packets_to_send.push((*key, Vec::from(msg)));
-                            }
+                            // @Todo: announce this block
                         }
                         _ => {
                             println!("NewNet: block_event: {:?}", block_event);
@@ -223,8 +214,7 @@ pub fn sync(
         }
         
         for block in &block_send_queue {
-            
-            let mut buf = [0u8; 1 + 20_000];
+            let mut buf = [0u8; 1 + 32_767];
             let mut o = 0;
             o += PACKET_TYPE_BLOCK.write_to(&mut buf[o..]);
             o += block.write_to(&mut buf[o..]);
