@@ -41,7 +41,7 @@ use zebra_chain::{
 };
 
 use zebra_chain::{block::Height, serialization::ZcashSerialize};
-use zebra_chain::block::FatPointerToBftBlock;
+use zcash_primitives::bft::FatPointerToBftBlock;
 
 use crate::{
     constants::{
@@ -1404,7 +1404,7 @@ impl Service<ReadRequest> for ReadStateService {
 
             ReadRequest::FinalizedTip => {
                 let state = self.clone();
-                
+
                 tokio::task::spawn_blocking(move || {
                     Ok(ReadResponse::Tip(state.db.tip()))
                 })

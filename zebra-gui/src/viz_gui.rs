@@ -368,8 +368,8 @@ pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Ve
             res.push(*bft.unwrap().block.proving_blocks.first().unwrap_or(&Hash32::from_u64(0))); // TODO: fall back to genesis hash instead of 0
         },
     }
-    res
 
+    res
 }
 
 

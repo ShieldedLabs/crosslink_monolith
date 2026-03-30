@@ -2655,7 +2655,7 @@ pub fn ui_right_pane(ui: &mut Context,
             ..Decl
         }) {
             let mut recv_address = String::new();
-            for b in wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().iter().rev() {
+            for b in wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().0.iter().rev() {
                 recv_address.push_str(&format!("{:02x}", b));
             }
 

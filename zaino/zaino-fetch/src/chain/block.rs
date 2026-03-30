@@ -8,8 +8,8 @@ use crate::chain::{
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
 use zaino_proto::proto::compact_formats::{ChainMetadata, CompactBlock};
+use zcash_primitives::bft::FatPointerToBftBlock;
 use zebra_chain::{
-    block::FatPointerToBftBlock,
     serialization::{ZcashDeserialize, ZcashSerialize},
 };
 

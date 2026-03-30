@@ -60,7 +60,7 @@ impl Solution {
     pub const INPUT_LENGTH: usize = 4 + 32 * 3 + 4 * 2;
 
     /// Returns the inner value of the [`Solution`] as a byte slice.
-    fn value(&self) -> &[u8] {
+    pub fn value(&self) -> &[u8] {
         match self {
             Solution::Common(solution) => solution.as_slice(),
             Solution::Regtest(solution) => solution.as_slice(),

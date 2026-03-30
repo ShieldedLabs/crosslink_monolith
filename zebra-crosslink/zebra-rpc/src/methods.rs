@@ -59,11 +59,12 @@ use tracing::Instrument;
 use zcash_address::{unified::Encoding, TryFromAddress};
 use zcash_protocol::consensus::Parameters;
 use zcash_primitives::transaction::RosterMember;
+use zcash_primitives::bft::FatPointerToBftBlock;
 
 use zebra_chain::{
     amount::{self, Amount, NegativeAllowed, NonNegative},
     block::{
-        self, Block, Commitment, FatPointerToBftBlock, Height, SerializedBlock, TryIntoHeight,
+        self, Block, Commitment, Height, SerializedBlock, TryIntoHeight,
     },
     chain_sync_status::ChainSyncStatus,
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},

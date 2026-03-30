@@ -81,9 +81,9 @@ pub async fn service_viz_requests(
 
                 async fn get_height_hash(
                     call: TFLServiceCalls,
-                    h: BlockHeight,
-                    existing_height_hash: (BlockHeight, BlockHash),
-                ) -> Option<(BlockHeight, BlockHash)> {
+                    h: ZebBlockHeight,
+                    existing_height_hash: (ZebBlockHeight, ZebBlockHash),
+                ) -> Option<(ZebBlockHeight, ZebBlockHash)> {
                     if h == existing_height_hash.0 {
                         // avoid duplicating work if we've already got that value
                         // TODO: does this miss reorgs?
@@ -172,7 +172,7 @@ pub async fn service_viz_requests(
                             is_best_chain: true,
                             is_finalized: false,
                             is_implicated_by_bft: false,
-                            points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash()),
+                            points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash().0),
                         });
                     }
                     for i in request.bft_ack_height as usize..internal.bft_blocks.len() {
@@ -186,8 +186,8 @@ pub async fn service_viz_requests(
                             this_hash: this_hash,
                             parent_hash: Hash32::from_bytes(b.previous_block_hash().0),
                             this_height: i as u64,
-                            points_at_bc_block: Hash32::from_bytes(b.finalization_candidate().hash().0),
-                            proving_blocks: b.headers.iter().skip(1).map(|x| Hash32::from_bytes(x.hash().0)).collect(),
+                            points_at_bc_block: Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0),
+                            proving_blocks: b.headers.iter().skip(1).map(|x| Hash32::from_bytes(BlockHash::from_header_data(x).0)).collect(),
                         });
 
                         // TODO: compute the finalized tip height!
@@ -202,20 +202,20 @@ pub async fn service_viz_requests(
     }
 }
 
-fn abs_block_height(height: i32, tip: Option<(BlockHeight, BlockHash)>) -> BlockHeight {
+fn abs_block_height(height: i32, tip: Option<(ZebBlockHeight, ZebBlockHash)>) -> ZebBlockHeight {
     if height >= 0 {
-        BlockHeight(height.try_into().unwrap())
+        ZebBlockHeight(height.try_into().unwrap())
     } else if let Some(tip) = tip {
         tip.0.sat_sub(!height)
     } else {
-        BlockHeight(0)
+        ZebBlockHeight(0)
     }
 }
 
 fn abs_block_heights(
     heights: (i32, i32),
-    tip: Option<(BlockHeight, BlockHash)>,
-) -> (BlockHeight, BlockHeight) {
+    tip: Option<(ZebBlockHeight, ZebBlockHash)>,
+) -> (ZebBlockHeight, ZebBlockHeight) {
     (
         abs_block_height(heights.0, tip),
         abs_block_height(heights.1, tip),

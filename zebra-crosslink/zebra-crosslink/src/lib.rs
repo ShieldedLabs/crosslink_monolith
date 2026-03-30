@@ -27,6 +27,9 @@ use rand::{Rng, SeedableRng};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::hash::{DefaultHasher, Hasher};
+use std::io::Cursor;
+use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -38,13 +41,17 @@ use tracing::{error, info, warn};
 
 use bytes::{Bytes, BytesMut};
 
-use ed25519_zebra::SigningKey as MalPrivateKey;
-use ed25519_zebra::VerificationKeyBytes as MalPublicKey;
+use zcash_primitives::bft::*;
+use zcash_primitives::block::{
+    BlockHash,
+    BlockHeaderData as BcBlockHeader,
+    BlockHeader as BcBlockHeaderWrap,
+};
+use zcash_protocol::consensus::BlockHeight;
+
+use chrono::DateTime;
 
 pub use wallet;
-
-pub mod chain;
-use chain::*;
 
 use std::sync::Mutex;
 use tokio::sync::Mutex as TokioMutex;
@@ -149,13 +156,13 @@ use crate::service::{TFLServiceCalls, TFLServiceHandle};
 
 // TODO: do we want to start differentiating BCHeight/PoWHeight, MalHeight/PoSHeigh etc?
 use zebra_chain::block::{
-    Block, CountedHeader, Hash as BlockHash, Header as BlockHeader, Height as BlockHeight,
+    Block, CountedHeader, Hash as ZebBlockHash, Header as ZebBlockHeader, Height as ZebBlockHeight,
 };
 use zebra_node_services::mempool::{Request as MempoolRequest, Response as MempoolResponse};
 use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
 
 /// Placeholder activation height for Crosslink functionality
-pub const TFL_ACTIVATION_HEIGHT: BlockHeight = BlockHeight(0);
+pub const TFL_ACTIVATION_HEIGHT: ZebBlockHeight = ZebBlockHeight(0);
 
 #[derive(Debug, Copy, Clone, EnumCount, EnumIter)]
 enum BFTMsgFlag {
@@ -172,48 +179,71 @@ enum BFTMsgFlag {
     ReceivedProposalPart,
 }
 
+pub fn bc_hdr_to_lrz(header: &ZebBlockHeader) -> BcBlockHeader {
+    // @Hack
+    let mut bytes = Vec::new();
+    header.zcash_serialize(&mut bytes);
+    BcBlockHeaderWrap::read_data(&*bytes).unwrap()
+
+
+    // let time = header.time.signed_duration_since(chrono::DateTime::UNIX_EPOCH).num_seconds();
+    // debug_assert_eq!(header.time, chrono::DateTime::<chrono::Utc>::from_timestamp_secs(time).unwrap());
+
+    // BcBlockHeader {
+    //     version: header.version.try_into().expect("non-negative version number"),
+    //     prev_block: BlockHash(header.previous_block_hash.0),
+    //     merkle_root: header.merkle_root.0,
+    //     final_sapling_root: *header.commitment_bytes,
+    //     time: time.try_into().unwrap(),
+    //     bits: header.difficulty_threshold.into(),
+    //     nonce: *header.nonce,
+    //     solution: header.solution.value().to_vec(),
+    //     fat_pointer_to_bft_block: header.fat_pointer_to_bft_block,
+    // }
+}
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct TFLServiceInternal {
-    my_public_key: MalPublicKey,
-    latest_final_block: Option<(BlockHeight, BlockHash)>,
+    my_public_key: PubKeyID,
+    latest_final_block: Option<(ZebBlockHeight, ZebBlockHash)>,
     tfl_is_activated: bool,
 
     // channels
-    final_change_tx: broadcast::Sender<(BlockHeight, BlockHash)>,
+    final_change_tx: broadcast::Sender<(ZebBlockHeight, ZebBlockHash)>,
 
     bft_msg_flags: u64, // ALT: Vec of messages/combine flags
     bft_err_flags: u64,
     bft_blocks: Vec<BftBlock>,
-    fat_pointer_to_tip: FatPointerToBftBlock2,
+    fat_pointer_to_tip: FatPointerToBftBlock,
     our_set_bft_string: Option<String>,
     active_bft_string: Option<String>,
 
     peer_strings: Vec<String>,
 
     // TODO: 2 versions of this: ever-added (in sequence) & currently non-0
-    validators_keys_to_names: HashMap<MalPublicKey, String>,
-    validators_at_current_height: Vec<MalValidator>,
+    validators_keys_to_names: HashMap<PubKeyID, String>,
+    validators_at_current_height: Vec<RosterMember>,
 
-    current_bc_final: Option<(BlockHeight, BlockHash)>,
+    current_bc_final: Option<(ZebBlockHeight, ZebBlockHash)>,
     path_to_pos_store_file: PathBuf,
 }
 
-fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: zebra_chain::block::FatPointerToBftBlock, child_fat_pointer: zebra_chain::block::FatPointerToBftBlock) -> bool {
+fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: FatPointerToBftBlock, child_fat_pointer: FatPointerToBftBlock) -> bool {
     let mut internal = internal_handle.internal.blocking_lock();
-    let parent_height = if parent_fat_pointer == zebra_chain::block::FatPointerToBftBlock::null() {
+    let parent_height = if parent_fat_pointer == FatPointerToBftBlock::null() {
         0
     } else {
-        if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash().0 == parent_fat_pointer.points_at_block_hash()) {
+        if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash() == parent_fat_pointer.points_at_block_hash()) {
             h
         } else {
             return false;
         }
     };
-    let child_height = if child_fat_pointer == zebra_chain::block::FatPointerToBftBlock::null() {
+    let child_height = if child_fat_pointer == FatPointerToBftBlock::null() {
         0
     } else {
-        if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash().0 == child_fat_pointer.points_at_block_hash()) {
+        if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash() == child_fat_pointer.points_at_block_hash()) {
             h
         } else {
             return false;
@@ -223,7 +253,7 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
 }
 
 // TODO: Result?
-async fn block_height_from_hash(call: &TFLServiceCalls, hash: BlockHash) -> Option<BlockHeight> {
+async fn block_height_from_hash(call: &TFLServiceCalls, hash: ZebBlockHash) -> Option<ZebBlockHeight> {
     if let Ok(StateResponse::KnownBlock(Some(known_block))) =
         (call.state)(StateRequest::KnownBlock(hash.into())).await
     {
@@ -235,8 +265,8 @@ async fn block_height_from_hash(call: &TFLServiceCalls, hash: BlockHash) -> Opti
 
 async fn block_height_hash_from_hash(
     call: &TFLServiceCalls,
-    hash: BlockHash,
-) -> Option<(BlockHeight, BlockHash)> {
+    hash: ZebBlockHash,
+) -> Option<(ZebBlockHeight, ZebBlockHash)> {
     if let Ok(StateResponse::BlockHeader {
         height,
         hash: check_hash,
@@ -252,7 +282,7 @@ async fn block_height_hash_from_hash(
 
 async fn block_from_hash( // @Phillip
     call: &TFLServiceCalls,
-    hash: BlockHash,
+    hash: ZebBlockHash,
 ) -> Option<Arc<Block>> {
     if let Ok(StateResponse::Block(Some(block))) = (call.state)(StateRequest::Block(zebra_state::HashOrHeight::Hash(hash.into()))).await {
         let check_hash = block.as_ref().hash();
@@ -265,7 +295,7 @@ async fn block_from_hash( // @Phillip
 
 async fn is_block_known( // @Phillip
     call: &TFLServiceCalls,
-    hash: BlockHash,
+    hash: ZebBlockHash,
 ) -> bool {
     if let Ok(StateResponse::KnownBlock(Some(known_block))) = (call.state)(StateRequest::KnownBlock(hash.into())).await {
         known_block.location == zebra_state::KnownBlockLocation::BestChain || known_block.location == zebra_state::KnownBlockLocation::SideChain
@@ -276,8 +306,8 @@ async fn is_block_known( // @Phillip
 
 async fn _block_header_from_hash(
     call: &TFLServiceCalls,
-    hash: BlockHash,
-) -> Option<Arc<BlockHeader>> {
+    hash: ZebBlockHash,
+) -> Option<Arc<ZebBlockHeader>> {
     if let Ok(StateResponse::BlockHeader { header, .. }) =
         (call.state)(StateRequest::BlockHeader(hash.into())).await
     {
@@ -287,7 +317,7 @@ async fn _block_header_from_hash(
     }
 }
 
-async fn _block_prev_hash_from_hash(call: &TFLServiceCalls, hash: BlockHash) -> Option<BlockHash> {
+async fn _block_prev_hash_from_hash(call: &TFLServiceCalls, hash: ZebBlockHash) -> Option<ZebBlockHash> {
     if let Ok(StateResponse::BlockHeader { header, .. }) =
         (call.state)(StateRequest::BlockHeader(hash.into())).await
     {
@@ -299,7 +329,7 @@ async fn _block_prev_hash_from_hash(call: &TFLServiceCalls, hash: BlockHash) -> 
 
 async fn tfl_reorg_final_block_height_hash(
     call: &TFLServiceCalls,
-) -> Option<(BlockHeight, BlockHash)> {
+) -> Option<(ZebBlockHeight, ZebBlockHash)> {
     let locator = (call.state)(StateRequest::BlockLocator).await;
 
     // NOTE: although this is a vector, the docs say it may skip some blocks
@@ -322,7 +352,7 @@ async fn tfl_reorg_final_block_height_hash(
             let tip_block_height = block_height_from_hash(call, *hashes.first().unwrap()).await;
 
             if let Some(height) = tip_block_height {
-                if height < BlockHeight(zebra_state::MAX_BLOCK_REORG_HEIGHT) {
+                if height < ZebBlockHeight(zebra_state::MAX_BLOCK_REORG_HEIGHT) {
                     // not enough blocks for any to be finalized
                     None // may be different from `locator.last()` in this case
                 } else {
@@ -349,7 +379,7 @@ async fn tfl_reorg_final_block_height_hash(
             let tip_block_hdr = block_height_from_hash(call, *hashes.first().unwrap()).await;
 
             if let Some(height) = tip_block_hdr {
-                if height >= BlockHeight(zebra_state::MAX_BLOCK_REORG_HEIGHT) {
+                if height >= ZebBlockHeight(zebra_state::MAX_BLOCK_REORG_HEIGHT) {
                     // not enough blocks for any to be finalized
                     let pre_reorg_height = height
                         .sub(BlockHeightDiff::from(zebra_state::MAX_BLOCK_REORG_HEIGHT))
@@ -379,7 +409,7 @@ async fn tfl_reorg_final_block_height_hash(
 
 async fn tfl_final_block_height_hash(
     internal_handle: &TFLServiceHandle,
-) -> Option<(BlockHeight, BlockHash)> {
+) -> Option<(ZebBlockHeight, ZebBlockHash)> {
     let mut internal = internal_handle.internal.lock().await;
     tfl_final_block_height_hash_pre_locked(internal_handle, &mut internal).await
 }
@@ -387,7 +417,7 @@ async fn tfl_final_block_height_hash(
 async fn tfl_final_block_height_hash_pre_locked(
     internal_handle: &TFLServiceHandle,
     internal: &mut TFLServiceInternal,
-) -> Option<(BlockHeight, BlockHash)> {
+) -> Option<(ZebBlockHeight, ZebBlockHash)> {
     #[allow(unused_mut)]
     if internal.latest_final_block.is_some() {
         internal.latest_final_block
@@ -396,16 +426,19 @@ async fn tfl_final_block_height_hash_pre_locked(
     }
 }
 
+// NAME: rng_sk_pk_from_addr
 pub fn rng_private_public_key_from_address(
     addr: &[u8],
-) -> (rand::rngs::StdRng, MalPrivateKey, MalPublicKey) {
+) -> (rand::rngs::StdRng, ed25519_zebra::SigningKey, PubKeyID) {
+// ) -> (rand::rngs::StdRng, ed25519_zebra::SigningKey, ed25519_zebra::VerificationKeyBytes) {
     let mut hasher = DefaultHasher::new();
     hasher.write(addr);
     let seed = hasher.finish();
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let private_key = MalPrivateKey::new(&mut rng);
-    let public_key = (&private_key).into();
-    (rng, private_key, public_key)
+    let private_key = ed25519_zebra::SigningKey::new(&mut rng);
+    let public_key = ed25519_zebra::VerificationKeyBytes::from(&private_key);
+    let pub_key = PubKeyID(<[u8; 32]>::from(public_key));
+    (rng, private_key, pub_key)
 }
 
 async fn push_new_bft_msg_flags(
@@ -476,7 +509,7 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
         return None;
     }
 
-    let finality_candidate_height = BlockHeight(finality_candidate_height.0.min(if let Some(v) = latest_final_block { v.0.0+10 } else { u32::MAX }));
+    let finality_candidate_height = ZebBlockHeight(finality_candidate_height.0.min(if let Some(v) = latest_final_block { v.0.0+10 } else { u32::MAX }));
 
     let resp = (call.state)(StateRequest::BlockHeader(finality_candidate_height.into())).await;
 
@@ -495,10 +528,10 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
     })
     .await;
 
-    let mut headers: Vec<BlockHeader> = if let Ok(StateResponse::BlockHeaders(hdrs)) = resp {
+    let mut headers: Vec<BcBlockHeader> = if let Ok(StateResponse::BlockHeaders(hdrs)) = resp {
         // TODO: do we want these in chain order or "walk-back order"
         hdrs.into_iter()
-            .map(|ch| Arc::unwrap_or_clone(ch.header))
+            .map(|ch| bc_hdr_to_lrz(&ch.header))
             .collect()
     } else {
         // Error or unexpected response type:
@@ -526,8 +559,8 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
 async fn new_decided_bft_block_from_malachite(
     tfl_handle: &TFLServiceHandle,
     new_block: &BftBlock,
-    fat_pointer: &FatPointerToBftBlock2,
-    tender_proposal_sigs: Vec<tenderlink::TMSig>,
+    fat_pointer: &FatPointerToBftBlock,
+    tender_proposal_sigs: Vec<TMSig>,
 ) -> Vec<tenderlink::SortedRosterMember> {
     // CHECK PRECONDITIONS
     {
@@ -553,7 +586,7 @@ async fn new_decided_bft_block_from_malachite(
     }
 
     let call = tfl_handle.call.clone();
-    let new_final_hash = new_block.headers.first().expect("at least 1 header").hash();
+    let new_final_hash = ZebBlockHash(BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0);
     let new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
     // assert_eq!(new_final_height.0, new_block.finalization_candidate_height);
     let insert_i = new_block.height as usize - 1;
@@ -566,7 +599,7 @@ async fn new_decided_bft_block_from_malachite(
         internal.bft_blocks.push(BftBlock {
             version: 0,
             height: i as u32,
-            previous_block_fat_ptr: FatPointerToBftBlock2 {
+            previous_block_fat_ptr: FatPointerToBftBlock {
                 vote_for_block_without_finalizer_public_key: [0u8; 76 - 32],
                 signatures: Vec::new(),
             },
@@ -613,7 +646,7 @@ async fn new_decided_bft_block_from_malachite(
     internal = tfl_handle.internal.lock().await;
 
     if got_stakes.len() > 0 {
-        internal.validators_at_current_height = got_stakes.into_iter().map(|s| MalValidator { public_key: s.0, voting_power: s.1 }).collect();
+        internal.validators_at_current_height = got_stakes.into_iter().map(|s| RosterMember { pub_key: s.0, voting_power: s.1, txids: Vec::new() }).collect();
     }
 
 //println!("Storing pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, internal.validators_at_current_height);
@@ -623,7 +656,7 @@ async fn new_decided_bft_block_from_malachite(
         fat_pointer.zcash_serialize(&mut append_bytes).unwrap();
         append_bytes.extend_from_slice(&(internal.validators_at_current_height.len() as u64).to_le_bytes());
         for v in &internal.validators_at_current_height {
-            v.write_to(&mut append_bytes).unwrap();
+            v.write_to_vec(&mut append_bytes);
         }
         append_bytes.extend_from_slice(&(tender_proposal_sigs.len() as u64).to_le_bytes());
         for sig in tender_proposal_sigs {
@@ -638,11 +671,11 @@ async fn new_decided_bft_block_from_malachite(
 }
 
 // TODO: collapse away Malachite roster
-fn tenderlink_roster_from_internal(vals: &[MalValidator]) -> Vec<SortedRosterMember> {
+fn tenderlink_roster_from_internal(vals: &[RosterMember]) -> Vec<SortedRosterMember> {
     let mut ret: Vec<SortedRosterMember> = vals
         .iter()
         .map(|v| SortedRosterMember {
-            pub_key: tenderlink::PubKeyID(v.public_key.into()),
+            pub_key: PubKeyID(v.pub_key.into()),
             stake: v.voting_power,
             cumulative_stake: 0,
         })
@@ -689,7 +722,7 @@ async fn validate_bft_block_from_malachite(
     }
     drop(internal);
 
-    let new_final_hash = new_block.headers.first().expect("at least 1 header").hash();
+    let new_final_hash = ZebBlockHash(BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0);
     let new_final_pow_height =
         if let Some(new_final_height) = block_height_from_hash(&call, new_final_hash).await {
             new_final_height.0
@@ -705,9 +738,9 @@ async fn validate_bft_block_from_malachite(
 
 fn fat_pointer_to_block_at_height(
     bft_blocks: &[BftBlock],
-    fat_pointer_to_tip: &FatPointerToBftBlock2,
+    fat_pointer_to_tip: &FatPointerToBftBlock,
     at_height: u64,
-) -> Option<FatPointerToBftBlock2> {
+) -> Option<FatPointerToBftBlock> {
     if at_height == 0 || at_height as usize - 1 >= bft_blocks.len() {
         return None;
     }
@@ -726,7 +759,7 @@ fn fat_pointer_to_block_at_height(
 async fn get_historical_bft_block_at_height(
     tfl_handle: &TFLServiceHandle,
     at_height: u64,
-) -> Option<(BftBlock, FatPointerToBftBlock2)> {
+) -> Option<(BftBlock, FatPointerToBftBlock)> {
     let mut internal = tfl_handle.internal.lock().await;
     if at_height == 0 || at_height as usize - 1 >= internal.bft_blocks.len() {
         return None;
@@ -911,15 +944,13 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         let tfl_handle7 = internal_handle.clone();
         let tfl_handle8 = internal_handle.clone();
 
-        use ed25519_zebra::VerificationKeyBytes;
-        let tender_pub = VerificationKeyBytes::from(&my_private_key);
-        *wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap() = tender_pub.into();
+        *wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap() = my_public_key;
 
         // TODO(Sam): Fill this out.
         let mut ingest_data_for_tenderlink: Vec<tenderlink::RoundData> = Vec::new();
 
         let mut i_bft_blocks: Vec<BftBlock> = Vec::new();
-        let mut fat_pointer_to_tip: FatPointerToBftBlock2 = FatPointerToBftBlock2::null();
+        let mut fat_pointer_to_tip: FatPointerToBftBlock = FatPointerToBftBlock::null();
         let mut unsorted_roster = internal_handle
             .internal
             .lock()
@@ -927,7 +958,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             .validators_at_current_height
             .clone();
 
-        use tenderlink::{FinalizerPeerAddress, PubKeyID};
+        use tenderlink::FinalizerPeerAddress;
         // Note(Sam): We do not support human names in the start config for now.
         let finalizer_peer_addresses: Vec<FinalizerPeerAddress> = unsorted_roster
             .iter()
@@ -941,7 +972,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 let (a, b) =
                     addr_string_to_stuff(&config.malachite_peers.get(i).unwrap_or_else(|| &string));
                 FinalizerPeerAddress {
-                    bft_pk: PubKeyID(m.public_key.into()),
+                    bft_pk: PubKeyID(m.pub_key.into()),
                     address: b,
                 }
             })
@@ -957,14 +988,14 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             'big_loop: loop {
                 valid_byte_count = cursor.position();
                 let block = if let Ok(block) = BftBlock::zcash_deserialize(&mut cursor) { block } else { break; };
-                let fat_pointer = if let Ok(fat_pointer) = FatPointerToBftBlock2::zcash_deserialize(&mut cursor) { fat_pointer } else { break; };
+                let fat_pointer = if let Ok(fat_pointer) = FatPointerToBftBlock::zcash_deserialize(&mut cursor) { fat_pointer } else { break; };
 
                 let mut buf = [0u8; 8];
                 if cursor.read_exact(&mut buf).is_err() { break; }
                 let new_roster_count = u64::from_le_bytes(buf);
                 let mut new_roster = Vec::new();
                 for _ in 0..new_roster_count {
-                    if let Ok(v) = MalValidator::read_from(&mut cursor) {
+                    if let Ok(v) = RosterMember::read_from(&mut cursor) {
                         new_roster.push(v);
                     } else { break; }
                 }
@@ -974,7 +1005,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 let proposal_sigs_n = u64::from_le_bytes(buf);
                 let mut proposal_sigs = Vec::new();
                 for _ in 0..proposal_sigs_n {
-                    let mut sig = tenderlink::TMSig::NIL;
+                    let mut sig = TMSig::NIL;
                     if cursor.read_exact(&mut sig.0).is_err() { break 'big_loop; }
                     proposal_sigs.push(sig);
                 }
@@ -983,7 +1014,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
                 let mut round_data = tenderlink::RoundData::EMPTY;
                 round_data.roster = tenderlink_roster_from_internal(&unsorted_roster);
-                round_data.msg_val_sigs = round_data.roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.public_key == v.pub_key.0).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, tenderlink::TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), tenderlink::TMSig(s))]).collect();
+                round_data.msg_val_sigs = round_data.roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.pub_key == v.pub_key).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), TMSig(s))]).collect();
                 round_data.counts.precommits = fat_pointer.signatures.len() as u64;
                 round_data.counts.yes_precommits = fat_pointer.signatures.len() as u64;
                 round_data.proposal_sigs_n = proposal_sigs_n as usize;
@@ -1001,11 +1032,11 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             pos_file.set_len(valid_byte_count).unwrap();
         }
 
-        let mut new_final_hash = BlockHash([0; 32]);
-        let mut new_final_height = BlockHeight(0);
+        let mut new_final_hash = ZebBlockHash([0; 32]);
+        let mut new_final_height = ZebBlockHeight(0);
 
         if let Some(new_block) = i_bft_blocks.last() {
-            new_final_hash = new_block.headers.first().expect("at least 1 header").hash();
+            new_final_hash.0 = BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0;
             new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
 //println!("Loaded at pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, unsorted_roster);
         }
@@ -1017,7 +1048,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             internal.validators_at_current_height = unsorted_roster;
             internal.bft_blocks = i_bft_blocks;
             internal.fat_pointer_to_tip = fat_pointer_to_tip;
-            if new_final_hash != BlockHash([0; 32]) {
+            if new_final_hash != ZebBlockHash([0; 32]) {
                 internal.current_bc_final = Some((new_final_height, new_final_hash));
                 internal.latest_final_block = Some((new_final_height, new_final_hash));
             }
@@ -1089,7 +1120,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
     let mut run_instant = Instant::now();
     let mut last_diagnostic_print = Instant::now();
-    let mut current_bc_tip: Option<(BlockHeight, BlockHash)> = None;
+    let mut current_bc_tip: Option<(ZebBlockHeight, ZebBlockHash)> = None;
 
     loop {
         // Calculate this prior to message handling so that handlers can use it:
@@ -1145,8 +1176,8 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
 async fn tfl_block_finality_from_height_hash(
     internal_handle: TFLServiceHandle,
-    height: BlockHeight,
-    hash: BlockHash,
+    height: ZebBlockHeight,
+    hash: ZebBlockHash,
 ) -> Result<Option<TFLBlockFinality>, TFLServiceError> {
     // TODO: None is no longer ever returned
     let call = internal_handle.call.clone();
@@ -1258,14 +1289,14 @@ async fn tfl_service_incoming_request(
             internal
                 .validators_at_current_height
                 .iter()
-                .map(|v| RosterMember{ pub_key:<[u8; 32]>::from(v.public_key), voting_power: v.voting_power, txids: Vec::new() })
+                .map(|v| RosterMember{ pub_key:<[u8; 32]>::from(v.pub_key), voting_power: v.voting_power, txids: Vec::new() })
                 .collect()
         })),
 
         TFLServiceRequest::FatPointerToBFTChainTip => {
             let internal = internal_handle.internal.lock().await;
             Ok(TFLServiceResponse::FatPointerToBFTChainTip(
-                internal.fat_pointer_to_tip.clone().to_non_two(),
+                internal.fat_pointer_to_tip.clone(),
             ))
         }
 
@@ -1286,8 +1317,8 @@ async fn tfl_service_incoming_request(
 
 async fn tfl_set_finality_by_hash(
     internal_handle: TFLServiceHandle,
-    hash: BlockHash,
-) -> Option<BlockHeight> {
+    hash: ZebBlockHash,
+) -> Option<ZebBlockHeight> {
     // ALT: Result with no success val?
     let mut internal = internal_handle.internal.lock().await;
 
@@ -1310,11 +1341,11 @@ trait SatSubAffine<D> {
 }
 
 /// Saturating subtract: goes to 0 if self < d
-impl SatSubAffine<i32> for BlockHeight {
-    fn sat_sub(&self, d: i32) -> BlockHeight {
+impl SatSubAffine<i32> for ZebBlockHeight {
+    fn sat_sub(&self, d: i32) -> ZebBlockHeight {
         use std::ops::Sub;
         use zebra_chain::block::HeightDiff as BlockHeightDiff;
-        self.sub(BlockHeightDiff::from(d)).unwrap_or(BlockHeight(0))
+        self.sub(BlockHeightDiff::from(d)).unwrap_or(ZebBlockHeight(0))
     }
 }
 
@@ -1325,11 +1356,11 @@ impl SatSubAffine<i32> for BlockHeight {
 /// always returns block hashes. If read_extra_info is set, also returns Blocks, otherwise returns an empty vector.
 async fn tfl_block_sequence(
     call: &TFLServiceCalls,
-    start_hash: BlockHash,
-    final_height_hash: Option<(BlockHeight, BlockHash)>,
+    start_hash: ZebBlockHash,
+    final_height_hash: Option<(ZebBlockHeight, ZebBlockHash)>,
     include_start_hash: bool,
     read_extra_info: bool, // NOTE: done here rather than on print to isolate async from sync code
-) -> (Vec<(BlockHeight, BlockHash)>, Vec<Option<Arc<Block>>>) {
+) -> (Vec<(ZebBlockHeight, ZebBlockHash)>, Vec<Option<Arc<Block>>>) {
     // get "real" initial values //////////////////////////////
     let (start_height, init_hash) = {
         if let Ok(StateResponse::BlockHeader { height, header, .. }) =
@@ -1340,7 +1371,7 @@ async fn tfl_block_sequence(
                 //       We would probably also be fine to just push it directly.
                 (Some(height), Some(header.previous_block_hash))
             } else {
-                (Some(BlockHeight(height.0 + 1)), Some(start_hash))
+                (Some(ZebBlockHeight(height.0 + 1)), Some(start_hash))
             }
         } else {
             (None, None)
@@ -1412,7 +1443,7 @@ async fn tfl_block_sequence(
         }
 
         if let Some(val) = chunk.get(chunk_i) {
-            let height = BlockHeight(
+            let height = ZebBlockHeight(
                 start_height.0 + <u32>::try_from(hashes.len()).expect("should fit in u32"),
             );
             // debug_assert!(if let Some(h) = block_height_from_hash(call, *val).await {
@@ -1449,7 +1480,7 @@ async fn tfl_block_sequence(
     (hashes, infos)
 }
 
-fn dump_hash_highlight_lo(hash: &BlockHash, highlight_chars_n: usize) {
+fn dump_hash_highlight_lo(hash: &ZebBlockHash, highlight_chars_n: usize) {
     let hash_string = hash.to_string();
     let hash_str = hash_string.as_bytes();
     let bgn_col_str = "\x1b[90m".as_bytes(); // "bright black" == grey
@@ -1475,15 +1506,15 @@ fn dump_hash_highlight_lo(hash: &BlockHash, highlight_chars_n: usize) {
 }
 
 trait HasBlockHash {
-    fn get_hash(&self) -> Option<BlockHash>;
+    fn get_hash(&self) -> Option<ZebBlockHash>;
 }
-impl HasBlockHash for BlockHash {
-    fn get_hash(&self) -> Option<BlockHash> {
+impl HasBlockHash for ZebBlockHash {
+    fn get_hash(&self) -> Option<ZebBlockHash> {
         Some(*self)
     }
 }
-impl HasBlockHash for (BlockHeight, BlockHash) {
-    fn get_hash(&self) -> Option<BlockHash> {
+impl HasBlockHash for (ZebBlockHeight, ZebBlockHash) {
+    fn get_hash(&self) -> Option<ZebBlockHash> {
         Some(self.1)
     }
 }
@@ -1495,7 +1526,7 @@ where
     T: HasBlockHash,
 {
     let is_unique = |prefix_len: usize, hashes: &[T]| -> bool {
-        let mut prefixes = HashSet::<BlockHash>::with_capacity(hashes.len());
+        let mut prefixes = HashSet::<ZebBlockHash>::with_capacity(hashes.len());
 
         // NOTE: characters correspond to nibbles
         let bytes_n = prefix_len / 2;
@@ -1503,7 +1534,7 @@ where
 
         for hash in hashes {
             if let Some(hash) = hash.get_hash() {
-                let mut subhash = BlockHash([0; 32]);
+                let mut subhash = ZebBlockHash([0; 32]);
                 subhash.0[..bytes_n].clone_from_slice(&hash.0[..bytes_n]);
 
                 if is_nib {
@@ -1528,7 +1559,7 @@ where
     unique_chars_n
 }
 
-fn tfl_dump_blocks(blocks: &[(BlockHeight, BlockHash)], infos: &[Option<Arc<Block>>]) {
+fn tfl_dump_blocks(blocks: &[(ZebBlockHeight, ZebBlockHash)], infos: &[Option<Arc<Block>>]) {
     let highlight_chars_n = block_hash_unique_chars_n(blocks);
 
     let print_color = true;
@@ -1550,7 +1581,7 @@ fn tfl_dump_blocks(blocks: &[(BlockHeight, BlockHash)], infos: &[Option<Arc<Bloc
             print!(
                 " - {}, height: {}, work: {:?}, {:3} transactions ({} shielded)",
                 block.header.time,
-                block.coinbase_height().unwrap_or(BlockHeight(0)).0,
+                block.coinbase_height().unwrap_or(ZebBlockHeight(0)).0,
                 block.header.difficulty_threshold.to_work().unwrap(),
                 block.transactions.len(),
                 shielded_c
@@ -1563,8 +1594,8 @@ fn tfl_dump_blocks(blocks: &[(BlockHeight, BlockHash)], infos: &[Option<Arc<Bloc
 
 async fn _tfl_dump_block_sequence(
     call: &TFLServiceCalls,
-    start_hash: BlockHash,
-    final_height_hash: Option<(BlockHeight, BlockHash)>,
+    start_hash: ZebBlockHash,
+    final_height_hash: Option<(ZebBlockHeight, ZebBlockHash)>,
     include_start_hash: bool,
 ) {
     let (blocks, infos) = tfl_block_sequence(
@@ -1578,321 +1609,3 @@ async fn _tfl_dump_block_sequence(
     tfl_dump_blocks(&blocks[..], &infos[..]);
 }
 
-/// A validator is a public key and voting power
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MalValidator {
-    pub public_key: [u8; 32],
-    pub voting_power: u64,
-}
-
-impl MalValidator {
-    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        w.write_all(&self.public_key)?;
-        w.write_all(&self.voting_power.to_le_bytes())?;
-        Ok(())
-    }
-
-    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
-        let mut public_key = [0u8; 32];
-        r.read_exact(&mut public_key)?;
-
-        let mut vp_bytes = [0u8; 8];
-        r.read_exact(&mut vp_bytes)?;
-        let voting_power = u64::from_le_bytes(vp_bytes);
-
-        Ok(Self {
-            public_key,
-            voting_power,
-        })
-    }
-}
-
-impl PartialOrd for MalValidator {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MalValidator {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.public_key.cmp(&other.public_key)
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MalPublicKey2(pub MalPublicKey);
-
-impl std::fmt::Display for MalPublicKey2 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0.as_ref() {
-            write!(f, "{:02X}", byte)?;
-        }
-        Ok(())
-    }
-}
-
-impl std::fmt::Debug for MalPublicKey2 {
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self)
-    }
-}
-
-/// A bundle of signed votes for a block
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)] //, serde::Serialize, serde::Deserialize)]
-pub struct FatPointerToBftBlock2 {
-    pub vote_for_block_without_finalizer_public_key: [u8; 76 - 32],
-    pub signatures: Vec<FatPointerSignature2>,
-}
-
-impl std::fmt::Display for FatPointerToBftBlock2 {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{{hash:")?;
-        for b in &self.vote_for_block_without_finalizer_public_key[0..32] {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, " ovd:")?;
-        for b in &self.vote_for_block_without_finalizer_public_key[32..] {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, " signatures:[")?;
-        for (i, s) in self.signatures.iter().enumerate() {
-            write!(f, "{{pk:")?;
-            for b in s.public_key {
-                write!(f, "{:02x}", b)?;
-            }
-            write!(f, " sig:")?;
-            for b in s.vote_signature {
-                write!(f, "{:02x}", b)?;
-            }
-            write!(f, "}}")?;
-            if i + 1 < self.signatures.len() {
-                write!(f, " ")?;
-            }
-        }
-        write!(f, "]}}")?;
-        Ok(())
-    }
-}
-
-impl From<tenderlink::FatPointerToBftBlock3> for FatPointerToBftBlock2 {
-    fn from(fat_pointer: tenderlink::FatPointerToBftBlock3) -> FatPointerToBftBlock2 {
-        FatPointerToBftBlock2 {
-            vote_for_block_without_finalizer_public_key: fat_pointer
-                .vote_for_block_without_finalizer_public_key,
-            signatures: fat_pointer
-                .signatures
-                .into_iter()
-                .map(|s| FatPointerSignature2 {
-                    public_key: s.public_key.0,
-                    vote_signature: s.vote_signature,
-                })
-                .collect(),
-        }
-    }
-}
-
-impl FatPointerToBftBlock2 {
-    pub fn to_non_two(self) -> zebra_chain::block::FatPointerToBftBlock {
-        zebra_chain::block::FatPointerToBftBlock {
-            vote_for_block_without_finalizer_public_key: self
-                .vote_for_block_without_finalizer_public_key,
-            signatures: self
-                .signatures
-                .into_iter()
-                .map(|two| zebra_chain::block::FatPointerSignature {
-                    public_key: two.public_key,
-                    vote_signature: two.vote_signature,
-                })
-                .collect(),
-        }
-    }
-
-    pub fn null() -> FatPointerToBftBlock2 {
-        FatPointerToBftBlock2 {
-            vote_for_block_without_finalizer_public_key: [0_u8; 76 - 32],
-            signatures: Vec::new(),
-        }
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&self.vote_for_block_without_finalizer_public_key);
-        buf.extend_from_slice(&(self.signatures.len() as u16).to_le_bytes());
-        for s in &self.signatures {
-            buf.extend_from_slice(&s.to_bytes());
-        }
-        buf
-    }
-    #[allow(clippy::reversed_empty_ranges)]
-    pub fn try_from_bytes(bytes: &Vec<u8>) -> Option<FatPointerToBftBlock2> {
-        if bytes.len() < 76 - 32 + 2 {
-            return None;
-        }
-        let vote_for_block_without_finalizer_public_key = bytes[0..76 - 32].try_into().unwrap();
-        let len = u16::from_le_bytes(bytes[76 - 32..2].try_into().unwrap()) as usize;
-
-        if 76 - 32 + 2 + len * (32 + 64) > bytes.len() {
-            return None;
-        }
-        let rem = &bytes[76 - 32 + 2..];
-        let signatures = rem
-            .chunks_exact(32 + 64)
-            .map(|chunk| FatPointerSignature2::from_bytes(chunk.try_into().unwrap()))
-            .collect();
-
-        Some(Self {
-            vote_for_block_without_finalizer_public_key,
-            signatures,
-        })
-    }
-
-    pub fn get_vote_template(&self) -> MalVote {
-        let mut vote_bytes = [0_u8; 76];
-        vote_bytes[32..76].copy_from_slice(&self.vote_for_block_without_finalizer_public_key);
-        MalVote::from_bytes(&vote_bytes)
-    }
-    pub fn inflate(&self) -> Vec<(MalVote, ed25519_zebra::ed25519::SignatureBytes)> {
-        let vote_template = self.get_vote_template();
-        self.signatures
-            .iter()
-            .map(|s| {
-                let mut vote = vote_template.clone();
-                vote.validator_address = MalPublicKey2(MalPublicKey::from(s.public_key));
-                (vote, s.vote_signature)
-            })
-            .collect()
-    }
-    pub fn validate_signatures(&self) -> bool {
-        let mut batch = ed25519_zebra::batch::Verifier::new();
-        for (vote, signature) in self.inflate() {
-            let vk_bytes = ed25519_zebra::VerificationKeyBytes::from(vote.validator_address.0);
-            let sig = ed25519_zebra::Signature::from_bytes(&signature);
-            let msg = vote.to_bytes();
-
-            batch.queue((vk_bytes, sig, &msg));
-        }
-        batch.verify(rand::thread_rng()).is_ok()
-    }
-    pub fn points_at_block_hash(&self) -> Blake3Hash {
-        Blake3Hash(
-            self.vote_for_block_without_finalizer_public_key[0..32]
-                .try_into()
-                .unwrap(),
-        )
-    }
-}
-
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{self, Cursor, Read, Write};
-
-impl ZcashSerialize for FatPointerToBftBlock2 {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        writer.write_all(&self.vote_for_block_without_finalizer_public_key)?;
-        writer.write_u16::<LittleEndian>(self.signatures.len() as u16)?;
-        for signature in &self.signatures {
-            writer.write_all(&signature.to_bytes())?;
-        }
-        Ok(())
-    }
-}
-
-impl ZcashDeserialize for FatPointerToBftBlock2 {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let mut vote_for_block_without_finalizer_public_key = [0u8; 76 - 32];
-        reader.read_exact(&mut vote_for_block_without_finalizer_public_key)?;
-
-        let len = reader.read_u16::<LittleEndian>()?;
-        let mut signatures: Vec<FatPointerSignature2> = Vec::with_capacity(len.into());
-        for _ in 0..len {
-            let mut signature_bytes = [0u8; 32 + 64];
-            reader.read_exact(&mut signature_bytes)?;
-            signatures.push(FatPointerSignature2::from_bytes(&signature_bytes));
-        }
-
-        Ok(FatPointerToBftBlock2 {
-            vote_for_block_without_finalizer_public_key,
-            signatures,
-        })
-    }
-}
-
-/// A vote signature for a block
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)] //, serde::Serialize, serde::Deserialize)]
-pub struct FatPointerSignature2 {
-    pub public_key: [u8; 32],
-    pub vote_signature: [u8; 64],
-}
-
-impl FatPointerSignature2 {
-    pub fn to_bytes(&self) -> [u8; 32 + 64] {
-        let mut buf = [0_u8; 32 + 64];
-        buf[0..32].copy_from_slice(&self.public_key);
-        buf[32..32 + 64].copy_from_slice(&self.vote_signature);
-        buf
-    }
-    pub fn from_bytes(bytes: &[u8; 32 + 64]) -> FatPointerSignature2 {
-        Self {
-            public_key: bytes[0..32].try_into().unwrap(),
-            vote_signature: bytes[32..32 + 64].try_into().unwrap(),
-        }
-    }
-}
-
-/// A vote for a value in a round
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MalVote {
-    pub validator_address: MalPublicKey2,
-    pub value: Blake3Hash,
-    pub height: u64,
-    pub typ: bool, // true is commit
-    pub round: i32,
-}
-
-/*
-DATA LAYOUT FOR VOTE
-32 byte ed25519 public key of the finalizer who's vote this is
-32 byte blake3 hash of value, or all zeroes to indicate Nil vote
-8 byte height
-4 byte round where MSB is used to indicate is_commit for the vote type. 1 bit is_commit, 31 bits round index
-
-TOTAL: 76 B
-
-A signed vote will be this same layout followed by the 64 byte ed25519 signature of the previous 76 bytes.
-*/
-
-impl MalVote {
-    pub fn to_bytes(&self) -> [u8; 76] {
-        let mut buf = [0_u8; 76];
-        buf[0..32].copy_from_slice(self.validator_address.0.as_ref());
-        buf[32..64].copy_from_slice(&self.value.0);
-        buf[64..72].copy_from_slice(&self.height.to_le_bytes());
-
-        let mut merged_round_val: u32 = (self.round & 0x7fff_ffff) as u32;
-        if self.typ {
-            merged_round_val |= 0x8000_0000;
-        }
-        buf[72..76].copy_from_slice(&merged_round_val.to_le_bytes());
-        buf
-    }
-    pub fn from_bytes(bytes: &[u8; 76]) -> MalVote {
-        let validator_address =
-            MalPublicKey2(From::<[u8; 32]>::from(bytes[0..32].try_into().unwrap()));
-        let value_hash_bytes = bytes[32..64].try_into().unwrap();
-        let value = Blake3Hash(value_hash_bytes);
-        let height = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
-
-        let merged_round_val = u32::from_le_bytes(bytes[72..76].try_into().unwrap());
-
-        let typ = merged_round_val & 0x8000_0000 != 0;
-        let round = (merged_round_val & 0x7fff_ffff) as i32;
-
-        MalVote {
-            validator_address,
-            value,
-            height,
-            typ,
-            round,
-        }
-    }
-}

@@ -12,7 +12,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use ed25519_zebra::VerificationKeyBytes;
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
@@ -23,8 +22,8 @@ use zebra_chain::transaction::Hash as TxHash;
 use zebra_node_services::mempool::{Request as MempoolRequest, Response as MempoolResponse};
 use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
 
-use crate::chain::BftBlock;
-use crate::FatPointerToBftBlock2;
+use zcash_primitives::transaction::RosterMember;
+use zcash_primitives::bft::*;
 use crate::{
     rng_private_public_key_from_address, tfl_service_incoming_request, TFLBlockFinality,
     TFLServiceInternal,
@@ -98,7 +97,7 @@ pub(crate) type ForceFeedPoWBlockProcedure = Arc<
 /// A pinned-in-memory, heap-allocated, reference-counted, thread-safe, asynchronous function
 /// pointer that takes an `Arc<Block>` as input and returns `()` as its output.
 pub(crate) type ForceFeedPoSBlockProcedure = Arc<
-    dyn Fn(Arc<BftBlock>, FatPointerToBftBlock2) -> Pin<Box<dyn Future<Output = Result<(),String>> + Send>>
+    dyn Fn(Arc<BftBlock>, FatPointerToBftBlock) -> Pin<Box<dyn Future<Output = Result<(),String>> + Send>>
         + Send
         + Sync,
 >;
@@ -142,7 +141,7 @@ pub fn spawn_new_tfl_service(
 
         for (i, peer) in config.malachite_peers.iter().enumerate() {
             let (_, _, public_key) = rng_private_public_key_from_address(peer.as_bytes());
-            array.push(crate::MalValidator { public_key:public_key.into(), voting_power: 1 });
+            array.push(RosterMember { pub_key:public_key.0, voting_power: 1, txids: Vec::new() });
             // array.push(crate::MalValidator::new(public_key, vec![StakeTxId{ txid: [0;32], zats:((i as u64) * 5) + 1 }])); // @Phillip @Testing
             map.insert(public_key, peer.to_string());
         }
@@ -159,7 +158,7 @@ pub fn spawn_new_tfl_service(
             // .unwrap_or(String::from_str("tester").unwrap());
             info!("user_name: {}", user_name);
             let (_, _, public_key) = rng_private_public_key_from_address(&user_name.as_bytes());
-            array.push(crate::MalValidator { public_key:public_key.into(), voting_power: 1 });
+            array.push(RosterMember { pub_key:public_key.0, voting_power: 1, txids: Vec::new() });
             map.insert(public_key, user_name);
         }
 
@@ -167,14 +166,14 @@ pub fn spawn_new_tfl_service(
     };
 
     let internal = Arc::new(Mutex::new(TFLServiceInternal {
-        my_public_key: VerificationKeyBytes::from([0u8; 32]),
+        my_public_key: PubKeyID::NIL,
         latest_final_block: None,
         tfl_is_activated: if is_regtest { true } else { false },
         final_change_tx: broadcast::channel(16).0,
         bft_msg_flags: 0,
         bft_err_flags: 0,
         bft_blocks: Vec::new(),
-        fat_pointer_to_tip: FatPointerToBftBlock2::null(),
+        fat_pointer_to_tip: FatPointerToBftBlock::null(),
         peer_strings: Vec::new(),
         our_set_bft_string: None,
         active_bft_string: None,
@@ -187,7 +186,7 @@ pub fn spawn_new_tfl_service(
     let handle_mtx = Arc::new(std::sync::Mutex::new(None));
 
     let handle_mtx2 = handle_mtx.clone();
-    let force_feed_pos: ForceFeedPoSBlockProcedure = Arc::new(move |block: Arc<BftBlock>, fat_pointer: FatPointerToBftBlock2| {
+    let force_feed_pos: ForceFeedPoSBlockProcedure = Arc::new(move |block: Arc<BftBlock>, fat_pointer: FatPointerToBftBlock| {
         let handle = handle_mtx2.lock().unwrap().clone().unwrap();
         Box::pin(async move {
             let fat_pointer_hash = fat_pointer.points_at_block_hash();

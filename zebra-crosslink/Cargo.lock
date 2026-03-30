@@ -7118,7 +7118,7 @@ dependencies = [
  "static_assertions",
  "tokio",
  "windows-sys 0.61.2",
- "zebra-chain",
+ "zcash_primitives",
 ]
 
 [[package]]
@@ -9618,8 +9618,10 @@ version = "0.26.1"
 dependencies = [
  "bip32",
  "blake2b_simd",
+ "blake3",
  "block-buffer 0.11.0-rc.3",
  "bs58",
+ "byteorder",
  "core2 0.3.3",
  "crypto-common 0.2.0-rc.1",
  "document-features",
@@ -9905,6 +9907,7 @@ dependencies = [
  "visualizer_zcash",
  "wallet",
  "zcash_primitives",
+ "zcash_protocol",
  "zebra-chain",
  "zebra-node-services",
  "zebra-state",

@@ -53,6 +53,7 @@ blake3 = "1.8.2"
 byteorder = { workspace = true }
 ed25519-zebra = { workspace = true }
 zcash_primitives = { workspace = true }
+zcash_protocol = { workspace = true }
 
 static_assertions = { workspace = true }
 

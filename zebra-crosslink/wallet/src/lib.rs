@@ -38,6 +38,7 @@ use zcash_client_sqlite::error::SqliteClientError;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_note_encryption::{try_compact_note_decryption, try_note_decryption, try_output_recovery_with_ovk, ShieldedOutput};
+use zcash_primitives::bft;
 use zcash_primitives::transaction::builder::{self, BuildConfig, Builder as TxBuilder, BuildResult as TxBuildResult};
 use zcash_primitives::transaction::components::TxOut;
 use zcash_primitives::transaction::fees::{
@@ -357,7 +358,7 @@ pub static AM_I_THE_UNSTAKER: Mutex<bool> = Mutex::new(false);
 
 pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
-pub static TENDERLINK_PUBLIC_KEY: Mutex<[u8; 32]> = Mutex::new([0_u8; 32]);
+pub static TENDERLINK_PUBLIC_KEY: Mutex<bft::PubKeyID> = Mutex::new(bft::PubKeyID([0;32]));
 
 async fn wait_for_zainod() {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));

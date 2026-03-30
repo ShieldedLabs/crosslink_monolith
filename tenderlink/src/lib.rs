@@ -45,12 +45,13 @@ pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 
 use static_assertions::{const_assert};
 use std::{hash::DefaultHasher, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, sync::{Arc, Mutex}};
-use ed25519_zebra::{Signature, SigningKey, VerificationKeyBytes, VerificationKey};
+use ed25519_zebra::{SigningKey, VerificationKeyBytes, VerificationKey};
 use rand::{seq::{IndexedRandom}, Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rand_pcg::Lcg128CmDxsm64 as SimRng;
 use snow::resolvers::CryptoResolver;
 use tokio::time::Instant;
+use zcash_primitives::bft::{ HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
 
 const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(300);
 const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_millis(10000);
@@ -117,7 +118,7 @@ impl std::fmt::Debug for ClosureToValidateProposedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToValidateProposedBlock(..)") }
 }
 #[derive(Clone)]
-pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock3, Vec<TMSig>)-> core::pin::Pin<Box<dyn Future<Output = Vec<SortedRosterMember>> + Send>> + Send + Sync + 'static>);
+pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock, Vec<TMSig>)-> core::pin::Pin<Box<dyn Future<Output = Vec<SortedRosterMember>> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToPushDecidedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushDecidedBlock(..)") }
 }
@@ -127,58 +128,7 @@ impl std::fmt::Debug for ClosureToUpdatePeers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToUpdatePeers(..)") }
 }
 
-/*
-FROM ZEBRA
-DATA LAYOUT FOR VOTE
-32 byte ed25519 public key of the finalizer who's vote this is
-32 byte blake3 hash of value, or all zeroes to indicate Nil vote
-8 byte height
-4 byte round where MSB is used to indicate is_commit for the vote type. 1 bit is_commit, 31 bits round index
-// TODO: do we want height, round, vote type?
-
-TOTAL: 76 B
-
-A signed vote will be this same layout followed by the 64 byte ed25519 signature of the previous 76 bytes.
-*/
-
-/// A bundle of signed votes for a block
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)] //, serde::Serialize, serde::Deserialize)]
-pub struct FatPointerToBftBlock3 {
-    pub vote_for_block_without_finalizer_public_key: [u8; 76 - 32],
-    pub signatures: Vec<FatPointerSignature3>,
-}
-
-impl std::fmt::Display for FatPointerToBftBlock3 {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{{hash:")?;
-        for b in &self.vote_for_block_without_finalizer_public_key[0..32] {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, " ovd:")?;
-        for b in &self.vote_for_block_without_finalizer_public_key[32..] {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, " signatures:[")?;
-        for (i, s) in self.signatures.iter().enumerate() {
-            write!(f, "{{pk:")?;
-            for b in s.public_key.0 {
-                write!(f, "{:02x}", b)?;
-            }
-            write!(f, " sig:")?;
-            for b in s.vote_signature {
-                write!(f, "{:02x}", b)?;
-            }
-            write!(f, "}}")?;
-            if i + 1 < self.signatures.len() {
-                write!(f, " ")?;
-            }
-        }
-        write!(f, "]}}")?;
-        Ok(())
-    }
-}
-
-fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMember]) -> FatPointerToBftBlock3 {
+fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMember]) -> FatPointerToBftBlock {
     let vote_for_block_without_finalizer_public_key: [u8; 76 - 32];
     {
         let mut sign_data = [0; 76 - 32];
@@ -188,7 +138,7 @@ fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMembe
         vote_for_block_without_finalizer_public_key = sign_data;
     }
 
-    FatPointerToBftBlock3 {
+    FatPointerToBftBlock {
         vote_for_block_without_finalizer_public_key,
         signatures: round_data.msg_val_sigs
             .iter()
@@ -196,69 +146,13 @@ fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMembe
             .enumerate()
             .filter_map(|(roster_i, (value_id, commit_signature))| {
                 if *value_id == round_data.proposal_id && *commit_signature != TMSig::NIL {
-                    Some(FatPointerSignature3 {
-                        public_key: roster[roster_i].pub_key,
+                    Some(FatPointerSignature {
+                        pub_key: roster[roster_i].pub_key,
                         vote_signature: commit_signature.0,
                     })
                 } else { None }
             })
             .collect(),
-    }
-}
-
-impl FatPointerToBftBlock3 {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&self.vote_for_block_without_finalizer_public_key);
-        buf.extend_from_slice(&(self.signatures.len() as u16).to_le_bytes());
-        for s in &self.signatures {
-            buf.extend_from_slice(&s.to_bytes());
-        }
-        buf
-    }
-    #[allow(clippy::reversed_empty_ranges)]
-    pub fn try_from_bytes(bytes: &Vec<u8>) -> Option<FatPointerToBftBlock3> {
-        if bytes.len() < 76 - 32 + 2 {
-            return None;
-        }
-        let vote_for_block_without_finalizer_public_key = bytes[0..76 - 32].try_into().unwrap();
-        let len = u16::from_le_bytes(bytes[76 - 32..2].try_into().unwrap()) as usize;
-
-        if 76 - 32 + 2 + len * (32 + 64) > bytes.len() {
-            return None;
-        }
-        let rem = &bytes[76 - 32 + 2..];
-        let signatures = rem
-            .chunks_exact(32 + 64)
-            .map(|chunk| FatPointerSignature3::from_bytes(chunk.try_into().unwrap()))
-            .collect();
-
-        Some(Self {
-            vote_for_block_without_finalizer_public_key,
-            signatures,
-        })
-    }
-}
-
-/// A vote signature for a block
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)] //, serde::Serialize, serde::Deserialize)]
-pub struct FatPointerSignature3 {
-    pub public_key: PubKeyID,
-    pub vote_signature: [u8; 64],
-}
-
-impl FatPointerSignature3 {
-    pub fn to_bytes(&self) -> [u8; 32 + 64] {
-        let mut buf = [0_u8; 32 + 64];
-        buf[0..32].copy_from_slice(&self.public_key.0);
-        buf[32..32 + 64].copy_from_slice(&self.vote_signature);
-        buf
-    }
-    pub fn from_bytes(bytes: &[u8; 32 + 64]) -> FatPointerSignature3 {
-        Self {
-            public_key: PubKeyID(bytes[0..32].try_into().unwrap()),
-            vote_signature: bytes[32..32 + 64].try_into().unwrap(),
-        }
     }
 }
 
@@ -282,25 +176,6 @@ pub struct ValueId(pub [u8; 32]);
 impl ValueId { pub const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str(f, &self.0) } }
 impl std::fmt::Debug   for ValueId { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "VId{", &self.0)?; write!(f, "}}") } }
-
-#[derive(Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PubKeyID(pub [u8; 32]);
-impl PubKeyID { const NIL: Self = Self([0; 32]); }
-impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str_rev(f, &self.0) } }
-impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str_rev(f, "Pub{", &self.0[..2])?; write!(f, "}}") } }
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TMSig(pub [u8; 64]);
-impl Default for TMSig { fn default() -> Self { Self::NIL } }
-impl TMSig {
-    pub const NIL: Self = Self([0; 64]);
-    fn verify(&self, pub_key: PubKeyID, signed_data: &[u8]) -> Result<(), (ed25519_zebra::Error, &str)> {
-        let signature = Signature::from_bytes(&self.0);
-        let vk = match VerificationKey::try_from(pub_key.0) { Ok(v)=>v,       Err(err)=>{ return Err((err, "invalid public key")) }};
-        match vk.verify(&signature, signed_data)            { Ok(())=>Ok(()), Err(err)=>{ Err((err, "invalid signature")) }}
-    }
-}
-impl std::fmt::Debug for TMSig { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Sig{", &self.0[..2])?; write!(f, "}}") } }
 
 #[derive(Debug, Clone)]
 pub struct RoundData {
@@ -501,31 +376,7 @@ const ROSTER_MAX_N: usize = 100;
 fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER_MAX_N, roster.len()) }
 fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 
-#[derive(PartialEq, Debug, Clone, Copy)]
-pub struct HashKey(pub [u8; 32]);
-impl HashKey { const NIL: Self = Self([0;32]); }
-impl HashKey {
-    pub fn hasher(&self)            -> blake3::Hasher { blake3::Hasher::new_keyed(&self.0) }
-    pub fn hash(&self, data: &[u8]) -> [u8; 32]       { *blake3::keyed_hash(&self.0, data).as_bytes() }
-}
 
-#[derive(Debug)]
-pub struct HashKeys {
-    pub proposer: HashKey,
-    pub value_id: HashKey,
-    pub connect_contention: HashKey,
-    pub proposal_sig: HashKey,
-}
-impl Default for HashKeys {
-    fn default() -> Self {
-        Self {
-            proposer:           HashKey(blake3::Hasher::new_derive_key("BFT Proposer")          .finalize().into()),
-            value_id:           HashKey(blake3::Hasher::new_derive_key("BFT Value ID")          .finalize().into()),
-            connect_contention: HashKey(blake3::Hasher::new_derive_key("BFT Connect Contention").finalize().into()), // NOTE(azmr): skipping update
-            proposal_sig:       HashKey(blake3::Hasher::new_derive_key("BFT Proposal Signature").finalize().into()),
-        }
-    }
-}
 
 #[derive(Debug)]
 struct TMState {
@@ -1316,7 +1167,7 @@ async fn instance(
 
     let should_propose_bad_value_sometimes = false; // my_endpoint.is_some(); // peer 0 only
 
-    let decisions = Arc::new(Mutex::new(Vec::<(BlockValue, FatPointerToBftBlock3)>::new()));
+    let decisions = Arc::new(Mutex::new(Vec::<(BlockValue, FatPointerToBftBlock)>::new()));
     let decisions2 = Arc::clone(&decisions);
 
     let roster2 = roster.clone();

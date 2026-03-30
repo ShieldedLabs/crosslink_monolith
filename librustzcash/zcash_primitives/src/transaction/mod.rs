@@ -1345,7 +1345,7 @@ pub enum StakingActionKind {
     BeginDelegationUnbonding,
     WithdrawDelegationBond,
     RetargetDelegationBond,
-    
+
     RegisterFinalizer,
     ConvertFinalizerRewardToDelegationBond,
     UpdateFinalizerKey,
@@ -1404,7 +1404,7 @@ impl StakeTxId {
 
         Ok(Self { txid, zats })
     }
-    
+
     pub fn write_to_vec(&self, data: &mut std::vec::Vec<u8>) {
         data.write_all(&self.txid).unwrap();
         data.write_all(&self.zats.to_le_bytes()).unwrap();
@@ -1422,10 +1422,23 @@ impl RosterMember {
     pub fn write_to_vec(&self, data: &mut std::vec::Vec<u8>) {
         data.write_all(&self.pub_key).unwrap();
         data.write_all(&self.voting_power.to_le_bytes()).unwrap();
-        data.write_all(&self.txids.len().to_le_bytes()).unwrap();
+        data.write_all(&(self.txids.len() as u64).to_le_bytes()).unwrap();
         for txid in &self.txids {
             txid.write_to_vec(data);
         }
+    }
+
+    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+        let mut pub_key = [0u8; 32];
+        r.read_exact(&mut pub_key)?;
+        let voting_power = r.read_u64_le()?;
+        let txids_len = r.read_u64_le()? as usize;
+        std::eprintln!("txids_len {txids_len}");
+        let mut txids = std::vec::Vec::with_capacity(txids_len);
+        for _ in 0..txids_len {
+            txids.push(StakeTxId::read_from(r)?);
+        }
+        Ok(Self { pub_key, voting_power, txids })
     }
 }
 

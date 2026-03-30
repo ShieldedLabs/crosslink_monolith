@@ -32,6 +32,7 @@ use zebra_chain::{
     transaction::{LockTime, Transaction},
     work::difficulty::{CompactDifficulty, INVALID_COMPACT_DIFFICULTY},
 };
+use zcash_primitives::bft::*;
 
 const IS_DEV: bool = true;
 fn dev(show_in_dev: bool) -> bool {
@@ -227,14 +228,14 @@ fn end_zone(active_depth: u32) {
 pub struct VizState {
     // general chain info
     /// Height & hash of the TFL finality point
-    pub latest_final_block: Option<(BlockHeight, BlockHash)>,
+    pub latest_final_block: Option<(ZebBlockHeight, ZebBlockHash)>,
     /// Height & hash of the best-chain tip
-    pub bc_tip: Option<(BlockHeight, BlockHash)>,
+    pub bc_tip: Option<(ZebBlockHeight, ZebBlockHash)>,
 
     // requested info //
     /// A range of hashes from the PoW chain, as requested by the visualizer.
     /// Ascending in height from `lo_height`. Parallel to `blocks`.
-    pub height_hashes: Vec<(BlockHeight, BlockHash)>,
+    pub height_hashes: Vec<(ZebBlockHeight, ZebBlockHash)>,
     /// A range of blocks from the PoW chain, as requested by the visualizer.
     /// Ascending in height from `lo_height`. Parallel to `height_hashes`.
     pub blocks: Vec<Option<Arc<Block>>>,
@@ -249,7 +250,7 @@ pub struct VizState {
     /// Vector of all decided BFT blocks, indexed by height-1.
     pub bft_blocks: Vec<BftBlock>,
     /// Fat pointer to the BFT tip (all other fat pointers are available at height+1)
-    pub fat_pointer_to_bft_tip: FatPointerToBftBlock2,
+    pub fat_pointer_to_bft_tip: FatPointerToBftBlock,
 
     /// Current mempool transactions
     pub mempool_txs: Vec<zebra_chain::transaction::VerifiedUnminedTx>,
@@ -263,7 +264,7 @@ pub struct VizState {
 //     use std::fs;
 //     use zebra_chain::{
 //         block::merkle::Root,
-//         block::{Block, Hash as BlockHash, Header as BlockHeader, Height as BlockHeight},
+//         block::{Block, Hash as ZebBlockHash, Header as BlockHeader, Height as ZebBlockHeight},
 //         fmt::HexDebug,
 //         work::equihash::Solution,
 //     };
@@ -367,14 +368,14 @@ pub struct VizState {
 //             let state = Arc::new(VizState {
 //                 latest_final_block: export
 //                     .latest_final_block
-//                     .map(|(h, hash)| (BlockHeight(h), BlockHash(hash))),
+//                     .map(|(h, hash)| (ZebBlockHeight(h), ZebBlockHash(hash))),
 //                 bc_tip: export
 //                     .bc_tip
-//                     .map(|(h, hash)| (BlockHeight(h), BlockHash(hash))),
+//                     .map(|(h, hash)| (ZebBlockHeight(h), ZebBlockHash(hash))),
 //                 height_hashes: export
 //                     .height_hashes
 //                     .into_iter()
-//                     .map(|h| (BlockHeight(h.0), BlockHash(h.1)))
+//                     .map(|h| (ZebBlockHeight(h.0), ZebBlockHash(h.1)))
 //                     .collect(),
 //                 blocks: export
 //                     .blocks
@@ -384,7 +385,7 @@ pub struct VizState {
 //                             Arc::new(Block {
 //                                 header: Arc::new(BlockHeader {
 //                                     version: 0,
-//                                     previous_block_hash: BlockHash(b.previous_block_hash),
+//                                     previous_block_hash: ZebBlockHash(b.previous_block_hash),
 //                                     merkle_root: Root::from_bytes_in_display_order(&[0u8; 32]),
 //                                     commitment_bytes: HexDebug([0u8; 32]),
 //                                     time: Utc::now(),
@@ -399,7 +400,7 @@ pub struct VizState {
 //                                 // dummy transactions, just so we have txs_n
 //                                 transactions: {
 //                                     let tx = Arc::new(Transaction::V1 {
-//                                         lock_time: LockTime::Height(BlockHeight(0)),
+//                                         lock_time: LockTime::Height(ZebBlockHeight(0)),
 //                                         inputs: Vec::new(),
 //                                         outputs: Vec::new(),
 //                                     });
@@ -543,8 +544,8 @@ pub struct VizGlobals {
     pub bft_pause_button: bool,
 
     /// validators_at_current_height
-    pub validators_at_current_height: Vec<MalValidator>,
-    pub validators_keys_to_names: HashMap<MalPublicKey, String>,
+    pub validators_at_current_height: Vec<RosterMember>,
+    pub validators_keys_to_names: HashMap<PubKeyID, String>,
 }
 pub static VIZ_G: std::sync::Mutex<Option<VizGlobals>> = std::sync::Mutex::new(None);
 
@@ -556,20 +557,20 @@ static G_FORCE_INSTRS: std::sync::Mutex<(Vec<u8>, Vec<TFInstr>)> =
 
 const VIZ_REQ_N: u32 = zebra_state::MAX_BLOCK_REORG_HEIGHT;
 
-fn abs_block_height(height: i32, tip: Option<(BlockHeight, BlockHash)>) -> BlockHeight {
+fn abs_block_height(height: i32, tip: Option<(ZebBlockHeight, ZebBlockHash)>) -> ZebBlockHeight {
     if height >= 0 {
-        BlockHeight(height.try_into().unwrap())
+        ZebBlockHeight(height.try_into().unwrap())
     } else if let Some(tip) = tip {
         tip.0.sat_sub(!height)
     } else {
-        BlockHeight(0)
+        ZebBlockHeight(0)
     }
 }
 
 fn abs_block_heights(
     heights: (i32, i32),
-    tip: Option<(BlockHeight, BlockHash)>,
-) -> (BlockHeight, BlockHeight) {
+    tip: Option<(ZebBlockHeight, ZebBlockHash)>,
+) -> (ZebBlockHeight, ZebBlockHeight) {
     (
         abs_block_height(heights.0, tip),
         abs_block_height(heights.1, tip),
@@ -597,7 +598,7 @@ pub async fn service_viz_requests(
             bft_msg_flags: 0,
             bft_err_flags: 0,
             bft_blocks: Vec::new(),
-            fat_pointer_to_bft_tip: FatPointerToBftBlock2::null(),
+            fat_pointer_to_bft_tip: FatPointerToBftBlock::null(),
 
             mempool_txs: Vec::new(),
         }),
@@ -655,7 +656,7 @@ pub async fn service_viz_requests(
         // ALT: do 1 or the other of force/read, not both
         // NOTE: we have to use force blocks, otherwise we miss side-chains
         // TODO: try not to miss side-chains for normal reads
-        let mut height_hashes: Vec<(BlockHeight, BlockHash)> = Vec::new();
+        let mut height_hashes: Vec<(ZebBlockHeight, ZebBlockHash)> = Vec::new();
         let mut pow_blocks: Vec<Option<Arc<Block>>> = Vec::new();
         {
             // TODO: is there a reason to not reuse the existing TEST_INSTRS global?
@@ -720,14 +721,14 @@ pub async fn service_viz_requests(
                 hi
             );
 
-            let tip_height_hash: (BlockHeight, BlockHash) = {
+            let tip_height_hash: (ZebBlockHeight, ZebBlockHash) = {
                 if let Ok(StateResponse::Tip(Some(tip_height_hash))) =
                     (call.state)(StateRequest::Tip).await
                 {
                     tip_height_hash
                 } else {
                     //error!("Failed to read tip");
-                    break (BlockHeight(0), None, Vec::new(), Vec::new());
+                    break (ZebBlockHeight(0), None, Vec::new(), Vec::new());
                 }
             };
 
@@ -746,9 +747,9 @@ pub async fn service_viz_requests(
 
             async fn get_height_hash(
                 call: TFLServiceCalls,
-                h: BlockHeight,
-                existing_height_hash: (BlockHeight, BlockHash),
-            ) -> Option<(BlockHeight, BlockHash)> {
+                h: ZebBlockHeight,
+                existing_height_hash: (ZebBlockHeight, ZebBlockHash),
+            ) -> Option<(ZebBlockHeight, ZebBlockHash)> {
                 if h == existing_height_hash.0 {
                     // avoid duplicating work if we've already got that value
                     Some(existing_height_hash)
@@ -767,7 +768,7 @@ pub async fn service_viz_requests(
             {
                 hi_height_hash
             } else {
-                break (BlockHeight(0), None, Vec::new(), Vec::new());
+                break (ZebBlockHeight(0), None, Vec::new(), Vec::new());
             };
 
             let lo_height_hash = if let Some(lo_height_hash) =
@@ -775,7 +776,7 @@ pub async fn service_viz_requests(
             {
                 lo_height_hash
             } else {
-                break (BlockHeight(0), None, Vec::new(), Vec::new());
+                break (ZebBlockHeight(0), None, Vec::new(), Vec::new());
             };
 
             let (height_hashes, blocks) =
@@ -830,7 +831,7 @@ pub async fn service_viz_requests(
             //     if block.finalization_candidate_height == 0 && !block.headers.is_empty()
             //     {
             //         // TODO: block.finalized()
-            //         if let Some(BlockHeight(h)) =
+            //         if let Some(ZebBlockHeight(h)) =
             //             block_height_from_hash(&call, block.headers[0].hash()).await
             //         {
             //             block.finalization_candidate_height = h;
@@ -903,7 +904,7 @@ type NodeRef = Option<NodeHdl>;
 #[derive(Clone, Debug)]
 enum VizHeader {
     None,
-    BlockHeader(BlockHeader),
+    BlockHeader(ZebBlockHeader),
     BftBlock(BftBlockAndFatPointerToIt), // ALT: just keep an array of *hashes*
 }
 
@@ -915,7 +916,7 @@ impl VizHeader {
         }
     }
 
-    fn as_pow(&self) -> Option<&BlockHeader> {
+    fn as_pow(&self) -> Option<&ZebBlockHeader> {
         match self {
             VizHeader::BlockHeader(val) => Some(val),
             _ => None,
@@ -932,8 +933,8 @@ impl From<Option<BftBlockAndFatPointerToIt>> for VizHeader {
     }
 }
 
-impl From<Option<BlockHeader>> for VizHeader {
-    fn from(v: Option<BlockHeader>) -> VizHeader {
+impl From<Option<ZebBlockHeader>> for VizHeader {
+    fn from(v: Option<ZebBlockHeader>) -> VizHeader {
         match v {
             Some(val) => VizHeader::BlockHeader(val),
             None => VizHeader::None,
@@ -972,7 +973,7 @@ fn tfl_nominee_from_node(ctx: &VizCtx, node: &Node) -> NodeRef {
     match &node.header {
         VizHeader::BftBlock(bft_block) => {
             if let Some(pow_block) = bft_block.block.headers.last() {
-                ctx.find_bc_node_by_hash(&pow_block.hash())
+                ctx.find_bc_node_by_hash(&BlockHash::from_header_data(&pow_block))
             } else {
                 None
             }
@@ -985,8 +986,8 @@ fn tfl_nominee_from_node(ctx: &VizCtx, node: &Node) -> NodeRef {
 fn pos_link_from_pow_node(ctx: &VizCtx, node: &Node) -> NodeRef {
     match &node.header {
         VizHeader::BlockHeader(pow_hdr) => {
-            let pos_hash_bytes = pow_hdr.fat_pointer_to_bft_block.points_at_block_hash();
-            ctx.find_bft_node_by_hash(&Blake3Hash(pos_hash_bytes))
+            let pos_hash = pow_hdr.fat_pointer_to_bft_block.points_at_block_hash();
+            ctx.find_bft_node_by_hash(&pos_hash)
         }
 
         _ => None,
@@ -997,7 +998,7 @@ fn tfl_finalized_from_node(ctx: &VizCtx, node: &Node) -> NodeRef {
     match &node.header {
         VizHeader::BftBlock(bft_block) => {
             if let Some(pow_block) = bft_block.block.headers.first() {
-                ctx.find_bc_node_by_hash(&pow_block.hash())
+                ctx.find_bc_node_by_hash(&BlockHash::from_header_data(pow_block))
             } else {
                 None
             }
@@ -1011,15 +1012,15 @@ fn cross_chain_link_from_node(ctx: &VizCtx, node: &Node) -> NodeRef {
     match &node.header {
         VizHeader::BftBlock(bft_block) => {
             if let Some(pow_block) = bft_block.block.headers.first() {
-                ctx.find_bc_node_by_hash(&pow_block.hash())
+                ctx.find_bc_node_by_hash(&BlockHash::from_header_data(pow_block))
             } else {
                 None
             }
         }
 
         VizHeader::BlockHeader(pow_hdr) => {
-            let pos_hash_bytes = pow_hdr.fat_pointer_to_bft_block.points_at_block_hash();
-            ctx.find_bft_node_by_hash(&Blake3Hash(pos_hash_bytes))
+            let pos_hash = pow_hdr.fat_pointer_to_bft_block.points_at_block_hash();
+            ctx.find_bft_node_by_hash(&pos_hash)
         }
 
         VizHeader::None => None,
@@ -1053,7 +1054,7 @@ enum NodeInit {
         hash: [u8; 32],
         height: u32,
         difficulty: Option<CompactDifficulty>,
-        header: BlockHeader,
+        header: ZebBlockHeader,
         bc_block: Option<Arc<Block>>,
         txs_n: u32, // N.B. includes coinbase
         is_real: bool,
@@ -1092,7 +1093,7 @@ impl Node {
         let _z = ZoneGuard::new("hash_string()");
         self.hash().map(|hash| {
             if self.kind == NodeKind::BC {
-                BlockHash(hash).to_string()
+                ZebBlockHash(hash).to_string()
             } else {
                 Blake3Hash(hash).to_string()
             }
@@ -1101,10 +1102,10 @@ impl Node {
 }
 
 impl HasBlockHash for Node {
-    fn get_hash(&self) -> Option<BlockHash> {
+    fn get_hash(&self) -> Option<ZebBlockHash> {
         if self.kind == NodeKind::BC {
             assert!(self.hash().is_some());
-            self.hash().map(BlockHash)
+            self.hash().map(ZebBlockHash)
         } else {
             None
         }
@@ -1128,7 +1129,7 @@ impl HasBlockHash for Node {
 //     }
 // }
 
-fn find_bc_node_i_by_height(nodes: &[Node], height: BlockHeight) -> NodeRef {
+fn find_bc_node_i_by_height(nodes: &[Node], height: ZebBlockHeight) -> NodeRef {
     let _z = ZoneGuard::new("find_bc_node_i_by_height");
     nodes
         .iter()
@@ -1201,7 +1202,7 @@ struct VizConfig {
 /// Common GUI state that may need to be passed around
 #[derive(Debug)]
 pub(crate) struct VizCtx {
-    // h: BlockHeight,
+    // h: ZebBlockHeight,
     screen_o: Vec2,
     screen_vel: Vec2,
     fix_screen_o: Vec2,
@@ -1436,9 +1437,9 @@ impl VizCtx {
                 NodeKind::BC => {
                     // info!(
                     //     "inserting PoW node {} at {} with parent {}",
-                    //     BlockHash(node_hash),
+                    //     ZebBlockHash(node_hash),
                     //     i,
-                    //     BlockHash(parent_hash.unwrap_or([0; 32]))
+                    //     ZebBlockHash(parent_hash.unwrap_or([0; 32]))
                     // );
                     self.bc_by_hash.insert(node_hash, node_hdl)
                 }
@@ -1600,11 +1601,11 @@ impl VizCtx {
         &mut self,
         config: &VizConfig,
         block: &Arc<Block>,
-        height_hash: &(BlockHeight, BlockHash),
+        height_hash: &(ZebBlockHeight, ZebBlockHash),
     ) {
         let _z = ZoneGuard::new("push BC block");
 
-        if self.find_bc_node_by_hash(&height_hash.1).is_none() {
+        if self.find_bc_node_by_hash(&BlockHash(height_hash.1.0)).is_none() {
             // NOTE: ignore if we don't have block (header) data; we can add it later if we
             // have all the data then.
             let node_ref = self.push_node(
@@ -2355,7 +2356,7 @@ pub async fn viz_main(
                         (i + 1) as u64,
                     ) {
                         let bft_parent =
-                            if bft_block.previous_block_fat_ptr == FatPointerToBftBlock2::null() {
+                            if bft_block.previous_block_fat_ptr == FatPointerToBftBlock::null() {
                                 if i != 0 {
                                     error!(
                                         "block at height {} does not have a previous_block_hash",
@@ -2667,7 +2668,7 @@ pub async fn viz_main(
                         let bft_block = BftBlock {
                             version: 0,
                             height: 0,
-                            previous_block_fat_ptr: FatPointerToBftBlock2::null(),
+                            previous_block_fat_ptr: FatPointerToBftBlock::null(),
                             finalization_candidate_height: 0,
                             headers: loop {
                                 let bc: Option<u32> = target_bc_str.trim().parse().ok();
@@ -2677,7 +2678,7 @@ pub async fn viz_main(
 
                                 let node = if let Some(node) = ctx.node(find_bc_node_i_by_height(
                                     &ctx.nodes,
-                                    BlockHeight(bc.unwrap()),
+                                    ZebBlockHeight(bc.unwrap()),
                                 )) {
                                     node
                                 } else {
@@ -2685,7 +2686,7 @@ pub async fn viz_main(
                                 };
 
                                 break match &node.header {
-                                    VizHeader::BlockHeader(hdr) => vec![hdr.clone()],
+                                    VizHeader::BlockHeader(hdr) => vec![bc_hdr_to_lrz(&hdr)],
                                     _ => Vec::new(),
                                 };
                             },
@@ -2701,7 +2702,7 @@ pub async fn viz_main(
 
                                 bft_block: BftBlockAndFatPointerToIt {
                                     block: bft_block,
-                                    fat_ptr: FatPointerToBftBlock2::null(),
+                                    fat_ptr: FatPointerToBftBlock::null(),
                                 },
                                 text: node_str.clone(),
                                 height: ctx.bft_last_added.map_or(Some(0), |_| None),
@@ -2775,7 +2776,7 @@ pub async fn viz_main(
                     let mut is_done = false;
                     if let Some(bft_block) = node.header.as_bft() {
                         if let Some(bc_hdr) = bft_block.block.headers.first() {
-                            if ctx.find_bc_node_by_hash(&bc_hdr.hash()).is_none() {
+                            if ctx.find_bc_node_by_hash(&BlockHash::from_header_data(&bc_hdr)).is_none() {
                                 clear_bft_bc_h = Some(
                                     bft_block.block.finalization_candidate_height
                                         + bft_block.block.headers.len() as u32
@@ -2910,9 +2911,9 @@ pub async fn viz_main(
                 let is_bft = kind == NodeKind::BFT;
                 let (header, id, bc_block) = match hover_node.kind {
                     NodeKind::BC => {
-                        let header = BlockHeader {
+                        let header = ZebBlockHeader {
                             version: 4,
-                            previous_block_hash: BlockHash(
+                            previous_block_hash: ZebBlockHash(
                                 hover_node.hash().expect("should have a hash"),
                             ),
                             merkle_root: zebra_chain::block::merkle::Root([0; 32]),
@@ -2922,7 +2923,7 @@ pub async fn viz_main(
                             nonce: zebra_chain::fmt::HexDebug([0; 32]),
                             solution: zebra_chain::work::equihash::Solution::for_proposal(),
                             fat_pointer_to_bft_block:
-                                zebra_chain::block::FatPointerToBftBlock::null(),
+                                FatPointerToBftBlock::null(),
                         };
                         let id = NodeId::Hash(header.hash().0);
                         (VizHeader::BlockHeader(header), id, None)
@@ -2932,7 +2933,7 @@ pub async fn viz_main(
                         let bft_block = BftBlock {
                             version: 0,
                             height: 0,
-                            previous_block_fat_ptr: FatPointerToBftBlock2::null(),
+                            previous_block_fat_ptr: FatPointerToBftBlock::null(),
                             finalization_candidate_height: 0,
                             headers: Vec::new(),
                         };
@@ -2940,7 +2941,7 @@ pub async fn viz_main(
                         let id = NodeId::Hash(bft_block.blake3_hash().0);
                         let bft_block_and_ptr = BftBlockAndFatPointerToIt {
                             block: bft_block,
-                            fat_ptr: FatPointerToBftBlock2::null(),
+                            fat_ptr: FatPointerToBftBlock::null(),
                         };
                         (VizHeader::BftBlock(bft_block_and_ptr), id, None)
                     }
@@ -3018,10 +3019,10 @@ pub async fn viz_main(
                     if let Some(bft_block) = node.header.as_bft() {
                         if !bft_block.block.headers.is_empty() {
                             let hdr_lo = ctx.find_bc_node_by_hash(
-                                &bft_block.block.headers.first().unwrap().hash(),
+                                &BlockHash::from_header_data(bft_block.block.headers.first().unwrap()),
                             );
                             let hdr_hi = ctx.find_bc_node_by_hash(
-                                &bft_block.block.headers.last().unwrap().hash(),
+                                &BlockHash::from_header_data(bft_block.block.headers.last().unwrap()),
                             );
                             if hdr_lo.is_none() && hdr_hi.is_none() {
                                 if let Some(bc_lo) = ctx.get_node(ctx.bc_lo) {
@@ -3328,7 +3329,7 @@ pub async fn viz_main(
                                     &format!(
                                         "  {} - {}",
                                         bft_block.block.finalization_candidate_height + i as u32,
-                                        pow_hdr.hash()
+                                        BlockHash::from_header_data(pow_hdr)
                                     ),
                                 );
                             }
@@ -3416,7 +3417,7 @@ pub async fn viz_main(
                                 || ctx.node_is_parent_of(i_ref, ctx.known_bc_tip))
                         } else {
                             // probably shouldn't hit here, but conservatively fall back to finalized...
-                            finalized_pow_blocks.contains(&BlockHash(node.hash().unwrap()))
+                            finalized_pow_blocks.contains(&ZebBlockHash(node.hash().unwrap()))
                         };
 
                         let thick = if is_on_best_chain { 3. } else { 1. };
@@ -3471,7 +3472,7 @@ pub async fn viz_main(
                 }
 
                 let is_final = if node.kind == NodeKind::BC {
-                    finalized_pow_blocks.contains(&BlockHash(node.hash().unwrap()))
+                    finalized_pow_blocks.contains(&ZebBlockHash(node.hash().unwrap()))
                 } else {
                     true
                 };
@@ -3573,7 +3574,7 @@ pub async fn viz_main(
             if let Some(bft_block) = node.header.as_bft() {
                 for i in 0..bft_block.block.headers.len() {
                     let link = if let Some(link) =
-                        ctx.get_node(ctx.find_bc_node_by_hash(&bft_block.block.headers[i].hash()))
+                        ctx.get_node(ctx.find_bc_node_by_hash(&BlockHash::from_header_data(&bft_block.block.headers[i])))
                     {
                         link
                     } else {
@@ -3781,7 +3782,7 @@ pub async fn viz_main(
                             } else if node.kind == NodeKind::BFT && node.header.as_bft().is_some() {
                                 tf.push_instr_serialize(
                                     TFInstr::LOAD_POS,
-                                    *node.header.as_bft().as_ref().unwrap(),
+                                    &BftBlockAndFatPointerToItWrap(node.header.as_bft().unwrap().clone()),
                                 );
                             }
                         }
@@ -3934,10 +3935,10 @@ pub async fn viz_main(
 
             for val in &g.validators_at_current_height {
                 let string =
-                    if let Some(user_name) = g.validators_keys_to_names.get(&val.public_key.into()) {
+                    if let Some(user_name) = g.validators_keys_to_names.get(&PubKeyID(val.pub_key)) {
                         user_name.clone()
                     } else {
-                        let mut string = format!("{:?}", MalPublicKey2(val.public_key.into()));
+                        let mut string = format!("{:?}", val.pub_key);
                         string.truncate(16);
                         string
                     };
@@ -3969,11 +3970,11 @@ pub async fn viz_main(
             for sig in bft_sigs {
                 let string = if let Some(user_name) = g
                     .validators_keys_to_names
-                    .get(&MalPublicKey::from(sig.public_key))
+                    .get(&sig.pub_key)
                 {
                     user_name.clone()
                 } else {
-                    let mut string = format!("{:?}", MalPublicKey2(sig.public_key.into()));
+                    let mut string = format!("{:?}", sig.pub_key);
                     string.truncate(16);
                     string
                 };

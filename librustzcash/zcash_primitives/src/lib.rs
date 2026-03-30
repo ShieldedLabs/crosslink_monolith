@@ -25,6 +25,7 @@ extern crate std;
 extern crate alloc;
 
 pub mod block;
+pub mod bft;
 pub(crate) mod encoding;
 #[cfg(zcash_unstable = "zfuture")]
 pub mod extensions;

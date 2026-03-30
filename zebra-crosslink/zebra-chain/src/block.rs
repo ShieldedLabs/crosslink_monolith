@@ -38,8 +38,8 @@ pub use commitment::{
 };
 pub use hash::Hash;
 pub use header::{
-    BlockTimeError, CommandBuf, CommandBuf2, CountedHeader, FatPointerSignature,
-    FatPointerToBftBlock, Header, ZCASH_BLOCK_VERSION,
+    BlockTimeError, CommandBuf, CommandBuf2, CountedHeader,
+    Header, ZCASH_BLOCK_VERSION,
 };
 pub use height::{Height, HeightDiff, TryIntoHeight};
 pub use serialize::{SerializedBlock, MAX_BLOCK_BYTES};

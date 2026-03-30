@@ -70,7 +70,7 @@ pub enum TFLServiceResponse {
     /// Finalizer roster
     Roster(Vec<zcash_primitives::transaction::RosterMember>),
     /// Fat pointer to the BFT chain tip
-    FatPointerToBFTChainTip(zebra_chain::block::FatPointerToBftBlock),
+    FatPointerToBFTChainTip(zcash_primitives::bft::FatPointerToBftBlock),
     /// Send a staking command transaction
     StakingCmd,
     /// Faucet

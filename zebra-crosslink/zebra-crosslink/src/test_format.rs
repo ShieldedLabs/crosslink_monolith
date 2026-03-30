@@ -1,10 +1,24 @@
 use static_assertions::*;
 use std::{io::Write, mem::align_of, mem::size_of};
-use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize};
+use zebra_chain::serialization::{ZcashDeserialize, ZcashSerialize, SerializationError};
 use zerocopy::*;
 use zerocopy_derive::*;
 
-use super::ZcashCrosslinkParameters;
+use zcash_primitives::bft::*;
+
+pub struct BftBlockAndFatPointerToItWrap(pub BftBlockAndFatPointerToIt);
+impl ZcashDeserialize for BftBlockAndFatPointerToItWrap {
+    fn zcash_deserialize<R: std::io::Read>(mut reader: R) -> Result<Self, SerializationError> { // SerializationError> {
+        Ok(Self(BftBlockAndFatPointerToIt::zcash_deserialize(&mut reader)?))
+    }
+}
+impl ZcashSerialize for BftBlockAndFatPointerToItWrap {
+    fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+        self.0.zcash_serialize(&mut writer)?;
+        Ok(())
+    }
+}
+
 
 #[repr(C)]
 #[derive(Immutable, KnownLayout, IntoBytes, FromBytes)]
@@ -109,8 +123,8 @@ impl TFInstr {
                 str += &format!(
                     "{}, hdrs: [{} .. {}]",
                     block.blake3_hash(),
-                    block.headers[0].hash(),
-                    block.headers.last().unwrap().hash()
+                    BlockHash::from_header_data(&block.headers[0]),
+                    BlockHash::from_header_data(block.headers.last().unwrap())
                 )
             }
             Some(TestInstr::SetParams(_)) => str += &format!("{} {}", instr.val[0], instr.val[1]),
@@ -120,10 +134,10 @@ impl TFInstr {
                 str += &format!("{} => {:?}", hash, f)
             }
             Some(TestInstr::ExpectRosterIncludes(pub_key, stake)) => {
-                str += &format!("{} => {}", crate::MalPublicKey2(pub_key.into()), stake)
+                str += &format!("{} => {}", PubKeyID(pub_key), stake)
             }
             Some(TestInstr::RosterForceInclude(pub_key, stake)) => {
-                str += &format!("{} => {}", crate::MalPublicKey2(pub_key.into()), stake)
+                str += &format!("{} => {}", PubKeyID(pub_key), stake)
             }
             None => {}
         }
@@ -271,7 +285,7 @@ impl TF {
         self.push_instr_ex(TFInstr::LOAD_POW, flags, data, [0; 2])
     }
 
-    pub fn push_instr_load_pos(&mut self, data: &BftBlockAndFatPointerToIt, flags: u32) {
+    pub fn push_instr_load_pos(&mut self, data: &BftBlockAndFatPointerToItWrap, flags: u32) {
         self.push_instr_serialize_ex(TFInstr::LOAD_POS, flags, data, [0; 2])
     }
     pub fn push_instr_load_pos_bytes(&mut self, data: &[u8], flags: u32) {
@@ -298,7 +312,7 @@ impl TF {
 
     pub fn push_instr_expect_pow_block_finality(
         &mut self,
-        pow_hash: &BlockHash,
+        pow_hash: &ZebBlockHash,
         finality: Option<TFLBlockFinality>,
         flags: u32,
     ) {
@@ -449,10 +463,10 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
 
         TFInstr::LOAD_POS => {
             let block_and_fat_ptr =
-                BftBlockAndFatPointerToIt::zcash_deserialize(instr.data_slice(bytes)).ok()?;
+                BftBlockAndFatPointerToItWrap::zcash_deserialize(instr.data_slice(bytes)).ok()?;
             Some(TestInstr::LoadPoS((
-                block_and_fat_ptr.block,
-                block_and_fat_ptr.fat_ptr,
+                block_and_fat_ptr.0.block,
+                block_and_fat_ptr.0.fat_ptr,
             )))
         }
 
@@ -467,7 +481,7 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
         TFInstr::EXPECT_POS_CHAIN_LENGTH => Some(TestInstr::ExpectPoSChainLength(instr.val[0])),
 
         TFInstr::EXPECT_POW_BLOCK_FINALITY => Some(TestInstr::ExpectPoWBlockFinality(
-            BlockHash(
+            ZebBlockHash(
                 instr
                     .data_slice(bytes)
                     .try_into()
@@ -495,11 +509,11 @@ pub(crate) fn tf_read_instr(bytes: &[u8], instr: &TFInstr) -> Option<TestInstr> 
 #[derive(Clone)]
 pub(crate) enum TestInstr {
     LoadPoW(Block),
-    LoadPoS((BftBlock, FatPointerToBftBlock2)),
+    LoadPoS((BftBlock, FatPointerToBftBlock)),
     SetParams(ZcashCrosslinkParameters),
     ExpectPoWChainLength(u32),
     ExpectPoSChainLength(u64),
-    ExpectPoWBlockFinality(BlockHash, Option<TFLBlockFinality>),
+    ExpectPoWBlockFinality(ZebBlockHash, Option<TFLBlockFinality>),
     RosterForceInclude([u8; 32], u64),   // public address
     ExpectRosterIncludes([u8; 32], u64), // public address
 }
@@ -589,12 +603,12 @@ pub(crate) async fn handle_instr(
         }
 
         TestInstr::ExpectRosterIncludes(pub_key, stake) => {
-            let key: MalPublicKey = pub_key.into();
+            let key = PubKeyID(pub_key);
             let internal = internal_handle.internal.lock().await;
             let finalizer = internal
                 .validators_at_current_height
                 .iter()
-                .find(|x| VerificationKeyBytes::from(x.public_key) == key);
+                .find(|x| PubKeyID(x.pub_key) == key);
 
             if let Some(finalizer) = finalizer {
                 test_check(
@@ -609,7 +623,7 @@ pub(crate) async fn handle_instr(
                 test_check(
                     flags,
                     false,
-                    &format!("Finalizer found: {:?}", MalPublicKey2(pub_key.into())),
+                    &format!("Finalizer found: {:?}", key),
                 );
             }
         }
@@ -618,7 +632,7 @@ pub(crate) async fn handle_instr(
             let mut internal = internal_handle.internal.lock().await;
             internal
                 .validators_at_current_height
-                .push(crate::MalValidator { public_key:pub_key.into(), voting_power: stake });
+                .push(RosterMember { pub_key, voting_power: stake, txids: Vec::new() });
         }
     }
 }

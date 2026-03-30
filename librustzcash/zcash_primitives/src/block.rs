@@ -12,7 +12,43 @@ use sha2::{Digest, Sha256};
 
 use zcash_encoding::Vector;
 
+use crate::bft;
 pub use equihash;
+
+
+mod sha256d_writer {
+    use super::{Digest, Sha256};
+    // NOTE: copied from zebra to provide non-failing hashing
+
+    /// An `io::Write` instance that produces a SHA256d output.
+    #[derive(Default)]
+    pub struct Writer {
+        hash: Sha256,
+    }
+
+    impl Writer {
+        /// Consume the Writer and produce the hash result.
+        pub fn finish(self) -> [u8; 32] {
+            let result1 = self.hash.finalize();
+            let result2 = Sha256::digest(result1);
+            let mut buffer = [0u8; 32];
+            buffer[0..32].copy_from_slice(&result2[0..32]);
+            buffer
+        }
+    }
+
+    impl std::io::Write for Writer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.hash.update(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+}
+
 
 /// The identifier for a Zcash block.
 ///
@@ -61,6 +97,22 @@ impl BlockHash {
             None
         }
     }
+
+    pub fn from_header_data(data: &BlockHeaderData) -> Self {
+        let mut hash_writer = sha256d_writer::Writer::default();
+        BlockHeader::write_data(data, &mut hash_writer)
+            .expect("Sha256dWriter is infallible");
+        let res = BlockHash(hash_writer.finish());
+
+        { // check against prev method @Temporary
+            let mut raw = vec![];
+            BlockHeader::write_data(data, &mut raw).unwrap();
+            let check = BlockHash(Sha256::digest(Sha256::digest(&raw)).into());
+            debug_assert_eq!(check, res);
+        }
+
+        res
+    }
 }
 
 /// A Zcash block header.
@@ -78,6 +130,7 @@ impl Deref for BlockHeader {
 }
 
 /// The information contained in a Zcash block header.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockHeaderData {
     pub version: i32,
     pub prev_block: BlockHash,
@@ -87,27 +140,23 @@ pub struct BlockHeaderData {
     pub bits: u32,
     pub nonce: [u8; 32],
     pub solution: Vec<u8>,
+    pub fat_pointer_to_bft_block: bft::FatPointerToBftBlock,
 }
 
 impl BlockHeaderData {
     pub fn freeze(self) -> io::Result<BlockHeader> {
-        BlockHeader::from_data(self)
+        Ok(BlockHeader::from_data(self))
     }
 }
 
 impl BlockHeader {
-    fn from_data(data: BlockHeaderData) -> io::Result<Self> {
-        let mut header = BlockHeader {
-            hash: BlockHash([0; 32]),
+    // NOTE: these *_data variants are here rather than in BlockHeaderData to avoid
+    //       weird interactions with Deref & same-named fns
+    pub fn from_data(data: BlockHeaderData) -> Self {
+        BlockHeader {
+            hash: BlockHash::from_header_data(&data),
             data,
-        };
-        let mut raw = vec![];
-        header.write(&mut raw)?;
-        header
-            .hash
-            .0
-            .copy_from_slice(&Sha256::digest(Sha256::digest(&raw)));
-        Ok(header)
+        }
     }
 
     /// Returns the hash of this header.
@@ -115,7 +164,7 @@ impl BlockHeader {
         self.hash
     }
 
-    pub fn read<R: Read>(mut reader: R) -> io::Result<Self> {
+    pub fn read_data<R: Read>(mut reader: R) -> io::Result<BlockHeaderData> {
         let version = reader.read_i32_le()?;
 
         let mut prev_block = BlockHash([0; 32]);
@@ -135,7 +184,9 @@ impl BlockHeader {
 
         let solution = Vector::read(&mut reader, |r| r.read_u8())?;
 
-        BlockHeader::from_data(BlockHeaderData {
+        let fat_pointer_to_bft_block = bft::FatPointerToBftBlock::zcash_deserialize(&mut reader)?;
+
+        Ok(BlockHeaderData {
             version,
             prev_block,
             merkle_root,
@@ -144,20 +195,30 @@ impl BlockHeader {
             bits,
             nonce,
             solution,
+            fat_pointer_to_bft_block,
         })
     }
 
-    pub fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
-        writer.write_i32_le(self.version)?;
-        writer.write_all(&self.prev_block.0)?;
-        writer.write_all(&self.merkle_root)?;
-        writer.write_all(&self.final_sapling_root)?;
-        writer.write_u32_le(self.time)?;
-        writer.write_u32_le(self.bits)?;
-        writer.write_all(&self.nonce)?;
-        Vector::write(&mut writer, &self.solution, |w, b| w.write_u8(*b))?;
+    pub fn write_data<W: Write>(data: &BlockHeaderData, mut writer: W) -> io::Result<()> {
+        writer.write_i32_le(data.version)?;
+        writer.write_all(&data.prev_block.0)?;
+        writer.write_all(&data.merkle_root)?;
+        writer.write_all(&data.final_sapling_root)?;
+        writer.write_u32_le(data.time)?;
+        writer.write_u32_le(data.bits)?;
+        writer.write_all(&data.nonce)?;
+        Vector::write(&mut writer, &data.solution, |w, b| w.write_u8(*b))?; // TODO: is this different from writer.write_a
+        data.fat_pointer_to_bft_block.zcash_serialize(writer)?;
 
         Ok(())
+    }
+
+    pub fn read<R: Read>(mut reader: R) -> io::Result<Self> {
+        Ok(BlockHeader::from_data(Self::read_data(reader)?))
+    }
+
+    pub fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
+        Self::write_data(&self.data, writer)
     }
 }
 

@@ -19,6 +19,7 @@ use super::{merkle, Commitment, CommitmentError, Hash, Height};
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 pub use zcash_primitives::transaction::CommandBuf;
+use zcash_primitives::bft;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct CommandBuf2(pub CommandBuf);
@@ -107,161 +108,11 @@ pub struct Header {
     pub solution: Solution,
 
     /// Crosslink fat pointer to PoS block.
-    pub fat_pointer_to_bft_block: FatPointerToBftBlock,
+    pub fat_pointer_to_bft_block: bft::FatPointerToBftBlock,
     // A command string used during development.
     // pub temp_command_buf: CommandBuf2,
 }
 
-/// A bundle of signed votes for a block
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct FatPointerToBftBlock {
-    /// The fixed size portion of the the fat pointer.
-    #[serde(with = "serde_big_array::BigArray")]
-    pub vote_for_block_without_finalizer_public_key: [u8; 76 - 32],
-    /// The array of signatures in the fat pointer.
-    pub signatures: Vec<FatPointerSignature>,
-}
-
-/// A signature inside a fat pointer to a BFT Block.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct FatPointerSignature {
-    /// The public key associated with this signature.
-    pub public_key: [u8; 32],
-    #[serde(with = "serde_big_array::BigArray")]
-    /// The actual ed25519 signature itself.
-    pub vote_signature: [u8; 64],
-}
-
-impl FatPointerSignature {
-    /// Convert the fat pointer signature to a fixed size byte array.
-    pub fn to_bytes(&self) -> [u8; 32 + 64] {
-        let mut buf = [0_u8; 32 + 64];
-        buf[0..32].copy_from_slice(&self.public_key);
-        buf[32..32 + 64].copy_from_slice(&self.vote_signature);
-        buf
-    }
-    /// Convert a fixed size array of bytes into a fat pointer signature.
-    pub fn from_bytes(bytes: &[u8; 32 + 64]) -> FatPointerSignature {
-        Self {
-            public_key: bytes[0..32].try_into().unwrap(),
-            vote_signature: bytes[32..32 + 64].try_into().unwrap(),
-        }
-    }
-}
-
-impl FatPointerToBftBlock {
-    /// Shorthand for an all null bytes and zero signature count fat pointer.
-    pub fn null() -> FatPointerToBftBlock {
-        FatPointerToBftBlock {
-            vote_for_block_without_finalizer_public_key: [0_u8; 76 - 32],
-            signatures: Vec::new(),
-        }
-    }
-
-    /// Serialize this fat pointer into a dynamically sized byte array.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&self.vote_for_block_without_finalizer_public_key);
-        buf.extend_from_slice(&(self.signatures.len() as u16).to_le_bytes());
-        for s in &self.signatures {
-            buf.extend_from_slice(&s.to_bytes());
-        }
-        buf
-    }
-    /// Try to deserialize a fat pointer from the provided dynamic array of bytes.
-    #[allow(clippy::reversed_empty_ranges)]
-    pub fn try_from_bytes(bytes: &Vec<u8>) -> Option<FatPointerToBftBlock> {
-        if bytes.len() < 76 - 32 + 2 {
-            return None;
-        }
-        let vote_for_block_without_finalizer_public_key = bytes[0..76 - 32].try_into().unwrap();
-        let len = u16::from_le_bytes(bytes[76 - 32..2].try_into().unwrap()) as usize;
-
-        if 76 - 32 + 2 + len * (32 + 64) > bytes.len() {
-            return None;
-        }
-        let rem = &bytes[76 - 32 + 2..];
-        let signatures = rem
-            .chunks_exact(32 + 64)
-            .map(|chunk| FatPointerSignature::from_bytes(chunk.try_into().unwrap()))
-            .collect();
-
-        Some(Self {
-            vote_for_block_without_finalizer_public_key,
-            signatures,
-        })
-    }
-
-    /// Get the blake3 hash bytes of the BFT block that this fat pointer points to.
-    pub fn points_at_block_hash(&self) -> [u8; 32] {
-        self.vote_for_block_without_finalizer_public_key[0..32]
-            .try_into()
-            .unwrap()
-    }
-}
-
-impl std::fmt::Display for FatPointerToBftBlock {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{{hash:")?;
-        for b in &self.vote_for_block_without_finalizer_public_key[0..32] {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, " ovd:")?;
-        for b in &self.vote_for_block_without_finalizer_public_key[32..] {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, " signatures:[")?;
-        for (i, s) in self.signatures.iter().enumerate() {
-            write!(f, "{{pk:")?;
-            for b in s.public_key {
-                write!(f, "{:02x}", b)?;
-            }
-            write!(f, " sig:")?;
-            for b in s.vote_signature {
-                write!(f, "{:02x}", b)?;
-            }
-            write!(f, "}}")?;
-            if i + 1 < self.signatures.len() {
-                write!(f, " ")?;
-            }
-        }
-        write!(f, "]}}")?;
-        Ok(())
-    }
-}
-
-impl crate::serialization::ZcashSerialize for FatPointerToBftBlock {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        writer.write_all(&self.vote_for_block_without_finalizer_public_key)?;
-        writer.write_u16::<LittleEndian>(self.signatures.len() as u16)?;
-        for signature in &self.signatures {
-            writer.write_all(&signature.to_bytes())?;
-        }
-        Ok(())
-    }
-}
-
-impl crate::serialization::ZcashDeserialize for FatPointerToBftBlock {
-    fn zcash_deserialize<R: io::Read>(
-        mut reader: R,
-    ) -> Result<Self, crate::serialization::SerializationError> {
-        let mut vote_for_block_without_finalizer_public_key = [0u8; 76 - 32];
-        reader.read_exact(&mut vote_for_block_without_finalizer_public_key)?;
-
-        let len = reader.read_u16::<LittleEndian>()?;
-        let mut signatures: Vec<FatPointerSignature> = Vec::with_capacity(len.into());
-        for _ in 0..len {
-            let mut signature_bytes = [0u8; 32 + 64];
-            reader.read_exact(&mut signature_bytes)?;
-            signatures.push(FatPointerSignature::from_bytes(&signature_bytes));
-        }
-
-        Ok(FatPointerToBftBlock {
-            vote_for_block_without_finalizer_public_key,
-            signatures,
-        })
-    }
-}
 
 /// TODO: Use this error as the source for zebra_consensus::error::BlockError::Time,
 /// and make `BlockError::Time` add additional context.

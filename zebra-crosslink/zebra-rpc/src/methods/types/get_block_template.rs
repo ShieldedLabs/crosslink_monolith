@@ -17,6 +17,7 @@ use jsonrpsee_types::{ErrorCode, ErrorObject};
 use tokio::sync::watch::{self, error::SendError};
 use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
+use zcash_primitives::bft::*;
 use zcash_protocol::PoolType;
 use zcash_script::script::Evaluable;
 
@@ -217,7 +218,7 @@ pub struct BlockTemplateResponse {
     #[getter(copy)]
     pub(crate) submit_old: Option<bool>,
     /// New version 5 field for crosslink
-    pub fat_pointer_to_bft_block: zebra_chain::block::FatPointerToBftBlock,
+    pub fat_pointer_to_bft_block: FatPointerToBftBlock,
 }
 
 impl fmt::Debug for BlockTemplateResponse {
@@ -276,7 +277,7 @@ impl BlockTemplateResponse {
         #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
         submit_old: Option<bool>,
         extra_coinbase_data: Vec<u8>,
-        fat_pointer_to_bft_block: block::FatPointerToBftBlock,
+        fat_pointer_to_bft_block: FatPointerToBftBlock,
     ) -> Self {
         // Calculate the next block height.
         let next_block_height =

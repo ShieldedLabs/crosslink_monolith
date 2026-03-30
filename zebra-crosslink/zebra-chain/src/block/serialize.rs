@@ -15,6 +15,8 @@ use crate::{
     work::{difficulty::CompactDifficulty, equihash},
 };
 
+use zcash_primitives::bft;
+
 /// The maximum size of a Zcash block, in bytes.
 ///
 /// Post-Sapling, this is also the maximum size of a transaction
@@ -123,9 +125,9 @@ impl ZcashDeserialize for Header {
             solution: equihash::Solution::zcash_deserialize(&mut reader)?,
             fat_pointer_to_bft_block: {
                 if logical_version >= 5 {
-                    super::FatPointerToBftBlock::zcash_deserialize(&mut reader)?
+                    bft::FatPointerToBftBlock::zcash_deserialize(&mut reader)?
                 } else {
-                    super::FatPointerToBftBlock::null()
+                    bft::FatPointerToBftBlock::null()
                 }
             },
             // temp_command_buf: {
