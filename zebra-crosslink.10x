@@ -26,15 +26,15 @@
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
 				<CleanCommand></CleanCommand>
-				<BuildWorkingDirectory></BuildWorkingDirectory>
+				<BuildWorkingDirectory>./zebra-crosslink</BuildWorkingDirectory>
 				<FileSyntaxCheckCommand></FileSyntaxCheckCommand>
 				<CancelBuild></CancelBuild>
 				<Exe></Exe>
 				<Args></Args>
-				<WorkingDirectory>.</WorkingDirectory>
+				<WorkingDirectory>./zebra-crosslink</WorkingDirectory>
 				<DebugCommand></DebugCommand>
 				<DebuggerExe></DebuggerExe>
-				<DebugSln>zebra-crosslink.sln</DebugSln>
+				<DebugSln>./zebra-crosslink/zebra-crosslink.sln</DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
 				<PrioritiseFiles></PrioritiseFiles>

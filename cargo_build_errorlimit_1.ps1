@@ -2,9 +2,9 @@
 # Streams cargo build output in real-time, showing only the first error.
 # Kills the cargo process once a second error line appears (no wasted compile time).
 
-$cargoArgs = "build"
+$cargoArgs = "build --color always"
 if ($args.Count -gt 0) {
-    $cargoArgs = "build " + ($args -join " ")
+    $cargoArgs = "build --color always " + ($args -join " ")
 }
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -17,8 +17,12 @@ $psi.UseShellExecute        = $false
 $proc = [System.Diagnostics.Process]::Start($psi)
 
 $errorCount = 0
+# Strip ANSI escapes for matching so color codes don't interfere with the regex
+$ansiPattern = '\x1b\[[0-9;]*m'
+
 while ($null -ne ($line = $proc.StandardError.ReadLine())) {
-    if ($line -match '^error') {
+    $plain = $line -replace $ansiPattern, ''
+    if ($plain -match '^error') {
         $errorCount++
     }
     if ($errorCount -ge 2) {
@@ -33,7 +37,9 @@ while ($null -ne ($line = $proc.StandardError.ReadLine())) {
         } catch {}
         break
     }
-    Write-Host $line
+
+    # Print raw line so ANSI escape sequences survive
+    [Console]::Error.WriteLine($line)
 }
 
 $proc.WaitForExit()
