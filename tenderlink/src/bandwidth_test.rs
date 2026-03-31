@@ -524,6 +524,7 @@ impl SliceWrite for PackletReliableStreamed {
     }
 }
 
+// Returns true if a packet was received. You should use this information to decide how to schedule your connection servicing.
 pub fn service_connections(
     connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
     packets_received_this_call: &mut Vec<(ConnectionKey, Vec<u8>)>,
@@ -533,8 +534,12 @@ pub fn service_connections(
     packet_memory_send: &mut PacketMemory,
     socket: SockHandle,
     my_listen_keypairs: &Vec<&IdentityKeyPair>,
-) {
+) -> bool {
+    let mut result = false;
+
     if let Ok((buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns)) = udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) {
+        result = true;
+
         if buf_len >= 6 {
             let magic1 = load_u48(&packet_memory_encrypted[0..6]);
             if magic1 & 1 != 0 { // Client Hello
@@ -772,13 +777,19 @@ pub fn service_connections(
                         if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
 
                         packets_received_this_call.push((connection_key, Vec::from(payload)));
+
+                        if OVERLY_VERBOSE {
+                            println!("\x1b[32mGot data\x1b[0m from {:?}. Now {} packets received!"
+                                     // "  data: {:?}"
+                                     , existing_connection.address(), packets_received_this_call.len());
+                        }
                     }
                     break;
                 }
             }
         }
     }
-    
+
     let current_time_now_ns = monotonic_clock_ns();
     connections_map.retain(|connection_key, connection_tracking_data| {match &mut connection_tracking_data.connection_state {
         ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
@@ -892,6 +903,8 @@ pub fn service_connections(
 
         udp_send_with_congestion_and_dscp(socket, connection.other_ip, connection.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort);
     }
+
+    result
 }
 
 pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
