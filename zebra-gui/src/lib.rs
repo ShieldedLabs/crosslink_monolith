@@ -68,7 +68,7 @@ pub const UI_COPY_STAKING_ACTION_DELAY_BLOCKS: u64 = 75;
 pub const UI_COPY_STAKING_DAY_PERIOD: u64 = 150;
 pub const UI_COPY_STAKING_DAY_WINDOW: u64 = 70;
 
-const RENDER_TILE_SHIFT: usize = 7;
+const RENDER_TILE_SHIFT: usize = 8;
 const RENDER_TILE_SIZE: usize = 1 << RENDER_TILE_SHIFT;
 const RENDER_TILE_INTRA_MASK: usize = RENDER_TILE_SIZE.wrapping_sub(1);
 
@@ -960,6 +960,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
     let mut prev_frame_time_us = 0usize;
     let mut prev_frame_time_total_us = 0usize;
     let mut prev_frame_time_total_us_max_5_seconds = 0usize;
+    let mut prev_frame_time_single_thread_us_max_5_seconds = 0usize;
     let mut prev_frame_time_total_us_max_5_seconds_last_reset = Instant::now();
     let mut last_call_to_present_instant = Instant::now();
     let mut frame_is_actually_queued_by_us = false;
@@ -1301,15 +1302,17 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 }
                                                 return;
                                             }
-
-                                            // Tell workers: WAKE UP WAKE UP WAKE UP!!!
-                                            while (*p_thread_context).workers_that_have_passed_the_wake_up_gate.load(Ordering::Relaxed) != (*p_thread_context).thread_count - 1 { spin_loop(); }
-                                            (*p_thread_context).workers_that_have_passed_the_wake_up_gate.store(0, Ordering::Relaxed);
-                                            (*p_thread_context).wake_up_gate.store(0, Ordering::Relaxed);
-                                            (*p_thread_context).wake_up_barrier.wait();
-                                            (*p_thread_context).is_last_time = false;
-                                            (*p_thread_context).begin_work_gate.store(0, Ordering::Relaxed);
-                                            (*p_thread_context).wake_up_gate.store(1, Ordering::Release);
+                                            
+                                            // Note(Sam): Single threaded time is too long right now. 3 ms! So w cannot perform the wakeup here. It is too early. Optimistic wakeup should be at most 100 us early.
+                                            // { // Tell workers: WAKE UP WAKE UP WAKE UP!!!
+                                            //     while (*p_thread_context).workers_that_have_passed_the_wake_up_gate.load(Ordering::Relaxed) != (*p_thread_context).thread_count - 1 { spin_loop(); }
+                                            //     (*p_thread_context).workers_that_have_passed_the_wake_up_gate.store(0, Ordering::Relaxed);
+                                            //     (*p_thread_context).wake_up_gate.store(0, Ordering::Relaxed);
+                                            //     (*p_thread_context).wake_up_barrier.wait();
+                                            //     (*p_thread_context).is_last_time = false;
+                                            //     (*p_thread_context).begin_work_gate.store(0, Ordering::Relaxed);
+                                            //     (*p_thread_context).wake_up_gate.store(1, Ordering::Release);
+                                            // }
 
                                             let target_frame_time_us = (1000000000.0 / (frame_interval_milli_hertz as f64)) as usize;
                                             let begin_frame_instant = Instant::now();
@@ -1616,6 +1619,17 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             assert!(*draw_ctx.draw_command_count <= DRAW_CALL_MAX);
                                             if *draw_ctx.draw_command_count == DRAW_CALL_MAX { println!("WARNING, we are at max capacity for draw commands."); }
                                             prev_frame_time_single_threaded_us = begin_frame_instant.elapsed().as_micros() as usize;
+                                            
+                                            // Note(Sam): We want to do this earlier but we are too slow. See comment above.
+                                            { // Tell workers: WAKE UP WAKE UP WAKE UP!!!
+                                                while (*p_thread_context).workers_that_have_passed_the_wake_up_gate.load(Ordering::Relaxed) != (*p_thread_context).thread_count - 1 { spin_loop(); }
+                                                (*p_thread_context).workers_that_have_passed_the_wake_up_gate.store(0, Ordering::Relaxed);
+                                                (*p_thread_context).wake_up_gate.store(0, Ordering::Relaxed);
+                                                (*p_thread_context).wake_up_barrier.wait();
+                                                (*p_thread_context).is_last_time = false;
+                                                (*p_thread_context).begin_work_gate.store(0, Ordering::Relaxed);
+                                                (*p_thread_context).wake_up_gate.store(1, Ordering::Release);
+                                            }
 
 
                                             #[derive(Clone, Copy)]
@@ -2069,6 +2083,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             frame_stats[frame_stat_o % frame_stats.len()].full_time_us = prev_frame_time_total_us as usize;
                                             frame_stat_o += 1;
 
+                                            prev_frame_time_single_thread_us_max_5_seconds = prev_frame_time_single_thread_us_max_5_seconds.max(prev_frame_time_single_threaded_us);
                                             prev_frame_time_total_us_max_5_seconds = prev_frame_time_total_us_max_5_seconds.max(prev_frame_time_total_us);
 
                                             if let Some((x, y)) = *draw_ctx.debug_pixel_inspector {
@@ -2087,7 +2102,15 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                         prev_frame_time_total_us,
                                                         prev_frame_time_total_us_max_5_seconds
                                                     ),
-                                                    if prev_frame_time_total_us < target_frame_time_us { 0xff_00ff00 } else { 0xff_ff5500 },
+                                                    if prev_frame_time_total_us_max_5_seconds < target_frame_time_us { 0xff_00ff00 } else { 0xff_ff5500 },
+                                                );
+                                                draw_ctx.text_line(FontKind::Mono, 8.0, 20.0, 13.0,
+                                                    &format!(
+                                                        "SINGLE THREAD PART: (us) {:>5} max(5s):{:>5}",
+                                                        prev_frame_time_single_threaded_us,
+                                                        prev_frame_time_single_thread_us_max_5_seconds
+                                                    ),
+                                                    0xff_00ff00,
                                                 );
 
                                                 // Force a non measured render buffer reset if the real code is not active to save CPU.
@@ -2169,6 +2192,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             }
 
                                             if prev_frame_time_total_us_max_5_seconds_last_reset.elapsed().as_secs() >= 5 {
+                                                prev_frame_time_single_thread_us_max_5_seconds = 0;
                                                 prev_frame_time_total_us_max_5_seconds = 0;
                                                 prev_frame_time_total_us_max_5_seconds_last_reset = Instant::now();
                                             }
