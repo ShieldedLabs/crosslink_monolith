@@ -1767,7 +1767,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
         }
 
-        loop {
+        for _ in 0..1024 {
             let more = service_connections(&mut connections_map,
                                 &mut packets_received,
                                 &packets_to_send,

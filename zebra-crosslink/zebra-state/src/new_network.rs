@@ -226,7 +226,7 @@ pub fn sync(
         block_send_queue.clear();
 
         // Service STP connections (send/recv)
-        loop {
+        for _ in 0..1024 {
             let more = service_connections(&mut connections_map,
                             &mut packets_received,
                             &packets_to_send,
