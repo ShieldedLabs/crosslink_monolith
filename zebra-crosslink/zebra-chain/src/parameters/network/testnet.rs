@@ -351,6 +351,8 @@ impl ConfiguredActivationHeights {
         let blossom = blossom.or(sapling);
         let heartwood = heartwood.or(blossom);
         let canopy = canopy.or(heartwood);
+        let nu5 = nu5.or(canopy);
+        let nu6 = nu6.or(nu5);
 
         Self {
             before_overwinter,

@@ -310,7 +310,10 @@ impl NonFinalisedState {
                     if let Some(hash) = self.heights_to_hashes.get(&pop_height) {
                         // Send to FinalisedState if db is active.
                         match self.config.storage.database.size {
-                            zaino_common::DatabaseSize::Gb(0) => {} // do nothing
+                            zaino_common::DatabaseSize::Gb(0) => {
+                                self.hashes_to_blocks.remove(&hash, None);
+                                self.heights_to_hashes.remove(&pop_height, None);
+                            }
                             zaino_common::DatabaseSize::Gb(_) => {
                                 if let Some(block) = self.hashes_to_blocks.get(&hash) {
                                     if self
@@ -326,10 +329,12 @@ impl NonFinalisedState {
                                         ));
                                     }
                                 }
+                                // Don't remove from DashMaps yet — let the block remain
+                                // readable until the LMDB writer has committed it.
+                                // The DashMap capacity (10 000) is large enough to absorb
+                                // these lingering entries.
                             }
                         }
-                        self.hashes_to_blocks.remove(&hash, None);
-                        self.heights_to_hashes.remove(&pop_height, None);
                     }
                 }
             }

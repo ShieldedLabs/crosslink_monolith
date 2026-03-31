@@ -152,6 +152,18 @@ impl BlockCacheSubscriber {
                 .await
                 .map_err(Into::into)
         } else {
+            // Reject requests for heights above the chain tip early,
+            // rather than falling through to the finalised state or validator.
+            if let HashOrHeight::Height(height) = hash_or_height {
+                if let Ok(chain_height) = self.get_chain_height().await {
+                    if height > chain_height {
+                        return Err(BlockCacheError::Custom(format!(
+                            "Block height {} above chain tip {}",
+                            height.0, chain_height.0
+                        )));
+                    }
+                }
+            }
             match &self.finalised_state {
                 // Fetch from finalised state.
                 Some(finalised_state) => finalised_state

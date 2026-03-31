@@ -330,8 +330,8 @@ impl FinalisedState {
             {
                 let response = match finalised_state.get_block(hash_or_height) {
                     Ok(block) => Ok(block),
-                    Err(_) => {
-                        warn!("Failed to fetch block from DB, re-fetching from validator.");
+                    Err(error) => {
+                        warn!("Failed to fetch block {:?} from DB, re-fetching from validator. the error is {:?}", hash_or_height, error);
                         match fetch_block_from_node(
                             finalised_state.state.as_ref(),
                             Some(&finalised_state.config.network.to_zebra_network()),
@@ -438,8 +438,7 @@ impl FinalisedState {
             .get_blockchain_info()
             .await?
             .blocks
-            .0
-            .saturating_sub(99);
+            .0;
         for block_height in ((reorg_height.0 + 1).max(
             self.config
                 .network
