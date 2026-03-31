@@ -76,7 +76,7 @@ do_not_manipulate_config = true
 i_am_the_unstaker = true
 listen_address = "127.0.0.1:24835"
 public_address = "127.0.0.1:24835"
-malachite_peers = [
+bft_peers = [
 "127.0.0.1:24834",
 "127.0.0.1:24835",
 ]

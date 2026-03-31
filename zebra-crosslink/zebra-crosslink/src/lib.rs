@@ -126,7 +126,7 @@ pub mod config {
         /// temp seed for private/public key pair
         pub insecure_user_name: Option<String>,
         /// List of public IP addresses for peers, in the same format as `public_address`.
-        pub malachite_peers: Vec<String>,
+        pub bft_peers: Vec<String>,
         /// Do not manipulate config
         pub do_not_manipulate_config: bool,
         /// I am the unstaker.
@@ -138,7 +138,7 @@ pub mod config {
                 listen_address: None,
                 public_address: None,
                 insecure_user_name: None,
-                malachite_peers: Vec::new(),
+                bft_peers: Vec::new(),
                 do_not_manipulate_config: false,
                 i_am_the_unstaker: false,
             }
@@ -556,7 +556,7 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
     }
 }
 
-async fn new_decided_bft_block_from_malachite(
+async fn handle_new_decided_bft_block(
     tfl_handle: &TFLServiceHandle,
     new_block: &BftBlock,
     fat_pointer: &FatPointerToBftBlock,
@@ -578,9 +578,7 @@ async fn new_decided_bft_block_from_malachite(
             panic!();
         }
 
-        assert_eq!(
-            validate_bft_block_from_malachite(&tfl_handle, new_block)
-                .await,
+        assert_eq!(validate_bft_block(&tfl_handle, new_block).await,
             (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None)
         );
     }
@@ -670,7 +668,6 @@ async fn new_decided_bft_block_from_malachite(
     tenderlink_roster_from_internal(&internal.validators_at_current_height)
 }
 
-// TODO: collapse away Malachite roster
 fn tenderlink_roster_from_internal(vals: &[RosterMember]) -> Vec<SortedRosterMember> {
     let mut ret: Vec<SortedRosterMember> = vals
         .iter()
@@ -703,7 +700,7 @@ fn tenderlink_roster_from_internal(vals: &[RosterMember]) -> Vec<SortedRosterMem
     ret
 }
 
-async fn validate_bft_block_from_malachite(
+async fn validate_bft_block(
     tfl_handle: &TFLServiceHandle,
     new_block: &BftBlock,
 ) -> (tenderlink::TMStatus, tenderlink::TMStatusReason) {
@@ -970,7 +967,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 let seed = hasher.finish();
                 let string = format!("127.0.0.1:{}", seed % 4000);
                 let (a, b) =
-                    addr_string_to_stuff(&config.malachite_peers.get(i).unwrap_or_else(|| &string));
+                    addr_string_to_stuff(&config.bft_peers.get(i).unwrap_or_else(|| &string));
                 FinalizerPeerAddress {
                     bft_pk: PubKeyID(m.pub_key.into()),
                     address: b,
@@ -1077,7 +1074,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     use zebra_chain::serialization::ZcashDeserialize;
 
                     if let Ok(bft_block) = BftBlock::zcash_deserialize(block.0.reader()) {
-                        validate_bft_block_from_malachite(&tfl_handle2, &bft_block).await
+                        validate_bft_block(&tfl_handle2, &bft_block).await
                     } else {
                         error!("Failed to deserialize Tenderlink payload.");
                         (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None)
@@ -1090,7 +1087,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     use bytes::Buf;
                     use zebra_chain::serialization::ZcashDeserialize;
 
-                    new_decided_bft_block_from_malachite(
+                    handle_new_decided_bft_block(
                         &tfl_handle3,
                         &BftBlock::zcash_deserialize(block.0.reader()).unwrap(),
                         &fat_pointer.into(),

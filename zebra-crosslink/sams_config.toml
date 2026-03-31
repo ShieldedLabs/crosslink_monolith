@@ -46,7 +46,7 @@ checkpoint_sync = true
 [crosslink]
 do_not_manipulate_config = false
 i_am_the_unstaker = true
-malachite_peers = []
+bft_peers = []
 
 [mempool]
 eviction_memory_time = "1h"

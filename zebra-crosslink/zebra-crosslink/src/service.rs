@@ -136,10 +136,10 @@ pub fn spawn_new_tfl_service(
     closure_from_state_to_here_mutex: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>>,
 ) -> (TFLServiceHandle, JoinHandle<Result<(), String>>) {
     let (validators_at_current_height, validators_keys_to_names) = {
-        let mut array = Vec::with_capacity(config.malachite_peers.len());
-        let mut map = std::collections::HashMap::with_capacity(config.malachite_peers.len());
+        let mut array = Vec::with_capacity(config.bft_peers.len());
+        let mut map = std::collections::HashMap::with_capacity(config.bft_peers.len());
 
-        for (i, peer) in config.malachite_peers.iter().enumerate() {
+        for (i, peer) in config.bft_peers.iter().enumerate() {
             let (_, _, public_key) = rng_private_public_key_from_address(peer.as_bytes());
             array.push(RosterMember { pub_key:public_key.0, voting_power: 1, txids: Vec::new() });
             // array.push(crate::MalValidator::new(public_key, vec![StakeTxId{ txid: [0;32], zats:((i as u64) * 5) + 1 }])); // @Phillip @Testing
@@ -195,11 +195,11 @@ pub fn spawn_new_tfl_service(
                 return Err(format!("block ({block_hash}) is not the one signed for ({fat_pointer_hash})"));
             };
 
-            let (status, reason) = crate::validate_bft_block_from_malachite(&handle, block.as_ref()).await;
+            let (status, reason) = crate::validate_bft_block(&handle, block.as_ref()).await;
             match status {
                 tenderlink::TMStatus::Pass => {
                     info!("Successfully force-fed BFT block");
-                    crate::new_decided_bft_block_from_malachite(&handle, block.as_ref(), &fat_pointer, Vec::new())
+                    crate::handle_new_decided_bft_block(&handle, block.as_ref(), &fat_pointer, Vec::new())
                         .await;
                     Ok(())
                 },

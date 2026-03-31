@@ -508,13 +508,13 @@ impl FatPointerToBftBlock {
         }
     }
 
-    pub fn get_vote_template(&self) -> MalVote {
+    pub fn get_vote_template(&self) -> Vote {
         let mut vote_bytes = [0_u8; 76];
         vote_bytes[32..76].copy_from_slice(&self.vote_for_block_without_finalizer_public_key);
-        MalVote::from_bytes(&vote_bytes)
+        Vote::from_bytes(&vote_bytes)
     }
 
-    pub fn inflate(&self) -> Vec<(MalVote, ed25519_zebra::ed25519::SignatureBytes)> {
+    pub fn inflate(&self) -> Vec<(Vote, ed25519_zebra::ed25519::SignatureBytes)> {
         let vote_template = self.get_vote_template();
         self.signatures
             .iter()
@@ -579,7 +579,7 @@ impl FatPointerToBftBlock {
 
 /// A vote for a value in a round
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct MalVote {
+pub struct Vote {
     pub validator_address: PubKeyID,
     pub value: Blake3Hash,
     pub height: u64,
@@ -599,7 +599,7 @@ TOTAL: 76 B
 A signed vote will be this same layout followed by the 64 byte ed25519 signature of the previous 76 bytes.
 */
 
-impl MalVote {
+impl Vote {
     pub fn to_bytes(&self) -> [u8; 76] {
         let mut buf = [0_u8; 76];
         buf[0..32].copy_from_slice(self.validator_address.0.as_ref());
@@ -614,7 +614,7 @@ impl MalVote {
         buf
     }
 
-    pub fn from_bytes(bytes: &[u8; 76]) -> MalVote {
+    pub fn from_bytes(bytes: &[u8; 76]) -> Vote {
         let value_hash_bytes = bytes[32..64].try_into().unwrap();
         let height = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
 
@@ -623,7 +623,7 @@ impl MalVote {
         let typ = merged_round_val & 0x8000_0000 != 0;
         let round = (merged_round_val & 0x7fff_ffff) as i32;
 
-        MalVote {
+        Vote {
             validator_address: PubKeyID(bytes[0..32].try_into().unwrap()),
             value: Blake3Hash(value_hash_bytes),
             height,
