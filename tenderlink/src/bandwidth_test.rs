@@ -466,7 +466,7 @@ macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone,
 #[repr(C)]  pod! { pub struct PackletAcknowledgements { pub hdr: PackletHeader } }
 #[repr(C)]  pod! { pub struct PackletAnEntireDatagram { pub hdr: PackletHeader } }
 #[repr(C)]  pod! { pub struct PackletOneJumboFragment { pub hdr: PackletHeader, pub id_idx: u32 } }
-#[repr(C)]  pod! { pub struct PackletReliableStreamed { pub hdr: PackletHeader, pub id: u16, pub seq: u32 } }
+#[repr(C)]  pod! { pub struct PackletReliableStreamed { pub hdr: PackletHeader, pub id: u32, pub seq: u32 } }
 
 impl PackletHeader {
     pub fn new(tag: PackletTag, len: u16) -> Self { debug_assert!(len < (1 << 14)); Self((tag as u16) | (len << 2)) }
@@ -509,7 +509,7 @@ impl SliceRead  for PackletReliableStreamed {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
         Some(Self {
             hdr: PackletHeader::read_from(buf)?,
-            id: u16::read_from(buf)?,
+            id:  u32::read_from(buf)?,
             seq: u32::read_from(buf)?
         })
     }
@@ -881,7 +881,7 @@ pub fn service_connections(
         let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &mut connection.connection_state
         else { continue; };
 
-        if data.len() > ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE - 6 {
+        if data.len() > ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE - 6 - 16 {
             panic!("You shouldn't have created a packet this big in the current test");
             continue;
         }

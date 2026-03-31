@@ -44,7 +44,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// An error describing the reason a semantically verified block could not be committed to the state.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 #[error("block is not contextually valid: {}", .0)]
-pub struct CommitSemanticallyVerifiedError(#[from] ValidateContextError);
+pub struct CommitSemanticallyVerifiedError(#[from] pub ValidateContextError);
 
 /// An error describing the reason a block or its descendants could not be reconsidered after
 /// potentially being invalidated from the chain_set.
