@@ -5,7 +5,7 @@
 
 #![allow(clippy::eq_op)]
 const PRINT_PROTOCOL:       bool = 1 == 1;
-const PRINT_PROTOCOL_TAG:   bool = 0 == 1;
+const PRINT_PROTOCOL_TAG:   bool = 1 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
 const PRINT_NETWORK_STATS:  bool = 1 == 1;
 const PRINT_PEERS:          bool = 0 == 1;
@@ -362,9 +362,9 @@ impl Timeout {
         let timeout = match step {
             // Note(Sam): These timeout should be tuned to match the maximum network load block time. An additional
             // virtue of a short block time that I had not considered is that it hides round stalls better.
-            TMStep::Propose   => Duration::from_millis(2000) + round * Duration::from_millis(500),
-            TMStep::Prevote   => Duration::from_millis(2000) + round * Duration::from_millis(500),
-            TMStep::Precommit => Duration::from_millis(2000) + round * Duration::from_millis(500),
+            TMStep::Propose   => Duration::from_millis(10000) + round * Duration::from_millis(2500),
+            TMStep::Prevote   => Duration::from_millis(10000) + round * Duration::from_millis(2500),
+            TMStep::Precommit => Duration::from_millis(10000) + round * Duration::from_millis(2500),
         };
 
         Timeout{ time: now + timeout, height, round, step }
@@ -1489,6 +1489,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let server_b_pub_key = PubKeyID([0xE6, 0x00, 0x6A, 0x82, 0xD9, 0xA0, 0xDA, 0xB4, 0x6B, 0xD4, 0xC1, 0xDD, 0x69, 0x14, 0xF0, 0x3B,
                                                  0xEC, 0x27, 0xB4, 0xEC, 0xD3, 0xD9, 0x09, 0xD1, 0x62, 0x34, 0x2D, 0xFD, 0xA5, 0x13, 0x78, 0x1E]);
 
+// @sam_now_work
                 if !bft_key_address_map.contains_key(&server_a_pub_key) && server_a_pub_key != PubKeyID(my_root_public_bft_key.into()) {
                     let address = STPAddress::parse("[::ffff:45.76.30.90]:8234:AQAAAAAA:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(); // @Todo
 
@@ -1766,17 +1767,18 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
         }
 
-        let remaining = next_tick_time.saturating_duration_since(was_now);
-
-        service_connections(&mut connections_map,
-                            &mut packets_received,
-                            &packets_to_send,
-                            &mut packet_memory_encrypted,
-                            &mut packet_memory_recv,
-                            &mut packet_memory_send,
-                            socket,
-                            &my_keypairs);
-        packets_to_send.clear();
+        loop {
+            let more = service_connections(&mut connections_map,
+                                &mut packets_received,
+                                &packets_to_send,
+                                &mut packet_memory_encrypted,
+                                &mut packet_memory_recv,
+                                &mut packet_memory_send,
+                                socket,
+                                &my_keypairs);
+            packets_to_send.clear();
+            if more == false { break; }
+        }
 
         // Ensure a Peer entry exists for every active connection
         for key in connections_map.keys() {

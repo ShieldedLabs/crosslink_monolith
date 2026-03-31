@@ -226,7 +226,8 @@ pub fn sync(
         block_send_queue.clear();
 
         // Service STP connections (send/recv)
-        service_connections(&mut connections_map,
+        loop {
+            let more = service_connections(&mut connections_map,
                             &mut packets_received,
                             &packets_to_send,
                             // &packets_that_failed_to_send_due_to_congestion,
@@ -239,7 +240,9 @@ pub fn sync(
         // for packet in &packets_that_failed_to_send_due_to_congestion {
         // }
 
-        packets_to_send.clear();
+            packets_to_send.clear();
+            if more == false { break; }
+        }
 
         // // hypothetical: something "we may want" to "avoid pessimal drop behaviour"
         // packets_received.shuffle();
