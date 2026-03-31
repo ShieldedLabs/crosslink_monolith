@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::{Request, Response, ReadRequest, ReadResponse};
 use tower::ServiceExt;
 use zebra_chain::block::{self, Block, Hash, Height};
@@ -84,10 +84,10 @@ pub fn get_tip(read_state: &ReadState, rt: &tokio::runtime::Handle) -> Option<(H
 }
 
 pub fn sync(
-        config: &crate::config::Config,
-        read_state: ReadState,
-        state: State,
-        rt: tokio::runtime::Handle,
+    config: &crate::config::Config,
+    read_state: ReadState,
+    state: State,
+    rt: tokio::runtime::Handle,
 ) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(500);
     BLOCK_EVENT_QUEUE_SENDER.set(event_tx).unwrap();
@@ -160,7 +160,7 @@ pub fn sync(
     let tick_duration = std::time::Duration::from_millis(TICK_MS);
     let mut peer_statuses = HashMap::<ConnectionKey, PacketStatus>::new();
 
-    let mut block_send_queue = Vec::<Vec<u8>>::new();
+    let mut committed_blocks = HashSet::new();
 
     // Main sync loop
     loop {
@@ -198,8 +198,47 @@ pub fn sync(
             }
         }
 
+        // @Todo: Send all chains, not just best chain.
+        // Currently this only lives for one tick because we currently only map height->best chain block.
+        let mut serialized_blocks = HashMap::new();
 
-        let our_status = PacketStatus { height: tip_height.0.saturating_sub(5), hash: tip_hash };
+        for (connection_key, peer_status) in &peer_statuses {
+            let Some(connection) = get_connected(&connections_map, connection_key) else { continue; };
+
+            for height in peer_status.height.saturating_sub(5)..peer_status.height + 5 {
+                if !serialized_blocks.contains_key(&height) {
+                    let res = rt.block_on(async {
+                        read_state.clone().oneshot(ReadRequest::Block(Height(height).into())).await
+                    });
+                    match res {
+                        Ok(ReadResponse::Block(Some(block))) => {
+                            serialized_blocks.insert(height, (block.zcash_serialize_to_vec().unwrap(), block.hash()));
+                        }
+                        Ok(ReadResponse::Block(None)) => { break; }
+                        Err(err) => { panic!("sync start err: {err:?}");               }
+                        _        => { panic!("sync err: unhandled response: {res:?}"); }
+                    }
+                }
+                let (serialized, hash) = &serialized_blocks[&height];
+
+                let mut buf = [0u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE];
+
+                if serialized.len() >= buf.len() - 1 {
+                    eprintln!("NewNet ERROR: Block too big! Was {:?} bytes, max is {}!", serialized.len(), buf.len() - 1);
+                    continue;
+                }
+
+                let mut o = 0;
+                o += PACKET_TYPE_BLOCK.write_to(&mut buf[o..]);
+                o += serialized       .write_to(&mut buf[o..]);
+
+                packets_to_send.push((*connection_key, Vec::from(&buf[..o])));
+                // eprintln!("\x1b[93mPOWLINK2 SENDING BLOCK HASH\x1b[0m: {}", hash);
+            }
+        }
+
+
+        let our_status = PacketStatus { height: tip_height.0, hash: tip_hash };
         for (key, connection) in &connections_map {
             if !connection.is_connected() {
                 continue;
@@ -212,36 +251,29 @@ pub fn sync(
 
             packets_to_send.push((*key, Vec::from(&buf[..o])));
         }
-        
-        for block in &block_send_queue {
-            let mut buf = [0u8; 1 + 32_767];
-            let mut o = 0;
-            o += PACKET_TYPE_BLOCK.write_to(&mut buf[o..]);
-            o += block.write_to(&mut buf[o..]);
 
-            for (key, connection) in &connections_map {
-                packets_to_send.push((*key, Vec::from(&buf[..o])));
-            }
-        }
-        block_send_queue.clear();
-
-        // Service STP connections (send/recv)
+        // Service STP connections (send/recv).
+        // @Todo: real scheduling. Right now I just want to receive everything!
         for _ in 0..1024 {
             let more = service_connections(&mut connections_map,
-                            &mut packets_received,
-                            &packets_to_send,
-                            // &packets_that_failed_to_send_due_to_congestion,
-                            &mut packet_memory_encrypted,
-                            &mut packet_memory_recv,
-                            &mut packet_memory_send,
-                            socket,
-                            &my_keypairs);
+                                           &mut packets_received,
+                                           &packets_to_send,
+                                           // &packets_that_failed_to_send_due_to_congestion,
+                                           &mut packet_memory_encrypted,
+                                           &mut packet_memory_recv,
+                                           &mut packet_memory_send,
+                                           socket,
+                                           &my_keypairs);
 
-        // for packet in &packets_that_failed_to_send_due_to_congestion {
-        // }
+            // for packet in &packets_that_failed_to_send_due_to_congestion {
+            // }
 
+            // @Todo: Just take a mut to the packets_to_send in service_connections and clear it inside?
             packets_to_send.clear();
-            if more == false { break; }
+
+            if !more {
+                break;
+            }
         }
 
         // // hypothetical: something "we may want" to "avoid pessimal drop behaviour"
@@ -264,24 +296,7 @@ pub fn sync(
             let packet_type = msg[0];
 
             if packet_type == PACKET_TYPE_STATUS {
-                let Some(status) = PacketStatus::read_from(&mut &msg[1..])
-                else { continue; };
-                
-                if block_send_queue.len() == 0 {
-                    for rq_h in status.height..status.height+10 {
-                        let maybe_block = rt.block_on(async {
-                            let res = read_state.clone().oneshot(ReadRequest::Block(crate::HashOrHeight::Height(Height(rq_h)))).await;
-                            match res {
-                                Ok(ReadResponse::Block(block_maybe)) => block_maybe,
-                                Err(err) => panic!("sync start err: {err:?}"),
-                                _ => panic!("sync err: unhandled response: {res:?}"),
-                            }
-                        });
-                        let Some(block) = maybe_block else { break; };
-                        let serialized = block.zcash_serialize_to_vec().unwrap();
-                        block_send_queue.push(serialized);
-                    }
-                }
+                let Some(status) = PacketStatus::read_from(&mut &msg[1..]) else { continue; };
 
                 let prev = peer_statuses.get(&connection_key).copied();
                 peer_statuses.insert(connection_key, status);
@@ -296,11 +311,43 @@ pub fn sync(
                 }
             } else if packet_type == PACKET_TYPE_BLOCK {
                 use zebra_chain::serialization::ZcashDeserializeInto;
-                if let Ok(block) = (&msg[1..]).zcash_deserialize_into::<Block>() {
-                    println!("got block hash: {}", block.hash());
-                    rt.block_on(async {
-                        let res = state.clone().oneshot(Request::CommitSemanticallyVerifiedBlock(crate::SemanticallyVerifiedBlock::from(std::sync::Arc::new(block)))).await;
-                    })
+                let Ok(block) = (&msg[1..]).zcash_deserialize_into::<Block>() else { continue; };
+
+                let hash = block.hash();
+                // eprintln!("\x1b[93mPOWLINK2 GOT BLOCK HASH\x1b[0m: {}", hash);
+
+                // skip already committed blocks
+                if committed_blocks.contains(&hash) {
+                    // println!("already committed!: {}", hash);
+                    continue;
+                }
+
+                println!("new block, committing!: {}", hash);
+
+                // @Todo(Phil): Do we need to semantically verify?
+                let res = rt.block_on(async {
+                    state.clone().oneshot(Request::CommitSemanticallyVerifiedBlock(crate::SemanticallyVerifiedBlock::from(std::sync::Arc::new(block)))).await
+                });
+                match res {
+                    Ok(_) => {
+                        committed_blocks.insert(hash);
+                        println!("committed!: {}", hash);
+                    }
+                    Err(error) => {
+                        if let Some(commit_err) = error.downcast_ref::<crate::error::CommitSemanticallyVerifiedError>() {
+                            match &commit_err.0 {
+                                crate::ValidateContextError::AlreadyFinalized { .. } => {
+                                    committed_blocks.insert(hash);
+                                    println!("Already was committed: {}", hash);
+                                }
+                                other => {
+                                    println!("Failed to commit {}: {:?}", hash, other);
+                                }
+                            }
+                        } else {
+                            println!("Failed to commit {}: {:?}", hash, error);
+                        }
+                    }
                 }
             } else {
                 println!("NewNet: Got unknown msg type={} len={}", packet_type, msg.len());
