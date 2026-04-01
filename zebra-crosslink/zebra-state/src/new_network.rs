@@ -60,10 +60,169 @@ impl SliceRead for PacketStatus {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct PacketHashTreeHdr {
+    tip_height: u32,
+    hashes_start_offset: u16,
+    // [PacketHashBranch]
+    // [Hash] @ hashes_start_offset
+}
+impl SliceWrite for PacketHashTreeHdr {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.tip_height.write_to(&mut buf[o..]);
+        o += self.hashes_start_offset.write_to(&mut buf[o..]);
+        o
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PacketHashBranch {
+    parent_hash_idx: u16,
+    // start index is implicit from sequential cursor (the end index of the previous branch)
+    branch_end_idx: u16,
+    // if parent_hash_idx == cursor, there's a parent_height: u32
+}
+impl SliceWrite for PacketHashBranch {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.parent_hash_idx.write_to(&mut buf[o..]);
+        o += self.branch_end_idx.write_to(&mut buf[o..]);
+        o
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct ShadowBlock {
     this_hash:   Hash,
     parent_hash: Hash,
+    this_height: u32,
+    // TODO: work
 }
+impl ShadowBlock {
+    fn work(&self) -> u32 {
+        self.this_height // @Hack, not @Prod
+    }
+}
+
+
+// currently assumes each block arrives after its parent
+pub fn write_packet_hash_tree(buf: &mut [u8], tip_height: u32, blocks: &[ShadowBlock]) {
+    // doing parallel chains (redundantly keeping shared prefixes)
+    // ALT: index tree in single buffer
+
+    let mut chains = Vec::<Vec<ShadowBlock>>::new();
+    // (a, b), (b, c,), (c, d), (d, e), ..., (c, i), (i, j), ...
+
+    // a b c d e f g h
+    //     \ i j k l m n
+
+    for block in blocks {
+        let mut found = None;
+        for (chain_idx, chain) in chains.iter().enumerate() {
+            if let Some(parent_idx) = chain.iter().position(|b| b.this_hash == block.parent_hash) {
+                found = Some((chain_idx, parent_idx));
+                if parent_idx == chain.len()-1 {
+                    break; // TODO (perf): I think we can unconditionally break on found, but I'd need to double-check invariants
+                }
+            }
+        }
+
+        // TODO: handling sets in theory demands prepending parents before children; TBD if
+        // streaming obsoletes this
+
+        if let Some((mut chain_idx, parent_idx)) = found {
+            if parent_idx != chains[chain_idx].len()-1 {
+                chains.push(chains[chain_idx][..parent_idx+1].to_vec());
+                chain_idx = chains.len()-1;
+            }
+            chains[chain_idx].push(*block);
+        } else {
+            chains.push(vec![*block]);
+        }
+    }
+
+    // a b c d e f g h
+    // a b c i j k l m n
+    chains.sort_by_key(|ch| std::cmp::Reverse(ch.len())); // proxy for work // TODO @Prod: use work
+
+    // a b c i j k l m n
+    // a b c d e f g h
+
+
+    let mut runs = Vec::<(PacketHashBranch, u32)>::new();
+    let mut hashes = Vec::<Hash>::new();
+
+    //         0 1 2 3 4 5 6 7 8 9 a b c d
+    // hashes: a b c i j k l m n d e f g h
+    // runs:   (0,9), (2, e)
+
+    for chain in &chains {
+        let parent_idx = if let Some(parent_idx) = hashes.iter().position(|h| *h == chain[0].parent_hash) {
+            parent_idx
+        } else {
+            // new tree
+            hashes.push(chain[0].parent_hash);
+            hashes.len()-1
+        };
+
+        let mut branch = PacketHashBranch {
+            parent_hash_idx: parent_idx.try_into().unwrap(),
+            branch_end_idx: hashes.len().try_into().unwrap(), // fixed up after loop
+        };
+
+        for block in chain {
+            if hashes[parent_idx+1..].contains(&block.this_hash) {
+                continue;
+            }
+            hashes.push(block.this_hash);
+        }
+        debug_assert!((branch.branch_end_idx as usize) < hashes.len(), "DEV: nothing from chain was used");
+
+        branch.branch_end_idx = hashes.len().try_into().unwrap();
+        runs.push((branch, chain[0].this_height));
+    }
+
+
+    // packet size = sizeof(hdr + 2 runs) + 0xa hashes [0, 1]
+    //                                     0 1 2 3 4 5 6 7 8 9 a b c d
+    // tip, offset_of(a), (0,9), (2, 0xa), a b c i j k l m n d - - - -
+    let mut hdr = PacketHashTreeHdr {
+        tip_height,
+        hashes_start_offset: 0, // fixed up
+    };
+
+    // TODO (perf): merge into loop above
+    let mut o      = hdr.write_to(&mut buf[..]);
+    let mut hash_c = 0usize;
+    for (mut branch, height) in &runs {
+        let run_start_if_last_run = o + std::mem::size_of_val(&branch) + (hash_c * 32);
+        if run_start_if_last_run + 32 > buf.len() {
+            // wouldn't be able to fit any more hashes in, no point in starting another run
+            break;
+        }
+
+        let end = run_start_if_last_run + (branch.branch_end_idx as usize * 32);
+        if end > buf.len() {
+            let rem_size = buf.len() - run_start_if_last_run;
+            let rem_hashes = rem_size / 32;
+            branch.branch_end_idx = (hash_c + rem_hashes).try_into().unwrap();
+        }
+
+        o += branch.write_to(&mut buf[o..]);
+        if (<usize>::from(branch.parent_hash_idx) == hash_c) {
+            o += height.write_to(&mut buf[o..]);
+        }
+        hash_c = branch.branch_end_idx.into();
+    }
+
+    hdr.hashes_start_offset = o.try_into().unwrap();
+    _ = hdr.write_to(&mut buf[..]); // fixup initial header
+
+    for hash in &hashes[..hash_c] {
+        o += hash.0.write_to(&mut buf[o..])
+    }
+}
+
 
 // @Todo: always only wait on real stuff, never sleeping for fixed amounts like this
 const TICK_MS: u64 = 500;
@@ -352,7 +511,7 @@ pub fn sync(
             } else {
                 println!("NewNet: Got unknown msg type={} len={}", packet_type, msg.len());
             }
-            
+
         }
 
         // Remove statuses for disconnected peers
@@ -365,3 +524,37 @@ pub fn sync(
         }
     }
 }
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_packet_from_block_hashes() {
+        let blocks = [
+            ShadowBlock { parent_hash: Hash([0x01;32]), this_hash: Hash([0x02;32]), this_height: 2 },
+            ShadowBlock { parent_hash: Hash([0x02;32]), this_hash: Hash([0x03;32]), this_height: 3 },
+            ShadowBlock { parent_hash: Hash([0x03;32]), this_hash: Hash([0x04;32]), this_height: 4 },
+            ShadowBlock { parent_hash: Hash([0x04;32]), this_hash: Hash([0x05;32]), this_height: 5 },
+            ShadowBlock { parent_hash: Hash([0x05;32]), this_hash: Hash([0x06;32]), this_height: 6 },
+            ShadowBlock { parent_hash: Hash([0x06;32]), this_hash: Hash([0x07;32]), this_height: 7 },
+            ShadowBlock { parent_hash: Hash([0x07;32]), this_hash: Hash([0x08;32]), this_height: 8 },
+            ShadowBlock { parent_hash: Hash([0x08;32]), this_hash: Hash([0x09;32]), this_height: 9 },
+            ShadowBlock { parent_hash: Hash([0x09;32]), this_hash: Hash([0x0a;32]), this_height:10 },
+
+            // fork off 05
+            ShadowBlock { parent_hash: Hash([0x05;32]), this_hash: Hash([0x16;32]), this_height: 6 },
+            ShadowBlock { parent_hash: Hash([0x16;32]), this_hash: Hash([0x17;32]), this_height: 7 },
+            ShadowBlock { parent_hash: Hash([0x17;32]), this_hash: Hash([0x18;32]), this_height: 8 },
+            ShadowBlock { parent_hash: Hash([0x18;32]), this_hash: Hash([0x19;32]), this_height: 9 },
+            ShadowBlock { parent_hash: Hash([0x19;32]), this_hash: Hash([0x1a;32]), this_height:10 },
+            ShadowBlock { parent_hash: Hash([0x1a;32]), this_hash: Hash([0x1b;32]), this_height:11 },
+        ];
+
+        let tip_height = 11;
+        let mut buf = [0u8, 1200];
+        write_packet_hash_tree(&mut buf, tip_height, &blocks);
+
+        println!("{}", hex::encode(buf));
+    }
+}
+

@@ -47,6 +47,8 @@ pub use serialize::{SerializedBlock, MAX_BLOCK_BYTES};
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use arbitrary::LedgerState;
 
+use zcash_primitives::bft::FatPointerToBftBlock;
+
 /// A Zcash block, containing a header and a list of transactions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(
