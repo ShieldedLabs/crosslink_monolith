@@ -5,7 +5,7 @@
 
 #![allow(clippy::eq_op)]
 const PRINT_PROTOCOL:       bool = 1 == 1;
-const PRINT_PROTOCOL_TAG:   bool = 1 == 1;
+const PRINT_PROTOCOL_TAG:   bool = 0 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
 const PRINT_NETWORK_STATS:  bool = 1 == 1;
 const PRINT_PEERS:          bool = 1 == 1;
@@ -1801,13 +1801,14 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             peers.entry(*key).or_insert_with(|| Peer::default());
         }
 
-        // Drop peers not on the roster. Kinda temp.
-        connections_map.retain(|key, value| {
-            let stp_address = value.address();
-            let Some(bft_key) = bft_key_address_map.get_key(&stp_address) else { return false; };
-            
-            roster.iter().position(|x| x.pub_key == *bft_key).is_some()
-        });
+        // Note(Sam): Disabled this due to confusion. I am not sure it is the right thing.
+        // // Drop peers not on the roster. Kinda temp.
+        // connections_map.retain(|key, value| {
+        //     let stp_address = value.address();
+        //     let Some(bft_key) = bft_key_address_map.get_key(&stp_address) else { return false; };
+        //     
+        //     roster.iter().position(|x| x.pub_key == *bft_key).is_some()
+        // });
         
         // Remove peer entries for dropped connections
         peers.retain(|key, _| connections_map.contains_key(key));
