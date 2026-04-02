@@ -8,16 +8,16 @@ const PRINT_PROTOCOL:       bool = 1 == 1;
 const PRINT_PROTOCOL_TAG:   bool = 1 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
 const PRINT_NETWORK_STATS:  bool = 1 == 1;
-const PRINT_PEERS:          bool = 0 == 1;
-const PRINT_VALID_INCOMING: bool = 0 == 1;
+const PRINT_PEERS:          bool = 1 == 1;
+const PRINT_VALID_INCOMING: bool = 1 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
 const PRINT_RNGS:           bool = 0 == 1;
 const PRINT_SIGN:           bool = 0 == 1;
-const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
+const PRINT_BFT_PROPOSAL:   bool = 1 == 1;
 const PRINT_BFT_VOTE:       bool = 1 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
-const PRINT_BFT_STATE:      bool = 0 == 1;
+const PRINT_BFT_STATE:      bool = 1 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
 const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
 
@@ -41,6 +41,7 @@ const MAX_BANDWIDTH_BYTES_PER_SECOND: usize = 1_000_000;
 
 
 pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+//pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 
 use static_assertions::{const_assert};
@@ -53,7 +54,7 @@ use snow::resolvers::CryptoResolver;
 use tokio::time::Instant;
 use zcash_primitives::bft::{ HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
 
-const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(300);
+const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
 const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_millis(10000);
 
 // NOTE: Sam and Phillip discussed forward jumps; Noise trial decryption already protects connectsions against replay attacks.
@@ -1075,6 +1076,7 @@ pub use crate::bandwidth_test::fmt_prefixed_byte_str;
 pub use crate::bandwidth_test::fmt_prefixed_byte_str_rev;
 pub use crate::bandwidth_test::new_keypair_from_connect_magic1_with_seed;
 pub use crate::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+pub use crate::bandwidth_test::CONNECT_MAGIC1_PLAIN_TEXT;
 
 
 pub const MAX_P2P_DISCOVERY_PUBKEY_SIZE: usize = 32;
@@ -1518,6 +1520,18 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                            stats: &mut NetworkStats) {
                     let height = round_data.height;
                     let round  = round_data.round;
+                    
+                    // Make sure to always sent at least one status.
+                    {
+                        let header = PacketHeader::new_(0);
+                        let o = write_header_and_maybe_status(header, true,
+                                                                       bft_state,
+                                                                       roster,
+                                                                       &mut send_buf1[..],
+                                                                       peer.index_counter);
+                        peer.index_counter += 1;
+                        send_noise_msg(packets_to_send, connection_key, &send_buf1[..o], stats);
+                    }
 
                     let mut chunk_hdr = PacketProposalChunkHeader {
                         height, round, chunk_i: 0,
@@ -1766,8 +1780,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 next_tick_time += TICK_DURATION;
             }
         }
-
-        for _ in 0..1024 {
+        
+        use rand::seq::SliceRandom;
+        packets_to_send.shuffle(&mut rand::thread_rng());
+        for _ in 0..256 {
             let more = service_connections(&mut connections_map,
                                 &mut packets_received,
                                 &packets_to_send,
@@ -1785,8 +1801,17 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             peers.entry(*key).or_insert_with(|| Peer::default());
         }
 
+        // Drop peers not on the roster. Kinda temp.
+        connections_map.retain(|key, value| {
+            let stp_address = value.address();
+            let Some(bft_key) = bft_key_address_map.get_key(&stp_address) else { return false; };
+            
+            roster.iter().position(|x| x.pub_key == *bft_key).is_some()
+        });
+        
         // Remove peer entries for dropped connections
         peers.retain(|key, _| connections_map.contains_key(key));
+        
 
         // READ
         while packets_received.len() > 0 {
@@ -1794,6 +1819,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let (key, packet) = packets_received.remove(0);
                 (key, peers.get_mut(&key).unwrap(), packet)
             };
+
             let msg: &[u8] = &msg[..];
             if msg.len() == 0 { continue; }
             let Some((header, status, read_o)) = read_header_and_maybe_status(&msg[..])
@@ -1882,15 +1908,13 @@ const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     names
 };
 fn packet_name_from_tag(packet_tag: u8) -> &'static str {
-    PACKET_TYPE_NAMES.get(packet_tag as usize).unwrap_or(&["<UNKNOWN>", "STATUS+<UNKNOWN>"])[(packet_tag >> PACKET_TAG_STATUS_SHIFT & 1) as usize]
+    PACKET_TYPE_NAMES.get((packet_tag & PACKET_TYPE_MASK) as usize).unwrap_or(&["<UNKNOWN>", "STATUS+<UNKNOWN>"])[(packet_tag >> PACKET_TAG_STATUS_SHIFT & 1) as usize]
 }
 fn print_packet_tag_send(header: PacketHeader) {
-    if header.type_() >= PACKET_TYPE_PROPOSAL_CHUNK { return; } // @Debug
-    if PRINT_PROTOCOL_TAG { println!("PACKET_{} ->", packet_name_from_tag(header.tag())); }
+    if PRINT_PROTOCOL_TAG { println!("PACKET_{} (0x{:X}) ->", packet_name_from_tag(header.tag()), header.tag()); }
 }
 fn print_packet_tag_recv(header: PacketHeader) {
-    if header.type_() >= PACKET_TYPE_PROPOSAL_CHUNK { return; } // @Debug
-    if PRINT_PROTOCOL_TAG { println!("<- PACKET_{}", packet_name_from_tag(header.tag())); }
+    if PRINT_PROTOCOL_TAG { println!("<- PACKET_{} (0x{:X})", packet_name_from_tag(header.tag()), header.tag()); }
 }
 
 // NOTE(azmr): could add packet sizes so we can check all sizes in 1 location

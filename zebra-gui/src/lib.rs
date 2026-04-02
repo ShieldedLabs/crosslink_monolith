@@ -712,23 +712,52 @@ impl InputCtx {
     }
 
     fn get_from_clipboard(&self) -> String {
-        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+        // Try xclip first (works reliably on X11), then xsel, then copypasta.
+        if let Ok(output) = std::process::Command::new("xclip").args(["-selection", "clipboard", "-o"]).output() {
+            if output.status.success() {
+                return String::from_utf8_lossy(&output.stdout).into_owned();
+            }
+        }
+        if let Ok(output) = std::process::Command::new("xsel").args(["--clipboard", "--output"]).output() {
+            if output.status.success() {
+                return String::from_utf8_lossy(&output.stdout).into_owned();
+            }
+        }
+        use copypasta::{ClipboardContext, ClipboardProvider};
+        let Ok(mut clipboard) = ClipboardContext::new() else {
             return String::new();
         };
-        let Ok(text) = clipboard.get_text() else {
+        let Ok(text) = clipboard.get_contents() else {
             return String::new();
         };
         return text;
     }
 
     fn send_to_clipboard(&self, text: &str) -> bool {
-        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+        // Try xclip first (works reliably on X11), then xsel, then copypasta.
+        if let Ok(mut child) = std::process::Command::new("xclip").args(["-selection", "clipboard"]).stdin(std::process::Stdio::piped()).spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if let Ok(status) = child.wait() {
+                if status.success() { return true; }
+            }
+        }
+        if let Ok(mut child) = std::process::Command::new("xsel").args(["--clipboard", "--input"]).stdin(std::process::Stdio::piped()).spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if let Ok(status) = child.wait() {
+                if status.success() { return true; }
+            }
+        }
+        use copypasta::{ClipboardContext, ClipboardProvider};
+        let Ok(mut clipboard) = ClipboardContext::new() else {
             return false;
         };
-        let Err(_) = clipboard.set_text(text) else {
-            return false;
-        };
-        return true;
+        clipboard.set_contents(text.to_owned()).is_ok()
     }
 }
 
@@ -1180,7 +1209,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                     };
 
                                     if event.state.is_pressed() && is_paste {
-                                        input_ctx.inflight_text_input.extend(&arboard::Clipboard::new().ok().map(|mut c| c.get_text().ok()).flatten().map(|s| s.chars().collect::<Vec<char>>()).unwrap_or_default());
+                                        input_ctx.inflight_text_input.extend(&input_ctx.get_from_clipboard().chars().collect::<Vec<char>>());
                                     } else {
                                         if !ctrl && let Some(text) = event.text && event.state.is_pressed() {
                                             input_ctx.inflight_text_input.extend(text.chars().filter(|c| *c >= ' ' && *c != 0x7f as char));
