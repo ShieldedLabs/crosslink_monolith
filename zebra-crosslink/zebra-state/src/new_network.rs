@@ -91,7 +91,7 @@ impl SliceWrite for PacketHashBranch {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ShadowBlock {
     this_hash:   Hash,
     parent_hash: Hash,
@@ -99,127 +99,184 @@ struct ShadowBlock {
     // TODO: work
 }
 impl ShadowBlock {
-    fn work(&self) -> u32 {
-        self.this_height // @Hack, not @Prod
+    fn work(&self) -> u128 {
+        1 // @Hack, not @Prod
     }
 }
 
 
-// currently assumes each block arrives after its parent
-pub fn write_packet_hash_tree(buf: &mut [u8], tip_height: u32, blocks: &[ShadowBlock]) {
-    // doing parallel chains (redundantly keeping shared prefixes)
-    // ALT: index tree in single buffer
+const NEAR_TIP_CHAIN_LEN: u32 = 100;
 
-    let mut chains = Vec::<Vec<ShadowBlock>>::new();
-    // (a, b), (b, c,), (c, d), (d, e), ..., (c, i), (i, j), ...
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NearTipChain {
+    work: u128,
+    blocks: Vec<ShadowBlock>, // TODO: circular buffer tracking behind tip (N.B. tip not necessarily being longest means that buffers must have independent start points)
+}
+impl NearTipChain {
+    pub fn push_block(&mut self, block: ShadowBlock) -> usize {
+        if (self.blocks.len() == NEAR_TIP_CHAIN_LEN as usize) {
+            self.blocks.remove(0);
+        }
+        self.work += block.work();
+        self.blocks.push(block);
+        self.blocks.len()-1
+    }
+}
 
-    // a b c d e f g h
-    //     \ i j k l m n
+/// Similar parallel chain model to Zebra's NonFinalizedState.
+///
+/// Not exactly "non-finalized", as it may include finalized blocks
+/// (either on startup or after crosslink finalization)
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NearTipChains {
+    chains: Vec<NearTipChain>,
+}
+impl NearTipChains {
+    /// Height of *best* chain, which is probably, but not necessarily, the longest chain
+    pub fn tip_height(&self) -> Option<u32> {
+        self.chains.first().and_then(|ch| ch.blocks.last()).map(|bl| bl.this_height)
+    }
 
-    for block in blocks {
-        let mut found = None;
-        for (chain_idx, chain) in chains.iter().enumerate() {
-            if let Some(parent_idx) = chain.iter().position(|b| b.this_hash == block.parent_hash) {
-                found = Some((chain_idx, parent_idx));
-                if parent_idx == chain.len()-1 {
-                    break; // TODO (perf): I think we can unconditionally break on found, but I'd need to double-check invariants
+    pub fn push_chain(&mut self, blocks: Vec<ShadowBlock>) -> usize {
+        let mut work = 0;
+        for block in &blocks {
+            work += block.work();
+        }
+        self.chains.push(NearTipChain { work, blocks });
+        self.chains.len()-1
+    }
+
+
+    pub fn push_blocks(&mut self, blocks: &[ShadowBlock]) {
+        if blocks.len() == 0 {
+            return;
+        }
+
+        for block in blocks {
+            let mut found = None;
+            // find chain on which the parent lives (ideally as the last item)
+            for (chain_idx, chain) in self.chains.iter().enumerate() {
+                if let Some(parent_idx) = chain.blocks.iter().position(|b| b.this_hash == block.parent_hash) {
+                    found = Some((chain_idx, parent_idx));
+                    if parent_idx == chain.blocks.len()-1 {
+                        break; // TODO (perf): I think we can unconditionally break on found, but I'd need to double-check invariants
+                    }
                 }
             }
+
+            let chain_idx = if let Some((mut chain_idx, parent_idx)) = found {
+                let blocks = &self.chains[chain_idx].blocks;
+                if parent_idx != blocks.len()-1 {
+                    self.push_chain(blocks[..parent_idx+1].to_vec())
+                } else {
+                    chain_idx
+                }
+            } else {
+                self.push_chain(Vec::new())
+            };
+
+            self.chains[chain_idx].push_block(*block);
         }
 
-        // TODO: handling sets in theory demands prepending parents before children; TBD if
-        // streaming obsoletes this
-
-        if let Some((mut chain_idx, parent_idx)) = found {
-            if parent_idx != chains[chain_idx].len()-1 {
-                chains.push(chains[chain_idx][..parent_idx+1].to_vec());
-                chain_idx = chains.len()-1;
+        // TODO: drop the bad chains if they're
+        // updated to the max(chain.tip_height, bc_tip_height).saturating_sub(NEAR_TIP_CHAIN_LEN)
+        let bc_tip_height = self.tip_height().expect("early-outed if there were no blocks");
+        self.chains.retain_mut(|chain| {
+            debug_assert!(chain.blocks.len() > 0, "should have been removed if empty");
+            while chain.blocks[0].this_height < bc_tip_height.saturating_sub(NEAR_TIP_CHAIN_LEN) {
+                chain.blocks.remove(0);
+                if chain.blocks.len() == 0 {
+                    return false;
+                }
             }
-            chains[chain_idx].push(*block);
-        } else {
-            chains.push(vec![*block]);
-        }
+            true
+        });
+
+        self.chains.sort_by_key(|ch| std::cmp::Reverse(ch.work));
     }
 
-    // a b c d e f g h
-    // a b c i j k l m n
-    chains.sort_by_key(|ch| std::cmp::Reverse(ch.len())); // proxy for work // TODO @Prod: use work
 
-    // a b c i j k l m n
-    // a b c d e f g h
+    // currently assumes each block arrives after its parent
+    pub fn write_packet_hash_tree(&self, buf: &mut [u8]) -> Option<usize> {
+        // doing parallel chains (redundantly keeping shared prefixes)
+        // ALT: index tree in single buffer
+
+        let tip_height = self.tip_height()?;
+
+        let mut runs = Vec::<(PacketHashBranch, u32)>::new();
+        let mut hashes = Vec::<Hash>::new();
+
+        //         0 1 2 3 4 5 6 7 8 9 a b c d
+        // hashes: a b c i j k l m n d e f g h
+        // runs:   (0,9), (2, e)
+
+        for chain in &self.chains {
+            let parent_idx = if let Some(parent_idx) = hashes.iter().position(|h| *h == chain.blocks[0].parent_hash) {
+                parent_idx
+            } else {
+                // new tree
+                hashes.push(chain.blocks[0].parent_hash);
+                hashes.len()-1
+            };
+
+            let mut branch = PacketHashBranch {
+                parent_hash_idx: parent_idx.try_into().unwrap(),
+                branch_end_idx: hashes.len().try_into().unwrap(), // fixed up after loop
+            };
+
+            for block in &chain.blocks {
+                if hashes[parent_idx+1..].contains(&block.this_hash) {
+                    continue;
+                }
+                hashes.push(block.this_hash);
+            }
+            debug_assert!((branch.branch_end_idx as usize) < hashes.len(), "DEV: nothing from chain was used");
+
+            branch.branch_end_idx = hashes.len().try_into().unwrap();
+            runs.push((branch, chain.blocks[0].this_height));
+        }
 
 
-    let mut runs = Vec::<(PacketHashBranch, u32)>::new();
-    let mut hashes = Vec::<Hash>::new();
-
-    //         0 1 2 3 4 5 6 7 8 9 a b c d
-    // hashes: a b c i j k l m n d e f g h
-    // runs:   (0,9), (2, e)
-
-    for chain in &chains {
-        let parent_idx = if let Some(parent_idx) = hashes.iter().position(|h| *h == chain[0].parent_hash) {
-            parent_idx
-        } else {
-            // new tree
-            hashes.push(chain[0].parent_hash);
-            hashes.len()-1
+        // packet size = sizeof(hdr + 2 runs) + 0xa hashes [0, 1]
+        //                                     0 1 2 3 4 5 6 7 8 9 a b c d
+        // tip, offset_of(a), (0,9), (2, 0xa), a b c i j k l m n d - - - -
+        let mut hdr = PacketHashTreeHdr {
+            tip_height,
+            hashes_start_offset: 0, // fixed up
         };
 
-        let mut branch = PacketHashBranch {
-            parent_hash_idx: parent_idx.try_into().unwrap(),
-            branch_end_idx: hashes.len().try_into().unwrap(), // fixed up after loop
-        };
-
-        for block in chain {
-            if hashes[parent_idx+1..].contains(&block.this_hash) {
-                continue;
+        // TODO (perf): merge into loop above
+        let mut o      = hdr.write_to(&mut buf[..]);
+        let mut hash_c = 0usize;
+        for (mut branch, height) in &runs {
+            let run_start_if_last_run = o + std::mem::size_of_val(&branch) + (hash_c * 32);
+            if run_start_if_last_run + 32 > buf.len() {
+                // wouldn't be able to fit any more hashes in, no point in starting another run
+                break;
             }
-            hashes.push(block.this_hash);
-        }
-        debug_assert!((branch.branch_end_idx as usize) < hashes.len(), "DEV: nothing from chain was used");
 
-        branch.branch_end_idx = hashes.len().try_into().unwrap();
-        runs.push((branch, chain[0].this_height));
-    }
+            let end = run_start_if_last_run + (branch.branch_end_idx as usize * 32);
+            if end > buf.len() {
+                let rem_size = buf.len() - run_start_if_last_run;
+                let rem_hashes = rem_size / 32;
+                branch.branch_end_idx = (hash_c + rem_hashes).try_into().unwrap();
+            }
 
-
-    // packet size = sizeof(hdr + 2 runs) + 0xa hashes [0, 1]
-    //                                     0 1 2 3 4 5 6 7 8 9 a b c d
-    // tip, offset_of(a), (0,9), (2, 0xa), a b c i j k l m n d - - - -
-    let mut hdr = PacketHashTreeHdr {
-        tip_height,
-        hashes_start_offset: 0, // fixed up
-    };
-
-    // TODO (perf): merge into loop above
-    let mut o      = hdr.write_to(&mut buf[..]);
-    let mut hash_c = 0usize;
-    for (mut branch, height) in &runs {
-        let run_start_if_last_run = o + std::mem::size_of_val(&branch) + (hash_c * 32);
-        if run_start_if_last_run + 32 > buf.len() {
-            // wouldn't be able to fit any more hashes in, no point in starting another run
-            break;
+            o += branch.write_to(&mut buf[o..]);
+            if (<usize>::from(branch.parent_hash_idx) == hash_c) {
+                o += height.write_to(&mut buf[o..]);
+            }
+            hash_c = branch.branch_end_idx.into();
         }
 
-        let end = run_start_if_last_run + (branch.branch_end_idx as usize * 32);
-        if end > buf.len() {
-            let rem_size = buf.len() - run_start_if_last_run;
-            let rem_hashes = rem_size / 32;
-            branch.branch_end_idx = (hash_c + rem_hashes).try_into().unwrap();
+        hdr.hashes_start_offset = o.try_into().unwrap();
+        _ = hdr.write_to(&mut buf[..]); // fixup initial header
+
+        for hash in &hashes[..hash_c] {
+            o += hash.0.write_to(&mut buf[o..])
         }
 
-        o += branch.write_to(&mut buf[o..]);
-        if (<usize>::from(branch.parent_hash_idx) == hash_c) {
-            o += height.write_to(&mut buf[o..]);
-        }
-        hash_c = branch.branch_end_idx.into();
-    }
-
-    hdr.hashes_start_offset = o.try_into().unwrap();
-    _ = hdr.write_to(&mut buf[..]); // fixup initial header
-
-    for hash in &hashes[..hash_c] {
-        o += hash.0.write_to(&mut buf[o..])
+        Some(o)
     }
 }
 
@@ -229,6 +286,8 @@ const TICK_MS: u64 = 500;
 
 type ReadState = crate::service::ReadStateService;
 type State = tower::buffer::Buffer<tower::util::BoxService<Request, Response, crate::BoxError>, Request>;
+
+// TODO: the handling for these calls is sync, so don't have the indirection through async
 
 pub fn get_tip(read_state: &ReadState, rt: &tokio::runtime::Handle) -> Option<(Height, Hash)> {
     let tip_maybe = rt.block_on(async {
@@ -240,6 +299,51 @@ pub fn get_tip(read_state: &ReadState, rt: &tokio::runtime::Handle) -> Option<(H
         }
     });
     tip_maybe
+}
+
+pub fn get_bc_hash_at_height(read_state: &ReadState, rt: &tokio::runtime::Handle, height: Height) -> Option<Hash> {
+    rt.block_on(async {
+        let res = read_state.clone().oneshot(ReadRequest::BestChainBlockHash(height)).await;
+        match res {
+            Ok(ReadResponse::BlockHash(maybe_hash)) => maybe_hash,
+            Err(err) => {
+                tracing::error!("header fetch: {err:?}");
+                None
+            },
+            _ => panic!("sync err: unhandled response: {res:?}"),
+        }
+    })
+}
+
+pub fn get_hdr_at_hash(read_state: &ReadState, rt: &tokio::runtime::Handle, hash: Hash) -> Option<(std::sync::Arc<block::Header>, Height, Hash)> {
+    rt.block_on(async {
+        let res = read_state.clone().oneshot(ReadRequest::BlockHeader(hash.into())).await;
+        match res {
+            Ok(ReadResponse::BlockHeader{ header, height, hash, .. }) => Some((header, height, hash)),
+            Err(err) => {
+                tracing::error!("header fetch: {err:?}");
+                None
+            },
+            _ => panic!("header fetch: unhandled response: {res:?}"),
+        }
+    })
+}
+
+pub fn get_hdrs_after_hash(read_state: &ReadState, rt: &tokio::runtime::Handle, pre_first_hash: Hash, last_hash: Option<Hash>) -> Option<Vec<block::CountedHeader>> {
+    rt.block_on(async {
+        let res = read_state.clone().oneshot(ReadRequest::FindBlockHeaders{
+            known_blocks: vec![pre_first_hash],
+            stop: last_hash,
+        }).await;
+        match res {
+            Ok(ReadResponse::BlockHeaders(hdrs)) => Some(hdrs),
+            Err(err) => {
+                tracing::error!("header fetch: {err:?}");
+                None
+            },
+            _ => panic!("header fetch: unhandled response: {res:?}"),
+        }
+    })
 }
 
 pub fn sync(
@@ -260,6 +364,33 @@ pub fn sync(
         break tip;
     };
     println!("NewNet: Starting at height={} hash={:?}", tip_height.0, tip_hash);
+
+    let mut near_tip_chains = NearTipChains { chains: Vec::new() };
+    'init_near_tip_chains: {
+        let near_tip_start_height = Height(tip_height.0.saturating_sub(NEAR_TIP_CHAIN_LEN+1));
+        let Some(near_tip_start_hash) = get_bc_hash_at_height(&read_state, &rt, near_tip_start_height) else {
+            break 'init_near_tip_chains;
+        };
+        let Some(near_tip_hdrs) = get_hdrs_after_hash(&read_state, &rt, near_tip_start_hash, None) else {
+            break 'init_near_tip_chains;
+        };
+
+        let mut parent_hash = near_tip_start_hash;
+        let mut shadow_blocks = Vec::with_capacity(near_tip_hdrs.len());
+        for (i, hdr) in near_tip_hdrs.iter().enumerate() {
+            let this_height = near_tip_start_height.0 + 1 + i as u32;
+            // TODO: double-check height
+            let block = ShadowBlock {
+                parent_hash,
+                this_hash: hdr.header.hash(),
+                this_height,
+            };
+            parent_hash = block.this_hash;
+            shadow_blocks.push(block);
+        };
+
+        near_tip_chains.push_blocks(&shadow_blocks);
+    }
 
     // Keypair setup
     let network_keypair;
@@ -336,8 +467,17 @@ pub fn sync(
                 Ok(block_event) => {
                     match block_event {
                         BlockEvent::Committed(hash) => {
+                            // TODO: BlockEvents should contain enough info to insert a shadow block
                             // @Todo: announce this block
+                            if let Some((hdr, height, hash)) = get_hdr_at_hash(&read_state, &rt, hash){
+                                near_tip_chains.push_blocks(&[ShadowBlock {
+                                    parent_hash: hdr.previous_block_hash,
+                                    this_hash: hash,
+                                    this_height: height.0,
+                                }]);
+                            }
                         }
+
                         _ => {
                             println!("NewNet: block_event: {:?}", block_event);
                         }
@@ -472,7 +612,7 @@ pub fn sync(
                 use zebra_chain::serialization::ZcashDeserializeInto;
                 let Ok(block) = (&msg[1..]).zcash_deserialize_into::<Block>() else { continue; };
 
-                let hash = block.hash();
+                let (hash, height) = (block.hash(), block.coinbase_height());
                 // eprintln!("\x1b[93mPOWLINK2 GOT BLOCK HASH\x1b[0m: {}", hash);
 
                 // skip already committed blocks
@@ -549,10 +689,32 @@ mod tests {
             ShadowBlock { parent_hash: Hash([0x19;32]), this_hash: Hash([0x1a;32]), this_height:10 },
             ShadowBlock { parent_hash: Hash([0x1a;32]), this_hash: Hash([0x1b;32]), this_height:11 },
         ];
-
-        let tip_height = 11;
         let mut buf = [0u8, 1200];
-        write_packet_hash_tree(&mut buf, tip_height, &blocks);
+
+        let mut chains = NearTipChains { chains: Vec::new() };
+        let res = chains.write_packet_hash_tree(&mut buf);
+        debug_assert_eq!(res, None);
+
+        // (a, b), (b, c,), (c, d), (d, e), ..., (c, i), (i, j), ...
+        // a b c d e f g h
+        //     \ i j k l m n
+        chains.push_blocks(blocks);
+
+        let mut chains2 = NearTipChains { chains: Vec::new() };
+        // (a, b), (b, c,), (c, d), (d, e), ..., (c, i), (i, j), ...
+        // a b c d e f g h
+        //     \ i j k l m n
+        for block in &blocks {
+            chains2.push_blocks(&[block]);
+        }
+        let tip_height = 11;
+
+        debug_assert_eq!(chains, chains2, "building incrementally should be functionally equivalent to batch-built");
+        debug_assert_eq!(chains.tip_height(), Some(11));
+
+
+        let res = write_packet_hash_tree(&mut buf, tip_height, &blocks);
+        debug_assert!(res.is_some(), "failed to write packet");
 
         println!("{}", hex::encode(buf));
     }
