@@ -88,6 +88,15 @@ pub fn noise_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     }
 }
 
+pub fn crypto_overhead_from_connect_magic1(magic: u64) -> Option<usize> {
+    match magic {
+        CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s => Some(16),
+        CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b => Some(16),
+        CONNECT_MAGIC1_PLAIN_TEXT => Some(0),
+        _ => None,
+    }
+}
+
 pub const MIN_SECRET_KEY_SIZE: usize = 32;
 pub const MIN_PUBLIC_KEY_SIZE: usize = 32;
 
@@ -245,13 +254,14 @@ impl Default for ConnectionKey {
 #[derive(Debug)]
 pub struct ConnectionTrackingData {
     pub creation_time_ns: u64,
-    pub my_ip: Ipv6Addr,
+    pub my_ip: Ipv6Addr, // TODO: use an ipv6 type that supports Default!
     pub my_transport_identity_keypair: IdentityKeyPair,
     pub two_byte_send_prefix: u16,
-    pub other_ip: Ipv6Addr,
+    pub other_ip: Ipv6Addr, // TODO: use an ipv6 type that supports Default!
     pub other_port: u16,
     pub other_transport_identity: Vec<u8>,
     pub connection_state: ConnectionState,
+    pub jumbo_reassembly: JumboReassembly,
 }
 impl ConnectionTrackingData {
     pub fn address(&self) -> STPAddress {
@@ -320,6 +330,8 @@ pub enum ConnectionState {
         hello_packet_payload: Vec<u8>,
     },
     SendingClientHello {
+        magic1: u64,
+
         last_sent_time_ns: u64,
         hello_packet_payload: Vec<u8>,
         handshake: snow::HandshakeState,
@@ -330,12 +342,17 @@ pub enum ConnectionState {
     },
     SendingServerHello {
         cipher: ConnectionCipherTriplet,
+        magic1: u64,
+
         last_sent_time_ns: u64,
         hello_packet_payload: Vec<u8>,
     },
     Connected {
         cipher: Option<ConnectionCipherTriplet>,
+        magic1: u64,
+
         send_sequence_number: u64,
+        jumbogram_index: u32,
         last_sent_keep_alive_time_ns: u64,
         recv_time_ns: u64,
     },
@@ -421,6 +438,7 @@ pub fn connect_to_endpoint(
                     other_port: endpoint.port,
                     other_transport_identity: endpoint.key.clone(),
                     connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
+                    jumbo_reassembly: Default::default(),
                 },
             );
         }
@@ -449,7 +467,8 @@ pub fn connect_to_endpoint(
                     other_ip: endpoint.ip,
                     other_port: endpoint.port,
                     other_transport_identity: endpoint.key.clone(),
-                    connection_state: ConnectionState::SendingClientHello { last_sent_time_ns: 0, hello_packet_payload, handshake },
+                    connection_state: ConnectionState::SendingClientHello { magic1: my_connect_keypair.magic1, last_sent_time_ns: 0, hello_packet_payload, handshake },
+                    jumbo_reassembly: Default::default(),
                 },
             );
         }
@@ -463,52 +482,116 @@ macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone,
 
 #[repr(u8)] pod! { pub enum PackletTag { #[default] Acknowledgements = 0, AnEntireDatagram = 1, OneJumboFragment = 2, ReliableStreamed = 3 } }
 #[repr(C)]  pod! { pub struct PackletHeader(u16); }
-#[repr(C)]  pod! { pub struct PackletAcknowledgements { pub hdr: PackletHeader } }
-#[repr(C)]  pod! { pub struct PackletAnEntireDatagram { pub hdr: PackletHeader } }
-#[repr(C)]  pod! { pub struct PackletOneJumboFragment { pub hdr: PackletHeader, pub id_idx: u32 } }
-#[repr(C)]  pod! { pub struct PackletReliableStreamed { pub hdr: PackletHeader, pub id: u32, pub seq: u32 } }
+#[repr(C)]  pod! { pub struct PackletOneJumboFragment { pub bits: u64 } } // id:18 | total_len:23 | byte_idx:23
+#[repr(C)]  pod! { pub struct PackletReliableStreamed { pub id: u32, pub seq: u32 } }
 
 impl PackletHeader {
-    pub fn new(tag: PackletTag, len: u16) -> Self { debug_assert!(len < (1 << 14)); Self((tag as u16) | (len << 2)) }
-    pub fn tag(self) -> PackletTag { unsafe { core::mem::transmute((self.0 & 0x3) as u8) } }
-    pub fn len(self) -> u16 { self.0 >> 2 }
+    pub fn new(tag: PackletTag, len: usize) -> Self { debug_assert!(len < (1 << 14)); Self((tag as u16) | ((len as u16) << 2)) }
+    pub fn tag(&self) -> PackletTag { unsafe { core::mem::transmute((self.0 & 0x3) as u8) } }
+    pub fn len(&self) -> usize { (self.0 >> 2) as usize }
 }
 
 impl PackletOneJumboFragment {
-    pub fn new(hdr: PackletHeader, id: u8, idx: u32) -> Self { debug_assert!(idx < (1 << 24)); Self { hdr, id_idx: (id as u32) | (idx << 8) } }
-    pub fn id(self) -> u8 { self.id_idx as u8 }
-    pub fn idx(self) -> u32 { self.id_idx >> 8 }
+    pub fn new(id: u32, total_len: usize, byte_idx: usize) -> Self {
+        debug_assert!(id        < (1 << 18));
+        debug_assert!(total_len < (1 << 23));
+        debug_assert!(byte_idx  < (1 << 23));
+        Self { bits: (id as u64) | ((total_len as u64) << 18) | ((byte_idx as u64) << 41) }
+    }
+    pub fn id(&self)        -> u32 { (self.bits & ((1 << 18) - 1)) as u32 }
+    pub fn total_len(&self) -> usize { ((self.bits >> 18) & ((1 << 23) - 1)) as usize }
+    pub fn byte_idx(&self)  -> usize { ((self.bits >> 41) & ((1 << 23) - 1)) as usize }
 }
 
+
+// Jumbo fragment reassembly validation:
+// exact duplicate range with exact duplicate bytes: kill connection
+// exact duplicate range with different bytes: kill connection
+// partial overlap: kill connection
+// out of bounds past total_len: kill connection
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ReassemblySlot {
+    buf: Vec<u8>,
+    total_len: u32,
+    received: Vec<(u32, u32)>, // sorted non-overlapping non-adjacent ranges: [start, end)
+}
+
+impl ReassemblySlot {
+    fn new(total_len: u32) -> Self {
+        Self {
+            buf: vec![0u8; total_len as usize],
+            total_len,
+            received: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, offset: usize, data: &[u8]) -> Result<bool, ()> {
+        let start = offset as u32;
+        let end = (offset + data.len()) as u32;
+        if end > self.total_len {
+            return Err(());
+        }
+
+        // Binary search: find first range whose end > start (skip adjacent)
+        let pos = self.received.partition_point(|&(_, e)| e <= start);
+
+        // Check overlap with the range at `pos`
+        if pos < self.received.len() && self.received[pos].0 < end {
+            return Err(());
+        }
+        // Check overlap with the range before `pos`
+        if pos > 0 && self.received[pos - 1].1 > start {
+            return Err(());
+        }
+
+        self.buf[offset..offset + data.len()].copy_from_slice(data);
+
+        // Insert and merge with adjacent ranges
+        let merge_prev = pos > 0 && self.received[pos - 1].1 == start;
+        let merge_next = pos < self.received.len() && self.received[pos].0 == end;
+
+        match (merge_prev, merge_next) {
+            (true, true) => {
+                self.received[pos - 1].1 = self.received[pos].1;
+                self.received.remove(pos);
+            }
+            (true, false) => {
+                self.received[pos - 1].1 = end;
+            }
+            (false, true) => {
+                self.received[pos].0 = start;
+            }
+            (false, false) => {
+                self.received.insert(pos, (start, end));
+            }
+        }
+
+        Ok(self.received.len() == 1 && self.received[0] == (0, self.total_len))
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct JumboReassembly {
+    slots: HashMap<u32, ReassemblySlot>,
+}
+
+const MAX_REASSEMBLY_SLOTS: usize = 64;
+const MAX_REASSEMBLY_TOTAL_LEN: usize = 1 << 23; // 8 MB, matches the 23-bit field
+
 impl SliceRead  for PackletHeader           { fn       read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self(u16::read_from(buf)?)) } }
-impl SliceRead  for PackletAcknowledgements { fn       read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self { hdr: PackletHeader::read_from(buf)?, }) } }
-impl SliceRead  for PackletAnEntireDatagram { fn       read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self { hdr: PackletHeader::read_from(buf)?, }) } }
 impl SliceWrite for PackletHeader           { fn write_to(&self, buf: &mut  [u8]) -> usize        { self.0  .write_to(buf) } }
-impl SliceWrite for PackletAcknowledgements { fn write_to(&self, buf: &mut  [u8]) -> usize        { self.hdr.write_to(buf) } }
-impl SliceWrite for PackletAnEntireDatagram { fn write_to(&self, buf: &mut  [u8]) -> usize        { self.hdr.write_to(buf) } }
 
 
 impl SliceRead  for PackletOneJumboFragment {
-    fn read_from(buf: &mut &[u8]) -> Option<Self> {
-        Some(Self {
-            hdr:    PackletHeader::read_from(buf)?,
-            id_idx: u32          ::read_from(buf)?
-        })
-    }
+    fn read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self { bits: u64::read_from(buf)? }) }
 }
 impl SliceWrite for PackletOneJumboFragment {
-    fn write_to(&self, buf: &mut [u8]) -> usize {
-        let mut o = 0;
-        o += self.hdr   .write_to(&mut buf[o..]);
-        o += self.id_idx.write_to(&mut buf[o..]);
-        o
-    }
+    fn write_to(&self, buf: &mut [u8]) -> usize { self.bits.write_to(buf) }
 }
 
 impl SliceRead  for PackletReliableStreamed {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
         Some(Self {
-            hdr: PackletHeader::read_from(buf)?,
             id:  u32::read_from(buf)?,
             seq: u32::read_from(buf)?
         })
@@ -517,7 +600,6 @@ impl SliceRead  for PackletReliableStreamed {
 impl SliceWrite for PackletReliableStreamed {
     fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = 0;
-        o += self.hdr.write_to(&mut buf[o..]);
         o += self.id .write_to(&mut buf[o..]);
         o += self.seq.write_to(&mut buf[o..]);
         o
@@ -541,14 +623,14 @@ pub fn service_connections(
         result = true;
 
         if buf_len >= 6 {
-            let magic1 = load_u48(&packet_memory_encrypted[0..6]);
-            if magic1 & 1 != 0 { // Client Hello
+            let first_six_bytes = load_u48(&packet_memory_encrypted[0..6]);
+            if first_six_bytes & 1 != 0 { // Client Hello
                 if OVERLY_VERBOSE { println!("Got a HELLO."); }
             } else {
                 if OVERLY_VERBOSE { println!("Got a non-hello."); }
             }
-            if magic1 & 1 != 0 { // Client Hello
-
+            if first_six_bytes & 1 != 0 { // Client Hello
+                let magic1 = first_six_bytes;
                 if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
                     for key_i in 0..my_listen_keypairs.len() {
                         let my_kp = my_listen_keypairs[key_i];
@@ -601,6 +683,7 @@ pub fn service_connections(
                                             other_port: other_port,
                                             other_transport_identity: client_key,
                                             connection_state: ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
+                                            jumbo_reassembly: Default::default(),
                                         },
                                     );
                                     if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
@@ -627,7 +710,7 @@ pub fn service_connections(
                                     let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
                                     if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
                                         if &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key {
-                                            if let ConnectionState::SendingClientHello { last_sent_time_ns, hello_packet_payload, handshake } = &mut existing_connection.connection_state {
+                                            if let ConnectionState::SendingClientHello { magic1, last_sent_time_ns, hello_packet_payload, handshake } = &mut existing_connection.connection_state {
                                                 if *client_key < *my_kp.public {
                                                     store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                                     // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
@@ -637,7 +720,7 @@ pub fn service_connections(
                                                     debug_assert!(new_handshake.is_handshake_finished());
                                                     let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
                                                     
-                                                    existing_connection.connection_state = ConnectionState::SendingServerHello { cipher, last_sent_time_ns: 0, hello_packet_payload };
+                                                    existing_connection.connection_state = ConnectionState::SendingServerHello { cipher, magic1: *magic1, last_sent_time_ns: 0, hello_packet_payload };
                                                 }
                                             }
                                         }
@@ -663,7 +746,8 @@ pub fn service_connections(
                                                 other_ip: other_ip_addr,
                                                 other_port: other_port,
                                                 other_transport_identity: client_key,
-                                                connection_state: ConnectionState::SendingServerHello { cipher, last_sent_time_ns: 0, hello_packet_payload },
+                                                connection_state: ConnectionState::SendingServerHello { cipher, magic1, last_sent_time_ns: 0, hello_packet_payload },
+                                                jumbo_reassembly: Default::default(),
                                             },
                                         );
                                     }
@@ -674,13 +758,14 @@ pub fn service_connections(
                 }
             }
             else { // Not client hello
-                loop { // just for early out
-                    let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: magic1 as u16 };
+                let mut kill_connection: Option<ConnectionKey> = None;
+                'conn: loop { // just for early out
+                    let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: first_six_bytes as u16 };
                     let Some(existing_connection) = connections_map.get_mut(&connection_key) else { break; };
                     
                     match &mut existing_connection.connection_state {
                         ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
-                            if magic1 >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
+                            if first_six_bytes >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
                                 let server_key = &packet_memory_encrypted[6..6+32];
                                 if server_key == existing_connection.other_transport_identity {
                                     assert_eq!(buf_len, 6 + 32);
@@ -688,7 +773,10 @@ pub fn service_connections(
                                     if VERBOSE { println!("Connected to new server {:?}", server_key); }
                                     existing_connection.connection_state = ConnectionState::Connected {
                                         cipher: None,
+                                        magic1: CONNECT_MAGIC1_PLAIN_TEXT,
+
                                         send_sequence_number: 0,
+                                        jumbogram_index: 0,
                                         last_sent_keep_alive_time_ns: 0,
                                         recv_time_ns: timestamp_ns,
                                     };
@@ -696,8 +784,8 @@ pub fn service_connections(
                             }
                             break;
                         }
-                        ConnectionState::SendingClientHello { last_sent_time_ns, hello_packet_payload, handshake } => {
-                            if magic1 >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
+                        ConnectionState::SendingClientHello { magic1, last_sent_time_ns, hello_packet_payload, handshake } => {
+                            if first_six_bytes >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
                                 if let Ok(payload_len) = handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
                                     debug_assert!(handshake.is_handshake_finished());
                                     assert_eq!(payload_len, 0);
@@ -707,7 +795,10 @@ pub fn service_connections(
                                     // Borrow Checker crazyness required here.
                                     let new_state = ConnectionState::Connected {
                                         cipher: None,
+                                        magic1: *magic1,
+
                                         send_sequence_number: 0,
+                                        jumbogram_index: 0,
                                         last_sent_keep_alive_time_ns: 0,
                                         recv_time_ns: timestamp_ns,
                                     };
@@ -724,25 +815,30 @@ pub fn service_connections(
                             if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
                             existing_connection.connection_state = ConnectionState::Connected {
                                 cipher: None,
+                                magic1: CONNECT_MAGIC1_PLAIN_TEXT,
+
                                 send_sequence_number: 0,
+                                jumbogram_index: 0,
                                 last_sent_keep_alive_time_ns: 0,
                                 recv_time_ns: timestamp_ns,
                             };
                             // FALLTHROUGH TO CONNECTED
                         }
-                        ConnectionState::SendingServerHello { cipher, last_sent_time_ns, hello_packet_payload } => {
-                            let non_virtual_nonce = magic1 >> 16; // Todo convert this to virtual.
+                        ConnectionState::SendingServerHello { cipher, magic1, last_sent_time_ns, hello_packet_payload } => {
+                            let non_virtual_nonce = first_six_bytes >> 16; // Todo convert this to virtual.
                             
                             let mut can_decrypt = false;
                             // Optimization done here. It can never be cipher.old so we skip checking.
                             can_decrypt |= cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
                             can_decrypt |= cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
                             if can_decrypt == false { break; }
-                            
+
                             if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
                             existing_connection.connection_state = ConnectionState::Connected {
                                 cipher: Some(cipher.clone()),
+                                magic1: *magic1,
                                 send_sequence_number: 0,
+                                jumbogram_index: 0,
                                 last_sent_keep_alive_time_ns: 0,
                                 recv_time_ns: timestamp_ns,
                             };
@@ -750,9 +846,9 @@ pub fn service_connections(
                         }
                         ConnectionState::Connected { .. } => (),
                     }
-                    if let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &mut existing_connection.connection_state {
-                        let non_virtual_nonce = magic1 >> 16; // Todo convert this to virtual.
-                    
+                    if let ConnectionState::Connected { cipher, magic1, send_sequence_number, jumbogram_index, last_sent_keep_alive_time_ns, recv_time_ns } = &mut existing_connection.connection_state {
+                        let non_virtual_nonce = first_six_bytes >> 16; // Todo convert this to virtual.
+
                         // TODO acks etc
                         let payload;
                         if let Some(cipher) = cipher {
@@ -776,15 +872,85 @@ pub fn service_connections(
 
                         if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
 
-                        packets_received_this_call.push((connection_key, Vec::from(payload)));
+                        let mut msg = payload;
+                        while !msg.is_empty() {
+                            let (tag, len) = match PackletHeader::read_from(&mut msg) {
+                                Some(hdr) => if hdr.0 == 0u16 {
+                                    continue
+                                } else {
+                                    (hdr.tag(), hdr.len())
+                                }
+                                None => break
+                            };
+                            if msg.len() < len { eprintln!("truncated packlet"); break; }
+                            let (mut body, remainder) = msg.split_at(len);
 
-                        if OVERLY_VERBOSE {
-                            println!("\x1b[32mGot data\x1b[0m from {:?}. Now {} packets received!"
-                                     // "  data: {:?}"
-                                     , existing_connection.address(), packets_received_this_call.len());
+                            match tag {
+                                PackletTag::OneJumboFragment => {
+                                    let Some(frag) = PackletOneJumboFragment::read_from(&mut body) else { eprintln!("truncated jumbo fragment"); continue };
+                                    let frag_data = body;
+
+                                    if OVERLY_VERBOSE {
+                                        println!("Jumbo fragment: id={} total_len={} byte_idx={} frag_len={}",
+                                            frag.id(), frag.total_len(), frag.byte_idx(), frag_data.len());
+                                    }
+
+                                    let frag_id = frag.id();
+                                    let total_len = frag.total_len();
+                                    let byte_idx = frag.byte_idx();
+
+                                    if total_len == 0 || total_len > MAX_REASSEMBLY_TOTAL_LEN || frag_data.is_empty() {
+                                        eprintln!("bad jumbo fragment params, killing connection");
+                                        kill_connection = Some(connection_key); break 'conn;
+                                    }
+
+                                    let reasm = &mut existing_connection.jumbo_reassembly;
+
+                                    // Create slot if needed, enforcing max concurrent reassemblies
+                                    if !reasm.slots.contains_key(&frag_id) {
+                                        if reasm.slots.len() >= MAX_REASSEMBLY_SLOTS {
+                                            eprintln!("too many concurrent reassembly slots, killing connection");
+                                            kill_connection = Some(connection_key); break 'conn;
+                                        }
+                                        reasm.slots.insert(frag_id, ReassemblySlot::new(total_len as u32));
+                                    }
+
+                                    let slot = reasm.slots.get_mut(&frag_id).unwrap();
+
+                                    // Validate total_len matches what we saw on the first fragment
+                                    if slot.total_len != total_len as u32 {
+                                        eprintln!("total_len mismatch, killing connection");
+                                        kill_connection = Some(connection_key); break 'conn;
+                                    }
+
+                                    match slot.insert(byte_idx, frag_data) {
+                                        Ok(true) => {
+                                            // Message complete — deliver it
+                                            let completed = reasm.slots.remove(&frag_id).unwrap();
+                                            packets_received_this_call.push((connection_key, completed.buf));
+                                        }
+                                        Ok(false) => {
+                                            // More fragments needed
+                                        }
+                                        Err(()) => {
+                                            eprintln!("overlapping/out-of-bounds fragment, killing connection");
+                                            kill_connection = Some(connection_key); break 'conn;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("unexpected packlet tag: {:?}", tag);
+                                    break;
+                                }
+                            }
+
+                            msg = remainder;
                         }
                     }
                     break;
+                }
+                if let Some(key) = kill_connection {
+                    connections_map.remove(&key);
                 }
             }
         }
@@ -806,7 +972,7 @@ pub fn service_connections(
                 return false;
             }
         }
-        ConnectionState::SendingClientHello { last_sent_time_ns, hello_packet_payload, handshake } => {
+        ConnectionState::SendingClientHello { magic1, last_sent_time_ns, hello_packet_payload, handshake } => {
             if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
                 udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
                 if *last_sent_time_ns == 0 { // cheeky optimization
@@ -834,7 +1000,7 @@ pub fn service_connections(
                 return false;
             }
         }
-        ConnectionState::SendingServerHello { cipher, last_sent_time_ns, hello_packet_payload } => {
+        ConnectionState::SendingServerHello { magic1, cipher, last_sent_time_ns, hello_packet_payload } => {
             if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
                 udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21);
                 if *last_sent_time_ns == 0 { // cheeky optimization
@@ -848,7 +1014,7 @@ pub fn service_connections(
                 return false;
             }
         }
-        ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } => {
+        ConnectionState::Connected { magic1, cipher, send_sequence_number, jumbogram_index, last_sent_keep_alive_time_ns, recv_time_ns } => {
             if *last_sent_keep_alive_time_ns + 5_000_000_000 < current_time_now_ns {
                 let virtual_nonce = *send_sequence_number;
                 store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
@@ -878,30 +1044,51 @@ pub fn service_connections(
         let Some(ref mut connection) = connections_map.get_mut(connection_key)
         else { continue; };
 
-        let ConnectionState::Connected { cipher, send_sequence_number, last_sent_keep_alive_time_ns, recv_time_ns } = &mut connection.connection_state
+        let ConnectionState::Connected { magic1, cipher, send_sequence_number, jumbogram_index, last_sent_keep_alive_time_ns, recv_time_ns } = &mut connection.connection_state
         else { continue; };
 
-        if data.len() > ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE - 6 - 16 {
-            panic!("You shouldn't have created a packet this big in the current test");
-            continue;
-        }
+        let mtu_inside_udp = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
+        let mtu_inside_stp = mtu_inside_udp - 6 - crypto_overhead_from_connect_magic1(*magic1).unwrap();
 
-        // Send
-        let virtual_nonce = *send_sequence_number;
-        store_u16(&mut packet_memory_encrypted[0..2], connection.two_byte_send_prefix);
-        store_u32(&mut packet_memory_encrypted[2..6], virtual_nonce as u32);
-        *send_sequence_number += 1;
+        let mut send = |payload: &[u8]| {
+            let mut o = 0;
 
-        let packet_len;
-        if let Some(cipher) = cipher {
-            packet_len = cipher.current.write_message(virtual_nonce, &data, &mut packet_memory_encrypted[6..]).unwrap();
-        }
-        else {
-            packet_len = data.len();
-            (&mut packet_memory_encrypted[6..6+data.len()]).copy_from_slice(&data);
-        }
+            let virtual_nonce = *send_sequence_number;
+            o += connection.two_byte_send_prefix.write_to(&mut packet_memory_encrypted[o..]);
+            o += (virtual_nonce as u32)         .write_to(&mut packet_memory_encrypted[o..]);
+            *send_sequence_number += 1;
 
-        udp_send_with_congestion_and_dscp(socket, connection.other_ip, connection.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort);
+            if let Some(cipher) = cipher {
+                o += cipher.current.write_message(virtual_nonce, payload, &mut packet_memory_encrypted[o..]).unwrap();
+            }
+            else {
+                o += payload.write_to(&mut packet_memory_encrypted[o..]);
+            }
+
+            assert!(o == mtu_inside_udp);
+
+            udp_send_with_congestion_and_dscp(socket, connection.other_ip, connection.other_port, &packet_memory_encrypted[..o], Dscp::BestEffort);
+        };
+
+        let fragment_max_size = mtu_inside_stp - std::mem::size_of::<PackletHeader>() - std::mem::size_of::<PackletOneJumboFragment>();
+
+        let mut jumbo_o: usize = 0;
+        for fragment in data.chunks(fragment_max_size) {
+            let hdr  = PackletHeader::new(PackletTag::OneJumboFragment, (std::mem::size_of::<PackletOneJumboFragment>() + fragment.len()) as usize);
+            let frag = PackletOneJumboFragment::new(*jumbogram_index, data.len(), jumbo_o);
+            jumbo_o += fragment.len();
+
+            let mut o = 0;
+            o += hdr     .write_to(&mut packet_memory_send[o..]);
+            o += frag    .write_to(&mut packet_memory_send[o..]);
+            o += fragment.write_to(&mut packet_memory_send[o..]);
+            if o < mtu_inside_stp {
+                packet_memory_send[o..mtu_inside_stp].fill(0); // @Todo: real packlet framing
+            }
+
+            send(&packet_memory_send[..mtu_inside_stp]);
+        }
+        *jumbogram_index = jumbogram_index.wrapping_add(1) & ((1 << 18) - 1);
     }
 
     result
@@ -1186,7 +1373,7 @@ pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
     }
 }
 
-const ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE: usize = 1200 - 8;
+const ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE: usize = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY - 8;
 const ASSUMED_ACK_CAPACITY: usize = (ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE-1-8)/3;
 
 const MIN_WAIT_BEFORE_SENDING_NON_FULL_ACK: u64 = 5_000_000;
