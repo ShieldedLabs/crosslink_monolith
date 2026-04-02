@@ -74,6 +74,14 @@ impl SliceWrite for PacketHashTreeHdr {
         o
     }
 }
+impl SliceRead for PacketHashTreeHdr {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(Self {
+            tip_height: u32::read_from(buf)?,
+            hashes_start_offset: u16::read_from(buf)?,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct PacketHashBranch {
@@ -88,6 +96,14 @@ impl SliceWrite for PacketHashBranch {
         o += self.parent_hash_idx.write_to(&mut buf[o..]);
         o += self.branch_end_idx.write_to(&mut buf[o..]);
         o
+    }
+}
+impl SliceRead for PacketHashBranch {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(PacketHashBranch {
+            parent_hash_idx: u16::read_from(buf)?,
+            branch_end_idx: u16::read_from(buf)?,
+        })
     }
 }
 
@@ -194,14 +210,15 @@ impl NearTipChains {
 
         self.chains.sort_by_key(|ch| std::cmp::Reverse(ch.work));
     }
+}
 
-
+impl SliceWrite for NearTipChains {
     // currently assumes each block arrives after its parent
-    pub fn write_packet_hash_tree(&self, buf: &mut [u8]) -> Option<usize> {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
         // doing parallel chains (redundantly keeping shared prefixes)
         // ALT: index tree in single buffer
 
-        let tip_height = self.tip_height()?;
+        let tip_height = self.tip_height().expect("programmer error: should be non-empty");
 
         let mut runs = Vec::<(PacketHashBranch, u32)>::new();
         let mut hashes = Vec::<Hash>::new();
@@ -276,7 +293,70 @@ impl NearTipChains {
             o += hash.0.write_to(&mut buf[o..])
         }
 
-        Some(o)
+        o
+    }
+}
+
+struct NearTipBranches {
+    tip_height: u32,
+    branches: Vec<Vec<ShadowBlock>>,
+}
+impl SliceRead for NearTipBranches {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        let full_buf = *buf;
+        let hdr = PacketHashTreeHdr::read_from(buf)?;
+        *buf = &buf[..(hdr.hashes_start_offset as usize).saturating_sub(std::mem::size_of::<PacketHashTreeHdr>())];
+        let mut buf_hashes: &mut &[u8] = &mut &full_buf[hdr.hashes_start_offset as usize..];
+        let mut branches = Vec::new();
+
+        let mut hash_c = 0;
+        let mut branch_height = 0;
+        while buf.len() > 0 {
+            let branch = PacketHashBranch::read_from(buf)?;
+            if branch.parent_hash_idx >= branch.branch_end_idx {
+                branch_height = u32::read_from(buf)?;
+                hash_c += (branch.parent_hash_idx == branch.branch_end_idx) as u16;
+            }
+            else {
+                // TODO: get branch height from previous hash point (height from beginning of run +
+                // offset)
+                // branches.find...
+            }
+            if branch.branch_end_idx as usize * 32 > buf_hashes.len() {
+                println!("received invalid Hash Tree packet (branch end)");
+                return None;
+            }
+            let parent_i = branch.parent_hash_idx as usize;
+            if (parent_i.saturating_add(1)) * 32 > buf_hashes.len() {
+                println!("received invalid Hash Tree packet (parent hash)");
+                return None;
+            }
+
+
+            let mut parent_hash = [0u8;32];
+            parent_hash.copy_from_slice(&buf_hashes[parent_i * 32..(parent_i+1) * 32]);
+
+            let branch_hashes_size = (branch.branch_end_idx - hash_c) as usize;
+            let mut branch_blocks = Vec::with_capacity(branch_hashes_size / 32);
+            for i in (hash_c as usize) .. (branch.branch_end_idx as usize) {
+                let mut hash = [0u8;32];
+                hash.copy_from_slice(&buf_hashes[i*32 .. (i+1)*32]);
+
+                branch_blocks.push(ShadowBlock{
+                    parent_hash: Hash(parent_hash),
+                    this_hash: Hash(hash),
+                    this_height: branch_height,
+                });
+                parent_hash = hash;
+                branch_height += 1;
+            }
+
+            hash_c = branch.branch_end_idx;
+
+            branches.push(branch_blocks);
+        }
+
+        Some(Self { tip_height: hdr.tip_height, branches })
     }
 }
 
@@ -538,15 +618,16 @@ pub fn sync(
 
 
         let our_status = PacketStatus { height: tip_height.0, hash: tip_hash };
+        let mut buf = [0u8; 1 + 1024];
+        let mut o = 0;
+        o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
+        o += our_status        .write_to(&mut buf[o..]);
+        // o += near_tip_chains.write_to(&mut buf[o..]); // @Phillip <<<<<<<<<<<<<<
+
         for (key, connection) in &connections_map {
             if !connection.is_connected() {
                 continue;
             }
-
-            let mut buf = [0u8; 1 + PACKET_STATUS_SIZE];
-            let mut o = 0;
-            o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
-            o += our_status        .write_to(&mut buf[o..]);
 
             packets_to_send.push((*key, Vec::from(&buf[..o])));
         }
@@ -595,7 +676,7 @@ pub fn sync(
             let packet_type = msg[0];
 
             if packet_type == PACKET_TYPE_STATUS {
-                let Some(status) = PacketStatus::read_from(&mut &msg[1..]) else { continue; };
+                let Some(status) = PacketStatus::read_from(&mut &msg[1..]) else { continue; }; // @Phillip <<<<<<<<<<<<<<
 
                 let prev = peer_statuses.get(&connection_key).copied();
                 peer_statuses.insert(connection_key, status);
