@@ -641,7 +641,6 @@ impl StartCmd {
         pin!(old_databases_task_handle_fused);
 
         if true
-        // if false // @Phillip @Testing
         {
             let tmp_dir = tempfile::TempDir::new().unwrap();
             let _ = std::fs::remove_dir_all(tmp_dir.path());

@@ -280,7 +280,7 @@ async fn block_height_hash_from_hash(
     }
 }
 
-async fn block_from_hash( // @Phillip
+async fn block_from_hash(
     call: &TFLServiceCalls,
     hash: ZebBlockHash,
 ) -> Option<Arc<Block>> {
@@ -293,7 +293,7 @@ async fn block_from_hash( // @Phillip
     }
 }
 
-async fn is_block_known( // @Phillip
+async fn is_block_known(
     call: &TFLServiceCalls,
     hash: ZebBlockHash,
 ) -> bool {
