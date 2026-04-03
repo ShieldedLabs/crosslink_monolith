@@ -340,7 +340,7 @@ impl SliceRead for NearTipBranches {
                             if block.parent_hash == parent_hash {
                                 break 'find_branch block.this_height;
                             } else if block.this_hash == parent_hash {
-                                break 'find_branch block.this_height + 1;
+                                break 'find_branch block.this_height.checked_add(1)?;
                             }
                         }
                     }
@@ -348,8 +348,19 @@ impl SliceRead for NearTipBranches {
                 }
             };
 
-            let branch_hashes_size = end_i - hash_c;
-            let mut branch_blocks = Vec::with_capacity(branch_hashes_size);
+            if end_i <= hash_c { // zero-length branch or otherwise somehow precedes the current cursor
+                return None;
+            }
+
+            let branch_hashes_n = end_i - hash_c;
+            debug_assert!(branch_hashes_n < u32::MAX as usize, "more blocks in a branch than could be in a blockchain with 32-bit height values");
+
+            let mut branch_blocks = Vec::with_capacity(branch_hashes_n);
+
+            // We NEED to bounds check all the heights in this chain branch.
+            // This means we can later increment heights by 1 without checking.
+            let _ = bgn_height.checked_add(branch_hashes_n.try_into().ok()?)?;
+
             for i in hash_c..end_i {
                 let mut this_hash = Hash([0u8; 32]);
                 this_hash.0.copy_from_slice(&buf_hashes[i*32 .. (i+1)*32]);
@@ -361,6 +372,7 @@ impl SliceRead for NearTipBranches {
 
             hash_c = end_i;
 
+            debug_assert!(branch_blocks.len() > 0, "should not have been able to be empty");
             branches.push(branch_blocks);
         }
 
@@ -369,8 +381,29 @@ impl SliceRead for NearTipBranches {
 }
 
 
-pub fn chain_intersect(bgn: usize, end: usize, haystack: &[ShadowBlock]) -> Option<&[ShadowBlock]> {
-    None
+// @Todo: @Test.
+pub fn chain_intersect(height_bgn: u32, height_end: u32, haystack: &[ShadowBlock]) -> &[ShadowBlock] {
+    if haystack.len() <= 0 {
+        return &haystack[0..0];
+    }
+
+    let haystack_height_bgn = haystack[             0].this_height;
+    let haystack_height_end = haystack.last().unwrap().this_height + 1;
+
+    if (haystack_height_end - haystack_height_bgn) as usize != haystack.len() { 
+        #[cfg(debug_assertions)] panic!("Invariant violated: ShadowBlock chains are supposed to have one block per height");
+        return &haystack[0..0];
+    }
+
+    let ol_bgn = haystack_height_bgn.max(height_bgn);
+    let ol_end = haystack_height_end.min(height_end);
+    if ol_bgn < ol_end {
+        let i_bgn = (ol_bgn - haystack_height_bgn) as usize;
+        let i_end = (ol_end - haystack_height_bgn) as usize;
+        &haystack[i_bgn..i_end]
+    } else {
+        &haystack[0..0]
+    }
 }
 
 
@@ -712,13 +745,12 @@ pub fn sync(
                     continue;
                 }
 
-                for run in &their_tree.branches {
-                    for block in run {
-                        for chain in &near_tip_chains.chains {
-                            if chain.blocks.len() <= 0 {
-                                continue;
-                            }
-                        }
+                for their_branch in &their_tree.branches {
+                    let their_branch_height_bgn = their_branch[0].this_height;
+                    let their_branch_height_end = their_branch.last().unwrap().this_height + 1;
+
+                    for our_chain in &near_tip_chains.chains {
+                        let intersection = chain_intersect(their_branch_height_bgn, their_branch_height_end, &our_chain.blocks);
                     }
                 }
 
