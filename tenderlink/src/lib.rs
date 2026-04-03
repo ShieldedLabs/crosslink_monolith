@@ -21,6 +21,12 @@ const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
 const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
 
+const ANSI_GRY: &'static str = "\x1b[90m";
+const ANSI_RED: &'static str = "\x1b[91m";
+const ANSI_GRN: &'static str = "\x1b[92m";
+const ANSI_YLW: &'static str = "\x1b[93m";
+const ANSI_BLU: &'static str = "\x1b[34m";
+const ANSI_RST: &'static str = "\x1b[0m";
 
 // @Todo: MTU discovery
 const UDP_mMTU:        usize = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
@@ -34,7 +40,7 @@ const PATH_MTU: usize = UDP_mMTU
 const MAX_BANDWIDTH_BYTES_PER_SECOND: usize = 1_000_000;
 
 
-pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
+pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 // pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 
@@ -436,8 +442,9 @@ impl TMState {
         // TODO: send to (some) others
         let height   = self.rounds_data[round_i].height;
         let round    = self.rounds_data[round_i].round;
+        let ctx_str = self.ctx_str(roster);
         let Some(roster_i) = roster_i_from_pub_key(&roster[..active_roster_len(roster)], self.my_pub_key) else {
-            eprintln!("{} \x1b[91mBFT ERROR\x1b[0m: failed to find my own public key in the roster", self.ctx_str(roster));
+            eprintln!("{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: failed to find my own public key in the roster");
             return self.step;
         };
         match msg {
@@ -460,7 +467,7 @@ impl TMState {
                     // NOTE: we *DON'T* want to write it immediately to our proper store because it
                     // will confuse check_and_incorporate_msg
                     let sig = TMSig(self.my_signing_key.sign(&buf[..o]).to_bytes());
-                    if PRINT_SIGN { println!("{} [SIGN]: signed proposal with {:?}", self.ctx_str(roster), sig) };
+                    if PRINT_SIGN { println!("{ctx_str} {ANSI_GRY}SIGN{ANSI_RST}: signed proposal with {:?}", sig) };
 
                     // NOTE: we're faulty if we give our pub key for this if it's not our proposal
                     self.check_and_incorporate_msg(
@@ -474,11 +481,11 @@ impl TMState {
 
             TMMsgData::Prevote(value_id) | TMMsgData::Precommit(value_id) => {
                 let is_precommit: u8 = if let TMMsgData::Precommit(..) = msg { 1 } else { 0 };
-                if PRINT_BFT_VOTE { println!("{} [BFT_VOTE]: {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id); }
+                if PRINT_BFT_VOTE { println!("{ctx_str} {ANSI_GRY}BFT_VOTE{ANSI_RST}: {} on {}", ["prevoting", "precommitting"][is_precommit as usize], value_id); }
                 let packet_type = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit;
                 let signed_data = make_vote_sign_datas(roster[roster_i].pub_key, is_precommit != 0, height, round, value_id)[1];
                 let sig         = TMSig(self.my_signing_key.sign(&signed_data).to_bytes());
-                if PRINT_SIGN { println!("{} [SIGN]: signed {} with {:?}", self.ctx_str(roster), ["prevote", "precommit"][is_precommit as usize], sig) };
+                if PRINT_SIGN { println!("{ctx_str} {ANSI_GRY}SIGN{ANSI_RST}: signed {} with {:?}", ["prevote", "precommit"][is_precommit as usize], sig) };
 
                 self.check_and_incorporate_msg(
                     height, round, 0, value_id, -2,
@@ -493,7 +500,7 @@ impl TMState {
     /// Deterministic weighted round robin (hash & mod total zec on cumulative list)
     fn proposer_from_height_round(hash_keys: &HashKeys, roster: &[SortedRosterMember], height: u64, round: u32) -> (Option<usize>, PubKeyID) {
         if roster.len() == 0 {
-            eprintln!("\x1b[91mBFT ERROR\x1b[0m: trying to get proposer from empty roster");
+            eprintln!("{ANSI_RED}BFT ERROR{ANSI_RST}: trying to get proposer from empty roster");
             return (None, PubKeyID::NIL); // TODO: is a fixed value here exploitable? Presumably nobody can sign for it?
         }
 
@@ -507,7 +514,7 @@ impl TMState {
         let last_included_i = active_roster_len(roster) - 1;
         let total_included_stake = roster[last_included_i].cumulative_stake;
         if total_included_stake == 0 {
-            eprintln!("\x1b[91mBFT ERROR\x1b[0m: all roster members have no stake");
+            eprintln!("{ANSI_RED}BFT ERROR{ANSI_RST}: all roster members have no stake");
             return (None, PubKeyID::NIL); // TODO: is a fixed value here exploitable? Presumably nobody can sign for it?
         }
 
@@ -541,14 +548,15 @@ impl TMState {
         };
 
         if Self::proposer_from_height_round(&self.hash_keys, roster, self.height, round).1 == self.my_pub_key {
+            let ctx_str = self.ctx_str(roster);
             let proposal = if let Some(valid_value) = self.valid_value_round.0.clone() {
                 Some(valid_value)
             } else {
                 let ret = self.propose_closure.0().await;
-                if PRINT_BFT_PROPOSAL { if ret.is_none() { println!("{} [BFT_PROPOSAL]: propose closure returned None.", self.ctx_str(roster)); } }
+                if PRINT_BFT_PROPOSAL { if ret.is_none() { println!("{ctx_str} {ANSI_GRY}BFT_PROPOSAL{ANSI_RST}: propose closure returned None."); } }
                 ret
             };
-            if PRINT_BFT_PROPOSAL { if let Some(proposal) = &proposal { println!("{} [BFT_PROPOSAL]: about to propose with status '{:?}': {:?}", self.ctx_str(roster), self.validate_closure.0(&proposal).await, proposal); } }
+            if PRINT_BFT_PROPOSAL { if let Some(proposal) = &proposal { println!("{ctx_str} {ANSI_GRY}BFT_PROPOSAL{ANSI_RST}: about to propose with status '{:?}': {:?}", self.validate_closure.0(&proposal).await, proposal); } }
 
             // TODO: simple approach: send proposal messages to self when broadcasting
             // self.active_proposal_value_round = (Some(proposal), self.valid_value_round.1);
@@ -568,32 +576,32 @@ impl TMState {
     }
 
     fn check_and_incorporate_msg(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], roster_i: usize, packet_type: u8, signed_data: &[u8], sig: TMSig) -> TMStatus {
-        let me_str  = self.ctx_str(roster);
+        let ctx_str  = self.ctx_str(roster);
         let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(packet_type), height, round, chunk_i);
 
         if height != self.height {
-            // eprintln!("{}: BFT: received [{}] when we're at height {}", me_str, pkt_str, self.height);
+            // eprintln!("{ctx_str} {ANSI_GRY}BFT{ANSI_RST}: received [{}] when we're at height {}", pkt_str, self.height);
             return TMStatus::Fail;
         }
 
         // check if in (active) roster
         if roster_i >= active_roster_len(roster) {
-            eprintln!("{} [{}]: \x1b[91mBFT FAULT\x1b[0m: {} is not in the active roster.", me_str, pkt_str, roster_i);
+            eprintln!("{ctx_str} ({}): {ANSI_RED}BFT FAULT{ANSI_RST}: {} is not in the active roster.", pkt_str, roster_i);
             return TMStatus::Fail;
         }
 
         let from_pub_key = roster[roster_i].pub_key;
 
         // pkt_str += &format!(" from {} ({})", roster_i, from_pub_key);
-        let ctx_str = format!("{} [{} from {} {:?}]", me_str, pkt_str, roster_i, from_pub_key);
+        let ctx_str = format!("{ctx_str} [{} from {} {:?}]", pkt_str, roster_i, from_pub_key);
 
         // check if data was signed by pub key
         match sig.verify(from_pub_key, signed_data) { Ok(())=>{}, Err((err, str))=> {
-            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: {} [..{}]: for {} {}", ctx_str, str, signed_data.len(), value_id, err);
+            eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST}: {} (..{}): for {} {}", str, signed_data.len(), value_id, err);
             return TMStatus::Fail;
         }};
 
-        if PRINT_VALID_INCOMING { eprintln!("{} [VALID_INCOMING]: valid signature for value id: {}", ctx_str, value_id); }
+        if PRINT_VALID_INCOMING { eprintln!("{ctx_str} {ANSI_GRY}VALID_INCOMING{ANSI_RST}: valid signature for value id: {}", value_id); }
 
         // TODO: other checks
         // - data size check if we're doing network stuff
@@ -641,23 +649,23 @@ impl TMState {
                        round_data.proposal_id != value_id ||
                        round_data.proposal_valid_round != valid_round) { // Amnesiac Proposer's Dilemma
                         round_data.flush_for_amnesiac_proposer(value_id, valid_round, roster, hdr.proposal_size);
-                        eprintln!("{}: \x1b[93mAMNESIAC PROPOSER\x1b[0m at {}.{}.{}: Flushing proposal...", ctx_str, height, round, chunk_i);
+                        eprintln!("{ctx_str} {ANSI_YLW}AMNESIAC PROPOSER{ANSI_RST} at {}.{}.{}: Flushing proposal...", height, round, chunk_i);
                     } else {
                         if round_data.proposal.0.len() != hdr.proposal_size as usize {
-                            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different-size values ({:?}, {:?}). Ignoring latest...",
-                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal.0.len(), hdr.proposal_size);
+                            eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}.{}: proposer {} proposed 2 different-size values ({:?}, {:?}). Ignoring latest...",
+                            height, round, chunk_i, roster_i, round_data.proposal.0.len(), hdr.proposal_size);
                             return TMStatus::Fail;
                         }
                         if round_data.proposal_id != value_id {
                             // TODO: immediately class both as invalid?
-                            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different values ({:?}, {:?}). Ignoring latest...",
-                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal_id, value_id);
+                            eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}.{}: proposer {} proposed 2 different values ({:?}, {:?}). Ignoring latest...",
+                            height, round, chunk_i, roster_i, round_data.proposal_id, value_id);
                             return TMStatus::Fail;
                         }
                         if round_data.proposal_valid_round != valid_round {
                             // TODO: immediately class both as invalid
-                            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}.{}: proposer {} proposed 2 different valid rounds ({}, {}). Ignoring latest...",
-                            ctx_str, height, round, chunk_i, roster_i, round_data.proposal_valid_round, valid_round);
+                            eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}.{}: proposer {} proposed 2 different valid rounds ({}, {}). Ignoring latest...",
+                            height, round, chunk_i, roster_i, round_data.proposal_valid_round, valid_round);
                             return TMStatus::Fail;
                         }
                     }
@@ -688,7 +696,7 @@ impl TMState {
                             for is_precommit in 0..2 {
                                 if msg_val[is_precommit].0 != ValueId::NIL && msg_val[is_precommit].0 != value_id {
                                     prev_sig_had_fault = true;
-                                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} {} on non-proposed value {}. Ignoring...", ctx_str, height, round, roster_i, ["prevoted","precommitted"][is_precommit], value_id);
+                                    eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} {} on non-proposed value {}. Ignoring...", height, round, roster_i, ["prevoted","precommitted"][is_precommit], value_id);
                                     msg_val[is_precommit] = (ValueId::NIL, TMSig::NIL);
                                 }
                             }
@@ -708,23 +716,23 @@ impl TMState {
                         let check_value_id = round_data.proposal.id_from_value(&self.hash_keys);
                         if round_data.proposal_id != check_value_id {
                             round_data.proposal_is_faulty = true;
-                            eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: proposer's value_id does not match our calculation: {} != {}",
-                                ctx_str, round_data.proposal_id, check_value_id);
+                            eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST}: proposer's value_id does not match our calculation: {} != {}",
+                                round_data.proposal_id, check_value_id);
                             return TMStatus::Fail;
                         }
                     }
 
-                    if PRINT_BFT_UPDATE { println!("{} [BFT_UPDATE]: update to {}/{} proposal chunks on {}", ctx_str, round_data.proposal_sigs_n, round_data.proposal_sigs.len(), round_data.proposal_id); }
+                    if PRINT_BFT_UPDATE { println!("{ctx_str} {ANSI_GRY}BFT_UPDATE{ANSI_RST}: update to {}/{} proposal chunks on {}", round_data.proposal_sigs_n, round_data.proposal_sigs.len(), round_data.proposal_id); }
 
                     // TODO: include signed prevote & precommit for self?
                 } else if round_data.proposal_sigs[chunk_i] != sig { // TODO: check value/sig conformance
                     if is_my_proposal { // Amnesiac Proposer's Dilemma
                         round_data.flush_for_amnesiac_proposer(value_id, valid_round, roster, hdr.proposal_size);
-                        eprintln!("{}: \x1b[93mAMNESIAC PROPOSER\x1b[0m at {}.{}.{}: Flushing proposal...", ctx_str, height, round, chunk_i);
+                        eprintln!("{ctx_str} {ANSI_YLW}AMNESIAC PROPOSER{ANSI_RST} at {}.{}.{}: Flushing proposal...", height, round, chunk_i);
                     } else {
                         // TODO: treat this as a failed is_valid & early out before awaiting full proposal
                         round_data.proposal_is_faulty = true;
-                        eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: proposer signed 2 different values. Ignoring latest...", ctx_str);
+                        eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST}: proposer signed 2 different values. Ignoring latest...");
                         return TMStatus::Fail;
                     }
                 } else {
@@ -745,7 +753,7 @@ impl TMState {
                     // if we don't have a real proposal yet we can't check for validity
                     TMStatus::Indeterminate
                 } else if round_data.proposal_id != value_id {
-                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on non-proposed value {}. Ignoring...", ctx_str, height, round, roster_i, value_id);
+                    eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} voted on non-proposed value {}. Ignoring...", height, round, roster_i, value_id);
                     return TMStatus::Fail;
                 } else {
                     TMStatus::Pass
@@ -757,7 +765,7 @@ impl TMState {
                 let new_val_sig = (value_id, sig);
                 if old_val_sig.1 != TMSig::NIL && new_val_sig != old_val_sig {
                     // TODO: do we want to allow for NIL updating to valid?
-                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m at {}.{}: finalizer {} voted on 2 different values ({:?}, {:?}). Ignoring latest...", ctx_str, height, round, roster_i, new_val_sig, old_val_sig);
+                    eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} voted on 2 different values ({:?}, {:?}). Ignoring latest...", height, round, roster_i, new_val_sig, old_val_sig);
                     return TMStatus::Fail;
                 }
                 // Checks now finished //////////////////////////
@@ -776,7 +784,7 @@ impl TMState {
                     d.yes_prevotes   |
                     d.yes_precommits |
                     d.nil_prevotes) != 0 {
-                    println!("{}: update to {:?} (d: {:?})", ctx_str, round_data.counts, d);
+                    println!("{ctx_str} {ANSI_GRY}BFT_UPDATE{ANSI_RST}: update to {:?} (d: {:?})", round_data.counts, d);
                 }
 
                 #[cfg(debug_assertions)]
@@ -786,7 +794,7 @@ impl TMState {
                         check_counts = check_counts + ConsensusCounts::from(&(*sig, roster[i].stake));
                     }
                     if check_counts != round_data.counts {
-                        eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: counts don't match: incremental: {:?}, absolute: {:?}", ctx_str, round_data.counts, check_counts);
+                        eprintln!("{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: counts don't match: incremental: {:?}, absolute: {:?}", round_data.counts, check_counts);
                     }
                 }
 
@@ -795,7 +803,7 @@ impl TMState {
 
 
             _ => {
-                eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: unexpected case: {}", ctx_str, packet_type);
+                eprintln!("{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: unexpected case: {}", packet_type);
                 TMStatus::Fail
             }
         }
@@ -808,7 +816,15 @@ impl TMState {
 
     fn ctx_str(&self, roster: &[SortedRosterMember]) -> String {
         // format!("{:?} {:05}-{:?}-{:?}.{:3}.{:3}.{:9}", roster.into_iter().map(|m| m.pub_key).collect::<Vec<_>>(), self.my_port, self.my_pub_key, roster_i_from_pub_key(roster, self.my_pub_key), self.height, self.round, format!("{:?}", self.step))
-        format!("{:05}-{:?}-{:>8}.{:3}.{:3}.{:9}", self.my_port, self.my_pub_key, format!("{:?}", roster_i_from_pub_key(roster, self.my_pub_key)), self.height, self.round, format!("{:?}", self.step))
+        // format!("{:05}-{:?}-{:>8}.{:3}.{:3}.{:9}", self.my_port, self.my_pub_key, format!("{:?}", roster_i_from_pub_key(roster, self.my_pub_key)), self.height, self.round, format!("{:?}", self.step))
+        let pk = self.my_pub_key;
+        let roster_i = roster_i_from_pub_key(roster, pk);
+        // let pk_str = if roster_i.is_some() { format!("{pk:?} ") } else { "          ".to_string() };
+        format!("{pk:?}{:>2}:{:2}.{:2}.{:>9}",
+                roster_i.map(|i| format!("{i}")).unwrap_or(" ".to_string()),
+                self.height,
+                self.round,
+                format!("{:?}", self.step))
     }
     fn name_str_other(roster: &[SortedRosterMember], bft_key: PubKeyID, address: Option<&STPAddress>) -> String {
         let port = address.map_or(0, |a| a.port);
@@ -845,7 +861,7 @@ impl TMState {
             // TODO: don't spam "while" messages repeatedly
             let is_current_height_and_round = (self.height, self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
             // println!("{:#?}", self);
-            if PRINT_BFT_STATE { println!("{} [BFT_STATE]: {}={}.{}, {}/{}, {}", ctx_str,
+            if PRINT_BFT_STATE { println!("{ctx_str} {ANSI_GRY}BFT_STATE{ANSI_RST}: {}={}.{}, {}/{}, {}",
                     ["!","="][is_current_height_and_round as usize],
                     self.rounds_data[i].height, self.rounds_data[i].round,
                     self.rounds_data[i].proposal_sigs_n, self.rounds_data[i].proposal_sigs.len(),
@@ -871,10 +887,10 @@ impl TMState {
                     self.locked_value_round.1 == -1 ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone())) // TODO(perf): use (previously-checked) ids for easier comparison?
                 {
-                    if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 22-0: receive first proposal this height", ctx_str); }
+                    if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 22-0: receive first proposal this height"); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
                 } else {
-                    if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 22-1: receive first proposal this height", ctx_str); }
+                    if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 22-1: receive first proposal this height"); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                 }
             }
@@ -893,10 +909,10 @@ impl TMState {
                     self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone()))
                 {
-                    if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 28-0: received 2f+1 prevotes", ctx_str); }
+                    if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 28-0: received 2f+1 prevotes"); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
                 } else {
-                    if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 28-1: received 2f+1 prevotes", ctx_str); }
+                    if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 28-1: received 2f+1 prevotes"); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                 }
             }
@@ -910,7 +926,7 @@ impl TMState {
                 self.step == TMStep::Prevote &&
                 !self.rounds_data[i].timeout_triggered[0]) // "for the first time" // ALT: round.timeout_step != TMStep::Prevote
             {
-                if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 34: last orders on prevote period", ctx_str); }
+                if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 34: last orders on prevote period"); }
                 self.rounds_data[i].timeout_triggered[0] = true;
                 self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Prevote));
             }
@@ -925,9 +941,9 @@ impl TMState {
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
-                if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 36: seen 2f+1 valid prevotes", ctx_str); }
+                if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 36: seen 2f+1 valid prevotes"); }
                 if self.step == TMStep::Prevote {
-                    if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 36-0: seen 2f+1 valid prevotes", ctx_str); }
+                    if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 36-0: seen 2f+1 valid prevotes"); }
                     self.locked_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
                     self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
                 }
@@ -942,7 +958,7 @@ impl TMState {
                 big_threshold <= counts.nil_prevotes &&
                 self.step == TMStep::Prevote)
             {
-                if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 44: seen 2f+1 nil prevotes", ctx_str); }
+                if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 44: seen 2f+1 nil prevotes"); }
                 self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
             }
 
@@ -953,7 +969,7 @@ impl TMState {
                 big_threshold <= counts.precommits &&
                 !self.rounds_data[i].timeout_triggered[1])
             {
-                if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 47: last orders on precommit period", ctx_str); }
+                if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 47: last orders on precommit period"); }
                 self.rounds_data[i].timeout_triggered[1] = true;
                 self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Precommit));
             }
@@ -967,9 +983,9 @@ impl TMState {
                 big_threshold <= counts.yes_precommits &&
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
-                if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 49: value decided", ctx_str); }
+                if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 49: value decided"); }
                 let new_roster = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster), self.rounds_data[i].proposal_sigs.clone()).await;
-                if PRINT_ROSTER { println!("{} [ROSTER]: new roster: {:?}", ctx_str, new_roster); }
+                if PRINT_ROSTER { println!("{ctx_str} {ANSI_GRY}ROSTER{ANSI_RST}: new roster: {:?}", new_roster); }
                 *roster = new_roster;
                 self.height += 1;
                 self.recent_commit_round_cache.push(self.rounds_data[i].clone());
@@ -986,7 +1002,7 @@ impl TMState {
                 self.round    <  self.rounds_data[i].round  &&
                 small_threshold <= counts.anys)
             {
-                if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 55: round catchup", ctx_str); }
+                if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 55: round catchup"); }
                 self.start_round(roster, now, self.rounds_data[i].round).await
             }
 
@@ -1000,15 +1016,15 @@ impl TMState {
                 // TODO(code): can we just use *our* step or is there a possible sequence issue? (from the presence of step checks, probably not)
                 match timeout.step {
                     TMStep::Propose => if self.step == TMStep::Propose {
-                        if PRINT_BFT_TIMEOUTS { println!("{} [BFT_TIMEOUTS]: hit timeout propose", ctx_str); }
+                        if PRINT_BFT_TIMEOUTS { println!("{ctx_str} {ANSI_GRY}BFT_TIMEOUTS{ANSI_RST}: hit timeout propose"); }
                         self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                     },
                     TMStep::Prevote => if self.step == TMStep::Prevote {
-                        if PRINT_BFT_TIMEOUTS { println!("{} [BFT_TIMEOUTS]: hit timeout prevote", ctx_str); }
+                        if PRINT_BFT_TIMEOUTS { println!("{ctx_str} {ANSI_GRY}BFT_TIMEOUTS{ANSI_RST}: hit timeout prevote"); }
                         self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
                     },
                     TMStep::Precommit => {
-                        if PRINT_BFT_TIMEOUTS { println!("{} [BFT_TIMEOUTS]: hit timeout precommit", ctx_str); }
+                        if PRINT_BFT_TIMEOUTS { println!("{ctx_str} {ANSI_GRY}BFT_TIMEOUTS{ANSI_RST}: hit timeout precommit"); }
                         self.start_round(roster, now, self.round + 1).await
                     },
                 }
@@ -1023,7 +1039,7 @@ impl TMState {
             {
                 match self.rounds_data[i].proposal_checked_validity.1 {
                     TMStatusReason::NeedsBlock { hash } => {
-                        println!("{}: \x1b[93mBLOCK NEEDED\x1b[0m hash: {:?}...", ctx_str, hash);
+                        println!("{ctx_str} {ANSI_YLW}BLOCK NEEDED{ANSI_RST} hash: {:?}...", hash);
                     },
                     _ => {
                     }
@@ -1068,7 +1084,7 @@ pub use crate::bandwidth_test::fmt_prefixed_byte_str_rev;
 pub use crate::bandwidth_test::CONNECT_MAGIC1_PLAIN_TEXT;
 pub use crate::bandwidth_test::crypto_overhead_from_connect_magic1;
 pub use crate::bandwidth_test::new_keypair_from_connect_magic1_with_seed;
-pub use crate::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
+pub use crate::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 pub use crate::native_sockets::ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
 
 
@@ -1383,6 +1399,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                          roster: &[SortedRosterMember],
                                          send_buf1: &mut [u8],
                                          peer_random: u64) -> usize {
+            let ctx_str = bft_state.ctx_str(roster);
+
             let mut header = header_;
             header.tag |= if include_status { PACKET_TAG_STATUS_FLAG as u64 } else { 0 };
 
@@ -1416,7 +1434,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             // TODO: "with removal"
                         }
                     }
-                    if PRINT_RNGS { println!("{} [RNGS]: request proposal  chunks {:?} from {:?}", bft_state.ctx_str(roster), status.need_proposal_chunk_rngs, proposal_chunk_rngs); }
+                    if PRINT_RNGS { println!("{ctx_str} {ANSI_GRY}RNGS{ANSI_RST}: request proposal  chunks {:?} from {:?}", status.need_proposal_chunk_rngs, proposal_chunk_rngs); }
 
                     for is_precommit in 0..2 {
                         let vote_rngs = gen_mostly_empty_rngs(active_roster_len(roster), |i| round_data.msg_val_sigs[i][is_precommit].1 == TMSig::NIL);
@@ -1429,7 +1447,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 // TODO: "with removal"
                             }
                         }
-                        if PRINT_RNGS { println!("{} [RNGS]: request {:9} chunks {:?} from {:?}", bft_state.ctx_str(roster), ["prevote", "precommit"][is_precommit], status.need_vote_rngs[is_precommit], vote_rngs); }
+                        if PRINT_RNGS { println!("{ctx_str} {ANSI_GRY}RNGS{ANSI_RST}: request {:9} chunks {:?} from {:?}", ["prevote", "precommit"][is_precommit], status.need_vote_rngs[is_precommit], vote_rngs); }
                     }
 
                 }
@@ -1565,12 +1583,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 match round_data.proposal_sigs[chunk_i].verify(proposer_pub_key, &send_buf1[signed_data_start..sig_o]) {
                                     Ok(_) => {}
                                     Err((err, str)) => {
-                                        eprintln!("{ctx_str}: \x1b[91mBFT FAULT\x1b[0m: {str} [..{}]: for proposal from {proposer_pub_key:?} {height}.{round}.{chunk_i}: {} {err}", sig_o-1, chunk_hdr.proposal_id);
+                                        eprintln!("{ctx_str}: {ANSI_RED}BFT FAULT{ANSI_RST}: {str} [..{}): for proposal from {proposer_pub_key:?} {height}.{round}.{chunk_i}: {} {err}", sig_o-1, chunk_hdr.proposal_id);
                                         continue;
                                     }
                                 }
 
-                                if PRINT_SENDS { println!("{} [SENDS]: sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer_bft_key); }
+                                if PRINT_SENDS { println!("{ctx_str} {ANSI_GRY}SENDS{ANSI_RST}: sending proposal chunk {} to {:?}", chunk_i, peer_bft_key); }
                                 sent_chunk_cs += 1;
                                 print_packet_tag_send(header);
                                 send_noise_msg(packets_to_send, connection_key, &send_buf1[..o], stats);
@@ -1599,14 +1617,14 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             for i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
                                 let (roster_i, sig) = (packet.votes[i].roster_i as usize, &packet.votes[i].sig);
                                 let Some(member) = roster.get(roster_i) else {
-                                    eprintln!("{ctx_str}: \x1b[91mBFT ERROR\x1b[0m: {} from {roster_i} - not in roster {}.{}: {}", ["prevote", "precommit"][is_precommit], packet.height, packet.round, packet.value_id);
+                                    eprintln!("{ctx_str}: {ANSI_RED}BFT ERROR{ANSI_RST}: {} from {roster_i} - not in roster {}.{}: {}", ["prevote", "precommit"][is_precommit], packet.height, packet.round, packet.value_id);
                                     return;
                                 };
                                 let pub_key = member.pub_key;
                                 let sign_datas = make_vote_sign_datas(pub_key, is_precommit != 0, packet.height, packet.round, packet.value_id);
                                 let sign_data  = &sign_datas[(i >= packet.no_votes_n as usize) as usize];
                                 match sig.verify(pub_key, sign_data) { Ok(_)=>{} Err((err, str)) => {
-                                    eprintln!("{ctx_str}: \x1b[91mBFT FAULT\x1b[0m: {str} [..{}]: for {} from {roster_i}-{pub_key:?} {}.{}: {} {err}",
+                                    eprintln!("{ctx_str}: {ANSI_RED}BFT FAULT{ANSI_RST}: {str} [..{}): for {} from {roster_i}-{pub_key:?} {}.{}: {} {err}",
                                         sign_data.len(), ["prevote", "precommit"][is_precommit], packet.height, packet.round, packet.value_id);
                                 }}
                             }
@@ -1616,14 +1634,14 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             let (value_id, sig) = round_data.msg_val_sigs[roster_i][is_precommit as usize];
                             if sig != TMSig::NIL {
                                 let pub_key_sig = PubKeySig{ roster_i: roster_i.try_into().unwrap(), sig };
-                                // println!("{} {}: packing in sig from {}", ctx_str, PubKeyID(my_root_public_bft_key.into()), pub_key_sig.pub_key);
+                                // println!("{} {}: packing in sig from {}", PubKeyID(my_root_public_bft_key.into()), pub_key_sig.pub_key);
 
                                 if packet.value_id == ValueId::NIL {
                                     // NOTE(azmr): gossip seen votes even if we haven't seen proposal, but only 1 non-nil value id per packet
                                     packet.value_id = value_id;
                                 }
                                 if value_id != ValueId::NIL && value_id != packet.value_id {
-                                    eprintln!("{}: \x1b[91mBFT FAULT\x1b[0m: local mismatch: {:?} vs {:?}", ctx_str, packet.value_id, value_id);
+                                    eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST}: local mismatch: {:?} vs {:?}", packet.value_id, value_id);
                                     continue;
                                 }
 
@@ -1640,7 +1658,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
                                     sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
                                     // full evidence block; send it
-                                    if PRINT_SENDS { println!("{} [SENDS]: sending full {} block: {:#?}", ctx_str, ["prevote", "precommit"][is_precommit as usize], packet); }
+                                    if PRINT_SENDS { println!("{ctx_str} {ANSI_GRY}SENDS{ANSI_RST}: sending full {} block: {:#?}", ["prevote", "precommit"][is_precommit as usize], packet); }
                                     dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet);
 
                                     let mut o = 0;
@@ -1665,13 +1683,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         // send any half-filled vote blocks
                         if (packet.no_votes_n + packet.yes_votes_n) > 0 {
                             sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
-                            // println!("{} half-filled block pre-gap-close: {:#?}", ctx_str, packet);
+                            // println!("{} half-filled block pre-gap-close: {:#?}", packet);
                             // move items from end to fill gap
                             for gap_i in 0..packet.votes.len() - (packet.no_votes_n + packet.yes_votes_n) as usize {
                                 packet.votes[packet.no_votes_n as usize + gap_i] = packet.votes[packet.votes.len() - 1 - gap_i];
                             }
 
-                            if PRINT_SENDS { println!("{} [SENDS]: half-filled block post-gap-close: {:#?}", ctx_str, packet); }
+                            if PRINT_SENDS { println!("{ctx_str} {ANSI_GRY}SENDS{ANSI_RST}: half-filled block post-gap-close: {:#?}", packet); }
                             dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet);
 
                             let mut o = 0;
@@ -1690,12 +1708,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         }
                     }
 
-                    if PRINT_SEND_CS && sent_chunk_cs > 0 { eprintln!("{} [SEND_CS]: sent {} proposal chunks", ctx_str, sent_chunk_cs); }
-                    if PRINT_SEND_CS && sent_c[0]     > 0 { eprintln!("{} [SEND_CS]: sent {} prevotes",        ctx_str, sent_c[0]);     }
-                    if PRINT_SEND_CS && sent_c[1]     > 0 { eprintln!("{} [SEND_CS]: sent {} precommits",      ctx_str, sent_c[1]);     }
+                    if PRINT_SEND_CS && sent_chunk_cs > 0 { eprintln!("{ctx_str} {ANSI_GRY}SEND_CS{ANSI_RST}: sent {} proposal chunks", sent_chunk_cs); }
+                    if PRINT_SEND_CS && sent_c[0]     > 0 { eprintln!("{ctx_str} {ANSI_GRY}SEND_CS{ANSI_RST}: sent {} prevotes",        sent_c[0]);     }
+                    if PRINT_SEND_CS && sent_c[1]     > 0 { eprintln!("{ctx_str} {ANSI_GRY}SEND_CS{ANSI_RST}: sent {} precommits",      sent_c[1]);     }
                 }
 
-                if PRINT_PEERS { println!("{} [PEERS]: {:?}", ctx_str, peers.iter().map(|(ck, p)| {
+                if PRINT_PEERS { println!("{ctx_str} {ANSI_GRY}PEERS{ANSI_RST}: {:?}", peers.iter().map(|(ck, p)| {
                     let bft_key = connections_map.get(ck)
                         .and_then(|c| bft_key_address_map.get_key(&c.address()))
                         .copied()
@@ -1740,7 +1758,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                     &mut net_stats);
                         }
                     } else {
-                        eprintln!("{}: \x1b[91mBFT ERROR\x1b[0m: round_data array was empty", ctx_str);
+                        eprintln!("{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: round_data array was empty");
                     }
                 }
 
@@ -1757,8 +1775,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let  bpp =  bpp as u32;
 
                     if kbps != 0 {
-                        println!("{}: \x1b[92mNET\x1b[0m: {} KB/s | {} packets/s | {} bytes/packet",
-                                 ctx_str, kbps, pps, bpp);
+                        println!("{ctx_str} {ANSI_GRN}NET{ANSI_RST}: {} KB/s | {} packets/s | {} bytes/packet",
+                                 kbps, pps, bpp);
                     }
                 }
 
