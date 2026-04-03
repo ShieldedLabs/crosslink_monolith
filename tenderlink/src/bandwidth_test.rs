@@ -79,7 +79,7 @@ fn contested_encrypted_test() {
 pub const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s: u64 = 0x7193_c304_f8d5;
 pub const CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b: u64 = 0xbe53_b364_1ce1;
 pub const CONNECT_MAGIC1_PLAIN_TEXT: u64 = 0x5bb2_2856_ae53;
-pub fn noise_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
+pub fn crypto_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     match magic {
         CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s => Some("Noise_IK_25519_ChaChaPoly_BLAKE2s"),
         CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b => Some("Noise_IK_25519_ChaChaPoly_BLAKE2b"),
@@ -110,8 +110,8 @@ pub fn new_keypair_from_connect_magic1(magic1: u64) -> Option<IdentityKeyPair> {
         ret.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
         return Some(ret);
     }
-    if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
-        let kp = snow::Builder::new(noise_string.parse().ok()?).generate_keypair().ok()?;
+    if let Some(crypto_string) = crypto_string_from_connect_magic1(magic1) {
+        let kp = snow::Builder::new(crypto_string.parse().ok()?).generate_keypair().ok()?;
         Some(IdentityKeyPair { magic1, private: kp.private, public: kp.public })
     } else { None }
 }
@@ -122,10 +122,10 @@ pub fn new_keypair_from_connect_magic1_with_seed(magic1: u64, seed: [u8; 32]) ->
         ret.magic1 = CONNECT_MAGIC1_PLAIN_TEXT;
         return Some(ret);
     }
-    if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
+    if let Some(crypto_string) = crypto_string_from_connect_magic1(magic1) {
         use rand::SeedableRng;
         let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
-        let kp = snow::Builder::with_resolver(noise_string.parse().ok()?, Box::new(SnowRngResolver { rng: RustIsBadRngWrapper(rng) })).generate_keypair().ok()?;
+        let kp = snow::Builder::with_resolver(crypto_string.parse().ok()?, Box::new(SnowRngResolver { rng: RustIsBadRngWrapper(rng) })).generate_keypair().ok()?;
         Some(IdentityKeyPair { magic1, private: kp.private, public: kp.public })
     } else { None }
 }
@@ -446,7 +446,7 @@ pub fn connect_to_endpoint(
         else {
             let mut hello_packet_payload = vec![0u8; 1024];
             store_u48(&mut hello_packet_payload[0..6], my_connect_keypair.magic1);
-            let mut handshake = snow::Builder::new(noise_string_from_connect_magic1(my_connect_keypair.magic1).unwrap().parse().unwrap())
+            let mut handshake = snow::Builder::new(crypto_string_from_connect_magic1(my_connect_keypair.magic1).unwrap().parse().unwrap())
                 .prologue(&hello_packet_payload[0..6]).unwrap()
                 .local_private_key(&my_connect_keypair.private[..]).unwrap()
                 .remote_public_key(&endpoint.key[..]).unwrap()
@@ -695,11 +695,11 @@ pub fn service_connections(
                         }
                     }
                 }
-                else if let Some(noise_string) = noise_string_from_connect_magic1(magic1) {
+                else if let Some(crypto_string) = crypto_string_from_connect_magic1(magic1) {
                     for key_i in 0..my_listen_keypairs.len() {
                         let my_kp = my_listen_keypairs[key_i];
                         if my_kp.magic1 == magic1 {
-                            let mut new_handshake = snow::Builder::new(noise_string.parse().unwrap())
+                            let mut new_handshake = snow::Builder::new(crypto_string.parse().unwrap())
                                 .prologue(&packet_memory_encrypted[0..6]).unwrap()
                                 .local_private_key(&my_kp.private).unwrap()
                                 .build_responder().unwrap();

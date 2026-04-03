@@ -514,6 +514,15 @@ pub fn sync(
     let mut peer_addresses: Vec<STPAddress> = Vec::new();
     for peer_str in &config.network_initial_peers {
         if let Some(address) = STPAddress::parse(peer_str) {
+            if address.magic1 != CRYPTO_MAGIC {
+                // @Dev
+                panic!("The magic in the config toml - {} ({}) is different from the crypto magic - {} ({})! Modify one or the other!",
+                        tenderlink::bandwidth_test::b64(&address.magic1.to_le_bytes()[..6]),
+                        tenderlink::bandwidth_test::crypto_string_from_connect_magic1(address.magic1).unwrap_or("<invalid>"),
+                        tenderlink::bandwidth_test::b64(&CRYPTO_MAGIC  .to_le_bytes()[..6]),
+                        tenderlink::bandwidth_test::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
+                        );
+            }
             println!("NewNet: Connecting to peer: {:?}", address);
             let _ = connect_to(socket, &mut connections_map, &my_keypairs, &address);
             peer_addresses.push(address);
