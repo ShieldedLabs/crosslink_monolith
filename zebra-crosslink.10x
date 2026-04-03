@@ -45,53 +45,15 @@
 				<RebuildCommand></RebuildCommand>
 				<BuildFileCommand></BuildFileCommand>
 				<CleanCommand></CleanCommand>
-				<BuildWorkingDirectory></BuildWorkingDirectory>
+				<BuildWorkingDirectory>./zebra-crosslink</BuildWorkingDirectory>
 				<FileSyntaxCheckCommand></FileSyntaxCheckCommand>
 				<CancelBuild></CancelBuild>
 				<Exe></Exe>
 				<Args></Args>
-				<WorkingDirectory>C:\Work\ShieldedLabs\crosslink_monolith</WorkingDirectory>
+				<WorkingDirectory>./zebra-crosslink</WorkingDirectory>
 				<DebugCommand></DebugCommand>
 				<DebuggerExe></DebuggerExe>
-				<DebugSln>C:\Work\ShieldedLabs\crosslink_monolith\zebra-crosslink\zebra-crosslink.sln</DebugSln>
-				<Defines></Defines>
-				<ForceIncludes></ForceIncludes>
-				<PrioritiseFiles></PrioritiseFiles>
-			</ConfigAndPlatform>
-			<ConfigAndPlatform>
-				<Name>debug:x64</Name>
-				<BuildCommand>phuild.bat -$(Configuration)</BuildCommand>
-				<RebuildCommand></RebuildCommand>
-				<BuildFileCommand></BuildFileCommand>
-				<CleanCommand></CleanCommand>
-				<BuildWorkingDirectory></BuildWorkingDirectory>
-				<FileSyntaxCheckCommand></FileSyntaxCheckCommand>
-				<CancelBuild></CancelBuild>
-				<Exe></Exe>
-				<Args></Args>
-				<WorkingDirectory>$(WorkspaceDirectory)</WorkingDirectory>
-				<DebugCommand>$(Executable)</DebugCommand>
-				<DebuggerExe></DebuggerExe>
-				<DebugSln></DebugSln>
-				<Defines></Defines>
-				<ForceIncludes></ForceIncludes>
-				<PrioritiseFiles></PrioritiseFiles>
-			</ConfigAndPlatform>
-			<ConfigAndPlatform>
-				<Name>release:x64</Name>
-				<BuildCommand>phuild.bat -$(Configuration)</BuildCommand>
-				<RebuildCommand></RebuildCommand>
-				<BuildFileCommand></BuildFileCommand>
-				<CleanCommand></CleanCommand>
-				<BuildWorkingDirectory></BuildWorkingDirectory>
-				<FileSyntaxCheckCommand></FileSyntaxCheckCommand>
-				<CancelBuild></CancelBuild>
-				<Exe></Exe>
-				<Args></Args>
-				<WorkingDirectory>$(WorkspaceDirectory)</WorkingDirectory>
-				<DebugCommand>$(Executable)</DebugCommand>
-				<DebuggerExe></DebuggerExe>
-				<DebugSln></DebugSln>
+				<DebugSln>./zebra-crosslink/zebra-crosslink.sln</DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
 				<PrioritiseFiles></PrioritiseFiles>
@@ -102,14 +64,6 @@
 			</Config>
 			<Config>
 				<Name>Release</Name>
-				<Defines></Defines>
-			</Config>
-			<Config>
-				<Name>debug</Name>
-				<Defines></Defines>
-			</Config>
-			<Config>
-				<Name>release</Name>
 				<Defines></Defines>
 			</Config>
 			<Platform>

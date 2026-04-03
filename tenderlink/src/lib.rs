@@ -28,7 +28,7 @@ const ANSI_YLW: &'static str = "\x1b[93m";
 const ANSI_BLU: &'static str = "\x1b[34m";
 const ANSI_RST: &'static str = "\x1b[0m";
 
-// @Todo: MTU discovery
+// @Todo: MTU discovery // @Duplicate with NewNet.
 const UDP_mMTU:        usize = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
 const STP_HEADER_SIZE: usize = 6 + crypto_overhead_from_connect_magic1(CRYPTO_MAGIC).unwrap();
 const STP_PACKLET_HDR: usize = std::mem::size_of::<crate::bandwidth_test::PackletHeader>();
@@ -821,7 +821,7 @@ impl TMState {
         let roster_i = roster_i_from_pub_key(roster, pk);
         // let pk_str = if roster_i.is_some() { format!("{pk:?} ") } else { "          ".to_string() };
         format!("{pk:?}{:>2}:{:2}.{:2}.{:>9}",
-                roster_i.map(|i| format!("{i}")).unwrap_or(" ".to_string()),
+                roster_i.map(|i| format!("{i}")).unwrap_or(Default::default()),
                 self.height,
                 self.round,
                 format!("{:?}", self.step))

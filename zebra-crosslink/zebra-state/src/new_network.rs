@@ -28,6 +28,19 @@ pub fn push_block_event(event: BlockEvent) {
 // NewNet packet types // @Todo: share common messages/code with Tenderlink
 // ---------------------------------------------------------------------------
 
+// @Todo: MTU discovery // @Duplicate with Tenderlink.
+const UDP_mMTU:        usize = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
+const STP_HEADER_SIZE: usize = 6 + crypto_overhead_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+const STP_PACKLET_HDR: usize = std::mem::size_of::<PackletHeader>();
+const STP_JUMBO_HDR:   usize = std::mem::size_of::<PackletOneJumboFragment>();
+const PATH_MTU: usize = UDP_mMTU
+                      - STP_HEADER_SIZE
+                      - STP_PACKLET_HDR;
+const JUMBO_FRAG_SIZE: usize = UDP_mMTU
+                             - STP_HEADER_SIZE
+                             - STP_PACKLET_HDR
+                             - STP_JUMBO_HDR;
+
 // const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
@@ -35,34 +48,13 @@ const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 const PACKET_TYPE_STATUS: u8 = 1;
 const PACKET_TYPE_BLOCK: u8 = 2;
 
-#[derive(Clone, Copy, Debug)]
-struct PacketStatus {
-    height: u32,
-    hash:   Hash,
-}
-const PACKET_STATUS_SIZE: usize = 4 /*height*/ + 32 /*hash*/;
 
-impl SliceWrite for PacketStatus {
-    fn write_to(&self, buf: &mut [u8]) -> usize {
-        let mut o = 0;
-        o += self.height.write_to(&mut buf[o..]);
-        o += self.hash.0.write_to(&mut buf[o..]);
-        o
-    }
-}
-impl SliceRead for PacketStatus {
-    fn read_from(buf: &mut &[u8]) -> Option<Self> {
-        Some(PacketStatus {
-            height: u32::read_from(buf)?,
-            hash:   Hash(SliceRead::read_from(buf)?)
-        })
-    }
-}
+const PACKET_STATUS_MAX_SIZE: usize = (65536 / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE;
 
 #[derive(Clone, Copy, Debug)]
 struct PacketHashTreeHdr {
     tip_height: u32,
-    hashes_start_offset: u16,
+    hashes_start_offset: u16, // we will never want >16384 branches in one status... that's a bushy tip
     // [PacketHashBranch]
     // [Hash] @ hashes_start_offset
 }
@@ -145,7 +137,7 @@ impl NearTipChain {
 /// (either on startup or after crosslink finalization)
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NearTipChains {
-    chains: Vec<NearTipChain>,
+    chains: Vec<NearTipChain>, // @Todo: should we cap max chains tracked? (we could make everything fixed size!!)
 }
 impl NearTipChains {
     /// Height of *best* chain, which is probably, but not necessarily, the longest chain
@@ -266,7 +258,11 @@ impl SliceWrite for NearTipChains {
         let mut o      = hdr.write_to(&mut buf[..]);
         let mut hash_c = 0usize;
         for (mut branch, height) in &runs {
-            let run_start_if_last_run = o + std::mem::size_of_val(&branch) + (hash_c * 32);
+            let disconnected = (<usize>::from(branch.parent_hash_idx) == hash_c);
+
+            let run_start_if_last_run = o
+                                      + std::mem::size_of_val(&branch) + disconnected as usize * std::mem::size_of_val(&height)
+                                      + hash_c * 32;
             if run_start_if_last_run + 32 > buf.len() {
                 // wouldn't be able to fit any more hashes in, no point in starting another run
                 break;
@@ -279,8 +275,10 @@ impl SliceWrite for NearTipChains {
                 branch.branch_end_idx = (hash_c + rem_hashes).try_into().unwrap();
             }
 
+            // write (parent, end)
             o += branch.write_to(&mut buf[o..]);
-            if (<usize>::from(branch.parent_hash_idx) == hash_c) {
+            if disconnected {
+                // write height, so we will have written (parent, end, height)
                 o += height.write_to(&mut buf[o..]);
             }
             hash_c = branch.branch_end_idx.into();
@@ -305,59 +303,74 @@ impl SliceRead for NearTipBranches {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
         let full_buf = *buf;
         let hdr = PacketHashTreeHdr::read_from(buf)?;
-        *buf = &buf[..(hdr.hashes_start_offset as usize).saturating_sub(std::mem::size_of::<PacketHashTreeHdr>())];
+        let hdr_len = full_buf.len() - buf.len(); // @Todo: better way to do this.
+        *buf = &buf[..(hdr.hashes_start_offset as usize).saturating_sub(hdr_len)];
         let mut buf_hashes: &mut &[u8] = &mut &full_buf[hdr.hashes_start_offset as usize..];
-        let mut branches = Vec::new();
+        let mut branches: Vec<Vec<ShadowBlock>> = Vec::new();
 
-        let mut hash_c = 0;
-        let mut branch_height = 0;
+        let mut hash_c = 0usize;
         while buf.len() > 0 {
-            let branch = PacketHashBranch::read_from(buf)?;
-            if branch.parent_hash_idx >= branch.branch_end_idx {
-                branch_height = u32::read_from(buf)?;
-                hash_c += (branch.parent_hash_idx == branch.branch_end_idx) as u16;
-            }
-            else {
-                // TODO: get branch height from previous hash point (height from beginning of run +
-                // offset)
-                // branches.find...
-            }
-            if branch.branch_end_idx as usize * 32 > buf_hashes.len() {
+            let (parent_i, end_i) = {
+                let branch = PacketHashBranch::read_from(buf)?;
+                (branch.parent_hash_idx as usize, branch.branch_end_idx as usize)
+            };
+            if end_i.saturating_mul(32) > buf_hashes.len() {
                 println!("received invalid Hash Tree packet (branch end)");
                 return None;
             }
-            let parent_i = branch.parent_hash_idx as usize;
-            if (parent_i.saturating_add(1)) * 32 > buf_hashes.len() {
+            if parent_i.saturating_add(1).saturating_mul(32) > buf_hashes.len() {
                 println!("received invalid Hash Tree packet (parent hash)");
                 return None;
             }
 
+            let mut parent_hash = Hash([0u8; 32]);
+            parent_hash.0.copy_from_slice(&buf_hashes[parent_i * 32..(parent_i+1) * 32]);
 
-            let mut parent_hash = [0u8;32];
-            parent_hash.copy_from_slice(&buf_hashes[parent_i * 32..(parent_i+1) * 32]);
+            let bgn_height = if parent_i > hash_c {
+                return None; // deciding this is malformed for now...
+            } else if parent_i == hash_c {
+                hash_c += 1;
+                u32::read_from(buf)?
+            } else {
+                // Get branch height from previous hash point (height from beginning of run + offset).
+                // @Todo(Perf) @Speed: store a Vec of [bgn_i, end_i) so we can binary search to find which branch parent_i is in.
+                'find_branch: {
+                    for branch in &branches {
+                        for block in branch {
+                            if block.parent_hash == parent_hash {
+                                break 'find_branch block.this_height;
+                            } else if block.this_hash == parent_hash {
+                                break 'find_branch block.this_height + 1;
+                            }
+                        }
+                    }
+                    return None;
+                }
+            };
 
-            let branch_hashes_size = (branch.branch_end_idx - hash_c) as usize;
-            let mut branch_blocks = Vec::with_capacity(branch_hashes_size / 32);
-            for i in (hash_c as usize) .. (branch.branch_end_idx as usize) {
-                let mut hash = [0u8;32];
-                hash.copy_from_slice(&buf_hashes[i*32 .. (i+1)*32]);
+            let branch_hashes_size = end_i - hash_c;
+            let mut branch_blocks = Vec::with_capacity(branch_hashes_size);
+            for i in hash_c..end_i {
+                let mut this_hash = Hash([0u8; 32]);
+                this_hash.0.copy_from_slice(&buf_hashes[i*32 .. (i+1)*32]);
 
-                branch_blocks.push(ShadowBlock{
-                    parent_hash: Hash(parent_hash),
-                    this_hash: Hash(hash),
-                    this_height: branch_height,
-                });
-                parent_hash = hash;
-                branch_height += 1;
+                let this_height = bgn_height + (i - hash_c) as u32;
+                branch_blocks.push(ShadowBlock { parent_hash, this_hash, this_height });
+                parent_hash = this_hash;
             }
 
-            hash_c = branch.branch_end_idx;
+            hash_c = end_i;
 
             branches.push(branch_blocks);
         }
 
         Some(Self { tip_height: hdr.tip_height, branches })
     }
+}
+
+
+pub fn chain_intersect(bgn: usize, end: usize, haystack: &[ShadowBlock]) -> Option<&[ShadowBlock]> {
+    None
 }
 
 
@@ -435,18 +448,18 @@ pub fn sync(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(500);
     BLOCK_EVENT_QUEUE_SENDER.set(event_tx).unwrap();
 
-    let (mut tip_height, mut tip_hash) = loop {
-        let Some(tip) = get_tip(&read_state, &rt)
-        else {
-            std::thread::yield_now();
-            continue;
-        };
-        break tip;
-    };
-    println!("NewNet: Starting at height={} hash={:?}", tip_height.0, tip_hash);
-
     let mut near_tip_chains = NearTipChains { chains: Vec::new() };
     'init_near_tip_chains: {
+        let (tip_height, tip_hash) = loop {
+            let Some(tip) = get_tip(&read_state, &rt)
+            else {
+                std::thread::yield_now();
+                continue;
+            };
+            break tip;
+        };
+        println!("NewNet: Starting at height={} hash={:?}", tip_height.0, tip_hash);
+
         let near_tip_start_height = Height(tip_height.0.saturating_sub(NEAR_TIP_CHAIN_LEN+1));
         let Some(near_tip_start_hash) = get_bc_hash_at_height(&read_state, &rt, near_tip_start_height) else {
             break 'init_near_tip_chains;
@@ -535,16 +548,15 @@ pub fn sync(
 
     // Sync state
     let tick_duration = std::time::Duration::from_millis(TICK_MS);
-    let mut peer_statuses = HashMap::<ConnectionKey, PacketStatus>::new();
 
-    let mut committed_blocks = HashSet::new();
+    let mut blocks_to_send_peers = Vec::<(ConnectionKey, Hash)>::new();
+
+    let mut serialized_blocks = HashMap::new(); // @Todo: cap max memory storage size for this map.
+    let mut committed_blocks = HashSet::new(); // @Todo: @Remove.
 
     // Main sync loop
     loop {
-        if let Some(tip) = get_tip(&read_state, &rt) {
-            (tip_height, tip_hash) = tip;
-        }
-        println!("tip height: {}", tip_height.0);
+        println!("tip height: {:?}", near_tip_chains.tip_height());
 
         let loop_start = std::time::Instant::now();
 
@@ -555,8 +567,7 @@ pub fn sync(
                     match block_event {
                         BlockEvent::Committed(hash) => {
                             // TODO: BlockEvents should contain enough info to insert a shadow block
-                            // @Todo: announce this block
-                            if let Some((hdr, height, hash)) = get_hdr_at_hash(&read_state, &rt, hash){
+                            if let Some((hdr, height, hash)) = get_hdr_at_hash(&read_state, &rt, hash) {
                                 near_tip_chains.push_blocks(&[ShadowBlock {
                                     parent_hash: hdr.previous_block_hash,
                                     this_hash: hash,
@@ -584,58 +595,53 @@ pub fn sync(
             }
         }
 
-        // @Todo: Send all chains, not just best chain.
-        // Currently this only lives for one tick because we currently only map height->best chain block.
-        let mut serialized_blocks = HashMap::new();
-
-        for (connection_key, peer_status) in &peer_statuses {
+        for (connection_key, hash) in &blocks_to_send_peers {
             let Some(connection) = get_connected(&connections_map, connection_key) else { continue; };
 
-            for height in peer_status.height.saturating_sub(10)..peer_status.height + 2 {
-                if !serialized_blocks.contains_key(&height) {
-                    let res = rt.block_on(async {
-                        read_state.clone().oneshot(ReadRequest::Block(Height(height).into())).await
-                    });
-                    match res {
-                        Ok(ReadResponse::Block(Some(block))) => {
-                            serialized_blocks.insert(height, (block.zcash_serialize_to_vec().unwrap(), block.hash()));
-                        }
-                        Ok(ReadResponse::Block(None)) => { break; }
-                        Err(err) => { panic!("sync start err: {err:?}");               }
-                        _        => { panic!("sync err: unhandled response: {res:?}"); }
+            if !serialized_blocks.contains_key(hash) {
+                let res = rt.block_on(async {
+                    read_state.clone().oneshot(ReadRequest::Block((*hash).into())).await
+                });
+                match res {
+                    Ok(ReadResponse::Block(Some(block))) => {
+                        let hash = block.hash();
+                        serialized_blocks.insert(hash, block.zcash_serialize_to_vec().unwrap());
                     }
+                    Ok(ReadResponse::Block(None)) => { break; }
+                    Err(err) => { panic!("sync start err: {err:?}");               }
+                    _        => { panic!("sync err: unhandled response: {res:?}"); }
                 }
-                let (serialized, hash) = &serialized_blocks[&height];
-
-                let mut buf = Vec::new();
-
-                if serialized.len() >= (1 << 23) - 1 {
-                    eprintln!("NewNet ERROR: Block too big! Was {:?} bytes, max is {}!", serialized.len(), (1 << 23) - 1);
-                    continue;
-                }
-
-                buf.push(PACKET_TYPE_BLOCK);
-                buf.extend(serialized);
-
-                packets_to_send.push((*connection_key, buf));
-                // eprintln!("\x1b[93mPOWLINK2 SENDING BLOCK HASH\x1b[0m: {}", hash);
             }
-        }
+            let serialized = &serialized_blocks[&hash];
 
+            let mut buf = Vec::new();
 
-        let our_status = PacketStatus { height: tip_height.0, hash: tip_hash };
-        let mut buf = [0u8; 1 + 1024];
-        let mut o = 0;
-        o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
-        o += our_status        .write_to(&mut buf[o..]);
-        // o += near_tip_chains.write_to(&mut buf[o..]); // @Phillip <<<<<<<<<<<<<<
-
-        for (key, connection) in &connections_map {
-            if !connection.is_connected() {
+            if serialized.len() >= (1 << 23) - 1 {
+                eprintln!("NewNet ERROR: Block too big! Was {:?} bytes, max is {}!", serialized.len(), (1 << 23) - 1);
                 continue;
             }
 
-            packets_to_send.push((*key, Vec::from(&buf[..o])));
+            buf.push(PACKET_TYPE_BLOCK);
+            buf.extend(serialized);
+
+            packets_to_send.push((*connection_key, buf));
+            // eprintln!("\x1b[93mPOWLINK2 SENDING BLOCK HASH\x1b[0m: {}", hash);
+        }
+        blocks_to_send_peers.clear();
+
+        if near_tip_chains.tip_height().is_some() {
+            let mut buf = [0u8; PACKET_STATUS_MAX_SIZE];
+            let mut o = 0;
+            o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
+            o += near_tip_chains   .write_to(&mut buf[o..]);
+
+            for (key, connection) in &connections_map {
+                if !connection.is_connected() {
+                    continue;
+                }
+
+                packets_to_send.push((*key, Vec::from(&buf[..o])));
+            }
         }
 
         use rand::seq::SliceRandom;
@@ -670,36 +676,55 @@ pub fn sync(
         // Process received packets
         while packets_received.len() > 0 {
             let (connection_key, msg) = packets_received.remove(0);
+            let mut msg = &msg[..];
+
+            // fn kill(map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, key: ConnectionKey) {
+            //     map.remove(&key);
+            // }
+            let mut kill = || connections_map.remove(&connection_key);
 
             // if time_limit_exceeded {
             //     stp_library::signal_backpressure(PacketID(&msg));
             //     break; // Congested! Drop remainder!
             // }
 
-            if msg.is_empty() {
-                // @Todo: disconnect this peer, likely denial of some kind or faulty
+            let Some(packet_type) = <u8>::read_from(&mut msg)
+            else {
+                kill();
                 continue;
-            }
-
-            let packet_type = msg[0];
+            };
 
             if packet_type == PACKET_TYPE_STATUS {
-                let Some(status) = PacketStatus::read_from(&mut &msg[1..]) else { continue; }; // @Phillip <<<<<<<<<<<<<<
+                let Some(our_tip_height) = near_tip_chains.tip_height()
+                else {
+                    continue;
+                };
 
-                let prev = peer_statuses.get(&connection_key).copied();
-                peer_statuses.insert(connection_key, status);
+                let Some(their_tree) = NearTipBranches::read_from(&mut msg)
+                else {
+                    kill();
+                    continue;
+                };
 
-                // Log when a peer's height changes or is first seen
-                let changed = prev.map_or(true, |p| p.height != status.height);
-                if changed {
-                    println!("NewNet: Peer {:?} at height={} hash={:?}", connection_key, status.height, status.hash);
-                    if status.height > tip_height.0 {
-                        println!("NewNet: Peer {:?} is ahead of us ({} > {})", connection_key, status.height, tip_height.0);
+                // @Todo: If the peer is far behind, beam them blocks from farther back in our chain to catch them up.
+                // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
+                if their_tree.tip_height + NEAR_TIP_CHAIN_LEN < our_tip_height {
+                    continue;
+                }
+
+                for run in &their_tree.branches {
+                    for block in run {
+                        for chain in &near_tip_chains.chains {
+                            if chain.blocks.len() <= 0 {
+                                continue;
+                            }
+                        }
                     }
                 }
+
             } else if packet_type == PACKET_TYPE_BLOCK {
                 use zebra_chain::serialization::ZcashDeserializeInto;
-                let Ok(block) = (&msg[1..]).zcash_deserialize_into::<Block>() else { continue; };
+                let Ok(block) = msg.zcash_deserialize_into::<Block>() else { continue; };
 
                 let (hash, height) = (block.hash(), block.coinbase_height());
                 // eprintln!("\x1b[93mPOWLINK2 GOT BLOCK HASH\x1b[0m: {}", hash);
@@ -743,9 +768,6 @@ pub fn sync(
 
         }
 
-        // Remove statuses for disconnected peers
-        peer_statuses.retain(|key, _| connections_map.contains_key(key));
-
         // Sleep remainder of tick
         let elapsed = loop_start.elapsed();
         if elapsed < tick_duration {
@@ -778,7 +800,7 @@ mod tests {
             ShadowBlock { parent_hash: Hash([0x19;32]), this_hash: Hash([0x1a;32]), this_height:10 },
             ShadowBlock { parent_hash: Hash([0x1a;32]), this_hash: Hash([0x1b;32]), this_height:11 },
         ];
-        let mut buf = [0u8, 1200];
+        let mut buf = [0u8; PATH_MTU];
 
         let mut chains = NearTipChains { chains: Vec::new() };
         let res = chains.write_packet_hash_tree(&mut buf);
