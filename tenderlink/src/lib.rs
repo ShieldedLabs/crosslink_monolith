@@ -35,12 +35,14 @@ const NOISE_HEADER_SIZE:     usize =   16;
 const MAX_PATH_HEADERS_SIZE: usize = (IPV6_HEADER_SIZE + UDP_HEADER_SIZE + WIREGUARD_HEADER_SIZE + VPN_HEADER_SIZE + NOISE_NONCE_SIZE + NOISE_HEADER_SIZE);
 
 const PATH_MTU: usize = ETHERNET_FRAME_SIZE - MAX_PATH_HEADERS_SIZE;
+// const PATH_MTU: usize = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY - 6 - crypto_overhead_from_connect_magic1(CRYPTO_MAGIC).unwrap();
 
 // Tweak this!
 const MAX_BANDWIDTH_BYTES_PER_SECOND: usize = 1_000_000;
 
 
-pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
+// pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 
 use static_assertions::{const_assert};
@@ -1066,15 +1068,18 @@ pub struct PeerInfo {
 }
 
 pub use crate::helpers::*;
-pub use crate::bandwidth_test::IdentityKeyPair;
-pub use crate::bandwidth_test::ConnectionKey;
 pub use crate::bandwidth_test::STPAddress;
 pub use crate::bandwidth_test::fmt_byte_str;
+pub use crate::bandwidth_test::ConnectionKey;
+pub use crate::bandwidth_test::IdentityKeyPair;
 pub use crate::bandwidth_test::fmt_byte_str_rev;
 pub use crate::bandwidth_test::fmt_prefixed_byte_str;
 pub use crate::bandwidth_test::fmt_prefixed_byte_str_rev;
+pub use crate::bandwidth_test::CONNECT_MAGIC1_PLAIN_TEXT;
+pub use crate::bandwidth_test::crypto_overhead_from_connect_magic1;
 pub use crate::bandwidth_test::new_keypair_from_connect_magic1_with_seed;
-pub use crate::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+pub use crate::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
+pub use crate::native_sockets::ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
 
 
 pub const MAX_P2P_DISCOVERY_PUBKEY_SIZE: usize = 32;
@@ -1769,15 +1774,19 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         for _ in 0..1024 {
             let more = service_connections(&mut connections_map,
-                                &mut packets_received,
-                                &packets_to_send,
-                                &mut packet_memory_encrypted,
-                                &mut packet_memory_recv,
-                                &mut packet_memory_send,
-                                socket,
-                                &my_keypairs);
+                                           &mut packets_received,
+                                           &packets_to_send,
+                                           &mut packet_memory_encrypted,
+                                           &mut packet_memory_recv,
+                                           &mut packet_memory_send,
+                                           socket,
+                                           &my_keypairs);
             packets_to_send.clear();
-            if more == false { break; }
+            if more == false {
+                break;
+            } else {
+                print!("");
+            }
         }
 
         // Ensure a Peer entry exists for every active connection
@@ -1792,12 +1801,20 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         while packets_received.len() > 0 {
             let (mut connection_key, mut peer, mut msg) = {
                 let (key, packet) = packets_received.remove(0);
-                (key, peers.get_mut(&key).unwrap(), packet)
+                let Some(peer) = peers.get_mut(&key)
+                else {
+                    continue;
+                };
+                (key, peer, packet)
             };
             let msg: &[u8] = &msg[..];
-            if msg.len() == 0 { continue; }
+            if msg.len() == 0 {
+                continue;
+            }
             let Some((header, status, read_o)) = read_header_and_maybe_status(&msg[..])
-            else { continue; };
+            else {
+                continue;
+            };
             let packet_type = header.type_();
 
 
@@ -1882,15 +1899,17 @@ const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     names
 };
 fn packet_name_from_tag(packet_tag: u8) -> &'static str {
-    PACKET_TYPE_NAMES.get(packet_tag as usize).unwrap_or(&["<UNKNOWN>", "STATUS+<UNKNOWN>"])[(packet_tag >> PACKET_TAG_STATUS_SHIFT & 1) as usize]
+    PACKET_TYPE_NAMES.get((packet_tag & PACKET_TYPE_MASK) as usize).unwrap_or(&["<UNKNOWN>", "STATUS+<UNKNOWN>"])[(packet_tag >> PACKET_TAG_STATUS_SHIFT & 1) as usize]
 }
 fn print_packet_tag_send(header: PacketHeader) {
-    if header.type_() >= PACKET_TYPE_PROPOSAL_CHUNK { return; } // @Debug
-    if PRINT_PROTOCOL_TAG { println!("PACKET_{} ->", packet_name_from_tag(header.tag())); }
+    if PRINT_PROTOCOL_TAG {
+        println!("PACKET_{} ->", packet_name_from_tag(header.tag()));
+    }
 }
 fn print_packet_tag_recv(header: PacketHeader) {
-    if header.type_() >= PACKET_TYPE_PROPOSAL_CHUNK { return; } // @Debug
-    if PRINT_PROTOCOL_TAG { println!("<- PACKET_{}", packet_name_from_tag(header.tag())); }
+    if PRINT_PROTOCOL_TAG {
+        println!("<- PACKET_{}", packet_name_from_tag(header.tag()));
+    }
 }
 
 // NOTE(azmr): could add packet sizes so we can check all sizes in 1 location

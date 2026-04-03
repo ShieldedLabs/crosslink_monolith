@@ -1949,8 +1949,10 @@ version = "0.26.1"
 dependencies = [
  "bip32",
  "blake2b_simd",
+ "blake3",
  "block-buffer 0.11.0-rc.3",
  "bs58",
+ "byteorder",
  "core2",
  "crypto-common 0.2.0-rc.1",
  "document-features",

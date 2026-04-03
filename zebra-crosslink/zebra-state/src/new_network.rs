@@ -28,8 +28,8 @@ pub fn push_block_event(event: BlockEvent) {
 // NewNet packet types // @Todo: share common messages/code with Tenderlink
 // ---------------------------------------------------------------------------
 
-//const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
-const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
+const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
+// const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 // @Todo: more of these, merge with Tenderlink, reintroduce peer discovery from p2p, etc.
 const PACKET_TYPE_STATUS: u8 = 1;
@@ -525,8 +525,6 @@ pub fn sync(
     println!("NewNet: STP setup complete, port={}, peers={}", config.network_local_port, peer_addresses.len());
 
     // Sync state
-    let mut awaiting_blocks_from: Option<ConnectionKey> = None;
-    let mut last_request_time = std::time::Instant::now();
     let tick_duration = std::time::Duration::from_millis(TICK_MS);
     let mut peer_statuses = HashMap::<ConnectionKey, PacketStatus>::new();
 

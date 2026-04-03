@@ -88,7 +88,7 @@ pub fn noise_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
     }
 }
 
-pub fn crypto_overhead_from_connect_magic1(magic: u64) -> Option<usize> {
+pub const fn crypto_overhead_from_connect_magic1(magic: u64) -> Option<usize> {
     match magic {
         CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s => Some(16),
         CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b => Some(16),
@@ -262,6 +262,7 @@ pub struct ConnectionTrackingData {
     pub other_transport_identity: Vec<u8>,
     pub connection_state: ConnectionState,
     pub jumbo_reassembly: JumboReassembly,
+    // pub reliable_streams: ReliableStreams,
 }
 impl ConnectionTrackingData {
     pub fn address(&self) -> STPAddress {
@@ -475,8 +476,8 @@ pub fn connect_to_endpoint(
     }
 }
 
-const        VERBOSE                :bool=0!=                (0);
-const OVERLY_VERBOSE                :bool=0!=                (0);
+const        VERBOSE                :bool=0!=                (1);
+const OVERLY_VERBOSE                :bool=0!=                (1);
 
 macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
 
@@ -716,13 +717,20 @@ pub fn service_connections(
                                                     // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
                                                     let handshake_size = new_handshake.write_message(&[], &mut packet_memory_send[6..]).unwrap();
                                                     let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
-                                                    
+
                                                     debug_assert!(new_handshake.is_handshake_finished());
                                                     let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
-                                                    
+
                                                     existing_connection.connection_state = ConnectionState::SendingServerHello { cipher, magic1: *magic1, last_sent_time_ns: 0, hello_packet_payload };
+                                                    if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHello.", connection_key.key_15_bits); }
+                                                } else {
+                                                    if OVERLY_VERBOSE { println!("Did NOT transition {} to SendingServerHello: We \"lost\" the contended initiator comparison.", connection_key.key_15_bits); }
                                                 }
+                                            } else {
+                                                if OVERLY_VERBOSE { println!("Did NOT transition {} to SendingServerHello: We were not in the SendingClientHello state.", connection_key.key_15_bits); }
                                             }
+                                        } else {
+                                            if OVERLY_VERBOSE { println!("Did NOT respond to client hello from {}: @Todo explanation: Following expression was false: &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key", connection_key.key_15_bits); }
                                         }
                                     }
                                     else {
@@ -750,19 +758,34 @@ pub fn service_connections(
                                                 jumbo_reassembly: Default::default(),
                                             },
                                         );
+
+                                        if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHello.", connection_key.key_15_bits); }
                                     }
+                                } else {
+                                    if OVERLY_VERBOSE { println!("Did NOT respond to Client Hello from {:?}: @Todo explanation: Following expression failed: let Some(client_key) = new_handshake.get_remote_static()", (other_ip_addr, other_port)); }
                                 }
+                            } else {
+                                if OVERLY_VERBOSE { println!("Did NOT respond to Client Hello from {:?}: @Todo explanation: let Ok(list_of_protocols_len_bytes) = new_handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).", (other_ip_addr, other_port)); }
                             }
                         }
                     }
                 }
             }
             else { // Not client hello
+                if OVERLY_VERBOSE {
+                    println!("Not a client hello. Processing...");
+                }
+
                 let mut kill_connection: Option<ConnectionKey> = None;
-                'conn: loop { // just for early out
+                'conn: {
                     let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: first_six_bytes as u16 };
-                    let Some(existing_connection) = connections_map.get_mut(&connection_key) else { break; };
-                    
+                    let Some(existing_connection) = connections_map.get_mut(&connection_key) else {
+                        if OVERLY_VERBOSE {
+                            println!("Packet arrived from non-connection. Drop!");
+                        }
+                        break 'conn;
+                    };
+
                     match &mut existing_connection.connection_state {
                         ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
                             if first_six_bytes >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
@@ -781,8 +804,12 @@ pub fn service_connections(
                                         recv_time_ns: timestamp_ns,
                                     };
                                 }
+                            } else {
+                                if OVERLY_VERBOSE {
+                                    println!("Dropping from {connection_key:?} because this was false: first_six_bytes >> 16 == 0xffff_ffff && buf_len >= 6 + 32");
+                                }
                             }
-                            break;
+                            break 'conn;
                         }
                         ConnectionState::SendingClientHello { magic1, last_sent_time_ns, hello_packet_payload, handshake } => {
                             if first_six_bytes >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
@@ -807,9 +834,17 @@ pub fn service_connections(
                                     let ConnectionState::SendingClientHello { handshake, .. } = old_state else { panic!(); };
                                     let ConnectionState::Connected { cipher, .. } = &mut existing_connection.connection_state else { panic!(); };
                                     *cipher = Some(ConnectionCipherTriplet::new_from_old_init_only(handshake.into_stateless_transport_mode().expect("Cannot fail given assert above.")));
+                                } else {
+                                    if OVERLY_VERBOSE {
+                                        println!("Dropping from {connection_key:?} because this failed: let Ok(payload_len) = handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..])");
+                                    }
+                                }
+                            } else {
+                                if OVERLY_VERBOSE {
+                                    println!("Dropping from {connection_key:?} because this was false: first_six_bytes >> 16 == 0xffff_ffff && buf_len >= 6 + 32");
                                 }
                             }
-                            break;
+                            break 'conn;
                         }
                         ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
                             if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
@@ -831,7 +866,9 @@ pub fn service_connections(
                             // Optimization done here. It can never be cipher.old so we skip checking.
                             can_decrypt |= cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
                             can_decrypt |= cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
-                            if can_decrypt == false { break; }
+                            if can_decrypt == false {
+                                break 'conn;
+                            }
 
                             if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
                             existing_connection.connection_state = ConnectionState::Connected {
@@ -862,7 +899,7 @@ pub fn service_connections(
                                 payload = &packet_memory_recv[0..payload_len];
                                 cipher.ratchet_forward_incoming();
                             }
-                            else { break; }
+                            else { break 'conn; }
                         }
                         else {
                             payload = &packet_memory_encrypted[6..buf_len];
@@ -871,6 +908,8 @@ pub fn service_connections(
                         *recv_time_ns = timestamp_ns;
 
                         if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
+
+                        let mMTU_inside_stp = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY - 6 - crypto_overhead_from_connect_magic1(*magic1).unwrap() - std::mem::size_of::<PackletHeader>();
 
                         let mut msg = payload;
                         while !msg.is_empty() {
@@ -882,25 +921,44 @@ pub fn service_connections(
                                 }
                                 None => break
                             };
-                            if msg.len() < len { eprintln!("truncated packlet"); break; }
+                            if msg.len() < len {
+                                eprintln!("truncated packlet");
+                                break 'conn;
+                            }
                             let (mut body, remainder) = msg.split_at(len);
 
                             match tag {
                                 PackletTag::OneJumboFragment => {
-                                    let Some(frag) = PackletOneJumboFragment::read_from(&mut body) else { eprintln!("truncated jumbo fragment"); continue };
+                                    let Some(frag) = PackletOneJumboFragment::read_from(&mut body)
+                                    else {
+                                        eprintln!("truncated jumbogram fragment");
+                                        break 'conn;
+                                    };
                                     let frag_data = body;
 
                                     if OVERLY_VERBOSE {
                                         println!("Jumbo fragment: id={} total_len={} byte_idx={} frag_len={}",
-                                            frag.id(), frag.total_len(), frag.byte_idx(), frag_data.len());
+                                                 frag.id(), frag.total_len(), frag.byte_idx(), frag_data.len());
                                     }
 
-                                    let frag_id = frag.id();
+                                    let frag_id   = frag.id();
                                     let total_len = frag.total_len();
-                                    let byte_idx = frag.byte_idx();
+                                    let byte_idx  = frag.byte_idx();
 
-                                    if total_len == 0 || total_len > MAX_REASSEMBLY_TOTAL_LEN || frag_data.is_empty() {
-                                        eprintln!("bad jumbo fragment params, killing connection");
+                                    if total_len <= mMTU_inside_stp {
+                                        eprintln!("jumbogram fragment is so small that it should have been a datagram");
+                                        kill_connection = Some(connection_key); break 'conn;
+                                    }
+                                    if total_len > MAX_REASSEMBLY_TOTAL_LEN {
+                                        eprintln!("jumbogram is bigger than the biggest allowed jumbogram");
+                                        kill_connection = Some(connection_key); break 'conn;
+                                    }
+                                    if frag_data.is_empty() {
+                                        eprintln!("jumbogram fragment is empty");
+                                        kill_connection = Some(connection_key); break 'conn;
+                                    }
+                                    if frag_data.len() >= total_len {
+                                        eprintln!("jumbogram fragment is bigger than the entire jumbogram that it should have been a datagram");
                                         kill_connection = Some(connection_key); break 'conn;
                                     }
 
@@ -947,9 +1005,11 @@ pub fn service_connections(
                             msg = remainder;
                         }
                     }
-                    break;
                 }
                 if let Some(key) = kill_connection {
+                    if OVERLY_VERBOSE {
+                        eprintln!("Killing {key:?}.");
+                    }
                     connections_map.remove(&key);
                 }
             }
@@ -1042,13 +1102,18 @@ pub fn service_connections(
 
     for (connection_key, data) in packets_to_send {
         let Some(ref mut connection) = connections_map.get_mut(connection_key)
-        else { continue; };
+        else {
+            continue;
+        };
 
         let ConnectionState::Connected { magic1, cipher, send_sequence_number, jumbogram_index, last_sent_keep_alive_time_ns, recv_time_ns } = &mut connection.connection_state
-        else { continue; };
+        else {
+            continue;
+        };
 
-        let mtu_inside_udp = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
-        let mtu_inside_stp = mtu_inside_udp - 6 - crypto_overhead_from_connect_magic1(*magic1).unwrap();
+        // mMTU - minimum MTU
+        let mMTU_inside_udp = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
+        let mMTU_inside_stp = mMTU_inside_udp - 6 - crypto_overhead_from_connect_magic1(*magic1).unwrap();
 
         let mut send = |payload: &[u8]| {
             let mut o = 0;
@@ -1065,30 +1130,43 @@ pub fn service_connections(
                 o += payload.write_to(&mut packet_memory_encrypted[o..]);
             }
 
-            assert!(o == mtu_inside_udp);
+            assert!(o == mMTU_inside_udp);
 
             udp_send_with_congestion_and_dscp(socket, connection.other_ip, connection.other_port, &packet_memory_encrypted[..o], Dscp::BestEffort);
         };
 
-        let fragment_max_size = mtu_inside_stp - std::mem::size_of::<PackletHeader>() - std::mem::size_of::<PackletOneJumboFragment>();
+        let fragment_max_size = mMTU_inside_stp - std::mem::size_of::<PackletHeader>() - std::mem::size_of::<PackletOneJumboFragment>();
 
-        let mut jumbo_o: usize = 0;
-        for fragment in data.chunks(fragment_max_size) {
-            let hdr  = PackletHeader::new(PackletTag::OneJumboFragment, (std::mem::size_of::<PackletOneJumboFragment>() + fragment.len()) as usize);
-            let frag = PackletOneJumboFragment::new(*jumbogram_index, data.len(), jumbo_o);
-            jumbo_o += fragment.len();
+        if data.len() > fragment_max_size {
+            let mut jumbo_o: usize = 0;
+            for fragment in data.chunks(fragment_max_size) {
+                let hdr  = PackletHeader::new(PackletTag::OneJumboFragment, std::mem::size_of::<PackletOneJumboFragment>() + fragment.len());
+                let frag = PackletOneJumboFragment::new(*jumbogram_index, data.len(), jumbo_o);
+                jumbo_o += fragment.len();
+
+                let mut o = 0;
+                o += hdr     .write_to(&mut packet_memory_send[o..]);
+                o += frag    .write_to(&mut packet_memory_send[o..]);
+                o += fragment.write_to(&mut packet_memory_send[o..]);
+                if o < mMTU_inside_stp {
+                    packet_memory_send[o..mMTU_inside_stp].fill(0); // @Todo: real packlet framing
+                }
+
+                send(&packet_memory_send[..mMTU_inside_stp]);
+            }
+            *jumbogram_index = jumbogram_index.wrapping_add(1) & ((1 << 18) - 1);
+        } else {
+            let hdr  = PackletHeader::new(PackletTag::AnEntireDatagram, data.len());
 
             let mut o = 0;
-            o += hdr     .write_to(&mut packet_memory_send[o..]);
-            o += frag    .write_to(&mut packet_memory_send[o..]);
-            o += fragment.write_to(&mut packet_memory_send[o..]);
-            if o < mtu_inside_stp {
-                packet_memory_send[o..mtu_inside_stp].fill(0); // @Todo: real packlet framing
+            o += hdr .write_to(&mut packet_memory_send[o..]);
+            o += data.write_to(&mut packet_memory_send[o..]);
+            if o < mMTU_inside_stp {
+                packet_memory_send[o..mMTU_inside_stp].fill(0); // @Todo: real packlet framing
             }
 
-            send(&packet_memory_send[..mtu_inside_stp]);
+            send(&packet_memory_send[..mMTU_inside_stp]);
         }
-        *jumbogram_index = jumbogram_index.wrapping_add(1) & ((1 << 18) - 1);
     }
 
     result
