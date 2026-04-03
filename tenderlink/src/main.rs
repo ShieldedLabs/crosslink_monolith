@@ -29,11 +29,18 @@ fn main() {
         }
     }
 
+    let args: Vec<String> = std::env::args().collect();
+    let mut i: usize = usize::MAX;
+    if args.len() > 1 {
+        i = args[1].parse().unwrap_or(usize::MAX);
+    }
+    println!("Command line: {:?}", args);
+    tenderlink::run_instances(i);
+
+    /*
     const P2P_PORT: u16 = 12345;
 
     const SEEDER_CRYPTO: u64 = bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
-
-    tenderlink::run_instances(if args.contains(&"p2p".to_string()) { 0 } else { 1 });
 
     let seed = [7, 11, 99, 220, 101, 143, 113,   4, 242, 136,  58, 150, 223, 186, 106, 203,
                67, 18, 48,  96, 176,  69, 152, 173, 224,  46, 206, 156, 217,  31, 170, 165];
@@ -70,5 +77,6 @@ fn main() {
     if use_ipv6 { peers.push(bandwidth_test::STPAddress::from(ip6, P2P_PORT, &seeder_keypair)); }
 
     p2p_test::p2p(0, SEEDER_CRYPTO, None, peers, use_ipv4, use_ipv6);
+    */
 }
 

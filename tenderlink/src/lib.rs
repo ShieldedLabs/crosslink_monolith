@@ -8,34 +8,27 @@ const PRINT_PROTOCOL:       bool = 1 == 1;
 const PRINT_PROTOCOL_TAG:   bool = 0 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
 const PRINT_NETWORK_STATS:  bool = 1 == 1;
-const PRINT_PEERS:          bool = 1 == 1;
-const PRINT_VALID_INCOMING: bool = 1 == 1;
+const PRINT_PEERS:          bool = 0 == 1;
+const PRINT_VALID_INCOMING: bool = 0 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
 const PRINT_RNGS:           bool = 0 == 1;
 const PRINT_SIGN:           bool = 0 == 1;
-const PRINT_BFT_PROPOSAL:   bool = 1 == 1;
+const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
 const PRINT_BFT_VOTE:       bool = 1 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
-const PRINT_BFT_STATE:      bool = 1 == 1;
+const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
 const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
 
 
-// MTU discovery is an option, but for now we're adopting a very conservative and VPN-friendly fixed-value MTU.
-const ETHERNET_FRAME_SIZE:   usize = 1500;
-const IPV6_HEADER_SIZE:      usize =   40;
-const UDP_HEADER_SIZE:       usize =    8;
-const PPPOE_HEADER_SIZE:     usize =    8;
-const WIREGUARD_HEADER_SIZE: usize =   40;
-const VPN_HEADER_SIZE:       usize =   64; // relatively conservative(?) OpenVPN header overhead size
-const NOISE_NONCE_SIZE:      usize =    8;
-const NOISE_HEADER_SIZE:     usize =   16;
-
-const MAX_PATH_HEADERS_SIZE: usize = (IPV6_HEADER_SIZE + UDP_HEADER_SIZE + WIREGUARD_HEADER_SIZE + VPN_HEADER_SIZE + NOISE_NONCE_SIZE + NOISE_HEADER_SIZE);
-
-const PATH_MTU: usize = ETHERNET_FRAME_SIZE - MAX_PATH_HEADERS_SIZE;
-// const PATH_MTU: usize = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY - 6 - crypto_overhead_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+// @Todo: MTU discovery
+const UDP_mMTU:        usize = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
+const STP_HEADER_SIZE: usize = 6 + crypto_overhead_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+const STP_PACKLET_HDR: usize = std::mem::size_of::<crate::bandwidth_test::PackletHeader>();
+const PATH_MTU: usize = UDP_mMTU
+                      - STP_HEADER_SIZE
+                      - STP_PACKLET_HDR;
 
 // Tweak this!
 const MAX_BANDWIDTH_BYTES_PER_SECOND: usize = 1_000_000;
@@ -56,7 +49,6 @@ use tokio::time::Instant;
 use zcash_primitives::bft::{ HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
 
 const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
-const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_millis(10000);
 
 // NOTE: Sam and Phillip discussed forward jumps; Noise trial decryption already protects connectsions against replay attacks.
 const NONCE_FORWARD_JUMP_TOLERANCE: u64 = 512;
@@ -468,7 +460,7 @@ impl TMState {
                     // NOTE: we *DON'T* want to write it immediately to our proper store because it
                     // will confuse check_and_incorporate_msg
                     let sig = TMSig(self.my_signing_key.sign(&buf[..o]).to_bytes());
-                    if PRINT_SIGN { println!("{}: signed proposal with {:?}", self.ctx_str(roster), sig) };
+                    if PRINT_SIGN { println!("{} [SIGN]: signed proposal with {:?}", self.ctx_str(roster), sig) };
 
                     // NOTE: we're faulty if we give our pub key for this if it's not our proposal
                     self.check_and_incorporate_msg(
@@ -482,11 +474,11 @@ impl TMState {
 
             TMMsgData::Prevote(value_id) | TMMsgData::Precommit(value_id) => {
                 let is_precommit: u8 = if let TMMsgData::Precommit(..) = msg { 1 } else { 0 };
-                if PRINT_BFT_VOTE { println!("{} {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id); }
+                if PRINT_BFT_VOTE { println!("{} [BFT_VOTE]: {} on {}", self.ctx_str(roster), ["prevoting", "precommitting"][is_precommit as usize], value_id); }
                 let packet_type = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit;
                 let signed_data = make_vote_sign_datas(roster[roster_i].pub_key, is_precommit != 0, height, round, value_id)[1];
                 let sig         = TMSig(self.my_signing_key.sign(&signed_data).to_bytes());
-                if PRINT_SIGN { println!("{} signed {} with {:?}", self.ctx_str(roster), ["prevote", "precommit"][is_precommit as usize], sig) };
+                if PRINT_SIGN { println!("{} [SIGN]: signed {} with {:?}", self.ctx_str(roster), ["prevote", "precommit"][is_precommit as usize], sig) };
 
                 self.check_and_incorporate_msg(
                     height, round, 0, value_id, -2,
@@ -553,10 +545,10 @@ impl TMState {
                 Some(valid_value)
             } else {
                 let ret = self.propose_closure.0().await;
-                if PRINT_BFT_PROPOSAL { if ret.is_none() { println!("{} propose closure returned None.", self.ctx_str(roster)); } }
+                if PRINT_BFT_PROPOSAL { if ret.is_none() { println!("{} [BFT_PROPOSAL]: propose closure returned None.", self.ctx_str(roster)); } }
                 ret
             };
-            if PRINT_BFT_PROPOSAL { if let Some(proposal) = &proposal { println!("{} about to propose with status '{:?}': {:?}", self.ctx_str(roster), self.validate_closure.0(&proposal).await, proposal); } }
+            if PRINT_BFT_PROPOSAL { if let Some(proposal) = &proposal { println!("{} [BFT_PROPOSAL]: about to propose with status '{:?}': {:?}", self.ctx_str(roster), self.validate_closure.0(&proposal).await, proposal); } }
 
             // TODO: simple approach: send proposal messages to self when broadcasting
             // self.active_proposal_value_round = (Some(proposal), self.valid_value_round.1);
@@ -601,7 +593,7 @@ impl TMState {
             return TMStatus::Fail;
         }};
 
-        if PRINT_VALID_INCOMING { eprintln!("{}: valid signature for value id: {}", ctx_str, value_id); }
+        if PRINT_VALID_INCOMING { eprintln!("{} [VALID_INCOMING]: valid signature for value id: {}", ctx_str, value_id); }
 
         // TODO: other checks
         // - data size check if we're doing network stuff
@@ -722,7 +714,7 @@ impl TMState {
                         }
                     }
 
-                    if PRINT_BFT_UPDATE { println!("{}: update to {}/{} proposal chunks on {}", ctx_str, round_data.proposal_sigs_n, round_data.proposal_sigs.len(), round_data.proposal_id); }
+                    if PRINT_BFT_UPDATE { println!("{} [BFT_UPDATE]: update to {}/{} proposal chunks on {}", ctx_str, round_data.proposal_sigs_n, round_data.proposal_sigs.len(), round_data.proposal_id); }
 
                     // TODO: include signed prevote & precommit for self?
                 } else if round_data.proposal_sigs[chunk_i] != sig { // TODO: check value/sig conformance
@@ -853,14 +845,12 @@ impl TMState {
             // TODO: don't spam "while" messages repeatedly
             let is_current_height_and_round = (self.height, self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
             // println!("{:#?}", self);
-            if PRINT_BFT_STATE {
-                println!("{} {}={}.{}, {}/{}, {}", ctx_str,
+            if PRINT_BFT_STATE { println!("{} [BFT_STATE]: {}={}.{}, {}/{}, {}", ctx_str,
                     ["!","="][is_current_height_and_round as usize],
                     self.rounds_data[i].height, self.rounds_data[i].round,
                     self.rounds_data[i].proposal_sigs_n, self.rounds_data[i].proposal_sigs.len(),
                     self.rounds_data[i].proposal_valid_round
-                );
-             }
+            ); }
 
             // line 11: init proposal period
             // (done elsewhere)
@@ -881,10 +871,10 @@ impl TMState {
                     self.locked_value_round.1 == -1 ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone())) // TODO(perf): use (previously-checked) ids for easier comparison?
                 {
-                    if PRINT_BFT_CONDITIONS { println!("{}: in condition 22-0: receive first proposal this height", ctx_str); }
+                    if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 22-0: receive first proposal this height", ctx_str); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
                 } else {
-                    if PRINT_BFT_CONDITIONS { println!("{}: in condition 22-1: receive first proposal this height", ctx_str); }
+                    if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 22-1: receive first proposal this height", ctx_str); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                 }
             }
@@ -903,10 +893,10 @@ impl TMState {
                     self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
                     self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone()))
                 {
-                    if PRINT_BFT_CONDITIONS { println!("{}: in condition 28-0: received 2f+1 prevotes", ctx_str); }
+                    if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 28-0: received 2f+1 prevotes", ctx_str); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
                 } else {
-                    if PRINT_BFT_CONDITIONS { println!("{}: in condition 28-1: received 2f+1 prevotes", ctx_str); }
+                    if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 28-1: received 2f+1 prevotes", ctx_str); }
                     self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                 }
             }
@@ -920,7 +910,7 @@ impl TMState {
                 self.step == TMStep::Prevote &&
                 !self.rounds_data[i].timeout_triggered[0]) // "for the first time" // ALT: round.timeout_step != TMStep::Prevote
             {
-                if PRINT_BFT_CONDITIONS { println!("{}: in condition 34: last orders on prevote period", ctx_str); }
+                if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 34: last orders on prevote period", ctx_str); }
                 self.rounds_data[i].timeout_triggered[0] = true;
                 self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Prevote));
             }
@@ -935,9 +925,9 @@ impl TMState {
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass &&
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
-                if PRINT_BFT_CONDITIONS { println!("{}: in condition 36: seen 2f+1 valid prevotes", ctx_str); }
+                if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 36: seen 2f+1 valid prevotes", ctx_str); }
                 if self.step == TMStep::Prevote {
-                    if PRINT_BFT_CONDITIONS { println!("{}: in condition 36-0: seen 2f+1 valid prevotes", ctx_str); }
+                    if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 36-0: seen 2f+1 valid prevotes", ctx_str); }
                     self.locked_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
                     self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
                 }
@@ -952,7 +942,7 @@ impl TMState {
                 big_threshold <= counts.nil_prevotes &&
                 self.step == TMStep::Prevote)
             {
-                if PRINT_BFT_CONDITIONS { println!("{}: in condition 44: seen 2f+1 nil prevotes", ctx_str); }
+                if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 44: seen 2f+1 nil prevotes", ctx_str); }
                 self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
             }
 
@@ -963,7 +953,7 @@ impl TMState {
                 big_threshold <= counts.precommits &&
                 !self.rounds_data[i].timeout_triggered[1])
             {
-                if PRINT_BFT_CONDITIONS { println!("{}: in condition 47: last orders on precommit period", ctx_str); }
+                if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 47: last orders on precommit period", ctx_str); }
                 self.rounds_data[i].timeout_triggered[1] = true;
                 self.rounds_data[i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Precommit));
             }
@@ -977,9 +967,9 @@ impl TMState {
                 big_threshold <= counts.yes_precommits &&
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
-                if PRINT_BFT_CONDITIONS { println!("{}: in condition 49: value decided", ctx_str); }
+                if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 49: value decided", ctx_str); }
                 let new_roster = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster), self.rounds_data[i].proposal_sigs.clone()).await;
-                if PRINT_ROSTER { println!("{} new roster: {:?}", ctx_str, new_roster); }
+                if PRINT_ROSTER { println!("{} [ROSTER]: new roster: {:?}", ctx_str, new_roster); }
                 *roster = new_roster;
                 self.height += 1;
                 self.recent_commit_round_cache.push(self.rounds_data[i].clone());
@@ -996,7 +986,7 @@ impl TMState {
                 self.round    <  self.rounds_data[i].round  &&
                 small_threshold <= counts.anys)
             {
-                if PRINT_BFT_CONDITIONS { println!("{}: in condition 55: round catchup", ctx_str); }
+                if PRINT_BFT_CONDITIONS { println!("{} [BFT_CONDITIONS]: in condition 55: round catchup", ctx_str); }
                 self.start_round(roster, now, self.rounds_data[i].round).await
             }
 
@@ -1010,15 +1000,15 @@ impl TMState {
                 // TODO(code): can we just use *our* step or is there a possible sequence issue? (from the presence of step checks, probably not)
                 match timeout.step {
                     TMStep::Propose => if self.step == TMStep::Propose {
-                        if PRINT_BFT_TIMEOUTS { println!("{}: hit timeout propose", ctx_str); }
+                        if PRINT_BFT_TIMEOUTS { println!("{} [BFT_TIMEOUTS]: hit timeout propose", ctx_str); }
                         self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
                     },
                     TMStep::Prevote => if self.step == TMStep::Prevote {
-                        if PRINT_BFT_TIMEOUTS { println!("{}: hit timeout prevote", ctx_str); }
+                        if PRINT_BFT_TIMEOUTS { println!("{} [BFT_TIMEOUTS]: hit timeout prevote", ctx_str); }
                         self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
                     },
                     TMStep::Precommit => {
-                        if PRINT_BFT_TIMEOUTS { println!("{}: hit timeout precommit", ctx_str); }
+                        if PRINT_BFT_TIMEOUTS { println!("{} [BFT_TIMEOUTS]: hit timeout precommit", ctx_str); }
                         self.start_round(roster, now, self.round + 1).await
                     },
                 }
@@ -1296,7 +1286,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         SimRng::new(seed, 0)
     };
 
-    let noise_params: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
     let my_root_public_bft_key = VerificationKeyBytes::from(&my_root_private_key);
     {
         let key : &[u8; 32] = &my_root_public_bft_key.into();
@@ -1305,7 +1294,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         println!("\"");
     }
 
-    let my_stp_keypair = my_stp_keypair.unwrap_or(new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap());
+    let my_stp_keypair = my_stp_keypair.unwrap_or(new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap());
 
     use crate::bandwidth_test::*;
     use crate::native_sockets::*;
@@ -1427,7 +1416,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             // TODO: "with removal"
                         }
                     }
-                    if PRINT_RNGS { println!("{} request proposal  chunks {:?} from {:?}", bft_state.ctx_str(roster), status.need_proposal_chunk_rngs, proposal_chunk_rngs); }
+                    if PRINT_RNGS { println!("{} [RNGS]: request proposal  chunks {:?} from {:?}", bft_state.ctx_str(roster), status.need_proposal_chunk_rngs, proposal_chunk_rngs); }
 
                     for is_precommit in 0..2 {
                         let vote_rngs = gen_mostly_empty_rngs(active_roster_len(roster), |i| round_data.msg_val_sigs[i][is_precommit].1 == TMSig::NIL);
@@ -1440,7 +1429,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 // TODO: "with removal"
                             }
                         }
-                        if PRINT_RNGS { println!("{} request {:9} chunks {:?} from {:?}", bft_state.ctx_str(roster), ["prevote", "precommit"][is_precommit], status.need_vote_rngs[is_precommit], vote_rngs); }
+                        if PRINT_RNGS { println!("{} [RNGS]: request {:9} chunks {:?} from {:?}", bft_state.ctx_str(roster), ["prevote", "precommit"][is_precommit], status.need_vote_rngs[is_precommit], vote_rngs); }
                     }
 
                 }
@@ -1506,7 +1495,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 if !bft_key_address_map.contains_key(&server_b_pub_key) && server_b_pub_key != PubKeyID(my_root_public_bft_key.into()) {
                     let address = STPAddress::parse("[::ffff:70.34.201.202]:8234:AQAAAAAA:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(); // @Todo
 
-                    bft_key_address_map.insert(&server_a_pub_key, &address);
+                    bft_key_address_map.insert(&server_b_pub_key, &address);
                     // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.address), ..Peer::default() });
                 }
 
@@ -1581,7 +1570,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                     }
                                 }
 
-                                if PRINT_SENDS { eprintln!("{} sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer_bft_key); }
+                                if PRINT_SENDS { println!("{} [SENDS]: sending proposal chunk {} to {:?}", ctx_str, chunk_i, peer_bft_key); }
                                 sent_chunk_cs += 1;
                                 print_packet_tag_send(header);
                                 send_noise_msg(packets_to_send, connection_key, &send_buf1[..o], stats);
@@ -1651,7 +1640,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 if (packet.no_votes_n + packet.yes_votes_n) as usize == packet.votes.len() {
                                     sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
                                     // full evidence block; send it
-                                    if PRINT_SENDS { println!("{}: sending full {} block: {:#?}", ctx_str, ["prevote", "precommit"][is_precommit as usize], packet); }
+                                    if PRINT_SENDS { println!("{} [SENDS]: sending full {} block: {:#?}", ctx_str, ["prevote", "precommit"][is_precommit as usize], packet); }
                                     dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet);
 
                                     let mut o = 0;
@@ -1676,13 +1665,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         // send any half-filled vote blocks
                         if (packet.no_votes_n + packet.yes_votes_n) > 0 {
                             sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
-                            // println!("{}: half-filled block pre-gap-close: {:#?}", ctx_str, packet);
+                            // println!("{} half-filled block pre-gap-close: {:#?}", ctx_str, packet);
                             // move items from end to fill gap
                             for gap_i in 0..packet.votes.len() - (packet.no_votes_n + packet.yes_votes_n) as usize {
                                 packet.votes[packet.no_votes_n as usize + gap_i] = packet.votes[packet.votes.len() - 1 - gap_i];
                             }
 
-                            if PRINT_SENDS { println!("{}: half-filled block post-gap-close: {:#?}", ctx_str, packet); }
+                            if PRINT_SENDS { println!("{} [SENDS]: half-filled block post-gap-close: {:#?}", ctx_str, packet); }
                             dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet);
 
                             let mut o = 0;
@@ -1701,12 +1690,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         }
                     }
 
-                    if PRINT_SEND_CS && sent_chunk_cs > 0 { eprintln!("{} sent {} proposal chunks", ctx_str, sent_chunk_cs); }
-                    if PRINT_SEND_CS && sent_c[0]     > 0 { eprintln!("{} sent {} prevotes",        ctx_str, sent_c[0]);     }
-                    if PRINT_SEND_CS && sent_c[1]     > 0 { eprintln!("{} sent {} precommits",      ctx_str, sent_c[1]);     }
+                    if PRINT_SEND_CS && sent_chunk_cs > 0 { eprintln!("{} [SEND_CS]: sent {} proposal chunks", ctx_str, sent_chunk_cs); }
+                    if PRINT_SEND_CS && sent_c[0]     > 0 { eprintln!("{} [SEND_CS]: sent {} prevotes",        ctx_str, sent_c[0]);     }
+                    if PRINT_SEND_CS && sent_c[1]     > 0 { eprintln!("{} [SEND_CS]: sent {} precommits",      ctx_str, sent_c[1]);     }
                 }
 
-                if PRINT_PEERS { println!("{} {:?}", ctx_str, peers.iter().map(|(ck, p)| {
+                if PRINT_PEERS { println!("{} [PEERS]: {:?}", ctx_str, peers.iter().map(|(ck, p)| {
                     let bft_key = connections_map.get(ck)
                         .and_then(|c| bft_key_address_map.get_key(&c.address()))
                         .copied()
@@ -1927,14 +1916,10 @@ fn packet_name_from_tag(packet_tag: u8) -> &'static str {
     PACKET_TYPE_NAMES.get((packet_tag & PACKET_TYPE_MASK) as usize).unwrap_or(&["<UNKNOWN>", "STATUS+<UNKNOWN>"])[(packet_tag >> PACKET_TAG_STATUS_SHIFT & 1) as usize]
 }
 fn print_packet_tag_send(header: PacketHeader) {
-    if PRINT_PROTOCOL_TAG {
-        println!("PACKET_{} (0x{:X}) ->", packet_name_from_tag(header.tag()), header.tag());
-    }
+    if PRINT_PROTOCOL_TAG { println!("PROTOCOL_TAG: PACKET_{} (0x{:X}) ->", packet_name_from_tag(header.tag()), header.tag()); }
 }
 fn print_packet_tag_recv(header: PacketHeader) {
-    if PRINT_PROTOCOL_TAG {
-        println!("<- PACKET_{} (0x{:X})", packet_name_from_tag(header.tag()), header.tag());
-    }
+    if PRINT_PROTOCOL_TAG { println!("PROTOCOL_TAG: <- PACKET_{} (0x{:X})", packet_name_from_tag(header.tag()), header.tag()); }
 }
 
 // NOTE(azmr): could add packet sizes so we can check all sizes in 1 location

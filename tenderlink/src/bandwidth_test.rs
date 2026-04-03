@@ -476,8 +476,8 @@ pub fn connect_to_endpoint(
     }
 }
 
-const        VERBOSE                :bool=0!=                (1);
-const OVERLY_VERBOSE                :bool=0!=                (1);
+const        VERBOSE                :bool=0!=                (0);
+const OVERLY_VERBOSE                :bool=0!=                (0);
 
 macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
 
@@ -909,7 +909,9 @@ pub fn service_connections(
 
                         if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
 
-                        let mMTU_inside_stp = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY - 6 - crypto_overhead_from_connect_magic1(*magic1).unwrap() - std::mem::size_of::<PackletHeader>();
+                        let mMTU_inside_udp = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
+                        let mMTU_inside_stp = mMTU_inside_udp - 6 - crypto_overhead_from_connect_magic1(*magic1).unwrap();
+                        let  MTU_fragmented = mMTU_inside_stp - std::mem::size_of::<PackletHeader>();
 
                         let mut msg = payload;
                         while !msg.is_empty() {
@@ -923,7 +925,7 @@ pub fn service_connections(
                             };
                             if msg.len() < len {
                                 eprintln!("truncated packlet");
-                                break 'conn;
+                                kill_connection = Some(connection_key); break 'conn;
                             }
                             let (mut body, remainder) = msg.split_at(len);
 
@@ -932,7 +934,7 @@ pub fn service_connections(
                                     let Some(frag) = PackletOneJumboFragment::read_from(&mut body)
                                     else {
                                         eprintln!("truncated jumbogram fragment");
-                                        break 'conn;
+                                        kill_connection = Some(connection_key); break 'conn;
                                     };
                                     let frag_data = body;
 
@@ -945,7 +947,7 @@ pub fn service_connections(
                                     let total_len = frag.total_len();
                                     let byte_idx  = frag.byte_idx();
 
-                                    if total_len <= mMTU_inside_stp {
+                                    if total_len <= MTU_fragmented {
                                         eprintln!("jumbogram fragment is so small that it should have been a datagram");
                                         kill_connection = Some(connection_key); break 'conn;
                                     }
@@ -958,7 +960,7 @@ pub fn service_connections(
                                         kill_connection = Some(connection_key); break 'conn;
                                     }
                                     if frag_data.len() >= total_len {
-                                        eprintln!("jumbogram fragment is bigger than the entire jumbogram that it should have been a datagram");
+                                        eprintln!("jumbogram fragment is bigger than the entire jumbogram (\"TARDIS jumbogram\")");
                                         kill_connection = Some(connection_key); break 'conn;
                                     }
 
@@ -996,10 +998,11 @@ pub fn service_connections(
                                         }
                                     }
                                 }
-                                _ => {
-                                    eprintln!("unexpected packlet tag: {:?}", tag);
-                                    break;
+                                PackletTag::AnEntireDatagram => {
+                                    packets_received_this_call.push((connection_key, body.to_vec()));
                                 }
+                                PackletTag::ReliableStreamed => { eprintln!("TODO {:?}", tag); kill_connection = Some(connection_key); break 'conn; }
+                                PackletTag::Acknowledgements => { eprintln!("TODO {:?}", tag); kill_connection = Some(connection_key); break 'conn; }
                             }
 
                             msg = remainder;
@@ -1114,6 +1117,7 @@ pub fn service_connections(
         // mMTU - minimum MTU
         let mMTU_inside_udp = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
         let mMTU_inside_stp = mMTU_inside_udp - 6 - crypto_overhead_from_connect_magic1(*magic1).unwrap();
+        let  MTU_fragmented = mMTU_inside_stp - std::mem::size_of::<PackletHeader>();
 
         let mut send = |payload: &[u8]| {
             let mut o = 0;
@@ -1135,11 +1139,9 @@ pub fn service_connections(
             udp_send_with_congestion_and_dscp(socket, connection.other_ip, connection.other_port, &packet_memory_encrypted[..o], Dscp::BestEffort);
         };
 
-        let fragment_max_size = mMTU_inside_stp - std::mem::size_of::<PackletHeader>() - std::mem::size_of::<PackletOneJumboFragment>();
-
-        if data.len() > fragment_max_size {
+        if data.len() > MTU_fragmented {
             let mut jumbo_o: usize = 0;
-            for fragment in data.chunks(fragment_max_size) {
+            for fragment in data.chunks(MTU_fragmented) {
                 let hdr  = PackletHeader::new(PackletTag::OneJumboFragment, std::mem::size_of::<PackletOneJumboFragment>() + fragment.len());
                 let frag = PackletOneJumboFragment::new(*jumbogram_index, data.len(), jumbo_o);
                 jumbo_o += fragment.len();
