@@ -1140,8 +1140,9 @@ pub fn service_connections(
         };
 
         if data.len() > MTU_fragmented {
+            let frag_mtu = MTU_fragmented - std::mem::size_of::<PackletOneJumboFragment>();
             let mut jumbo_o: usize = 0;
-            for fragment in data.chunks(MTU_fragmented) {
+            for fragment in data.chunks(frag_mtu) {
                 let hdr  = PackletHeader::new(PackletTag::OneJumboFragment, std::mem::size_of::<PackletOneJumboFragment>() + fragment.len());
                 let frag = PackletOneJumboFragment::new(*jumbogram_index, data.len(), jumbo_o);
                 jumbo_o += fragment.len();
