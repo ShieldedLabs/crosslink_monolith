@@ -582,7 +582,7 @@ pub fn sync(
         for (connection_key, peer_status) in &peer_statuses {
             let Some(connection) = get_connected(&connections_map, connection_key) else { continue; };
 
-            for height in peer_status.height.saturating_sub(5)..peer_status.height + 5 {
+            for height in peer_status.height.saturating_sub(10)..peer_status.height + 2 {
                 if !serialized_blocks.contains_key(&height) {
                     let res = rt.block_on(async {
                         read_state.clone().oneshot(ReadRequest::Block(Height(height).into())).await
@@ -598,18 +598,17 @@ pub fn sync(
                 }
                 let (serialized, hash) = &serialized_blocks[&height];
 
-                let mut buf = [0u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE];
+                let mut buf = Vec::new();
 
-                if serialized.len() >= buf.len() - 1 {
-                    eprintln!("NewNet ERROR: Block too big! Was {:?} bytes, max is {}!", serialized.len(), buf.len() - 1);
+                if serialized.len() >= (1 << 23) - 1 {
+                    eprintln!("NewNet ERROR: Block too big! Was {:?} bytes, max is {}!", serialized.len(), (1 << 23) - 1);
                     continue;
                 }
 
-                let mut o = 0;
-                o += PACKET_TYPE_BLOCK.write_to(&mut buf[o..]);
-                o += serialized       .write_to(&mut buf[o..]);
+                buf.push(PACKET_TYPE_BLOCK);
+                buf.extend(serialized);
 
-                packets_to_send.push((*connection_key, Vec::from(&buf[..o])));
+                packets_to_send.push((*connection_key, buf));
                 // eprintln!("\x1b[93mPOWLINK2 SENDING BLOCK HASH\x1b[0m: {}", hash);
             }
         }
@@ -630,9 +629,11 @@ pub fn sync(
             packets_to_send.push((*key, Vec::from(&buf[..o])));
         }
 
+        use rand::seq::SliceRandom;
+        packets_to_send.shuffle(&mut rand::thread_rng());
         // Service STP connections (send/recv).
         // @Todo: real scheduling. Right now I just want to receive everything!
-        for _ in 0..1024 {
+        for _ in 0..256 {
             let more = service_connections(&mut connections_map,
                                            &mut packets_received,
                                            &packets_to_send,

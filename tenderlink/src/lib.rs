@@ -5,19 +5,19 @@
 
 #![allow(clippy::eq_op)]
 const PRINT_PROTOCOL:       bool = 1 == 1;
-const PRINT_PROTOCOL_TAG:   bool = 1 == 1;
+const PRINT_PROTOCOL_TAG:   bool = 0 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
 const PRINT_NETWORK_STATS:  bool = 1 == 1;
-const PRINT_PEERS:          bool = 0 == 1;
-const PRINT_VALID_INCOMING: bool = 0 == 1;
+const PRINT_PEERS:          bool = 1 == 1;
+const PRINT_VALID_INCOMING: bool = 1 == 1;
 const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
 const PRINT_RNGS:           bool = 0 == 1;
 const PRINT_SIGN:           bool = 0 == 1;
-const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
+const PRINT_BFT_PROPOSAL:   bool = 1 == 1;
 const PRINT_BFT_VOTE:       bool = 1 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
-const PRINT_BFT_STATE:      bool = 0 == 1;
+const PRINT_BFT_STATE:      bool = 1 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
 const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
 
@@ -55,7 +55,7 @@ use snow::resolvers::CryptoResolver;
 use tokio::time::Instant;
 use zcash_primitives::bft::{ HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
 
-const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(300);
+const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
 const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_millis(10000);
 
 // NOTE: Sam and Phillip discussed forward jumps; Noise trial decryption already protects connectsions against replay attacks.
@@ -1523,6 +1523,18 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                            stats: &mut NetworkStats) {
                     let height = round_data.height;
                     let round  = round_data.round;
+                    
+                    // Make sure to always sent at least one status.
+                    {
+                        let header = PacketHeader::new_(0);
+                        let o = write_header_and_maybe_status(header, true,
+                                                                       bft_state,
+                                                                       roster,
+                                                                       &mut send_buf1[..],
+                                                                       peer.index_counter);
+                        peer.index_counter += 1;
+                        send_noise_msg(packets_to_send, connection_key, &send_buf1[..o], stats);
+                    }
 
                     let mut chunk_hdr = PacketProposalChunkHeader {
                         height, round, chunk_i: 0,
@@ -1771,8 +1783,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 next_tick_time += TICK_DURATION;
             }
         }
-
-        for _ in 0..1024 {
+        
+        use rand::seq::SliceRandom;
+        packets_to_send.shuffle(&mut rand::thread_rng());
+        for _ in 0..256 {
             let more = service_connections(&mut connections_map,
                                            &mut packets_received,
                                            &packets_to_send,
@@ -1794,8 +1808,18 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             peers.entry(*key).or_insert_with(|| Peer::default());
         }
 
+        // Note(Sam): Disabled this due to confusion. I am not sure it is the right thing.
+        // // Drop peers not on the roster. Kinda temp.
+        // connections_map.retain(|key, value| {
+        //     let stp_address = value.address();
+        //     let Some(bft_key) = bft_key_address_map.get_key(&stp_address) else { return false; };
+        //     
+        //     roster.iter().position(|x| x.pub_key == *bft_key).is_some()
+        // });
+        
         // Remove peer entries for dropped connections
         peers.retain(|key, _| connections_map.contains_key(key));
+        
 
         // READ
         while packets_received.len() > 0 {
@@ -1807,6 +1831,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 };
                 (key, peer, packet)
             };
+
             let msg: &[u8] = &msg[..];
             if msg.len() == 0 {
                 continue;
@@ -1903,12 +1928,12 @@ fn packet_name_from_tag(packet_tag: u8) -> &'static str {
 }
 fn print_packet_tag_send(header: PacketHeader) {
     if PRINT_PROTOCOL_TAG {
-        println!("PACKET_{} ->", packet_name_from_tag(header.tag()));
+        println!("PACKET_{} (0x{:X}) ->", packet_name_from_tag(header.tag()), header.tag());
     }
 }
 fn print_packet_tag_recv(header: PacketHeader) {
     if PRINT_PROTOCOL_TAG {
-        println!("<- PACKET_{}", packet_name_from_tag(header.tag()));
+        println!("<- PACKET_{} (0x{:X})", packet_name_from_tag(header.tag()), header.tag());
     }
 }
 
