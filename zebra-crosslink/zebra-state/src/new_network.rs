@@ -382,7 +382,7 @@ impl SliceRead for NearTipBranches {
 
 
 // @Todo: @Test.
-pub fn chain_intersect(height_bgn: u32, height_end: u32, haystack: &[ShadowBlock]) -> &[ShadowBlock] {
+pub fn height_intersect(haystack: &[ShadowBlock], height_bgn: u32, height_end: u32) -> &[ShadowBlock] {
     if haystack.len() <= 0 {
         return &haystack[0..0];
     }
@@ -404,6 +404,41 @@ pub fn chain_intersect(height_bgn: u32, height_end: u32, haystack: &[ShadowBlock
     } else {
         &haystack[0..0]
     }
+}
+
+pub fn chain_intersect_prefix<'l>(a: &'l [ShadowBlock], b: &'l [ShadowBlock]) -> &'l [ShadowBlock] {
+    if a.len() <= 0 {
+        return &a[0..0];
+    }
+    if b.len() <= 0 {
+        return &a[0..0];
+    }
+
+    let a_height_bgn = a[             0].this_height;
+    let a_height_end = a.last().unwrap().this_height + 1;
+    let b_height_bgn = b[             0].this_height;
+    let b_height_end = b.last().unwrap().this_height + 1;
+    let a_ol = height_intersect(a, b_height_bgn, b_height_end);
+    let b_ol = height_intersect(b, a_height_bgn, a_height_end);
+
+    if a_ol.len() <= 0 {
+        return &a[0..0];
+    }
+    if b_ol.len() <= 0 {
+        return &a[0..0];
+    }
+
+    debug_assert!(a_ol.len() == b_ol.len(), "height_intersect on two chains should have the same length");
+
+    let mut n = a_ol.len();
+    for i in 0..n {
+        if a_ol[i] != b_ol[i] {
+            n = i;
+            break;
+        }
+    }
+
+    &a_ol[..n]
 }
 
 
@@ -582,7 +617,7 @@ pub fn sync(
     // Sync state
     let tick_duration = std::time::Duration::from_millis(TICK_MS);
 
-    let mut blocks_to_send_peers = Vec::<(ConnectionKey, Hash)>::new();
+    let mut blocks_to_send = Vec::<(ConnectionKey, Hash)>::new();
 
     let mut serialized_blocks = HashMap::new(); // @Todo: cap max memory storage size for this map.
     let mut committed_blocks = HashSet::new(); // @Todo: @Remove.
@@ -628,7 +663,7 @@ pub fn sync(
             }
         }
 
-        for (connection_key, hash) in &blocks_to_send_peers {
+        for (connection_key, hash) in &blocks_to_send {
             let Some(connection) = get_connected(&connections_map, connection_key) else { continue; };
 
             if !serialized_blocks.contains_key(hash) {
@@ -660,7 +695,7 @@ pub fn sync(
             packets_to_send.push((*connection_key, buf));
             // eprintln!("\x1b[93mPOWLINK2 SENDING BLOCK HASH\x1b[0m: {}", hash);
         }
-        blocks_to_send_peers.clear();
+        blocks_to_send.clear();
 
         if near_tip_chains.tip_height().is_some() {
             let mut buf = [0u8; PACKET_STATUS_MAX_SIZE];
@@ -745,13 +780,58 @@ pub fn sync(
                     continue;
                 }
 
-                for their_branch in &their_tree.branches {
-                    let their_branch_height_bgn = their_branch[0].this_height;
-                    let their_branch_height_end = their_branch.last().unwrap().this_height + 1;
+                // rule to push:
+                //     per each of our chains:
+                //         find the longest prefix branch they have with the chain
+                //         send everything after the end of the prefix branch
+                //     OR
+                //     per each of our chains:
+                //         if any of their branches is equal to or an extension of this chain, don't push
+                //         otherwise push the blocks after the intersection
+                //
+                // rule to pull:
+                // per each of their branches:
+                //     per each of our chains:
+                //         if any of our chains contain all of the branch, then break
+                //         track the maximum height of the intersections
+                //     request everything up from the maximum height all the way to their tip
+                //
 
-                    for our_chain in &near_tip_chains.chains {
-                        let intersection = chain_intersect(their_branch_height_bgn, their_branch_height_end, &our_chain.blocks);
+                let mut blocks_to_queue = HashSet::new();
+                for our_chain in &near_tip_chains.chains {
+                    assert!(our_chain.blocks.len() > 0);
+
+                    let our_chain_height_bgn = our_chain.blocks[0].this_height;
+                    let our_chain_height_end = our_chain.blocks.last().unwrap().this_height + 1;
+
+                    let mut max_height_we_both_share = 0;
+
+                    for their_branch in &their_tree.branches {
+                        let their_branch_height_bgn = their_branch[0].this_height;
+                        let their_branch_height_end = their_branch.last().unwrap().this_height + 1;
+
+                        let prefix = chain_intersect_prefix(&their_branch, &our_chain.blocks);
+
+                        // If the prefix was empty, there was no overlap.
+                        if prefix.len() <= 0 {
+                            continue;
+                        }
+
+                        let height_of_match = prefix.last().unwrap().this_height;
+                        max_height_we_both_share = max_height_we_both_share.max(height_of_match);
                     }
+
+                    for height in max_height_we_both_share + 1 .. our_chain_height_end {
+                        let chain_i = (height - our_chain_height_bgn) as usize;
+
+                        let block_to_queue = &our_chain.blocks[chain_i];
+
+                        blocks_to_queue.insert(block_to_queue.this_hash);
+                    }
+                }
+
+                for block in blocks_to_queue {
+                    blocks_to_send.push((connection_key, block));
                 }
 
             } else if packet_type == PACKET_TYPE_BLOCK {
