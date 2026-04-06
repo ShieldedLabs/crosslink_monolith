@@ -208,38 +208,50 @@ impl NearTipChains {
     }
 
 
-    const PRINT_H: usize = 0;
-    fn indent_slice(start_h: u32, h: u32) {
-        let w = (h - start_h) as usize * 9 + 3 * Self::PRINT_H;
-        print!("{:w$}", "");
-    }
 
-    fn print_slice(blocks: &[ShadowBlock]) {
+    fn print_slice(indent_start_h: u32, blocks: &[ShadowBlock], bytes_n: usize) {
+        const PRINT_H: usize = 0;
+        if blocks.len() == 0 {
+            return;
+        }
+
+        let w_per = bytes_n * 2 * 2 + 4 * PRINT_H + "( ), ".len();
+        let w = (blocks[0].this_height - indent_start_h) as usize * w_per;
+
+        print!("{:w$}", "");
+
         for block in blocks {
-            if Self::PRINT_H == 1 {
-                print!("({:02x} {:02x} {:2}), ", block.parent_hash.0[0], block.this_hash.0[0], block.this_height);
-            } else {
-                print!("({:02x} {:02x}), ", block.parent_hash.0[0], block.this_hash.0[0]);
+            print!("(");
+            for byte in &block.parent_hash.0[..bytes_n] {
+                print!("{:02x}", byte);
             }
+            print!(" ");
+            for byte in &block.this_hash.0[..bytes_n] {
+                print!("{:02x}", byte);
+            }
+            if PRINT_H == 1 {
+                print!("{:3}", block.this_height);
+            }
+            print!("), ");
         }
         println!("");
     }
 
-    fn roundtrip_to_branches(&self, max_size: usize, print: bool) {
+    /// 0 print_bytes => no print, otherwise it's the number of bytes to print from the hashes
+    fn roundtrip_to_branches(&self, max_size: usize, bytes_n: usize) {
         let buf = &mut [0u8; PATH_MTU][..max_size];
         let res = self.write_to(buf);
         debug_assert!(res > 0, "failed to write packet");
 
         let branches = NearTipBranches::read_from(&mut &buf[..]).unwrap();
 
-        if print {
+        if bytes_n > 0 {
             let mut min_h = u32::MAX;
             for chain in &self.chains {
                 min_h = min_h.min(chain.blocks[0].this_height);
             }
             for chain in &self.chains {
-                Self::indent_slice(min_h, chain.blocks[0].this_height);
-                Self::print_slice(&chain.blocks);
+                Self::print_slice(min_h, &chain.blocks, bytes_n);
             }
 
             println!("");
@@ -248,8 +260,7 @@ impl NearTipChains {
                 min_h = min_h.min(blocks[0].this_height);
             }
             for blocks in &branches.branches {
-                Self::indent_slice(min_h, blocks[0].this_height);
-                Self::print_slice(blocks);
+                Self::print_slice(min_h, blocks, bytes_n);
             }
         }
     }
@@ -1034,11 +1045,10 @@ mod tests {
 
         debug_assert_eq!(chains, chains2, "building incrementally should be functionally equivalent to batch-built");
         debug_assert_eq!(chains.tip_height(), Some(11));
-        NearTipChains::indent_slice(2, blocks[0].this_height);
-        NearTipChains::print_slice(&blocks);
+        NearTipChains::print_slice(2, &blocks, 1);
         println!("");
 
-        chains.roundtrip_to_branches(PATH_MTU, true);
+        chains.roundtrip_to_branches(PATH_MTU, 1);
 
 //         println!("{}", hex::encode(buf));
     }
