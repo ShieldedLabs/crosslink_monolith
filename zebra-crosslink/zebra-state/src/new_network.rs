@@ -243,6 +243,7 @@ pub fn print_shadow_block_intersection(a: &[ShadowBlock], b: &[ShadowBlock], byt
         return;
     }
 
+    eprintln!("Intersection:");
     let min = a[0].this_height.min(b[0].this_height);
     let prefix = chain_intersect_prefix(a, b);
     print_shadow_block_slice(min, a, bytes_n);
@@ -383,6 +384,7 @@ impl NearTipChains {
             for chain in &self.chains {
                 min_h = min_h.min(chain.blocks[0].this_height);
             }
+            eprintln!("{} chains:", self.chains.len());
             for chain in &self.chains {
                 print_shadow_block_slice(min_h, &chain.blocks, hash_bytes_n);
             }
@@ -392,9 +394,9 @@ impl NearTipChains {
         let res = self.write_to(buf);
         debug_assert!(res > 0, "failed to write packet");
 
-        let branches = NearTipBranches::read_from(&mut &buf[..]).unwrap();
+        let branches = NearTipBranches::read_from(&mut &buf[..res]).unwrap();
         if hash_bytes_n > 0 {
-            eprintln!("");
+            eprintln!("\n{} branches:", branches.branches.len());
             branches.dump(hash_bytes_n);
         }
     }
@@ -449,7 +451,7 @@ impl SliceWrite for NearTipChains {
             runs.push((branch, base_height, start_idx));
         }
 
-        {
+        if false { // @Dev @Debug
             let mut min_h = u32::MAX;
             for run in &runs {
                 min_h = min_h.min(run.1);
