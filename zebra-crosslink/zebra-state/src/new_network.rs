@@ -11,10 +11,10 @@ use tenderlink::{SliceWrite, SliceRead};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum BlockEvent {
-    Dequeued(Hash),
-    Committed(Hash),
-    TradFinalized(Hash),
-    CrosslinkFinalized(Hash),
+    Dequeued(ShadowBlock),
+    Committed(ShadowBlock),
+    TradFinalized(ShadowBlock),
+    CrosslinkFinalized(ShadowBlock),
 }
 static BLOCK_EVENT_QUEUE_SENDER: std::sync::OnceLock<tokio::sync::mpsc::Sender<BlockEvent>> = std::sync::OnceLock::new();
 
@@ -725,10 +725,10 @@ pub fn get_bc_hash_at_height(read_state: &ReadState, rt: &tokio::runtime::Handle
         match res {
             Ok(ReadResponse::BlockHash(maybe_hash)) => maybe_hash,
             Err(err) => {
-                tracing::error!("header fetch: {err:?}");
+                tracing::error!("get_bc_hash_at_height({height:?}): Error: {err:?}");
                 None
             },
-            _ => panic!("sync err: unhandled response: {res:?}"),
+            _ => panic!("get_bc_hash_at_height({height:?}): Unhandled response: {res:?}"),
         }
     })
 }
@@ -739,10 +739,10 @@ pub fn get_hdr_at_hash(read_state: &ReadState, rt: &tokio::runtime::Handle, hash
         match res {
             Ok(ReadResponse::BlockHeader{ header, height, hash, .. }) => Some((header, height, hash)),
             Err(err) => {
-                tracing::error!("header fetch: {err:?}");
+                tracing::error!("get_hdr_at_hash({hash}): Error: {err:?}");
                 None
             },
-            _ => panic!("header fetch: unhandled response: {res:?}"),
+            _ => panic!("get_hdr_at_hash({hash}): Unhandled response: {res:?}"),
         }
     })
 }
@@ -756,10 +756,10 @@ pub fn get_hdrs_after_hash(read_state: &ReadState, rt: &tokio::runtime::Handle, 
         match res {
             Ok(ReadResponse::BlockHeaders(hdrs)) => Some(hdrs),
             Err(err) => {
-                tracing::error!("header fetch: {err:?}");
+                tracing::error!("get_hdrs_after_hash({pre_first_hash}): Error: {err:?}");
                 None
             },
-            _ => panic!("header fetch: unhandled response: {res:?}"),
+            _ => panic!("get_hdrs_after_hash({pre_first_hash}): Unhandled response: {res:?}"),
         }
     })
 }
@@ -897,35 +897,12 @@ pub fn sync(
             match event_rx.try_recv() {
                 Ok(block_event) => {
                     match block_event {
-                        BlockEvent::Committed(hash) => {
-                            'wait_for_push_blocks: loop {
-                                // TODO: BlockEvents should contain enough info to insert a shadow block
-                                if let Some((hdr, height, hash)) = get_hdr_at_hash(&read_state, &rt, hash) {
-                                    near_tip_chains.push_blocks(&[ShadowBlock {
-                                        parent_hash: hdr.previous_block_hash,
-                                        this_hash: hash,
-                                        this_height: height.0,
-                                    }]);
-                                    break 'wait_for_push_blocks;
-                                } else {
-                                    std::thread::yield_now();
-                                }
-                            }
+                        BlockEvent::Committed(block) => {
+                            near_tip_chains.push_blocks(&[block]);
                         }
 
-                        BlockEvent::TradFinalized(hash) | BlockEvent::CrosslinkFinalized(hash) => {
-                            'wait_for_push_blocks: loop {
-                                if let Some((hdr, height, hash)) = get_hdr_at_hash(&read_state, &rt, hash) {
-                                    near_tip_chains.remove_chains_invalidated_by_finalized(&ShadowBlock {
-                                        parent_hash: hdr.previous_block_hash,
-                                        this_hash: hash,
-                                        this_height: height.0,
-                                    });
-                                    break 'wait_for_push_blocks;
-                                } else {
-                                    std::thread::yield_now();
-                                }
-                            }
+                        BlockEvent::TradFinalized(block) | BlockEvent::CrosslinkFinalized(block) => {
+                            near_tip_chains.remove_chains_invalidated_by_finalized(&block);
                         }
 
                         _ => {
