@@ -224,28 +224,28 @@ impl SliceWrite for NearTipChains {
         // runs:   (0,9), (2, e)
 
         for chain in &self.chains {
-            let parent_idx = if let Some(parent_idx) = hashes.iter().position(|h| *h == chain.blocks[0].parent_hash) {
-                parent_idx
+            let mut fork_idx = if let Some(idx) = hashes.iter().position(|h| *h == chain.blocks[0].parent_hash) {
+                idx
             } else {
                 // new tree
                 hashes.push(chain.blocks[0].parent_hash);
                 hashes.len()-1
             };
 
-            let mut branch = PacketHashBranch {
-                parent_hash_idx: parent_idx.try_into().unwrap(),
-                branch_end_idx: hashes.len().try_into().unwrap(), // fixed up after loop
-            };
-
+            let dedup_start = fork_idx + 1;
             for block in &chain.blocks {
-                if hashes[parent_idx+1..].contains(&block.this_hash) {
+                if let Some(pos) = hashes[fork_idx+1..].iter().position(|h| *h == block.this_hash) {
+                    fork_idx = fork_idx + 1 + pos;
                     continue;
                 }
                 hashes.push(block.this_hash);
             }
-            debug_assert!((branch.branch_end_idx as usize) < hashes.len(), "DEV: nothing from chain was used");
+            debug_assert!(dedup_start < hashes.len(), "DEV: nothing from chain was used");
 
-            branch.branch_end_idx = hashes.len().try_into().unwrap();
+            let branch = PacketHashBranch {
+                parent_hash_idx: fork_idx.try_into().unwrap(),
+                branch_end_idx: hashes.len().try_into().unwrap(),
+            };
             runs.push((branch, chain.blocks[0].this_height));
         }
 
