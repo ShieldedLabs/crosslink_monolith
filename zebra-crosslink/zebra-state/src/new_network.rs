@@ -381,30 +381,32 @@ impl SliceWrite for NearTipChains {
         // runs:   (0,9), (2, e)
 
         for chain in &self.chains {
-            let mut fork_idx = if let Some(idx) = hashes.iter().position(|h| *h == chain.blocks[0].parent_hash) {
-                idx
-            } else {
-                // new tree
+            assert!(chain.blocks.len() > 0);
+
+            let (parent_idx_into_hashes, base_idx_into_chain) = 'found: {
+                // find the newest block with a parent that was already serialized
+                for (chain_idx, block) in chain.blocks.iter().enumerate().rev() {
+                    if let Some(i) = hashes.iter().rposition(|hash| *hash == block.parent_hash) {
+                        break 'found (i, chain_idx);
+                    }
+                }
+
+                // no blocks found with a parent contained in the serialized hashes; start a new tree
                 hashes.push(chain.blocks[0].parent_hash);
-                hashes.len()-1
+                (hashes.len()-1, 0)
             };
             let start_idx = hashes.len();
+            let base_height = chain.blocks[base_idx_into_chain].this_height;
 
-            let dedup_start = fork_idx + 1;
-            for block in &chain.blocks {
-                if let Some(pos) = hashes[fork_idx+1..].iter().position(|h| *h == block.this_hash) {
-                    fork_idx = fork_idx + 1 + pos;
-                    continue;
-                }
-                hashes.push(block.this_hash);
+            for chain_idx in base_idx_into_chain..chain.blocks.len() {
+                hashes.push(chain.blocks[chain_idx].this_hash);
             }
-            debug_assert!(dedup_start < hashes.len(), "DEV: nothing from chain was used");
 
             let branch = PacketHashBranch {
-                parent_hash_idx: fork_idx.try_into().unwrap(),
+                parent_hash_idx: parent_idx_into_hashes.try_into().unwrap(),
                 branch_end_idx: hashes.len().try_into().unwrap(),
             };
-            runs.push((branch, chain.blocks[0].this_height, start_idx));
+            runs.push((branch, base_height, start_idx));
         }
 
         {
@@ -433,19 +435,21 @@ impl SliceWrite for NearTipChains {
         for (mut branch, height, _fork_idx) in &runs {
             let disconnected = (<usize>::from(branch.parent_hash_idx) == hash_c);
 
-            let run_start_if_last_run = o
-                                      + std::mem::size_of_val(&branch) + disconnected as usize * std::mem::size_of_val(&height)
-                                      + hash_c * 32;
-            if run_start_if_last_run + 32 > buf.len() {
-                // wouldn't be able to fit any more hashes in, no point in starting another run
+            let hashes_start_if_last = o + std::mem::size_of_val(&branch) + disconnected as usize * std::mem::size_of_val(&height);
+
+            let run_bgn_if_last = hashes_start_if_last + (hash_c                         * 32);
+            let run_end_if_last = hashes_start_if_last + (branch.branch_end_idx as usize * 32);
+
+            if run_bgn_if_last + ((disconnected as usize + 1) * 32) > buf.len() {
+                // wouldn't be able to fit even one more this_hash in, no point in starting another run
                 break;
             }
 
-            let end = run_start_if_last_run + (branch.branch_end_idx as usize * 32);
-            if end > buf.len() {
-                let rem_size = buf.len() - run_start_if_last_run;
+            if run_end_if_last > buf.len() {
+                let rem_size = buf.len() - run_bgn_if_last;
                 let rem_hashes = rem_size / 32;
                 branch.branch_end_idx = (hash_c + rem_hashes).try_into().unwrap();
+                assert!(branch.branch_end_idx as usize <= hashes.len());
             }
 
             // write (parent, end)
