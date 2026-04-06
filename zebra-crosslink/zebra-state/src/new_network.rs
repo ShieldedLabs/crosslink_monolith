@@ -143,6 +143,7 @@ impl Default for ShadowBlock {
     fn default() -> Self { Self { this_hash: Hash([0u8; 32]), parent_hash: Hash([0u8; 32]), this_height: 0 } }
 }
 
+const PRINT_H_1: usize = 1;
 pub fn print_shadow_block_slice(indent_start_h: u32, blocks: &[ShadowBlock], bytes_n: usize) {
     const INCLUDE_PARENT: usize = 0;
     const INCLUDE_PARENT_1: usize = 1 & (1-INCLUDE_PARENT);
@@ -151,6 +152,10 @@ pub fn print_shadow_block_slice(indent_start_h: u32, blocks: &[ShadowBlock], byt
 
     if blocks.len() == 0 {
         return;
+    }
+
+    if PRINT_H_1 == 1 {
+        eprint!("{:3}: ", blocks[0].this_height); // NOTE: NOT the parent height, even when that's prepended
     }
 
     {
@@ -182,16 +187,51 @@ pub fn print_shadow_block_slice(indent_start_h: u32, blocks: &[ShadowBlock], byt
             eprint!(" {:3}", block.this_height);
         }
         if PARENS == 1 { eprint!(")"); }
-        eprint!(", ");
-
     }
 
     if INCLUDE_PARENT_1 == 1 {
         print_block(&ShadowBlock{ parent_hash: Hash([0;32]), this_hash: blocks[0].parent_hash, this_height: blocks[0].this_height.wrapping_sub(1)}, bytes_n);
+        eprint!("| ");
     }
 
     for block in blocks {
         print_block(block, bytes_n);
+        eprint!(", ");
+    }
+    eprintln!("");
+}
+
+pub fn print_hash_slice(indent_start_h: u32, h: u32, parent: Option<Hash>, hashes: &[Hash], bytes_n: usize) {
+    if hashes.len() == 0 {
+        return;
+    }
+
+    if PRINT_H_1 == 1 {
+        eprint!("{:3}: ", h); // NOTE: NOT the parent height, even when that's prepended
+    }
+
+    {
+        // indent for alignment
+        let w_base   = bytes_n * 2 + ", ".len();
+        let w_per    = w_base;
+        let w = (h - indent_start_h) as usize * w_per;
+        eprint!("{:w$}", "");
+    }
+
+    fn print_hash(hash: &Hash, bytes_n: usize) {
+        for byte in &hash.0[..bytes_n] {
+            eprint!("{:02x}", byte);
+        }
+    }
+
+    if let Some(parent) = parent {
+        print_hash(&parent, bytes_n);
+        eprint!("| ");
+    }
+
+    for hash in hashes {
+        print_hash(hash, bytes_n);
+        eprint!(", ");
     }
     eprintln!("");
 }
@@ -333,7 +373,7 @@ impl SliceWrite for NearTipChains {
 
         let tip_height = self.tip_height().expect("programmer error: should be non-empty");
 
-        let mut runs = Vec::<(PacketHashBranch, u32)>::new();
+        let mut runs = Vec::<(PacketHashBranch, u32, usize)>::new();
         let mut hashes = Vec::<Hash>::new();
 
         //         0 1 2 3 4 5 6 7 8 9 a b c d
@@ -348,6 +388,7 @@ impl SliceWrite for NearTipChains {
                 hashes.push(chain.blocks[0].parent_hash);
                 hashes.len()-1
             };
+            let start_idx = hashes.len();
 
             let dedup_start = fork_idx + 1;
             for block in &chain.blocks {
@@ -363,7 +404,18 @@ impl SliceWrite for NearTipChains {
                 parent_hash_idx: fork_idx.try_into().unwrap(),
                 branch_end_idx: hashes.len().try_into().unwrap(),
             };
-            runs.push((branch, chain.blocks[0].this_height));
+            runs.push((branch, chain.blocks[0].this_height, start_idx));
+        }
+
+        {
+            let mut min_h = u32::MAX;
+            for run in &runs {
+                min_h = min_h.min(run.1);
+            }
+            for (i, run) in runs.iter().enumerate() {
+                eprintln!("run {i}");
+                print_hash_slice(min_h, run.1, Some(hashes[run.0.parent_hash_idx as usize]), &hashes[run.2..run.0.branch_end_idx as usize], 1);
+            }
         }
 
 
@@ -378,7 +430,7 @@ impl SliceWrite for NearTipChains {
         // TODO (perf): merge into loop above
         let mut o      = hdr.write_to(&mut buf[..]);
         let mut hash_c = 0usize;
-        for (mut branch, height) in &runs {
+        for (mut branch, height, _fork_idx) in &runs {
             let disconnected = (<usize>::from(branch.parent_hash_idx) == hash_c);
 
             let run_start_if_last_run = o
