@@ -206,6 +206,53 @@ impl NearTipChains {
 
         self.chains.sort_by_key(|ch| std::cmp::Reverse(ch.work));
     }
+
+
+    const PRINT_H: usize = 0;
+    fn indent_slice(start_h: u32, h: u32) {
+        let w = (h - start_h) as usize * 9 + 3 * Self::PRINT_H;
+        print!("{:w$}", "");
+    }
+
+    fn print_slice(blocks: &[ShadowBlock]) {
+        for block in blocks {
+            if Self::PRINT_H == 1 {
+                print!("({:02x} {:02x} {:2}), ", block.parent_hash.0[0], block.this_hash.0[0], block.this_height);
+            } else {
+                print!("({:02x} {:02x}), ", block.parent_hash.0[0], block.this_hash.0[0]);
+            }
+        }
+        println!("");
+    }
+
+    fn roundtrip_to_branches(&self, max_size: usize, print: bool) {
+        let buf = &mut [0u8; PATH_MTU][..max_size];
+        let res = self.write_to(buf);
+        debug_assert!(res > 0, "failed to write packet");
+
+        let branches = NearTipBranches::read_from(&mut &buf[..]).unwrap();
+
+        if print {
+            let mut min_h = u32::MAX;
+            for chain in &self.chains {
+                min_h = min_h.min(chain.blocks[0].this_height);
+            }
+            for chain in &self.chains {
+                Self::indent_slice(min_h, chain.blocks[0].this_height);
+                Self::print_slice(&chain.blocks);
+            }
+
+            println!("");
+            let mut min_h = u32::MAX;
+            for blocks in &branches.branches {
+                min_h = min_h.min(blocks[0].this_height);
+            }
+            for blocks in &branches.branches {
+                Self::indent_slice(min_h, blocks[0].this_height);
+                Self::print_slice(blocks);
+            }
+        }
+    }
 }
 
 impl SliceWrite for NearTipChains {
@@ -401,7 +448,7 @@ pub fn height_intersect(haystack: &[ShadowBlock], height_bgn: u32, height_end: u
     let haystack_height_bgn = haystack[             0].this_height;
     let haystack_height_end = haystack.last().unwrap().this_height + 1;
 
-    if (haystack_height_end - haystack_height_bgn) as usize != haystack.len() { 
+    if (haystack_height_end - haystack_height_bgn) as usize != haystack.len() {
         #[cfg(debug_assertions)] panic!("Invariant violated: ShadowBlock chains are supposed to have one block per height");
         return &haystack[0..0];
     }
@@ -970,31 +1017,30 @@ mod tests {
         let mut buf = [0u8; PATH_MTU];
 
         let mut chains = NearTipChains { chains: Vec::new() };
-        let res = chains.write_packet_hash_tree(&mut buf);
-        debug_assert_eq!(res, None);
 
         // (a, b), (b, c,), (c, d), (d, e), ..., (c, i), (i, j), ...
         // a b c d e f g h
         //     \ i j k l m n
-        chains.push_blocks(blocks);
+        chains.push_blocks(&blocks);
 
         let mut chains2 = NearTipChains { chains: Vec::new() };
         // (a, b), (b, c,), (c, d), (d, e), ..., (c, i), (i, j), ...
         // a b c d e f g h
         //     \ i j k l m n
         for block in &blocks {
-            chains2.push_blocks(&[block]);
+            chains2.push_blocks(&[*block]);
         }
         let tip_height = 11;
 
         debug_assert_eq!(chains, chains2, "building incrementally should be functionally equivalent to batch-built");
         debug_assert_eq!(chains.tip_height(), Some(11));
+        NearTipChains::indent_slice(2, blocks[0].this_height);
+        NearTipChains::print_slice(&blocks);
+        println!("");
 
+        chains.roundtrip_to_branches(PATH_MTU, true);
 
-        let res = write_packet_hash_tree(&mut buf, tip_height, &blocks);
-        debug_assert!(res.is_some(), "failed to write packet");
-
-        println!("{}", hex::encode(buf));
+//         println!("{}", hex::encode(buf));
     }
 }
 
