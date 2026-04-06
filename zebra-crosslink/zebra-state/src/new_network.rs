@@ -366,11 +366,6 @@ impl SliceRead for NearTipBranches {
                 return None;
             }
 
-            // Subsequent branches must be shorter
-            if end_height - 1 > hdr.tip_height {
-                return None;
-            }
-
             let mut branch_blocks = Vec::with_capacity(branch_hashes_n);
 
             // We NEED to bounds check all the heights in this chain branch.
