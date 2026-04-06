@@ -1124,7 +1124,7 @@ pub fn sync(
 
                         let inserted = blocks_to_queue.insert(block_to_queue.this_hash);
                         if !inserted {
-                            dbg_panic!("Block was already in the set of blocks to queue! Hash: {}", block_to_queue.this_hash);
+                            // dbg_panic!("Block was already in the set of blocks to queue! Hash: {}", block_to_queue.this_hash);
                         }
 
                         // @Temporary @Debug: Only send one block on each chain for now. @Todo: sort block packets by height on receiver side.
