@@ -1101,15 +1101,31 @@ pub fn sync(
 
             } else if packet_type == PACKET_TYPE_BLOCK {
                 use zebra_chain::serialization::ZcashDeserializeInto;
-                let Ok(block) = msg.zcash_deserialize_into::<Block>() else { continue; };
+                let Some(block) = dbg_verify(msg.zcash_deserialize_into::<Block>().ok()) else {
+                    continue;
+                };
 
                 let (hash, height) = (block.hash(), block.coinbase_height());
                 // eprintln!("\x1b[93mPOWLINK2 GOT BLOCK HASH\x1b[0m: {}", hash);
 
-                // skip already committed blocks
-                if committed_blocks.contains(&hash) {
-                    // println!("already committed!: {}", hash);
+                let Some(height) = dbg_verify(height) else {
                     continue;
+                };
+
+                // skip already committed blocks
+                let min_height = near_tip_chains.chains[0].blocks[0].this_height; // @Todo: :AssumeGenesisBlockIncludedInNearTipChains
+
+                // @Todo: Dubious? Double-check.
+                if height < Height(min_height) {
+                    // println!("already committed!: {}", hash);
+                    continue; // Already committed.
+                }
+
+                for our_chain in &near_tip_chains.chains {
+                    if our_chain.blocks.iter().any(|block| block.this_hash == hash) {
+                        // println!("already committed!: {}", hash);
+                        continue; // Already committed.
+                    }
                 }
 
                 println!("new block, committing!: {}", hash);
