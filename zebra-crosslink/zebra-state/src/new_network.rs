@@ -51,6 +51,33 @@ const PACKET_TYPE_BLOCK: u8 = 2;
 
 const PACKET_STATUS_MAX_SIZE: usize = (65536 / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE;
 
+macro_rules! dbg_break {
+    () => {
+        #[cfg(target_arch = "x86_64")] unsafe { std::arch::asm!("int 3"); }
+        // @Todo: AArch64 debugbreak.
+    }
+}
+
+macro_rules! dbg_panic {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)] {
+            dbg_break!();
+            panic!($($arg)*);
+        }
+    }
+}
+pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
+    #[cfg(debug_assertions)] {
+        if t.is_none() { dbg_break!(); }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        return Some(t.unwrap());
+    }
+
+    t
+}
+
+
 #[derive(Clone, Copy, Debug)]
 pub struct PacketHashTreeHdr {
     pub tip_height: u32,
@@ -69,8 +96,8 @@ impl SliceWrite for PacketHashTreeHdr {
 impl SliceRead for PacketHashTreeHdr {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
         Some(Self {
-            tip_height: u32::read_from(buf)?,
-            hashes_start_offset: u16::read_from(buf)?,
+            tip_height:          dbg_verify(u32::read_from(buf))?,
+            hashes_start_offset: dbg_verify(u16::read_from(buf))?,
         })
     }
 }
@@ -93,8 +120,8 @@ impl SliceWrite for PacketHashBranch {
 impl SliceRead for PacketHashBranch {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
         Some(PacketHashBranch {
-            parent_hash_idx: u16::read_from(buf)?,
-            branch_end_idx: u16::read_from(buf)?,
+            parent_hash_idx: dbg_verify(u16::read_from(buf))?,
+            branch_end_idx:  dbg_verify(u16::read_from(buf))?,
         })
     }
 }
@@ -371,7 +398,7 @@ impl NearTipBranches {
 impl SliceRead for NearTipBranches {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
         let full_buf = *buf;
-        let hdr = PacketHashTreeHdr::read_from(buf)?;
+        let hdr = dbg_verify(PacketHashTreeHdr::read_from(buf))?;
         let hdr_len = full_buf.len() - buf.len(); // @Todo: better way to do this.
         *buf = &buf[..(hdr.hashes_start_offset as usize).saturating_sub(hdr_len)];
         let mut buf_hashes: &mut &[u8] = &mut &full_buf[hdr.hashes_start_offset as usize..];
@@ -380,15 +407,17 @@ impl SliceRead for NearTipBranches {
         let mut hash_c = 0usize;
         while buf.len() > 0 {
             let (parent_i, end_i) = {
-                let branch = PacketHashBranch::read_from(buf)?;
+                let branch = dbg_verify(PacketHashBranch::read_from(buf))?;
                 (branch.parent_hash_idx as usize, branch.branch_end_idx as usize)
             };
             if end_i.saturating_mul(32) > buf_hashes.len() {
                 println!("received invalid Hash Tree packet (branch end)");
+                dbg_panic!("received invalid Hash Tree packet (branch end)");
                 return None;
             }
             if parent_i.saturating_add(1).saturating_mul(32) > buf_hashes.len() {
                 println!("received invalid Hash Tree packet (parent hash)");
+                dbg_panic!("received invalid Hash Tree packet (parent hash)");
                 return None;
             }
 
@@ -396,10 +425,11 @@ impl SliceRead for NearTipBranches {
             parent_hash.0.copy_from_slice(&buf_hashes[parent_i * 32..(parent_i+1) * 32]);
 
             let bgn_height = if parent_i > hash_c {
+                dbg_panic!("parent_i > hash_c, this is malformed! Parent_i: {parent_i}, hash_c: {hash_c}");
                 return None; // deciding this is malformed for now...
             } else if parent_i == hash_c {
                 hash_c += 1;
-                u32::read_from(buf)?
+                dbg_verify(u32::read_from(buf))?
             } else {
                 // Get branch height from previous hash point (height from beginning of run + offset).
                 // @Todo(Perf) @Speed: store a Vec of [bgn_i, end_i) so we can binary search to find which branch parent_i is in.
@@ -409,25 +439,28 @@ impl SliceRead for NearTipBranches {
                             if block.parent_hash == parent_hash {
                                 break 'find_branch block.this_height;
                             } else if block.this_hash == parent_hash {
-                                break 'find_branch block.this_height.checked_add(1)?;
+                                break 'find_branch dbg_verify(block.this_height.checked_add(1))?;
                             }
                         }
                     }
+                    dbg_panic!("Could not locate the parent in the branches list! Parent hash: {parent_hash}, hash_c: {hash_c}");
                     return None;
                 }
             };
 
             if end_i <= hash_c { // zero-length branch or otherwise somehow precedes the current cursor
+                dbg_panic!("Zero-length branch/somehow precedes current cursor! Hash_c: {hash_c}, end: {end_i}");
                 return None;
             }
 
             let branch_hashes_n = end_i - hash_c;
             debug_assert!(branch_hashes_n < u32::MAX as usize, "more blocks in a branch than could be in a blockchain with 32-bit height values");
 
-            let end_height = bgn_height.checked_add((end_i - hash_c) as u32)?;
+            let end_height = dbg_verify(bgn_height.checked_add((end_i - hash_c) as u32))?;
 
             // The first branch must be the best chain
             if branches.is_empty() && end_height - 1 != hdr.tip_height {
+                dbg_panic!("The first branch must be the best chain and match the header's tip height! First branch height: {}, tip height: {}", end_height - 1, hdr.tip_height);
                 return None;
             }
 
@@ -435,7 +468,7 @@ impl SliceRead for NearTipBranches {
 
             // We NEED to bounds check all the heights in this chain branch.
             // This means we can later increment heights by 1 without checking.
-            let _ = bgn_height.checked_add(branch_hashes_n.try_into().ok()?)?;
+            let _ = dbg_verify(bgn_height.checked_add(dbg_verify(branch_hashes_n.try_into().ok())?))?;
 
             for i in hash_c..end_i {
                 let mut this_hash = Hash([0u8; 32]);
@@ -866,20 +899,22 @@ pub fn sync(
             //     break; // Congested! Drop remainder!
             // }
 
-            let Some(packet_type) = <u8>::read_from(&mut msg)
+            let Some(packet_type) = dbg_verify(<u8>::read_from(&mut msg))
             else {
                 kill();
                 continue;
             };
 
             if packet_type == PACKET_TYPE_STATUS {
-                let Some(our_tip_height) = near_tip_chains.tip_height()
+                // println!("got a status");
+
+                let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height())
                 else {
                     continue;
                 };
 
                 // TODO: rate limit consumption
-                let Some(their_tree) = NearTipBranches::read_from(&mut msg)
+                let Some(their_tree) = dbg_verify(NearTipBranches::read_from(&mut msg))
                 else {
                     kill();
                     continue;
@@ -943,7 +978,7 @@ pub fn sync(
                         max_height_we_both_share = max_height_we_both_share.max(Some(height_of_match));
                     }
 
-                    let Some(max_height_we_both_share) = max_height_we_both_share else {
+                    let Some(max_height_we_both_share) = dbg_verify(max_height_we_both_share) else {
                         continue;
                     };
 

@@ -476,7 +476,7 @@ pub fn connect_to_endpoint(
     }
 }
 
-const        VERBOSE                :bool=0!=                (0);
+const        VERBOSE                :bool=0!=                (1);
 const OVERLY_VERBOSE                :bool=0!=                (0);
 
 macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
@@ -626,9 +626,9 @@ pub fn service_connections(
         if buf_len >= 6 {
             let first_six_bytes = load_u48(&packet_memory_encrypted[0..6]);
             if first_six_bytes & 1 != 0 { // Client Hello
-                if OVERLY_VERBOSE { println!("Got a HELLO."); }
+                // if OVERLY_VERBOSE { println!("Got a HELLO."); }
             } else {
-                if OVERLY_VERBOSE { println!("Got a non-hello."); }
+                // if OVERLY_VERBOSE { println!("Got a non-hello."); }
             }
             if first_six_bytes & 1 != 0 { // Client Hello
                 let magic1 = first_six_bytes;
@@ -772,9 +772,7 @@ pub fn service_connections(
                 }
             }
             else { // Not client hello
-                if OVERLY_VERBOSE {
-                    println!("Not a client hello. Processing...");
-                }
+                // if OVERLY_VERBOSE { println!("Not a client hello. Processing..."); }
 
                 let mut kill_connection: Option<ConnectionKey> = None;
                 'conn: {
@@ -907,7 +905,7 @@ pub fn service_connections(
 
                         *recv_time_ns = timestamp_ns;
 
-                        if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
+                        // if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
 
                         let mMTU_inside_udp = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
                         let mMTU_inside_stp = mMTU_inside_udp - 6 - crypto_overhead_from_connect_magic1(*magic1).unwrap();
