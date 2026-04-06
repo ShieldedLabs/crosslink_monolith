@@ -1074,8 +1074,8 @@ pub fn sync(
                         max_height_we_both_share = max_height_we_both_share.max(Some(height_of_match));
                     }
 
-                    let Some(max_height_we_both_share) = dbg_verify(max_height_we_both_share) else {
-                        continue;
+                    let Some(max_height_we_both_share) = max_height_we_both_share else {
+                        continue; // Nothing on this chain of ours that we can use to extend their branch.
                     };
 
                     for height in max_height_we_both_share + 1 .. our_chain_height_end {
