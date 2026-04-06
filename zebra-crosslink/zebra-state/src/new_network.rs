@@ -171,6 +171,19 @@ pub fn print_shadow_block_slice(indent_start_h: u32, blocks: &[ShadowBlock], byt
     eprintln!("");
 }
 
+pub fn print_shadow_block_intersection(a: &[ShadowBlock], b: &[ShadowBlock], bytes_n: usize) {
+    if a.len() == 0 || b.len() == 0 {
+        eprintln!("empty slice: no intersection");
+        return;
+    }
+
+    let min = a[0].this_height.min(b[0].this_height);
+    let prefix = chain_intersect_prefix(a, b);
+    print_shadow_block_slice(min, a, bytes_n);
+    print_shadow_block_slice(min, prefix, bytes_n);
+    print_shadow_block_slice(min, b, bytes_n);
+}
+
 
 const NEAR_TIP_CHAIN_LEN: u32 = 100;
 
@@ -964,6 +977,8 @@ pub fn sync(
                         let their_branch_height_end = their_branch.last().unwrap().this_height + 1;
 
                         let prefix = chain_intersect_prefix(&their_branch, &our_chain.blocks);
+                        // print_shadow_block_intersection(&their_branch, &our_chain.blocks, 1);
+
 
                         // If the prefix was empty, there was no overlap.
                         if prefix.is_empty() {
@@ -1075,6 +1090,24 @@ mod tests {
             ShadowBlock { parent_hash: Hash([0x19;32]), this_hash: Hash([0x1a;32]), this_height:10 },
             ShadowBlock { parent_hash: Hash([0x1a;32]), this_hash: Hash([0x1b;32]), this_height:11 },
         ];
+
+        // {
+        //     let blocks2 = [
+        //         ShadowBlock { parent_hash: Hash([0x01;32]), this_hash: Hash([0x02;32]), this_height: 2 },
+        //         ShadowBlock { parent_hash: Hash([0x02;32]), this_hash: Hash([0x03;32]), this_height: 3 },
+        //         ShadowBlock { parent_hash: Hash([0x03;32]), this_hash: Hash([0x04;32]), this_height: 4 },
+        //         ShadowBlock { parent_hash: Hash([0x04;32]), this_hash: Hash([0x05;32]), this_height: 5 },
+        //         ShadowBlock { parent_hash: Hash([0x05;32]), this_hash: Hash([0x16;32]), this_height: 6 },
+        //         ShadowBlock { parent_hash: Hash([0x16;32]), this_hash: Hash([0x17;32]), this_height: 7 },
+        //         ShadowBlock { parent_hash: Hash([0x17;32]), this_hash: Hash([0x18;32]), this_height: 8 },
+        //         ShadowBlock { parent_hash: Hash([0x18;32]), this_hash: Hash([0x19;32]), this_height: 9 },
+        //         ShadowBlock { parent_hash: Hash([0x19;32]), this_hash: Hash([0x1a;32]), this_height:10 },
+        //         ShadowBlock { parent_hash: Hash([0x1a;32]), this_hash: Hash([0x1b;32]), this_height:11 },
+        //     ];
+
+        //     print_shadow_block_intersection(&blocks[0..8], &blocks2[2..9], 1);
+        // }
+
         let mut buf = [0u8; PATH_MTU];
 
         let mut chains = NearTipChains { chains: Vec::new() };
@@ -1095,8 +1128,8 @@ mod tests {
 
         debug_assert_eq!(chains, chains2, "building incrementally should be functionally equivalent to batch-built");
         debug_assert_eq!(chains.tip_height(), Some(11));
-        NearTipChains::print_slice(2, &blocks, 1);
-        println!("");
+        print_shadow_block_slice(blocks[0].this_height, &blocks, 1);
+        eprintln!("");
 
         chains.roundtrip_to_branches(PATH_MTU, 1);
 
