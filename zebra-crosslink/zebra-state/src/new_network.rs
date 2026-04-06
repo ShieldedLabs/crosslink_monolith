@@ -1264,7 +1264,7 @@ mod tests {
         //     eprintln!("");
         // }
 
-        let mut buf = [0u8; PATH_MTU];
+        let mut buf = [0u8; PACKET_STATUS_MAX_SIZE];
 
         let mut chains = NearTipChains { chains: Vec::new() };
 
@@ -1287,7 +1287,7 @@ mod tests {
         print_shadow_block_slice(blocks[0].this_height, &blocks, 1);
         eprintln!("");
 
-        chains.roundtrip_to_branches(PATH_MTU, 1);
+        chains.roundtrip_to_branches(PACKET_STATUS_MAX_SIZE, 1);
 
 //         println!("{}", hex::encode(buf));
     }
