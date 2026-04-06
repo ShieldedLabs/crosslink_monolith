@@ -354,13 +354,16 @@ impl WriteBlockWorkerTask {
                         info!("finalized {}, which implicitly finalizes:", hash);
                         for i in 0..newly_finalized_blocks.len() {
                             let finalizable_block = non_finalized_state.finalize();
-                            crate::new_network::push_block_event(crate::new_network::BlockEvent::CrosslinkFinalized(finalizable_block.inner_block().hash()));
+                            let finalizable_block_inner_block_hash = finalizable_block.inner_block().hash();
                             match finalized_state.commit_finalized_direct(
                                 finalizable_block,
                                 None,
                                 "commit Crosslink-finalized block",
                             ) {
-                                Ok((hash, _)) => info!("  {}: {}", i, hash),
+                                Ok((hash, _)) => {
+                                    crate::new_network::push_block_event(crate::new_network::BlockEvent::CrosslinkFinalized(finalizable_block_inner_block_hash));
+                                    info!("  {}: {}", i, hash);
+                                }
                                 Err(err) => {
                                     unreachable!("unexpected finalized block commit error: {}", err)
                                 }
@@ -456,7 +459,6 @@ impl WriteBlockWorkerTask {
                 // Skip the things we only need to do for successfully committed blocks
                 continue;
             }
-            crate::new_network::push_block_event(crate::new_network::BlockEvent::Committed(child_hash));
 
             // Committing blocks to the finalized state keeps the same chain,
             // so we can update the chain seen by the rest of the application now.
@@ -481,12 +483,13 @@ impl WriteBlockWorkerTask {
             {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
-                crate::new_network::push_block_event(crate::new_network::BlockEvent::TradFinalized(contextually_verified_with_trees.inner_block().hash()));
+                let contextually_verified_with_trees_inner_block_hash = contextually_verified_with_trees.inner_block().hash();
                 prev_finalized_note_commitment_trees = finalized_state
                             .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), "commit contextually-verified request")
                             .expect(
                                 "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                             ).1.into();
+                crate::new_network::push_block_event(crate::new_network::BlockEvent::TradFinalized(contextually_verified_with_trees_inner_block_hash));
             }
 
             // Update the metrics if semantic and contextual validation passes
@@ -504,6 +507,7 @@ impl WriteBlockWorkerTask {
             metrics::gauge!("zcash.chain.verified.block.height").set(tip_block_height.0 as f64);
 
             tracing::trace!("finished processing queued block");
+            crate::new_network::push_block_event(crate::new_network::BlockEvent::Committed(child_hash));
         }
 
         // We're finished receiving non-finalized blocks from the state, and

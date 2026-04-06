@@ -898,23 +898,33 @@ pub fn sync(
                 Ok(block_event) => {
                     match block_event {
                         BlockEvent::Committed(hash) => {
-                            // TODO: BlockEvents should contain enough info to insert a shadow block
-                            if let Some((hdr, height, hash)) = get_hdr_at_hash(&read_state, &rt, hash) {
-                                near_tip_chains.push_blocks(&[ShadowBlock {
-                                    parent_hash: hdr.previous_block_hash,
-                                    this_hash: hash,
-                                    this_height: height.0,
-                                }]);
+                            'wait_for_push_blocks: loop {
+                                // TODO: BlockEvents should contain enough info to insert a shadow block
+                                if let Some((hdr, height, hash)) = get_hdr_at_hash(&read_state, &rt, hash) {
+                                    near_tip_chains.push_blocks(&[ShadowBlock {
+                                        parent_hash: hdr.previous_block_hash,
+                                        this_hash: hash,
+                                        this_height: height.0,
+                                    }]);
+                                    break 'wait_for_push_blocks;
+                                } else {
+                                    std::thread::yield_now();
+                                }
                             }
                         }
 
                         BlockEvent::TradFinalized(hash) | BlockEvent::CrosslinkFinalized(hash) => {
-                            if let Some((hdr, height, hash)) = get_hdr_at_hash(&read_state, &rt, hash) {
-                                near_tip_chains.remove_chains_invalidated_by_finalized(&ShadowBlock {
-                                    parent_hash: hdr.previous_block_hash,
-                                    this_hash: hash,
-                                    this_height: height.0,
-                                });
+                            'wait_for_push_blocks: loop {
+                                if let Some((hdr, height, hash)) = get_hdr_at_hash(&read_state, &rt, hash) {
+                                    near_tip_chains.remove_chains_invalidated_by_finalized(&ShadowBlock {
+                                        parent_hash: hdr.previous_block_hash,
+                                        this_hash: hash,
+                                        this_height: height.0,
+                                    });
+                                    break 'wait_for_push_blocks;
+                                } else {
+                                    std::thread::yield_now();
+                                }
                             }
                         }
 
@@ -1165,7 +1175,7 @@ pub fn sync(
                 };
 
                 // skip already committed blocks
-                let min_height = near_tip_chains.chains[0].blocks[0].this_height; // @Todo: :AssumeGenesisBlockIncludedInNearTipChains
+                let min_height = near_tip_chains.chains[0].blocks[0].this_height; // @Todo: this assumes :AssumeGenesisBlockIncludedInNearTipChains
 
                 // @Todo: Dubious? Double-check.
                 if height < Height(min_height) {
