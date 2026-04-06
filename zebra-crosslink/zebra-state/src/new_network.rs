@@ -144,29 +144,54 @@ impl Default for ShadowBlock {
 }
 
 pub fn print_shadow_block_slice(indent_start_h: u32, blocks: &[ShadowBlock], bytes_n: usize) {
+    const INCLUDE_PARENT: usize = 0;
+    const INCLUDE_PARENT_1: usize = 1 & (1-INCLUDE_PARENT);
     const PRINT_H: usize = 0;
+    const PARENS: usize = INCLUDE_PARENT | PRINT_H;
+
     if blocks.len() == 0 {
         return;
     }
 
-    let w_per = bytes_n * 2 * 2 + 4 * PRINT_H + "( ), ".len();
-    let w = (blocks[0].this_height - indent_start_h) as usize * w_per;
+    {
+        // indent for alignment
+        let w_base   = bytes_n * 2 + ", ".len();
+        let w_parent = INCLUDE_PARENT * (" ".len() + bytes_n * 2);
+        let w_parens = PARENS * 2;
+        let w_h      = PRINT_H * 4;
+        let w_per    = w_base + w_parent + w_parens + w_h;
+        let w = (blocks[0].this_height - indent_start_h) as usize * w_per;
+        eprint!("{:w$}", "");
+    }
 
-    eprint!("{:w$}", "");
+    fn print_block(block: &ShadowBlock, bytes_n: usize) {
+        if PARENS == 1 { eprint!("("); }
 
-    for block in blocks {
-        eprint!("(");
-        for byte in &block.parent_hash.0[..bytes_n] {
-            eprint!("{:02x}", byte);
+        if INCLUDE_PARENT == 1 {
+            for byte in &block.parent_hash.0[..bytes_n] {
+                eprint!("{:02x}", byte);
+            }
+            eprint!(" ");
         }
-        eprint!(" ");
+
         for byte in &block.this_hash.0[..bytes_n] {
             eprint!("{:02x}", byte);
         }
+
         if PRINT_H == 1 {
-            eprint!("{:3}", block.this_height);
+            eprint!(" {:3}", block.this_height);
         }
-        eprint!("), ");
+        if PARENS == 1 { eprint!(")"); }
+        eprint!(", ");
+
+    }
+
+    if INCLUDE_PARENT_1 == 1 {
+        print_block(&ShadowBlock{ parent_hash: Hash([0;32]), this_hash: blocks[0].parent_hash, this_height: blocks[0].this_height.wrapping_sub(1)}, bytes_n);
+    }
+
+    for block in blocks {
+        print_block(block, bytes_n);
     }
     eprintln!("");
 }
@@ -1106,6 +1131,7 @@ mod tests {
         //     ];
 
         //     print_shadow_block_intersection(&blocks[0..8], &blocks2[2..9], 1);
+        //     eprintln!("");
         // }
 
         let mut buf = [0u8; PATH_MTU];
