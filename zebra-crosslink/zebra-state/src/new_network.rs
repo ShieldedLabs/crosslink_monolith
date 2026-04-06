@@ -340,6 +340,28 @@ impl NearTipChains {
         self.chains.sort_by_key(|ch| std::cmp::Reverse(ch.work));
     }
 
+    fn remove_chains_invalidated_by_finalized(&mut self, final_block: &ShadowBlock) {
+        self.chains.retain_mut(|chain| {
+            debug_assert!(chain.blocks.len() > 0, "should have been removed if empty");
+            let final_block_slice = [*final_block];
+            let prefix = chain_intersect_prefix(&final_block_slice, &chain.blocks);
+
+            if prefix.len() > 0 && prefix[0].this_hash == final_block.this_hash {
+                // contains finalized block; all good
+                return true;
+            }
+
+            if chain.blocks[0].this_height > final_block.this_height {
+                // possibly long branch that clipped after finalized; too soon to tell
+                // TODO: work out if finalized is ancestor; it will eventually get phased out anyway
+                return true;
+            }
+
+            // finalization invalidates chain, remove it
+            false
+        });
+    }
+
 
     /// 0 print_bytes => no print, otherwise it's the number of bytes to print from the hashes
     fn roundtrip_to_branches(&self, max_size: usize, hash_bytes_n: usize) {
@@ -863,6 +885,16 @@ pub fn sync(
                                     this_hash: hash,
                                     this_height: height.0,
                                 }]);
+                            }
+                        }
+
+                        BlockEvent::TradFinalized(hash) | BlockEvent::CrosslinkFinalized(hash) => {
+                            if let Some((hdr, height, hash)) = get_hdr_at_hash(&read_state, &rt, hash) {
+                                near_tip_chains.remove_chains_invalidated_by_finalized(&ShadowBlock {
+                                    parent_hash: hdr.previous_block_hash,
+                                    this_hash: hash,
+                                    this_height: height.0,
+                                });
                             }
                         }
 
