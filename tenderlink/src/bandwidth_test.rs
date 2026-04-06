@@ -576,8 +576,8 @@ pub struct JumboReassembly {
     slots: HashMap<u32, ReassemblySlot>,
 }
 
-const MAX_REASSEMBLY_SLOTS: usize = 64;
-const MAX_REASSEMBLY_TOTAL_LEN: usize = 1 << 23; // 8 MB, matches the 23-bit field
+pub const MAX_REASSEMBLY_SLOTS: usize = 64;
+pub const MAX_JUMBOGRAM_LEN: usize = 1 << 23; // 8 MB, matches the 23-bit field
 
 impl SliceRead  for PackletHeader           { fn       read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self(u16::read_from(buf)?)) } }
 impl SliceWrite for PackletHeader           { fn write_to(&self, buf: &mut  [u8]) -> usize        { self.0  .write_to(buf) } }
@@ -949,7 +949,7 @@ pub fn service_connections(
                                         eprintln!("jumbogram fragment is so small that it should have been a datagram");
                                         kill_connection = Some(connection_key); break 'conn;
                                     }
-                                    if total_len > MAX_REASSEMBLY_TOTAL_LEN {
+                                    if total_len > MAX_JUMBOGRAM_LEN {
                                         eprintln!("jumbogram is bigger than the biggest allowed jumbogram");
                                         kill_connection = Some(connection_key); break 'conn;
                                     }

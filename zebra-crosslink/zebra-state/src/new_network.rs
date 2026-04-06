@@ -49,7 +49,8 @@ const PACKET_TYPE_STATUS: u8 = 1;
 const PACKET_TYPE_BLOCK: u8 = 2;
 
 
-const PACKET_STATUS_MAX_SIZE: usize = (65536 / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE;
+const PACKET_STATUS_MAX_HASHES: usize = 400; // @Lazy: gives room for 300 hashes plus room for 200 run metadatas
+const PACKET_STATUS_MAX_SIZE: usize = ((PACKET_STATUS_MAX_HASHES * 32 + JUMBO_FRAG_SIZE - 1) / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE; // @Cleanup @Lazy.
 
 macro_rules! dbg_break {
     () => {
@@ -78,7 +79,7 @@ pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
 }
 
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PacketHashTreeHdr {
     pub tip_height: u32,
     pub hashes_start_offset: u16, // we will never want >16384 branches in one status... that's a bushy tip
@@ -102,7 +103,7 @@ impl SliceRead for PacketHashTreeHdr {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PacketHashBranch {
     pub parent_hash_idx: u16,
     // start index is implicit from sequential cursor (the end index of the previous branch)
@@ -126,7 +127,7 @@ impl SliceRead for PacketHashBranch {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug,          Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShadowBlock {
     pub this_hash:   Hash,
     pub parent_hash: Hash,
@@ -252,7 +253,7 @@ pub fn print_shadow_block_intersection(a: &[ShadowBlock], b: &[ShadowBlock], byt
 
 const NEAR_TIP_CHAIN_LEN: u32 = 100;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NearTipChain {
     pub work: u128,
     pub blocks: Vec<ShadowBlock>, // TODO: circular buffer tracking behind tip (N.B. tip not necessarily being longest means that buffers must have independent start points)
@@ -272,7 +273,7 @@ impl NearTipChain {
 ///
 /// Not exactly "non-finalized", as it may include finalized blocks
 /// (either on startup or after crosslink finalization)
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NearTipChains {
     pub chains: Vec<NearTipChain>, // @Todo: should we cap max chains tracked? (we could make everything fixed size!!)
 }
@@ -280,6 +281,18 @@ impl NearTipChains {
     /// Height of *best* chain, which is probably, but not necessarily, the longest chain
     pub fn tip_height(&self) -> Option<u32> {
         self.chains.first().and_then(|ch| ch.blocks.last()).map(|bl| bl.this_height)
+    }
+
+    pub fn min_packet_size() -> usize {
+        let mut buf     = [0u8; 128];
+        let mut hdr_len = PacketHashTreeHdr::default()            .write_to(&mut buf[..]);
+        let mut run_len = PacketHashBranch ::default()            .write_to(&mut buf[..]);
+        let mut hgt_len = ShadowBlock      ::default().this_height.write_to(&mut buf[..]);
+        let     hsh_len = 32;
+        let     min_len = hdr_len
+                        + (run_len + hgt_len)
+                        + (NEAR_TIP_CHAIN_LEN as usize + 1) * hsh_len;
+        min_len
     }
 
     pub fn push_chain(&mut self, blocks: Vec<ShadowBlock>) -> usize {
@@ -375,7 +388,7 @@ impl NearTipChains {
             }
         }
 
-        let buf = &mut [0u8; PATH_MTU][..max_size];
+        let buf = &mut [0u8; PACKET_STATUS_MAX_SIZE][..max_size];
         let res = self.write_to(buf);
         debug_assert!(res > 0, "failed to write packet");
 
@@ -390,6 +403,11 @@ impl NearTipChains {
 impl SliceWrite for NearTipChains {
     // currently assumes each block arrives after its parent
     fn write_to(&self, buf: &mut [u8]) -> usize {
+        { // Manually, at runtime, compute the min len for this function. Awful! Also, @Volatile. Fun.
+            let min_len = NearTipChains::min_packet_size();
+            assert!(buf.len() >= min_len, "NearTipChains::write_to() needs at least enough room for one best-chain run of {} hashes (i.e., >= {min_len} bytes).", NEAR_TIP_CHAIN_LEN + 1);
+        }
+
         // doing parallel chains (redundantly keeping shared prefixes)
         // ALT: index tree in single buffer
 
@@ -910,7 +928,7 @@ pub fn sync(
 
         #[cfg(debug_assertions)]
         { // @Dev @Debug: Roundtrip test.
-            near_tip_chains.roundtrip_to_branches(PATH_MTU, if XXX_tick_loop_counter % 20 == 0 { 2 } else { 0 });
+            near_tip_chains.roundtrip_to_branches(PACKET_STATUS_MAX_SIZE, if XXX_tick_loop_counter % 20 == 0 { 2 } else { 0 });
             XXX_tick_loop_counter += 1;
         }
 
@@ -958,7 +976,7 @@ pub fn sync(
         }
         blocks_to_send.clear();
 
-        // Invariant: near_tip_chains contains at least the genesis.
+        // Invariant: near_tip_chains contains at least the genesis. Currently.
         assert!(near_tip_chains.tip_height().is_some());
         {
             let mut buf = [0u8; PACKET_STATUS_MAX_SIZE];
