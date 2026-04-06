@@ -52,9 +52,9 @@ const PACKET_TYPE_BLOCK: u8 = 2;
 const PACKET_STATUS_MAX_SIZE: usize = (65536 / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE;
 
 #[derive(Clone, Copy, Debug)]
-struct PacketHashTreeHdr {
-    tip_height: u32,
-    hashes_start_offset: u16, // we will never want >16384 branches in one status... that's a bushy tip
+pub struct PacketHashTreeHdr {
+    pub tip_height: u32,
+    pub hashes_start_offset: u16, // we will never want >16384 branches in one status... that's a bushy tip
     // [PacketHashBranch]
     // [Hash] @ hashes_start_offset
 }
@@ -76,10 +76,10 @@ impl SliceRead for PacketHashTreeHdr {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PacketHashBranch {
-    parent_hash_idx: u16,
+pub struct PacketHashBranch {
+    pub parent_hash_idx: u16,
     // start index is implicit from sequential cursor (the end index of the previous branch)
-    branch_end_idx: u16,
+    pub branch_end_idx: u16,
     // if parent_hash_idx == cursor, there's a parent_height: u32
 }
 impl SliceWrite for PacketHashBranch {
@@ -100,10 +100,10 @@ impl SliceRead for PacketHashBranch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ShadowBlock {
-    this_hash:   Hash,
-    parent_hash: Hash,
-    this_height: u32,
+pub struct ShadowBlock {
+    pub this_hash:   Hash,
+    pub parent_hash: Hash,
+    pub this_height: u32,
     // TODO: work
 }
 impl ShadowBlock {
@@ -116,13 +116,41 @@ impl Default for ShadowBlock {
     fn default() -> Self { Self { this_hash: Hash([0u8; 32]), parent_hash: Hash([0u8; 32]), this_height: 0 } }
 }
 
+pub fn print_shadow_block_slice(indent_start_h: u32, blocks: &[ShadowBlock], bytes_n: usize) {
+    const PRINT_H: usize = 0;
+    if blocks.len() == 0 {
+        return;
+    }
+
+    let w_per = bytes_n * 2 * 2 + 4 * PRINT_H + "( ), ".len();
+    let w = (blocks[0].this_height - indent_start_h) as usize * w_per;
+
+    eprint!("{:w$}", "");
+
+    for block in blocks {
+        eprint!("(");
+        for byte in &block.parent_hash.0[..bytes_n] {
+            eprint!("{:02x}", byte);
+        }
+        eprint!(" ");
+        for byte in &block.this_hash.0[..bytes_n] {
+            eprint!("{:02x}", byte);
+        }
+        if PRINT_H == 1 {
+            eprint!("{:3}", block.this_height);
+        }
+        eprint!("), ");
+    }
+    eprintln!("");
+}
+
 
 const NEAR_TIP_CHAIN_LEN: u32 = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct NearTipChain {
-    work: u128,
-    blocks: Vec<ShadowBlock>, // TODO: circular buffer tracking behind tip (N.B. tip not necessarily being longest means that buffers must have independent start points)
+pub struct NearTipChain {
+    pub work: u128,
+    pub blocks: Vec<ShadowBlock>, // TODO: circular buffer tracking behind tip (N.B. tip not necessarily being longest means that buffers must have independent start points)
 }
 impl NearTipChain {
     pub fn push_block(&mut self, block: ShadowBlock) -> usize {
@@ -140,8 +168,8 @@ impl NearTipChain {
 /// Not exactly "non-finalized", as it may include finalized blocks
 /// (either on startup or after crosslink finalization)
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct NearTipChains {
-    chains: Vec<NearTipChain>, // @Todo: should we cap max chains tracked? (we could make everything fixed size!!)
+pub struct NearTipChains {
+    pub chains: Vec<NearTipChain>, // @Todo: should we cap max chains tracked? (we could make everything fixed size!!)
 }
 impl NearTipChains {
     /// Height of *best* chain, which is probably, but not necessarily, the longest chain
@@ -208,60 +236,26 @@ impl NearTipChains {
     }
 
 
-
-    fn print_slice(indent_start_h: u32, blocks: &[ShadowBlock], bytes_n: usize) {
-        const PRINT_H: usize = 0;
-        if blocks.len() == 0 {
-            return;
-        }
-
-        let w_per = bytes_n * 2 * 2 + 4 * PRINT_H + "( ), ".len();
-        let w = (blocks[0].this_height - indent_start_h) as usize * w_per;
-
-        print!("{:w$}", "");
-
-        for block in blocks {
-            print!("(");
-            for byte in &block.parent_hash.0[..bytes_n] {
-                print!("{:02x}", byte);
-            }
-            print!(" ");
-            for byte in &block.this_hash.0[..bytes_n] {
-                print!("{:02x}", byte);
-            }
-            if PRINT_H == 1 {
-                print!("{:3}", block.this_height);
-            }
-            print!("), ");
-        }
-        println!("");
-    }
-
     /// 0 print_bytes => no print, otherwise it's the number of bytes to print from the hashes
-    fn roundtrip_to_branches(&self, max_size: usize, bytes_n: usize) {
-        let buf = &mut [0u8; PATH_MTU][..max_size];
-        let res = self.write_to(buf);
-        debug_assert!(res > 0, "failed to write packet");
-
-        let branches = NearTipBranches::read_from(&mut &buf[..]).unwrap();
-
-        if bytes_n > 0 {
+    fn roundtrip_to_branches(&self, max_size: usize, hash_bytes_n: usize) {
+        if hash_bytes_n > 0 {
             let mut min_h = u32::MAX;
             for chain in &self.chains {
                 min_h = min_h.min(chain.blocks[0].this_height);
             }
             for chain in &self.chains {
-                Self::print_slice(min_h, &chain.blocks, bytes_n);
+                print_shadow_block_slice(min_h, &chain.blocks, hash_bytes_n);
             }
+        }
 
-            println!("");
-            let mut min_h = u32::MAX;
-            for blocks in &branches.branches {
-                min_h = min_h.min(blocks[0].this_height);
-            }
-            for blocks in &branches.branches {
-                Self::print_slice(min_h, blocks, bytes_n);
-            }
+        let buf = &mut [0u8; PATH_MTU][..max_size];
+        let res = self.write_to(buf);
+        debug_assert!(res > 0, "failed to write packet");
+
+        let branches = NearTipBranches::read_from(&mut &buf[..]).unwrap();
+        if hash_bytes_n > 0 {
+            eprintln!("");
+            branches.dump(hash_bytes_n);
         }
     }
 }
@@ -360,6 +354,19 @@ impl SliceWrite for NearTipChains {
 struct NearTipBranches {
     tip_height: u32,
     branches: Vec<Vec<ShadowBlock>>,
+}
+impl NearTipBranches {
+    pub fn dump(&self, hash_bytes_n: usize) {
+        if hash_bytes_n > 0 {
+            let mut min_h = u32::MAX;
+            for blocks in &self.branches {
+                min_h = min_h.min(blocks[0].this_height);
+            }
+            for blocks in &self.branches {
+                print_shadow_block_slice(min_h, blocks, hash_bytes_n);
+            }
+        }
+    }
 }
 impl SliceRead for NearTipBranches {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
@@ -708,6 +715,8 @@ pub fn sync(
     let mut serialized_blocks = HashMap::new(); // @Todo: cap max memory storage size for this map.
     let mut committed_blocks = HashSet::new(); // @Todo: @Remove.
 
+    let mut XXX_tick_loop_counter = 0usize;
+
     // Main sync loop
     loop {
         println!("tip height: {:?}", near_tip_chains.tip_height());
@@ -738,6 +747,12 @@ pub fn sync(
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(err) => { tracing::error!("{err:?}"); break; },
             }
+        }
+
+        #[cfg(debug_assertions)]
+        { // @Dev @Debug: Roundtrip test.
+            near_tip_chains.roundtrip_to_branches(PATH_MTU, if XXX_tick_loop_counter % 20 == 0 { 2 } else { 0 });
+            XXX_tick_loop_counter += 1;
         }
 
         // Try to reconnect to known but disconnected peers
