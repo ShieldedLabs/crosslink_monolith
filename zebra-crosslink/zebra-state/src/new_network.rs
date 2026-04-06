@@ -355,6 +355,18 @@ impl SliceRead for NearTipBranches {
             let branch_hashes_n = end_i - hash_c;
             debug_assert!(branch_hashes_n < u32::MAX as usize, "more blocks in a branch than could be in a blockchain with 32-bit height values");
 
+            let end_height = bgn_height.checked_add((end_i - hash_c) as u32)?;
+
+            // The first branch must be the best chain
+            if branches.is_empty() && end_height - 1 != hdr.tip_height {
+                return None;
+            }
+
+            // Subsequent branches must be shorter
+            if end_height - 1 > hdr.tip_height {
+                return None;
+            }
+
             let mut branch_blocks = Vec::with_capacity(branch_hashes_n);
 
             // We NEED to bounds check all the heights in this chain branch.
@@ -383,7 +395,7 @@ impl SliceRead for NearTipBranches {
 
 // @Todo: @Test.
 pub fn height_intersect(haystack: &[ShadowBlock], height_bgn: u32, height_end: u32) -> &[ShadowBlock] {
-    if haystack.len() <= 0 {
+    if haystack.is_empty() {
         return &haystack[0..0];
     }
 
@@ -407,10 +419,10 @@ pub fn height_intersect(haystack: &[ShadowBlock], height_bgn: u32, height_end: u
 }
 
 pub fn chain_intersect_prefix<'l>(a: &'l [ShadowBlock], b: &'l [ShadowBlock]) -> &'l [ShadowBlock] {
-    if a.len() <= 0 {
+    if a.is_empty() {
         return &a[0..0];
     }
-    if b.len() <= 0 {
+    if b.is_empty() {
         return &a[0..0];
     }
 
@@ -421,10 +433,10 @@ pub fn chain_intersect_prefix<'l>(a: &'l [ShadowBlock], b: &'l [ShadowBlock]) ->
     let a_ol = height_intersect(a, b_height_bgn, b_height_end);
     let b_ol = height_intersect(b, a_height_bgn, a_height_end);
 
-    if a_ol.len() <= 0 {
+    if a_ol.is_empty() {
         return &a[0..0];
     }
-    if b_ol.len() <= 0 {
+    if b_ol.is_empty() {
         return &a[0..0];
     }
 
@@ -432,7 +444,7 @@ pub fn chain_intersect_prefix<'l>(a: &'l [ShadowBlock], b: &'l [ShadowBlock]) ->
 
     let mut n = a_ol.len();
     for i in 0..n {
-        if a_ol[i] != b_ol[i] {
+        if a_ol[i] != b_ol[i] { // NOTE: equality check includes parent hash
             n = i;
             break;
         }
@@ -527,6 +539,16 @@ pub fn sync(
             break tip;
         };
         println!("NewNet: Starting at height={} hash={:?}", tip_height.0, tip_hash);
+
+        // Genesis case: give fresh nodes 1 hash to place in their status
+        // so they don't assert when serializing an empty NearTipChains.
+        if tip_height == Height(0) {
+            near_tip_chains.push_blocks(&[ShadowBlock {
+                parent_hash: Hash([0u8; 32]),
+                this_hash: tip_hash,
+                this_height: 0,
+            }]);
+        }
 
         let near_tip_start_height = Height(tip_height.0.saturating_sub(NEAR_TIP_CHAIN_LEN+1));
         let Some(near_tip_start_hash) = get_bc_hash_at_height(&read_state, &rt, near_tip_start_height) else {
@@ -663,6 +685,7 @@ pub fn sync(
             }
         }
 
+        // TODO: rate limit production
         for (connection_key, hash) in &blocks_to_send {
             let Some(connection) = get_connected(&connections_map, connection_key) else { continue; };
 
@@ -675,7 +698,7 @@ pub fn sync(
                         let hash = block.hash();
                         serialized_blocks.insert(hash, block.zcash_serialize_to_vec().unwrap());
                     }
-                    Ok(ReadResponse::Block(None)) => { break; }
+                    Ok(ReadResponse::Block(None)) => { eprintln!("couldn't get block for hash {hash}"); continue; }
                     Err(err) => { panic!("sync start err: {err:?}");               }
                     _        => { panic!("sync err: unhandled response: {res:?}"); }
                 }
@@ -697,7 +720,9 @@ pub fn sync(
         }
         blocks_to_send.clear();
 
-        if near_tip_chains.tip_height().is_some() {
+        // Invariant: near_tip_chains contains at least the genesis.
+        assert!(near_tip_chains.tip_height().is_some());
+        {
             let mut buf = [0u8; PACKET_STATUS_MAX_SIZE];
             let mut o = 0;
             o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
@@ -744,6 +769,12 @@ pub fn sync(
         // Process received packets
         while packets_received.len() > 0 {
             let (connection_key, msg) = packets_received.remove(0);
+
+            // Skip packets from now-disconnected peers
+            if get_connected(&connections_map, &connection_key).is_none() {
+                continue;
+            }
+
             let mut msg = &msg[..];
 
             // fn kill(map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, key: ConnectionKey) {
@@ -768,6 +799,7 @@ pub fn sync(
                     continue;
                 };
 
+                // TODO: rate limit consumption
                 let Some(their_tree) = NearTipBranches::read_from(&mut msg)
                 else {
                     kill();
@@ -777,6 +809,11 @@ pub fn sync(
                 // @Todo: If the peer is far behind, beam them blocks from farther back in our chain to catch them up.
                 // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
                 if their_tree.tip_height + NEAR_TIP_CHAIN_LEN < our_tip_height {
+                    continue;
+                }
+
+                // @Todo: If the peer is far ahead, request blocks from farther back in their chain to catch us up.
+                if our_tip_height + NEAR_TIP_CHAIN_LEN < their_tree.tip_height {
                     continue;
                 }
 
@@ -797,6 +834,8 @@ pub fn sync(
                 //     request everything up from the maximum height all the way to their tip
                 //
 
+                // @Note: With this algorithm, another peer can systematically probe which
+                //        blocks we have on each branch. This may have implications.
                 let mut blocks_to_queue = HashSet::new();
                 for our_chain in &near_tip_chains.chains {
                     assert!(our_chain.blocks.len() > 0);
@@ -813,12 +852,20 @@ pub fn sync(
                         let prefix = chain_intersect_prefix(&their_branch, &our_chain.blocks);
 
                         // If the prefix was empty, there was no overlap.
-                        if prefix.len() <= 0 {
+                        if prefix.is_empty() {
                             continue;
                         }
 
                         let height_of_match = prefix.last().unwrap().this_height;
+
+                        assert!(height_of_match < our_chain_height_end);
+                        assert!(height_of_match < their_branch_height_end);
+
                         max_height_we_both_share = max_height_we_both_share.max(height_of_match);
+                    }
+
+                    if max_height_we_both_share <= 0 {
+                        continue;
                     }
 
                     for height in max_height_we_both_share + 1 .. our_chain_height_end {
@@ -833,6 +880,8 @@ pub fn sync(
                 for block in blocks_to_queue {
                     blocks_to_send.push((connection_key, block));
                 }
+
+                // @Todo: Pull.
 
             } else if packet_type == PACKET_TYPE_BLOCK {
                 use zebra_chain::serialization::ZcashDeserializeInto;
