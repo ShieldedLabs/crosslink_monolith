@@ -112,6 +112,10 @@ impl ShadowBlock {
     }
 }
 
+impl Default for ShadowBlock {
+    fn default() -> Self { Self { this_hash: Hash([0u8; 32]), parent_hash: Hash([0u8; 32]), this_height: 0 } }
+}
+
 
 const NEAR_TIP_CHAIN_LEN: u32 = 100;
 
@@ -474,6 +478,18 @@ pub fn get_tip(read_state: &ReadState, rt: &tokio::runtime::Handle) -> Option<(H
     tip_maybe
 }
 
+pub fn get_genesis_hash(read_state: &ReadState, rt: &tokio::runtime::Handle) -> Hash {
+    rt.block_on(async {
+        let res = read_state.clone().oneshot(ReadRequest::BestChainBlockHash(Height(0))).await;
+        match res {
+            Ok(ReadResponse::BlockHash(Some(hash))) => hash,
+            Ok(ReadResponse::BlockHash(None)) => panic!("failed to get genesis block"),
+            Err(err) => panic!("sync start err: {err:?}"),
+            _ => panic!("sync err: unhandled response: {res:?}"),
+        }
+    })
+}
+
 pub fn get_bc_hash_at_height(read_state: &ReadState, rt: &tokio::runtime::Handle, height: Height) -> Option<Hash> {
     rt.block_on(async {
         let res = read_state.clone().oneshot(ReadRequest::BestChainBlockHash(height)).await;
@@ -540,15 +556,10 @@ pub fn sync(
         };
         println!("NewNet: Starting at height={} hash={:?}", tip_height.0, tip_hash);
 
-        // Genesis case: give fresh nodes 1 hash to place in their status
-        // so they don't assert when serializing an empty NearTipChains.
-        if tip_height == Height(0) {
-            near_tip_chains.push_blocks(&[ShadowBlock {
-                parent_hash: Hash([0u8; 32]),
-                this_hash: tip_hash,
-                this_height: 0,
-            }]);
-        }
+        // Push genesis into near_tip_chains for two reasons:
+        // - Prevents NearTipChains serialization asserts on new nodes
+        // - Allows early nodes to overlap with and push to new nodes
+        near_tip_chains.push_blocks(&[ShadowBlock { this_hash: get_genesis_hash(&read_state, &rt), ..ShadowBlock::default() }]);
 
         let near_tip_start_height = Height(tip_height.0.saturating_sub(NEAR_TIP_CHAIN_LEN+1));
         let Some(near_tip_start_hash) = get_bc_hash_at_height(&read_state, &rt, near_tip_start_height) else {
@@ -843,7 +854,7 @@ pub fn sync(
                     let our_chain_height_bgn = our_chain.blocks[0].this_height;
                     let our_chain_height_end = our_chain.blocks.last().unwrap().this_height + 1;
 
-                    let mut max_height_we_both_share = 0;
+                    let mut max_height_we_both_share = None;
 
                     for their_branch in &their_tree.branches {
                         let their_branch_height_bgn = their_branch[0].this_height;
@@ -861,12 +872,12 @@ pub fn sync(
                         assert!(height_of_match < our_chain_height_end);
                         assert!(height_of_match < their_branch_height_end);
 
-                        max_height_we_both_share = max_height_we_both_share.max(height_of_match);
+                        max_height_we_both_share = max_height_we_both_share.max(Some(height_of_match));
                     }
 
-                    if max_height_we_both_share <= 0 {
+                    let Some(max_height_we_both_share) = max_height_we_both_share else {
                         continue;
-                    }
+                    };
 
                     for height in max_height_we_both_share + 1 .. our_chain_height_end {
                         let chain_i = (height - our_chain_height_bgn) as usize;

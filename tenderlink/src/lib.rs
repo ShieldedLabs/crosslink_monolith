@@ -14,6 +14,7 @@ const PRINT_SENDS:          bool = 0 == 1;
 const PRINT_SEND_CS:        bool = 0 == 1;
 const PRINT_RNGS:           bool = 0 == 1;
 const PRINT_SIGN:           bool = 0 == 1;
+const PRINT_BLOCK_NEEDED:   bool = 0 == 1;
 const PRINT_BFT_PROPOSAL:   bool = 0 == 1;
 const PRINT_BFT_VOTE:       bool = 1 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
@@ -1039,7 +1040,7 @@ impl TMState {
             {
                 match self.rounds_data[i].proposal_checked_validity.1 {
                     TMStatusReason::NeedsBlock { hash } => {
-                        println!("{ctx_str} {ANSI_YLW}BLOCK NEEDED{ANSI_RST} hash: {:?}...", hash);
+                        if PRINT_BLOCK_NEEDED { println!("{ctx_str} {ANSI_YLW}BLOCK NEEDED{ANSI_RST} hash: {:?}...", hash); }
                     },
                     _ => {
                     }
