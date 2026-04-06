@@ -281,8 +281,6 @@ mod linux {
     
         // Decide whether this is IPv4-mapped
         let (mut name_buf, name_len, is_v4) = if let Some(v4) = dst_ip6.to_ipv4_mapped() {
-println!("was {} and {}", dst_ip6, v4);
-panic!();
             let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
             sin.sin_family = libc::AF_INET as _;
             sin.sin_port = dst_port.to_be();
