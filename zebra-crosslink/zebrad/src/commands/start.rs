@@ -305,16 +305,6 @@ impl StartCmd {
             )
             .await;
 
-        #[cfg(feature = "new-net")]
-        {
-            let state_config_copy = Arc::clone(&config);
-            let sync_state = state.clone();
-            let sync_read_state = read_only_state_service.clone();
-            tokio::task::spawn_blocking(move ||{
-                zebra_state::new_network::sync(&state_config_copy.state, sync_read_state, sync_state, tokio::runtime::Handle::current())
-            });
-        }
-
         info!("initializing syncer");
         let (mut syncer, sync_status) = ChainSync::new(
             &config,
@@ -379,7 +369,7 @@ impl StartCmd {
 
         let mempool2 = mempool.clone();
         info!("spawning tfl service task");
-        let (tfl, tfl_service_task_handle) = {
+        let (tfl_handle, tfl_service_task_handle) = {
             let state = state.clone();
             let read_only_state_service = read_only_state_service.clone();
             zebra_crosslink::service::spawn_new_tfl_service(
@@ -490,8 +480,20 @@ impl StartCmd {
                 actual_closure2,
             )
         };
-        let tfl_service = BoxService::new(tfl);
+        let tfl_service = BoxService::new(tfl_handle);
         let tfl_service = ServiceBuilder::new().buffer(1).service(tfl_service);
+
+        #[cfg(feature = "new-net")]
+        {
+            // let tfl_service2 = tfl_service.clone();
+
+            let state_config_copy = Arc::clone(&config);
+            let sync_state = state.clone();
+            let sync_read_state = read_only_state_service.clone();
+            tokio::task::spawn_blocking(move ||{
+                zebra_state::new_network::sync(&state_config_copy.state, sync_read_state, sync_state, /* tfl_service2, */ tokio::runtime::Handle::current())
+            });
+        }
 
         // Launch RPC server
         let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new(
@@ -689,6 +691,7 @@ impl StartCmd {
         pin!(old_databases_task_handle_fused);
 
         if true
+        // if false // @Phillip
         {
             let tmp_dir = tempfile::TempDir::new().unwrap();
             let _ = std::fs::remove_dir_all(tmp_dir.path());

@@ -1212,6 +1212,8 @@ impl Service<Request> for StateService {
 
             // Used by sync, inbound, and block verifier to check if a block is already in the state
             // before downloading or validating it.
+            // @Todo: We'd like a new request or modification to KnownBlock to allow
+            //        NewNet to send full block data from blocks on sidechains. :SidechainSync
             Request::KnownBlock(hash) => {
                 let timer = CodeTimer::start();
 
