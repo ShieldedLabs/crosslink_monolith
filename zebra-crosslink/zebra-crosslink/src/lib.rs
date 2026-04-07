@@ -118,8 +118,6 @@ pub mod config {
     #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
     #[serde(deny_unknown_fields, default)]
     pub struct Config {
-        /// Local address, e.g. "/ip4/0.0.0.0/udp/24834/quic-v1"
-        pub listen_address: Option<String>,
         /// Public address for this node, e.g. "/ip4/127.0.0.1/udp/24834/quic-v1" if testing
         /// internally, or the public IP address if using externally.
         pub public_address: Option<String>,
@@ -135,7 +133,6 @@ pub mod config {
     impl Default for Config {
         fn default() -> Self {
             Self {
-                listen_address: None,
                 public_address: None,
                 insecure_user_name: None,
                 bft_peers: Vec::new(),
@@ -926,11 +923,9 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
         let mut static_keypair_maybe = None;
         let mut endpoint_maybe = None;
-        if let Some(listen_addr) = &config.listen_address {
-            let (a, b) = addr_string_to_stuff(&listen_addr);
-            static_keypair_maybe = Some(a);
-            endpoint_maybe = Some(b);
-        };
+        let (a, b) = addr_string_to_stuff(&public_ip_string);
+        static_keypair_maybe = Some(a);
+        endpoint_maybe = Some(b);
 
         let tfl_handle1 = internal_handle.clone();
         let tfl_handle2 = internal_handle.clone();
