@@ -333,6 +333,10 @@ impl WriteBlockWorkerTask {
             return;
         }
 
+        use crate::new_network::push_block_event;
+        use crate::new_network::BlockEvent;
+        use crate::new_network::ShadowBlock;
+
         // Save any errors to propagate down to queued child blocks
         let mut parent_error_map: IndexMap<block::Hash, CommitSemanticallyVerifiedError> =
             IndexMap::new();
@@ -354,14 +358,23 @@ impl WriteBlockWorkerTask {
                         info!("finalized {}, which implicitly finalizes:", hash);
                         for i in 0..newly_finalized_blocks.len() {
                             let finalizable_block = non_finalized_state.finalize();
-                            let finalizable_block_inner_block_hash = finalizable_block.inner_block().hash();
+
+                            let inner_block = finalizable_block.inner_block();
+                            let this_hash = inner_block.hash();
+                            let parent_hash = inner_block.header.previous_block_hash;
+                            let this_height = inner_block.coinbase_height().expect("finalized block must have a coinbase height").0;
+
                             match finalized_state.commit_finalized_direct(
                                 finalizable_block,
                                 None,
                                 "commit Crosslink-finalized block",
                             ) {
                                 Ok((hash, _)) => {
-                                    crate::new_network::push_block_event(crate::new_network::BlockEvent::CrosslinkFinalized(finalizable_block_inner_block_hash));
+                                    push_block_event(BlockEvent::CrosslinkFinalized(ShadowBlock {
+                                        this_hash,
+                                        parent_hash,
+                                        this_height
+                                    }));
                                     info!("  {}: {}", i, hash);
                                 }
                                 Err(err) => {
@@ -417,12 +430,17 @@ impl WriteBlockWorkerTask {
             };
 
             let child_hash = queued_child.hash;
-            crate::new_network::push_block_event(crate::new_network::BlockEvent::Dequeued(child_hash));
             let parent_hash = queued_child.block.header.previous_block_hash;
+            push_block_event(BlockEvent::Dequeued(ShadowBlock {
+                this_hash: child_hash,
+                parent_hash,
+                this_height: u32::MAX, // @Todo.
+            }));
             let parent_error = parent_error_map.get(&parent_hash);
 
             let result;
 
+            let queued_block_height = queued_child.block.coinbase_height().expect("committed block should have a coinbase height").0;
             // If the parent block was marked as rejected, also reject all its children.
             //
             // At this point, we know that all the block's descendants
@@ -483,13 +501,20 @@ impl WriteBlockWorkerTask {
             {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
-                let contextually_verified_with_trees_inner_block_hash = contextually_verified_with_trees.inner_block().hash();
+
+                let inner_block = contextually_verified_with_trees.inner_block();
+                let this_height = inner_block.coinbase_height().expect("finalized block must have a coinbase height").0;
+
                 prev_finalized_note_commitment_trees = finalized_state
                             .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), "commit contextually-verified request")
                             .expect(
                                 "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                             ).1.into();
-                crate::new_network::push_block_event(crate::new_network::BlockEvent::TradFinalized(contextually_verified_with_trees_inner_block_hash));
+                push_block_event(BlockEvent::TradFinalized(ShadowBlock {
+                    this_hash: child_hash,
+                    parent_hash,
+                    this_height
+                }));
             }
 
             // Update the metrics if semantic and contextual validation passes
@@ -507,7 +532,12 @@ impl WriteBlockWorkerTask {
             metrics::gauge!("zcash.chain.verified.block.height").set(tip_block_height.0 as f64);
 
             tracing::trace!("finished processing queued block");
-            crate::new_network::push_block_event(crate::new_network::BlockEvent::Committed(child_hash));
+
+            push_block_event(BlockEvent::Committed(ShadowBlock {
+                this_hash: child_hash,
+                parent_hash,
+                this_height: queued_block_height,
+            }));
         }
 
         // We're finished receiving non-finalized blocks from the state, and
