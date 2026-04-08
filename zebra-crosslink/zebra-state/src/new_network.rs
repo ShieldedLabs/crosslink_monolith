@@ -41,8 +41,8 @@ const JUMBO_FRAG_SIZE: usize = UDP_mMTU
                              - STP_PACKLET_HDR
                              - STP_JUMBO_HDR;
 
-// const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
-const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
+const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+//const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 // @Todo: more of these, merge with Tenderlink, reintroduce peer discovery from p2p, etc.
 const PACKET_TYPE_STATUS: u8 = 1;
@@ -688,7 +688,7 @@ pub fn chain_intersect_prefix<'l>(a: &'l [ShadowBlock], b: &'l [ShadowBlock]) ->
 
 
 // @Todo: always only wait on real stuff, never sleeping for fixed amounts like this
-const TICK_MS: u64 = 500;
+const TICK_MS: u64 = 2500;
 
 type ReadState = crate::service::ReadStateService;
 type State = tower::buffer::Buffer<tower::util::BoxService<Request, Response, crate::BoxError>, Request>;
