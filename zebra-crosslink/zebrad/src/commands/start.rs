@@ -134,6 +134,42 @@ impl StartCmd {
         };
 
 
+        // workshop-specific key seed
+        let global_seed = loop {
+            use std::{fs::File, io::Read, io::Write};
+            use rand::Rng;
+
+            let mut key_path = config.state.cache_dir.clone();
+            let _ = std::fs::create_dir_all(key_path.clone());
+
+            key_path.push("secret.seed");
+            let mut seed = [0u8; 32];
+            println!("getting key seed from {:?}", key_path);
+            if let Ok(mut f) = File::open(key_path.clone()) {
+                match f.read_exact(&mut seed) {
+                    Ok(()) => break seed,
+                    Err(err) => warn!("couldn't read seed at {key_path:?} ({err:?}); creating a new one"),
+                }
+            }
+
+            // all else failed, create/replace file from scratch
+            seed = rand::thread_rng().gen();
+            let mut f = File::create(key_path).expect("couldn't create seed file; add one manually");
+            f.write(&seed).expect("couldn't write to seed file; add one manually");
+
+            break seed;
+        };
+        *wallet::GLOBAL_SEED.lock().unwrap() = Some(global_seed);
+
+        let path_to_pos_store_file = if config.state.ephemeral { std::path::PathBuf::new() } else {
+            let mut key_path = config.state.cache_dir.clone();
+            let _ = std::fs::create_dir_all(key_path.clone());
+
+            key_path.push("pos.chain");
+            key_path
+        };
+
+
         let config = if is_regtest {
             fn add_to_port(mut addr: std::net::SocketAddr, addend: u16) -> std::net::SocketAddr {
                 addr.set_port(addr.port() + addend);
@@ -168,43 +204,28 @@ impl StartCmd {
                 },
                 ..Arc::unwrap_or_clone(config)
             })
+        } else if is_clt0 {
+            // debug_enable_at_height: Some(0)
+            Arc::new(ZebradConfig {
+                // mempool: mempool::Config {
+                //     debug_enable_at_height: Some(0),
+                //     ..config.mempool
+                // },
+                mining: zebra_rpc::config::mining::Config {
+                    miner_address: Some(config.mining.miner_address.clone().unwrap_or_else(||{
+                        use zcash_address::ToAddress;
+
+                        let t_addr = wallet::default_t_addr_from_entropy(&config.network.network, &global_seed).expect("unable to initialize miner");
+                        info!("Miner address unspecified. Mining to {}", wallet::string_from_t_addr(&config.network.network, t_addr));
+                        t_addr.to_zcash_address(config.network.network.kind().into())
+                    })),
+                    // TODO: extra_coinbase_data
+                    ..config.mining.clone()
+                },
+                ..Arc::unwrap_or_clone(config)
+            })
         } else {
             config
-        };
-
-        // workshop-specific key seed
-        let global_seed = loop {
-            use std::{fs::File, io::Read, io::Write};
-            use rand::Rng;
-
-            let mut key_path = config.state.cache_dir.clone();
-            let _ = std::fs::create_dir_all(key_path.clone());
-
-            key_path.push("secret.seed");
-            let mut seed = [0u8; 32];
-            println!("getting key seed from {:?}", key_path);
-            if let Ok(mut f) = File::open(key_path.clone()) {
-                match f.read_exact(&mut seed) {
-                    Ok(()) => break seed,
-                    Err(err) => warn!("couldn't read seed at {key_path:?} ({err:?}); creating a new one"),
-                }
-            }
-
-            // all else failed, create/replace file from scratch
-            seed = rand::thread_rng().gen();
-            let mut f = File::create(key_path).expect("couldn't create seed file; add one manually");
-            f.write(&seed).expect("couldn't write to seed file; add one manually");
-
-            break seed;
-        };
-        *wallet::GLOBAL_SEED.lock().unwrap() = Some(global_seed);
-
-        let path_to_pos_store_file = if config.state.ephemeral { std::path::PathBuf::new() } else {
-            let mut key_path = config.state.cache_dir.clone();
-            let _ = std::fs::create_dir_all(key_path.clone());
-
-            key_path.push("pos.chain");
-            key_path
         };
 
 

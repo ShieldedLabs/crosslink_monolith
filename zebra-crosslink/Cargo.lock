@@ -10169,6 +10169,7 @@ dependencies = [
  "zaino-serve",
  "zaino-state",
  "zainod",
+ "zcash_address",
  "zcash_keys",
  "zebra-chain",
  "zebra-consensus",
