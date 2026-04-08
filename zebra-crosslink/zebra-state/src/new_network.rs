@@ -966,7 +966,7 @@ pub fn sync(
 
     let mut blocks_to_send = Vec::<(ConnectionKey, Hash)>::new();
 
-    const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 64;
+    const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 8;
     let mut blocks_to_commit = Vec::new();
 
     let mut serialized_blocks = HashMap::new(); // @Todo: cap max memory storage size for this map.
@@ -1096,10 +1096,14 @@ pub fn sync(
         }
 
         use rand::seq::SliceRandom;
-        packets_to_send.shuffle(&mut rand::thread_rng());
+
+        // @@@ @Todo @@@: We need speculative queueing ASAP!
+        // packets_to_send.shuffle(&mut rand::thread_rng());
+
+
         // Service STP connections (send/recv).
         // @Todo: real scheduling. Right now I just want to receive everything!
-        for _ in 0..256 {
+        for _ in 0..1024 {
             let more = service_connections(&mut connections_map,
                                            &mut packets_received,
                                            &packets_to_send,
