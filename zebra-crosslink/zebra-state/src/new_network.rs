@@ -84,6 +84,7 @@ pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PacketHashTreeHdr {
     pub tip_height: u32,
+    pub finalized_height: u32,
     pub hashes_start_offset: u16, // we will never want >16384 branches in one status... that's a bushy tip
     // [PacketHashBranch]
     // [Hash] @ hashes_start_offset
@@ -92,6 +93,7 @@ impl SliceWrite for PacketHashTreeHdr {
     fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = 0;
         o += self.tip_height.write_to(&mut buf[o..]);
+        o += self.finalized_height.write_to(&mut buf[o..]);
         o += self.hashes_start_offset.write_to(&mut buf[o..]);
         o
     }
@@ -100,6 +102,7 @@ impl SliceRead for PacketHashTreeHdr {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
         Some(Self {
             tip_height:          dbg_verify(u32::read_from(buf))?,
+            finalized_height:    dbg_verify(u32::read_from(buf))?,
             hashes_start_offset: dbg_verify(u16::read_from(buf))?,
         })
     }
@@ -424,6 +427,8 @@ impl SliceWrite for NearTipChains {
         // ALT: index tree in single buffer
 
         let tip_height = self.tip_height().expect("programmer error: should be non-empty");
+        let finalized_height = self.finalized_height;
+        assert!(finalized_height <= tip_height);
 
         let mut runs = Vec::<(PacketHashBranch, u32, usize)>::new();
         let mut hashes = Vec::<Hash>::new();
@@ -478,6 +483,7 @@ impl SliceWrite for NearTipChains {
         // tip, offset_of(a), (0,9), (2, 0xa), a b c i j k l m n d - - - -
         let mut hdr = PacketHashTreeHdr {
             tip_height,
+            finalized_height,
             hashes_start_offset: 0, // fixed up
         };
 
@@ -526,6 +532,7 @@ impl SliceWrite for NearTipChains {
 
 struct NearTipBranches {
     tip_height: u32,
+    finalized_height: u32,
     branches: Vec<Vec<ShadowBlock>>,
 }
 impl NearTipBranches {
@@ -631,7 +638,7 @@ impl SliceRead for NearTipBranches {
             branches.push(branch_blocks);
         }
 
-        Some(Self { tip_height: hdr.tip_height, branches })
+        Some(Self { tip_height: hdr.tip_height, finalized_height: hdr.finalized_height, branches })
     }
 }
 
@@ -842,9 +849,11 @@ pub fn sync(
     // @Todo: @Refactor into a fn we can call to flush and reset the NearTipChains state.
     'init_near_tip_chains: {
         let ((tip_height, tip_hash), (finalized_tip_height, finalized_tip_hash)) = get_tips_blocking(&read_state, &rt);
-        println!("NewNet: Starting at height={} hash={:?}", tip_height.0, tip_hash);
+        println!("NewNet: Starting at height={} hash={:?} finalized_height={} finalized_hash={}", tip_height.0, tip_hash, finalized_tip_height.0, finalized_tip_hash);
 
         near_tip_chains.finalized_height = finalized_tip_height.0;
+
+        assert!(near_tip_chains.finalized_height <= tip_height.0);
 
         // let res = rt.block_on(async { tfl_service.clone().oneshot(Request::Get).await });
         // if let Some((height, hash)) = match res {
@@ -887,6 +896,8 @@ pub fn sync(
         };
 
         near_tip_chains.push_blocks(&shadow_blocks);
+
+        assert!(near_tip_chains.finalized_height <= near_tip_chains.tip_height().unwrap()); // :AssumeGenesisBlockIncludedInNearTipChains
     }
 
     // Keypair setup
@@ -1054,8 +1065,8 @@ pub fn sync(
                         eprintln!("Couldn't get block for hash {hash}!");
                         continue;
                     }
-                    Err(err) => { panic!("sync start err: {err:?}");               }
-                    _        => { panic!("sync err: unhandled response: {res:?}"); }
+                    Err(err) => { panic!("ReadRequest::Block({hash}): Error: {err:?}");               }
+                    _        => { panic!("ReadRequest::Block({hash}): Unhandled response: {res:?}"); }
                 }
             }
 
@@ -1178,13 +1189,30 @@ pub fn sync(
 
                 // @Todo: If the peer is far behind, beam them blocks from farther back in our chain to catch them up.
                 // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
-                if their_tree.tip_height + NEAR_TIP_CHAIN_LEN < our_tip_height {
-                    warning!("Too far behind me");
-                    continue 'process_packets;
+                if their_tree.tip_height < near_tip_chains.finalized_height {
+
+                    for height in their_tree.tip_height..near_tip_chains.finalized_height {
+                        let res = rt.block_on(async {
+                            read_state.clone().oneshot(ReadRequest::BestChainBlockHash(Height(height).into())).await
+                        });
+                        match res {
+                            Ok(ReadResponse::BlockHash(hash)) => {
+                                let Some(hash) = dbg_verify(hash) else {
+                                    warning!("Couldn't get block for height {height} which should be finalized! What happened?");
+                                    break;
+                                };
+
+                                blocks_to_send.push((connection_key, hash));
+                            }
+                            Err(err) => { panic!("ReadRequest::BestChainBlockHash({height}): Error: {err:?}");              }
+                            _        => { panic!("ReadRequest::BestChainBlockHash({height}): Unhandled response: {res:?}"); }
+                        }
+                    }
+
                 }
 
                 // @Todo: If the peer is far ahead, request blocks from farther back in their chain to catch us up.
-                if our_tip_height + NEAR_TIP_CHAIN_LEN < their_tree.tip_height {
+                if our_tip_height < their_tree.finalized_height {
                     warning!("Too far ahead of me");
                     continue 'process_packets;
                 }
