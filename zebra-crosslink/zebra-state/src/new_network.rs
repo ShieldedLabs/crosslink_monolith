@@ -46,11 +46,11 @@ const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 // @Todo: more of these, merge with Tenderlink, reintroduce peer discovery from p2p, etc.
 const PACKET_TYPE_STATUS: u8 = 1;
-const PACKET_TYPE_BLOCK: u8 = 2;
+const PACKET_TYPE_BLOCK:  u8 = 2;
 
 
 const PACKET_STATUS_MAX_HASHES: usize = 400; // @Lazy: gives room for 300 hashes plus room for 200 run metadatas
-const PACKET_STATUS_MAX_SIZE: usize = ((PACKET_STATUS_MAX_HASHES * 32 + JUMBO_FRAG_SIZE - 1) / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE; // @Cleanup @Lazy.
+const PACKET_STATUS_MAX_SIZE:   usize = ((PACKET_STATUS_MAX_HASHES * 32 + JUMBO_FRAG_SIZE - 1) / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE; // @Cleanup @Lazy.
 
 macro_rules! dbg_break {
     () => {
@@ -59,14 +59,16 @@ macro_rules! dbg_break {
     }
 }
 
-macro_rules! dbg_panic {
-    ($($arg:tt)*) => {
-        #[cfg(debug_assertions)] {
-            dbg_break!();
-            panic!($($arg)*);
-        }
-    }
+#[cfg(debug_assertions)] #[track_caller] fn dbg_panic_internal(msg: std::fmt::Arguments<'_>) -> ! {
+    dbg_break!();
+    std::env::set_var("RUST_BACKTRACE", "full");
+    panic!("{msg}");
 }
+macro_rules! dbg_panic {
+    ()            => { #[cfg(debug_assertions)] dbg_panic_internal(format_args!("explicit panic")); };
+    ($($arg:tt)*) => { #[cfg(debug_assertions)] dbg_panic_internal(format_args!($($arg)*)); };
+}
+
 pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
     #[cfg(debug_assertions)] {
         if t.is_none() { dbg_break!(); }
@@ -797,6 +799,35 @@ pub fn get_hdrs_after_hash(read_state: &ReadState, rt: &tokio::runtime::Handle, 
     })
 }
 
+pub fn is_parent_in_chains(rt: &tokio::runtime::Handle, state: &State, near_tip_chains: &NearTipChains, parent_hash: Hash) -> bool {
+    for our_chain in &near_tip_chains.chains {
+        if our_chain.blocks.iter().any(|block| block.this_hash == parent_hash || block.parent_hash == parent_hash) {
+            return true;
+        }
+    }
+
+    // @Dev @Debug, but we would like to be able to quickly do this in production as well...
+    let res = rt.block_on(async { state.clone().oneshot(Request::KnownBlock(parent_hash.try_into().unwrap())).await });
+    match res {
+        Ok(Response::KnownBlock(None)) => {
+            return false;
+        }
+        Ok(Response::KnownBlock(Some(block))) => {
+            // @Note: if we don't find the parent in near tip chains, but we ask Zebra and Zebra is aware of it, warn loudly.
+            eprintln!("WARNING!! Block hash {parent_hash} was NOT in near tip chains but contained by Zebra state!!");
+            dbg_panic!();
+            return true;
+        }
+        Err(err) => {
+            println!("Error requesting {}: {:?}", parent_hash, err);
+            return false;
+        }
+        _ => unreachable!("wrong response for KnownBlock")
+    }
+
+    return false;
+}
+
 pub fn sync(
     config: &crate::config::Config,
     read_state: ReadState,
@@ -924,13 +955,24 @@ pub fn sync(
 
     let mut blocks_to_send = Vec::<(ConnectionKey, Hash)>::new();
 
+    const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 16;
+    let mut blocks_to_commit = Vec::new();
+
     let mut serialized_blocks = HashMap::new(); // @Todo: cap max memory storage size for this map.
 
     let mut XXX_tick_loop_counter = 0usize;
 
     // Main sync loop
     loop {
-        println!("tip height: {:?}, finalized height: {:?}", near_tip_chains.tip_height(), near_tip_chains.finalized_height);
+        let mut my_peers_to_print = Vec::new();
+        for (connection_key, connection) in &connections_map {
+            if connection.is_connected() {
+                let addr = format!("{:?}", connection.address());
+                let short = &addr[addr.len().saturating_sub(4)..];
+                my_peers_to_print.push(short.to_string());
+            }
+        }
+        println!("tip height: {:?}, finalized height: {:?}, peers: {:?}", near_tip_chains.tip_height(), near_tip_chains.finalized_height, my_peers_to_print);
 
         let loop_start = std::time::Instant::now();
 
@@ -973,41 +1015,52 @@ pub fn sync(
 
         // TODO: rate limit production
         for (connection_key, hash) in &blocks_to_send {
+            let hash = *hash;
             let Some(connection) = get_connected(&connections_map, connection_key) else {
+                // println!("Disconnected! @Trace");
                 continue;
             };
 
-            if !serialized_blocks.contains_key(hash) {
+            if !serialized_blocks.contains_key(&hash) {
                 let res = rt.block_on(async {
-                    read_state.clone().oneshot(ReadRequest::Block((*hash).into())).await
+                    read_state.clone().oneshot(ReadRequest::Block(hash.into())).await
                 });
                 match res {
                     Ok(ReadResponse::Block(Some(block))) => {
-                        let hash = block.hash();
-                        serialized_blocks.insert(hash, block.zcash_serialize_to_vec().unwrap());
+                        const PACKET_BLOCK_HEADER_LEN: usize = 1 + 4 + 32;
+
+                        let serialized = dbg_verify(block.zcash_serialize_to_vec().ok()).unwrap();
+                        if serialized.len().saturating_add(PACKET_BLOCK_HEADER_LEN) >= (1 << 23) - 1 {
+                            eprintln!("NewNet ERROR: Block too big! Was {:?} bytes, max is {}!", serialized.len(), (1 << 23) - 1);
+                            continue;
+                        }
+
+                        let mut tmp = [0u8; PACKET_BLOCK_HEADER_LEN];
+                        let mut o = 0;
+                        o += PACKET_TYPE_BLOCK                             .write_to(&mut tmp[o..]);
+                        o += dbg_verify(block.coinbase_height()).unwrap().0.write_to(&mut tmp[o..]);
+                        o += block.hash().0                                .write_to(&mut tmp[o..]);
+                        assert!(o == PACKET_BLOCK_HEADER_LEN);
+
+                        let mut buf = Vec::with_capacity(PACKET_BLOCK_HEADER_LEN + serialized.len());
+
+                        buf.extend(&tmp[..o]);
+                        buf.extend(serialized);
+
+                        serialized_blocks.insert(hash, buf);
                     }
                     Ok(ReadResponse::Block(None)) => {
-                        // @Todo: This needs fixing!!! :SidechainSync.
-                        eprintln!("couldn't get block for hash {hash}");
+                        // @Todo: This needs fixing!!! :SidechainSync
+                        eprintln!("Couldn't get block for hash {hash}!");
                         continue;
                     }
                     Err(err) => { panic!("sync start err: {err:?}");               }
                     _        => { panic!("sync err: unhandled response: {res:?}"); }
                 }
             }
-            let serialized = &serialized_blocks[&hash];
 
-            let mut buf = Vec::new();
-
-            if serialized.len() >= (1 << 23) - 1 {
-                eprintln!("NewNet ERROR: Block too big! Was {:?} bytes, max is {}!", serialized.len(), (1 << 23) - 1);
-                continue;
-            }
-
-            buf.push(PACKET_TYPE_BLOCK);
-            buf.extend(serialized);
-
-            packets_to_send.push((*connection_key, buf));
+            // println!("Hey. I'm sending a BLOCK. @Trace");
+            packets_to_send.push((*connection_key, serialized_blocks[&hash].clone()));
             // eprintln!("\x1b[93mPOWLINK2 SENDING BLOCK HASH\x1b[0m: {}", hash);
         }
         blocks_to_send.clear();
@@ -1022,9 +1075,11 @@ pub fn sync(
 
             for (key, connection) in &connections_map {
                 if !connection.is_connected() {
+                    // println!("Disconnected! @Trace");
                     continue;
                 }
 
+                // println!("Hey. I'm sending a STATUS. @Trace");
                 packets_to_send.push((*key, Vec::from(&buf[..o])));
             }
         }
@@ -1061,52 +1116,76 @@ pub fn sync(
         // Process received packets
         'process_packets: while packets_received.len() > 0 {
             let (connection_key, msg) = packets_received.remove(0);
+            // println!("got a message. @Trace");
 
             // Skip packets from now-disconnected peers
-            if get_connected(&connections_map, &connection_key).is_none() {
+            let Some(connection) = get_connected(&connections_map, &connection_key) else {
+                eprintln!("Dropping message from disconnected peer: {connection_key:?}");
                 continue 'process_packets;
-            }
+            };
 
             let mut msg = &msg[..];
 
-            let mut kill = || {
-                connections_map.remove(&connection_key);
-            };
+            macro_rules! warning {
+                ($($arg:tt)*) => {{
+                    // let msg = format!("Peer {:?}: {}", connection.address(), format!($($arg)*));
+                    eprintln!("{}", format!("Peer {:?}: {}", connection.address(), format!($($arg)*)).to_string());
+                }};
+            }
+            macro_rules! kill {
+                ($($arg:tt)*) => {{
+                    // let msg = format!("Killing peer {:?}: {}", connection.address(), format!($($arg)*));
+                    eprintln!("{}", format!("Killing peer {:?}: {}", connection.address(), format!($($arg)*)).to_string());
+                    connections_map.remove(&connection_key);
+                    dbg_panic!();
+                }};
+            }
+            macro_rules! some_or_kill {
+                ($maybe_val:expr, $($arg:tt)*) => {{
+                    let val = dbg_verify($maybe_val);
+                    if val.is_none() {
+                        kill!($($arg)*);
+                    }
+                    val
+                }};
+            }
 
             // if time_limit_exceeded {
             //     stp_library::signal_backpressure(PacketID(&msg));
             //     break; // Congested! Drop remainder!
             // }
 
-            let Some(packet_type) = dbg_verify(<u8>::read_from(&mut msg))
-            else {
-                kill();
+            let Some(packet_type) = some_or_kill!(<u8>::read_from(&mut msg), "Packet type read failed") else {
                 continue 'process_packets;
             };
 
+            // println!("got message {packet_type}. @Trace");
+
             if packet_type == PACKET_TYPE_STATUS {
-                // println!("got a status");
+                // println!("got a status. @Trace");
 
                 let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height())
                 else {
+                    warning!("I don't have a tip height yet");
                     continue 'process_packets;
                 };
 
                 // TODO: rate limit consumption
-                let Some(their_tree) = dbg_verify(NearTipBranches::read_from(&mut msg))
+                let Some(their_tree) = some_or_kill!(NearTipBranches::read_from(&mut msg), "NearTipBranches read failed")
                 else {
-                    kill();
                     continue 'process_packets;
                 };
 
                 // @Todo: If the peer is far behind, beam them blocks from farther back in our chain to catch them up.
                 // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
                 if their_tree.tip_height + NEAR_TIP_CHAIN_LEN < our_tip_height {
+                    warning!("Too far behind me");
                     continue 'process_packets;
                 }
 
                 // @Todo: If the peer is far ahead, request blocks from farther back in their chain to catch us up.
                 if our_tip_height + NEAR_TIP_CHAIN_LEN < their_tree.tip_height {
+                    warning!("Too far ahead of me");
                     continue 'process_packets;
                 }
 
@@ -1170,9 +1249,6 @@ pub fn sync(
 
                         // We may submit the same block multiple times (visit >1 of our chains that share a short prefix with their branch), and that's valid
                         blocks_to_queue.insert(block_to_queue.this_hash);
-
-                        // @Temporary @Debug: Only send one block on each chain for now. @Todo: sort block packets by height on receiver side.
-                        break;
                     }
                 }
 
@@ -1183,24 +1259,12 @@ pub fn sync(
                 // @Todo: Pull.
 
             } else if packet_type == PACKET_TYPE_BLOCK {
-                use zebra_chain::serialization::ZcashDeserializeInto;
-                let Some(block) = dbg_verify(msg.zcash_deserialize_into::<Block>().ok()) else {
+                // println!("got a block. @Trace");
+
+                // @Note: for valid blocks the height can be computed from block data, so this is an early-out optimization.
+                let Some(alleged_height) = some_or_kill!(<u32>::read_from(&mut msg), "Failed to read block height") else {
                     continue 'process_packets;
                 };
-
-                let (hash, height) = (block.hash(), block.coinbase_height());
-                // eprintln!("\x1b[93mPOWLINK2 GOT BLOCK HASH\x1b[0m: {}", hash);
-
-                let Some(height) = dbg_verify(height) else {
-                    continue 'process_packets;
-                };
-
-
-                // @Todo: - safely reorganize checks in block verification that are quite cheap to the top of the function
-                //        - turn that into a function
-                //        - call it at the top of the place where they are currently used
-                //        - call that right here
-
 
                 // @Note: Skip blocks that are older than the base of our NearTipChain view of the best chain.
                 // Depending on whether our NEAR_TIP_CHAIN_LEN is < or > Zebra's MAX_BLOCK_REORG_HEIGHT,
@@ -1208,52 +1272,160 @@ pub fn sync(
                 // is "not even worth" submitting to Zebra (rejected due to being too far back).
                 let min_height = near_tip_chains.chains[0].blocks[0].this_height; // @Todo: this assumes :AssumeGenesisBlockIncludedInNearTipChains
 
-                if height < Height(min_height) {
+                if alleged_height < min_height {
+                    warning!("Block at height {alleged_height} is below our near-tip-chain height {min_height}");
                     continue 'process_packets; // Deciding that it's "not even worth" sending to Zebra
                 }
 
-                if height <= Height(near_tip_chains.finalized_height) {
+                // println!(">= min_height. @Trace");
+
+                if alleged_height <= near_tip_chains.finalized_height {
+                    warning!("Block at height {alleged_height} is already finalized");
                     continue 'process_packets; // Definitely already committed :)
                 }
 
+                // println!("> finalized_height. @Trace");
+
+                // @Note: the hash could be computed from the block header, so this is an early-out optimization.
+                let Some(alleged_hash) = some_or_kill!(<[u8; 32]>::read_from(&mut msg), "Failed to read block hash") else {
+                    continue 'process_packets;
+                };
+                let alleged_hash = Hash(alleged_hash);
+
+                // println!("hash read. @Trace");
+
+                if blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == alleged_hash) {
+                    warning!("Block was already queued to commit!: {alleged_hash}");
+                    continue 'process_packets;
+                }
+
+                // println!("not already queued. @Trace");
+
                 for our_chain in &near_tip_chains.chains {
-                    if our_chain.blocks.iter().any(|block| block.this_hash == hash) {
-                        // println!("already committed!: {}", hash);
+                    if our_chain.blocks.iter().any(|block| block.this_hash == alleged_hash) {
+                        warning!("Block was already committed!: {alleged_hash}");
                         continue 'process_packets;
                     }
                 }
 
-                println!("new block, committing!: {}", hash);
+                // println!("not already in near_tip_chains. @Trace");
+
+                // @Volatile, depends on block header format.
+                let parent_hash = {
+                    let mut tmp = &msg[..];
+                    let Some(version) = some_or_kill!(<u32>::read_from(&mut tmp), "Failed to read block version number") else {
+                        continue 'process_packets;
+                    };
+                    let Some(parent_hash) = some_or_kill!(<[u8; 32]>::read_from(&mut tmp), "Failed to read parent hash") else {
+                        continue 'process_packets;
+                    };
+                    Hash(parent_hash)
+                };
+
+                let have_parent_in_chains           = is_parent_in_chains(&rt, &state, &near_tip_chains, parent_hash);
+                // @Todo: let have_parent_in_blocks_to_commit = !blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == parent_hash);
+
+                if !have_parent_in_chains { // && !have_parent_in_blocks_to_commit {
+                    warning!("Block does not link anywhere known, neither to our chains nor to our blocks-to-commit queue! Not queueing; dropping: height {alleged_height} hash {alleged_hash}");
+                    continue 'process_packets;
+                }
+                // if blocks_to_commit.len() >= MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
+                // } else {
+                // }
+
+                // println!("hash and height. @Trace");
+
+                use zebra_chain::serialization::ZcashDeserializeInto;
+                let Some(block) = some_or_kill!(msg.zcash_deserialize_into::<Block>().ok(), "Failed to deserialize block") else {
+                    continue 'process_packets;
+                };
+
+                // @Todo: - safely reorganize checks in block verification that are quite cheap to the top of the function
+                //        - turn that into a function
+                //        - call it at the top of the place where they are currently used
+                //        - call that right here
+
+                // println!("deserialized. @Trace");
+
+                let hash = block.hash();
+                if hash != alleged_hash {
+                    kill!("Deserialized block hash did not match advertised hash");
+                    continue 'process_packets;
+                }
+
+                if block.header.previous_block_hash != parent_hash {
+                    kill!("Deserialized block parent hash did not match advertised parent hash");
+                    continue 'process_packets;
+                }
+
+                let Some(height) = some_or_kill!(block.coinbase_height(), "Failed to read coinbase height") else {
+                    continue 'process_packets;
+                };
+
+                if height != Height(alleged_height) {
+                    kill!("Computed block height did not match advertised hash");
+                    continue 'process_packets;
+                }
+
+                eprintln!("\x1b[93mPOWLINK2 GOT BLOCK HASH\x1b[0m: {}", hash);
+
+                // println!("hash and height. @Trace");
 
                 // @Todo(Phil): Semantic verification.
-                let res = rt.block_on(async {
-                    state.clone().oneshot(Request::CommitSemanticallyVerifiedBlock(crate::SemanticallyVerifiedBlock::from(std::sync::Arc::new(block)))).await
-                });
-                match res {
-                    Ok(_) => {
-                        println!("committed!: {}", hash);
-                    }
-                    Err(error) => {
-                        if let Some(commit_err) = error.downcast_ref::<crate::error::CommitSemanticallyVerifiedError>() {
-                            match &commit_err.0 {
-                                crate::ValidateContextError::AlreadyFinalized { .. } => {
-                                    // @Todo: We would like to update the trad finalized height, but
-                                    //        we would also have to call near_tip_chains.remove_chains_invalidated_by_finalized() with that height.
-                                    println!("Already was committed: {}", hash);
-                                }
-                                other => {
-                                    println!("Failed to commit {}: {:?}", hash, other);
-                                }
-                            }
-                        } else {
-                            println!("Failed to commit {}: {:?}", hash, error);
-                        }
-                    }
-                }
+            println!("Queueing for commit: {}", hash);
+                blocks_to_commit.push((hash, std::sync::Arc::new(block)));
             } else {
                 println!("NewNet: Got unknown msg type={} len={}", packet_type, msg.len());
             }
+        }
 
+        // @Temporary: just pull one and wait to commit it.
+        let mut any_blocks_in_the_queue_can_make_progress = false;
+        blocks_to_commit.retain(|(hash, block_arc)| {
+            let hash = *hash;
+            let block_arc = block_arc.clone();
+
+            let parent_hash = block_arc.header.previous_block_hash;
+
+            if !is_parent_in_chains(&rt, &state, &near_tip_chains, parent_hash) {
+                return true; // keep
+            }
+
+            any_blocks_in_the_queue_can_make_progress = true;
+
+            println!("Committing: {}", hash);
+            let res = rt.block_on(async {
+                state.clone().oneshot(Request::CommitSemanticallyVerifiedBlock(crate::SemanticallyVerifiedBlock::from(block_arc))).await
+            });
+            match res {
+                Ok(_) => {
+                    println!("committed!: {}", hash);
+                    return false; // remove
+                }
+                Err(error) => {
+                    if let Some(commit_err) = error.downcast_ref::<crate::error::CommitSemanticallyVerifiedError>() {
+                        match &commit_err.0 {
+                            crate::ValidateContextError::AlreadyFinalized { .. } => {
+                                // @Todo: We would like to update the trad finalized height, but
+                                //        we would also have to call near_tip_chains.remove_chains_invalidated_by_finalized() with that height.
+                                println!("Already was committed: {}", hash);
+                            }
+                            other => {
+                                println!("Failed to commit {}: {:?}", hash, other);
+                            }
+                        }
+                    } else {
+                        println!("Failed to commit {}: {:?}", hash, error);
+                    }
+                }
+            }
+
+            return true; // keep
+        });
+
+        if blocks_to_commit.len() > 0 && !any_blocks_in_the_queue_can_make_progress {
+            dbg_panic!("currently we are only queueing blocks that can make progress! This should never hit!"); // @Temporary.
+            blocks_to_commit.clear();
         }
 
         // Sleep remainder of tick

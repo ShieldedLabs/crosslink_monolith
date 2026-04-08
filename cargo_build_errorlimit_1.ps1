@@ -2,9 +2,9 @@
 # Streams cargo build output in real-time, showing only the first error.
 # Kills the cargo process once a second error line appears (no wasted compile time).
 
-$cargoArgs = "build --color always"
+$cargoArgs = "build"
 if ($args.Count -gt 0) {
-    $cargoArgs = "build --color always " + ($args -join " ")
+    $cargoArgs = "build " + ($args -join " ")
 }
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo

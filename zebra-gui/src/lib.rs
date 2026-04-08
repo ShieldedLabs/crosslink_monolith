@@ -56,7 +56,7 @@ impl InteractiveVizOp {
 
 
 #[allow(unused_imports)]
-use std::{alloc::{alloc, dealloc, Layout}, hash::Hasher, hint::spin_loop, mem::{swap, transmute, MaybeUninit}, ptr::{copy_nonoverlapping, slice_from_raw_parts}, rc::Rc, sync::{atomic::{AtomicU32, Ordering}, Barrier}, time::{Duration, Instant}, u32};
+use std::{alloc::{alloc, dealloc, Layout}, hash::Hasher, hint::spin_loop, mem::{swap, transmute, MaybeUninit}, ptr::{copy_nonoverlapping, slice_from_raw_parts}, rc::Rc, sync::{atomic::{AtomicU32, Ordering, AtomicBool}, Barrier}, time::{Duration, Instant}, u32};
 use winit::{dpi::Size, keyboard::KeyCode};
 
 use rustybuzz::{shape, Face as RbFace, UnicodeBuffer};
@@ -974,6 +974,10 @@ pub static SOUND_CELLO_DRONE1: &[u8] = include_bytes!("../assets/cello_drone1.og
 const DRAW_CALL_MAX: usize = 131072;
 const GLYPH_RUN_MAX: usize = 16384;
 
+// @Dev @Debug
+pub const DEV_WIN32_WINDOW_ARRANGEMENT: bool = false;
+pub static DEV_WIN32_WINDOW_RIGHT: AtomicBool = AtomicBool::new(false);
+
 pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fake_data: bool) {
 
     let mut viz_state = viz_gui_init(fake_data);
@@ -1126,12 +1130,59 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
             winit::event::Event::Resumed => { // Runs at startup and is where we have to do init.
                 let twindow = Rc::new(elwt.create_window(
                     winit::window::WindowAttributes::default()
-                    .with_maximized(true)
+                    .with_maximized({
+                        #[cfg(target_os = "windows")]      if DEV_WIN32_WINDOW_ARRANGEMENT { false } else { true }
+                        #[cfg(not(target_os = "windows"))] true
+                    })
                     .with_title("Zcash Visualizer")
                     .with_inner_size(Size::Physical(winit::dpi::PhysicalSize { width: 1600, height: 900 }))
                 ).unwrap());
                 let context = softbuffer::Context::new(twindow.clone()).unwrap();
                 let surface = softbuffer::Surface::new(&context, twindow.clone()).unwrap();
+
+                // @Dev @Debug: Position windows for side-by-side debugging
+                #[cfg(target_os = "windows")] if DEV_WIN32_WINDOW_ARRANGEMENT {
+                    unsafe extern "system" {
+                        fn GetConsoleWindow() -> *mut core::ffi::c_void;
+                        fn SetWindowPos(hwnd: isize, insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+                        fn GetSystemMetrics(index: i32) -> i32;
+                    }
+                    const SM_CXSCREEN: i32 = 0;
+                    const SM_CYSCREEN: i32 = 1;
+                    unsafe {
+
+                        let right = DEV_WIN32_WINDOW_RIGHT.load(Ordering::Relaxed);
+
+                        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+                        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+
+                        // Gui
+                        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                        if let Ok(wh) = twindow.window_handle() {
+                            if let RawWindowHandle::Win32(h) = wh.as_raw() {
+                                let hwnd = h.hwnd.get() as isize;
+                                let win_w = screen_w / 2;
+                                let win_h = screen_h / 2;
+                                let (x, y) = if right {
+                                    (screen_w - win_w, screen_h - win_h) // bottom-right
+                                } else {
+                                    (0,                screen_h - win_h) // bottom-left
+                                };
+                                SetWindowPos(hwnd, 0, x, y, win_w, win_h, 0);
+                            }
+                        }
+
+                        // Console
+                        const SWP_NOSIZE: u32 = 0x0001;
+                        let hwnd = GetConsoleWindow();
+                        if !hwnd.is_null() {
+                            let x = if right { screen_w / 2 } else { 0 };
+                            SetWindowPos(hwnd as isize, 0, x, 0, 0, 0, SWP_NOSIZE);
+                        }
+
+                    }
+                }
+
                 window = Some(twindow);
                 softbuffer_context = Some(context);
                 softbuffer_surface = Some(surface);

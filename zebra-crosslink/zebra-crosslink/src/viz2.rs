@@ -13,6 +13,15 @@ pub fn viz_main(tokio_root_thread_handle: Option<std::thread::JoinHandle<()>>, w
     //         }
     //     }
     // }
+
+    // @Dev @Debug: detect which instance we are to position viz window
+    #[cfg(target_os = "windows")] if visualizer_zcash::DEV_WIN32_WINDOW_ARRANGEMENT {
+        let args: Vec<String> = std::env::args().collect();
+        let args_str = args.join(" ");
+        let bottom_right = args_str.contains("12302") || args_str.contains("12002") || args_str.contains("_1.local");
+        visualizer_zcash::DEV_WIN32_WINDOW_RIGHT.store(bottom_right, std::sync::atomic::Ordering::Relaxed);
+    }
+
     visualizer_zcash::main_thread_run_program(wallet_state, false);
 }
 
@@ -29,7 +38,9 @@ pub async fn service_viz_requests(
     loop {
         let request_queue = visualizer_zcash::REQUESTS_TO_ZEBRA.lock().unwrap();
         let response_queue = visualizer_zcash::RESPONSES_FROM_ZEBRA.lock().unwrap();
-        if request_queue.is_none() || response_queue.is_none() { continue; }
+        if request_queue.is_none() || response_queue.is_none() {
+            continue;
+        }
         let request_queue = request_queue.as_ref().unwrap();
         let response_queue = response_queue.as_ref().unwrap();
 
