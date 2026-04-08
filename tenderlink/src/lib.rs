@@ -55,7 +55,7 @@ use snow::resolvers::CryptoResolver;
 use tokio::time::Instant;
 use zcash_primitives::bft::{ HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
 
-const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
+const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(2500);
 
 // NOTE: Sam and Phillip discussed forward jumps; Noise trial decryption already protects connectsions against replay attacks.
 const NONCE_FORWARD_JUMP_TOLERANCE: u64 = 512;
@@ -1466,7 +1466,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             packets_to_send.push((*connection_key, Vec::from(msg)));
         }
 
-        if net_stats_window_start.elapsed() >= ONE_SECOND {
+        if net_stats_window_start.elapsed() >= 10*ONE_SECOND {
             net_stats = NetworkStats::default();
             net_stats_window_start = tokio::time::Instant::now();
         }
