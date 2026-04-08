@@ -808,7 +808,7 @@ pub fn get_hdrs_after_hash(read_state: &ReadState, rt: &tokio::runtime::Handle, 
 
 pub fn is_parent_in_chains(rt: &tokio::runtime::Handle, state: &State, near_tip_chains: &NearTipChains, parent_hash: Hash) -> bool {
     for our_chain in &near_tip_chains.chains {
-        if our_chain.blocks.iter().any(|block| block.this_hash == parent_hash || block.parent_hash == parent_hash) {
+        if our_chain.blocks.iter().any(|block| block.this_hash == parent_hash) {
             return true;
         }
     }
@@ -1024,7 +1024,7 @@ pub fn sync(
             }
         }
 
-        // TODO: rate limit production
+        // TODO: rate limit production!
         for (connection_key, hash) in &blocks_to_send {
             let hash = *hash;
             let Some(connection) = get_connected(&connections_map, connection_key) else {
@@ -1290,7 +1290,20 @@ pub fn sync(
                 // @Todo: Pull.
 
             } else if packet_type == PACKET_TYPE_BLOCK {
+
+                let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height())
+                else {
+                    warning!("I don't have a tip height yet");
+                    continue 'process_packets;
+                };
+
                 // println!("got a block. @Trace");
+
+                // @Todo: @Temporary. We will instead want to evict non-committable blocks and replace them with new blocks if they are committable.
+                if blocks_to_commit.len() >= MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
+                    warning!("Block commit queue full! Dropping.");
+                    continue 'process_packets;
+                }
 
                 // @Note: for valid blocks the height can be computed from block data, so this is an early-out optimization.
                 let Some(alleged_height) = some_or_kill!(<u32>::read_from(&mut msg), "Failed to read block height") else {
@@ -1360,6 +1373,8 @@ pub fn sync(
                     warning!("Block does not link anywhere known, neither to our chains nor to our blocks-to-commit queue! Not queueing; dropping: height {alleged_height} hash {alleged_hash}");
                     continue 'process_packets;
                 }
+
+                // @Todo: We will want to evict non-committable blocks and replace them with new blocks if they are committable.
                 // if blocks_to_commit.len() >= MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
                 // } else {
                 // }
@@ -1431,31 +1446,36 @@ pub fn sync(
             match res {
                 Ok(_) => {
                     println!("committed!: {}", hash);
-                    return false; // remove
+                    false // remove
                 }
                 Err(error) => {
                     if let Some(commit_err) = error.downcast_ref::<crate::error::CommitSemanticallyVerifiedError>() {
                         match &commit_err.0 {
                             crate::ValidateContextError::AlreadyFinalized { .. } => {
-                                // @Todo: We would like to update the trad finalized height, but
+                                // @Todo: We would like to update the finalized height here, but
                                 //        we would also have to call near_tip_chains.remove_chains_invalidated_by_finalized() with that height.
                                 println!("Already was committed: {}", hash);
+                                false // remove
                             }
                             other => {
+                                // @Todo: detect request timeout and keep the block if it merely timed out.
                                 println!("Failed to commit {}: {:?}", hash, other);
+                                false // remove
                             }
                         }
                     } else {
+                        // @Todo: detect request timeout and keep the block if it merely timed out.
                         println!("Failed to commit {}: {:?}", hash, error);
+                        false // remove
                     }
                 }
+                // @Todo: detect request timeout and keep the block if it merely timed out.
+                _ => unreachable!("wrong response for CommitSemanticallyVerifiedBlock")
             }
-
-            return true; // keep
         });
 
         if blocks_to_commit.len() > 0 && !any_blocks_in_the_queue_can_make_progress {
-            dbg_panic!("currently we are only queueing blocks that can make progress! This should never hit!"); // @Temporary.
+            dbg_panic!("No blocks made progress in the queue this tick!? This should never hit! Currently we are only queueing blocks that can make progress!"); // @Temporary.
             blocks_to_commit.clear();
         }
 
