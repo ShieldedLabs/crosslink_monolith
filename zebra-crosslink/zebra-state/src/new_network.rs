@@ -1130,23 +1130,26 @@ pub fn sync(
             // println!("got a message. @Trace");
 
             // Skip packets from now-disconnected peers
-            let Some(connection) = get_connected(&connections_map, &connection_key) else {
-                eprintln!("Dropping message from disconnected peer: {connection_key:?}");
-                continue 'process_packets;
+            let connection_address = {
+                let Some(connection) = get_connected(&connections_map, &connection_key) else {
+                    eprintln!("Dropping message from disconnected peer: {connection_key:?}");
+                    continue 'process_packets;
+                };
+                connection.address()
             };
 
             let mut msg = &msg[..];
 
             macro_rules! warning {
                 ($($arg:tt)*) => {{
-                    // let msg = format!("Peer {:?}: {}", connection.address(), format!($($arg)*));
-                    eprintln!("{}", format!("Peer {:?}: {}", connection.address(), format!($($arg)*)).to_string());
+                    // let msg = format!("Peer {:?}: {}", connection_address, format!($($arg)*));
+                    eprintln!("{}", format!("Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
                 }};
             }
             macro_rules! kill {
                 ($($arg:tt)*) => {{
-                    // let msg = format!("Killing peer {:?}: {}", connection.address(), format!($($arg)*));
-                    eprintln!("{}", format!("Killing peer {:?}: {}", connection.address(), format!($($arg)*)).to_string());
+                    // let msg = format!("Killing peer {:?}: {}", connection_address, format!($($arg)*));
+                    eprintln!("{}", format!("Killing peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
                     connections_map.remove(&connection_key);
                     dbg_panic!();
                 }};
@@ -1191,7 +1194,7 @@ pub fn sync(
                 // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
                 if their_tree.tip_height < near_tip_chains.finalized_height {
 
-                    for height in their_tree.tip_height..near_tip_chains.finalized_height.min(their_tree.tip_height.saturating_add(MAX_BLOCKS_TO_QUEUE_TO_COMMIT as u32)) {
+                    for height in their_tree.tip_height..near_tip_chains.finalized_height.min(their_tree.tip_height.saturating_add(MAX_BLOCKS_TO_QUEUE_TO_COMMIT as u32)).max(their_tree.tip_height) {
                         let res = rt.block_on(async {
                             read_state.clone().oneshot(ReadRequest::BestChainBlockHash(Height(height).into())).await
                         });
