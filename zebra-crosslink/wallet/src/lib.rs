@@ -1036,15 +1036,23 @@ fn transparent_keys_from_usk(usk: &UnifiedSpendingKey, index: u32) -> Option<(se
     Some((address_pubkey, address_privkey))
 }
 
-fn addrs_from_account(account: &ManualAccount, index: u32) -> Option<(TransparentAddress, UnifiedAddress)> {
-    // NOTE: the wallet auto-increments the child index so this isn't recognized
-    let ufvk = &account.ufvk;
-    let (ua, di_) = ufvk.find_address(orchard::keys::DiversifierIndex::new(), UnifiedAddressRequest::ORCHARD).ok()?;
+fn t_addr_from_ufvk(ufvk: &UnifiedFullViewingKey, index: u32) -> Option<TransparentAddress> {
     let account_pubkey = ufvk.transparent()?;
     let child_index = NonHardenedChildIndex::const_from_index(index);
     let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).ok()?;
-    Some((TransparentAddress::from_pubkey(&address_pubkey), ua))
+    Some(TransparentAddress::from_pubkey(&address_pubkey))
+}
+
+fn addrs_from_ufvk(ufvk: &UnifiedFullViewingKey, index: u32) -> Option<(TransparentAddress, UnifiedAddress)> {
+    // NOTE: the wallet auto-increments the child index so this isn't recognized
+    let (ua, di_) = ufvk.find_address(orchard::keys::DiversifierIndex::new(), UnifiedAddressRequest::ORCHARD).ok()?;
+    let t_addr = t_addr_from_ufvk(ufvk, index)?;
+    Some((t_addr, ua))
         // Some(account.default_address().ok()??.0)
+}
+
+fn addrs_from_account(account: &ManualAccount, index: u32) -> Option<(TransparentAddress, UnifiedAddress)> {
+    addrs_from_ufvk(&account.ufvk, index)
 }
 
 fn update_insert_i(txs: &[WalletTx], insert_i: &mut usize, block_h: BlockHeight) {
@@ -2584,6 +2592,40 @@ fn user_view_of_faucet_tx(tx: &WalletTx) -> WalletTx {
     }
 }
 
+fn stuff_from_seed_phrase<P: Parameters>(params: P, phrase: &str) -> (
+    SecretVec<u8>,
+    UnifiedSpendingKey,
+) {
+    use secrecy::ExposeSecret;
+
+    let mnemonic = bip39::Mnemonic::parse(phrase).unwrap();
+    let bip39_passphrase = ""; // optional
+    let seed64 = mnemonic.to_seed(bip39_passphrase);
+    let seed = SecretVec::new(seed64[..32].to_vec());
+    let seed_fp = zip32::fingerprint::SeedFingerprint::from_seed(seed.expose_secret()).unwrap();
+    let account_id = zip32::AccountId::try_from(0).unwrap();
+
+    let usk = UnifiedSpendingKey::from_seed(&params, seed.expose_secret(), account_id).unwrap();
+    // let birthday = &AccountBirthday::from_parts(
+    //     ChainState::empty(LRZBlockHeight::from_u32(0), zcash_primitives::block::BlockHash([0; 32])),
+    //     None,
+    // );
+
+    (seed, usk)
+}
+
+pub fn default_t_addr_from_entropy<P: Parameters>(params: P, entropy: &[u8; 32]) -> Option<TransparentAddress> {
+    let mnemonic = bip39::Mnemonic::from_entropy_in(bip39::Language::English, entropy).unwrap();
+    let phrase = mnemonic.words().map(|s| s.to_string()).collect::<Vec<String>>().join(" ");
+    let (_seed, usk) = stuff_from_seed_phrase(&params, &phrase);
+    let ufvk = usk.to_unified_full_viewing_key();
+    t_addr_from_ufvk(&ufvk, 0)
+}
+
+pub fn string_from_t_addr<P: Parameters>(params: P, t_addr: TransparentAddress) -> String {
+    t_addr.encode(&params)
+}
+
 /// NOTE: this *must* only be called in sequential order without gaps (including after reorg/truncate)
 fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &CompactTx, next_orchard_pos: &mut u64, insert_i: &mut usize, orchard_tree: &mut OrchardShardTree) -> (TxId, bool/*ours*/, bool/*ok*/) {
     let txid = TxId::from_bytes(<[u8;32]>::try_from(&tx.hash[..]).expect("successfully converted above"));
@@ -2684,32 +2726,9 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
 
 
 pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
-    fn stuff_from_seed_phrase<P: Parameters + 'static>(params:P, phrase: &str) -> (
-        SecretVec<u8>,
-        UnifiedSpendingKey,
-    ) {
-        use secrecy::ExposeSecret;
-
-        let mnemonic = bip39::Mnemonic::parse(phrase).unwrap();
-        let bip39_passphrase = ""; // optional
-        let seed64 = mnemonic.to_seed(bip39_passphrase);
-        let seed = SecretVec::new(seed64[..32].to_vec());
-        let seed_fp = zip32::fingerprint::SeedFingerprint::from_seed(seed.expose_secret()).unwrap();
-        let account_id = zip32::AccountId::try_from(0).unwrap();
-
-        let usk = UnifiedSpendingKey::from_seed(&params, seed.expose_secret(), account_id).unwrap();
-        let birthday = &AccountBirthday::from_parts(
-            ChainState::empty(LRZBlockHeight::from_u32(0), zcash_primitives::block::BlockHash([0; 32])),
-            None,
-        );
-
-        (seed, usk)
-    }
-
-    fn wallet_from_stuff<P: Parameters + 'static>(params: P, name: &'static str, seed: SecretVec<u8>) -> (ManualWallet, ManualAccount) {
+    fn wallet_from_usk<P: Parameters + 'static>(params: P, name: &'static str, usk: &UnifiedSpendingKey) -> (ManualWallet, ManualAccount) {
         // TODO: skip this by changing API slightly
         let account_id = zip32::AccountId::try_from(0).unwrap();
-        let usk = UnifiedSpendingKey::from_seed(&params, seed.expose_secret(), account_id).unwrap();
 
         let account = ManualAccount {
             ufvk: usk.to_unified_full_viewing_key(),
@@ -3064,7 +3083,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         let (seed, miner_usk) = stuff_from_seed_phrase(network,
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
         );
-        let (miner_wallet, miner_account) = wallet_from_stuff(network, "miner", Secret::new(seed.expose_secret().clone()));
+        let (miner_wallet, miner_account) = wallet_from_usk(network, "miner", &miner_usk);
 
         let (miner_t_addr, miner_ua) = addrs_from_account(&miner_account, 0).unwrap();
         let miner_t_addr_str = miner_t_addr.encode(network);
@@ -3086,9 +3105,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // roundtrip seed through mnemonic phrase
         let mnemonic = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &global_seed).unwrap();
         let phrase = mnemonic.words().map(|s| s.to_string()).collect::<Vec<String>>().join(" ");
-
         let (seed, user_usk) = stuff_from_seed_phrase(network, &phrase);
-        let (user_wallet, user_account) = wallet_from_stuff(network, "user", Secret::new(seed.expose_secret().clone()));
+        let (user_wallet, user_account) = wallet_from_usk(network, "user", &user_usk);
         let (user_t_addr, user_ua) = addrs_from_account(&user_account, 0).unwrap();
         let user_t_addr_str = user_t_addr.encode(network);
         let (user_pubkey, user_privkey) = transparent_keys_from_usk(&user_usk, 0).unwrap();
@@ -3212,6 +3230,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     });
 
+    const USER_WALLET_IDX: usize = 0;
+    const MINER_WALLET_IDX: usize = 1;
+    const SYNC_T_TXS_FROM_WALLET: usize = MINER_WALLET_IDX; // TODO: sync multiple
+    let t_addresses = [ user_t_address, miner_t_address ];
+
     let mut auto_spend = (false,);
 
     let mut faucet_shield_cooldown_instant = Instant::now() - Duration::from_secs(1000);
@@ -3279,7 +3302,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     client0.get_lightd_info(Empty {}),
                     client1.get_block_range(block_rng_from_heights(req_rng)),
                     client2.get_taddress_txids(TransparentAddressBlockFilter {
-                        address: miner_t_address.encode(network),
+                        address: t_addresses[SYNC_T_TXS_FROM_WALLET].encode(network),
                         range: Some(block_rng_from_heights(t_req_rng)),
                     })
                 );
@@ -3838,13 +3861,14 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // } else {
             //     req_rng.0.try_into.expect("fits in u32")
             // };
-            let keys = PreparedKeys::from_ufvk_all(&miner_wallet.accounts[0].ufvk);
+            let wallets = [&mut user_wallet, &mut miner_wallet];
+            let keys = PreparedKeys::from_ufvk_all(&wallets[SYNC_T_TXS_FROM_WALLET].accounts[0].ufvk);
             let mut insert_i = 0;
             for t_tx_i in 0..miner_t_txs.len() {
                 // kinda @in_step_sync
                 let block_h = miner_t_txs[t_tx_i].0;
                 let tx = &miner_t_txs[t_tx_i].1;
-                read_full_tx(&mut miner_wallet, 0, &keys, block_h, tx, &mut insert_i, TxStatus::OnBc);
+                read_full_tx(wallets[SYNC_T_TXS_FROM_WALLET], 0, &keys, block_h, tx, &mut insert_i, TxStatus::OnBc);
             }
         }
 

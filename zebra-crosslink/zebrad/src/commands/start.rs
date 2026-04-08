@@ -124,43 +124,15 @@ impl StartCmd {
         let config = APPLICATION.config();
         let is_regtest = config.network.network.is_regtest();
 
-        let config = if is_regtest {
-            fn add_to_port(mut addr: std::net::SocketAddr, addend: u16) -> std::net::SocketAddr {
-                addr.set_port(addr.port() + addend);
-                addr
-            }
-            let nextest_slot: u16 = if let Ok(str) = std::env::var("NEXTEST_TEST_GLOBAL_SLOT") {
-                if let Ok(slot) = str.parse::<u16>() {
-                    slot
-                } else {
-                    0
+        let is_clt0 = 'is_clt0: { // Crosslink_Testnet_0
+            if let zebra_chain::parameters::Network::Testnet(params) = &config.network.network {
+                if params.network_magic().0 == [b'C',b'l',b'T',b'0'] {
+                    break 'is_clt0 true;
                 }
-            } else {
-                0
-            };
-
-            Arc::new(ZebradConfig {
-                mempool: mempool::Config {
-                    debug_enable_at_height: Some(0),
-                    ..config.mempool
-                },
-                network: zebra_network::config::Config {
-                    listen_addr: add_to_port(config.network.listen_addr.clone(), nextest_slot * 7),
-                    ..config.network.clone()
-                },
-                rpc: zebra_rpc::config::rpc::Config {
-                    listen_addr: config
-                        .rpc
-                        .listen_addr
-                        .clone()
-                        .map(|addr| add_to_port(addr, nextest_slot * 7)),
-                    ..config.rpc.clone()
-                },
-                ..Arc::unwrap_or_clone(config)
-            })
-        } else {
-            config
+            }
+            false
         };
+
 
         // workshop-specific key seed
         let global_seed = loop {
@@ -195,6 +167,65 @@ impl StartCmd {
 
             key_path.push("pos.chain");
             key_path
+        };
+
+
+        let config = if is_regtest {
+            fn add_to_port(mut addr: std::net::SocketAddr, addend: u16) -> std::net::SocketAddr {
+                addr.set_port(addr.port() + addend);
+                addr
+            }
+            let nextest_slot: u16 = if let Ok(str) = std::env::var("NEXTEST_TEST_GLOBAL_SLOT") {
+                if let Ok(slot) = str.parse::<u16>() {
+                    slot
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            Arc::new(ZebradConfig {
+                mempool: mempool::Config {
+                    debug_enable_at_height: Some(0),
+                    ..config.mempool
+                },
+                network: zebra_network::config::Config {
+                    listen_addr: add_to_port(config.network.listen_addr.clone(), nextest_slot * 7),
+                    ..config.network.clone()
+                },
+                rpc: zebra_rpc::config::rpc::Config {
+                    listen_addr: config
+                        .rpc
+                        .listen_addr
+                        .clone()
+                        .map(|addr| add_to_port(addr, nextest_slot * 7)),
+                    ..config.rpc.clone()
+                },
+                ..Arc::unwrap_or_clone(config)
+            })
+        } else if is_clt0 {
+            // debug_enable_at_height: Some(0)
+            Arc::new(ZebradConfig {
+                // mempool: mempool::Config {
+                //     debug_enable_at_height: Some(0),
+                //     ..config.mempool
+                // },
+                mining: zebra_rpc::config::mining::Config {
+                    miner_address: Some(config.mining.miner_address.clone().unwrap_or_else(||{
+                        use zcash_address::ToAddress;
+
+                        let t_addr = wallet::default_t_addr_from_entropy(&config.network.network, &global_seed).expect("unable to initialize miner");
+                        info!("Miner address unspecified. Mining to {}", wallet::string_from_t_addr(&config.network.network, t_addr));
+                        t_addr.to_zcash_address(config.network.network.kind().into())
+                    })),
+                    // TODO: extra_coinbase_data
+                    ..config.mining.clone()
+                },
+                ..Arc::unwrap_or_clone(config)
+            })
+        } else {
+            config
         };
 
 
@@ -274,16 +305,6 @@ impl StartCmd {
             )
             .await;
 
-        #[cfg(feature = "new-net")]
-        {
-            let state_config_copy = Arc::clone(&config);
-            let sync_state = state.clone();
-            let sync_read_state = read_only_state_service.clone();
-            tokio::task::spawn_blocking(move ||{
-                zebra_state::new_network::sync(&state_config_copy.state, sync_read_state, sync_state, tokio::runtime::Handle::current())
-            });
-        }
-
         info!("initializing syncer");
         let (mut syncer, sync_status) = ChainSync::new(
             &config,
@@ -348,7 +369,7 @@ impl StartCmd {
 
         let mempool2 = mempool.clone();
         info!("spawning tfl service task");
-        let (tfl, tfl_service_task_handle) = {
+        let (tfl_handle, tfl_service_task_handle) = {
             let state = state.clone();
             let read_only_state_service = read_only_state_service.clone();
             zebra_crosslink::service::spawn_new_tfl_service(
@@ -459,8 +480,20 @@ impl StartCmd {
                 actual_closure2,
             )
         };
-        let tfl_service = BoxService::new(tfl);
+        let tfl_service = BoxService::new(tfl_handle);
         let tfl_service = ServiceBuilder::new().buffer(1).service(tfl_service);
+
+        #[cfg(feature = "new-net")]
+        {
+            // let tfl_service2 = tfl_service.clone();
+
+            let state_config_copy = Arc::clone(&config);
+            let sync_state = state.clone();
+            let sync_read_state = read_only_state_service.clone();
+            tokio::task::spawn_blocking(move ||{
+                zebra_state::new_network::sync(&state_config_copy.state, sync_read_state, sync_state, /* tfl_service2, */ tokio::runtime::Handle::current())
+            });
+        }
 
         // Launch RPC server
         let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new(
@@ -573,16 +606,33 @@ impl StartCmd {
         );
 
         info!("spawning syncer task");
-        let syncer_task_handle = if is_regtest {
+        let syncer_task_handle = if is_regtest || is_clt0 {
             if !syncer
                 .state_contains(config.network.network.genesis_hash())
                 .await?
             {
-                let genesis_hash = block_verifier_router
-                    .clone()
-                    .oneshot(zebra_consensus::Request::Commit(regtest_genesis_block()))
-                    .await
-                    .expect("should validate Regtest genesis block");
+                let genesis_hash = if is_regtest {
+                    block_verifier_router
+                        .clone()
+                        .oneshot(zebra_consensus::Request::Commit(regtest_genesis_block()))
+                        .await
+                        .expect("should validate Regtest genesis block")
+                } else if is_clt0 {
+                    use zebra_chain::serialization::ZcashDeserialize;
+                    let genesis_bytes = include_bytes!("../../../ClT0-genesis.pow");
+                    let genesis_block = Arc::new(zebra_chain::block::Block::zcash_deserialize(&genesis_bytes[..]).expect("hardcoded genesis must be valid"));
+
+                    assert_eq!(genesis_block.hash(), config.network.network.genesis_hash(),
+                    "config genesis hash doesn't match hash of baked genesis; consider editing your config");
+
+                    block_verifier_router
+                        .clone()
+                        .oneshot(zebra_consensus::Request::Commit(genesis_block))
+                        .await
+                        .expect("should validate baked-in genesis block")
+                } else {
+                    panic!("unhandled special-case genesis");
+                };
 
                 assert_eq!(
                     genesis_hash,
@@ -641,6 +691,7 @@ impl StartCmd {
         pin!(old_databases_task_handle_fused);
 
         if true
+        // if false // @Phillip
         {
             let tmp_dir = tempfile::TempDir::new().unwrap();
             let _ = std::fs::remove_dir_all(tmp_dir.path());
