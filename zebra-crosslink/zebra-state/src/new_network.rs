@@ -966,7 +966,7 @@ pub fn sync(
 
     let mut blocks_to_send = Vec::<(ConnectionKey, Hash)>::new();
 
-    const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 16;
+    const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 64;
     let mut blocks_to_commit = Vec::new();
 
     let mut serialized_blocks = HashMap::new(); // @Todo: cap max memory storage size for this map.
@@ -1191,7 +1191,7 @@ pub fn sync(
                 // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
                 if their_tree.tip_height < near_tip_chains.finalized_height {
 
-                    for height in their_tree.tip_height..near_tip_chains.finalized_height {
+                    for height in their_tree.tip_height..near_tip_chains.finalized_height.max(their_tree.tip_height.saturating_add(MAX_BLOCKS_TO_QUEUE_TO_COMMIT)) {
                         let res = rt.block_on(async {
                             read_state.clone().oneshot(ReadRequest::BestChainBlockHash(Height(height).into())).await
                         });
