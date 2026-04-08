@@ -1191,7 +1191,7 @@ pub fn sync(
                 // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
                 if their_tree.tip_height < near_tip_chains.finalized_height {
 
-                    for height in their_tree.tip_height..near_tip_chains.finalized_height.max(their_tree.tip_height.saturating_add(MAX_BLOCKS_TO_QUEUE_TO_COMMIT)) {
+                    for height in their_tree.tip_height..near_tip_chains.finalized_height.max(their_tree.tip_height.saturating_add(MAX_BLOCKS_TO_QUEUE_TO_COMMIT as u32)) {
                         let res = rt.block_on(async {
                             read_state.clone().oneshot(ReadRequest::BestChainBlockHash(Height(height).into())).await
                         });
