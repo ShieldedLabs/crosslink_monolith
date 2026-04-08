@@ -124,6 +124,16 @@ impl StartCmd {
         let config = APPLICATION.config();
         let is_regtest = config.network.network.is_regtest();
 
+        let is_clt0 = 'is_clt0: { // Crosslink_Testnet_0
+            if let zebra_chain::parameters::Network::Testnet(params) = &config.network.network {
+                if params.network_magic().0 == [b'C',b'l',b'T',b'0'] {
+                    break 'is_clt0 true;
+                }
+            }
+            false
+        };
+
+
         let config = if is_regtest {
             fn add_to_port(mut addr: std::net::SocketAddr, addend: u16) -> std::net::SocketAddr {
                 addr.set_port(addr.port() + addend);
@@ -573,16 +583,33 @@ impl StartCmd {
         );
 
         info!("spawning syncer task");
-        let syncer_task_handle = if is_regtest {
+        let syncer_task_handle = if is_regtest || is_clt0 {
             if !syncer
                 .state_contains(config.network.network.genesis_hash())
                 .await?
             {
-                let genesis_hash = block_verifier_router
-                    .clone()
-                    .oneshot(zebra_consensus::Request::Commit(regtest_genesis_block()))
-                    .await
-                    .expect("should validate Regtest genesis block");
+                let genesis_hash = if is_regtest {
+                    block_verifier_router
+                        .clone()
+                        .oneshot(zebra_consensus::Request::Commit(regtest_genesis_block()))
+                        .await
+                        .expect("should validate Regtest genesis block")
+                } else if is_clt0 {
+                    use zebra_chain::serialization::ZcashDeserialize;
+                    let genesis_bytes = include_bytes!("../../../ClT0-genesis.pow");
+                    let genesis_block = Arc::new(zebra_chain::block::Block::zcash_deserialize(&genesis_bytes[..]).expect("hardcoded genesis must be valid"));
+
+                    assert_eq!(genesis_block.hash(), config.network.network.genesis_hash(),
+                    "config genesis hash doesn't match hash of baked genesis; consider editing your config");
+
+                    block_verifier_router
+                        .clone()
+                        .oneshot(zebra_consensus::Request::Commit(genesis_block))
+                        .await
+                        .expect("should validate baked-in genesis block")
+                } else {
+                    panic!("unhandled special-case genesis");
+                };
 
                 assert_eq!(
                     genesis_hash,
