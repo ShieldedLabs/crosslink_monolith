@@ -3230,6 +3230,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     });
 
+    const USER_WALLET_IDX: usize = 0;
+    const MINER_WALLET_IDX: usize = 1;
+    const SYNC_T_TXS_FROM_WALLET: usize = MINER_WALLET_IDX; // TODO: sync multiple
+    let t_addresses = [ user_t_address, miner_t_address ];
+
     let mut auto_spend = (false,);
 
     let mut faucet_shield_cooldown_instant = Instant::now() - Duration::from_secs(1000);
@@ -3297,7 +3302,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     client0.get_lightd_info(Empty {}),
                     client1.get_block_range(block_rng_from_heights(req_rng)),
                     client2.get_taddress_txids(TransparentAddressBlockFilter {
-                        address: miner_t_address.encode(network),
+                        address: t_addresses[SYNC_T_TXS_FROM_WALLET].encode(network),
                         range: Some(block_rng_from_heights(t_req_rng)),
                     })
                 );
@@ -3856,13 +3861,14 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             // } else {
             //     req_rng.0.try_into.expect("fits in u32")
             // };
-            let keys = PreparedKeys::from_ufvk_all(&miner_wallet.accounts[0].ufvk);
+            let wallets = [&mut user_wallet, &mut miner_wallet];
+            let keys = PreparedKeys::from_ufvk_all(&wallets[SYNC_T_TXS_FROM_WALLET].accounts[0].ufvk);
             let mut insert_i = 0;
             for t_tx_i in 0..miner_t_txs.len() {
                 // kinda @in_step_sync
                 let block_h = miner_t_txs[t_tx_i].0;
                 let tx = &miner_t_txs[t_tx_i].1;
-                read_full_tx(&mut miner_wallet, 0, &keys, block_h, tx, &mut insert_i, TxStatus::OnBc);
+                read_full_tx(wallets[SYNC_T_TXS_FROM_WALLET], 0, &keys, block_h, tx, &mut insert_i, TxStatus::OnBc);
             }
         }
 
