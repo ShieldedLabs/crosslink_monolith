@@ -703,7 +703,7 @@ pub fn chain_intersect_prefix<'l>(a: &'l [ShadowBlock], b: &'l [ShadowBlock]) ->
 }
 
 
-const TRACE     :bool=0!=       0;
+const TRACE     :bool=0!=       1;
 
 
 // @Todo: always only wait on real stuff, never sleeping for fixed amounts like this
@@ -980,7 +980,7 @@ pub fn sync(
     const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 8;
 
     let mut blocks_to_commit = Vec::new();
-    let mut blocks_to_send = Vec::<(ConnectionKey, Hash)>::new();
+    let mut blocks_to_send = Vec::<(ConnectionKey, Hash, u32)>::new();
     let mut serialized_blocks = HashMap::new(); // @Todo: cap max memory storage size for this map.
     let mut peer_statuses = HashMap::<ConnectionKey, NearTipBranches>::new();
 
@@ -1041,7 +1041,7 @@ pub fn sync(
         }
 
         // TODO: rate limit production!
-        for (connection_key, hash) in &blocks_to_send {
+        for (connection_key, hash, height) in &blocks_to_send {
             let hash = *hash;
             let Some(connection) = get_connected(&connections_map, connection_key) else {
                 if TRACE { println!("Disconnected!"); }
@@ -1086,7 +1086,7 @@ pub fn sync(
                 }
             }
 
-            if TRACE { println!("Hey. I'm sending a BLOCK."); }
+            if TRACE { println!("Hey. I'm sending a BLOCK. Height: {height}. Hash: {hash}."); }
             packets_to_send.push((*connection_key, serialized_blocks[&hash].clone()));
             // eprintln!("\x1b[93mPOWLINK2 SENDING BLOCK HASH\x1b[0m: {}", hash);
         }
@@ -1156,7 +1156,7 @@ pub fn sync(
                                     break;
                                 };
 
-                                blocks_to_send.push((*connection_key, hash));
+                                blocks_to_send.push((*connection_key, hash, height));
                             }
                             Err(err) => { panic!("ReadRequest::BestChainBlockHash({height}): Error: {err:?}");              }
                             _        => { panic!("ReadRequest::BestChainBlockHash({height}): Unhandled response: {res:?}"); }
@@ -1230,12 +1230,12 @@ pub fn sync(
                         let block_to_queue = &our_chain.blocks[chain_i];
 
                         // We may submit the same block multiple times (visit >1 of our chains that share a short prefix with their branch), and that's valid
-                        blocks_to_queue.insert(block_to_queue.this_hash);
+                        blocks_to_queue.insert((block_to_queue.this_hash, height));
                     }
                 }
 
-                for block in blocks_to_queue {
-                    blocks_to_send.push((*connection_key, block));
+                for (block, height) in blocks_to_queue {
+                    blocks_to_send.push((*connection_key, block, height));
                 }
 
                 // @Todo: Pull.
