@@ -52,15 +52,13 @@ const PACKET_TYPE_BLOCK:  u8 = 2;
 const PACKET_STATUS_MAX_HASHES: usize = 400; // @Lazy: gives room for 300 hashes plus room for 200 run metadatas
 const PACKET_STATUS_MAX_SIZE:   usize = ((PACKET_STATUS_MAX_HASHES * 32 + JUMBO_FRAG_SIZE - 1) / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE; // @Cleanup @Lazy.
 
-macro_rules! dbg_break {
-    () => {
-        #[cfg(target_arch = "x86_64")] unsafe { std::arch::asm!("int 3"); }
-        // @Todo: AArch64 debugbreak.
-    }
+fn dbg_break() {
+    #[cfg(target_arch = "x86_64")] unsafe { std::arch::asm!("int 3"); }
+    // @Todo: AArch64 debugbreak.
 }
 
 #[cfg(debug_assertions)] #[track_caller] fn dbg_panic_internal(msg: std::fmt::Arguments<'_>) -> ! {
-    dbg_break!();
+    dbg_break();
     std::env::set_var("RUST_BACKTRACE", "full");
     panic!("{msg}");
 }
@@ -71,7 +69,7 @@ macro_rules! dbg_panic {
 
 pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
     #[cfg(debug_assertions)] {
-        if t.is_none() { dbg_break!(); }
+        if t.is_none() { dbg_break(); }
 
         #[cfg(not(target_arch = "x86_64"))]
         return Some(t.unwrap());
