@@ -85,7 +85,6 @@ mod linux {
         unsafe {
             let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
             if libc::getifaddrs(&mut ifap) != 0 {
-                // If you prefer, return None instead of panicking.
                 panic!("getifaddrs failed: {}", std::io::Error::last_os_error());
             }
     
@@ -103,26 +102,22 @@ mod linux {
                     let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
                     let addr = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
     
-                    // Skip loopback (::1)
                     if addr.is_loopback() {
                         cur = (*cur).ifa_next;
                         if index == 1 { first_is_loopback = true; }
                         continue;
                     }
     
-                    // Skip multicast (ff00::/8)
                     if addr.is_multicast() {
                         cur = (*cur).ifa_next;
                         continue;
                     }
     
-                    // Skip link-local (fe80::/10)
                     if (addr.segments()[0] & 0xffc0) == 0xfe80 {
                         cur = (*cur).ifa_next;
                         continue;
                     }
     
-                    // Skip subnet-router anycast (IID all zeros): xxxx:xxxx:xxxx:xxxx::
                     let seg = addr.segments();
                     if seg[4] == 0 && seg[5] == 0 && seg[6] == 0 && seg[7] == 0 {
                         cur = (*cur).ifa_next;
@@ -132,7 +127,6 @@ mod linux {
                     libc::freeifaddrs(ifap);
                     
                     if index == 2 && first_is_loopback {
-                        // This is a normally configured Linux box and we do not need the workaround.
                         return None;
                     }
                     eprintln!("[WARNING] This linux machine has incorrectly configured it's ipv6 addresses causing a bug when sending ipv6 packets. We will be overriding the sender ip field with '{}' in order to try and work around this issue.", addr);
@@ -161,15 +155,47 @@ mod linux {
             return None;
         }
 
+        unsafe {
+            let one: libc::c_int = 1;
+
+            if libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            ) != 0
+            {
+                eprintln!("Failed to enable SO_REUSEADDR: {}", std::io::Error::last_os_error());
+                let _ = libc::close(fd);
+                return None;
+            }
+
+            if libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            ) != 0
+            {
+                eprintln!("Failed to enable SO_REUSEPORT: {}", std::io::Error::last_os_error());
+                let _ = libc::close(fd);
+                return None;
+            }
+        }
+
         // Make socket non-blocking
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             if flags < 0 {
                 eprintln!("fcntl(F_GETFL) failed: {}", std::io::Error::last_os_error());
+                let _ = libc::close(fd);
                 return None;
             }
             if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
                 eprintln!("fcntl(F_SETFL) failed: {}", std::io::Error::last_os_error());
+                let _ = libc::close(fd);
                 return None;
             }
         }
@@ -177,7 +203,6 @@ mod linux {
         unsafe {
             let zero: libc::c_int = 0;
 
-            // Dual-stack: allow IPv4-mapped IPv6 addresses.
             if libc::setsockopt(
                 fd,
                 libc::IPPROTO_IPV6,
@@ -187,23 +212,17 @@ mod linux {
             ) != 0
             {
                 eprintln!("Failed to disable IPV6_V6ONLY: {}", std::io::Error::last_os_error());
+                let _ = libc::close(fd);
                 return None;
             }
         }
 
         let known_good_ipv6_address = first_usable_ipv6();
-        // Bind [::]:port
+
         unsafe {
             let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
             addr.sin6_family = libc::AF_INET6 as _;
             addr.sin6_port = port.to_be();
-            // Note(Sam): We cannot bind it here because then we break dual stack. Instead we
-            // must manually set the sender ip on every packet which is why we embedd it in
-            // the socket handle.
-            // addr.sin6_addr = match known_good_ipv6_address {
-            //     Some(ip6) => libc::in6_addr { s6_addr: ip6.octets() },
-            //     None => libc::in6_addr { s6_addr: [0; 16] },
-            // };
 
             if libc::bind(
                 fd,
@@ -212,6 +231,7 @@ mod linux {
             ) != 0
             {
                 eprintln!("bind([::]:{}) failed: {}", port, std::io::Error::last_os_error());
+                let _ = libc::close(fd);
                 return None;
             }
         }
@@ -219,7 +239,6 @@ mod linux {
         unsafe {
             let one: libc::c_int = 1;
 
-            // IPv4 TOS (includes ECN bits) as CMSG on recvmsg
             if libc::setsockopt(
                 fd,
                 libc::IPPROTO_IP,
@@ -231,7 +250,6 @@ mod linux {
                 panic!("Failed to Enable IPv4 TOS, error: {}", std::io::Error::last_os_error());
             }
     
-            // IPv6 Traffic Class (includes ECN bits) as CMSG on recvmsg
             if libc::setsockopt(
                 fd,
                 libc::IPPROTO_IPV6,
@@ -243,7 +261,6 @@ mod linux {
                 panic!("Failed to Enable IPv6 TOS, error: {}", std::io::Error::last_os_error());
             }
     
-            // IPv6 Packet Info (source addr / ifindex) as CMSG on sendmsg/recvmsg
             if libc::setsockopt(
                 fd,
                 libc::IPPROTO_IPV6,
@@ -258,11 +275,6 @@ mod linux {
         Some(SockHandle(fd, known_good_ipv6_address))
     }
 
-    /// SEND one UDP packet to (dst_ip6, dst_port) on a dual-stack socket.
-    /// - If `dst_ip6` is IPv4-mapped (::ffff:a.b.c.d), it sends to IPv4 using sockaddr_in
-    ///   and uses IP_TOS cmsg.
-    /// - Otherwise sends to IPv6 using sockaddr_in6 and IPV6_TCLASS cmsg.
-    /// Return value is a nanosecond timestamp of the send.
     #[inline]
     pub fn udp_send_with_congestion_and_dscp( // Linux
         udp_socket: SockHandle,
@@ -279,7 +291,6 @@ mod linux {
             iov_len: payload.len(),
         };
     
-        // Decide whether this is IPv4-mapped
         let (mut name_buf, name_len, is_v4) = if let Some(v4) = dst_ip6.to_ipv4_mapped() {
             let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
             sin.sin_family = libc::AF_INET as _;
@@ -316,7 +327,6 @@ mod linux {
             (buf, buf_len, false)
         };
     
-        // Control buffer
         let mut cbuf = [0u8; 256];
     
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -327,7 +337,7 @@ mod linux {
         msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = cbuf.len();
     
-        let tclass_byte = ((dscp as u8) << 2) | 0b10; // ecn
+        let tclass_byte = ((dscp as u8) << 2) | 0b10;
     
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg as *const _ as *mut _);
@@ -335,7 +345,6 @@ mod linux {
                 return Err(std::io::Error::new(std::io::ErrorKind::Other, "CMSG_FIRSTHDR returned null"));
             }
     
-            // Linux uses int for send cmsg values.
             let val: libc::c_int = tclass_byte as libc::c_int;
     
             (*cmsg).cmsg_level = if is_v4 { libc::IPPROTO_IP } else { libc::IPPROTO_IPV6 };
@@ -386,12 +395,6 @@ mod linux {
         }
     }
     
-    /// RECV one UDP packet, returning:
-    /// (len, src_ip6, src_port, congested, dscp)
-    ///
-    /// - If the peer is IPv4, it is returned as an IPv4-mapped IPv6 address (::ffff:a.b.c.d).
-    /// - `congested=true` iff ECN == CE (0b11).
-    /// - If no TOS/TCLASS cmsg was provided by the kernel, returns congested=false and dscp=BestEffort.
     #[inline]
     pub fn udp_recv_with_congestion_and_dscp( // Linux
         udp_socket: SockHandle,
@@ -428,7 +431,6 @@ mod linux {
             ));
         }
     
-        // Peer address -> always return IPv6 (IPv4 becomes v4-mapped IPv6)
         let (src_ip6, src_port) = if (addr_storage.ss_family as i32) == libc::AF_INET {
             let sin: &libc::sockaddr_in =
                 unsafe { &*(&addr_storage as *const _ as *const libc::sockaddr_in) };
@@ -445,7 +447,6 @@ mod linux {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown sockaddr family"));
         };
     
-        // Defaults if no cmsg
         let mut congested = false;
         let mut ecn_enabled = false;
         let mut dscp = Dscp::BestEffort;
@@ -458,18 +459,16 @@ mod linux {
                 let mut tclass_opt: Option<u8> = None;
     
                 if cmsg.cmsg_level == libc::IPPROTO_IP && cmsg.cmsg_type == libc::IP_TOS {
-                    // With IP_RECVTOS, Linux provides 1 byte.
                     let data = libc::CMSG_DATA(cmsg_ptr) as *const u8;
                     tclass_opt = Some(*data);
                 } else if cmsg.cmsg_level == libc::IPPROTO_IPV6 && cmsg.cmsg_type == libc::IPV6_TCLASS {
-                    // With IPV6_RECVTCLASS, Linux usually provides an int.
                     let data = libc::CMSG_DATA(cmsg_ptr) as *const libc::c_int;
                     tclass_opt = Some((*data as u8));
                 }
     
                 if let Some(tclass) = tclass_opt {
                     let ecn_bits = tclass & 0b11;
-                    congested = ecn_bits == 0b11; // CE
+                    congested = ecn_bits == 0b11;
                     ecn_enabled = ecn_bits != 0;
                     dscp = Dscp::from_u8(tclass >> 2);
                     break;
@@ -569,7 +568,6 @@ mod linux {
                 dst.sin6_family = libc::AF_INET6 as _;
                 dst.sin6_port = 53u16.to_be();
                 dst.sin6_addr = libc::in6_addr {
-                    // 2606:4700:4700::1111
                     s6_addr: [
                         0x26, 0x06, 0x47, 0x00,
                         0x47, 0x00, 0x00, 0x00,
