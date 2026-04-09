@@ -528,6 +528,10 @@ impl ReassemblySlot {
 
     fn insert(&mut self, offset: usize, data: &[u8]) -> Result<bool, ()> {
         let start = offset as u32;
+        if start >= self.total_len {
+            return Err(());
+        }
+
         let end = (offset + data.len()) as u32;
         if end > self.total_len {
             return Err(());
@@ -576,8 +580,9 @@ pub struct JumboReassembly {
     slots: HashMap<u32, ReassemblySlot>,
 }
 
-pub const MAX_REASSEMBLY_SLOTS: usize = 64;
+pub const MAX_REASSEMBLY_SLOTS: usize = 128; // @Todo: convert max slots into max bytes instead -- which is what we really want anyway!
 pub const MAX_JUMBOGRAM_LEN: usize = 1 << 23; // 8 MB, matches the 23-bit field
+pub const MAX_JUMBOGRAM_IDS: u32   = 1 << 18; // matches 18-bit field
 
 impl SliceRead  for PackletHeader           { fn       read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self(u16::read_from(buf)?)) } }
 impl SliceWrite for PackletHeader           { fn write_to(&self, buf: &mut  [u8]) -> usize        { self.0  .write_to(buf) } }
@@ -964,11 +969,12 @@ pub fn service_connections(
 
                                     let reasm = &mut existing_connection.jumbo_reassembly;
 
-                                    // Create slot if needed, enforcing max concurrent reassemblies
+                                    // Create slot if needed, evicting oldest if at capacity
                                     if !reasm.slots.contains_key(&frag_id) {
                                         if reasm.slots.len() >= MAX_REASSEMBLY_SLOTS {
-                                            eprintln!("too many concurrent reassembly slots, killing connection");
-                                            kill_connection = Some(connection_key); break 'conn;
+                                            let mask = MAX_JUMBOGRAM_IDS - 1;
+                                            let oldest = *reasm.slots.keys().max_by_key(|&&k| (frag_id.wrapping_sub(k)) & mask).unwrap();
+                                            reasm.slots.remove(&oldest);
                                         }
                                         reasm.slots.insert(frag_id, ReassemblySlot::new(total_len as u32));
                                     }
