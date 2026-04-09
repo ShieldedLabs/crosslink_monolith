@@ -1268,7 +1268,7 @@ pub fn sync(
         let mut more_packets_likely_available = false;
         // Service STP connections (send/recv).
         // @Todo: real scheduling. Right now I just want to receive everything!
-        for _ in 0..1024 {
+        for _ in 0..128 {
             more_packets_likely_available = service_connections(&mut connections_map,
                                                                 &mut packets_received,
                                                                 &packets_to_send,
