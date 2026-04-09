@@ -977,7 +977,7 @@ pub fn sync(
     let status_interval = std::time::Duration::from_millis(STATUS_MS);
     let block_send_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
 
-    const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 8;
+    const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 12; // DO NOT MAKE LARGE, subject to N^2!!!
 
     let mut blocks_to_commit = Vec::new();
     let mut blocks_to_send = Vec::<(ConnectionKey, Hash, u32)>::new();
@@ -1366,10 +1366,10 @@ pub fn sync(
                 if TRACE { println!("got a block."); }
 
                 // @Todo: @Temporary. We will instead want to evict non-committable blocks and replace them with new blocks if they are committable.
-                if blocks_to_commit.len() >= MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
-                    warning!("Block commit queue full! Dropping.");
-                    continue 'process_packets;
-                }
+                // if blocks_to_commit.len() >= MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
+                //     warning!("Block commit queue full! Dropping.");
+                //     continue 'process_packets;
+                // }
 
                 // @Note: for valid blocks the height can be computed from block data, so this is an early-out optimization.
                 let Some(alleged_height) = some_or_kill!(<u32>::read_from(&mut msg), "Failed to read block height") else {
@@ -1433,17 +1433,12 @@ pub fn sync(
                 };
 
                 let have_parent_in_chains           = is_parent_in_chains(&rt, &state, &near_tip_chains, parent_hash);
-                // @Todo: let have_parent_in_blocks_to_commit = !blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == parent_hash);
+                let have_parent_in_blocks_to_commit = blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == parent_hash);
 
-                if !have_parent_in_chains { // && !have_parent_in_blocks_to_commit {
+                if !have_parent_in_chains && !have_parent_in_blocks_to_commit {
                     warning!("Block does not link anywhere known, neither to our chains nor to our blocks-to-commit queue! Not queueing; dropping: height {alleged_height} hash {alleged_hash}");
                     continue 'process_packets;
                 }
-
-                // @Todo: We will want to evict non-committable blocks and replace them with new blocks if they are committable.
-                // if blocks_to_commit.len() >= MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
-                // } else {
-                // }
 
                 if TRACE { println!("hash and height."); }
 
@@ -1484,12 +1479,45 @@ pub fn sync(
                 if TRACE { println!("hash and height."); }
 
                 // @Todo(Phil): Semantic verification.
+
+                // @Note: Evict a sidechain tail to make room. Prefer non-committable tails.
+                if blocks_to_commit.len() >= MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
+
+                    // @Lazy. N squared. Not cool.
+                    let is_tail = |i: usize| {
+                        let (h, _) = &blocks_to_commit[i];
+                        !blocks_to_commit.iter().any(|(_, b)| b.header.previous_block_hash == *h)
+                    };
+
+                    // Prefer a non-committable tail (parent not in chains).
+                    // Never evict the incoming block's parent — that would orphan the block we're about to push.
+                    let evict_idx = (0..blocks_to_commit.len()).find(|&i| {
+                        blocks_to_commit[i].0 != parent_hash
+                        && is_tail(i) && !is_parent_in_chains(&rt, &state, &near_tip_chains, blocks_to_commit[i].1.header.previous_block_hash)
+                    }).or_else(|| if have_parent_in_chains {
+                        // All tails are committable; only evict if new block is also committable.
+                        (0..blocks_to_commit.len()).filter(|&i| blocks_to_commit[i].0 != parent_hash && is_tail(i)).last()
+                    } else {
+                        None
+                    });
+
+                    if let Some(idx) = evict_idx {
+                        warning!("Evicting block from commit queue to make room");
+                        blocks_to_commit.swap_remove(idx);
+                    } else {
+                        warning!("Commit queue full of committable blocks; dropping non-committable block");
+                        continue 'process_packets;
+                    }
+                }
+
             println!("Queueing for commit: {}", hash);
                 blocks_to_commit.push((hash, std::sync::Arc::new(block)));
             } else {
                 println!("NewNet: Got unknown msg type={} len={}", packet_type, msg.len());
             }
         }
+
+        blocks_to_commit.sort_by_key(|(_, block)| block.coinbase_height().expect("all blocks in the commit queue should already have been confirmed to have a height"));
 
         // @Temporary: just pull one and wait to commit it.
         let mut any_blocks_in_the_queue_can_make_progress = false;
@@ -1541,7 +1569,7 @@ pub fn sync(
         });
 
         if blocks_to_commit.len() > 0 && !any_blocks_in_the_queue_can_make_progress {
-            dbg_panic!("No blocks made progress in the queue this tick!? This should never hit! Currently we are only queueing blocks that can make progress!"); // @Temporary.
+            // dbg_panic!("No blocks made progress in the queue this tick!? This should never hit! Currently we are only queueing blocks that can make progress!"); // @Temporary.
             blocks_to_commit.clear();
         }
 
