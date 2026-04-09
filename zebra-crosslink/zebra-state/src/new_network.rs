@@ -822,7 +822,7 @@ pub fn is_parent_in_chains(rt: &tokio::runtime::Handle, state: &State, near_tip_
         Ok(Response::KnownBlock(Some(block))) => {
             // @Note: if we don't find the parent in near tip chains, but we ask Zebra and Zebra is aware of it, warn loudly.
             eprintln!("WARNING!! Block hash {parent_hash} was NOT in near tip chains but contained by Zebra state!!");
-            dbg_panic!();
+            //dbg_panic!();
             return true;
         }
         Err(err) => {
