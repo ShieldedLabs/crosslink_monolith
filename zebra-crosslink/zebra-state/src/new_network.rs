@@ -1040,6 +1040,8 @@ pub fn sync(
             }
         }
 
+        blocks_to_send.sort_by_key(|(_, _, height)| *height);
+
         // TODO: rate limit production!
         for (connection_key, hash, height) in &blocks_to_send {
             let hash = *hash;
@@ -1119,6 +1121,8 @@ pub fn sync(
         if std::time::Instant::now() >= next_block_send {
             'send_to_peers: for (connection_key, their_tree) in &peer_statuses {
                 // @Duplicate with packet status parsing
+
+                let mut blocks_to_this_peer = 0;
                 // Skip now-disconnected peers
                 let connection_address = {
                     let Some(connection) = get_connected(&connections_map, &connection_key) else {
@@ -1145,7 +1149,7 @@ pub fn sync(
                 // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
                 if their_tree.tip_height < near_tip_chains.finalized_height {
 
-                    for height in their_tree.tip_height..near_tip_chains.finalized_height.min(their_tree.tip_height.saturating_add(MAX_BLOCKS_TO_QUEUE_TO_COMMIT as u32)).max(their_tree.tip_height) {
+                    for height in their_tree.tip_height..near_tip_chains.finalized_height {
                         let res = rt.block_on(async {
                             read_state.clone().oneshot(ReadRequest::BestChainBlockHash(Height(height).into())).await
                         });
@@ -1156,7 +1160,12 @@ pub fn sync(
                                     break;
                                 };
 
-                                blocks_to_send.push((*connection_key, hash, height));
+                                if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
+                                    blocks_to_this_peer += 1;
+                                    blocks_to_send.push((*connection_key, hash, height));
+                                } else {
+                                    break;
+                                }
                             }
                             Err(err) => { panic!("ReadRequest::BestChainBlockHash({height}): Error: {err:?}");              }
                             _        => { panic!("ReadRequest::BestChainBlockHash({height}): Unhandled response: {res:?}"); }
@@ -1230,7 +1239,13 @@ pub fn sync(
                         let block_to_queue = &our_chain.blocks[chain_i];
 
                         // We may submit the same block multiple times (visit >1 of our chains that share a short prefix with their branch), and that's valid
-                        blocks_to_queue.insert((block_to_queue.this_hash, height));
+                        if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
+                            if blocks_to_queue.insert((block_to_queue.this_hash, height)) {
+                                blocks_to_this_peer += 1;
+                            }
+                        } else {
+                            break;
+                        }
                     }
                 }
 
