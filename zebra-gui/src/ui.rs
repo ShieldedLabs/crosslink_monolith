@@ -2383,13 +2383,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                             let withdrawal = 'withdrawal: {
                                                 let mut tx_i = index+1;
                                                 while tx_i < txs.len() {
-                                                    if !(txs[tx_i].is_on_bc() && txs[tx_i].h.is_in_block()) {
-                                                        continue;
-                                                    }
-                                                    if let (Some(staking_action), WalletTxKind::ClaimUnstake) = (txs[tx_i].staking_action, txs[tx_i].kind()) {
-                                                        // NOTE: ignoring fee
-                                                        let b = WalletTxPart::from_staking_action(txs[tx_i].staking_action);
-                                                        break 'withdrawal Some((b, txs[tx_i].h));
+                                                    if txs[tx_i].is_on_bc() && txs[tx_i].h.is_in_block() {
+                                                        if let (Some(staking_action), WalletTxKind::ClaimUnstake) = (txs[tx_i].staking_action, txs[tx_i].kind()) {
+                                                            // NOTE: ignoring fee
+                                                            let b = WalletTxPart::from_staking_action(txs[tx_i].staking_action);
+                                                            break 'withdrawal Some((b, txs[tx_i].h));
+                                                        }
                                                     }
                                                     tx_i += 1;
                                                 }
