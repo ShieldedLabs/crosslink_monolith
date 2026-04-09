@@ -979,7 +979,7 @@ pub fn sync(
 
     const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 12; // DO NOT MAKE LARGE, subject to N^2!!!
 
-    let mut blocks_to_commit = Vec::new();
+    let mut blocks_to_commit: Vec<(Hash, std::sync::Arc<Block>)> = Vec::new();
     let mut blocks_to_send = Vec::<(ConnectionKey, Hash, u32)>::new();
     let mut serialized_blocks = HashMap::new(); // @Todo: cap max memory storage size for this map.
     let mut peer_statuses = HashMap::<ConnectionKey, NearTipBranches>::new();
