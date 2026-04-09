@@ -703,6 +703,9 @@ pub fn chain_intersect_prefix<'l>(a: &'l [ShadowBlock], b: &'l [ShadowBlock]) ->
 }
 
 
+const TRACE     :bool=0!=       0;
+
+
 // @Todo: always only wait on real stuff, never sleeping for fixed amounts like this
 const TICK_MS: u64 = 2500;
 
@@ -1026,7 +1029,7 @@ pub fn sync(
         for (connection_key, hash) in &blocks_to_send {
             let hash = *hash;
             let Some(connection) = get_connected(&connections_map, connection_key) else {
-                // println!("Disconnected! @Trace");
+                if TRACE { println!("Disconnected!"); }
                 continue;
             };
 
@@ -1039,8 +1042,8 @@ pub fn sync(
                         const PACKET_BLOCK_HEADER_LEN: usize = 1 + 4 + 32;
 
                         let serialized = dbg_verify(block.zcash_serialize_to_vec().ok()).unwrap();
-                        if serialized.len().saturating_add(PACKET_BLOCK_HEADER_LEN) >= (1 << 23) - 1 {
-                            eprintln!("NewNet ERROR: Block too big! Was {:?} bytes, max is {}!", serialized.len(), (1 << 23) - 1);
+                        if serialized.len().saturating_add(PACKET_BLOCK_HEADER_LEN) >= MAX_JUMBOGRAM_LEN - 1 {
+                            eprintln!("NewNet ERROR: Block too big! Was {:?} bytes, max is {}!", serialized.len(), MAX_JUMBOGRAM_LEN - 1);
                             continue;
                         }
 
@@ -1068,7 +1071,7 @@ pub fn sync(
                 }
             }
 
-            // println!("Hey. I'm sending a BLOCK. @Trace");
+            if TRACE { println!("Hey. I'm sending a BLOCK."); }
             packets_to_send.push((*connection_key, serialized_blocks[&hash].clone()));
             // eprintln!("\x1b[93mPOWLINK2 SENDING BLOCK HASH\x1b[0m: {}", hash);
         }
@@ -1084,11 +1087,11 @@ pub fn sync(
 
             for (key, connection) in &connections_map {
                 if !connection.is_connected() {
-                    // println!("Disconnected! @Trace");
+                    if TRACE { println!("Disconnected!"); }
                     continue;
                 }
 
-                // println!("Hey. I'm sending a STATUS. @Trace");
+                if TRACE { println!("Hey. I'm sending a STATUS."); }
                 packets_to_send.push((*key, Vec::from(&buf[..o])));
             }
         }
@@ -1129,7 +1132,7 @@ pub fn sync(
         // Process received packets
         'process_packets: while packets_received.len() > 0 {
             let (connection_key, msg) = packets_received.remove(0);
-            // println!("got a message. @Trace");
+            if TRACE { println!("got a message."); }
 
             // Skip packets from now-disconnected peers
             let connection_address = {
@@ -1175,10 +1178,10 @@ pub fn sync(
                 continue 'process_packets;
             };
 
-            // println!("got message {packet_type}. @Trace");
+            if TRACE { println!("got message {packet_type}."); }
 
             if packet_type == PACKET_TYPE_STATUS {
-                // println!("got a status. @Trace");
+                if TRACE { println!("got a status."); }
 
                 let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height())
                 else {
@@ -1299,7 +1302,7 @@ pub fn sync(
                     continue 'process_packets;
                 };
 
-                // println!("got a block. @Trace");
+                if TRACE { println!("got a block."); }
 
                 // @Todo: @Temporary. We will instead want to evict non-committable blocks and replace them with new blocks if they are committable.
                 if blocks_to_commit.len() >= MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
@@ -1323,14 +1326,14 @@ pub fn sync(
                     continue 'process_packets; // Deciding that it's "not even worth" sending to Zebra
                 }
 
-                // println!(">= min_height. @Trace");
+                if TRACE { println!(">= min_height."); }
 
                 if alleged_height <= near_tip_chains.finalized_height {
                     warning!("Block at height {alleged_height} is already finalized");
                     continue 'process_packets; // Definitely already committed :)
                 }
 
-                // println!("> finalized_height. @Trace");
+                if TRACE { println!("> finalized_height."); }
 
                 // @Note: the hash could be computed from the block header, so this is an early-out optimization.
                 let Some(alleged_hash) = some_or_kill!(<[u8; 32]>::read_from(&mut msg), "Failed to read block hash") else {
@@ -1338,14 +1341,14 @@ pub fn sync(
                 };
                 let alleged_hash = Hash(alleged_hash);
 
-                // println!("hash read. @Trace");
+                if TRACE { println!("hash read."); }
 
                 if blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == alleged_hash) {
                     warning!("Block was already queued to commit!: {alleged_hash}");
                     continue 'process_packets;
                 }
 
-                // println!("not already queued. @Trace");
+                if TRACE { println!("not already queued."); }
 
                 for our_chain in &near_tip_chains.chains {
                     if our_chain.blocks.iter().any(|block| block.this_hash == alleged_hash) {
@@ -1354,7 +1357,7 @@ pub fn sync(
                     }
                 }
 
-                // println!("not already in near_tip_chains. @Trace");
+                if TRACE { println!("not already in near_tip_chains."); }
 
                 // @Volatile, depends on block header format.
                 let parent_hash = {
@@ -1381,7 +1384,7 @@ pub fn sync(
                 // } else {
                 // }
 
-                // println!("hash and height. @Trace");
+                if TRACE { println!("hash and height."); }
 
                 use zebra_chain::serialization::ZcashDeserializeInto;
                 let Some(block) = some_or_kill!(msg.zcash_deserialize_into::<Block>().ok(), "Failed to deserialize block") else {
@@ -1393,7 +1396,7 @@ pub fn sync(
                 //        - call it at the top of the place where they are currently used
                 //        - call that right here
 
-                // println!("deserialized. @Trace");
+                if TRACE { println!("deserialized."); }
 
                 let hash = block.hash();
                 if hash != alleged_hash {
@@ -1417,7 +1420,7 @@ pub fn sync(
 
                 eprintln!("\x1b[93mPOWLINK2 GOT BLOCK HASH\x1b[0m: {}", hash);
 
-                // println!("hash and height. @Trace");
+                if TRACE { println!("hash and height."); }
 
                 // @Todo(Phil): Semantic verification.
             println!("Queueing for commit: {}", hash);
