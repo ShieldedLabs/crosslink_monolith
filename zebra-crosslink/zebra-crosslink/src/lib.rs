@@ -898,7 +898,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
     let public_ip_string = config
         .public_address
-        .unwrap_or(String::from_str("/ip4/127.0.0.1/tcp/45869").unwrap());
+        .unwrap_or(format!("127.0.0.1:{}", rand::thread_rng().next_u32() % 45869 + 200));
     info!("public IP: {}", public_ip_string);
 
     let user_name = if config.do_not_manipulate_config {
