@@ -707,7 +707,17 @@ const TRACE     :bool=0!=       0;
 
 
 // @Todo: always only wait on real stuff, never sleeping for fixed amounts like this
-const TICK_MS: u64 = 2500;
+
+// @Note: Status/block packet deliveries should NOT happen once per tick, because we don't sleep
+//        when there are more packets to process in the current tick.
+//        Let's disaggregate send from receive. And in fact, let's make them all happen at
+//        coprime millisecond intervals, so we can make sure our code is not relying on
+//        any kind of consistent or clean timing in order to function properly.
+
+const STATUS_MS: u64 = 839;      // fastest interval at which to send status messages
+const BLOCK_SEND_MS: u64 = 1013; // fastest interval at which to send blocks to peers
+
+const IDLE_MS: u64 = 571; // 571 is the closest prime number to (geometric_mean(839/phi, 1013/phi))
 
 // use crate::crosslink::TFLServiceRequest;
 // use crate::crosslink::TFLServiceResponse;
@@ -963,16 +973,21 @@ pub fn sync(
     println!("NewNet: STP setup complete, port={}, peers={}", config.network_local_port, peer_addresses.len());
 
     // Sync state
-    let tick_duration = std::time::Duration::from_millis(TICK_MS);
-
-    let mut blocks_to_send = Vec::<(ConnectionKey, Hash)>::new();
+    let tick_duration = std::time::Duration::from_millis(IDLE_MS);
+    let status_interval = std::time::Duration::from_millis(STATUS_MS);
+    let block_send_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
 
     const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 8;
-    let mut blocks_to_commit = Vec::new();
 
+    let mut blocks_to_commit = Vec::new();
+    let mut blocks_to_send = Vec::<(ConnectionKey, Hash)>::new();
     let mut serialized_blocks = HashMap::new(); // @Todo: cap max memory storage size for this map.
+    let mut peer_statuses = HashMap::<ConnectionKey, NearTipBranches>::new();
 
     let mut XXX_tick_loop_counter = 0usize;
+
+    let mut next_status_send = std::time::Instant::now();
+    let mut next_block_send  = std::time::Instant::now();
 
     // Main sync loop
     loop {
@@ -1066,7 +1081,7 @@ pub fn sync(
                         eprintln!("Couldn't get block for hash {hash}!");
                         continue;
                     }
-                    Err(err) => { panic!("ReadRequest::Block({hash}): Error: {err:?}");               }
+                    Err(err) => { panic!("ReadRequest::Block({hash}): Error: {err:?}");              }
                     _        => { panic!("ReadRequest::Block({hash}): Unhandled response: {res:?}"); }
                 }
             }
@@ -1079,7 +1094,7 @@ pub fn sync(
 
         // Invariant: near_tip_chains contains at least the genesis. Currently.
         assert!(near_tip_chains.tip_height().is_some());
-        {
+        if std::time::Instant::now() >= next_status_send {
             let mut buf = [0u8; PACKET_STATUS_MAX_SIZE];
             let mut o = 0;
             o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
@@ -1094,108 +1109,39 @@ pub fn sync(
                 if TRACE { println!("Hey. I'm sending a STATUS."); }
                 packets_to_send.push((*key, Vec::from(&buf[..o])));
             }
+
+            next_status_send = std::time::Instant::now() + status_interval;
         }
 
-        use rand::seq::SliceRandom;
+        // Discard statuses of disconnected peers
+        peer_statuses.retain(|connection_key, _| get_connected(&connections_map, connection_key).is_some());
 
-        // @@@ @Todo @@@: We need speculative queueing ASAP!
-        // packets_to_send.shuffle(&mut rand::thread_rng());
-
-
-        // Service STP connections (send/recv).
-        // @Todo: real scheduling. Right now I just want to receive everything!
-        for _ in 0..1024 {
-            let more = service_connections(&mut connections_map,
-                                           &mut packets_received,
-                                           &packets_to_send,
-                                           // &packets_that_failed_to_send_due_to_congestion,
-                                           &mut packet_memory_encrypted,
-                                           &mut packet_memory_recv,
-                                           &mut packet_memory_send,
-                                           socket,
-                                           &my_keypairs);
-
-            // for packet in &packets_that_failed_to_send_due_to_congestion {
-            // }
-
-            // @Todo: Just take a mut to the packets_to_send in service_connections and clear it inside?
-            packets_to_send.clear();
-
-            if !more {
-                break;
-            }
-        }
-
-        // // hypothetical: something "we may want" to "avoid pessimal drop behaviour"
-        // packets_received.shuffle();
-
-        // Process received packets
-        'process_packets: while packets_received.len() > 0 {
-            let (connection_key, msg) = packets_received.remove(0);
-            if TRACE { println!("got a message."); }
-
-            // Skip packets from now-disconnected peers
-            let connection_address = {
-                let Some(connection) = get_connected(&connections_map, &connection_key) else {
-                    eprintln!("Dropping message from disconnected peer: {connection_key:?}");
-                    continue 'process_packets;
+        if std::time::Instant::now() >= next_block_send {
+            'send_to_peers: for (connection_key, their_tree) in &peer_statuses {
+                // @Duplicate with packet status parsing
+                // Skip now-disconnected peers
+                let connection_address = {
+                    let Some(connection) = get_connected(&connections_map, &connection_key) else {
+                        eprintln!("Peer is disconnected even after we filtered out disconnected peers. Impossible!: {connection_key:?}");
+                        continue 'send_to_peers;
+                    };
+                    connection.address()
                 };
-                connection.address()
-            };
 
-            let mut msg = &msg[..];
-
-            macro_rules! warning {
-                ($($arg:tt)*) => {{
-                    // let msg = format!("Peer {:?}: {}", connection_address, format!($($arg)*));
-                    eprintln!("{}", format!("Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
-                }};
-            }
-            macro_rules! kill {
-                ($($arg:tt)*) => {{
-                    // let msg = format!("Killing peer {:?}: {}", connection_address, format!($($arg)*));
-                    eprintln!("{}", format!("Killing peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
-                    connections_map.remove(&connection_key);
-                    dbg_panic!();
-                }};
-            }
-            macro_rules! some_or_kill {
-                ($maybe_val:expr, $($arg:tt)*) => {{
-                    let val = dbg_verify($maybe_val);
-                    if val.is_none() {
-                        kill!($($arg)*);
-                    }
-                    val
-                }};
-            }
-
-            // if time_limit_exceeded {
-            //     stp_library::signal_backpressure(PacketID(&msg));
-            //     break; // Congested! Drop remainder!
-            // }
-
-            let Some(packet_type) = some_or_kill!(<u8>::read_from(&mut msg), "Packet type read failed") else {
-                continue 'process_packets;
-            };
-
-            if TRACE { println!("got message {packet_type}."); }
-
-            if packet_type == PACKET_TYPE_STATUS {
-                if TRACE { println!("got a status."); }
+                macro_rules! warning {
+                    ($($arg:tt)*) => {{
+                        // let msg = format!("Peer {:?}: {}", connection_address, format!($($arg)*));
+                        eprintln!("{}", format!("Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
+                    }};
+                }
 
                 let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height())
                 else {
                     warning!("I don't have a tip height yet");
-                    continue 'process_packets;
+                    continue 'send_to_peers;
                 };
 
-                // TODO: rate limit consumption
-                let Some(their_tree) = some_or_kill!(NearTipBranches::read_from(&mut msg), "NearTipBranches read failed")
-                else {
-                    continue 'process_packets;
-                };
-
-                // @Todo: If the peer is far behind, beam them blocks from farther back in our chain to catch them up.
+                // @Note: If the peer is far behind, beam them blocks from farther back in our chain to catch them up.
                 // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
                 if their_tree.tip_height < near_tip_chains.finalized_height {
 
@@ -1210,7 +1156,7 @@ pub fn sync(
                                     break;
                                 };
 
-                                blocks_to_send.push((connection_key, hash));
+                                blocks_to_send.push((*connection_key, hash));
                             }
                             Err(err) => { panic!("ReadRequest::BestChainBlockHash({height}): Error: {err:?}");              }
                             _        => { panic!("ReadRequest::BestChainBlockHash({height}): Unhandled response: {res:?}"); }
@@ -1222,7 +1168,7 @@ pub fn sync(
                 // @Todo: If the peer is far ahead, request blocks from farther back in their chain to catch us up.
                 if our_tip_height < their_tree.finalized_height {
                     warning!("Too far ahead of me");
-                    continue 'process_packets;
+                    continue 'send_to_peers;
                 }
 
                 // rule to push:
@@ -1289,10 +1235,110 @@ pub fn sync(
                 }
 
                 for block in blocks_to_queue {
-                    blocks_to_send.push((connection_key, block));
+                    blocks_to_send.push((*connection_key, block));
                 }
 
                 // @Todo: Pull.
+
+            }
+
+            next_block_send = std::time::Instant::now() + block_send_interval;
+        }
+
+        use rand::seq::SliceRandom;
+
+        // @@@ @Todo @@@: We need speculative queueing ASAP!
+        // packets_to_send.shuffle(&mut rand::thread_rng());
+
+        let mut more_packets_likely_available = false;
+        // Service STP connections (send/recv).
+        // @Todo: real scheduling. Right now I just want to receive everything!
+        for _ in 0..1024 {
+            more_packets_likely_available = service_connections(&mut connections_map,
+                                                                &mut packets_received,
+                                                                &packets_to_send,
+                                                                // &packets_that_failed_to_send_due_to_congestion,
+                                                                &mut packet_memory_encrypted,
+                                                                &mut packet_memory_recv,
+                                                                &mut packet_memory_send,
+                                                                socket,
+                                                                &my_keypairs);
+
+            // for packet in &packets_that_failed_to_send_due_to_congestion {
+            // }
+
+            // @Todo: Just take a mut to the packets_to_send in service_connections and clear it inside?
+            packets_to_send.clear();
+
+            if !more_packets_likely_available || packets_received.len() > 0 {
+                break;
+            }
+        }
+
+        // // hypothetical: something "we may want" to "avoid pessimal drop behaviour"
+        // packets_received.shuffle();
+
+        // Process received packets
+        'process_packets: while packets_received.len() > 0 {
+            let (connection_key, msg) = packets_received.remove(0);
+            if TRACE { println!("got a message."); }
+
+            // Skip packets from now-disconnected peers
+            let connection_address = {
+                let Some(connection) = get_connected(&connections_map, &connection_key) else {
+                    eprintln!("Dropping message from disconnected peer: {connection_key:?}");
+                    continue 'process_packets;
+                };
+                connection.address()
+            };
+
+            let mut msg = &msg[..];
+
+            macro_rules! warning {
+                ($($arg:tt)*) => {{
+                    // let msg = format!("Peer {:?}: {}", connection_address, format!($($arg)*));
+                    eprintln!("{}", format!("Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
+                }};
+            }
+            macro_rules! kill {
+                ($($arg:tt)*) => {{
+                    // let msg = format!("Killing peer {:?}: {}", connection_address, format!($($arg)*));
+                    eprintln!("{}", format!("Killing peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
+                    connections_map.remove(&connection_key);
+                    dbg_panic!();
+                }};
+            }
+            macro_rules! some_or_kill {
+                ($maybe_val:expr, $($arg:tt)*) => {{
+                    let val = dbg_verify($maybe_val);
+                    if val.is_none() {
+                        kill!($($arg)*);
+                    }
+                    val
+                }};
+            }
+
+            // if time_limit_exceeded {
+            //     stp_library::signal_backpressure(PacketID(&msg));
+            //     break; // Congested! Drop remainder!
+            // }
+
+            let Some(packet_type) = some_or_kill!(<u8>::read_from(&mut msg), "Packet type read failed") else {
+                continue 'process_packets;
+            };
+
+            if TRACE { println!("got message {packet_type}."); }
+
+            if packet_type == PACKET_TYPE_STATUS {
+                if TRACE { println!("got a status."); }
+
+                // TODO: rate limit consumption
+                let Some(their_tree) = some_or_kill!(NearTipBranches::read_from(&mut msg), "NearTipBranches read failed")
+                else {
+                    continue 'process_packets;
+                };
+
+                peer_statuses.insert(connection_key, their_tree);
 
             } else if packet_type == PACKET_TYPE_BLOCK {
 
@@ -1484,10 +1530,12 @@ pub fn sync(
             blocks_to_commit.clear();
         }
 
-        // Sleep remainder of tick
-        let elapsed = loop_start.elapsed();
-        if elapsed < tick_duration {
-            std::thread::sleep(tick_duration - elapsed);
+        if !more_packets_likely_available {
+            // Sleep remainder of tick
+            let elapsed = loop_start.elapsed();
+            if elapsed < tick_duration {
+                std::thread::sleep(tick_duration - elapsed);
+            }
         }
     }
 }
