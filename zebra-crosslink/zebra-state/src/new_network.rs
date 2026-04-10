@@ -528,6 +528,7 @@ impl SliceWrite for NearTipChains {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct NearTipBranches {
     tip_height: u32,
     finalized_height: u32,
@@ -717,6 +718,12 @@ const TRACE     :bool=0!=       1;
 const STATUS_MS: u64 = 839;      // fastest interval at which to send status messages
 const BLOCK_SEND_MS: u64 = 1013; // fastest interval at which to send blocks to peers
 
+
+const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 8;
+const PEER_CONNECT_MS: u64 = 2000;
+const PEER_GOSSIP_MS:  u64 = 3229;
+
+
 const IDLE_MS: u64 = 571; // 571 is the closest prime number to (geometric_mean(839/phi, 1013/phi))
 
 // use crate::crosslink::TFLServiceRequest;
@@ -846,6 +853,46 @@ pub fn is_parent_in_chains(rt: &tokio::runtime::Handle, state: &State, near_tip_
     return false;
 }
 
+pub const MAX_BUCKETS:          usize = 2048;
+pub const MAX_PEERS_PER_BUCKET: usize = 128;
+
+type AddressBucket = u64;
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RecentPeerAddress {
+    recv_time_ns: u64,
+    failure_count: u32, // @Todo: Implement this counter!
+}
+
+// Bucket addresses by prefix as a crude proxy for ASN allocation, which is itself
+// a proxy for a distinct operator, to increase the cost of an eclipse attack.
+// @Todo: IP->ASN map support.
+pub fn address_bucket(local_secret: u64, address: &STPAddress) -> AddressBucket {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&local_secret.to_le_bytes());
+
+    let ip = u128::from_be_bytes(address.ip.octets());
+    let prefix: u128 = if address.is_ipv4() { ip >>  16 }  // prefix range /16, bits ffffxxxx
+                                       else { ip >> 104 }; // prefix range /24, bits 00xxxxxx
+    hasher.update(&prefix.to_le_bytes());
+    hasher.update(&address.magic1.to_le_bytes());
+    let hash = hasher.finalize();
+
+    u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+}
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PeerOrigin {
+    #[default] Unsolicited, // unprompted or gossiped/holepunched;    more likely to be Sybil. AKA:  inbound connection.
+    Selected,               // chosen from our address map diversely; less likely to be Sybil. AKA: outbound connection.
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Peer {
+    origin: PeerOrigin,
+    their_tree: NearTipBranches,
+}
+
 pub fn sync(
     config: &crate::config::Config,
     read_state: ReadState,
@@ -947,10 +994,10 @@ pub fn sync(
     let mut packets_to_send:  Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
     let mut packets_received: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
 
-    let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
+    let mut connections_map: HashMap<ConnectionKey, ConnectionTrackingData> = HashMap::new();
 
     // Parse and connect to initial peers
-    let mut peer_addresses: Vec<STPAddress> = Vec::new();
+    let mut initial_peer_addresses: Vec<STPAddress> = Vec::new();
     for peer_str in &config.network_initial_peers {
         if let Some(address) = STPAddress::parse(peer_str) {
             if address.magic1 != CRYPTO_MAGIC {
@@ -964,39 +1011,53 @@ pub fn sync(
             }
             println!("NewNet: Connecting to peer: {:?}", address);
             let _ = connect_to(socket, &mut connections_map, &my_keypairs, &address);
-            peer_addresses.push(address);
+            initial_peer_addresses.push(address);
         } else {
             eprintln!("NewNet: Failed to parse peer address: {}", peer_str);
         }
     }
 
-    println!("NewNet: STP setup complete, port={}, peers={}", config.network_local_port, peer_addresses.len());
+    println!("NewNet: STP setup complete, port={}, peers={}", config.network_local_port, initial_peer_addresses.len());
 
     // Sync state
     let tick_duration = std::time::Duration::from_millis(IDLE_MS);
     let status_interval = std::time::Duration::from_millis(STATUS_MS);
     let block_send_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
+    let peer_connect_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
 
     const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 12; // DO NOT MAKE LARGE, subject to N^2!!!
 
-    let mut blocks_to_commit: Vec<(Hash, std::sync::Arc<Block>)> = Vec::new();
-    let mut blocks_to_send = Vec::<(ConnectionKey, Hash, u32)>::new();
-    let mut serialized_blocks = HashMap::new(); // @Todo: cap max memory storage size for this map.
-    let mut peer_statuses = HashMap::<ConnectionKey, NearTipBranches>::new();
+    let mut blocks_to_commit:       Vec<(Hash, std::sync::Arc<Block>)>      = Vec::new();
+    let mut blocks_to_send:         Vec<(ConnectionKey, Hash, u32)>         = Vec::new();
+    let mut serialized_blocks:      HashMap<Hash, Vec<u8>>                  = HashMap::new(); // @Todo: cap max memory storage size for this map.
 
-    let mut XXX_tick_loop_counter = 0usize;
+    use rand::Rng;
+    let mut local_addresses_secret: u64 = rand::thread_rng().gen();
+
+    let mut recent_peer_addresses:  HashMap<AddressBucket, HashMap<STPAddress, RecentPeerAddress>> = HashMap::new();
+    let mut alleged_peer_addresses: HashMap<(AddressBucket, AddressBucket), HashSet<STPAddress>>   = HashMap::new();
+
+    let mut peers: HashMap<ConnectionKey, Peer> = HashMap::new();
+    let mut pending_selected_addresses: HashSet<ConnectionKey> = HashSet::new();
+
+    // let mut XXX_tick_loop_counter = 0usize;
 
     let mut next_status_send = std::time::Instant::now();
     let mut next_block_send  = std::time::Instant::now();
+    let mut next_peer_connect= std::time::Instant::now();
+
+    let stp_address_get_short_string = |address| {
+        let addr = format!("{:?}", address);
+        let short = &addr[addr.len().saturating_sub(6)..]; // 6 base64 chars -> 4 bytes -> probably unique up to 65536 connections
+        short.to_string()
+    };
 
     // Main sync loop
     loop {
         let mut my_peers_to_print = Vec::new();
         for (connection_key, connection) in &connections_map {
             if connection.is_connected() {
-                let addr = format!("{:?}", connection.address());
-                let short = &addr[addr.len().saturating_sub(4)..];
-                my_peers_to_print.push(short.to_string());
+                my_peers_to_print.push(stp_address_get_short_string(connection.address()));
             }
         }
         println!("tip height: {:?}, finalized height: {:?}, peers: {:?}", near_tip_chains.tip_height(), near_tip_chains.finalized_height, my_peers_to_print);
@@ -1025,20 +1086,75 @@ pub fn sync(
             }
         }
 
-        #[cfg(debug_assertions)]
-        { // @Dev @Debug: Roundtrip test.
-            near_tip_chains.roundtrip_to_branches(PACKET_STATUS_MAX_SIZE, if XXX_tick_loop_counter % 20 == 0 { 2 } else { 0 });
-            XXX_tick_loop_counter += 1;
-        }
+        // #[cfg(debug_assertions)]
+        // { // @Dev @Debug: Roundtrip test.
+        //     near_tip_chains.roundtrip_to_branches(PACKET_STATUS_MAX_SIZE, if XXX_tick_loop_counter % 20 == 0 { 2 } else { 0 });
+        //     XXX_tick_loop_counter += 1;
+        // }
 
-        // Try to reconnect to known but disconnected peers
-        // @Todo: peer discovery
-        for address in &peer_addresses {
+        // Try to reconnect to the trusted peers. This is currently our only defense against eclipse attacks!
+        for address in &initial_peer_addresses {
             if !connections_map.contains_key(&address.connection_key()) {
                 println!("NewNet: Connecting to {:?}...", address);
                 let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
             }
         }
+
+        let now = monotonic_clock_ns();
+        const ONE_SECOND: u64 = 1_000_000_000;
+        const ONE_MINUTE: u64 = ONE_SECOND * 60;
+        const ONE_HOUR:   u64 = ONE_MINUTE * 60;
+
+        // evict old recent addresses
+        for (_, map) in &mut recent_peer_addresses {
+            map.retain(|_, recent_peer_address| {
+                recent_peer_address.recv_time_ns + 10 * ONE_MINUTE >= now
+            });
+        }
+
+        recent_peer_addresses .retain(|_, map| map.len() > 0);
+        alleged_peer_addresses.retain(|_, set| set.len() > 0);
+
+        if std::time::Instant::now() >= next_peer_connect {
+            let mut connection_attempts = 0;
+
+            let rng = &mut rand::thread_rng();
+
+            let mut recents: Vec<_> = recent_peer_addresses.iter().collect(); recents.shuffle(rng);
+            for (_, map) in recents {
+                let mut m: Vec<_> = map.iter().collect(); m.shuffle(rng);
+                for (address, _) in &m {
+                    if connection_attempts >= MAX_PEERS_TO_CONNECT_PER_ATTEMPT {
+                        break;
+                    }
+                    if !connections_map.contains_key(&address.connection_key()) {
+                        // println!("NewNet: Connecting to {:?}...", address);
+                        let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
+                        connection_attempts += 1;
+
+                        pending_selected_addresses.insert(address.connection_key());
+                    }
+                }
+            }
+
+            let mut allegeds: Vec<_> = alleged_peer_addresses.iter().collect(); allegeds.shuffle(rng);
+            for (_, set) in allegeds {
+                let mut s: Vec<_> = set.iter().collect(); s.shuffle(rng);
+                for address in &s {
+                    if connection_attempts >= MAX_PEERS_TO_CONNECT_PER_ATTEMPT {
+                        break;
+                    }
+                    if !connections_map.contains_key(&address.connection_key()) {
+                        // println!("NewNet: Connecting to {:?}...", address);
+                        let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
+                        connection_attempts += 1;
+                    }
+                }
+            }
+
+            next_peer_connect = std::time::Instant::now() + peer_connect_interval;
+        }
+
 
         blocks_to_send.sort_by_key(|(_, _, height)| *height);
 
@@ -1071,7 +1187,7 @@ pub fn sync(
                         o += block.hash().0                                .write_to(&mut tmp[o..]);
                         assert!(o == PACKET_BLOCK_HEADER_LEN);
 
-                        let mut buf = Vec::with_capacity(PACKET_BLOCK_HEADER_LEN + serialized.len());
+                        let mut buf = Vec::<u8>::with_capacity(PACKET_BLOCK_HEADER_LEN + serialized.len());
 
                         buf.extend(&tmp[..o]);
                         buf.extend(serialized);
@@ -1116,11 +1232,15 @@ pub fn sync(
         }
 
         // Discard statuses of disconnected peers
-        peer_statuses.retain(|connection_key, _| get_connected(&connections_map, connection_key).is_some());
+        peers.retain(|connection_key, _| get_connected(&connections_map, connection_key).is_some());
 
         if std::time::Instant::now() >= next_block_send {
-            'send_to_peers: for (connection_key, their_tree) in &peer_statuses {
+            'send_to_peers: for (connection_key, Peer { origin, their_tree }) in &peers {
                 // @Duplicate with packet status parsing
+
+                if *their_tree == NearTipBranches::default() {
+                    continue 'send_to_peers; // No messages yet.
+                }
 
                 let mut blocks_to_this_peer = 0;
                 // Skip now-disconnected peers
@@ -1298,7 +1418,7 @@ pub fn sync(
             let (connection_key, msg) = packets_received.remove(0);
             if TRACE { println!("got a message."); }
 
-            // Skip packets from now-disconnected peers
+            // Skip processing packets from now-disconnected peers
             let connection_address = {
                 let Some(connection) = get_connected(&connections_map, &connection_key) else {
                     eprintln!("Dropping message from disconnected peer: {connection_key:?}");
@@ -1306,6 +1426,42 @@ pub fn sync(
                 };
                 connection.address()
             };
+
+            let peer = peers.entry(connection_key).or_insert(Peer::default());
+            if pending_selected_addresses.contains(&connection_key) {
+                peer.origin = PeerOrigin::Selected;
+                pending_selected_addresses.remove(&connection_key);
+            }
+
+            // Once we have received a message from this connection, they have proven their path.
+            // Update our address maps.
+            let bucket = address_bucket(local_addresses_secret, &connection_address);
+            let recents_bucket = recent_peer_addresses.entry(bucket).or_insert(Default::default());
+            if let Some(existing) = recents_bucket.get_mut(&connection_address) {
+                existing.recv_time_ns = monotonic_clock_ns();
+            } else {
+                // Evict oldest before inserting if bucket is full.
+                if recents_bucket.len() >= MAX_PEERS_PER_BUCKET {
+                    if let Some(oldest_key) = recents_bucket.iter()
+                        .min_by_key(|(_, v)| v.recv_time_ns)
+                        .map(|(k, _)| k.clone())
+                    {
+                        recents_bucket.remove(&oldest_key);
+                    }
+                }
+                if TRACE { println!("Added to recent addresses: {connection_address:?}"); }
+                recents_bucket.insert(connection_address.clone(), RecentPeerAddress {
+                    recv_time_ns: monotonic_clock_ns(),
+                    failure_count: 0u32, // @Todo: Implement this counter!
+                });
+            }
+
+            // @Todo: how to do this?
+            // if let Some(alleged_bucket) = alleged_peer_addresses.get(&bucket) {
+            //     if alleged_bucket.contains(&connection_address) {
+            //         alleged_bucket.remove(connection_address);
+            //     }
+            // }
 
             let mut msg = &msg[..];
 
@@ -1320,6 +1476,10 @@ pub fn sync(
                     // let msg = format!("Killing peer {:?}: {}", connection_address, format!($($arg)*));
                     eprintln!("{}", format!("Killing peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
                     connections_map.remove(&connection_key);
+                    let kill_bucket = address_bucket(local_addresses_secret, &connection_address);
+                    if let Some(bucket) = recent_peer_addresses.get_mut(&kill_bucket) {
+                        bucket.remove(&connection_address);
+                    }
                     dbg_panic!();
                 }};
             }
@@ -1353,7 +1513,7 @@ pub fn sync(
                     continue 'process_packets;
                 };
 
-                peer_statuses.insert(connection_key, their_tree);
+                peer.their_tree = their_tree;
 
             } else if packet_type == PACKET_TYPE_BLOCK {
 
