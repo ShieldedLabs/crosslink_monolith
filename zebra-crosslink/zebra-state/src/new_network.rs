@@ -1143,6 +1143,11 @@ pub fn sync(
         }
 
         recent_peer_addresses .retain(|_, map| map.len() > 0);
+        for ((_, addr_bucket), set) in alleged_peer_addresses.iter_mut() {
+            if let Some(recents) = recent_peer_addresses.get(addr_bucket) {
+                set.retain(|addr| !recents.contains_key(addr));
+            }
+        }
         alleged_peer_addresses.retain(|_, set| set.len() > 0);
 
         if std::time::Instant::now() >= next_peer_connect {
@@ -1150,36 +1155,33 @@ pub fn sync(
 
             let rng = &mut rand::thread_rng();
 
+            use rand::seq::IteratorRandom;
             let mut recents: Vec<_> = recent_peer_addresses.iter().collect(); recents.shuffle(rng);
             for (_, map) in recents {
-                let mut m: Vec<_> = map.iter().collect(); m.shuffle(rng);
-                for (address, _) in &m {
-                    if connection_attempts >= MAX_PEERS_TO_CONNECT_PER_ATTEMPT {
-                        break;
-                    }
+                if connection_attempts >= MAX_PEERS_TO_CONNECT_PER_ATTEMPT {
+                    break;
+                }
+                if let Some((address, _)) = map.iter().choose(rng) {
                     if !connections_map.contains_key(&address.connection_key()) {
                         // println!("NewNet: Connecting to {:?}...", address);
                         let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
                         connection_attempts += 1;
 
                         pending_selected_addresses.insert(address.connection_key());
-                        break;
                     }
                 }
             }
 
             let mut allegeds: Vec<_> = alleged_peer_addresses.iter().collect(); allegeds.shuffle(rng);
             for (_, set) in allegeds {
-                let mut s: Vec<_> = set.iter().collect(); s.shuffle(rng);
-                for address in &s {
-                    if connection_attempts >= MAX_PEERS_TO_CONNECT_PER_ATTEMPT {
-                        break;
-                    }
+                if connection_attempts >= MAX_PEERS_TO_CONNECT_PER_ATTEMPT {
+                    break;
+                }
+                if let Some(address) = set.iter().choose(rng) {
                     if !connections_map.contains_key(&address.connection_key()) {
                         // println!("NewNet: Connecting to {:?}...", address);
                         let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
                         connection_attempts += 1;
-                        break;
                     }
                 }
             }
@@ -1196,8 +1198,7 @@ pub fn sync(
 
             use rand::seq::IteratorRandom;
 
-            let mut bucket_keys: Vec<_> = recent_peer_addresses.keys().collect();
-            bucket_keys.shuffle(rng);
+            let mut bucket_keys: Vec<_> = recent_peer_addresses.keys().collect(); bucket_keys.shuffle(rng);
 
             let mut pckt_addrs = HashSet::new();
 
@@ -1770,12 +1771,8 @@ pub fn sync(
                 }
             }
 
-            // @Todo: how to do this?
-            // if let Some(alleged_bucket) = alleged_peer_addresses.get(&bucket) {
-            //     if alleged_bucket.contains(&connection_address) {
-            //         alleged_bucket.remove(connection_address);
-            //     }
-            // }
+            // Alleged addresses that are now in recent_peer_addresses are skipped lazily
+            // at connection time, and pruned from the alleged map each loop iteration.
 
         }
 
