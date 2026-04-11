@@ -45,7 +45,7 @@ pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 // pub const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 
-use static_assertions::{const_assert};
+use static_assertions::const_assert;
 use std::{hash::DefaultHasher, net::{Ipv6Addr, SocketAddr, SocketAddrV6}, sync::{Arc, Mutex}};
 use ed25519_zebra::{SigningKey, VerificationKeyBytes, VerificationKey};
 use rand::{seq::{IndexedRandom}, Rng, RngCore, SeedableRng};

@@ -44,6 +44,7 @@ tx_v6 = ["zebra-chain/tx_v6"]
 
 [dependencies]
 tenderlink = { workspace = true }
+static_assertions = "1.1.0"
 blake3 = "1.8.2"
 rand = { workspace = true }
 rand_chacha = { workspace = true }

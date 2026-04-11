@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use static_assertions::const_assert;
+
 use crate::{Request, Response, ReadRequest, ReadResponse};
 use tower::ServiceExt;
 use zebra_chain::block::{self, Block, Hash, Height};
@@ -48,6 +50,11 @@ const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 const PACKET_TYPE_STATUS: u8 = 1;
 const PACKET_TYPE_BLOCK:  u8 = 2;
 
+const PACKET_TYPE_PEER_GOSSIP: u8 3;
+
+const PACKET_TYPE_SEEK_PUNCH: u8 = 4;
+const PACKET_TYPE_TRY_PUNCH:  u8 = 5;
+
 
 const PACKET_STATUS_MAX_HASHES: usize = 400; // @Lazy: gives room for 300 hashes plus room for 200 run metadatas
 const PACKET_STATUS_MAX_SIZE:   usize = ((PACKET_STATUS_MAX_HASHES * 32 + JUMBO_FRAG_SIZE - 1) / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE; // @Cleanup @Lazy.
@@ -76,6 +83,11 @@ pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
     }
 
     t
+}
+pub fn verify<T>(t: Option<T>) -> T {
+    if t.is_none() { dbg_break(); }
+
+    t.unwrap()
 }
 
 
@@ -853,8 +865,21 @@ pub fn is_parent_in_chains(rt: &tokio::runtime::Handle, state: &State, near_tip_
     return false;
 }
 
+const STP_ADDRESS_SIZE: usize =
+    16 /* ip */ +
+     2 /* port */ +
+     8 /* magic1 */ +
+    32 /* noise curve25519 pk */;
+
 pub const MAX_BUCKETS:          usize = 2048;
 pub const MAX_PEERS_PER_BUCKET: usize = 128;
+
+pub const MAX_RECENT_ADDRESS_MAP_STORAGE_SIZE:  usize = MAX_BUCKETS * MAX_PEERS_PER_BUCKET * (STP_ADDRESS_SIZE + RECENT_ADDRESS_SIZE);
+pub const MAX_ALLEGED_ADDRESS_MAP_STORAGE_SIZE: usize = MAX_BUCKETS * MAX_PEERS_PER_BUCKET * STP_ADDRESS_SIZE;
+
+const ONE_MEGABYTE: usize = 1024 * 1024;
+
+const_assert!(64 * ONE_MEGABYTE > MAX_RECENT_ADDRESS_MAP_STORAGE_SIZE + MAX_ALLEGED_ADDRESS_MAP_STORAGE_SIZE);
 
 type AddressBucket = u64;
 
@@ -863,6 +888,9 @@ pub struct RecentPeerAddress {
     recv_time_ns: u64,
     failure_count: u32, // @Todo: Implement this counter!
 }
+const RECENT_ADDRESS_SIZE: usize =
+    8 /* recv_time_ns */ +
+    4 /* failure_count */;
 
 // Bucket addresses by prefix as a crude proxy for ASN allocation, which is itself
 // a proxy for a distinct operator, to increase the cost of an eclipse attack.
@@ -1023,7 +1051,7 @@ pub fn sync(
     let tick_duration = std::time::Duration::from_millis(IDLE_MS);
     let status_interval = std::time::Duration::from_millis(STATUS_MS);
     let block_send_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
-    let peer_connect_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
+    let peer_connect_interval = std::time::Duration::from_millis(PEER_CONNECT_MS);
 
     const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 12; // DO NOT MAKE LARGE, subject to N^2!!!
 
@@ -1092,7 +1120,7 @@ pub fn sync(
         //     XXX_tick_loop_counter += 1;
         // }
 
-        // Try to reconnect to the trusted peers. This is currently our only defense against eclipse attacks!
+        // Try to reconnect to trusted initial seed peers
         for address in &initial_peer_addresses {
             if !connections_map.contains_key(&address.connection_key()) {
                 println!("NewNet: Connecting to {:?}...", address);
@@ -1133,6 +1161,7 @@ pub fn sync(
                         connection_attempts += 1;
 
                         pending_selected_addresses.insert(address.connection_key());
+                        break;
                     }
                 }
             }
@@ -1148,6 +1177,7 @@ pub fn sync(
                         // println!("NewNet: Connecting to {:?}...", address);
                         let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
                         connection_attempts += 1;
+                        break;
                     }
                 }
             }
@@ -1433,36 +1463,6 @@ pub fn sync(
                 pending_selected_addresses.remove(&connection_key);
             }
 
-            // Once we have received a message from this connection, they have proven their path.
-            // Update our address maps.
-            let bucket = address_bucket(local_addresses_secret, &connection_address);
-            let recents_bucket = recent_peer_addresses.entry(bucket).or_insert(Default::default());
-            if let Some(existing) = recents_bucket.get_mut(&connection_address) {
-                existing.recv_time_ns = monotonic_clock_ns();
-            } else {
-                // Evict oldest before inserting if bucket is full.
-                if recents_bucket.len() >= MAX_PEERS_PER_BUCKET {
-                    if let Some(oldest_key) = recents_bucket.iter()
-                        .min_by_key(|(_, v)| v.recv_time_ns)
-                        .map(|(k, _)| k.clone())
-                    {
-                        recents_bucket.remove(&oldest_key);
-                    }
-                }
-                if TRACE { println!("Added to recent addresses: {connection_address:?}"); }
-                recents_bucket.insert(connection_address.clone(), RecentPeerAddress {
-                    recv_time_ns: monotonic_clock_ns(),
-                    failure_count: 0u32, // @Todo: Implement this counter!
-                });
-            }
-
-            // @Todo: how to do this?
-            // if let Some(alleged_bucket) = alleged_peer_addresses.get(&bucket) {
-            //     if alleged_bucket.contains(&connection_address) {
-            //         alleged_bucket.remove(connection_address);
-            //     }
-            // }
-
             let mut msg = &msg[..];
 
             macro_rules! warning {
@@ -1670,11 +1670,60 @@ pub fn sync(
                     }
                 }
 
-            println!("Queueing for commit: {}", hash);
+                println!("Queueing for commit: {}", hash);
                 blocks_to_commit.push((hash, std::sync::Arc::new(block)));
             } else {
-                println!("NewNet: Got unknown msg type={} len={}", packet_type, msg.len());
+                kill!("NewNet: Got unknown msg type={} len={}", packet_type, msg.len());
+                continue 'process_packets;
             }
+
+            // Valid packet arrived and was processed successfully. Mark this peer as a recent address.
+
+            // Once we have received a message from this connection, they have proven their path.
+            // Update our address maps.
+            let bucket = address_bucket(local_addresses_secret, &connection_address);
+
+            // Enforce MAX_BUCKETS: if this is a new bucket and we're full, randomly evict one (or skip).
+            let insert_recent = if recent_peer_addresses.contains_key(&bucket) || recent_peer_addresses.len() < MAX_BUCKETS {
+                true // ready to insert new address into bucket
+            } else {
+                let i = rand::thread_rng().gen_range(0..=recent_peer_addresses.len());
+                if i < recent_peer_addresses.len() {
+                    let key = *recent_peer_addresses.keys().nth(i).unwrap();
+                    recent_peer_addresses.remove(&key);
+                    true // evicted bucket to make room for new bucket
+                } else {
+                    false // new bucket was chosen to be evicted
+                }
+            };
+
+            if insert_recent {
+                let recents_bucket = recent_peer_addresses.entry(bucket).or_default();
+
+                // Update existing address, or evict oldest + insert new.
+                if let Some(existing) = recents_bucket.get_mut(&connection_address) {
+                    existing.recv_time_ns = monotonic_clock_ns();
+                    existing.failure_count = 0;
+                } else {
+                    if recents_bucket.len() >= MAX_PEERS_PER_BUCKET {
+                        let oldest = recents_bucket.iter().min_by_key(|(_, v)| v.recv_time_ns).map(|(k, _)| k.clone());
+                        if let Some(k) = oldest { recents_bucket.remove(&k); }
+                    }
+                    if TRACE { println!("Added to recent addresses: {connection_address:?}"); }
+                    recents_bucket.insert(connection_address.clone(), RecentPeerAddress {
+                        recv_time_ns: monotonic_clock_ns(),
+                        failure_count: 0u32, // @Todo: Implement this counter!
+                    });
+                }
+            }
+
+            // @Todo: how to do this?
+            // if let Some(alleged_bucket) = alleged_peer_addresses.get(&bucket) {
+            //     if alleged_bucket.contains(&connection_address) {
+            //         alleged_bucket.remove(connection_address);
+            //     }
+            // }
+
         }
 
         blocks_to_commit.sort_by_key(|(_, block)| block.coinbase_height().expect("all blocks in the commit queue should already have been confirmed to have a height"));
