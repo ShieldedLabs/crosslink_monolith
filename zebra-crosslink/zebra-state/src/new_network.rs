@@ -50,10 +50,10 @@ const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 const PACKET_TYPE_STATUS: u8 = 1;
 const PACKET_TYPE_BLOCK:  u8 = 2;
 
-const PACKET_TYPE_PEER_GOSSIP: u8 3;
+const PACKET_TYPE_PEER_ADDRESS_LIST: u8 = 3;
 
-const PACKET_TYPE_SEEK_PUNCH: u8 = 4;
-const PACKET_TYPE_TRY_PUNCH:  u8 = 5;
+const PACKET_TYPE_WANT_HOLE_PUNCH: u8 = 4;
+const PACKET_TYPE_TRY_HOLE_PUNCH:  u8 = 5;
 
 
 const PACKET_STATUS_MAX_HASHES: usize = 400; // @Lazy: gives room for 300 hashes plus room for 200 run metadatas
@@ -865,7 +865,7 @@ pub fn is_parent_in_chains(rt: &tokio::runtime::Handle, state: &State, near_tip_
     return false;
 }
 
-const STP_ADDRESS_SIZE: usize =
+const STP_ADDRESS_MEMORY_SIZE: usize =
     16 /* ip */ +
      2 /* port */ +
      8 /* magic1 */ +
@@ -874,8 +874,8 @@ const STP_ADDRESS_SIZE: usize =
 pub const MAX_BUCKETS:          usize = 2048;
 pub const MAX_PEERS_PER_BUCKET: usize = 128;
 
-pub const MAX_RECENT_ADDRESS_MAP_STORAGE_SIZE:  usize = MAX_BUCKETS * MAX_PEERS_PER_BUCKET * (STP_ADDRESS_SIZE + RECENT_ADDRESS_SIZE);
-pub const MAX_ALLEGED_ADDRESS_MAP_STORAGE_SIZE: usize = MAX_BUCKETS * MAX_PEERS_PER_BUCKET * STP_ADDRESS_SIZE;
+pub const MAX_RECENT_ADDRESS_MAP_STORAGE_SIZE:  usize = MAX_BUCKETS * MAX_PEERS_PER_BUCKET * (STP_ADDRESS_MEMORY_SIZE + RECENT_ADDRESS_SIZE);
+pub const MAX_ALLEGED_ADDRESS_MAP_STORAGE_SIZE: usize = MAX_BUCKETS * MAX_PEERS_PER_BUCKET * STP_ADDRESS_MEMORY_SIZE;
 
 const ONE_MEGABYTE: usize = 1024 * 1024;
 
@@ -1051,13 +1051,14 @@ pub fn sync(
     let tick_duration = std::time::Duration::from_millis(IDLE_MS);
     let status_interval = std::time::Duration::from_millis(STATUS_MS);
     let block_send_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
+    let peer_gossip_interval = std::time::Duration::from_millis(PEER_GOSSIP_MS);
     let peer_connect_interval = std::time::Duration::from_millis(PEER_CONNECT_MS);
 
     const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 12; // DO NOT MAKE LARGE, subject to N^2!!!
 
-    let mut blocks_to_commit:       Vec<(Hash, std::sync::Arc<Block>)>      = Vec::new();
-    let mut blocks_to_send:         Vec<(ConnectionKey, Hash, u32)>         = Vec::new();
-    let mut serialized_blocks:      HashMap<Hash, Vec<u8>>                  = HashMap::new(); // @Todo: cap max memory storage size for this map.
+    let mut blocks_to_commit:  Vec<(Hash, std::sync::Arc<Block>)> = Vec::new();
+    let mut blocks_to_send:    Vec<(ConnectionKey, Hash, u32)>    = Vec::new();
+    let mut serialized_blocks: HashMap<Hash, Vec<u8>>             = HashMap::new(); // @Todo: cap max memory storage size for this map.
 
     use rand::Rng;
     let mut local_addresses_secret: u64 = rand::thread_rng().gen();
@@ -1070,9 +1071,10 @@ pub fn sync(
 
     // let mut XXX_tick_loop_counter = 0usize;
 
-    let mut next_status_send = std::time::Instant::now();
-    let mut next_block_send  = std::time::Instant::now();
-    let mut next_peer_connect= std::time::Instant::now();
+    let mut next_status       = std::time::Instant::now();
+    let mut next_block_send   = std::time::Instant::now();
+    let mut next_peer_gossip  = std::time::Instant::now();
+    let mut next_peer_connect = std::time::Instant::now();
 
     let stp_address_get_short_string = |address| {
         let addr = format!("{:?}", address);
@@ -1185,6 +1187,55 @@ pub fn sync(
             next_peer_connect = std::time::Instant::now() + peer_connect_interval;
         }
 
+        if std::time::Instant::now() >= next_peer_gossip {
+
+            let rng = &mut rand::thread_rng();
+
+            let recent_addrs_n: usize = recent_peer_addresses.values().map(|m| m.len()).sum();
+            let pckt_addrs_n = ((JUMBO_FRAG_SIZE - 1) / tenderlink::STP_ADDRESS_SERIALIZED_SIZE).min(recent_addrs_n);
+
+            use rand::seq::IteratorRandom;
+
+            let mut bucket_keys: Vec<_> = recent_peer_addresses.keys().collect();
+            bucket_keys.shuffle(rng);
+
+            let mut pckt_addrs = HashSet::new();
+
+            loop {
+                let prev = pckt_addrs.len();
+                for key in &bucket_keys {
+                    if pckt_addrs.len() >= pckt_addrs_n {
+                        break;
+                    }
+
+                    let bucket = &recent_peer_addresses[*key];
+                    if let Some(addr) = bucket.keys().filter(|a| !pckt_addrs.contains(*a)).choose(rng) {
+                        pckt_addrs.insert(addr.clone());
+                    }
+                }
+                if pckt_addrs.len() >= pckt_addrs_n || pckt_addrs.len() <= prev {
+                    break;
+                }
+            }
+
+            let (mut buf, mut o) = ([0u8; JUMBO_FRAG_SIZE], 0); // ensure no fragmentation
+            o += PACKET_TYPE_PEER_ADDRESS_LIST.write_to(&mut buf[o..]);
+            for address in pckt_addrs {
+                o += address.write_to(&mut buf[o..]);
+            }
+
+            let gossip_packet = Vec::from(&buf[..o]);
+            for (key, connection) in &connections_map {
+                if !connection.is_connected() {
+                    continue;
+                }
+
+                packets_to_send.push((*key, gossip_packet.clone()));
+            }
+
+            next_peer_gossip = std::time::Instant::now() + peer_gossip_interval;
+        }
+
 
         blocks_to_send.sort_by_key(|(_, _, height)| *height);
 
@@ -1210,8 +1261,7 @@ pub fn sync(
                             continue;
                         }
 
-                        let mut tmp = [0u8; PACKET_BLOCK_HEADER_LEN];
-                        let mut o = 0;
+                        let (mut tmp, mut o) = ([0u8; PACKET_BLOCK_HEADER_LEN], 0);
                         o += PACKET_TYPE_BLOCK                             .write_to(&mut tmp[o..]);
                         o += dbg_verify(block.coinbase_height()).unwrap().0.write_to(&mut tmp[o..]);
                         o += block.hash().0                                .write_to(&mut tmp[o..]);
@@ -1242,9 +1292,8 @@ pub fn sync(
 
         // Invariant: near_tip_chains contains at least the genesis. Currently.
         assert!(near_tip_chains.tip_height().is_some());
-        if std::time::Instant::now() >= next_status_send {
-            let mut buf = [0u8; PACKET_STATUS_MAX_SIZE];
-            let mut o = 0;
+        if std::time::Instant::now() >= next_status {
+            let (mut buf, mut o) = ([0u8; PACKET_STATUS_MAX_SIZE], 0);
             o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
             o += near_tip_chains   .write_to(&mut buf[o..]);
 
@@ -1258,7 +1307,7 @@ pub fn sync(
                 packets_to_send.push((*key, Vec::from(&buf[..o])));
             }
 
-            next_status_send = std::time::Instant::now() + status_interval;
+            next_status = std::time::Instant::now() + status_interval;
         }
 
         // Discard statuses of disconnected peers
@@ -1504,7 +1553,11 @@ pub fn sync(
 
             if TRACE { println!("got message {packet_type}."); }
 
-            if packet_type == PACKET_TYPE_STATUS {
+            if packet_type == PACKET_TYPE_PEER_ADDRESS_LIST {
+                // @Todo.
+
+
+            } else if packet_type == PACKET_TYPE_STATUS {
                 if TRACE { println!("got a status."); }
 
                 // TODO: rate limit consumption

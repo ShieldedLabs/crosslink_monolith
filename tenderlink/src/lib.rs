@@ -1091,7 +1091,9 @@ pub use crate::native_sockets::ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTE
 
 pub const MAX_P2P_DISCOVERY_PUBKEY_SIZE: usize = 32;
 
-impl STPAddress {
+
+pub const STP_ADDRESS_SERIALIZED_SIZE: usize = 16 + 8 + MAX_P2P_DISCOVERY_PUBKEY_SIZE; // @Volatile.
+impl SliceWrite for STPAddress {
     fn write_to(&self, buf: &mut [u8]) -> usize {
         let key             = &self.key[..MAX_P2P_DISCOVERY_PUBKEY_SIZE];
         let port_and_magic1 = (self.port as u64 | self.magic1 << 16);
@@ -1102,11 +1104,12 @@ impl STPAddress {
         o += self.key        .write_to(&mut buf[o..]);
         o
     }
-
-    pub fn read_from(buf: &mut &[u8]) -> Option<Self> {
-        let ip_bytes: [u8; 16]                          = SliceRead::read_from(buf)?;
-        let port_and_magic1: u64                        = SliceRead::read_from(buf)?;
-        let key: [u8; MAX_P2P_DISCOVERY_PUBKEY_SIZE]    = SliceRead::read_from(buf)?;
+}
+impl SliceRead for STPAddress {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        let ip_bytes: [u8; 16]                       = SliceRead::read_from(buf)?;
+        let port_and_magic1: u64                     = SliceRead::read_from(buf)?;
+        let key: [u8; MAX_P2P_DISCOVERY_PUBKEY_SIZE] = SliceRead::read_from(buf)?;
         Some(STPAddress {
             ip:     Ipv6Addr::from(ip_bytes),
             port:   port_and_magic1 as u16,

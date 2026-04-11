@@ -1118,7 +1118,7 @@ pub fn service_connections(
             continue;
         };
 
-        // mMTU - minimum MTU
+        // mMTU == minimum MTU
         let mMTU_inside_udp = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
         let mMTU_inside_stp = mMTU_inside_udp - 6 - crypto_overhead_from_connect_magic1(*magic1).unwrap();
         let  MTU_fragmented = mMTU_inside_stp - std::mem::size_of::<PackletHeader>();
