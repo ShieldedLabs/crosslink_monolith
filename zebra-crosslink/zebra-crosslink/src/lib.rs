@@ -1311,7 +1311,6 @@ async fn tfl_service_incoming_request(
 
     // from this point onwards we must race to completion in order to avoid stalling the main thread
 
-    #[allow(unreachable_patterns)]
     match request {
         TFLServiceRequest::IsTFLActivated => Ok(TFLServiceResponse::IsTFLActivated(
             internal_handle.internal.lock().await.tfl_is_activated,
@@ -1390,8 +1389,6 @@ async fn tfl_service_incoming_request(
                 }
             }))
         }
-
-        _ => Err(TFLServiceError::NotImplemented),
     }
 }
 
