@@ -38,6 +38,7 @@ use crossterm::{event::{poll, read, Event, KeyCode, KeyEventKind}, terminal};
 use std::io::{stdout, Write};
 
 use crate::bandwidth_test::*;
+use crate::STP_ADDRESS_SERIALIZED_SIZE;
 
 use std::collections::HashMap;
 
@@ -246,10 +247,9 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
             if buf[0] == PACKET_TYPE_PEER_LIST {
                 let buf = &buf[1..];
 
-                let chunks = buf.chunks_exact(56);
+                let chunks = buf.chunks_exact(STP_ADDRESS_SERIALIZED_SIZE);
 
-                clear_line();
-                if PRINT_PEER_LIST { print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses: ", chunks.len()); }
+                if PRINT_PEER_LIST { clear_line(); print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses: ", chunks.len()); }
 
                 let mut new_peers = Vec::new();
 

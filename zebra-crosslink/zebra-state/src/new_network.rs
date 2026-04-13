@@ -873,17 +873,18 @@ const STP_ADDRESS_MEMORY_SIZE: usize =
      8 /* magic1 */ +
     32 /* noise curve25519 pk */;
 
-pub const MAX_BUCKETS:          usize = 2048;
+pub const MAX_RECENT_BUCKETS:          usize = 2048;
 pub const MAX_PEERS_PER_BUCKET: usize = 128;
 
-pub const MAX_RECENT_ADDRESS_MAP_STORAGE_SIZE:  usize = MAX_BUCKETS * MAX_PEERS_PER_BUCKET * (STP_ADDRESS_MEMORY_SIZE + RECENT_ADDRESS_SIZE);
-pub const MAX_ALLEGED_ADDRESS_MAP_STORAGE_SIZE: usize = MAX_BUCKETS * MAX_PEERS_PER_BUCKET * STP_ADDRESS_MEMORY_SIZE;
+pub const MAX_SENDER_BUCKETS:              usize = 1024;
+pub const MAX_ADDRESSES_PER_SENDER: usize = 64;
+
+pub const MAX_RECENT_ADDRESS_MAP_STORAGE_SIZE:  usize = MAX_RECENT_BUCKETS * MAX_PEERS_PER_BUCKET * (STP_ADDRESS_MEMORY_SIZE + RECENT_ADDRESS_SIZE);
+pub const MAX_ALLEGED_ADDRESS_MAP_STORAGE_SIZE: usize = MAX_SENDER_BUCKETS * MAX_ADDRESSES_PER_SENDER * STP_ADDRESS_MEMORY_SIZE;
 
 const ONE_MEGABYTE: usize = 1024 * 1024;
 
 const_assert!(64 * ONE_MEGABYTE > MAX_RECENT_ADDRESS_MAP_STORAGE_SIZE + MAX_ALLEGED_ADDRESS_MAP_STORAGE_SIZE);
-
-type AddressBucket = u64;
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RecentPeerAddress {
@@ -897,7 +898,7 @@ const RECENT_ADDRESS_SIZE: usize =
 // Bucket addresses by prefix as a crude proxy for ASN allocation, which is itself
 // a proxy for a distinct operator, to increase the cost of an eclipse attack.
 // @Todo: IP->ASN map support.
-pub fn address_bucket(local_secret: u64, address: &STPAddress) -> AddressBucket {
+pub fn address_bucket(local_secret: u64, address: &STPAddress) -> usize {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&local_secret.to_le_bytes());
 
@@ -908,7 +909,7 @@ pub fn address_bucket(local_secret: u64, address: &STPAddress) -> AddressBucket 
     hasher.update(&address.magic1.to_le_bytes());
     let hash = hasher.finalize();
 
-    u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+    usize::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1065,8 +1066,8 @@ pub fn sync(
     use rand::Rng;
     let mut local_addresses_secret: u64 = rand::thread_rng().gen();
 
-    let mut recent_peer_addresses:  HashMap<AddressBucket, HashMap<STPAddress, RecentPeerAddress>> = HashMap::new();
-    let mut alleged_peer_addresses: HashMap<(AddressBucket, AddressBucket), HashSet<STPAddress>>   = HashMap::new();
+    let mut recent_peer_addresses:  HashMap<u16, HashMap<STPAddress, RecentPeerAddress>> = HashMap::new();
+    let mut alleged_peer_addresses: HashMap<u16, HashMap<STPAddress, ConnectionKey>> = HashMap::new(); // keyed by sender, not address. connection key of latest sender is stored so we know who to ask to initiate UDP hole punch
 
     let mut peers: HashMap<ConnectionKey, Peer> = HashMap::new();
     let mut pending_selected_addresses: HashSet<ConnectionKey> = HashSet::new();
@@ -1145,19 +1146,25 @@ pub fn sync(
         }
 
         recent_peer_addresses .retain(|_, map| map.len() > 0);
-        for ((_, addr_bucket), set) in alleged_peer_addresses.iter_mut() {
-            if let Some(recents) = recent_peer_addresses.get(addr_bucket) {
-                set.retain(|addr| !recents.contains_key(addr));
-            }
+        for (_, map) in alleged_peer_addresses.iter_mut() {
+            map.retain(|addr, _| {
+                let addr_bucket = address_bucket(local_addresses_secret, addr) & (MAX_RECENT_BUCKETS - 1);
+                if let Some(recents) = recent_peer_addresses.get(&(addr_bucket as u16)) {
+                    !recents.contains_key(addr)
+                } else {
+                    true
+                }
+            });
         }
-        alleged_peer_addresses.retain(|_, set| set.len() > 0);
+        alleged_peer_addresses.retain(|_, map| map.len() > 0);
+
+        use rand::seq::IteratorRandom;
 
         if std::time::Instant::now() >= next_peer_connect {
             let mut connection_attempts = 0;
 
             let rng = &mut rand::thread_rng();
 
-            use rand::seq::IteratorRandom;
             let mut recents: Vec<_> = recent_peer_addresses.iter().collect(); recents.shuffle(rng);
             for (_, map) in recents {
                 if connection_attempts >= MAX_PEERS_TO_CONNECT_PER_ATTEMPT {
@@ -1175,11 +1182,11 @@ pub fn sync(
             }
 
             let mut allegeds: Vec<_> = alleged_peer_addresses.iter().collect(); allegeds.shuffle(rng);
-            for (_, set) in allegeds {
+            for (_, map) in allegeds {
                 if connection_attempts >= MAX_PEERS_TO_CONNECT_PER_ATTEMPT {
                     break;
                 }
-                if let Some(address) = set.iter().choose(rng) {
+                if let Some((address, _)) = map.iter().choose(rng) {
                     if !connections_map.contains_key(&address.connection_key()) {
                         // println!("NewNet: Connecting to {:?}...", address);
                         let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
@@ -1528,9 +1535,9 @@ pub fn sync(
                     // let msg = format!("Killing peer {:?}: {}", connection_address, format!($($arg)*));
                     eprintln!("{}", format!("Killing peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
                     connections_map.remove(&connection_key);
-                    let kill_bucket = address_bucket(local_addresses_secret, &connection_address);
-                    if let Some(bucket) = recent_peer_addresses.get_mut(&kill_bucket) {
-                        bucket.remove(&connection_address);
+                    let kill_bucket = address_bucket(local_addresses_secret, &connection_address) & (MAX_RECENT_BUCKETS - 1);
+                    if let Some(recents) = recent_peer_addresses.get_mut(&(kill_bucket as u16)) {
+                        recents.remove(&connection_address);
                     }
                     dbg_panic!();
                 }};
@@ -1557,8 +1564,34 @@ pub fn sync(
             if TRACE { println!("got message {packet_type}."); }
 
             if packet_type == PACKET_TYPE_PEER_ADDRESS_LIST {
-                // @Todo.
 
+                let mut new_alleged_addresses = HashSet::new();
+
+                let chunks = msg.chunks_exact(tenderlink::STP_ADDRESS_SERIALIZED_SIZE);
+                for chunk in chunks {
+                    let Some(address) = some_or_kill!(STPAddress::read_from(&mut &chunk[..]), "Address read failed") else {
+                        continue 'process_packets;
+                    };
+                    new_alleged_addresses.insert(address);
+                }
+
+                // Prune my own addresses. // @Todo: Lazy-prune elsewhere, don't waste precious packet time eagerly-pruning.
+                new_alleged_addresses.retain(|a| !my_keypairs.iter().any(|kp| a.key == kp.public && a.magic1 == kp.magic1));
+
+                let sender_bucket = address_bucket(local_addresses_secret, &connection_address) & (MAX_SENDER_BUCKETS - 1);
+                const_assert!(MAX_SENDER_BUCKETS.is_power_of_two());
+
+                for address in new_alleged_addresses {
+                    let map = alleged_peer_addresses.entry(sender_bucket as u16).or_default();
+
+                    if !map.contains_key(&address) {
+                        if map.len() >= MAX_ADDRESSES_PER_SENDER {
+                            map.remove(&map.keys().choose(&mut rand::thread_rng()).cloned().unwrap());
+                        }
+                        if TRACE { println!("Added to alleged addresses: {address:?}"); }
+                        map.insert(address, connection_key);
+                    }
+                }
 
             } else if packet_type == PACKET_TYPE_STATUS {
                 if TRACE { println!("got a status."); }
@@ -1737,40 +1770,25 @@ pub fn sync(
 
             // Once we have received a message from this connection, they have proven their path.
             // Update our address maps.
-            let bucket = address_bucket(local_addresses_secret, &connection_address);
+            let bucket = address_bucket(local_addresses_secret, &connection_address) & (MAX_RECENT_BUCKETS - 1);
+            const_assert!(MAX_RECENT_BUCKETS.is_power_of_two());
 
-            // Enforce MAX_BUCKETS: if this is a new bucket and we're full, randomly evict one (or skip).
-            let insert_recent = if recent_peer_addresses.contains_key(&bucket) || recent_peer_addresses.len() < MAX_BUCKETS {
-                true // ready to insert new address into bucket
+            let recents_bucket = recent_peer_addresses.entry(bucket as u16).or_default();
+
+            // Update existing address, or evict oldest + insert new.
+            if let Some(existing) = recents_bucket.get_mut(&connection_address) {
+                existing.recv_time_ns = monotonic_clock_ns();
+                existing.failure_count = 0;
             } else {
-                let i = rand::thread_rng().gen_range(0..=recent_peer_addresses.len());
-                if i < recent_peer_addresses.len() {
-                    let key = *recent_peer_addresses.keys().nth(i).unwrap();
-                    recent_peer_addresses.remove(&key);
-                    true // evicted bucket to make room for new bucket
-                } else {
-                    false // new bucket was chosen to be evicted
+                if recents_bucket.len() >= MAX_PEERS_PER_BUCKET {
+                    let oldest = recents_bucket.iter().min_by_key(|(_, v)| v.recv_time_ns).map(|(k, _)| k.clone());
+                    if let Some(k) = oldest { recents_bucket.remove(&k); }
                 }
-            };
-
-            if insert_recent {
-                let recents_bucket = recent_peer_addresses.entry(bucket).or_default();
-
-                // Update existing address, or evict oldest + insert new.
-                if let Some(existing) = recents_bucket.get_mut(&connection_address) {
-                    existing.recv_time_ns = monotonic_clock_ns();
-                    existing.failure_count = 0;
-                } else {
-                    if recents_bucket.len() >= MAX_PEERS_PER_BUCKET {
-                        let oldest = recents_bucket.iter().min_by_key(|(_, v)| v.recv_time_ns).map(|(k, _)| k.clone());
-                        if let Some(k) = oldest { recents_bucket.remove(&k); }
-                    }
-                    if TRACE { println!("Added to recent addresses: {connection_address:?}"); }
-                    recents_bucket.insert(connection_address.clone(), RecentPeerAddress {
-                        recv_time_ns: monotonic_clock_ns(),
-                        failure_count: 0u32, // @Todo: Implement this counter!
-                    });
-                }
+                if TRACE { println!("Added to recent addresses: {connection_address:?}"); }
+                recents_bucket.insert(connection_address.clone(), RecentPeerAddress {
+                    recv_time_ns: monotonic_clock_ns(),
+                    failure_count: 0u32, // @Todo: Implement this counter!
+                });
             }
 
             // Alleged addresses that are now in recent_peer_addresses are skipped lazily
