@@ -215,7 +215,7 @@ impl StartCmd {
                     miner_address: Some(config.mining.miner_address.clone().unwrap_or_else(||{
                         use zcash_address::ToAddress;
 
-                        let t_addr = wallet::default_t_addr_from_entropy(&config.network.network, &global_seed).expect("unable to initialize miner");
+                        let t_addr = wallet::default_p2pkh_from_entropy(&config.network.network, &global_seed).expect("unable to initialize miner");
                         info!("Miner address unspecified. Mining to {}", wallet::string_from_t_addr(&config.network.network, t_addr));
                         t_addr.to_zcash_address(config.network.network.kind().into())
                     })),

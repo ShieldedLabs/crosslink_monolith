@@ -7,6 +7,9 @@ edition = "2021"
 secp256k1 = { workspace = true }
 bip39 = "2.2.0"
 
+ripemd = { workspace = true }
+sha2 = { workspace = true }
+
 zcash_primitives = { workspace = true } # version = "0.26.1"
 zcash_client_backend = { path = "../../librustzcash/zcash_client_backend", features = ["lightwalletd-tonic"] } # version = "0.21.0"
 zcash_client_memory = { path = "../../librustzcash/zcash_client_memory", features = ["orchard", "transparent-inputs"] }

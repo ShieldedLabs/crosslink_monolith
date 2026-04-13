@@ -1,18 +1,18 @@
 //! Internal wallet
 #![allow(warnings)]
 
-const AUTO_SPEND:    bool = false; // automatically make spends without requiring GUI interaction
-const DUMP_ACTIONS:  bool = false;
+const AUTO_SPEND:     bool = false; // automatically make spends without requiring GUI interaction
+const DUMP_ACTIONS:   bool = false;
 const DUMP_CACHE_TIP: bool = false;
-const DUMP_FAUCET:   bool = false;
-const DUMP_NOTES:    bool = false;
-const DUMP_ROSTER:   bool = false;
-const DUMP_SYNC:     bool = true;
-const DUMP_TREES:    bool = false;
-const DUMP_TX_BUILD: bool = false;
-const DUMP_TX_RECV:  bool = false;
-const DUMP_TX_SEND:  bool = false;
-const AUDIT_TXS:     bool = true;
+const DUMP_FAUCET:    bool = false;
+const DUMP_NOTES:     bool = false;
+const DUMP_ROSTER:    bool = false;
+const DUMP_SYNC:      bool = true;
+const DUMP_TREES:     bool = false;
+const DUMP_TX_BUILD:  bool = false;
+const DUMP_TX_RECV:   bool = false;
+const DUMP_TX_SEND:   bool = false;
+const AUDIT_TXS:      bool = true;
 
 use rand::seq::SliceRandom;
 use zcash_client_backend::data_api::WalletCommitmentTrees;
@@ -311,7 +311,7 @@ struct BuildPrep {
 impl BuildPrep {
     fn fee_required(&self) -> Result<Zatoshis, builder::FeeError<zip317::FeeError>> {
         // NOTE: we can impl these ourselves
-        use zcash_primitives::transaction::fees::transparent::{InputView, OutputView};
+        use zcash_primitives::transaction::fees::transparent::{InputView, OutputView, InputSize};
         let orchard_actions = orchard::builder::BundleType::DEFAULT.num_actions(
             self.o_inputs.len(), self.o_outputs.len()
         ).map_err(|e| builder::FeeError::Bundle(e))?;
@@ -320,6 +320,20 @@ impl BuildPrep {
             &TEST_NETWORK,
             LRZBlockHeight::from_u32(self.block_h),
             self.t_inputs.iter().map(|input| input.serialized_size()),
+            // @P2SH
+            // self.t_inputs.iter().map(|input| match input.kind() {
+            //     TransparentInputKind::P2pkh{ pubkey } => {
+            //         println!("### FEE CALC: P2PKH {pubkey} => {:?}", input.serialized_size());
+            //         input.serialized_size()
+            //     },
+
+            //     TransparentInputKind::P2sh{ redeem_script } => {
+            //         // NOTE: serialized size treat non-P2PKH inputs as unknown, so we handle manually
+            //         use zcash_script::script::Evaluable;
+            //         println!("### FEE CALC: P2SH  {redeem_script:?} => {} / {}", redeem_script.0.len(), redeem_script.byte_len());
+            //         InputSize::Known(redeem_script.byte_len())
+            //     },
+            // }),
             self.t_outputs.iter().map(|output| 8 + output.dst.script().0.len()), // DUP from zcash_primitives/src/transaction/fees/transparent.rs
             0, 0, // sapling
             orchard_actions
@@ -1037,19 +1051,55 @@ fn transparent_keys_from_usk(usk: &UnifiedSpendingKey, index: u32) -> Option<(se
     Some((address_pubkey, address_privkey))
 }
 
-fn t_addr_from_ufvk(ufvk: &UnifiedFullViewingKey, index: u32) -> Option<TransparentAddress> {
-    let account_pubkey = ufvk.transparent()?;
+
+pub fn p2sh_from_p2pkh(p2pkh: &TransparentAddress) -> (TransparentAddress, [u8; 25]) {
+    use sha2::Digest;
+
+    // REF: copied from zebra-chain/src/transparent/opcodes.rs
+    // Opcodes used to generate P2SH scripts.
+    const OP_EQUAL: u8 = 0x87;
+    const OP_HASH_160: u8 = 0xa9;
+    const OP_PUSH_20_BYTES: u8 = 0x14;
+    // Additional opcodes used to generate P2PKH scripts.
+    const OP_DUP: u8 = 0x76;
+    const OP_EQUAL_VERIFY: u8 = 0x88;
+    const OP_CHECK_SIG: u8 = 0xac;
+
+    let TransparentAddress::PublicKeyHash(pubkey_hash) = p2pkh else {
+        panic!("expects P2PKH as input");
+    };
+
+    let mut redeem_script = [0u8; 25];
+    redeem_script[0..3].copy_from_slice(&[
+        OP_DUP,
+        OP_HASH_160,
+        OP_PUSH_20_BYTES,
+    ]);
+    redeem_script[3..23].copy_from_slice(&pubkey_hash[..]);
+    redeem_script[23..25].copy_from_slice(&[
+        OP_EQUAL_VERIFY,
+        OP_CHECK_SIG
+    ]);
+
+    let script_hash = ripemd::Ripemd160::digest(sha2::Sha256::digest(&redeem_script));
+    let t_addr = TransparentAddress::ScriptHash(script_hash.into());
+
+    (t_addr, redeem_script)
+}
+
+pub fn p2pkh_from_ufvk(ufvk: &UnifiedFullViewingKey, index: u32) -> Option<TransparentAddress> {
+    let account_pubkey: &zcash_transparent::keys::AccountPubKey = ufvk.transparent()?;
     let child_index = NonHardenedChildIndex::const_from_index(index);
-    let address_pubkey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).ok()?;
-    Some(TransparentAddress::from_pubkey(&address_pubkey))
+    let address_pubkey: secp256k1::PublicKey = account_pubkey.derive_address_pubkey(TransparentKeyScope::EXTERNAL, child_index).ok()?;
+    let p2pkh = TransparentAddress::from_pubkey(&address_pubkey);
+    Some(p2pkh)
 }
 
 fn addrs_from_ufvk(ufvk: &UnifiedFullViewingKey, index: u32) -> Option<(TransparentAddress, UnifiedAddress)> {
     // NOTE: the wallet auto-increments the child index so this isn't recognized
     let (ua, di_) = ufvk.find_address(orchard::keys::DiversifierIndex::new(), UnifiedAddressRequest::ORCHARD).ok()?;
-    let t_addr = t_addr_from_ufvk(ufvk, index)?;
+    let t_addr = p2pkh_from_ufvk(ufvk, index)?;
     Some((t_addr, ua))
-        // Some(account.default_address().ok()??.0)
 }
 
 fn addrs_from_account(account: &ManualAccount, index: u32) -> Option<(TransparentAddress, UnifiedAddress)> {
@@ -1620,15 +1670,17 @@ impl ManualWallet {
         //- SPENDS
         // TODO: use fee_required with our own data directly
         fn calc_fee<P: Parameters>(txb: &TxBuilder<'_, P, ()>, prep: &BuildPrep) -> Option<u64> {
-            let txb_fee = txb.get_fee(&zip317::FeeRule::standard());
-            let dbg_txb_fee = txb_fee.as_ref().map(|z| z.into_u64()).unwrap_or(0);
             let prep_fee = prep.fee_required();
-            let dbg_prep_fee = prep_fee.as_ref().map(|z| z.into_u64()).unwrap_or(0);
-            debug_assert!(
-                (prep_fee.is_err() && txb_fee.is_err()) ||
-                (prep_fee.as_ref().unwrap() == txb_fee.as_ref().unwrap()),
-                "prep_fee {prep_fee:?}, txb_fee {txb_fee:?}"
-            );
+
+            {
+                // NOTE: comparison disabled while we're using P2SH, which zip317 standard doesn't account for
+                let txb_fee = txb.get_fee(&zip317::FeeRule::standard());
+                debug_assert!(
+                    (prep_fee.is_err() && txb_fee.is_err()) ||
+                    (prep_fee.as_ref().ok() == txb_fee.as_ref().ok()),
+                    "prep_fee {prep_fee:?}, txb_fee {txb_fee:?}"
+                );
+            }
 
             match prep_fee {
                 Ok(zats) => Some(zats.into_u64()),
@@ -1651,8 +1703,23 @@ impl ManualWallet {
                     let t_pubkey = t_pubkey.expect("checked above");
                     // "greedy strategy"
                     for utxo in &account.utxos {
-                        if let Err(err) = txb.add_transparent_input(t_pubkey, utxo.id.clone(), utxo.txout()) {
-                            println!("tx build: transparent/UTXO spend failed: {err:?}");
+                        let res = txb.add_transparent_input(t_pubkey, utxo.id.clone(), utxo.txout());
+                        // @P2SH
+                        // let res = match utxo.t_addr {
+                        //     TransparentAddress::PublicKeyHash(_) => txb.add_transparent_input(t_pubkey, utxo.id.clone(), utxo.txout()),
+                        //     TransparentAddress::ScriptHash(_) => {
+                        //         use zcash_script::op;
+
+                        //         let script_bytes = p2sh_from_p2pkh(&TransparentAddress::from_pubkey(&t_pubkey)).1;
+                        //         match zcash_script::script::Code(script_bytes.to_vec()).to_component() {
+                        //             Ok(redeem_script) => txb.add_transparent_p2sh_input(redeem_script, utxo.id.clone(), utxo.txout()),
+                        //             Err(err) => Err(zcash_transparent::builder::Error::UnsupportedScript),
+                        //         }
+                        //     }
+                        // };
+
+                        if let Err(err) = res {
+                            println!("tx build: transparent/UTXO spend failed: {err:?}, {:?}", utxo.t_addr);
                             continue;
                         }
                         t.spent(utxo.value, true)?;
@@ -2615,12 +2682,12 @@ fn stuff_from_seed_phrase<P: Parameters>(params: P, phrase: &str) -> (
     (seed, usk)
 }
 
-pub fn default_t_addr_from_entropy<P: Parameters>(params: P, entropy: &[u8; 32]) -> Option<TransparentAddress> {
+pub fn default_p2pkh_from_entropy<P: Parameters>(params: P, entropy: &[u8; 32]) -> Option<TransparentAddress> {
     let mnemonic = bip39::Mnemonic::from_entropy_in(bip39::Language::English, entropy).unwrap();
     let phrase = mnemonic.words().map(|s| s.to_string()).collect::<Vec<String>>().join(" ");
     let (_seed, usk) = stuff_from_seed_phrase(&params, &phrase);
     let ufvk = usk.to_unified_full_viewing_key();
-    t_addr_from_ufvk(&ufvk, 0)
+    p2pkh_from_ufvk(&ufvk, 0)
 }
 
 pub fn string_from_t_addr<P: Parameters>(params: P, t_addr: TransparentAddress) -> String {
@@ -3123,8 +3190,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let user_ua_str = user_ua.encode(network);
     println!("*************************");
     println!("MINER WALLET T-ADDRESS: {}", miner_t_address.encode(network));
+    println!("MINER WALLET P2SH:      {}", p2sh_from_p2pkh(&miner_t_address).0.encode(network));
     println!("MINER WALLET ADDRESS:   {}", miner_ua_str);
     println!("USER WALLET T-ADDRESS:  {}", user_t_address.encode(network));
+    println!("USER WALLET P2SH:       {}", p2sh_from_p2pkh(&user_t_address).0.encode(network));
     println!("USER WALLET ADDRESS:    {}", user_ua_str);
     println!("*************************");
 
