@@ -718,7 +718,7 @@ pub fn chain_intersect_prefix<'l>(a: &'l [ShadowBlock], b: &'l [ShadowBlock]) ->
 }
 
 
-const TRACE     :bool=0!=       1;
+const TRACE     :bool=0!=       0;
 
 
 // @Todo: always only wait on real stuff, never sleeping for fixed amounts like this
@@ -1620,7 +1620,7 @@ pub fn sync(
                     continue 'process_packets;
                 };
 
-                if !connections_map.contains_key(address_to_punch_to.connection_key()) {
+                if !connections_map.contains_key(&address_to_punch_to.connection_key()) {
                     // println!("NewNet: Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, connection_address);
                     let _ = connect_to(socket, &mut connections_map, &my_keypairs, &address_to_punch_to);
                 }
