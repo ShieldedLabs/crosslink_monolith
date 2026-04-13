@@ -220,16 +220,11 @@ impl Application for ZebradApp {
                 if c.crosslink.do_not_manipulate_config == false {
                     c.crosslink.bft_peers =
                         vec![
-"45.63.42.203:12301".to_owned(),
-"155.138.223.43:12301".to_owned(),
-"95.179.151.22:12301".to_owned(),
-"45.32.219.198:12301".to_owned(),
-"70.34.215.140:12301".to_owned(),
-"207.148.73.157:12301".to_owned(),
-"70.34.218.31:12301".to_owned(),
-"104.238.162.51:12301".to_owned(),
-"139.180.223.135:12301".to_owned(),
-"45.63.71.88:12301".to_owned(),
+"96.30.205.23:12301".to_owned(),
+"70.34.200.119:12301".to_owned(),
+"173.199.93.134:12301".to_owned(),
+"66.42.54.194:12301".to_owned(),
+"45.32.185.154:12301".to_owned(),
 ];
 
                     c.mempool.debug_enable_at_height = Some(0);
@@ -248,34 +243,26 @@ impl Application for ZebradApp {
                         .to_network();
                     
                     c.network.initial_testnet_peers.clear();
-c.network.initial_testnet_peers.insert("45.63.42.203:8233".to_owned());
-c.network.initial_testnet_peers.insert("155.138.223.43:8233".to_owned());
-c.network.initial_testnet_peers.insert("95.179.151.22:8233".to_owned());
-c.network.initial_testnet_peers.insert("45.32.219.198:8233".to_owned());
-c.network.initial_testnet_peers.insert("70.34.215.140:8233".to_owned());
-c.network.initial_testnet_peers.insert("207.148.73.157:8233".to_owned());
-c.network.initial_testnet_peers.insert("70.34.218.31:8233".to_owned());
-c.network.initial_testnet_peers.insert("104.238.162.51:8233".to_owned());
-c.network.initial_testnet_peers.insert("139.180.223.135:8233".to_owned());
-c.network.initial_testnet_peers.insert("45.63.71.88:8233".to_owned());
+c.network.initial_testnet_peers.insert("96.30.205.23:8233".to_owned());
+c.network.initial_testnet_peers.insert("70.34.200.119:8233".to_owned());
+c.network.initial_testnet_peers.insert("173.199.93.134:8233".to_owned());
+c.network.initial_testnet_peers.insert("66.42.54.194:8233".to_owned());
+c.network.initial_testnet_peers.insert("45.32.185.154:8233".to_owned());
+
 
                     c.rpc.listen_addr = Some("127.0.0.1:8232".parse().unwrap());
                     c.rpc.enable_cookie_auth = false;
                     c.state
                         .cache_dir
-                        .push("zebra_crosslink_workshop_season_one_cache_delete_me");
+                        .push("zebra_crosslink_workshop_season_one_43593_cache_delete_me");
                     
                     c.state.network_initial_peers = vec![
-"[::ffff:45.63.42.203]:12001:1fgEw5Nx:d6ThWU7gAvrhTiHAjSEDmC112jcDFPGcrPx8jpG3XEI".to_owned(),
-"[::ffff:155.138.223.43]:12001:1fgEw5Nx:LexxnQ5ixcgjHO-h3uXlF_BESFRtIi4DSW9mIvphgEw".to_owned(),
-"[::ffff:95.179.151.22]:12001:1fgEw5Nx:cawPbKaoUW0Tj7idHbV0ugW9YJrGJ9Lh6YqEfu1znjU".to_owned(),
-"[::ffff:45.32.219.198]:12001:1fgEw5Nx:Wy0tf_DP65bxOI6WhD1YXHN1ip_aF9NtOr2HPZc5YDI".to_owned(),
-"[::ffff:70.34.215.140]:12001:1fgEw5Nx:mhCsrIW-D0mk0zlS4yLBWL3JDDGtXeXRdwjTlKexeU0".to_owned(),
-"[::ffff:207.148.73.157]:12001:1fgEw5Nx:9z4Vz83ZNmAH-YvdN13mzVcPWtMjAdjQNrXmwh8qdAw".to_owned(),
-"[::ffff:70.34.218.31]:12001:1fgEw5Nx:F4kN8avHQ4Awl2XBv3DCke_t7crE2ZdCf_h9GwI2kUk".to_owned(),
-"[::ffff:104.238.162.51]:12001:1fgEw5Nx:rqGgo6ftQ286j_ObdhBC9UefRKE5NUeDTVS_3WR3yBY".to_owned(),
-"[::ffff:139.180.223.135]:12001:1fgEw5Nx:K8RApH2J61iakYy3VdYIqiZBW_7VKjjJ7rdfQmX0mAA".to_owned(),
-"[::ffff:45.63.71.88]:12001:1fgEw5Nx:UV_1lhSQiZbZHh5X7fgqKzxI5hT4pa_rDoag_YbPnRQ".to_owned(),
+"[::ffff:96.30.205.23]:12001:1fgEw5Nx:Acr23D5mFdtKIl_nA6uY8uaRd4LTypYkPdBiUy1cVRQ".to_owned(),
+"[::ffff:70.34.200.119]:12001:1fgEw5Nx:qJDIuDssacWhMP-tVFlouIjc6-A8RlE7r_I2QF6QijU".to_owned(),
+"[::ffff:173.199.93.134]:12001:1fgEw5Nx:pBguqTTv2yOx3Cti7E_Cx6LQ2fmHXwyRbY4I74L0pUo".to_owned(),
+"[::ffff:66.42.54.194]:12001:1fgEw5Nx:3wj6TSOeRDoCZTxShK2h1gd_YAv8aHV6p-DpHQy-dFM".to_owned(),
+"[::ffff:45.32.185.154]:12001:1fgEw5Nx:Lik63-CrHVvmVtG5m-zD1txhUercsKokFqNtCieZNxM".to_owned(),
+
 ];
 
                 }
