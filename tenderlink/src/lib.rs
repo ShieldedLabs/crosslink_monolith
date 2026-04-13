@@ -1251,7 +1251,10 @@ pub fn addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, STPAddress) {
     rand_chacha::ChaCha20Rng::seed_from_u64(seed).fill(&mut other_seed);
     let static_keypair = new_keypair_from_connect_magic1_with_seed(CRYPTO_MAGIC, other_seed).unwrap();
 
-    let (ip, port) = parse_to_ipv6_bytes(addr).unwrap();
+    let (ip, port) = match parse_to_ipv6_bytes(addr) {
+        Ok(v) => v,
+        Err(err) => panic!("failed to parse IPV6 from {addr}"),
+    };
     (
         static_keypair.clone(),
         STPAddress {

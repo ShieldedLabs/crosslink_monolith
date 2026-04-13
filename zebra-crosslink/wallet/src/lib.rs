@@ -3,6 +3,7 @@
 
 const AUTO_SPEND:    bool = false; // automatically make spends without requiring GUI interaction
 const DUMP_ACTIONS:  bool = false;
+const DUMP_CACHE_TIP: bool = false;
 const DUMP_FAUCET:   bool = false;
 const DUMP_NOTES:    bool = false;
 const DUMP_ROSTER:   bool = false;
@@ -622,7 +623,7 @@ impl ErrBuf {
         let mut buf = ErrBuf([0;128]);
         let err_bytes = err_str.as_bytes();
         let len = err_bytes.len().min(buf.0.len());
-        buf.0.copy_from_slice(&err_bytes[..len]);
+        buf.0[..len].copy_from_slice(&err_bytes[..len]);
         buf
     }
     pub fn to_string(&self) -> String {
@@ -2022,7 +2023,7 @@ impl PoWCache {
         }
     }
     pub fn push_new_tip(&mut self, h: u64, hash: [u8; 32]) {
-        println!("pushed tip at {h}: {}", LEHash(hash));
+        if DUMP_CACHE_TIP { println!("wallet cache: pushed tip at {h}: {}", LEHash(hash)); }
         assert!(h <= self.next_tip_h as u64);
         if h < self.next_tip_h as u64 {
             self.hashes.truncate(h as usize + 1);

@@ -1,3 +1,5 @@
+const DUMP_NEAR_TIP_CHAINS: bool = 1 == 0;
+
 use std::collections::{HashMap, HashSet};
 use static_assertions::const_assert;
 
@@ -407,7 +409,7 @@ impl NearTipChains {
             for chain in &self.chains {
                 min_h = min_h.min(chain.blocks[0].this_height);
             }
-            eprintln!("{} chains:", self.chains.len());
+            if DUMP_NEAR_TIP_CHAINS { eprintln!("{} chains:", self.chains.len()) };
             for chain in &self.chains {
                 print_shadow_block_slice(min_h, &chain.blocks, hash_bytes_n);
             }
@@ -419,7 +421,7 @@ impl NearTipChains {
 
         let branches = NearTipBranches::read_from(&mut &buf[..res]).unwrap();
         if hash_bytes_n > 0 {
-            eprintln!("\n{} branches:", branches.branches.len());
+            if DUMP_NEAR_TIP_CHAINS { eprintln!("\n{} branches:", branches.branches.len()); }
             branches.dump(hash_bytes_n);
         }
     }
