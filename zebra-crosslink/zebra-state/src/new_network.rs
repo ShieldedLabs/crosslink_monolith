@@ -1168,9 +1168,7 @@ pub fn sync(
                     break;
                 }
                 if let Some((address, _)) = map.iter().choose(rng) {
-                    // @Temporary for @Debug don't check connection
-                    // if !connections_map.contains_key(&address.connection_key())
-                    {
+                    if !connections_map.contains_key(&address.connection_key()) {
                         // println!("NewNet: Connecting to {:?}...", address);
                         let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
                         connection_attempts += 1;
@@ -1186,10 +1184,8 @@ pub fn sync(
                     break;
                 }
                 if let Some((address, sender_connection_key)) = map.iter().choose(rng) {
-                    // @Temporary for @Debug don't check connection
-                    // if !connections_map.contains_key(&address.connection_key())
-                    {
-                        println!("NewNet: Requesting hole punch to {:?} via {:?}...", address, sender_connection_key);
+                    if !connections_map.contains_key(&address.connection_key()) {
+                        // println!("NewNet: Requesting hole punch to {:?} via {:?}...", address, sender_connection_key);
                         let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
                         connection_attempts += 1;
 
@@ -1586,8 +1582,7 @@ pub fn sync(
                 }
 
                 // Prune my own addresses. // @Todo: Lazy-prune elsewhere, don't waste precious packet time eagerly-pruning.
-                // @Temporary for @Debug don't check for self-connect
-                // new_alleged_addresses.retain(|a| !my_keypairs.iter().any(|kp| a.key == kp.public && a.magic1 == kp.magic1));
+                new_alleged_addresses.retain(|a| !my_keypairs.iter().any(|kp| a.key == kp.public && a.magic1 == kp.magic1));
 
                 let sender_bucket = address_bucket(local_addresses_secret, &connection_address) & (MAX_SENDER_BUCKETS - 1);
                 const_assert!(MAX_SENDER_BUCKETS.is_power_of_two());
@@ -1625,10 +1620,8 @@ pub fn sync(
                     continue 'process_packets;
                 };
 
-                // @Temporary for @Debug don't check connection
-                // if !connections_map.contains_key(address_to_punch_to.connection_key())
-                {
-                    println!("NewNet: Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, connection_address);
+                if !connections_map.contains_key(address_to_punch_to.connection_key()) {
+                    // println!("NewNet: Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, connection_address);
                     let _ = connect_to(socket, &mut connections_map, &my_keypairs, &address_to_punch_to);
                 }
 
