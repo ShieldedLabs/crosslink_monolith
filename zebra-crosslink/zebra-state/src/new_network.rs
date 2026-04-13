@@ -867,11 +867,8 @@ pub fn is_parent_in_chains(rt: &tokio::runtime::Handle, state: &State, near_tip_
     return false;
 }
 
-const STP_ADDRESS_MEMORY_SIZE: usize =
-    16 /* ip */ +
-     2 /* port */ +
-     8 /* magic1 */ +
-    32 /* noise curve25519 pk */;
+use tenderlink::STP_ADDRESS_MEMORY_SIZE;
+use tenderlink::STP_ADDRESS_SERIALIZED_SIZE;
 
 pub const MAX_RECENT_BUCKETS:          usize = 2048;
 pub const MAX_PEERS_PER_BUCKET: usize = 128;
@@ -1171,7 +1168,9 @@ pub fn sync(
                     break;
                 }
                 if let Some((address, _)) = map.iter().choose(rng) {
-                    if !connections_map.contains_key(&address.connection_key()) {
+                    // @Temporary for @Debug don't check connection
+                    // if !connections_map.contains_key(&address.connection_key())
+                    {
                         // println!("NewNet: Connecting to {:?}...", address);
                         let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
                         connection_attempts += 1;
@@ -1186,11 +1185,22 @@ pub fn sync(
                 if connection_attempts >= MAX_PEERS_TO_CONNECT_PER_ATTEMPT {
                     break;
                 }
-                if let Some((address, _)) = map.iter().choose(rng) {
-                    if !connections_map.contains_key(&address.connection_key()) {
-                        // println!("NewNet: Connecting to {:?}...", address);
+                if let Some((address, sender_connection_key)) = map.iter().choose(rng) {
+                    // @Temporary for @Debug don't check connection
+                    // if !connections_map.contains_key(&address.connection_key())
+                    {
+                        println!("NewNet: Requesting hole punch to {:?} via {:?}...", address, sender_connection_key);
                         let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
                         connection_attempts += 1;
+
+                        if connections_map.contains_key(sender_connection_key) {
+                            let (mut buf, mut o) = ([0u8; 1 + STP_ADDRESS_SERIALIZED_SIZE], 0);
+
+                            o += PACKET_TYPE_WANT_HOLE_PUNCH .write_to(&mut buf[o..]);
+                            o += ConnectionKey::from(address).write_to(&mut buf[o..]);
+
+                            packets_to_send.push((*sender_connection_key, Vec::from(&buf[..o])));
+                        }
                     }
                 }
             }
@@ -1203,7 +1213,7 @@ pub fn sync(
             let rng = &mut rand::thread_rng();
 
             let recent_addrs_n: usize = recent_peer_addresses.values().map(|m| m.len()).sum();
-            let pckt_addrs_n = ((JUMBO_FRAG_SIZE - 1) / tenderlink::STP_ADDRESS_SERIALIZED_SIZE).min(recent_addrs_n);
+            let pckt_addrs_n = ((JUMBO_FRAG_SIZE - 1) / STP_ADDRESS_SERIALIZED_SIZE).min(recent_addrs_n);
 
             use rand::seq::IteratorRandom;
 
@@ -1567,7 +1577,7 @@ pub fn sync(
 
                 let mut new_alleged_addresses = HashSet::new();
 
-                let chunks = msg.chunks_exact(tenderlink::STP_ADDRESS_SERIALIZED_SIZE);
+                let chunks = msg.chunks_exact(STP_ADDRESS_SERIALIZED_SIZE);
                 for chunk in chunks {
                     let Some(address) = some_or_kill!(STPAddress::read_from(&mut &chunk[..]), "Address read failed") else {
                         continue 'process_packets;
@@ -1576,7 +1586,8 @@ pub fn sync(
                 }
 
                 // Prune my own addresses. // @Todo: Lazy-prune elsewhere, don't waste precious packet time eagerly-pruning.
-                new_alleged_addresses.retain(|a| !my_keypairs.iter().any(|kp| a.key == kp.public && a.magic1 == kp.magic1));
+                // @Temporary for @Debug don't check for self-connect
+                // new_alleged_addresses.retain(|a| !my_keypairs.iter().any(|kp| a.key == kp.public && a.magic1 == kp.magic1));
 
                 let sender_bucket = address_bucket(local_addresses_secret, &connection_address) & (MAX_SENDER_BUCKETS - 1);
                 const_assert!(MAX_SENDER_BUCKETS.is_power_of_two());
@@ -1591,6 +1602,34 @@ pub fn sync(
                         if TRACE { println!("Added to alleged addresses: {address:?}"); }
                         map.insert(address, connection_key);
                     }
+                }
+
+            } else if packet_type == PACKET_TYPE_WANT_HOLE_PUNCH {
+
+                let Some(relay_to_connection_key) = some_or_kill!(ConnectionKey::read_from(&mut msg), "Connection key read failed") else {
+                    continue 'process_packets;
+                };
+
+                if connections_map.contains_key(&relay_to_connection_key) {
+                    let (mut buf, mut o) = ([0u8; 1 + STP_ADDRESS_SERIALIZED_SIZE], 0);
+
+                    o += PACKET_TYPE_TRY_HOLE_PUNCH.write_to(&mut buf[o..]);
+                    o += connection_address        .write_to(&mut buf[o..]);
+
+                    packets_to_send.push((relay_to_connection_key, Vec::from(&buf[..o])));
+                }
+
+            } else if packet_type == PACKET_TYPE_TRY_HOLE_PUNCH {
+
+                let Some(address_to_punch_to) = some_or_kill!(STPAddress::read_from(&mut msg), "Address read failed") else {
+                    continue 'process_packets;
+                };
+
+                // @Temporary for @Debug don't check connection
+                // if !connections_map.contains_key(address_to_punch_to.connection_key())
+                {
+                    println!("NewNet: Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, connection_address);
+                    let _ = connect_to(socket, &mut connections_map, &my_keypairs, &address_to_punch_to);
                 }
 
             } else if packet_type == PACKET_TYPE_STATUS {

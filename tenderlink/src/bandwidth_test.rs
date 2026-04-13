@@ -251,6 +251,26 @@ impl Default for ConnectionKey {
     fn default() -> Self { Self { ip: Ipv6Addr::UNSPECIFIED, port: 0, key_15_bits: 0 } }
 }
 
+impl SliceWrite for ConnectionKey {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.ip.octets().write_to(&mut buf[o..]);
+        o += self.port       .write_to(&mut buf[o..]);
+        o += self.key_15_bits.write_to(&mut buf[o..]);
+        o
+    }
+}
+impl SliceRead for ConnectionKey {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(Self {
+            ip:          Ipv6Addr::from(<[u8; 16]>::read_from(buf)?),
+            port:        SliceRead::read_from(buf)?,
+            key_15_bits: SliceRead::read_from(buf)?,
+        })
+    }
+}
+
+
 #[derive(Debug)]
 pub struct ConnectionTrackingData {
     pub creation_time_ns: u64,

@@ -1093,6 +1093,13 @@ pub const MAX_P2P_DISCOVERY_PUBKEY_SIZE: usize = 32;
 
 
 pub const STP_ADDRESS_SERIALIZED_SIZE: usize = 16 + 8 + MAX_P2P_DISCOVERY_PUBKEY_SIZE; // @Volatile.
+pub const STP_ADDRESS_MEMORY_SIZE: usize =
+    16 /* ip */ +
+     2 /* port */ +
+     8 /* magic1 */ +
+    32 /* noise curve25519 pk */; // @Volatile.
+
+
 impl SliceWrite for STPAddress {
     fn write_to(&self, buf: &mut [u8]) -> usize {
         let key             = &self.key[..MAX_P2P_DISCOVERY_PUBKEY_SIZE];
@@ -1110,7 +1117,7 @@ impl SliceRead for STPAddress {
         let ip_bytes: [u8; 16]                       = SliceRead::read_from(buf)?;
         let port_and_magic1: u64                     = SliceRead::read_from(buf)?;
         let key: [u8; MAX_P2P_DISCOVERY_PUBKEY_SIZE] = SliceRead::read_from(buf)?;
-        Some(STPAddress {
+        Some(Self {
             ip:     Ipv6Addr::from(ip_bytes),
             port:   port_and_magic1 as u16,
             magic1: port_and_magic1 >> 16,
