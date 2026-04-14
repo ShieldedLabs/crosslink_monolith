@@ -3081,8 +3081,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         ..Decl
     }) {
 
-        let pane_pct_left  = Sizing::Percent(ui.zoom * PANE_PERCENT_LEFT);
-        let pane_pct_right = Sizing::Percent(ui.zoom * PANE_PERCENT_RIGHT);
+        let pane_pct_left  = Sizing::Percent(PANE_PERCENT_LEFT);
+        let pane_pct_right = Sizing::Percent(PANE_PERCENT_RIGHT);
 
         if let _elem = elem().decl(Decl {
             id: id("Left Pane"),
