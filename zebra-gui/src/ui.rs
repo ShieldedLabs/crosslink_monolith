@@ -1541,7 +1541,10 @@ pub fn ui_left_pane(ui: &mut Context,
                     let can = hex_dest.is_some();
                     let label = "Retarget";
                     let id = id(label);
-                    if button_ex(ui, id, label, can) { wallet_state.lock().unwrap().retarget_bond(ui.retarget_modal_bond_key, hex_dest.unwrap()); }
+                    if button_ex(ui, id, label, can) {
+                        wallet_state.lock().unwrap().retarget_bond(ui.retarget_modal_bond_key, hex_dest.unwrap());
+                        ui.modal = Modal::None;
+                    }
                 }
 
                 Modal::Unstake => {
