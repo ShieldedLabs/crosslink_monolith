@@ -1548,7 +1548,7 @@ pub fn ui_left_pane(ui: &mut Context,
                 }
 
                 Modal::Unstake => {
-                    title_bar(ui, true, "Unstake", id("Unstake Title Bar"));
+                    title_bar(ui, true, "Edit Stake", id("Unstake Title Bar"));
 
                     let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
                         let id = id(label);
