@@ -1150,14 +1150,22 @@ pub fn sync(
 
         // evict old recent addresses
         for (_, map) in &mut recent_peer_addresses {
-            map.retain(|_, recent_peer_address| {
+            map.retain(|addr, recent_peer_address| {
+                if initial_peer_addresses.contains(addr) {
+                    return false;
+                }
+
                 recent_peer_address.recv_time_ns + 10 * ONE_MINUTE >= now
             });
         }
-
         recent_peer_addresses .retain(|_, map| map.len() > 0);
+
         for (_, map) in alleged_peer_addresses.iter_mut() {
             map.retain(|addr, _| {
+                if initial_peer_addresses.contains(addr) {
+                    return false;
+                }
+
                 let addr_bucket = address_bucket(local_addresses_secret, addr) & (MAX_RECENT_BUCKETS - 1);
                 if let Some(recents) = recent_peer_addresses.get(&(addr_bucket as u16)) {
                     !recents.contains_key(addr)
@@ -1208,7 +1216,7 @@ pub fn sync(
                 o += ConnectionKey::from(address).write_to(&mut buf[o..]);
 
                 for (key, _conn) in connections_map.iter().filter(|(_, c)| c.is_connected()).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_RECENTS) {
-                    println!("NewNet: Requesting hole punch to recent address {:?} via random peer: {:?}...", address, _conn.address());
+                    if TRACE { println!("NewNet: Requesting hole punch to recent address {:?} via random peer: {:?}...", address, _conn.address()); }
                     packets_to_send.push((*key, Vec::from(&buf[..o])));
                 }
             }
@@ -1241,12 +1249,12 @@ pub fn sync(
                 o += ConnectionKey::from(address).write_to(&mut buf[o..]);
 
                 for (key, _conn) in connections_map.iter().filter(|(k, c)| c.is_connected() && *k != sender_connection_key).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_ALLEGEDS) {
-                    println!("NewNet: Requesting hole punch to alleged address {:?} via random peer: {:?}...", address, _conn.address());
+                    if TRACE { println!("NewNet: Requesting hole punch to alleged address {:?} via random peer: {:?}...", address, _conn.address()); }
                     packets_to_send.push((*key, Vec::from(&buf[..o])));
                 }
 
                 if get_connected(&connections_map, &sender_connection_key).is_some() {
-                    println!("NewNet: Requesting hole punch to alleged address {:?} via the original sender: {:?}...", address, sender_connection_key);
+                    if TRACE { println!("NewNet: Requesting hole punch to alleged address {:?} via the original sender: {:?}...", address, sender_connection_key); }
                     packets_to_send.push((*sender_connection_key, Vec::from(&buf[..o])));
                 }
             }
@@ -1664,6 +1672,7 @@ pub fn sync(
                     o += PACKET_TYPE_TRY_HOLE_PUNCH.write_to(&mut buf[o..]);
                     o += connection_address        .write_to(&mut buf[o..]);
 
+                    if TRACE { println!("NewNet: Relaying hole punch request from {:?} to {:?}...", connection_address, relay_to_connection_key); }
                     packets_to_send.push((relay_to_connection_key, Vec::from(&buf[..o])));
                 }
 
@@ -1675,7 +1684,7 @@ pub fn sync(
                 };
 
                 if !connections_map.contains_key(&address_to_punch_to.connection_key()) {
-                    // println!("NewNet: Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, connection_address);
+                    if TRACE { println!("NewNet: Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, connection_address); }
                     let _ = connect_to(socket, &mut connections_map, &my_keypairs, &address_to_punch_to);
                 }
 
