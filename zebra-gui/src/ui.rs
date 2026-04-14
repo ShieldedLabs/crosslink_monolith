@@ -391,8 +391,8 @@ impl Element {
     }
 }
 
-pub const PANE_PERCENT_LEFT:  f32 = 0.30; // @PreventPanesColliding
-pub const PANE_PERCENT_RIGHT: f32 = 0.24; // @PreventPanesColliding
+pub const PANE_PERCENT_LEFT:  f32 = 0.28; // @Todo: @PreventOverflowOnZoom
+pub const PANE_PERCENT_RIGHT: f32 = 0.22; // @Todo: @PreventOverflowOnZoom
 
 pub const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
 // pub const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
@@ -3006,7 +3006,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
     let mut result = false;
 
     const MIN_ZOOM: f32 = 0.5;
-    const MAX_ZOOM: f32 = 1.65; // @PreventPanesColliding
+    const MAX_ZOOM: f32 = 1.75; // @Todo: @PreventOverflowOnZoom
 
     if ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight) {
         if ui.input().key_pressed(KeyCode::Equal) {
