@@ -599,6 +599,13 @@ impl TMState {
         // check if data was signed by pub key
         match sig.verify(from_pub_key, signed_data) { Ok(())=>{}, Err((err, str))=> {
             eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST}: {} (..{}): for {} {}", str, signed_data.len(), value_id, err);
+            #[cfg(debug_assertions)]
+            {
+                println!("DEBUG LOOP OVER ALL ROSTER AND TRIAL VERIFY only success should be {} but that is not so... :(", roster_i);
+                for i in 0..roster.len() {
+                    println!("{}: success={} pub_key: {:?} stake: {} cumulative_stake: {}", i, sig.verify(roster[i].pub_key, signed_data).is_ok(), roster[i].pub_key, roster[i].stake, roster[i].cumulative_stake);
+                }
+            }
             return TMStatus::Fail;
         }};
 
@@ -706,7 +713,7 @@ impl TMState {
                         if prev_sig_had_fault { // recompute from scratch
                             // NOTE: this does NOT imply the current packet/proposal is faulty, so we should continue with it
                             let mut check_counts = ConsensusCounts::ZERO;
-                            for (_, sig) in round_data.msg_val_sigs.iter().enumerate() {
+                            for (roster_i, sig) in round_data.msg_val_sigs.iter().enumerate() {
                                 check_counts = check_counts + ConsensusCounts::from(&(*sig, roster[roster_i].stake));
                             }
                             round_data.counts = check_counts;
@@ -1335,7 +1342,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let my_port = my_endpoint.map(|e|e.port).unwrap_or(0); // @Todo! Get local port after sock creation! @@@
 
-    let socket = setup_and_bind_udp_socket(my_port).unwrap();
+    let socket = setup_and_bind_udp_socket(my_port).expect("Failed to bind socket, try again.");
 
     let my_keypairs = vec![&my_stp_keypair];
 
