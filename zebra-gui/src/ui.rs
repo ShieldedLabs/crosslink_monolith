@@ -1130,6 +1130,8 @@ pub fn ui_left_pane(ui: &mut Context,
         }
     }
 
+    let wallet_is_init = wallet_state.lock().unwrap().wallet_is_init;
+
     // You can't operate on the miner, so you can't open any modals. // @Todo: maybe you can open Receive?
     if *tab_id == tab_id_miner_wallet {
         ui.modal = Modal::None;
@@ -1548,7 +1550,7 @@ pub fn ui_left_pane(ui: &mut Context,
                 }
 
                 Modal::Unstake => {
-                    title_bar(ui, true, "Edit Stake", id("Unstake Title Bar"));
+                    title_bar(ui, true, "Edit Stake", id("Edit Stake Title Bar"));
 
                     let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
                         let id = id(label);
@@ -1605,7 +1607,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                     let can = is_staking_day;
 
-                    let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Unstake Scroll Container"), 48.0);
+                    let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Edit Stake Scroll Container"), 48.0);
                     if (staked_roster_unbonded.len() + staked_roster_bonded.len()) == 0 {
                         clip = ClipMode::None;
                         *scroll = 0.0;
@@ -2184,11 +2186,11 @@ pub fn ui_left_pane(ui: &mut Context,
             };
 
             // TODO: send should use ICON_PAPER_PLANE but it would be nice to support negative glyph advance first
-            if button(ui, can, ICON_UP_BIG, "Send")    { ui.modal = Modal::Send;    }
-            if button(ui, can, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
-            if button(ui, can, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
-            if button(ui, can, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
-            if button(ui, can, ICON_COG_1,  "User")    { ui.modal = Modal::User;    } // TODO: person icon
+            if button(ui, can, ICON_UP_BIG, "Send")       { ui.modal = Modal::Send;    }
+            if button(ui, can, ICON_QRCODE, "Receive")    { ui.modal = Modal::Receive; }
+            if button(ui, can, ICON_LINK_1, "Stake")      { ui.modal = Modal::Stake;   }
+            if button(ui, can, ICON_UNLINK, "Edit Stake") { ui.modal = Modal::Unstake; }
+            if button(ui, can, ICON_COG_1,  "User")       { ui.modal = Modal::User;    } // TODO: person icon
         }
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
@@ -2222,7 +2224,7 @@ pub fn ui_left_pane(ui: &mut Context,
         ui.scroll_container_bgn(data, padding, 0.0, id, clip, scroll, content_h, viewport_h, max);
         {
             {
-                if txs.len() == 0 {
+                if wallet_is_init == false || txs.len() == 0 {
                     let h = ui.scale(24.0);
                     if let _ = elem().decl(Decl {
                         direction: TopToBottom,
@@ -2232,8 +2234,13 @@ pub fn ui_left_pane(ui: &mut Context,
                         align:  Center,
                         ..Decl
                     }) {
-                        ui.text(ICON_DROPBOX_1, TextDecl { font: Icons, colour: WHITE.mul(0.6), h: ui.scale(64.0), align: AlignX::Center, ..TextDecl });
-                        ui.text("There are no transactions yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
+                        let (icon, text, font) = if ! wallet_is_init {
+                            (ICON_EYE_OFF, animated_loading_icon(ui), FontKind::Icons)
+                        } else {
+                            (ICON_DROPBOX_1, "There are no transactions yet.", FontKind::Normal)
+                        };
+                        ui.text(icon, TextDecl { font: Icons, colour: WHITE.mul(0.6), h: ui.scale(64.0), align: AlignX::Center, ..TextDecl });
+                        ui.text(text, TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, font, ..TextDecl });
                     }
                 }
                 else {
@@ -2385,8 +2392,7 @@ pub fn ui_left_pane(ui: &mut Context,
                             }) {
                                 let mut pending = tx.part_flags != TxParts::FULL_TX;
                                 let icon = if pending {
-                                    let timer = (ui.tx_loading_animation_timer * 3.0) as usize;
-                                    [ICON_DOT, ICON_DOT_2, ICON_DOT_3][timer % 3]
+                                    animated_loading_icon(ui)
                                 } else {
                                     match tx.kind() {
                                         WalletTxKind::Send         => ICON_UP_SMALL,
@@ -2631,11 +2637,12 @@ pub fn ui_right_pane(ui: &mut Context,
     let mut tab_id_faucet = Id::default();
     let mut tab_id_roster = Id::default();
 
-    let roster = {
-        let mut roster = wallet_state.lock().unwrap().roster.clone();
-        roster.sort_by_key(|member| std::cmp::Reverse(member.voting_power));
-        roster
+    let (wallet_is_init, mut roster) = {
+        let state = wallet_state.lock().unwrap();
+        (state.wallet_is_init, state.roster.clone())
     };
+    roster.sort_by_key(|member| std::cmp::Reverse(member.voting_power));
+    let roster = roster;
 
     if let _ = elem().decl(Decl {
         id: id("Finalizers Tab Bar"),
@@ -2769,7 +2776,7 @@ pub fn ui_right_pane(ui: &mut Context,
         let scroll = *scroll;
         ui.scroll_container_bgn(data, padding, child_gap * 0.5, id, clip, scroll, content_h, viewport_h, max);
         {
-            if roster.len() == 0 {
+            if wallet_is_init == false || roster.len() == 0 {
                 let h = ui.scale(24.0);
                 if let _ = elem().decl(Decl {
                     direction: TopToBottom,
@@ -2780,7 +2787,12 @@ pub fn ui_right_pane(ui: &mut Context,
                     ..Decl
                 }) {
                     ui.text(ICON_EYE_OFF, TextDecl { font: Icons, colour: WHITE.mul(0.6), h: ui.scale(64.0), align: AlignX::Center, ..TextDecl });
-                    ui.text("There are no finalizers yet.", TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, ..TextDecl });
+                    let (text, font) = if ! wallet_is_init {
+                        (animated_loading_icon(ui), FontKind::Icons)
+                    } else {
+                        ("There are no finalizers yet.", FontKind::Normal)
+                    };
+                    ui.text(text, TextDecl { colour: WHITE.mul(0.6), h, align: AlignX::Center, font, ..TextDecl });
                 }
             }
             else {
@@ -3006,6 +3018,10 @@ pub fn ui_right_pane(ui: &mut Context,
     }
 }
 
+fn animated_loading_icon(ui: &Context) -> &str {
+    let timer = (ui.tx_loading_animation_timer * 3.0) as usize;
+    [ICON_DOT, ICON_DOT_2, ICON_DOT_3][timer % 3]
+}
 
 pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
     data.per_frame_strs.clear();

@@ -883,6 +883,7 @@ pub struct WalletRosterMember {
 
 #[derive(Default, Debug, Clone)]
 pub struct WalletState {
+    pub wallet_is_init: bool,
     pub miner_seen_h: u32,
     pub miner_unshielded_funds: u64,
     pub miner_shielded_pending_funds: u64,
@@ -3328,6 +3329,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             end:   Some(BlockId { height: heights.1, hash: Vec::new() }),
         }
     }
+
+    wallet_state.lock().unwrap().wallet_is_init = true; // TODO: consider only doing this after an initial sync success
 
     const USER_WALLET_IDX: usize = 0;
     const MINER_WALLET_IDX: usize = 1;
