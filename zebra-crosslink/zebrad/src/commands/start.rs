@@ -490,8 +490,23 @@ impl StartCmd {
             let state_config_copy = Arc::clone(&config);
             let sync_state = state.clone();
             let sync_read_state = read_only_state_service.clone();
+            let sync_block_verifier = block_verifier_router.clone();
             tokio::task::spawn_blocking(move ||{
-                zebra_state::new_network::sync(&state_config_copy.state, sync_read_state, sync_state, /* tfl_service2, */ tokio::runtime::Handle::current())
+                use zebra_state::new_network::BlockCommitError;
+                let commit_block = |block: std::sync::Arc<zebra_chain::block::Block>| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<zebra_chain::block::Hash, BlockCommitError>> + Send>> {
+                    let mut verifier = sync_block_verifier.clone();
+                    Box::pin(async move {
+                        use tower::ServiceExt;
+                        let ready = verifier.ready().await.map_err(|e| BlockCommitError::Other(format!("{e:?}")))?;
+                        ready.call(zebra_consensus::Request::Commit(block)).await
+                            .map_err(|e| {
+                                let is_dup = e.downcast_ref::<zebra_consensus::router::RouterError>()
+                                    .map_or(false, |re| re.is_duplicate_request());
+                                if is_dup { BlockCommitError::Duplicate } else { BlockCommitError::Other(format!("{e:?}")) }
+                            })
+                    })
+                };
+                zebra_state::new_network::sync(commit_block, &state_config_copy.state, sync_read_state, sync_state, /* tfl_service2, */ tokio::runtime::Handle::current())
             });
         }
 

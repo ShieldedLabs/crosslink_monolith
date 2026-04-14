@@ -921,7 +921,14 @@ pub struct Peer {
     their_tree: NearTipBranches,
 }
 
+#[derive(Debug)]
+pub enum BlockCommitError {
+    Duplicate,
+    Other(String),
+}
+
 pub fn sync(
+    commit_block: impl Fn(std::sync::Arc<Block>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Hash, BlockCommitError>> + Send>>,
     config: &crate::config::Config,
     read_state: ReadState,
     state: State,
@@ -1845,37 +1852,23 @@ pub fn sync(
             any_blocks_in_the_queue_can_make_progress = true;
 
             println!("Committing: {}", hash);
-            let res = rt.block_on(async {
-                state.clone().oneshot(Request::CommitSemanticallyVerifiedBlock(crate::SemanticallyVerifiedBlock::from(block_arc))).await
-            });
+            let res = rt.block_on(commit_block(block_arc));
             match res {
                 Ok(_) => {
                     println!("committed!: {}", hash);
                     false // remove
                 }
-                Err(error) => {
-                    if let Some(commit_err) = error.downcast_ref::<crate::error::CommitSemanticallyVerifiedError>() {
-                        match &commit_err.0 {
-                            crate::ValidateContextError::AlreadyFinalized { .. } => {
-                                // @Todo: We would like to update the finalized height here, but
-                                //        we would also have to call near_tip_chains.remove_chains_invalidated_by_finalized() with that height.
-                                println!("Already was committed: {}", hash);
-                                false // remove
-                            }
-                            other => {
-                                // @Todo: detect request timeout and keep the block if it merely timed out.
-                                println!("Failed to commit {}: {:?}", hash, other);
-                                false // remove
-                            }
-                        }
-                    } else {
-                        // @Todo: detect request timeout and keep the block if it merely timed out.
-                        println!("Failed to commit {}: {:?}", hash, error);
-                        false // remove
-                    }
+                Err(BlockCommitError::Duplicate) => {
+                    // @Todo: We would like to update the finalized height here, but
+                    //        we would also have to call near_tip_chains.remove_chains_invalidated_by_finalized() with that height.
+                    println!("Already was committed: {}", hash);
+                    false // remove
                 }
-                // @Todo: detect request timeout and keep the block if it merely timed out.
-                _ => unreachable!("wrong response for CommitSemanticallyVerifiedBlock")
+                Err(BlockCommitError::Other(description)) => {
+                    // @Todo: detect request timeout and keep the block if it merely timed out.
+                    println!("Failed to commit {}: {}", hash, description);
+                    false // remove
+                }
             }
         });
 

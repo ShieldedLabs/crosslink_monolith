@@ -508,7 +508,7 @@ macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone,
 
 impl PackletHeader {
     pub fn new(tag: PackletTag, len: usize) -> Self { debug_assert!(len < (1 << 14)); Self((tag as u16) | ((len as u16) << 2)) }
-    pub fn tag(&self) -> PackletTag { unsafe { core::mem::transmute((self.0 & 0x3) as u8) } }
+    pub fn tag(&self) -> PackletTag { match self.0 & 0x3 { 0 => PackletTag::Acknowledgements, 1 => PackletTag::AnEntireDatagram, 2 => PackletTag::OneJumboFragment, _ => PackletTag::ReliableStreamed } }
     pub fn len(&self) -> usize { (self.0 >> 2) as usize }
 }
 
