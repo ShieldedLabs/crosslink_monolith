@@ -233,7 +233,7 @@ impl Application for ZebradApp {
                     //     ZcashAddress::try_from_encoded("tmRB9AEVsxNAQsqtJPqJUje9KCaAijpS77z")
                     //         .unwrap(),
                     // );
-                    // c.mining.internal_miner = false;
+                    c.mining.internal_miner = true;
                     c.network.network = testnet::Parameters::build()
                         //.with_network_name("CrosslinkTestnet")
                         .with_network_magic(Magic([67, 108, 84, 48]))
