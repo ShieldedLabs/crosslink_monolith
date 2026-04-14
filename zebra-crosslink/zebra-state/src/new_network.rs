@@ -718,7 +718,7 @@ pub fn chain_intersect_prefix<'l>(a: &'l [ShadowBlock], b: &'l [ShadowBlock]) ->
 }
 
 
-const TRACE     :bool=0!=       0;
+const TRACE     :bool=0!=       1;
 
 
 // @Todo: always only wait on real stuff, never sleeping for fixed amounts like this
@@ -1150,14 +1150,22 @@ pub fn sync(
 
         // evict old recent addresses
         for (_, map) in &mut recent_peer_addresses {
-            map.retain(|_, recent_peer_address| {
+            map.retain(|addr, recent_peer_address| {
+                if initial_peer_addresses.contains(addr) {
+                    return false;
+                }
+
                 recent_peer_address.recv_time_ns + 10 * ONE_MINUTE >= now
             });
         }
-
         recent_peer_addresses .retain(|_, map| map.len() > 0);
+
         for (_, map) in alleged_peer_addresses.iter_mut() {
             map.retain(|addr, _| {
+                if initial_peer_addresses.contains(addr) {
+                    return false;
+                }
+
                 let addr_bucket = address_bucket(local_addresses_secret, addr) & (MAX_RECENT_BUCKETS - 1);
                 if let Some(recents) = recent_peer_addresses.get(&(addr_bucket as u16)) {
                     !recents.contains_key(addr)
@@ -1208,7 +1216,7 @@ pub fn sync(
                 o += ConnectionKey::from(address).write_to(&mut buf[o..]);
 
                 for (key, _conn) in connections_map.iter().filter(|(_, c)| c.is_connected()).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_RECENTS) {
-                    println!("NewNet: Requesting hole punch to recent address {:?} via random peer: {:?}...", address, _conn.address());
+                    if TRACE { println!("NewNet: Requesting hole punch to recent address {:?} via random peer: {:?}...", address, _conn.address()); }
                     packets_to_send.push((*key, Vec::from(&buf[..o])));
                 }
             }
@@ -1241,12 +1249,12 @@ pub fn sync(
                 o += ConnectionKey::from(address).write_to(&mut buf[o..]);
 
                 for (key, _conn) in connections_map.iter().filter(|(k, c)| c.is_connected() && *k != sender_connection_key).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_ALLEGEDS) {
-                    println!("NewNet: Requesting hole punch to alleged address {:?} via random peer: {:?}...", address, _conn.address());
+                    if TRACE { println!("NewNet: Requesting hole punch to alleged address {:?} via random peer: {:?}...", address, _conn.address()); }
                     packets_to_send.push((*key, Vec::from(&buf[..o])));
                 }
 
                 if get_connected(&connections_map, &sender_connection_key).is_some() {
-                    println!("NewNet: Requesting hole punch to alleged address {:?} via the original sender: {:?}...", address, sender_connection_key);
+                    if TRACE { println!("NewNet: Requesting hole punch to alleged address {:?} via the original sender: {:?}...", address, sender_connection_key); }
                     packets_to_send.push((*sender_connection_key, Vec::from(&buf[..o])));
                 }
             }
@@ -1563,7 +1571,7 @@ pub fn sync(
         // Process received packets
         'process_packets: while packets_received.len() > 0 {
             let (connection_key, msg) = packets_received.remove(0);
-            if TRACE { println!("got a message."); }
+            // if TRACE { println!("got a message."); }
 
             // Skip processing packets from now-disconnected peers
             let connection_address = {
@@ -1619,9 +1627,10 @@ pub fn sync(
                 continue 'process_packets;
             };
 
-            if TRACE { println!("got message {packet_type}."); }
+            // if TRACE { println!("got message {packet_type}."); }
 
             if packet_type == PACKET_TYPE_PEER_ADDRESS_LIST {
+                if TRACE { println!("Got message type: PEER_ADDRESS_LIST"); }
                 // @Todo: rate limit consumption
 
                 let mut new_alleged_addresses = HashSet::new();
@@ -1652,6 +1661,7 @@ pub fn sync(
                 }
 
             } else if packet_type == PACKET_TYPE_WANT_HOLE_PUNCH {
+                if TRACE { println!("Got message type: WANT_HOLE_PUNCH"); }
                 // @Todo: rate limit consumption
 
                 let Some(relay_to_connection_key) = some_or_kill!(ConnectionKey::read_from(&mut msg), "Connection key read failed") else {
@@ -1664,10 +1674,12 @@ pub fn sync(
                     o += PACKET_TYPE_TRY_HOLE_PUNCH.write_to(&mut buf[o..]);
                     o += connection_address        .write_to(&mut buf[o..]);
 
+                    if TRACE { println!("NewNet: Relaying hole punch request from {:?} to {:?}...", connection_address, relay_to_connection_key); }
                     packets_to_send.push((relay_to_connection_key, Vec::from(&buf[..o])));
                 }
 
             } else if packet_type == PACKET_TYPE_TRY_HOLE_PUNCH {
+                if TRACE { println!("Got message type: TRY_HOLE_PUNCH"); }
                 // @Todo: rate limit consumption
 
                 let Some(address_to_punch_to) = some_or_kill!(STPAddress::read_from(&mut msg), "Address read failed") else {
@@ -1675,14 +1687,13 @@ pub fn sync(
                 };
 
                 if !connections_map.contains_key(&address_to_punch_to.connection_key()) {
-                    // println!("NewNet: Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, connection_address);
+                    if TRACE { println!("NewNet: Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, connection_address); }
                     let _ = connect_to(socket, &mut connections_map, &my_keypairs, &address_to_punch_to);
                 }
 
             } else if packet_type == PACKET_TYPE_STATUS {
+                if TRACE { println!("Got message type: STATUS"); }
                 // @Todo: rate limit consumption
-
-                if TRACE { println!("got a status."); }
 
                 // TODO: rate limit consumption
                 let Some(their_tree) = some_or_kill!(NearTipBranches::read_from(&mut msg), "NearTipBranches read failed")
@@ -1693,6 +1704,7 @@ pub fn sync(
                 peer.their_tree = their_tree;
 
             } else if packet_type == PACKET_TYPE_BLOCK {
+                if TRACE { println!("Got message type: BLOCK"); }
                 // @Todo: rate limit consumption
 
                 let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height())
@@ -1700,8 +1712,6 @@ pub fn sync(
                     warning!("I don't have a tip height yet");
                     continue 'process_packets;
                 };
-
-                if TRACE { println!("got a block."); }
 
                 // @Todo: @Temporary. We will instead want to evict non-committable blocks and replace them with new blocks if they are committable.
                 // if blocks_to_commit.len() >= MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
