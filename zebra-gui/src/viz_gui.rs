@@ -607,15 +607,15 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     if !ui.capture {
         let dxm = (input_ctx.mouse_pos().0.clamp(0, draw_ctx.window_width) - draw_ctx.window_width/2) as f32;
         let dym = (input_ctx.mouse_pos().1.clamp(0, draw_ctx.window_height) - draw_ctx.window_height/2) as f32;
-        let old_screen_unit = SCREEN_UNIT_CONST * (ZOOM_FACTOR.powf(viz_state.zoom) * ui.scale);
+        let old_screen_unit = SCREEN_UNIT_CONST * (ZOOM_FACTOR.powf(viz_state.zoom) * ui.dpi_scale);
         viz_state.zoom += input_ctx.zoom_delta as f32;
         viz_state.zoom = viz_state.zoom.min(26.0);
-        let new_screen_unit = SCREEN_UNIT_CONST * (ZOOM_FACTOR.powf(viz_state.zoom) * ui.scale);
+        let new_screen_unit = SCREEN_UNIT_CONST * (ZOOM_FACTOR.powf(viz_state.zoom) * ui.dpi_scale);
         viz_state.camera_x += (dxm / old_screen_unit) - (dxm / new_screen_unit);
         viz_state.camera_y += (dym / old_screen_unit) - (dym / new_screen_unit);
     }
 
-    let zoom = (ZOOM_FACTOR.powf(viz_state.zoom) * ui.scale);
+    let zoom = (ZOOM_FACTOR.powf(viz_state.zoom) * ui.dpi_scale);
     // origin
     let screen_unit = SCREEN_UNIT_CONST * zoom;
     let very_zoom_out = screen_unit < 0.16;
@@ -650,7 +650,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             let mut bft_keys = viz_state.on_screen_bfts.keys();
             let bft_x = viz_state.on_screen_bfts.get(bft_keys.nth(0).unwrap_or(&Hash32::from_u64(0))).unwrap_or(&OnScreenBft::default()).x;
 
-            let right_margin = draw_ctx.window_width as f32 - (draw_ctx.window_width as f32 * (ui.zoom * PANE_PERCENT_RIGHT));
+            let right_margin = draw_ctx.window_width as f32 - (draw_ctx.window_width as f32 * PANE_PERCENT_RIGHT);
 
             // window
             draw_ctx.rectangle_r(0.0, origin_y + y1, draw_ctx.window_width as f32, origin_y + y2, 1, 0x06ffffff);
