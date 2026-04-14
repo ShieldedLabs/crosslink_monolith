@@ -418,6 +418,7 @@ pub enum Modal {
     Stake,
     Unstake,
     Retarget,
+    User, // settings
 }
 
 pub fn rgba_to_hsva(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8, u8) {
@@ -1364,6 +1365,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         }
                     }
                 }
+
                 Modal::Receive => {
                     title_bar(ui, true, "Receive", id("Receive Title Bar"));
 
@@ -1389,6 +1391,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         }
                     }
                 }
+
                 Modal::Stake => {
                     title_bar(ui, true, "Stake", id("Stake Title Bar"));
 
@@ -1474,6 +1477,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         }
                     }
                 }
+
                 Modal::Retarget => {
                     title_bar(ui, true, "Retarget Delegation Bond", id("Retarget Title Bar"));
 
@@ -1539,6 +1543,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     let id = id(label);
                     if button_ex(ui, id, label, can) { wallet_state.lock().unwrap().retarget_bond(ui.retarget_modal_bond_key, hex_dest.unwrap()); }
                 }
+
                 Modal::Unstake => {
                     title_bar(ui, true, "Unstake", id("Unstake Title Bar"));
 
@@ -1995,6 +2000,82 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
                     ui.scroll_container_end(data, padding, id, clip, scroll, content_h, viewport_h, max);
                 }
+
+                Modal::User => {
+                    title_bar(ui, true, "User", id("User Title Bar"));
+
+                    let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
+                        let id = id(label);
+                        let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
+                        if let _ = elem().decl(Decl {
+                            id,
+                            child_gap,
+                            align: Center,
+                            direction: TopToBottom,
+                            width: fit!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            let radius = ui.scale(24.0);
+
+                            // Button
+                            if let _ = elem().decl(Decl {
+                                colour,
+                                padding,
+                                child_gap,
+                                radius: radius.dup4(),
+                                align: Center,
+                                width:  fit!(ui.scale(192.0)),
+                                height: fit!(radius * 2.0),
+                                ..Decl
+                            }) {
+                                let h = ui.scale(20.0);
+                                ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
+                            }
+                        }
+
+                        clicked
+                    };
+
+                    let clickable_icon = |ui: &mut Context, id, icon, icon_hovered, enabled | {
+                        let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
+
+                        let icon = if ui.hovered(id) { icon_hovered } else { icon };
+                        if let _ = elem().decl(Decl {
+                            id,
+                            child_gap,
+                            align: Center,
+                            direction: TopToBottom,
+                            width: fit!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+                        }
+
+                        clicked
+                    };
+
+
+                    let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("User Scroll Container"), 48.0);
+                    let scroll = *scroll;
+                    ui.scroll_container_bgn(data, padding, 0.0, id, clip, scroll, content_h, viewport_h, max);
+                    {
+                        let (seed, ufvk) = {
+                            let state = wallet_state.lock().unwrap();
+                            (state.user_seed_mnemonic.clone(), state.user_ufvk.clone())
+                        };
+                        if button_ex(ui, "Copy Seed", true, true) {
+                            ui.input().send_to_clipboard(&seed);
+                        }
+
+                        if button_ex(ui, "Copy Viewing Key", true, true) {
+                            ui.input().send_to_clipboard(&ufvk);
+                        }
+
+                    }
+                    ui.scroll_container_end(data, padding, id, clip, scroll, content_h, viewport_h, max);
+                }
             }
         }
     }
@@ -2104,6 +2185,7 @@ pub fn ui_left_pane(ui: &mut Context,
             if button(ui, can, ICON_QRCODE, "Receive") { ui.modal = Modal::Receive; }
             if button(ui, can, ICON_LINK_1, "Stake")   { ui.modal = Modal::Stake;   }
             if button(ui, can, ICON_UNLINK, "Unstake") { ui.modal = Modal::Unstake; }
+            if button(ui, can, ICON_COG_1,  "User")    { ui.modal = Modal::User;    } // TODO: person icon
         }
 
         // if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(32.0)), ..Default::default() }) {}
