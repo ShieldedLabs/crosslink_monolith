@@ -2631,7 +2631,11 @@ pub fn ui_right_pane(ui: &mut Context,
     let mut tab_id_faucet = Id::default();
     let mut tab_id_roster = Id::default();
 
-    let roster = &wallet_state.lock().unwrap().roster.clone();
+    let roster = {
+        let mut roster = wallet_state.lock().unwrap().roster.clone();
+        roster.sort_by_key(|member| std::cmp::Reverse(member.voting_power));
+        roster
+    };
 
     if let _ = elem().decl(Decl {
         id: id("Finalizers Tab Bar"),
@@ -2752,7 +2756,7 @@ pub fn ui_right_pane(ui: &mut Context,
         }
 
         let mut total_stake = 0u64;
-        for member in roster {
+        for member in &roster {
             total_stake += member.voting_power;
         }
         finalizer_ratio_bar(ui, data, &roster, total_stake);
