@@ -718,7 +718,7 @@ pub fn chain_intersect_prefix<'l>(a: &'l [ShadowBlock], b: &'l [ShadowBlock]) ->
 }
 
 
-const TRACE     :bool=0!=       0;
+const TRACE     :bool=0!=       1;
 
 
 // @Todo: always only wait on real stuff, never sleeping for fixed amounts like this
@@ -1571,7 +1571,7 @@ pub fn sync(
         // Process received packets
         'process_packets: while packets_received.len() > 0 {
             let (connection_key, msg) = packets_received.remove(0);
-            if TRACE { println!("got a message."); }
+            // if TRACE { println!("got a message."); }
 
             // Skip processing packets from now-disconnected peers
             let connection_address = {
@@ -1627,9 +1627,10 @@ pub fn sync(
                 continue 'process_packets;
             };
 
-            if TRACE { println!("got message {packet_type}."); }
+            // if TRACE { println!("got message {packet_type}."); }
 
             if packet_type == PACKET_TYPE_PEER_ADDRESS_LIST {
+                if TRACE { println!("Got message type: PEER_ADDRESS_LIST"); }
                 // @Todo: rate limit consumption
 
                 let mut new_alleged_addresses = HashSet::new();
@@ -1660,6 +1661,7 @@ pub fn sync(
                 }
 
             } else if packet_type == PACKET_TYPE_WANT_HOLE_PUNCH {
+                if TRACE { println!("Got message type: WANT_HOLE_PUNCH"); }
                 // @Todo: rate limit consumption
 
                 let Some(relay_to_connection_key) = some_or_kill!(ConnectionKey::read_from(&mut msg), "Connection key read failed") else {
@@ -1677,6 +1679,7 @@ pub fn sync(
                 }
 
             } else if packet_type == PACKET_TYPE_TRY_HOLE_PUNCH {
+                if TRACE { println!("Got message type: TRY_HOLE_PUNCH"); }
                 // @Todo: rate limit consumption
 
                 let Some(address_to_punch_to) = some_or_kill!(STPAddress::read_from(&mut msg), "Address read failed") else {
@@ -1689,9 +1692,8 @@ pub fn sync(
                 }
 
             } else if packet_type == PACKET_TYPE_STATUS {
+                if TRACE { println!("Got message type: STATUS"); }
                 // @Todo: rate limit consumption
-
-                if TRACE { println!("got a status."); }
 
                 // TODO: rate limit consumption
                 let Some(their_tree) = some_or_kill!(NearTipBranches::read_from(&mut msg), "NearTipBranches read failed")
@@ -1702,6 +1704,7 @@ pub fn sync(
                 peer.their_tree = their_tree;
 
             } else if packet_type == PACKET_TYPE_BLOCK {
+                if TRACE { println!("Got message type: BLOCK"); }
                 // @Todo: rate limit consumption
 
                 let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height())
@@ -1709,8 +1712,6 @@ pub fn sync(
                     warning!("I don't have a tip height yet");
                     continue 'process_packets;
                 };
-
-                if TRACE { println!("got a block."); }
 
                 // @Todo: @Temporary. We will instead want to evict non-committable blocks and replace them with new blocks if they are committable.
                 // if blocks_to_commit.len() >= MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
