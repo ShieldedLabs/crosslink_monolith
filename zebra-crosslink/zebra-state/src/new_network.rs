@@ -1861,7 +1861,7 @@ pub fn sync(
                 println!("Queueing for commit: {}", hash);
                 blocks_to_commit.push((hash, std::sync::Arc::new(block)));
             } else {
-                kill!("NewNet: Got unknown msg type={} len={}", packet_type, msg.len());
+                warning!("NewNet: Got unknown msg type={} len={}, ignoring.", packet_type, msg.len());
                 continue 'process_packets;
             }
 
