@@ -1193,7 +1193,7 @@ pub fn sync(
                 match connect_to(socket, &mut connections_map, &my_keypairs, address) {
                     Err(e) => {
                         println!("NewNet: Recent-address reconnect: connect_to failed: {e}");
-                        break;
+                        continue;
                     }
                     Ok(()) => {},
                 }
@@ -1228,7 +1228,7 @@ pub fn sync(
                 match connect_to(socket, &mut connections_map, &my_keypairs, address) {
                     Err(e) => {
                         println!("NewNet: Alleged-address reconnect: connect_to failed: {e}");
-                        break;
+                        continue;
                     }
                     Ok(()) => {},
                 }
@@ -1245,7 +1245,7 @@ pub fn sync(
                     packets_to_send.push((*key, Vec::from(&buf[..o])));
                 }
 
-                if connections_map.contains_key(sender_connection_key) {
+                if get_connected(&connections_map, &sender_connection_key).is_some() {
                     println!("NewNet: Requesting hole punch to alleged address {:?} via the original sender: {:?}...", address, sender_connection_key);
                     packets_to_send.push((*sender_connection_key, Vec::from(&buf[..o])));
                 }
