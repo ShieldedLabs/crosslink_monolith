@@ -912,6 +912,8 @@ pub struct WalletState {
     pub wallets_tip_h: u64,
 
     pub user_recv_ua: String,
+    pub user_seed_mnemonic: String, // @insecure
+    pub user_ufvk: String, // @assume_1_account
 
     pub actions_in_flight: VecDeque<WalletAction>,
 
@@ -3164,7 +3166,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let (
         mut user_wallet,
         mut user_account,
-        user_seed,
+        user_mnemonic,
         user_usk,
         user_pubkey,
         user_privkey,
@@ -3173,8 +3175,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         mut user_txid_map,
     ) = {
         // roundtrip seed through mnemonic phrase
+        // NOTE: the mnemonic is just an encoding of the *entropy*, & the seed is derived from
+        // that. The seed cannot be converted back to the mnemonic
         let mnemonic = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &global_seed).unwrap();
-        let phrase = mnemonic.words().map(|s| s.to_string()).collect::<Vec<String>>().join(" ");
+        // {
+        //     let mnemonic_entropy = mnemonic.to_entropy_array();
+        //     let entropy = &mnemonic_entropy.0[..mnemonic_entropy.1];
+        //     println!("USER MNEMONIC is entropy {}", global_seed == entropy);
+        //     for b in entropy { print!("{b:02x}"); }
+        // }
+        let phrase = mnemonic.to_string(); // == mnemonic.words().map(|s| s.to_string()).collect::<Vec<String>>().join(" ");
         let (seed, user_usk) = stuff_from_seed_phrase(network, &phrase);
         let (mut user_wallet, user_account) = wallet_from_usk(network, "user", &user_usk);
         let (user_t_addr, user_p2sh, user_ua) = addrs_from_account(&user_account, 0).unwrap();
@@ -3190,7 +3200,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // NOTE: the default isn't the same as below, but I think this is because it forces a diversifier index
         // println!("User wallet: {}/{:?}", user_t_addr_str, user_t_addr1.encode(network));
 
-        (user_wallet, user_account, seed, user_usk, user_pubkey, user_privkey, user_t_addr, user_ua, HashMap::<TxId, (Option<StakingAction>, Vec<String>)>::new())
+        (user_wallet, user_account, mnemonic, user_usk, user_pubkey, user_privkey, user_t_addr, user_ua, HashMap::<TxId, (Option<StakingAction>, Vec<String>)>::new())
     };
 
     let miner_ua_str = miner_ua.encode(network);
@@ -3204,7 +3214,12 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     println!("USER WALLET ADDRESS:    {}", user_ua_str);
     println!("*************************");
 
-    wallet_state.lock().unwrap().user_recv_ua = user_ua_str.clone();
+    {
+        let mut state = wallet_state.lock().unwrap();
+        state.user_recv_ua = user_ua_str.clone();
+        state.user_seed_mnemonic = user_mnemonic.to_string();
+        state.user_ufvk = user_account.ufvk.encode(network);
+    }
 
 
     println!("waiting for zaino to be ready...");

@@ -23,7 +23,7 @@ if "%config%"=="Release" (
 )
 
 if "%project%"=="zebra-crosslink" (
-    set "flags=%flags% -Fviz_gui -Fnew-net"
+    set "flags=%flags% -Fviz_gui"
 )
 
 echo Pushing working dir: "%root%/%project%"

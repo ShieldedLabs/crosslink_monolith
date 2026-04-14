@@ -61,7 +61,7 @@ default-release-binaries = ["release_max_level_info", "progress-bar", "prometheu
 viz_gui = ["zebra-crosslink/viz_gui"]
 
 # Default features for official ZF binary release builds
-default = ["default-release-binaries", "internal-miner"]
+default = ["default-release-binaries", "internal-miner", "new-net"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 

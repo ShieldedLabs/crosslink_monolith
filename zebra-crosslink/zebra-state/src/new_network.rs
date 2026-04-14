@@ -1045,7 +1045,10 @@ pub fn sync(
                         );
             }
             println!("NewNet: Connecting to peer: {:?}", address);
-            let _ = connect_to(socket, &mut connections_map, &my_keypairs, &address);
+            match connect_to(socket, &mut connections_map, &my_keypairs, &address) {
+                Err(e) => println!("NewNet: Initial peer connect: connect_to failed: {e}"),
+                Ok(()) => {},
+            }
             initial_peer_addresses.push(address);
         } else {
             eprintln!("NewNet: Failed to parse peer address: {}", peer_str);
@@ -1074,7 +1077,7 @@ pub fn sync(
     let mut alleged_peer_addresses: HashMap<u16, HashMap<STPAddress, ConnectionKey>> = HashMap::new(); // keyed by sender, not address. connection key of latest sender is stored so we know who to ask to initiate UDP hole punch
 
     let mut peers: HashMap<ConnectionKey, Peer> = HashMap::new();
-    let mut pending_selected_addresses: HashSet<ConnectionKey> = HashSet::new();
+    let mut pending_selected_addresses: HashMap<ConnectionKey, std::time::Instant> = HashMap::new(); // store time for expiry
 
     // let mut XXX_tick_loop_counter = 0usize;
 
@@ -1133,7 +1136,10 @@ pub fn sync(
         for address in &initial_peer_addresses {
             if !connections_map.contains_key(&address.connection_key()) {
                 println!("NewNet: Connecting to {:?}...", address);
-                let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
+                match connect_to(socket, &mut connections_map, &my_keypairs, address) {
+                    Err(e) => println!("NewNet: Initial peer reconnect: connect_to failed: {e}"),
+                    Ok(()) => {},
+                }
             }
         }
 
@@ -1169,19 +1175,41 @@ pub fn sync(
 
             let rng = &mut rand::thread_rng();
 
+            const PEERS_TO_ASK_PUNCH_FOR_RECENTS:  usize = 5;
+            const PEERS_TO_ASK_PUNCH_FOR_ALLEGEDS: usize = 2;
+
             let mut recents: Vec<_> = recent_peer_addresses.iter().collect(); recents.shuffle(rng);
             for (_, map) in recents {
                 if connection_attempts >= MAX_PEERS_TO_CONNECT_PER_ATTEMPT {
                     break;
                 }
-                if let Some((address, _)) = map.iter().choose(rng) {
-                    if !connections_map.contains_key(&address.connection_key()) {
-                        // println!("NewNet: Connecting to {:?}...", address);
-                        let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
-                        connection_attempts += 1;
+                let Some((address, _)) = map.iter().choose(rng) else {
+                    continue;
+                };
+                if connections_map.contains_key(&address.connection_key()) {
+                    continue;
+                }
 
-                        pending_selected_addresses.insert(address.connection_key());
+                match connect_to(socket, &mut connections_map, &my_keypairs, address) {
+                    Err(e) => {
+                        println!("NewNet: Recent-address reconnect: connect_to failed: {e}");
+                        continue;
                     }
+                    Ok(()) => {},
+                }
+
+                connection_attempts += 1;
+
+                pending_selected_addresses.insert(address.connection_key(), std::time::Instant::now());
+
+                // Hole punch
+                let (mut buf, mut o) = ([0u8; 1 + STP_ADDRESS_SERIALIZED_SIZE], 0);
+                o += PACKET_TYPE_WANT_HOLE_PUNCH .write_to(&mut buf[o..]);
+                o += ConnectionKey::from(address).write_to(&mut buf[o..]);
+
+                for (key, _conn) in connections_map.iter().filter(|(_, c)| c.is_connected()).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_RECENTS) {
+                    println!("NewNet: Requesting hole punch to recent address {:?} via random peer: {:?}...", address, _conn.address());
+                    packets_to_send.push((*key, Vec::from(&buf[..o])));
                 }
             }
 
@@ -1190,21 +1218,36 @@ pub fn sync(
                 if connection_attempts >= MAX_PEERS_TO_CONNECT_PER_ATTEMPT {
                     break;
                 }
-                if let Some((address, sender_connection_key)) = map.iter().choose(rng) {
-                    if !connections_map.contains_key(&address.connection_key()) {
-                        // println!("NewNet: Requesting hole punch to {:?} via {:?}...", address, sender_connection_key);
-                        let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
-                        connection_attempts += 1;
+                let Some((address, sender_connection_key)) = map.iter().choose(rng) else {
+                    continue;
+                };
+                if connections_map.contains_key(&address.connection_key()) {
+                    continue;
+                }
 
-                        if connections_map.contains_key(sender_connection_key) {
-                            let (mut buf, mut o) = ([0u8; 1 + STP_ADDRESS_SERIALIZED_SIZE], 0);
-
-                            o += PACKET_TYPE_WANT_HOLE_PUNCH .write_to(&mut buf[o..]);
-                            o += ConnectionKey::from(address).write_to(&mut buf[o..]);
-
-                            packets_to_send.push((*sender_connection_key, Vec::from(&buf[..o])));
-                        }
+                match connect_to(socket, &mut connections_map, &my_keypairs, address) {
+                    Err(e) => {
+                        println!("NewNet: Alleged-address reconnect: connect_to failed: {e}");
+                        continue;
                     }
+                    Ok(()) => {},
+                }
+
+                connection_attempts += 1;
+
+                // Hole punch
+                let (mut buf, mut o) = ([0u8; 1 + STP_ADDRESS_SERIALIZED_SIZE], 0);
+                o += PACKET_TYPE_WANT_HOLE_PUNCH .write_to(&mut buf[o..]);
+                o += ConnectionKey::from(address).write_to(&mut buf[o..]);
+
+                for (key, _conn) in connections_map.iter().filter(|(k, c)| c.is_connected() && *k != sender_connection_key).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_ALLEGEDS) {
+                    println!("NewNet: Requesting hole punch to alleged address {:?} via random peer: {:?}...", address, _conn.address());
+                    packets_to_send.push((*key, Vec::from(&buf[..o])));
+                }
+
+                if get_connected(&connections_map, &sender_connection_key).is_some() {
+                    println!("NewNet: Requesting hole punch to alleged address {:?} via the original sender: {:?}...", address, sender_connection_key);
+                    packets_to_send.push((*sender_connection_key, Vec::from(&buf[..o])));
                 }
             }
 
@@ -1482,6 +1525,8 @@ pub fn sync(
             next_block_send = std::time::Instant::now() + block_send_interval;
         }
 
+        pending_selected_addresses.retain(|addr, time| std::time::Instant::now().saturating_duration_since(*time).as_secs() < 30);
+
         use rand::seq::SliceRandom;
 
         // @@@ @Todo @@@: We need speculative queueing ASAP!
@@ -1530,7 +1575,7 @@ pub fn sync(
             };
 
             let peer = peers.entry(connection_key).or_insert(Peer::default());
-            if pending_selected_addresses.contains(&connection_key) {
+            if pending_selected_addresses.contains_key(&connection_key) {
                 peer.origin = PeerOrigin::Selected;
                 pending_selected_addresses.remove(&connection_key);
             }
@@ -1577,6 +1622,7 @@ pub fn sync(
             if TRACE { println!("got message {packet_type}."); }
 
             if packet_type == PACKET_TYPE_PEER_ADDRESS_LIST {
+                // @Todo: rate limit consumption
 
                 let mut new_alleged_addresses = HashSet::new();
 
@@ -1597,22 +1643,22 @@ pub fn sync(
                 for address in new_alleged_addresses {
                     let map = alleged_peer_addresses.entry(sender_bucket as u16).or_default();
 
-                    if !map.contains_key(&address) {
+                    if TRACE { println!("Adding to alleged addresses: {address:?}"); }
+                    if map.insert(address, connection_key).is_none() { // true if newly inserted
                         if map.len() >= MAX_ADDRESSES_PER_SENDER {
                             map.remove(&map.keys().choose(&mut rand::thread_rng()).cloned().unwrap());
                         }
-                        if TRACE { println!("Added to alleged addresses: {address:?}"); }
-                        map.insert(address, connection_key);
                     }
                 }
 
             } else if packet_type == PACKET_TYPE_WANT_HOLE_PUNCH {
+                // @Todo: rate limit consumption
 
                 let Some(relay_to_connection_key) = some_or_kill!(ConnectionKey::read_from(&mut msg), "Connection key read failed") else {
                     continue 'process_packets;
                 };
 
-                if connections_map.contains_key(&relay_to_connection_key) {
+                if get_connected(&connections_map, &relay_to_connection_key).is_some() {
                     let (mut buf, mut o) = ([0u8; 1 + STP_ADDRESS_SERIALIZED_SIZE], 0);
 
                     o += PACKET_TYPE_TRY_HOLE_PUNCH.write_to(&mut buf[o..]);
@@ -1622,6 +1668,7 @@ pub fn sync(
                 }
 
             } else if packet_type == PACKET_TYPE_TRY_HOLE_PUNCH {
+                // @Todo: rate limit consumption
 
                 let Some(address_to_punch_to) = some_or_kill!(STPAddress::read_from(&mut msg), "Address read failed") else {
                     continue 'process_packets;
@@ -1633,6 +1680,8 @@ pub fn sync(
                 }
 
             } else if packet_type == PACKET_TYPE_STATUS {
+                // @Todo: rate limit consumption
+
                 if TRACE { println!("got a status."); }
 
                 // TODO: rate limit consumption
@@ -1644,6 +1693,7 @@ pub fn sync(
                 peer.their_tree = their_tree;
 
             } else if packet_type == PACKET_TYPE_BLOCK {
+                // @Todo: rate limit consumption
 
                 let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height())
                 else {
