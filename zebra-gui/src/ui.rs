@@ -1114,7 +1114,7 @@ pub fn ui_left_pane(ui: &mut Context,
         ..Decl
     }) {
         tab_id_user_wallet  = ui.tab((radius.0, 0.0, radius.2, radius.3), padding, tab_id, "Your Wallet");
-        tab_id_miner_wallet = ui.tab(radius, padding, tab_id, "Miner Wallet");
+        tab_id_miner_wallet = ui.tab(radius, padding, tab_id, "Faucet Wallet");
     }
     ui.nav_skip = false;
 
