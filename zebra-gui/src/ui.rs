@@ -2372,9 +2372,9 @@ pub fn ui_left_pane(ui: &mut Context,
                                         } else if h == BlockHeight::BUILT {
                                             (ICON_PAPER_PLANE, "This transaction failed to send.") // Failed to send
                                         } else if h == BlockHeight::SENT {
-                                            (ICON_EYE_OFF,     "This transaction was to enter the mempool.")
+                                            (ICON_EYE_OFF,     "This transaction was unable to enter the mempool.")
                                         } else if h == BlockHeight::MEMPOOL {
-                                            (ICON_EYE_1,       "This transaction failed while in the mempool.")
+                                            (ICON_EYE_OFF,     "This transaction failed while in the mempool.")
                                         } else if tx_is_in_block {
                                             (ICON_FORK,        "This transaction is on a side chain.")
                                         } else {
