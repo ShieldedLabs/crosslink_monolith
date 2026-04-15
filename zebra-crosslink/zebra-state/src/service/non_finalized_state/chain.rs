@@ -1926,7 +1926,7 @@ impl Chain {
                 max_staker
             };
 
-            let bond_reward_total = 650_000_000;
+            let bond_reward_total = 500_000_000; // TODO: directly contribute to "reward total" - currently dev fund 20% ignores this in its calculation
             let mut so_far_payed_reward = 0u64;
 
             let mut reward_store_for_revert: Vec<([u8; 32], u64)> = Vec::new();
