@@ -6,6 +6,7 @@ const DUMP_ACTIONS:   bool = false;
 const DUMP_CACHE_TIP: bool = false;
 const DUMP_FAUCET:    bool = false;
 const DUMP_NOTES:     bool = false;
+const DUMP_ODD_FEE:   bool = false;
 const DUMP_ROSTER:    bool = false;
 const DUMP_SYNC:      bool = true;
 const DUMP_TREES:     bool = false;
@@ -13,6 +14,8 @@ const DUMP_TX_BUILD:  bool = false;
 const DUMP_TX_RECV:   bool = false;
 const DUMP_TX_SEND:   bool = false;
 const AUDIT_TXS:      bool = true;
+
+// const PUSH_GUI_NOTES: bool = true;
 
 const TEST_P2SH:      bool = true;
 
@@ -800,7 +803,16 @@ impl WalletTx {
         let spent = all.spent_zats.into_u64();
         let sent = all.sent_zats.into_u64();
         if spent >= sent {
-            Some(Zatoshis::from_u64(spent - sent).ok()?)
+            let fee = spent - sent;
+
+            if DUMP_ODD_FEE {
+                let recv = all.recv_zats.into_u64();
+                if 0 < recv  && recv < fee {
+                    println!("Suspicious fees: {fee} for {}: (flags: {}){:?}, {:?}", self.txid, self.part_flags, self.parts, WalletTxPart::from_staking_action(self.staking_action));
+                }
+            }
+
+            Some(Zatoshis::from_u64(fee).ok()?)
         } else {
             None
         }
@@ -896,6 +908,8 @@ pub struct WalletState {
 
     pub staked_balance:  u64, // in zats
     pub withdrawable_balance:  u64, // in zats
+
+    // pub debug_user_account: Option<ManualAccount>,
 
     pub user_local_txs_n: usize,
     pub user_local_txs: [WalletTx; 3],
@@ -1137,6 +1151,13 @@ fn update_with_tx(wallet: &mut ManualWallet, mut new_tx: WalletTx, insert_i: &mu
     // debug_assert!(new_totals.sent_zats == Zatoshis::const_from_u64(0) || new_totals.sent_zats < new_totals.spent_zats, "must spend for send");
     if !(new_totals.sent_zats == Zatoshis::const_from_u64(0) || new_totals.sent_zats < new_totals.spent_zats) {
         println!("TX ERROR: no spend seen for send {new_totals:?}")
+    }
+
+    if DUMP_ODD_FEE && new_tx.is_coinbase {
+        let all = new_tx.totals(true);
+        if all.recv_zats.into_u64() > 10 * 100_000_000 {
+            println!("Suspicious coinbase: {new_tx:?}");
+        }
     }
 
     if let Some(tx_h) = wallet.tx_h_map.get_mut(&txid) {
@@ -1650,7 +1671,7 @@ impl ManualWallet {
             match output {
                 &TxOutput::Transparent{ dst, zats } => {
                     t.sent(zats, true)?;
-                    let is_to_me = (dst == t_addr); // TODO: more comprehensive address matching
+                    let is_to_me = t_addr_belongs_to_account(account, dst);
                     t.maybe_recv(is_to_me, zats, true)?;
 
                     if let Err(err) = txb.add_transparent_output(&dst, zats) {
@@ -1889,7 +1910,6 @@ impl ManualWallet {
         let tz = Timer::scope("send_orchard_to_orchard_zats");
         let account = &self.accounts[0];
         let keys = PreparedKeys::from_ufvk_all(&account.ufvk);
-        let (_t_addr, _p2sh, ua) = addrs_from_account(account, 0).unwrap(); // @Hack
         if let Some(ovk) = keys.orchard_ovk {
             let zats = to_zats_or_dump_err("shielding zats", exact_amount_to_send)?;
             let out = &[TxOutput::Orchard{ ovk: Some(ovk), dst, zats, memo }];
@@ -2412,6 +2432,16 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
     Some(s)
 }
 
+// TODO: prebuild array of addresses & check membership
+fn t_addr_belongs_to_account(account: &ManualAccount, t_addr: TransparentAddress) -> bool {
+    if let Some((p2pkh, p2sh, _ua)) = addrs_from_account(account, 0) {
+        t_addr == p2pkh || t_addr == p2sh
+    } else {
+        println!("Couldn't determine account t-addresses");
+        false
+    }
+}
+
 fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize, status: TxStatus) -> Option<()> {
     // TODO: we probably want to early-out if our existing tx data is complete
     // (after checking that this doesn't get modified)
@@ -2428,9 +2458,6 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
     let mut t = WalletTxPart::ZERO;
     let mut is_coinbase = false;
     let account = &mut wallet.accounts[account_i];
-
-    // TODO: handle multiple addresses per account
-    let (account_t_addr, account_p2sh, account_ua) = addrs_from_account(account, 0)?;
 
     if let Some(t_bundle) = tx.transparent_bundle() {
         // TODO: t_bundle.authorization
@@ -2487,7 +2514,7 @@ fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys
             }
 
             if let Some(t_addr) = txout.recipient_address() {
-                if (t_addr == account_t_addr || t_addr == account_p2sh) {
+                if t_addr_belongs_to_account(account, t_addr) {
                     let utxo = Txo {
                         recv_h: block_h,
                         spent_h: BlockHeight(0),
