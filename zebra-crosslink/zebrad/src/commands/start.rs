@@ -708,9 +708,10 @@ impl StartCmd {
         if true
         // if false // @Phillip
         {
-            let tmp_dir = tempfile::TempDir::new().unwrap();
-            let _ = std::fs::remove_dir_all(tmp_dir.path());
+            use std::path::PathBuf;
             let zebra_port_base = config.network.listen_addr.port();
+            let mut path = config.state.cache_dir.clone();
+            path.push(PathBuf::from("zaino"));
 
             let zaino_config = zainodlib::config::ZainodConfig {
                 backend: zaino_state::BackendType::Fetch,
@@ -739,7 +740,7 @@ impl StartCmd {
                         shard_power: 4,
                     },
                     database: zaino_common::DatabaseConfig {
-                        path: std::path::PathBuf::from(tmp_dir.path()),
+                        path,
                         size: zaino_common::DatabaseSize::Gb(4),
                     },
                 },
