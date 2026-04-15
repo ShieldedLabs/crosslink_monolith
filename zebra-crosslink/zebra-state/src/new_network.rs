@@ -62,7 +62,7 @@ const PACKET_STATUS_MAX_HASHES: usize = 400; // @Lazy: gives room for 300 hashes
 const PACKET_STATUS_MAX_SIZE:   usize = ((PACKET_STATUS_MAX_HASHES * 32 + JUMBO_FRAG_SIZE - 1) / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE; // @Cleanup @Lazy.
 
 fn dbg_break() {
-    #[cfg(target_arch = "x86_64")] unsafe { std::arch::asm!("int 3"); }
+    //#[cfg(target_arch = "x86_64")] unsafe { std::arch::asm!("int 3"); }
     // @Todo: AArch64 debugbreak.
 }
 
