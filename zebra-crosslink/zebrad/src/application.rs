@@ -235,7 +235,7 @@ impl Application for ZebradApp {
                         .with_network_magic(Magic([67, 108, 84, 48]))
                         .with_slow_start_interval(Height(0))
                         .with_genesis_hash("05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38")
-                        .with_target_difficulty_limit(zebra_chain::work::difficulty::U256::from_str_radix("0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f", 16).unwrap())
+                        .with_target_difficulty_limit(zebra_chain::work::difficulty::U256::from_str_radix("03c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3", 16).unwrap())
                         .with_funding_streams(vec![testnet::ConfiguredFundingStreams {
                             height_range: Some(Height(1)..Height(99_999_999)),
                             recipients: Some(vec![testnet::ConfiguredFundingStreamRecipient {
