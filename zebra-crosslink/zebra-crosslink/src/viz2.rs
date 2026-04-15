@@ -184,6 +184,10 @@ pub async fn service_viz_requests(
                             is_finalized: false,
                             is_implicated_by_bft: false,
                             points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash().0),
+                            // #[cfg(debug_assertions)]
+                            work: bc.header.difficulty_threshold.to_work()
+                                .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
+                                .unwrap_or(0xdeadbeef),
                         });
                     }
                     for i in request.bft_ack_height as usize..internal.bft_blocks.len() {
