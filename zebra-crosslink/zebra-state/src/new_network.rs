@@ -733,8 +733,8 @@ const STATUS_MS: u64 = 839;      // fastest interval at which to send status mes
 const BLOCK_SEND_MS: u64 = 1013; // fastest interval at which to send blocks to peers
 
 
-const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 8;
-const PEER_CONNECT_MS: u64 = 2000;
+const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 4;
+const PEER_CONNECT_MS: u64 = 8000;
 const PEER_GOSSIP_MS:  u64 = 3229;
 
 

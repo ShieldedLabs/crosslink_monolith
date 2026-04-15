@@ -17,7 +17,7 @@ use semver::{BuildMetadata, Version};
 use tokio::sync::watch;
 use zebra_chain::{
     block::Height,
-    parameters::{testnet, Magic},
+    parameters::{subsidy::FundingStreamReceiver, testnet, Magic},
 };
 use zebra_network::constants::PORT_IN_USE_ERROR;
 use zebra_rpc::config::mining::ZcashAddress;
@@ -220,11 +220,7 @@ impl Application for ZebradApp {
                 if c.crosslink.do_not_manipulate_config == false {
                     c.crosslink.bft_peers =
                         vec![
-"96.30.205.23:12301".to_owned(),
-"70.34.200.119:12301".to_owned(),
-"173.199.93.134:12301".to_owned(),
-"66.42.54.194:12301".to_owned(),
-"45.32.185.154:12301".to_owned(),
+"70.34.194.45:12301".to_owned(),
 ];
 
                     c.mempool.debug_enable_at_height = Some(0);
@@ -240,14 +236,18 @@ impl Application for ZebradApp {
                         .with_slow_start_interval(Height(0))
                         .with_genesis_hash("05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38")
                         .with_target_difficulty_limit(zebra_chain::work::difficulty::U256::from_str_radix("0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f", 16).unwrap())
+                        .with_funding_streams(vec![testnet::ConfiguredFundingStreams {
+                            height_range: Some(Height(1)..Height(99_999_999)),
+                            recipients: Some(vec![testnet::ConfiguredFundingStreamRecipient {
+                                receiver: FundingStreamReceiver::MajorGrants,
+                                numerator: 20,
+                                addresses: Some(vec!["t27tjLaUJZ53JKqWPkgd1XCTNWF636eLQRg".to_string()]),
+                            }]),
+                        }])
                         .to_network();
                     
                     c.network.initial_testnet_peers.clear();
-c.network.initial_testnet_peers.insert("96.30.205.23:8233".to_owned());
-c.network.initial_testnet_peers.insert("70.34.200.119:8233".to_owned());
-c.network.initial_testnet_peers.insert("173.199.93.134:8233".to_owned());
-c.network.initial_testnet_peers.insert("66.42.54.194:8233".to_owned());
-c.network.initial_testnet_peers.insert("45.32.185.154:8233".to_owned());
+c.network.initial_testnet_peers.insert("70.34.194.45:8233".to_owned());
 
 
                     c.rpc.listen_addr = Some("127.0.0.1:8232".parse().unwrap());
@@ -257,11 +257,7 @@ c.network.initial_testnet_peers.insert("45.32.185.154:8233".to_owned());
                         .push("zebra_crosslink_workshop_season_one_43593_cache_delete_me");
                     
                     c.state.network_initial_peers = vec![
-"[::ffff:96.30.205.23]:12001:1fgEw5Nx:Acr23D5mFdtKIl_nA6uY8uaRd4LTypYkPdBiUy1cVRQ".to_owned(),
-"[::ffff:70.34.200.119]:12001:1fgEw5Nx:qJDIuDssacWhMP-tVFlouIjc6-A8RlE7r_I2QF6QijU".to_owned(),
-"[::ffff:173.199.93.134]:12001:1fgEw5Nx:pBguqTTv2yOx3Cti7E_Cx6LQ2fmHXwyRbY4I74L0pUo".to_owned(),
-"[::ffff:66.42.54.194]:12001:1fgEw5Nx:3wj6TSOeRDoCZTxShK2h1gd_YAv8aHV6p-DpHQy-dFM".to_owned(),
-"[::ffff:45.32.185.154]:12001:1fgEw5Nx:Lik63-CrHVvmVtG5m-zD1txhUercsKokFqNtCieZNxM".to_owned(),
+"[::ffff:70.34.194.45]:12001:1fgEw5Nx:U-0EN3lTTLDsWQqycyIKhd_9tx9a65BKaDLB1Re9Tks".to_owned(),
 
 ];
 
