@@ -1340,7 +1340,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     socket_setup();
     monotonic_clock_setup();
 
-    let my_port = my_endpoint.map(|e|e.port).unwrap_or(0); // @Todo! Get local port after sock creation! @@@
+    let my_port = my_endpoint.map(|e|e.port).unwrap_or(23485); // @Todo! Get local port after sock creation! @@@
 
     let socket = setup_and_bind_udp_socket(my_port).expect("Failed to bind socket, try again.");
 
