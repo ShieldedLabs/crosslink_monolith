@@ -729,8 +729,8 @@ const TRACE     :bool=0!=       1;
 //        coprime millisecond intervals, so we can make sure our code is not relying on
 //        any kind of consistent or clean timing in order to function properly.
 
-const STATUS_MS: u64 = 839 * 2;      // fastest interval at which to send status messages
-const BLOCK_SEND_MS: u64 = 1013 * 2; // fastest interval at which to send blocks to peers
+const STATUS_MS: u64 = 839 * 4;      // fastest interval at which to send status messages
+const BLOCK_SEND_MS: u64 = 1013 * 3; // fastest interval at which to send blocks to peers
 
 
 const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 4;
@@ -1073,7 +1073,7 @@ pub fn sync(
     let peer_gossip_interval = std::time::Duration::from_millis(PEER_GOSSIP_MS);
     let peer_connect_interval = std::time::Duration::from_millis(PEER_CONNECT_MS);
 
-    const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 12; // DO NOT MAKE LARGE, subject to N^2!!!
+    const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 10; // DO NOT MAKE LARGE, subject to N^2!!!
 
     let mut blocks_to_commit:  Vec<(Hash, std::sync::Arc<Block>)> = Vec::new();
     let mut blocks_to_send:    Vec<(ConnectionKey, Hash, u32)>    = Vec::new();
@@ -1397,7 +1397,9 @@ pub fn sync(
         peers.retain(|connection_key, _| get_connected(&connections_map, connection_key).is_some());
 
         if std::time::Instant::now() >= next_block_send {
-            'send_to_peers: for (connection_key, Peer { origin, their_tree }) in &peers {
+            const MAX_PEERS_TO_SEND_BLOCKS_TO: usize = 8;
+
+            'send_to_peers: for (connection_key, Peer { origin, their_tree }) in &peers.iter().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_SEND_BLOCKS_TO) {
                 // @Duplicate with packet status parsing
 
                 if *their_tree == NearTipBranches::default() {
@@ -1444,7 +1446,7 @@ pub fn sync(
 
                                 if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
                                     blocks_to_this_peer += 1;
-                                    blocks_to_send.push((*connection_key, hash, height));
+                                    blocks_to_send.push((**connection_key, hash, height));
                                 } else {
                                     break;
                                 }
@@ -1532,7 +1534,7 @@ pub fn sync(
                 }
 
                 for (block, height) in blocks_to_queue {
-                    blocks_to_send.push((*connection_key, block, height));
+                    blocks_to_send.push((**connection_key, block, height));
                 }
 
                 // @Todo: Pull.
