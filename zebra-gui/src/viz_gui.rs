@@ -79,6 +79,8 @@ pub struct BcBlock {
     pub is_finalized: bool,
     pub is_implicated_by_bft: bool,
     pub points_at_bft_block: Hash32,
+    // #[cfg(debug_assertions)]
+    pub work: u64,
 }
 impl Default for BcBlock {
     fn default() -> Self {
@@ -91,6 +93,8 @@ impl Default for BcBlock {
             is_finalized: false,
             is_implicated_by_bft: false,
             points_at_bft_block: Hash32::from_u64(0),
+            // #[cfg(debug_assertions)]
+            work: 0,
         }
     }
 }
@@ -432,7 +436,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 
             *seq += 1;
             let this_hash = Hash32::from_u64(*seq);
-            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, is_implicated_by_bft, points_at_bft_block, }, ..Default::default() };
+            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, is_implicated_by_bft, points_at_bft_block, work:1234 }, ..Default::default() };
             viz_state.on_screen_bcs.insert(block.block.this_hash, block);
             this_hash
         };
@@ -543,7 +547,18 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                     if let Some(bc) = viz_state.on_screen_bcs.get_mut(hash) { bc.block.is_implicated_by_bft = true; }
                     else {
                         let parent = viz_state.on_screen_bcs.get(&prev).unwrap();
-                        let block = OnScreenBc { y: spawn_y, block: BcBlock { this_hash: *hash, parent_hash: parent.block.this_hash, txs_n: 1, this_height: parent.block.this_height + 1, is_best_chain: false, is_finalized: false, is_implicated_by_bft: true, points_at_bft_block: Hash32::from_u64(0), }, ..Default::default() };
+                        let block = OnScreenBc { y: spawn_y, block: BcBlock {
+                            this_hash: *hash,
+                            parent_hash: parent.block.this_hash,
+                            txs_n: 1,
+                            this_height: parent.block.this_height + 1,
+                            is_best_chain: false,
+                            is_finalized: false,
+                            is_implicated_by_bft: true,
+                            points_at_bft_block: Hash32::from_u64(0),
+                            // #[cfg(debug_assertions)]
+                            work: 0
+                        }, ..Default::default() };
                         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
                     }
                     prev = *hash;
@@ -890,6 +905,8 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                     };
                     let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
                     draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y as f32, screen_unit, &on_screen_bc.block.this_hash.display_str(), color);
+                    // #[cfg(debug_assertions)]
+                    draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y+screen_unit as f32, screen_unit, &format!("work: 0x{:x}", on_screen_bc.block.work), color);
 
                     let height_text_buf;
                     let height_text = if null_hash_is_rectangle {
@@ -911,6 +928,8 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                     };
                     let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
                     draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y as f32, screen_unit, &text_line, color);
+                    // #[cfg(debug_assertions)]
+                    draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y+screen_unit as f32, screen_unit, &format!("work: 0x{:x}", on_screen_bc.block.work), color);
                 }
             }
 
