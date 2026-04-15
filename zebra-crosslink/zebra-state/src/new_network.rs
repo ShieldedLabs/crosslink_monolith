@@ -729,13 +729,13 @@ const TRACE     :bool=0!=       1;
 //        coprime millisecond intervals, so we can make sure our code is not relying on
 //        any kind of consistent or clean timing in order to function properly.
 
-const STATUS_MS: u64 = 839;      // fastest interval at which to send status messages
-const BLOCK_SEND_MS: u64 = 1013; // fastest interval at which to send blocks to peers
+const STATUS_MS: u64 = 839 * 2;      // fastest interval at which to send status messages
+const BLOCK_SEND_MS: u64 = 1013 * 2; // fastest interval at which to send blocks to peers
 
 
 const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 4;
 const PEER_CONNECT_MS: u64 = 8000;
-const PEER_GOSSIP_MS:  u64 = 3229;
+const PEER_GOSSIP_MS:  u64 = 3229 * 2;
 
 
 const IDLE_MS: u64 = 571; // 571 is the closest prime number to (geometric_mean(839/phi, 1013/phi))

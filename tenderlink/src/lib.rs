@@ -55,7 +55,7 @@ use snow::resolvers::CryptoResolver;
 use tokio::time::Instant;
 use zcash_primitives::bft::{ HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
 
-const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(2500);
+const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(1000);
 
 // NOTE: Sam and Phillip discussed forward jumps; Noise trial decryption already protects connectsions against replay attacks.
 const NONCE_FORWARD_JUMP_TOLERANCE: u64 = 512;
@@ -363,9 +363,9 @@ impl Timeout {
         let timeout = match step {
             // Note(Sam): These timeout should be tuned to match the maximum network load block time. An additional
             // virtue of a short block time that I had not considered is that it hides round stalls better.
-            TMStep::Propose   => Duration::from_millis(10000) + round * Duration::from_millis(2500),
-            TMStep::Prevote   => Duration::from_millis(10000) + round * Duration::from_millis(2500),
-            TMStep::Precommit => Duration::from_millis(10000) + round * Duration::from_millis(2500),
+            TMStep::Propose   => Duration::from_millis(5000) + round * Duration::from_millis(1000),
+            TMStep::Prevote   => Duration::from_millis(5000) + round * Duration::from_millis(1000),
+            TMStep::Precommit => Duration::from_millis(5000) + round * Duration::from_millis(1000),
         };
 
         Timeout{ time: now + timeout, height, round, step }
