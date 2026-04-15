@@ -1893,7 +1893,7 @@ impl ManualWallet {
         if let Some(ovk) = keys.orchard_ovk {
             let zats = to_zats_or_dump_err("shielding zats", exact_amount_to_send)?;
             let out = &[TxOutput::Orchard{ ovk: Some(ovk), dst, zats, memo }];
-            let opts = &TxOptions{ src_pools: &[TxPool::Orchard(orchard_tree)], ..TxOptions::default() };
+            let opts = &TxOptions{ src_pools: &[TxPool::Orchard(orchard_tree), TxPool::Transparent], ..TxOptions::default() };
             self.send_zats(network, tx, client, out, src_usk, opts)
         } else {
             None
@@ -1915,7 +1915,7 @@ impl ManualWallet {
             rand::rngs::OsRng.fill_bytes(&mut pretend_pub_key);
 
             let opts = &TxOptions{
-                src_pools: &[TxPool::Orchard(orchard_tree)],
+                src_pools: &[TxPool::Orchard(orchard_tree), TxPool::Transparent],
                 staking_action: Some(StakingAction_CreateNewDelegationBond {
                     amount_zats: exact_amount_to_send,
                     unique_pubkey: pretend_pub_key,
@@ -1938,7 +1938,7 @@ impl ManualWallet {
         let tz = Timer::scope("begin_unbonding_using_orchard");
         let account = &self.accounts[0];
         let opts = &TxOptions{
-            src_pools: &[TxPool::Orchard(orchard_tree)],
+            src_pools: &[TxPool::Orchard(orchard_tree), TxPool::Transparent],
             staking_action: Some(StakingAction_BeginDelegationUnbonding {
                 unique_pubkey: bond_key,
                 challenge: [0u8; 32],
@@ -1956,7 +1956,7 @@ impl ManualWallet {
         let tz = Timer::scope("begin_unbonding_using_orchard");
         let account = &self.accounts[0];
         let opts = &TxOptions{
-            src_pools: &[TxPool::Orchard(orchard_tree)],
+            src_pools: &[TxPool::Orchard(orchard_tree), TxPool::Transparent],
             staking_action: Some(StakingAction_RetargetDelegationBond {
                 unique_pubkey: bond_key,
                 challenge: [0u8; 32],
