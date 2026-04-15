@@ -81,6 +81,7 @@ pub struct BcBlock {
     pub points_at_bft_block: Hash32,
     // #[cfg(debug_assertions)]
     pub work: u64,
+    pub utc: i64,
 }
 impl Default for BcBlock {
     fn default() -> Self {
@@ -95,6 +96,7 @@ impl Default for BcBlock {
             points_at_bft_block: Hash32::from_u64(0),
             // #[cfg(debug_assertions)]
             work: 0,
+            utc: 0
         }
     }
 }
@@ -436,7 +438,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 
             *seq += 1;
             let this_hash = Hash32::from_u64(*seq);
-            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, is_implicated_by_bft, points_at_bft_block, work:1234 }, ..Default::default() };
+            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, is_implicated_by_bft, points_at_bft_block, work:1234, utc:0 }, ..Default::default() };
             viz_state.on_screen_bcs.insert(block.block.this_hash, block);
             this_hash
         };
@@ -557,7 +559,8 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                             is_implicated_by_bft: true,
                             points_at_bft_block: Hash32::from_u64(0),
                             // #[cfg(debug_assertions)]
-                            work: 0
+                            work: 0,
+                            utc: 0,
                         }, ..Default::default() };
                         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
                     }
@@ -894,6 +897,8 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         if very_zoom_out == false {
             let here_text_y = (origin_y + (y - 0.5)*screen_unit);
             if here_text_y <= draw_ctx.window_height as f32 && here_text_y + screen_unit >= 0.0 {
+                let extra_info = format!("{}", chrono::DateTime::<chrono::Utc>::from_timestamp_secs(on_screen_bc.block.utc).unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC), on_screen_bc.block.work);
+                let extra_info2 = format!("work: 0x{:x}", on_screen_bc.block.work);
                 if on_screen_bc.block.is_best_chain {
                     // hash
                     let text_line_buf;
@@ -906,7 +911,8 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                     let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
                     draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y as f32, screen_unit, &on_screen_bc.block.this_hash.display_str(), color);
                     // #[cfg(debug_assertions)]
-                    draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y+screen_unit as f32, screen_unit, &format!("work: 0x{:x}", on_screen_bc.block.work), color);
+                    draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y+screen_unit as f32, screen_unit, &extra_info, color);
+                    draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y+2*screen_unit as f32, screen_unit, &extra_info2, color);
 
                     let height_text_buf;
                     let height_text = if null_hash_is_rectangle {
@@ -929,7 +935,8 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                     let w = draw_ctx.measure_text_line(FontKind::Mono, screen_unit, &text_line) / screen_unit;
                     draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y as f32, screen_unit, &text_line, color);
                     // #[cfg(debug_assertions)]
-                    draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y+screen_unit as f32, screen_unit, &format!("work: 0x{:x}", on_screen_bc.block.work), color);
+                    draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y+screen_unit as f32, screen_unit, &extra_info, color);
+                    draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y+2*screen_unit as f32, screen_unit, &extra_info2, color);
                 }
             }
 

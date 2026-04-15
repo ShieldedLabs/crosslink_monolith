@@ -188,6 +188,7 @@ pub async fn service_viz_requests(
                             work: bc.header.difficulty_threshold.to_work()
                                 .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
                                 .unwrap_or(0xdeadbeef),
+                            utc: bc.header.time.timestamp(),
                         });
                     }
                     for i in request.bft_ack_height as usize..internal.bft_blocks.len() {

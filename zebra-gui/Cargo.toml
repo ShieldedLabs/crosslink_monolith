@@ -15,6 +15,7 @@ rodio = "0.21.1"
 copypasta = "0.10.1"
 clay-layout = { path = "../clay-rs" }
 wallet = { path = "../zebra-crosslink/wallet" }
+chrono = "0.4.44"
 
 [profile.release]
 debug = 2   # full debug info (0 = none, 1 = line tables only, 2 = full)
