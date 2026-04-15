@@ -1403,7 +1403,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
 
                     ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                    if button(ui, "Paste Address", true) {
+                    if button(ui, "Paste Identity", true) {
                         data.stake_address = ui.input().get_from_clipboard().trim().to_string();
                     }
 
@@ -1489,7 +1489,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
 
                     ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                    if button(ui, "Paste Address", true) {
+                    if button(ui, "Paste Identity", true) {
                         data.stake_address = ui.input().get_from_clipboard().trim().to_string();
                     }
 
@@ -2754,10 +2754,10 @@ pub fn ui_right_pane(ui: &mut Context,
                 recv_address.push_str(&format!("{:02x}", b));
             }
 
-            ui.text("Your Finalizer Address", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+            ui.text("Your Finalizer Identity", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
             ui.text(frame_strf!(data, "[{}..{}]", &recv_address[0..8], &recv_address[recv_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
 
-            if button_ex(ui, "Copy Address", true, true) {
+            if button_ex(ui, "Copy Identity", true, true) {
                 ui.input().send_to_clipboard(&recv_address);
             }
         }
