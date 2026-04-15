@@ -1433,7 +1433,6 @@ impl RosterMember {
         r.read_exact(&mut pub_key)?;
         let voting_power = r.read_u64_le()?;
         let txids_len = r.read_u64_le()? as usize;
-        std::eprintln!("txids_len {txids_len}");
         let mut txids = std::vec::Vec::with_capacity(txids_len);
         for _ in 0..txids_len {
             txids.push(StakeTxId::read_from(r)?);
