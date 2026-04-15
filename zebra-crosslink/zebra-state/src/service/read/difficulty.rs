@@ -236,6 +236,16 @@ fn difficulty_time_and_history_tree(
         .checked_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN))
         .expect("a valid block time plus a small constant is in-range");
 
+    // The max block time rule is only enforced on Testnet at height >= 653_606.
+    // For a fresh testnet starting from an old genesis block, clamping to max_time
+    // would trap timestamps in the past (advancing only 90 min per block).
+    let next_block_height = Height(tip_height.0 + 1);
+    let max_time = if network.is_max_block_time_enforced(next_block_height) {
+        max_time
+    } else {
+        max_time.max(cur_time)
+    };
+
     let cur_time = cur_time.clamp(min_time, max_time);
 
     // Now that we have a valid time, get the difficulty for that time.

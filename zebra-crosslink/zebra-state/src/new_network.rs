@@ -1010,13 +1010,22 @@ pub fn sync(
     socket_setup();
     monotonic_clock_setup();
 
-    let socket = match setup_and_bind_udp_socket(config.network_local_port) {
+    let actual_network_local_port : u16 = {
+        if config.network_local_port == 0 {
+            use rand::RngCore;
+            rand::thread_rng().next_u32() as u16 % 45869 + 2000
+        } else {
+            config.network_local_port
+        }
+    };
+    
+    let socket = match setup_and_bind_udp_socket(actual_network_local_port) {
         Some(s) => {
-            println!("NewNet: Bound to port {}", config.network_local_port);
+            println!("NewNet: Bound to port {}", actual_network_local_port);
             s
         }
         None => {
-            eprintln!("NewNet: Port {} unavailable, binding to ephemeral port", config.network_local_port);
+            eprintln!("NewNet: Port {} unavailable, binding to ephemeral port", actual_network_local_port);
             setup_and_bind_udp_socket(0).expect("Failed to bind UDP socket on any port")
         }
     };
@@ -1055,7 +1064,7 @@ pub fn sync(
         }
     }
 
-    println!("NewNet: STP setup complete, port={}, peers={}", config.network_local_port, initial_peer_addresses.len());
+    println!("NewNet: STP setup complete, port={}, peers={}", actual_network_local_port, initial_peer_addresses.len());
 
     // Sync state
     let tick_duration = std::time::Duration::from_millis(IDLE_MS);

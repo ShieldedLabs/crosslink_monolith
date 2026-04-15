@@ -497,7 +497,7 @@ pub fn connect_to_endpoint(
 }
 
 const        VERBOSE                :bool=0!=                (1);
-const OVERLY_VERBOSE                :bool=0!=                (0);
+const OVERLY_VERBOSE                :bool=0!=                (1);
 
 macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
 
@@ -728,7 +728,8 @@ pub fn service_connections(
                                 .prologue(&packet_memory_encrypted[0..6]).unwrap()
                                 .local_private_key(&my_kp.private).unwrap()
                                 .build_responder().unwrap();
-                            if let Ok(list_of_protocols_len_bytes) = new_handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
+                            let read_message_maybe = new_handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]);
+                            if let Ok(list_of_protocols_len_bytes) = read_message_maybe {
                                 if let Some(client_key) = new_handshake.get_remote_static() {
                                     assert_eq!(list_of_protocols_len_bytes, 0); // temp
                                     // TODO list of supported Application Level protocols for e.g. zcash network upgrades. Note: We will need to use a callback in order for application code on the server to select which magic2 we will use and whether to reject the client. This is because magic2's do not have a strict order preference and so we need to push that logic to the application layer.
@@ -790,7 +791,7 @@ pub fn service_connections(
                                     if OVERLY_VERBOSE { println!("Did NOT respond to Client Hello from {:?}: @Todo explanation: Following expression failed: let Some(client_key) = new_handshake.get_remote_static()", (other_ip_addr, other_port)); }
                                 }
                             } else {
-                                if OVERLY_VERBOSE { println!("Did NOT respond to Client Hello from {:?}: @Todo explanation: let Ok(list_of_protocols_len_bytes) = new_handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).", (other_ip_addr, other_port)); }
+                                if OVERLY_VERBOSE { println!("Did NOT respond to Client Hello from {:?}: new_handshake.read_message failed with error = {:?}", (other_ip_addr, other_port), read_message_maybe); }
                             }
                         }
                     }

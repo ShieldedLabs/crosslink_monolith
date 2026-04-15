@@ -192,7 +192,7 @@ impl Default for Config {
             #[cfg(feature = "elasticsearch")]
             elasticsearch_password: "".to_string(),
             network_identity_seed_string: None,
-            network_local_port: 12001,
+            network_local_port: 0,
             network_initial_peers: Vec::new(),
         }
     }
