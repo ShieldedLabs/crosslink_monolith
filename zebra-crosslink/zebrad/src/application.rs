@@ -220,10 +220,10 @@ impl Application for ZebradApp {
                 if c.crosslink.do_not_manipulate_config == false {
                     c.crosslink.bft_peers =
                         vec![
-"216.128.152.109:12301".to_owned(),
-"66.42.87.0:12301".to_owned(),
-"139.180.155.202:12301".to_owned(),
-"70.34.199.239:12301".to_owned(),
+	"95.179.153.56:12301".to_owned(),
+	"70.34.218.82:12301".to_owned(),
+	"78.141.222.62:12301".to_owned(),
+	"65.20.115.148:12301".to_owned(),
 ];
 
                     c.mempool.debug_enable_at_height = Some(0);
@@ -250,23 +250,23 @@ impl Application for ZebradApp {
                         .to_network();
                     
                     c.network.initial_testnet_peers.clear();
-c.network.initial_testnet_peers.insert("216.128.152.109:8233".to_owned());
-c.network.initial_testnet_peers.insert("66.42.87.0:8233".to_owned());
-c.network.initial_testnet_peers.insert("139.180.155.202:8233".to_owned());
-c.network.initial_testnet_peers.insert("70.34.199.239:8233".to_owned());
+c.network.initial_testnet_peers.insert("95.179.153.56:8233".to_owned());
+c.network.initial_testnet_peers.insert("70.34.218.82:8233".to_owned());
+c.network.initial_testnet_peers.insert("78.141.222.62:8233".to_owned());
+c.network.initial_testnet_peers.insert("65.20.115.148:8233".to_owned());
 
 
                     c.rpc.listen_addr = Some("127.0.0.1:8232".parse().unwrap());
                     c.rpc.enable_cookie_auth = false;
                     c.state
                         .cache_dir
-                        .push("zebra_crosslink_workshop_season_one_938475_cache_delete_me");
+                        .push("zebra_crosslink_workshop_season_one_10493_cache_delete_me");
                     
                     c.state.network_initial_peers = vec![
-"[::ffff:216.128.152.109]:12001:1fgEw5Nx:j2Z0UgRTQqb6W08jlYhvOA07Rnt63RoDICC5BCmYTw4".to_owned(),
-"[::ffff:66.42.87.0]:12001:1fgEw5Nx:esYxkgkLTi2xj51LHxmBhBBynwLOwmpo6nh3OiZl9Qc".to_owned(),
-"[::ffff:139.180.155.202]:12001:1fgEw5Nx:SAzIuEe36zEqADrCL5OtaUPwvogkdW-Q1YO-nmm78W4".to_owned(),
-"[::ffff:70.34.199.239]:12001:1fgEw5Nx:aWU5nXgqJqiaxKa1eTir-WXKIg6B1FIIO9YZx5ya13I".to_owned(),
+"[::ffff:95.179.153.56]:12001:1fgEw5Nx:mZnwM4srK7soc93ZSkBxoxHz5ni4ql0b65qUiaChJRo".to_owned(),
+"[::ffff:70.34.218.82]:12001:1fgEw5Nx:zrO3eiAnTXGDSutRlE4CBJltMlgZsfvObS8ZOtkf63g".to_owned(),
+"[::ffff:78.141.222.62]:12001:1fgEw5Nx:74K3VXdgH1yGexWjL0srh8Yqi-X6ZUO-6fiWaVX2AFA".to_owned(),
+"[::ffff:65.20.115.148]:12001:1fgEw5Nx:JXiubQwCjPHu2hNP9qSJ5_AXy0M69TrlQkH2eJn5pzA".to_owned(),
 
 ];
 
