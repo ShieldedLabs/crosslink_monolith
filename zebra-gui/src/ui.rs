@@ -1139,7 +1139,7 @@ pub fn ui_left_pane(ui: &mut Context,
     const deemph_mul: f32 = 0.6;
     let grey: (u8, u8, u8, u8) = WHITE.mul(deemph_mul);
 
-    let is_staking_day = viz.bc_finalized_tip_height % UI_COPY_STAKING_DAY_PERIOD <= UI_COPY_STAKING_DAY_WINDOW;
+    let is_staking_day = viz.bc_finalized_tip_height % UI_COPY_STAKING_DAY_PERIOD < UI_COPY_STAKING_DAY_WINDOW;
 
     // USER STAKING POSITIONS
     // TODO: phillip audaciously deleted the accumulated bond amount field, bring that back
