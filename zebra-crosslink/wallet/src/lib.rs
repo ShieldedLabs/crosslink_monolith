@@ -3332,11 +3332,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     wallet_state.lock().unwrap().wallet_is_init = true; // TODO: consider only doing this after an initial sync success
 
-    const USER_WALLET_IDX: usize = 0;
-    const MINER_WALLET_IDX: usize = 1;
-    const SYNC_T_TXS_FROM_WALLET: usize = MINER_WALLET_IDX; // TODO: sync multiple
-    let t_addresses = [ user_t_address, miner_t_address ];
-
     let mut auto_spend = (false,);
 
     let mut faucet_shield_cooldown_instant = Instant::now() - Duration::from_secs(1000);
@@ -3982,7 +3977,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             //     req_rng.0.try_into.expect("fits in u32")
             // };
             let wallets = [&mut user_wallet, &mut miner_wallet];
-            let keys = PreparedKeys::from_ufvk_all(&wallets[SYNC_T_TXS_FROM_WALLET].accounts[0].ufvk);
+            let keys = [
+                PreparedKeys::from_ufvk_all(&wallets[0].accounts[0].ufvk),
+                PreparedKeys::from_ufvk_all(&wallets[1].accounts[0].ufvk),
+            ];
             for t_tx_i in 0..t_txs.len() {
                 // kinda @in_step_sync
                 let block_h = t_txs[t_tx_i].0;
@@ -3991,7 +3989,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 let strm_i   = t_txs[t_tx_i].3;
 
                 let mut insert_i = 0;
-                if let Some(()) = read_full_tx(wallets[wallet_i], wallets[wallet_i].strms[strm_i].account_id, &keys, block_h, tx, &mut insert_i, TxStatus::OnBc) {
+                if let Some(()) = read_full_tx(wallets[wallet_i], wallets[wallet_i].strms[strm_i].account_id, &keys[wallet_i], block_h, tx, &mut insert_i, TxStatus::OnBc) {
                 }
             }
         }
