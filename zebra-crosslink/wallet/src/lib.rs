@@ -2646,7 +2646,7 @@ static FAUCET_Q: Mutex<FaucetQ> = Mutex::new(FaucetQ {
     data: [None; FAUCET_Q_LEN],
 });
 const TEST_FAUCET: bool = false;
-const FAUCET_VALUE: u64 = 500_000_000;
+const FAUCET_VALUE: u64 = 50_000_000;
 
 // CHEAT
 fn user_view_of_faucet_tx(tx: &WalletTx) -> WalletTx {

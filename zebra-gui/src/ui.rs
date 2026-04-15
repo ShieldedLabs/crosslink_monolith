@@ -1200,7 +1200,7 @@ pub fn ui_left_pane(ui: &mut Context,
         if container_hovered { ui.capture = true; }
 
         let mut height = grow!(ui.scale(192.0), ui.scale(384.0));
-        if ui.modal == Modal::Stake {
+        if ui.modal == Modal::Stake || ui.modal == Modal::Send {
             height = fit!();
         }
         if ui.modal == Modal::Unstake {
@@ -1362,8 +1362,22 @@ pub fn ui_left_pane(ui: &mut Context,
                             };
 
                             let can = !waiting_for_send && data.send_address.len() != 0;
-                            if button(ui,    "1 cTAZ", can && (balance as u64) >= ONE_cTAZ)       { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ);       }
-                            if button(ui,   "10 cTAZ", can && (balance as u64) >= ONE_cTAZ * 10)  { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), ONE_cTAZ * 10);  }
+                            let sends = [
+                                ("0.1", ONE_cTAZ/10),
+                                // ("0.2", 2*(ONE_cTAZ/10)),
+                                ("0.6", 6*(ONE_cTAZ/10)),
+                                ("1",   ONE_cTAZ),
+                                // ("2",   2*ONE_cTAZ),
+                                ("5",   5*ONE_cTAZ),
+                                // ("10",  10*ONE_cTAZ),
+                                ("31",  31*ONE_cTAZ),
+                                // ("75",  75*ONE_cTAZ),
+                                ("141", 141*ONE_cTAZ),
+                                // ("250", 250*ONE_cTAZ),
+                            ];
+                            for send in sends {
+                                if button(ui, send.0, can && (balance as u64) >= send.1) { wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), send.1);       }
+                            }
                         }
                     }
                 }
@@ -1403,7 +1417,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
 
                     ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                    if button(ui, "Paste Address", true) {
+                    if button(ui, "Paste Identity", true) {
                         data.stake_address = ui.input().get_from_clipboard().trim().to_string();
                     }
 
@@ -1489,7 +1503,7 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
 
                     ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-                    if button(ui, "Paste Address", true) {
+                    if button(ui, "Paste Identity", true) {
                         data.stake_address = ui.input().get_from_clipboard().trim().to_string();
                     }
 
@@ -2754,10 +2768,10 @@ pub fn ui_right_pane(ui: &mut Context,
                 recv_address.push_str(&format!("{:02x}", b));
             }
 
-            ui.text("Your Finalizer Address", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+            ui.text("Your Finalizer Identity", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
             ui.text(frame_strf!(data, "[{}..{}]", &recv_address[0..8], &recv_address[recv_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
 
-            if button_ex(ui, "Copy Address", true, true) {
+            if button_ex(ui, "Copy Identity", true, true) {
                 ui.input().send_to_clipboard(&recv_address);
             }
         }
