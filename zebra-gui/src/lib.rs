@@ -906,9 +906,11 @@ struct PlayingSound {
     volume: f32, // base volume before multiplication by global volume
 }
 
+const GLOBAL_AUDIO_SCALE_FACTOR: f32 = 0.316; // 0.316 ~= perceptually "half volume"
+
 static mut GLOBAL_OUTPUT_STREAM : *mut rodio::OutputStream = std::ptr::null_mut();
 static mut playing_sounds: *mut Vec<PlayingSound> = std::ptr::null_mut(); // These only exist for global volume. A mixer would be better but this is the minimal diff.
-static mut global_audio_volume: f32 = 1.0;
+static mut global_audio_volume: f32 = GLOBAL_AUDIO_SCALE_FACTOR;
 pub fn setup_audio() {
     unsafe {
         if GLOBAL_OUTPUT_STREAM == std::ptr::null_mut() {
@@ -1115,7 +1117,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
     #[allow(deprecated)]
     event_loop.run(move |event, elwt: &winit::event_loop::ActiveEventLoop| {
         unsafe {
-            global_audio_volume = ui.global_audio_volume;
+            global_audio_volume = ui.global_audio_volume * GLOBAL_AUDIO_SCALE_FACTOR;
 
             if playing_sounds != std::ptr::null_mut() {
                 let playing = &mut *playing_sounds;
