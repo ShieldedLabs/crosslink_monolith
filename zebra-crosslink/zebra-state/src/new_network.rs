@@ -49,20 +49,37 @@ const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 //const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
 // @Todo: more of these, merge with Tenderlink, reintroduce peer discovery from p2p, etc.
-const PACKET_TYPE_STATUS: u8 = 1;
-const PACKET_TYPE_BLOCK:  u8 = 2;
+const PACKET_TYPE_STATUS:            u8 = 1;
+const PACKET_TYPE_BLOCK:             u8 = 2;
+const PACKET_TYPE_BLOCK_ACK:         u8 = 3;
+const PACKET_TYPE_PEER_ADDRESS_LIST: u8 = 4;
+const PACKET_TYPE_WANT_HOLE_PUNCH:   u8 = 5;
+const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 6;
+const PACKET_TYPE_COUNT:             u8 = 7;
 
-const PACKET_TYPE_PEER_ADDRESS_LIST: u8 = 3;
-
-const PACKET_TYPE_WANT_HOLE_PUNCH: u8 = 4;
-const PACKET_TYPE_TRY_HOLE_PUNCH:  u8 = 5;
+const PACKET_TYPE_NAMES: [&str; PACKET_TYPE_COUNT as usize] = {
+    let mut names = ["<UNKNOWN>"; PACKET_TYPE_COUNT as usize];
+    names[PACKET_TYPE_STATUS            as usize] = "STATUS";
+    names[PACKET_TYPE_BLOCK             as usize] = "BLOCK";
+    names[PACKET_TYPE_BLOCK_ACK         as usize] = "BLOCK_ACK";
+    names[PACKET_TYPE_PEER_ADDRESS_LIST as usize] = "PEER_ADDRESS_LIST";
+    names[PACKET_TYPE_WANT_HOLE_PUNCH   as usize] = "WANT_HOLE_PUNCH";
+    names[PACKET_TYPE_TRY_HOLE_PUNCH    as usize] = "TRY_HOLE_PUNCH";
+    const_assert!(PACKET_TYPE_COUNT == 7); // keep names array updated when adding other types
+    names
+};
+fn packet_name_from_type(packet_type: u8) -> &'static str {
+    let string_maybe = PACKET_TYPE_NAMES.get(packet_type as usize);
+    let string       = string_maybe.unwrap_or(&"<UNKNOWN>");
+    string
+}
 
 
 const PACKET_STATUS_MAX_HASHES: usize = 400; // @Lazy: gives room for 300 hashes plus room for 200 run metadatas
 const PACKET_STATUS_MAX_SIZE:   usize = ((PACKET_STATUS_MAX_HASHES * 32 + JUMBO_FRAG_SIZE - 1) / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE; // @Cleanup @Lazy.
 
-fn dbg_break() {
-    //#[cfg(target_arch = "x86_64")] unsafe { std::arch::asm!("int 3"); }
+#[cfg(debug_assertions)] fn dbg_break() {
+    #[cfg(target_arch = "x86_64")] unsafe { std::arch::asm!("int 3"); }
     // @Todo: AArch64 debugbreak.
 }
 
@@ -87,7 +104,7 @@ pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
     t
 }
 pub fn verify<T>(t: Option<T>) -> T {
-    if t.is_none() { dbg_break(); }
+    #[cfg(debug_assertions)] if t.is_none() { dbg_break(); }
 
     t.unwrap()
 }
@@ -729,16 +746,16 @@ const TRACE     :bool=0!=       1;
 //        coprime millisecond intervals, so we can make sure our code is not relying on
 //        any kind of consistent or clean timing in order to function properly.
 
-const STATUS_MS: u64 = 839 * 4;      // fastest interval at which to send status messages
-const BLOCK_SEND_MS: u64 = 1013 * 3; // fastest interval at which to send blocks to peers
+const STATUS_MS: u64 = IDLE_MS;  // fastest interval at which to send status messages
+const BLOCK_SEND_MS: u64 = 2000; // fastest interval at which to send blocks to peers
 
 
-const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 4;
-const PEER_CONNECT_MS: u64 = 8000;
-const PEER_GOSSIP_MS:  u64 = 3229 * 2;
+const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 2;
+const PEER_CONNECT_MS: u64 = 6000;
+const PEER_GOSSIP_MS:  u64 = 2500;
 
 
-const IDLE_MS: u64 = 571; // 571 is the closest prime number to (geometric_mean(839/phi, 1013/phi))
+const IDLE_MS: u64 = 550;
 
 // use crate::crosslink::TFLServiceRequest;
 // use crate::crosslink::TFLServiceResponse;
@@ -853,7 +870,7 @@ pub fn is_parent_in_chains(rt: &tokio::runtime::Handle, state: &State, near_tip_
         }
         Ok(Response::KnownBlock(Some(block))) => {
             // @Note: if we don't find the parent in near tip chains, but we ask Zebra and Zebra is aware of it, warn loudly.
-            eprintln!("WARNING!! Block hash {parent_hash} was NOT in near tip chains but contained by Zebra state!!");
+            eprintln!("NewNet: WARNING!! Block hash {parent_hash} was NOT in near tip chains but contained by Zebra state!!");
             //dbg_panic!();
             return true;
         }
@@ -915,10 +932,16 @@ pub enum PeerOrigin {
     Selected,               // chosen from our address map diversely; less likely to be Sybil. AKA: outbound connection.
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 10; // DO NOT MAKE LARGE, subject to N^2!!!
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Peer {
     origin: PeerOrigin,
     their_tree: NearTipBranches,
+    their_queue: HashSet<Hash>,
+
+    in_flight_blocks: HashMap<(Hash, Height), u32 /* jumbogram id */>,
+    in_flight_jumbos: HashMap<u32, (Hash, Height)>,
 }
 
 #[derive(Debug)]
@@ -1035,8 +1058,8 @@ pub fn sync(
     let mut packet_memory_recv      = new_packet_memory();
     let mut packet_memory_send      = new_packet_memory();
 
-    let mut packets_to_send:  Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
-    let mut packets_received: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
+    let mut packets_to_send:  Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
+    let mut packets_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
 
     let mut connections_map: HashMap<ConnectionKey, ConnectionTrackingData> = HashMap::new();
 
@@ -1072,8 +1095,6 @@ pub fn sync(
     let block_send_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
     let peer_gossip_interval = std::time::Duration::from_millis(PEER_GOSSIP_MS);
     let peer_connect_interval = std::time::Duration::from_millis(PEER_CONNECT_MS);
-
-    const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 10; // DO NOT MAKE LARGE, subject to N^2!!!
 
     let mut blocks_to_commit:  Vec<(Hash, std::sync::Arc<Block>)> = Vec::new();
     let mut blocks_to_send:    Vec<(ConnectionKey, Hash, u32)>    = Vec::new();
@@ -1226,7 +1247,7 @@ pub fn sync(
 
                 for (key, _conn) in connections_map.iter().filter(|(_, c)| c.is_connected()).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_RECENTS) {
                     if TRACE { println!("NewNet: Requesting hole punch to recent address {:?} via random peer: {:?}...", address, _conn.address()); }
-                    packets_to_send.push((*key, Vec::from(&buf[..o])));
+                    packets_to_send.push((*key, Vec::from(&buf[..o]), None));
                 }
             }
 
@@ -1259,12 +1280,12 @@ pub fn sync(
 
                 for (key, _conn) in connections_map.iter().filter(|(k, c)| c.is_connected() && *k != sender_connection_key).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_ALLEGEDS) {
                     if TRACE { println!("NewNet: Requesting hole punch to alleged address {:?} via random peer: {:?}...", address, _conn.address()); }
-                    packets_to_send.push((*key, Vec::from(&buf[..o])));
+                    packets_to_send.push((*key, Vec::from(&buf[..o]), None));
                 }
 
                 if get_connected(&connections_map, &sender_connection_key).is_some() {
                     if TRACE { println!("NewNet: Requesting hole punch to alleged address {:?} via the original sender: {:?}...", address, sender_connection_key); }
-                    packets_to_send.push((*sender_connection_key, Vec::from(&buf[..o])));
+                    packets_to_send.push((*sender_connection_key, Vec::from(&buf[..o]), None));
                 }
             }
 
@@ -1313,7 +1334,7 @@ pub fn sync(
                     continue;
                 }
 
-                packets_to_send.push((*key, gossip_packet.clone()));
+                packets_to_send.push((*key, gossip_packet.clone(), None));
             }
 
             next_peer_gossip = std::time::Instant::now() + peer_gossip_interval;
@@ -1326,7 +1347,11 @@ pub fn sync(
         for (connection_key, hash, height) in &blocks_to_send {
             let hash = *hash;
             let Some(connection) = get_connected(&connections_map, connection_key) else {
-                if TRACE { println!("Disconnected!"); }
+                if TRACE { println!("NewNet: Can't send block that was queued for sending: Peer was disconnected: {connection_key:?}"); }
+                continue;
+            };
+            let Some(peer) = peers.get_mut(connection_key) else {
+                if TRACE { println!("NewNet: Can't send block that was queued for sending: Peer does not exist for address: {:?}", connection.address()); }
                 continue;
             };
 
@@ -1359,7 +1384,7 @@ pub fn sync(
                     }
                     Ok(ReadResponse::Block(None)) => {
                         // @Todo: This needs fixing!!! :SidechainSync
-                        eprintln!("Couldn't get block for hash {hash}!");
+                        eprintln!("NewNet: Couldn't get block for hash {hash}!");
                         continue;
                     }
                     Err(err) => { panic!("ReadRequest::Block({hash}): Error: {err:?}");              }
@@ -1367,27 +1392,42 @@ pub fn sync(
                 }
             }
 
-            if TRACE { println!("Hey. I'm sending a BLOCK. Height: {height}. Hash: {hash}."); }
-            packets_to_send.push((*connection_key, serialized_blocks[&hash].clone()));
-            // eprintln!("\x1b[93mPOWLINK2 SENDING BLOCK HASH\x1b[0m: {}", hash);
+            if TRACE { println!("NewNet: Sending BLOCK (Height: {height}, Hash: {hash})"); }
+            let jumbo_id = if let Some(&existing_id) = peer.in_flight_blocks.get(&(hash, Height(*height))) {
+                existing_id // Reuse: fragments contribute to the same reassembly slot
+            } else if let Some(new_id) = allocate_jumbogram_id(&mut connections_map, connection_key) {
+                peer.in_flight_blocks.insert((hash, Height(*height)), new_id);
+                peer.in_flight_jumbos.insert(new_id, (hash, Height(*height)));
+                new_id
+            } else {
+                continue; // connection dropped
+            };
+            packets_to_send.push((*connection_key, serialized_blocks[&hash].clone(), Some(jumbo_id)));
         }
         blocks_to_send.clear();
 
         // Invariant: near_tip_chains contains at least the genesis. Currently.
         assert!(near_tip_chains.tip_height().is_some());
         if std::time::Instant::now() >= next_status {
-            let (mut buf, mut o) = ([0u8; PACKET_STATUS_MAX_SIZE], 0);
+
+            assert!(blocks_to_commit.len() < MAX_BLOCKS_TO_QUEUE_TO_COMMIT);
+            let queue_len = blocks_to_commit.len().min(MAX_BLOCKS_TO_QUEUE_TO_COMMIT) as u8;
+
+            let (mut buf, mut o) = ([0u8; 1 + 1 + MAX_BLOCKS_TO_QUEUE_TO_COMMIT * 32 + PACKET_STATUS_MAX_SIZE], 0);
             o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
+            o += queue_len         .write_to(&mut buf[o..]);
+            for (queued_hash, _) in &blocks_to_commit {
+                o += queued_hash.0.write_to(&mut buf[o..]);
+            }
             o += near_tip_chains   .write_to(&mut buf[o..]);
 
             for (key, connection) in &connections_map {
                 if !connection.is_connected() {
-                    if TRACE { println!("Disconnected!"); }
+                    if TRACE { println!("NewNet: Trying to send a STATUS to {:?}, but was disconnected!", connection.address()); }
                     continue;
                 }
 
-                if TRACE { println!("Hey. I'm sending a STATUS."); }
-                packets_to_send.push((*key, Vec::from(&buf[..o])));
+                packets_to_send.push((*key, Vec::from(&buf[..o]), None));
             }
 
             next_status = std::time::Instant::now() + status_interval;
@@ -1399,18 +1439,18 @@ pub fn sync(
         if std::time::Instant::now() >= next_block_send {
             const MAX_PEERS_TO_SEND_BLOCKS_TO: usize = 8;
 
-            'send_to_peers: for (connection_key, Peer { origin, their_tree }) in &peers.iter().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_SEND_BLOCKS_TO) {
+            'send_to_peers: for (connection_key, Peer { origin, their_tree, their_queue, in_flight_blocks, in_flight_jumbos }) in peers.iter().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_SEND_BLOCKS_TO) {
                 // @Duplicate with packet status parsing
 
                 if *their_tree == NearTipBranches::default() {
                     continue 'send_to_peers; // No messages yet.
                 }
 
-                let mut blocks_to_this_peer = 0;
+                let mut blocks_to_this_peer = their_queue.len();
                 // Skip now-disconnected peers
                 let connection_address = {
                     let Some(connection) = get_connected(&connections_map, &connection_key) else {
-                        eprintln!("Peer is disconnected even after we filtered out disconnected peers. Impossible!: {connection_key:?}");
+                        eprintln!("NewNet: Peer is disconnected even after we filtered out disconnected peers. Impossible!: {connection_key:?}");
                         continue 'send_to_peers;
                     };
                     connection.address()
@@ -1418,8 +1458,8 @@ pub fn sync(
 
                 macro_rules! warning {
                     ($($arg:tt)*) => {{
-                        // let msg = format!("Peer {:?}: {}", connection_address, format!($($arg)*));
-                        eprintln!("{}", format!("Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
+                        // let msg = format!("NewNet: Peer {:?}: {}", connection_address, format!($($arg)*));
+                        eprintln!("{}", format!("NewNet: Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
                     }};
                 }
 
@@ -1428,6 +1468,15 @@ pub fn sync(
                     warning!("I don't have a tip height yet");
                     continue 'send_to_peers;
                 };
+
+                for (_, (hash, height)) in in_flight_jumbos {
+                    if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
+                        blocks_to_this_peer += 1;
+                        blocks_to_send.push((*connection_key, *hash, height.0));
+                    } else {
+                        break;
+                    }
+                }
 
                 // @Note: If the peer is far behind, beam them blocks from farther back in our chain to catch them up.
                 // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
@@ -1444,9 +1493,14 @@ pub fn sync(
                                     break;
                                 };
 
+                                if their_queue.contains(&hash) {
+                                    if TRACE { println!("NewNet: Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
+                                    continue;
+                                }
+
                                 if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
                                     blocks_to_this_peer += 1;
-                                    blocks_to_send.push((**connection_key, hash, height));
+                                    blocks_to_send.push((*connection_key, hash, height));
                                 } else {
                                     break;
                                 }
@@ -1522,9 +1576,16 @@ pub fn sync(
 
                         let block_to_queue = &our_chain.blocks[chain_i];
 
+                        let hash = block_to_queue.this_hash;
+
+                        if their_queue.contains(&hash) {
+                            if TRACE { println!("NewNet: Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
+                            continue;
+                        }
+
                         // We may submit the same block multiple times (visit >1 of our chains that share a short prefix with their branch), and that's valid
                         if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
-                            if blocks_to_queue.insert((block_to_queue.this_hash, height)) {
+                            if blocks_to_queue.insert((hash, height)) {
                                 blocks_to_this_peer += 1;
                             }
                         } else {
@@ -1534,7 +1595,7 @@ pub fn sync(
                 }
 
                 for (block, height) in blocks_to_queue {
-                    blocks_to_send.push((**connection_key, block, height));
+                    blocks_to_send.push((*connection_key, block, height));
                 }
 
                 // @Todo: Pull.
@@ -1554,6 +1615,10 @@ pub fn sync(
         let mut more_packets_likely_available = false;
         // Service STP connections (send/recv).
         // @Todo: real scheduling. Right now I just want to receive everything!
+        for (_, buf, _) in &packets_to_send {
+            assert!(buf.len() > 0);
+            if TRACE { println!("NewNet: Sending message type: {}", packet_name_from_type(buf[0])); }
+        }
         for _ in 0..128 {
             more_packets_likely_available = service_connections(&mut connections_map,
                                                                 &mut packets_received,
@@ -1581,13 +1646,12 @@ pub fn sync(
 
         // Process received packets
         'process_packets: while packets_received.len() > 0 {
-            let (connection_key, msg) = packets_received.remove(0);
-            // if TRACE { println!("got a message."); }
+            let (connection_key, msg, jumbogram_id) = packets_received.remove(0);
 
             // Skip processing packets from now-disconnected peers
             let connection_address = {
                 let Some(connection) = get_connected(&connections_map, &connection_key) else {
-                    eprintln!("Dropping message from disconnected peer: {connection_key:?}");
+                    eprintln!("NewNet: Dropping message from disconnected peer: {connection_key:?}");
                     continue 'process_packets;
                 };
                 connection.address()
@@ -1604,13 +1668,13 @@ pub fn sync(
             macro_rules! warning {
                 ($($arg:tt)*) => {{
                     // let msg = format!("Peer {:?}: {}", connection_address, format!($($arg)*));
-                    eprintln!("{}", format!("Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
+                    eprintln!("{}", format!("NewNet: Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
                 }};
             }
             macro_rules! kill {
                 ($($arg:tt)*) => {{
                     // let msg = format!("Killing peer {:?}: {}", connection_address, format!($($arg)*));
-                    eprintln!("{}", format!("Killing peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
+                    eprintln!("{}", format!("NewNet: Killing peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
                     connections_map.remove(&connection_key);
                     let kill_bucket = address_bucket(local_addresses_secret, &connection_address) & (MAX_RECENT_BUCKETS - 1);
                     if let Some(recents) = recent_peer_addresses.get_mut(&(kill_bucket as u16)) {
@@ -1638,10 +1702,9 @@ pub fn sync(
                 continue 'process_packets;
             };
 
-            // if TRACE { println!("got message {packet_type}."); }
+            if TRACE { println!("NewNet: Got message type: {}", packet_name_from_type(packet_type)); }
 
             if packet_type == PACKET_TYPE_PEER_ADDRESS_LIST {
-                if TRACE { println!("Got message type: PEER_ADDRESS_LIST"); }
                 // @Todo: rate limit consumption
 
                 let mut new_alleged_addresses = HashSet::new();
@@ -1663,16 +1726,16 @@ pub fn sync(
                 for address in new_alleged_addresses {
                     let map = alleged_peer_addresses.entry(sender_bucket as u16).or_default();
 
-                    if TRACE { println!("Adding to alleged addresses: {address:?}"); }
+                    let address_clone_for_printing = address.clone();
                     if map.insert(address, connection_key).is_none() { // true if newly inserted
                         if map.len() >= MAX_ADDRESSES_PER_SENDER {
                             map.remove(&map.keys().choose(&mut rand::thread_rng()).cloned().unwrap());
                         }
                     }
+                    if TRACE { println!("NewNet: Adding new address to alleged addresses: {address_clone_for_printing:?}"); }
                 }
 
             } else if packet_type == PACKET_TYPE_WANT_HOLE_PUNCH {
-                if TRACE { println!("Got message type: WANT_HOLE_PUNCH"); }
                 // @Todo: rate limit consumption
 
                 let Some(relay_to_connection_key) = some_or_kill!(ConnectionKey::read_from(&mut msg), "Connection key read failed") else {
@@ -1686,11 +1749,10 @@ pub fn sync(
                     o += connection_address        .write_to(&mut buf[o..]);
 
                     if TRACE { println!("NewNet: Relaying hole punch request from {:?} to {:?}...", connection_address, relay_to_connection_key); }
-                    packets_to_send.push((relay_to_connection_key, Vec::from(&buf[..o])));
+                    packets_to_send.push((relay_to_connection_key, Vec::from(&buf[..o]), None));
                 }
 
             } else if packet_type == PACKET_TYPE_TRY_HOLE_PUNCH {
-                if TRACE { println!("Got message type: TRY_HOLE_PUNCH"); }
                 // @Todo: rate limit consumption
 
                 let Some(address_to_punch_to) = some_or_kill!(STPAddress::read_from(&mut msg), "Address read failed") else {
@@ -1703,19 +1765,55 @@ pub fn sync(
                 }
 
             } else if packet_type == PACKET_TYPE_STATUS {
-                if TRACE { println!("Got message type: STATUS"); }
                 // @Todo: rate limit consumption
 
-                // TODO: rate limit consumption
-                let Some(their_tree) = some_or_kill!(NearTipBranches::read_from(&mut msg), "NearTipBranches read failed")
-                else {
+                let Some(queue_len) = some_or_kill!(u8::read_from(&mut msg), "Failed to read block queue length") else {
+                    continue 'process_packets;
+                };
+                if queue_len as usize > MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
+                    kill!("Too many queued block hashes sent in a peer status! Was {queue_len}, max is {MAX_BLOCKS_TO_QUEUE_TO_COMMIT}.");
+                    continue 'process_packets;
+                }
+
+                let mut their_queue = HashSet::new();
+                for _ in 0..queue_len {
+                    let Some(hash) = some_or_kill!(<[u8; 32]>::read_from(&mut msg), "Failed to read block hash") else {
+                        continue 'process_packets;
+                    };
+                    their_queue.insert(Hash(hash));
+                };
+
+                let Some(their_tree) = some_or_kill!(NearTipBranches::read_from(&mut msg), "NearTipBranches read failed") else {
                     continue 'process_packets;
                 };
 
                 peer.their_tree = their_tree;
+                peer.their_queue = their_queue;
+
+            } else if packet_type == PACKET_TYPE_BLOCK_ACK {
+                let Some(ack_jumbo) = some_or_kill!(u32::read_from(&mut msg), "Failed to read jumbogram id") else {
+                    continue 'process_packets;
+                };
+
+                // let Some(ack_hash) = some_or_kill!(<[u8; 32]>::read_from(&mut msg), "Failed to read block hash") else {
+                //     continue 'process_packets;
+                // };
+
+                if let Some(ack_hash) = peer.in_flight_jumbos.get(&ack_jumbo) {
+                    peer.in_flight_blocks.remove(&ack_hash);
+                }
+                peer.in_flight_jumbos.remove(&ack_jumbo);
 
             } else if packet_type == PACKET_TYPE_BLOCK {
-                if TRACE { println!("Got message type: BLOCK"); }
+                // send ack
+                if let Some(id) = jumbogram_id {
+                    let id: u32 = id; // type assertion
+                    let (mut buf, mut o) = ([0u8; 1 + 32], 0);
+                    o += PACKET_TYPE_BLOCK_ACK.write_to(&mut buf[o..]);
+                    o += id                   .write_to(&mut buf[o..]);
+                    packets_to_send.push((connection_key, Vec::from(&buf[..o]), None));
+                }
+
                 // @Todo: rate limit consumption
 
                 let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height())
@@ -1741,19 +1839,17 @@ pub fn sync(
                 // is "not even worth" submitting to Zebra (rejected due to being too far back).
                 let min_height = near_tip_chains.chains[0].blocks[0].this_height; // @Todo: this assumes :AssumeGenesisBlockIncludedInNearTipChains
 
+                if TRACE { println!("NewNet: Block @ {alleged_height}..."); }
+
                 if alleged_height < min_height {
                     warning!("Block at height {alleged_height} is below our near-tip-chain height {min_height}");
                     continue 'process_packets; // Deciding that it's "not even worth" sending to Zebra
                 }
 
-                if TRACE { println!(">= min_height."); }
-
                 if alleged_height <= near_tip_chains.finalized_height {
                     warning!("Block at height {alleged_height} is already finalized");
                     continue 'process_packets; // Definitely already committed :)
                 }
-
-                if TRACE { println!("> finalized_height."); }
 
                 // @Note: the hash could be computed from the block header, so this is an early-out optimization.
                 let Some(alleged_hash) = some_or_kill!(<[u8; 32]>::read_from(&mut msg), "Failed to read block hash") else {
@@ -1761,14 +1857,14 @@ pub fn sync(
                 };
                 let alleged_hash = Hash(alleged_hash);
 
-                if TRACE { println!("hash read."); }
+                if TRACE { println!("NewNet: Block @ {alleged_height} hash {alleged_hash}..."); }
 
                 if blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == alleged_hash) {
                     warning!("Block was already queued to commit!: {alleged_hash}");
                     continue 'process_packets;
                 }
 
-                if TRACE { println!("not already queued."); }
+                if TRACE { println!("NewNet: Block @ {alleged_height} hash {alleged_hash}, not already queued..."); }
 
                 for our_chain in &near_tip_chains.chains {
                     if our_chain.blocks.iter().any(|block| block.this_hash == alleged_hash) {
@@ -1777,7 +1873,7 @@ pub fn sync(
                     }
                 }
 
-                if TRACE { println!("not already in near_tip_chains."); }
+                if TRACE { println!("NewNet: Block @ {alleged_height} hash {alleged_hash}, not already in near_tip_chains..."); }
 
                 // @Volatile, depends on block header format.
                 let parent_hash = {
@@ -1799,7 +1895,7 @@ pub fn sync(
                     continue 'process_packets;
                 }
 
-                if TRACE { println!("hash and height."); }
+                if TRACE { println!("NewNet: Block @ {alleged_height} hash {alleged_hash}, valid hash and height and links somewhere known..."); }
 
                 use zebra_chain::serialization::ZcashDeserializeInto;
                 let Some(block) = some_or_kill!(msg.zcash_deserialize_into::<Block>().ok(), "Failed to deserialize block") else {
@@ -1811,7 +1907,7 @@ pub fn sync(
                 //        - call it at the top of the place where they are currently used
                 //        - call that right here
 
-                if TRACE { println!("deserialized."); }
+                if TRACE { println!("NewNet: Block @ {alleged_height} hash {alleged_hash}, deserialized..."); }
 
                 let hash = block.hash();
                 if hash != alleged_hash {
@@ -1833,9 +1929,7 @@ pub fn sync(
                     continue 'process_packets;
                 }
 
-                eprintln!("\x1b[93mPOWLINK2 GOT BLOCK HASH\x1b[0m: {}", hash);
-
-                if TRACE { println!("hash and height."); }
+                eprintln!("NewNet: \x1b[93mGOT BLOCK HASH\x1b[0m: {}", hash);
 
                 // @Todo(Phil): Semantic verification.
 
@@ -1894,11 +1988,13 @@ pub fn sync(
                     let oldest = recents_bucket.iter().min_by_key(|(_, v)| v.recv_time_ns).map(|(k, _)| k.clone());
                     if let Some(k) = oldest { recents_bucket.remove(&k); }
                 }
-                if TRACE { println!("Added to recent addresses: {connection_address:?}"); }
-                recents_bucket.insert(connection_address.clone(), RecentPeerAddress {
+                let prev = recents_bucket.insert(connection_address.clone(), RecentPeerAddress {
                     recv_time_ns: monotonic_clock_ns(),
                     failure_count: 0u32, // @Todo: Implement this counter!
                 });
+                if prev.is_none() {
+                    if TRACE { println!("NewNet: Added address to recent addresses: {connection_address:?}"); }
+                }
             }
 
             // Alleged addresses that are now in recent_peer_addresses are skipped lazily
