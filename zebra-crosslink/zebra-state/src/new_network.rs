@@ -1473,7 +1473,7 @@ pub fn sync(
                 // Evict jumbos that are too old
                 let now = std::time::Instant::now();
                 let mut removals: Vec<(u32, (Hash, Height))> = Vec::new();
-                const JUMBO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(11);
+                const JUMBO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
                 for (jumbogram_id, (hash, height, time)) in &mut *in_flight_jumbos {
                     if now.duration_since(*time) >= JUMBO_TIMEOUT {
                         removals.push((*jumbogram_id, (*hash, *height)));
