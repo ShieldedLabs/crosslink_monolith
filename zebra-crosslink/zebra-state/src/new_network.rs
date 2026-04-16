@@ -1500,10 +1500,13 @@ pub fn sync(
                     }
                 }
 
+                let mut blocks_to_queue = HashSet::new();
+
                 for (_, (hash, height, time)) in in_flight_jumbos {
                     if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
-                        blocks_to_this_peer += 1;
-                        blocks_to_send.push((*connection_key, *hash, height.0));
+                        if blocks_to_queue.insert((*hash, height.0)) {
+                            blocks_to_this_peer += 1;
+                        }
                     } else {
                         break;
                     }
@@ -1530,8 +1533,9 @@ pub fn sync(
                                 }
 
                                 if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
-                                    blocks_to_this_peer += 1;
-                                    blocks_to_send.push((*connection_key, hash, height));
+                                    if blocks_to_queue.insert((hash, height)) {
+                                        blocks_to_this_peer += 1;
+                                    }
                                 } else {
                                     break;
                                 }
@@ -1568,7 +1572,6 @@ pub fn sync(
 
                 // @Note: With this algorithm, another peer can systematically probe which
                 //        blocks we have on each branch. This may have implications.
-                let mut blocks_to_queue = HashSet::new();
                 for our_chain in &near_tip_chains.chains {
                     assert!(our_chain.blocks.len() > 0);
 
