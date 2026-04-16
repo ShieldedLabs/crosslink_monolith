@@ -219,11 +219,10 @@ impl Application for ZebradApp {
                 let mut c = self.config.read().deref().clone();
                 if c.crosslink.do_not_manipulate_config == false {
                     c.crosslink.bft_peers = vec![
-                        "70.34.196.192:12301".to_owned(),
-                        "95.179.153.112:12301".to_owned(),
-                        "45.32.234.251:12301".to_owned(),
-                        "78.141.220.253:12301".to_owned(),
-                        "70.34.216.166:12301".to_owned(),
+"70.34.201.146:12301".to_owned(),
+"70.34.209.22:12301".to_owned(),
+"70.34.195.191:12301".to_owned(),
+"70.34.209.18:12301".to_owned(),
                     ];
 
                     c.mempool.debug_enable_at_height = Some(0);
@@ -249,25 +248,24 @@ impl Application for ZebradApp {
                         .to_network();
 
                     c.network.initial_testnet_peers.clear();
-                    c.network.initial_testnet_peers.insert("70.34.196.192:8233".to_owned());
-                    c.network.initial_testnet_peers.insert("95.179.153.112:8233".to_owned());
-                    c.network.initial_testnet_peers.insert("45.32.234.251:8233".to_owned());
-                    c.network.initial_testnet_peers.insert("78.141.220.253:8233".to_owned());
-                    c.network.initial_testnet_peers.insert("70.34.216.166:8233".to_owned());
+c.network.initial_testnet_peers.insert("70.34.201.146:8233".to_owned());
+c.network.initial_testnet_peers.insert("70.34.209.22:8233".to_owned());
+c.network.initial_testnet_peers.insert("70.34.195.191:8233".to_owned());
+c.network.initial_testnet_peers.insert("70.34.209.18:8233".to_owned());
+
 
 
                     c.rpc.listen_addr = Some("127.0.0.1:8232".parse().unwrap());
                     c.rpc.enable_cookie_auth = false;
                     c.state
                         .cache_dir
-                        .push("zebra_crosslink_workshop_season_one_16925_cache_delete_me");
+                        .push("zebra_crosslink_workshop_season_one_v2_37482_cache_delete_me");
 
                     c.state.network_initial_peers = vec![
-                        "[::ffff:70.34.196.192]:12001:1fgEw5Nx:uiIG_dETMIIWTbkgLcRfZmve-paO2SyAjzpruJsJKx4".to_owned(),
-                        "[::ffff:95.179.153.112]:12001:1fgEw5Nx:gigvT6OSAFX47O5n3ut88OJs8bP2NjaWS5BTSQsjnlM".to_owned(),
-                        "[::ffff:45.32.234.251]:12001:1fgEw5Nx:y41cMe9dGDGLRfJ8cYwDgYnPuL5UfZNVArj6qbwezEQ".to_owned(),
-                        "[::ffff:78.141.220.253]:12001:1fgEw5Nx:9ujjUvi1EWcd40lsnuDuOG-0MxZ5qa3ur-5bagxwvm8".to_owned(),
-                        "[::ffff:70.34.216.166]:12001:1fgEw5Nx:_F3wQ4-Djn-7EzkWYfkmq5QbGOgqZDEHV2vGUFWFuWg".to_owned(),
+"[::ffff:70.34.201.146]:12001:1fgEw5Nx:_BA-d-zgMDO3lj5R-FgL3VwJQofnPVZarZSUzx9ZMhs".to_owned(),
+"[::ffff:70.34.209.22]:12001:1fgEw5Nx:2huJ7vzzieTrT_dFMaQwhS0fSGZFatCeBXNFCXTfJCs".to_owned(),
+"[::ffff:70.34.195.191]:12001:1fgEw5Nx:iezUrR8zwiqzt1__9Ex0OiqQ1O0gbipHuuKwCHwQggo".to_owned(),
+"[::ffff:70.34.209.18]:12001:1fgEw5Nx:9nM4V10MYltC-ShN4OaEQlvDiFHEJtsOYmOroLBanQM".to_owned(),
                     ];
 
                 }
