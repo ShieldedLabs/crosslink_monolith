@@ -939,7 +939,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
 
                 let extra_info = DateTime::<Utc>::from_timestamp_secs(on_screen_bc.block.utc).unwrap_or(DateTime::<Utc>::MAX_UTC).to_string();
                 let extra_info2 = format!("work: 0x{:x}", on_screen_bc.block.work);
-                let extra_info3 = format!("size: {} ({} / {})", on_screen_bc.block.serialized_size, on_screen_bc.block.serialized_size + 37, (on_screen_bc.block.serialized_size + 37 + 1175) / 1176);
+                let extra_info3 = format!("size: {} ({})", on_screen_bc.block.serialized_size, (on_screen_bc.block.serialized_size + 37 + 1399) / 1400);
                 // #[cfg(debug_assertions)]
                 draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y+screen_unit as f32, screen_unit, &extra_info, color);
                 draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y+2.0*screen_unit as f32, screen_unit, &extra_info2, color);
