@@ -218,17 +218,16 @@ impl Application for ZebradApp {
                 // NORMAL OPERATION CROSSLINK CONFIG OVERRIDES
                 let mut c = self.config.read().deref().clone();
                 if c.crosslink.do_not_manipulate_config == false {
-                    c.crosslink.bft_peers =
-                        vec![
-"209.250.255.139:12301".to_owned(),
-"45.77.139.242:12301".to_owned(),
-"70.34.209.3:12301".to_owned(),
-"70.34.202.64:12301".to_owned(),
-
-];
+                    c.crosslink.bft_peers = vec![
+                        "70.34.196.192:12301".to_owned(),
+                        "95.179.153.112:12301".to_owned(),
+                        "45.32.234.251:12301".to_owned(),
+                        "78.141.220.253:12301".to_owned(),
+                        "70.34.216.166:12301".to_owned(),
+                    ];
 
                     c.mempool.debug_enable_at_height = Some(0);
-                    
+
                     // c.mining.miner_address = Some(
                     //     ZcashAddress::try_from_encoded("tmRB9AEVsxNAQsqtJPqJUje9KCaAijpS77z")
                     //         .unwrap(),
@@ -248,29 +247,28 @@ impl Application for ZebradApp {
                             }]),
                         }])
                         .to_network();
-                    
+
                     c.network.initial_testnet_peers.clear();
-
-c.network.initial_testnet_peers.insert("209.250.255.139:8233".to_owned());
-c.network.initial_testnet_peers.insert("45.77.139.242:8233".to_owned());
-c.network.initial_testnet_peers.insert("70.34.209.3:8233".to_owned());
-c.network.initial_testnet_peers.insert("70.34.202.64:8233".to_owned());
-
+                    c.network.initial_testnet_peers.insert("70.34.196.192:8233".to_owned());
+                    c.network.initial_testnet_peers.insert("95.179.153.112:8233".to_owned());
+                    c.network.initial_testnet_peers.insert("45.32.234.251:8233".to_owned());
+                    c.network.initial_testnet_peers.insert("78.141.220.253:8233".to_owned());
+                    c.network.initial_testnet_peers.insert("70.34.216.166:8233".to_owned());
 
 
                     c.rpc.listen_addr = Some("127.0.0.1:8232".parse().unwrap());
                     c.rpc.enable_cookie_auth = false;
                     c.state
                         .cache_dir
-                        .push("zebra_crosslink_workshop_season_one_40348_cache_delete_me");
-                    
-                    c.state.network_initial_peers = vec![
-"[::ffff:209.250.255.139]:12001:1fgEw5Nx:1X2vm4ynqvQpoBJg_X6hIBb_fg9L5HAMMTnNl5UkrGU".to_owned(),
-"[::ffff:45.77.139.242]:12001:1fgEw5Nx:K9USugtJMfH6a-Sfd8fVVPNshTcQDRi24Ej0E2n0XSk".to_owned(),
-"[::ffff:70.34.209.3]:12001:1fgEw5Nx:Nzw7ELqPOVIrPqeazNjQBFPHrOoeS-2M5N-E6juF4zI".to_owned(),
-"[::ffff:70.34.202.64]:12001:1fgEw5Nx:-3WYXGpTY3CISx_3LsivPZj97BN8-sbfWH5gsFG_B2g".to_owned(),
+                        .push("zebra_crosslink_workshop_season_one_16925_cache_delete_me");
 
-];
+                    c.state.network_initial_peers = vec![
+                        "[::ffff:70.34.196.192]:12001:1fgEw5Nx:uiIG_dETMIIWTbkgLcRfZmve-paO2SyAjzpruJsJKx4".to_owned(),
+                        "[::ffff:95.179.153.112]:12001:1fgEw5Nx:gigvT6OSAFX47O5n3ut88OJs8bP2NjaWS5BTSQsjnlM".to_owned(),
+                        "[::ffff:45.32.234.251]:12001:1fgEw5Nx:y41cMe9dGDGLRfJ8cYwDgYnPuL5UfZNVArj6qbwezEQ".to_owned(),
+                        "[::ffff:78.141.220.253]:12001:1fgEw5Nx:9ujjUvi1EWcd40lsnuDuOG-0MxZ5qa3ur-5bagxwvm8".to_owned(),
+                        "[::ffff:70.34.216.166]:12001:1fgEw5Nx:_F3wQ4-Djn-7EzkWYfkmq5QbGOgqZDEHV2vGUFWFuWg".to_owned(),
+                    ];
 
                 }
                 Arc::new(c)

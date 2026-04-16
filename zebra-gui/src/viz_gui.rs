@@ -897,7 +897,8 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         if very_zoom_out == false {
             let here_text_y = (origin_y + (y - 0.5)*screen_unit);
             if here_text_y <= draw_ctx.window_height as f32 && here_text_y + screen_unit >= 0.0 {
-                let extra_info = format!("{} {}", chrono::DateTime::<chrono::Utc>::from_timestamp_secs(on_screen_bc.block.utc).unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC), on_screen_bc.block.work);
+                use chrono::{DateTime,Utc};
+                let extra_info = DateTime::<Utc>::from_timestamp_secs(on_screen_bc.block.utc).unwrap_or(DateTime::<Utc>::MAX_UTC).to_string();
                 let extra_info2 = format!("work: 0x{:x}", on_screen_bc.block.work);
                 if on_screen_bc.block.is_best_chain {
                     // hash
