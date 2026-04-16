@@ -189,6 +189,7 @@ pub async fn service_viz_requests(
                                 .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
                                 .unwrap_or(0xdeadbeef),
                             utc: bc.header.time.timestamp(),
+                            serialized_size: bc.zcash_serialized_size(),
                         });
                     }
                     for i in request.bft_ack_height as usize..internal.bft_blocks.len() {
