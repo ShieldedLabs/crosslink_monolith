@@ -1208,7 +1208,7 @@ pub fn service_connections(
             let mut shuffle_vec : Vec<_> = data.chunks(frag_mtu).collect();
             use rand::seq::SliceRandom;
             shuffle_vec.shuffle(&mut rand::thread_rng());
-            for fragment in shuffle_vec {
+            for fragment in &shuffle_vec {
                 let hdr  = PackletHeader::new(PackletTag::OneJumboFragment, std::mem::size_of::<PackletOneJumboFragment>() + fragment.len());
                 let frag = PackletOneJumboFragment::new(jumbo_id, data.len(), jumbo_o);
                 jumbo_o += fragment.len();
@@ -1223,10 +1223,10 @@ pub fn service_connections(
 
                 send(&packet_memory_send[..mMTU_inside_stp]);
                 packet_counter_index += 1;
-                if packet_counter_index > 2000 {
+                if packet_counter_index > 1000 {
                     return result;
                 }
-                std::thread::sleep(std::time::Duration::from_micros(200));
+                std::thread::yield_now();
             }
         } else {
             let hdr  = PackletHeader::new(PackletTag::AnEntireDatagram, data.len());
@@ -1240,10 +1240,10 @@ pub fn service_connections(
             
             send(&packet_memory_send[..mMTU_inside_stp]);
             packet_counter_index += 1;
-            if packet_counter_index > 2000 {
+            if packet_counter_index > 1000 {
                 return result;
             }
-            std::thread::sleep(std::time::Duration::from_micros(200));
+            std::thread::yield_now();
         }
     }
 
