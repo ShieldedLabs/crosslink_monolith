@@ -575,14 +575,7 @@ where
                 // TODO: deduplicate this code with remaining_transaction_value()?
                 miner_fee = match value_balance {
                     Ok(vb) => match vb.remaining_transaction_value() {
-                        Ok(tx_rtv) => Some(
-                            if let Transaction::VCrosslink{..} = *tx {
-                                // TODO: remove this complete @Hack
-                                <Amount<NonNegative>>::new_from_zec(zebra_chain::transaction::zip317::MIN_MEMPOOL_TX_FEE_RATE as i64 * 1)
-                            } else {
-                                tx_rtv
-                            }
-                        ),
+                        Ok(tx_rtv) => Some(tx_rtv),
                         Err(_) => return Err(TransactionError::IncorrectFee),
                     },
                     Err(_) => return Err(TransactionError::IncorrectFee),
