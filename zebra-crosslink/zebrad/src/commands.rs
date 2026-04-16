@@ -25,7 +25,7 @@ mod tests;
 use ZebradCmd::*;
 
 /// Zebrad Configuration Filename
-pub const CONFIG_FILE: &str = "zebrad.toml";
+pub const CONFIG_FILE: &str = "crosslink_s1_v2_zebrad.toml";
 
 /// Zebrad Subcommands
 #[derive(Command, Debug, clap::Subcommand)]
