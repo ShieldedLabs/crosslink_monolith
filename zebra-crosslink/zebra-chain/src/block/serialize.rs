@@ -24,7 +24,7 @@ use zcash_primitives::bft;
 /// block header and transaction count, the maximum size of a
 /// transaction in the chain is approximately 1.5 kB smaller.)
 // Note(Sam): We are making this smaller because new network does not support streaming blocks at the moment.
-pub const MAX_BLOCK_BYTES: u64 = 50_000;
+pub const MAX_BLOCK_BYTES: u64 = 200_000;
 //pub const MAX_BLOCK_BYTES: u64 = 2_000_000;
 
 /// Checks if a block header version is valid.

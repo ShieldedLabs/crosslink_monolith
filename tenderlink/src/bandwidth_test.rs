@@ -1128,7 +1128,16 @@ pub fn service_connections(
         }
     } true});
 
-    for (connection_key, data) in packets_to_send {
+    for (packet_counter_index, (connection_key, data)) in packets_to_send.iter().enumerate() {
+        if packet_counter_index > 5000 {
+            return result;
+        }
+        
+        let target = std::time::Instant::now() + std::time::Duration::from_micros(100);
+        while std::time::Instant::now() < target {
+            std::hint::spin_loop();
+        }
+    
         let Some(ref mut connection) = connections_map.get_mut(connection_key)
         else {
             continue;
