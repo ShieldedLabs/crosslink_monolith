@@ -1153,12 +1153,9 @@ pub fn service_connections(
         }
     } true});
 
-    for (packet_counter_index, (connection_key, data, jumbo_id_override)) in packets_to_send.iter().enumerate() {
-        if packet_counter_index > 1000 {
-            return result;
-        }
-        std::thread::yield_now();
 
+    let mut packet_counter_index = 0;
+    for (connection_key, data, jumbo_id_override) in packets_to_send {
         let Some(ref mut connection) = connections_map.get_mut(connection_key)
         else {
             continue;
@@ -1208,7 +1205,10 @@ pub fn service_connections(
                 }
             };
             let mut jumbo_o: usize = 0;
-            for fragment in data.chunks(frag_mtu) {
+            let mut shuffle_vec : Vec<_> = data.chunks(frag_mtu).collect();
+            use rand::seq::SliceRandom;
+            shuffle_vec.shuffle(&mut rand::thread_rng());
+            for fragment in shuffle_vec {
                 let hdr  = PackletHeader::new(PackletTag::OneJumboFragment, std::mem::size_of::<PackletOneJumboFragment>() + fragment.len());
                 let frag = PackletOneJumboFragment::new(jumbo_id, data.len(), jumbo_o);
                 jumbo_o += fragment.len();
@@ -1222,6 +1222,11 @@ pub fn service_connections(
                 }
 
                 send(&packet_memory_send[..mMTU_inside_stp]);
+                packet_counter_index += 1;
+                if packet_counter_index > 2000 {
+                    return result;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(200));
             }
         } else {
             let hdr  = PackletHeader::new(PackletTag::AnEntireDatagram, data.len());
@@ -1232,8 +1237,13 @@ pub fn service_connections(
             if o < mMTU_inside_stp {
                 packet_memory_send[o..mMTU_inside_stp].fill(0); // @Todo: real packlet framing
             }
-
+            
             send(&packet_memory_send[..mMTU_inside_stp]);
+            packet_counter_index += 1;
+            if packet_counter_index > 2000 {
+                return result;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
         }
     }
 
