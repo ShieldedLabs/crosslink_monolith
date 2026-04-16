@@ -1350,8 +1350,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
     let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
 
-    let mut packets_to_send:  Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
-    let mut packets_received: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
+    let mut packets_to_send:  Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
+    let mut packets_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
 
     let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
@@ -1477,13 +1477,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
             o
         }
-        fn send_noise_msg(packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>,
+        fn send_noise_msg(packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
                           connection_key: &ConnectionKey,
                           msg: &[u8],
                           stats: &mut NetworkStats) {
             stats.packets_sent += 1;
             stats.bytes_sent += msg.len();
-            packets_to_send.push((*connection_key, Vec::from(msg)));
+            packets_to_send.push((*connection_key, Vec::from(msg), None));
         }
 
         if net_stats_window_start.elapsed() >= 10*ONE_SECOND {
@@ -1543,7 +1543,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                            round_data: &RoundData,
                                            ctx_str: &str,
                                            roster: &[SortedRosterMember],
-                                           packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>,
+                                           packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
                                            send_buf1: &mut [u8],
                                            peer: &mut Peer,
                                            connection_key: &ConnectionKey,
@@ -1852,7 +1852,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         // READ
         while packets_received.len() > 0 {
             let (mut connection_key, mut peer, mut msg) = {
-                let (key, packet) = packets_received.remove(0);
+                let (key, packet, _) = packets_received.remove(0);
                 let Some(peer) = peers.get_mut(&key)
                 else {
                     continue;

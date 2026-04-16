@@ -81,11 +81,11 @@ pub struct Peer {
     pub address: STPAddress,
 }
 
-pub fn send_to(socket: SockHandle, packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>, chat_buf: &String, name: &str, connection_key: &ConnectionKey, buf: &[u8]) {
+pub fn send_to(socket: SockHandle, packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>, Option<u32>)>, chat_buf: &String, name: &str, connection_key: &ConnectionKey, buf: &[u8]) {
     if PRINT_SENDS {
         println_redraw!(chat_buf, name, "Sent {} to: {:?}.", PACKET_TYPE_NAMES[buf[0] as usize], connection_key);
     }
-    packets_to_send.push((*connection_key, Vec::from(buf)));
+    packets_to_send.push((*connection_key, Vec::from(buf), None));
 }
 
 pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addresses: Vec<STPAddress>, use_ipv4: bool, use_ipv6: bool) {
@@ -224,7 +224,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
         }
 
         // Receive
-        for (connection_key, data) in &packets_received_this_tick {
+        for (connection_key, data, _) in &packets_received_this_tick {
             let n = data.len();
 
             if n <= 0 {

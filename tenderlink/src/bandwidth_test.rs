@@ -393,6 +393,17 @@ pub fn get_connected_mut<'a>(m: &'a mut HashMap::<ConnectionKey, ConnectionTrack
     Some(connection)
 }
 
+pub fn allocate_jumbogram_id(connections_map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, key: &ConnectionKey) -> Option<u32> {
+    let conn = connections_map.get_mut(key)?;
+    if let ConnectionState::Connected { jumbogram_index, .. } = &mut conn.connection_state {
+        let id = *jumbogram_index;
+        *jumbogram_index = jumbogram_index.wrapping_add(1) & (MAX_JUMBOGRAM_IDS - 1);
+        Some(id)
+    } else {
+        None
+    }
+}
+
 pub fn connection_state_string(state: &ConnectionState) -> &'static str {
     match state {
         ConnectionState::SendingClientHelloPlaintext { .. } => { return "SendingClientHelloPlaintext"; },
@@ -560,6 +571,20 @@ impl ReassemblySlot {
         // Binary search: find first range whose end > start (skip adjacent)
         let pos = self.received.partition_point(|&(_, e)| e <= start);
 
+        // Check if [start, end) is fully contained in an already-received range (duplicate fragment).
+        // This happens when a jumbogram ID is reused for retransmission.
+        let fully_covered =
+            (pos < self.received.len() && self.received[pos].0 <= start && self.received[pos].1 >= end) ||
+            (pos > 0 && self.received[pos - 1].0 <= start && self.received[pos - 1].1 >= end);
+        if fully_covered {
+            // Verify the data matches what we already have (detect corruption / adversarial tampering)
+            if self.buf[offset..offset + data.len()] == *data {
+                return Ok(self.received.len() == 1 && self.received[0] == (0, self.total_len));
+            } else {
+                return Err(()); // same range, different data - kill connection
+            }
+        }
+
         // Check overlap with the range at `pos`
         if pos < self.received.len() && self.received[pos].0 < end {
             return Err(());
@@ -635,8 +660,8 @@ impl SliceWrite for PackletReliableStreamed {
 // Returns true if a packet was received. You should use this information to decide how to schedule your connection servicing.
 pub fn service_connections(
     connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
-    packets_received_this_call: &mut Vec<(ConnectionKey, Vec<u8>)>,
-    packets_to_send: &Vec<(ConnectionKey, Vec<u8>)>,
+    packets_received_this_call: &mut Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
+    packets_to_send: &Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
     packet_memory_encrypted: &mut PacketMemory,
     packet_memory_recv: &mut PacketMemory,
     packet_memory_send: &mut PacketMemory,
@@ -908,7 +933,7 @@ pub fn service_connections(
                         ConnectionState::Connected { .. } => (),
                     }
                     if let ConnectionState::Connected { cipher, magic1, send_sequence_number, jumbogram_index, last_sent_keep_alive_time_ns, recv_time_ns } = &mut existing_connection.connection_state {
-                        let non_virtual_nonce = first_six_bytes >> 16; // Todo convert this to virtual.
+                        let non_virtual_nonce = first_six_bytes >> 16; // @Todo: convert this to virtual.
 
                         // TODO acks etc
                         let payload;
@@ -1012,7 +1037,7 @@ pub fn service_connections(
                                         Ok(true) => {
                                             // Message complete — deliver it
                                             let completed = reasm.slots.remove(&frag_id).unwrap();
-                                            packets_received_this_call.push((connection_key, completed.buf));
+                                            packets_received_this_call.push((connection_key, completed.buf, Some(frag_id)));
                                         }
                                         Ok(false) => {
                                             // More fragments needed
@@ -1024,7 +1049,7 @@ pub fn service_connections(
                                     }
                                 }
                                 PackletTag::AnEntireDatagram => {
-                                    packets_received_this_call.push((connection_key, body.to_vec()));
+                                    packets_received_this_call.push((connection_key, body.to_vec(), None));
                                 }
                                 PackletTag::ReliableStreamed => { eprintln!("TODO {:?}", tag); kill_connection = Some(connection_key); break 'conn; }
                                 PackletTag::Acknowledgements => { eprintln!("TODO {:?}", tag); kill_connection = Some(connection_key); break 'conn; }
@@ -1128,12 +1153,12 @@ pub fn service_connections(
         }
     } true});
 
-    for (packet_counter_index, (connection_key, data)) in packets_to_send.iter().enumerate() {
+    for (packet_counter_index, (connection_key, data, jumbo_id_override)) in packets_to_send.iter().enumerate() {
         if packet_counter_index > 1000 {
             return result;
         }
         std::thread::yield_now();
-    
+
         let Some(ref mut connection) = connections_map.get_mut(connection_key)
         else {
             continue;
@@ -1171,10 +1196,21 @@ pub fn service_connections(
 
         if data.len() > MTU_fragmented {
             let frag_mtu = MTU_fragmented - std::mem::size_of::<PackletOneJumboFragment>();
+            let jumbo_id = match jumbo_id_override {
+                Some(id) => {
+                    debug_assert!(*id < MAX_JUMBOGRAM_IDS, "jumbogram ID override {id} out of range (max {})", MAX_JUMBOGRAM_IDS);
+                    *id & (MAX_JUMBOGRAM_IDS - 1)
+                }
+                None => {
+                    let id = *jumbogram_index;
+                    *jumbogram_index = jumbogram_index.wrapping_add(1) & (MAX_JUMBOGRAM_IDS - 1);
+                    id
+                }
+            };
             let mut jumbo_o: usize = 0;
             for fragment in data.chunks(frag_mtu) {
                 let hdr  = PackletHeader::new(PackletTag::OneJumboFragment, std::mem::size_of::<PackletOneJumboFragment>() + fragment.len());
-                let frag = PackletOneJumboFragment::new(*jumbogram_index, data.len(), jumbo_o);
+                let frag = PackletOneJumboFragment::new(jumbo_id, data.len(), jumbo_o);
                 jumbo_o += fragment.len();
 
                 let mut o = 0;
@@ -1187,7 +1223,6 @@ pub fn service_connections(
 
                 send(&packet_memory_send[..mMTU_inside_stp]);
             }
-            *jumbogram_index = jumbogram_index.wrapping_add(1) & ((1 << 18) - 1);
         } else {
             let hdr  = PackletHeader::new(PackletTag::AnEntireDatagram, data.len());
 
