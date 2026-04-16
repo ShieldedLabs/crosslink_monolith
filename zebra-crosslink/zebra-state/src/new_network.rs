@@ -940,8 +940,8 @@ pub struct Peer {
     their_tree: NearTipBranches,
     their_queue: HashSet<Hash>,
 
-    in_flight_blocks: HashMap<(Hash, Height), u32 /* jumbogram id */>,
-    in_flight_jumbos: HashMap<u32, (Hash, Height)>,
+    in_flight_blocks: HashMap<(Hash, Height), (u32 /* jumbogram id */, std::time::Instant)>,
+    in_flight_jumbos: HashMap<u32, (Hash, Height, std::time::Instant)>,
 }
 
 #[derive(Debug)]
@@ -1393,11 +1393,12 @@ pub fn sync(
             }
 
             if TRACE { println!("NewNet: Sending BLOCK (Height: {height}, Hash: {hash})"); }
-            let jumbo_id = if let Some(&existing_id) = peer.in_flight_blocks.get(&(hash, Height(*height))) {
+            let jumbo_id = if let Some(&(existing_id, _)) = peer.in_flight_blocks.get(&(hash, Height(*height))) {
                 existing_id // Reuse: fragments contribute to the same reassembly slot
             } else if let Some(new_id) = allocate_jumbogram_id(&mut connections_map, connection_key) {
-                peer.in_flight_blocks.insert((hash, Height(*height)), new_id);
-                peer.in_flight_jumbos.insert(new_id, (hash, Height(*height)));
+                let now = std::time::Instant::now();
+                peer.in_flight_blocks.insert((hash, Height(*height)), (new_id, now));
+                peer.in_flight_jumbos.insert(new_id, (hash, Height(*height), now));
                 new_id
             } else {
                 continue; // connection dropped
@@ -1439,7 +1440,7 @@ pub fn sync(
         if std::time::Instant::now() >= next_block_send {
             const MAX_PEERS_TO_SEND_BLOCKS_TO: usize = 8;
 
-            'send_to_peers: for (connection_key, Peer { origin, their_tree, their_queue, in_flight_blocks, in_flight_jumbos }) in peers.iter().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_SEND_BLOCKS_TO) {
+            'send_to_peers: for (connection_key, Peer { origin, their_tree, their_queue, ref mut in_flight_blocks, ref mut in_flight_jumbos }) in peers.iter_mut().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_SEND_BLOCKS_TO) {
                 // @Duplicate with packet status parsing
 
                 if *their_tree == NearTipBranches::default() {
@@ -1469,7 +1470,37 @@ pub fn sync(
                     continue 'send_to_peers;
                 };
 
-                for (_, (hash, height)) in in_flight_jumbos {
+                // Evict jumbos that are too old
+                let now = std::time::Instant::now();
+                let mut removals: Vec<(u32, (Hash, Height))> = Vec::new();
+                const JUMBO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(11);
+                for (jumbogram_id, (hash, height, time)) in &mut *in_flight_jumbos {
+                    if now.duration_since(*time) >= JUMBO_TIMEOUT {
+                        removals.push((*jumbogram_id, (*hash, *height)));
+                    }
+                }
+                for ((hash, height), (jumbogram_id, time)) in &mut *in_flight_blocks {
+                    if now.duration_since(*time) >= JUMBO_TIMEOUT {
+                        removals.push((*jumbogram_id, (*hash, *height)));
+                    }
+                }
+
+                for (jumbogram_id, (hash, height)) in removals {
+                    in_flight_blocks.remove(&(hash, height));
+                    in_flight_jumbos.remove(&jumbogram_id);
+                }
+
+                // Evict jumbos in their tree
+                for their_branch in &their_tree.branches {
+                    for block in their_branch {
+                        let hash_and_height = (block.this_hash, Height(block.this_height));
+                        if let Some((jumbogram_id, time)) = in_flight_blocks.remove(&hash_and_height) {
+                            in_flight_jumbos.remove(&jumbogram_id);
+                        }
+                    }
+                }
+
+                for (_, (hash, height, time)) in in_flight_jumbos {
                     if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
                         blocks_to_this_peer += 1;
                         blocks_to_send.push((*connection_key, *hash, height.0));
@@ -1799,8 +1830,8 @@ pub fn sync(
                 //     continue 'process_packets;
                 // };
 
-                if let Some(ack_hash) = peer.in_flight_jumbos.get(&ack_jumbo) {
-                    peer.in_flight_blocks.remove(&ack_hash);
+                if let Some((ack_hash, ack_height, _)) = peer.in_flight_jumbos.get(&ack_jumbo) {
+                    peer.in_flight_blocks.remove(&(*ack_hash, *ack_height));
                 }
                 peer.in_flight_jumbos.remove(&ack_jumbo);
 
