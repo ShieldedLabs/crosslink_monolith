@@ -727,6 +727,12 @@ mod windows {
     #[inline]
     pub fn socket_setup() { // Windows
         unsafe {
+            unsafe extern "system" {
+                fn timeBeginPeriod(uPeriod: u32) -> u32;
+                fn timeEndPeriod(uPeriod: u32) -> u32;
+            }
+            timeBeginPeriod(1);
+
             let mut data: WSADATA = zeroed();
             // MAKEWORD(2,2)
             let ver: u16 = 0x0202;
