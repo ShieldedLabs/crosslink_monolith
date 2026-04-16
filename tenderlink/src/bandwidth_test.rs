@@ -1206,7 +1206,7 @@ pub fn service_connections(
             };
             let mut shuffle_vec: Vec<_> = data.chunks(frag_mtu).enumerate().collect();
             use rand::seq::SliceRandom;
-            shuffle_vec.shuffle(&mut rand::thread_rng()); // Note(Sam): We should make jumbos work out of order.
+            shuffle_vec.shuffle(&mut rand::thread_rng());
             for (i, fragment) in shuffle_vec {
                 let offset = i * frag_mtu;
                 let hdr  = PackletHeader::new(PackletTag::OneJumboFragment, std::mem::size_of::<PackletOneJumboFragment>() + fragment.len());
