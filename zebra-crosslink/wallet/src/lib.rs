@@ -1879,6 +1879,33 @@ impl ManualWallet {
         res
     }
 
+    fn upsert_wallet_tx(&mut self, wallet_tx: WalletTx) {
+        let mut insert_i = 0;
+        update_insert_i(&self.txs, &mut insert_i, wallet_tx.h);
+        update_with_tx(self, wallet_tx, &mut insert_i);
+    }
+
+    fn mark_batch_inputs_spent(&mut self, account_id: usize, orchard_notes: &[OrchardNote], transparent_inputs: &[OutPoint], spent_h: BlockHeight) {
+        let transparent_inputs_with_heights = transparent_inputs.iter()
+            .filter_map(|outpoint| self.tx_h_map.get(outpoint.txid()).copied().map(|recv_h| (outpoint.clone(), recv_h)))
+            .collect::<Vec<_>>();
+        let account = &mut self.accounts[account_id];
+
+        for note in orchard_notes {
+            if let Some(note_i) = orchard_recv_h_position(&account.unspent_orchard_notes, note.recv_h, &note.nf) {
+                let unspent_note = account.unspent_orchard_notes.remove(note_i);
+                orchard_spent_h_insert(&mut account.spent_orchard_notes, OrchardNote { spent_h, ..unspent_note });
+            }
+        }
+
+        for (outpoint, recv_h) in transparent_inputs_with_heights {
+            if let Some(utxo_i) = txo_recv_h_position(&account.utxos, recv_h, &outpoint) {
+                let utxo = account.utxos.remove(utxo_i);
+                txo_spent_h_insert(&mut account.stxos, Txo { spent_h, ..utxo });
+            }
+        }
+    }
+
     // NOTE: because we get 2 grace actions, we don't need to try and special-case getting all
     // change outputs within a single output, although that might be better for later note use...
     pub fn shield_transparent_zats<P: Parameters>(
@@ -1948,6 +1975,68 @@ impl ManualWallet {
         } else {
             None
         }
+    }
+
+    /// Sequentially prepare, build, and broadcast one orchard stake per requested amount.
+    ///
+    /// This only filters locally consumed orchard notes and transparent inputs between successful
+    /// sends. Any orchard change created by an earlier batch transaction becomes usable only after
+    /// the caller refreshes wallet state with a newer orchard tree.
+    pub async fn stake_orchard_to_finalizer_batch<P: Parameters + Copy>(
+        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
+        src_usk: &UnifiedSpendingKey, amounts_zats: &[u64], orchard_tree: &OrchardShardTree,
+        target_finalizer: [u8; 32],
+    ) -> Vec<Option<(String, u64)>>
+    {
+        let mut results = Vec::with_capacity(amounts_zats.len());
+
+        for &amount_zats in amounts_zats {
+            let mut tx = ProposedTx::EMPTY;
+            if self.stake_orchard_to_finalizer(network, &mut tx, client, src_usk, amount_zats, orchard_tree, target_finalizer).is_none() {
+                results.push(None);
+                continue;
+            }
+
+            let Some(prep_view) = tx.prep.as_ref() else {
+                results.push(None);
+                continue;
+            };
+            let orchard_spends = prep_view.o_inputs.iter().map(|input| input.note).collect::<Vec<_>>();
+            let transparent_spends = prep_view.t_inputs.iter().map(|input| input.outpoint().clone()).collect::<Vec<_>>();
+
+            let Some(prep) = tx.prep.take() else {
+                results.push(None);
+                continue;
+            };
+
+            if !self.build_tx_from_prep(network, &mut tx, prep) {
+                tx.tx.status = TxStatus::HardFail(tx.tx.h, ErrBuf::from_str("failed to build"));
+                tx.tx.h = self.chain_tip_h;
+                self.upsert_wallet_tx(tx.tx);
+                results.push(None);
+                continue;
+            }
+            self.upsert_wallet_tx(tx.tx);
+
+            let txid_hex = tx.tx.txid.to_string();
+            let sent_ok = if let Some(tx_res) = &tx.tx_res {
+                self.send_built_tx(network, client, &mut tx.tx, tx_res.transaction()).await
+            } else {
+                tx.tx.status = TxStatus::HardFail(tx.tx.h, ErrBuf::from_str("missing built tx"));
+                tx.tx.h = self.chain_tip_h;
+                false
+            };
+            self.upsert_wallet_tx(tx.tx);
+
+            if sent_ok {
+                self.mark_batch_inputs_spent(tx.tx.account_id, &orchard_spends, &transparent_spends, tx.tx.h);
+                results.push(Some((txid_hex, amount_zats)));
+            } else {
+                results.push(None);
+            }
+        }
+
+        results
     }
 
     pub fn begin_unbonding_using_orchard<P: Parameters>(
