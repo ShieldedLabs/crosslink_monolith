@@ -3345,9 +3345,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     println!("MEMPOOL stream connection error: {err:?}");
                 }
             }
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
         }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
     });
 
     fn block_rng_from_heights(heights: (u64, u64)) -> BlockRange {
