@@ -1,0 +1,18 @@
+[package]
+name = "staking-cli"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[[bin]]
+name = "staking-cli"
+path = "src/main.rs"
+
+[dependencies]
+wallet = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+hex.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tonic = { workspace = true, features = ["transport"] }

@@ -57,7 +57,7 @@ use zcash_primitives::transaction::txid::TxIdDigester;
 use zcash_primitives::transaction::{Authorized, StakingAction_BeginDelegationUnbonding, StakingAction_CreateNewDelegationBond, StakingAction_RetargetDelegationBond, StakingAction_WithdrawDelegationBond, Transaction, TransactionData, TxVersion, Unauthorized};
 use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
 use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::consensus::{BlockHeight as LRZBlockHeight, BranchId};
+use zcash_protocol::consensus::{BlockHeight as LRZBlockHeight, BranchId, NetworkUpgrade};
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::{ZatBalance, Zatoshis};
 use zcash_protocol::{PoolType, ShieldedProtocol, TxId};
@@ -77,6 +77,8 @@ use rustls::crypto::CryptoProvider;
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::CertificateError;
 use tokio::runtime::Builder;
+pub use zcash_client_backend::keys::UnifiedSpendingKey;
+pub use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 use zcash_client_backend::{
     address::UnifiedAddress,
     data_api::{
@@ -89,13 +91,13 @@ use zcash_client_backend::{
     },
     encoding::AddressCodec,
     keys::{
-        UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedIncomingViewingKey, UnifiedSpendingKey,
+        UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedIncomingViewingKey,
     },
     proto::{
         compact_formats::{CompactBlock, CompactTx, CompactSaplingSpend, CompactSaplingOutput, CompactOrchardAction},
         service::{
-            compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
-            Empty, GetAddressUtxosArg, LightdInfo, TransparentAddressBlockFilter,
+            BlockId, BlockRange, ChainSpec, Empty, GetAddressUtxosArg, LightdInfo,
+            TransparentAddressBlockFilter,
         },
     },
 };
@@ -168,6 +170,28 @@ impl std::fmt::Display for BlockHeight {
             Self::SENT     => write!(f, "<sent>"),
             Self::MEMPOOL  => write!(f, "<mempool>"),
             _ => self.0.fmt(f)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum StakingCliNetwork {
+    Main,
+    Regtest,
+}
+
+impl Parameters for StakingCliNetwork {
+    fn network_type(&self) -> NetworkType {
+        match self {
+            Self::Main => NetworkType::Main,
+            Self::Regtest => NetworkType::Regtest,
+        }
+    }
+
+    fn activation_height(&self, nu: NetworkUpgrade) -> Option<LRZBlockHeight> {
+        match self {
+            Self::Main => MAIN_NETWORK.activation_height(nu),
+            Self::Regtest => TEST_NETWORK.activation_height(nu),
         }
     }
 }
@@ -1351,6 +1375,135 @@ pub struct ManualWallet {
 }
 // N.B. using some of the same API as WalletDb to allow smooth transition/comparison
 impl ManualWallet {
+    pub fn from_seed_text<P: Parameters + 'static>(params: P, seed_text: &str) -> Result<(ManualWallet, UnifiedSpendingKey), String> {
+        let usk = unified_spending_key_from_seed_text(params.clone(), seed_text)?;
+        let (mut wallet, account) = manual_wallet_from_usk_inner(params, "staking-cli", &usk);
+        let (t_addr, p2sh, _ua) = addrs_from_account(&account, 0)
+            .ok_or_else(|| "failed to derive default addresses from the spending key".to_owned())?;
+
+        wallet.strms.push(ManualStream { account_id: 0, sync_h: BlockHeight(0), t_addr });
+        if TEST_P2SH {
+            wallet.strms.push(ManualStream { account_id: 0, sync_h: BlockHeight(0), t_addr: p2sh });
+        }
+
+        Ok((wallet, usk))
+    }
+
+    pub async fn sync_from_lightwalletd<P: Parameters + Copy>(
+        &mut self,
+        network: P,
+        client: &mut CompactTxStreamerClient<Channel>,
+    ) -> Result<OrchardShardTree, String> {
+        const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u64 = 64;
+        const CHECKPOINTS_N: usize = 100;
+
+        let tip_info = client.get_lightd_info(Empty {}).await
+            .map_err(|err| format!("failed to fetch lightwalletd info: {err:?}"))?;
+        let tip_height_u64 = tip_info.into_inner().block_height;
+        let tip_height = u32::try_from(tip_height_u64)
+            .map_err(|_| format!("lightwalletd tip height {tip_height_u64} does not fit in u32"))?;
+
+        client.get_tree_state(BlockId {
+            height: tip_height_u64,
+            hash: Vec::new(),
+        }).await.map_err(|err| {
+            format!("failed to fetch orchard tree state at height {tip_height}: {err:?}")
+        })?;
+
+        let mut orchard_tree = OrchardShardTree::new(
+            shardtree::store::memory::MemoryShardStore::empty(),
+            CHECKPOINTS_N,
+        );
+        let mut next_orchard_pos = 0u64;
+        let mut seen_transparent_txids = HashSet::<TxId>::new();
+        let full_keys = PreparedKeys::from_ufvk_all(&self.accounts[0].ufvk);
+        let ivk_keys = PreparedKeys::from_ufvk_ivks(&self.accounts[0].ufvk);
+
+        let mut start_height = 0u64;
+        while start_height <= tip_height_u64 {
+            let end_height = (start_height + MAX_BLOCKS_TO_DOWNLOAD_AT_TIME - 1).min(tip_height_u64);
+
+            for strm_i in 0..self.strms.len() {
+                let strm = self.strms[strm_i].clone();
+                let address = strm.t_addr.encode(&network);
+                let response = client.get_taddress_txids(TransparentAddressBlockFilter {
+                    address: address.clone(),
+                    range: Some(block_range_from_heights((start_height, end_height))),
+                }).await.map_err(|err| {
+                    format!("failed to fetch transparent transactions for {} in {}-{}: {err:?}", address, start_height, end_height)
+                })?;
+
+                let mut tx_stream = response.into_inner();
+                loop {
+                    let raw_tx = tx_stream.message().await.map_err(|err| {
+                        format!("failed to read transparent transaction stream for {} in {}-{}: {err:?}", address, start_height, end_height)
+                    })?;
+                    let Some(raw_tx) = raw_tx else { break; };
+
+                    let Some(Some(block_h)) = bc_h_from_raw_tx_h(raw_tx.height) else { continue; };
+                    if !block_h.is_in_block() {
+                        continue;
+                    }
+
+                    let tx = Transaction::read(
+                        &raw_tx.data[..],
+                        BranchId::for_height(&network, LRZBlockHeight::from_u32(block_h.0)),
+                    ).map_err(|err| {
+                        format!("failed to decode transparent transaction for {} at height {}: {err:?}", address, block_h.0)
+                    })?;
+                    let txid = tx.txid();
+                    if !seen_transparent_txids.insert(txid) {
+                        continue;
+                    }
+
+                    let mut insert_i = 0;
+                    update_insert_i(&self.txs, &mut insert_i, block_h);
+                    read_full_tx(self, strm.account_id, &full_keys, block_h, &tx, &mut insert_i, TxStatus::OnBc);
+                }
+
+                self.strms[strm_i].sync_h = BlockHeight(end_height.try_into().unwrap_or(u32::MAX));
+            }
+
+            let response = client.get_block_range(block_range_from_heights((start_height, end_height))).await
+                .map_err(|err| format!("failed to fetch compact blocks in {}-{}: {err:?}", start_height, end_height))?;
+            let mut block_stream = response.into_inner();
+            loop {
+                let block = block_stream.message().await.map_err(|err| {
+                    format!("failed to read compact block stream in {}-{}: {err:?}", start_height, end_height)
+                })?;
+                let Some(block) = block else { break; };
+
+                let block_h = BlockHeight(block.height.try_into().map_err(|_| {
+                    format!("compact block height {} does not fit in u32", block.height)
+                })?);
+                let mut insert_i = 0;
+                update_insert_i(&self.txs, &mut insert_i, block_h);
+
+                for tx in &block.vtx {
+                    let _ = read_compact_tx(
+                        self,
+                        0,
+                        &ivk_keys,
+                        block_h,
+                        tx,
+                        &mut next_orchard_pos,
+                        &mut insert_i,
+                        &mut orchard_tree,
+                    );
+                }
+
+                orchard_tree.checkpoint(block_h).expect("Infallible MemoryShardStore");
+                self.chain_tip_h = block_h;
+                self.accounts[0].fully_detected_h = block_h;
+                self.accounts[0].fully_decoded_h = block_h;
+            }
+
+            start_height = end_height.saturating_add(1);
+        }
+
+        Ok(orchard_tree)
+    }
+
     pub fn chain_height(&self)          -> BlockHeight { self.chain_tip_h }
     pub fn fully_detected_height(&self) -> BlockHeight {
         let mut h = BlockHeight(0);
@@ -2039,6 +2192,46 @@ impl ManualWallet {
         results
     }
 
+    pub fn dry_run_stake_orchard_to_finalizer_batch<P: Parameters + Copy>(
+        &mut self, network: P, client: &mut CompactTxStreamerClient<Channel>,
+        src_usk: &UnifiedSpendingKey, amounts_zats: &[u64], orchard_tree: &OrchardShardTree,
+        target_finalizer: [u8; 32],
+    ) -> Vec<Option<(String, u64)>>
+    {
+        let mut results = Vec::with_capacity(amounts_zats.len());
+
+        for &amount_zats in amounts_zats {
+            let mut tx = ProposedTx::EMPTY;
+            if self.stake_orchard_to_finalizer(network, &mut tx, client, src_usk, amount_zats, orchard_tree, target_finalizer).is_none() {
+                results.push(None);
+                continue;
+            }
+
+            let Some(prep_view) = tx.prep.as_ref() else {
+                results.push(None);
+                continue;
+            };
+            let orchard_spends = prep_view.o_inputs.iter().map(|input| input.note).collect::<Vec<_>>();
+            let transparent_spends = prep_view.t_inputs.iter().map(|input| input.outpoint().clone()).collect::<Vec<_>>();
+
+            let Some(prep) = tx.prep.take() else {
+                results.push(None);
+                continue;
+            };
+
+            if !self.build_tx_from_prep(network, &mut tx, prep) {
+                results.push(None);
+                continue;
+            }
+
+            let txid_hex = tx.tx.txid.to_string();
+            self.mark_batch_inputs_spent(tx.tx.account_id, &orchard_spends, &transparent_spends, tx.tx.h);
+            results.push(Some((txid_hex, amount_zats)));
+        }
+
+        results
+    }
+
     pub fn begin_unbonding_using_orchard<P: Parameters>(
         &mut self, network: P, tx: &mut ProposedTx, client: &mut CompactTxStreamerClient<Channel>,
         src_usk: &UnifiedSpendingKey, orchard_tree: &OrchardShardTree, bond_key: [u8; 32],
@@ -2722,7 +2915,7 @@ type OrchardTree = incrementalmerkletree::frontier::CommitmentTree<orchard::tree
 type OrchardFrontier = incrementalmerkletree::frontier::Frontier<orchard::tree::MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>;
 type OrchardWitness = incrementalmerkletree::witness::IncrementalWitness<orchard::tree::MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>;
 const SHARD_HEIGHT: u8 = 16; // default => 65536 leaves per shard
-type OrchardShardTree = shardtree::ShardTree::<
+pub type OrchardShardTree = shardtree::ShardTree::<
     shardtree::store::memory::MemoryShardStore::<
         orchard::tree::MerkleHashOrchard,
         // shardtree::Node<orchard::tree::MerkleHashOrchard, (), ()>,
@@ -2801,6 +2994,76 @@ fn stuff_from_seed_phrase<P: Parameters>(params: P, phrase: &str) -> (
     // );
 
     (seed, usk)
+}
+
+fn unified_spending_key_from_seed_text<P: Parameters>(
+    params: P,
+    seed_text: &str,
+) -> Result<UnifiedSpendingKey, String> {
+    use secrecy::ExposeSecret;
+
+    let trimmed = seed_text.trim();
+    if trimmed.is_empty() {
+        return Err("seed file is empty".to_owned());
+    }
+
+    let seed = if let Ok(mnemonic) = bip39::Mnemonic::parse(trimmed) {
+        let seed64 = mnemonic.to_seed("");
+        SecretVec::new(seed64[..32].to_vec())
+    } else {
+        let seed_bytes = hex::decode(trimmed).map_err(|_|
+            "seed file must contain a bip39 mnemonic or a 32-byte hex seed".to_owned()
+        )?;
+        if seed_bytes.len() != 32 {
+            return Err(format!("hex seed file must decode to 32 bytes, got {} bytes", seed_bytes.len()));
+        }
+        SecretVec::new(seed_bytes)
+    };
+
+    let account_id = zip32::AccountId::try_from(0)
+        .map_err(|err| format!("failed to create account id 0: {err:?}"))?;
+    UnifiedSpendingKey::from_seed(&params, seed.expose_secret(), account_id)
+        .map_err(|err| format!("failed to derive unified spending key from seed text: {err:?}"))
+}
+
+fn manual_wallet_from_usk_inner<P: Parameters + 'static>(
+    _params: P,
+    name: &'static str,
+    usk: &UnifiedSpendingKey,
+) -> (ManualWallet, ManualAccount) {
+    let account = ManualAccount {
+        ufvk: usk.to_unified_full_viewing_key(),
+        birthday: BlockHeight(0),
+        balance_changes: vec![(BlockHeight(0), data_api::AccountBalance::ZERO)],
+        fully_decoded_h: BlockHeight(0),
+        fully_detected_h: BlockHeight(0),
+        recv_txos: Vec::new(),
+        utxos: Vec::new(),
+        stxos: Vec::new(),
+        recv_orchard_notes: Vec::new(),
+        unspent_orchard_notes: Vec::new(),
+        spent_orchard_notes: Vec::new(),
+    };
+
+    let wallet = ManualWallet {
+        name,
+        accounts: vec![account.clone()],
+        strms: Vec::new(),
+        chain_tip_h: BlockHeight(0),
+        txs: Vec::new(),
+        tx_h_map: HashMap::new(),
+        seen_bond_values: HashMap::new(),
+        care_about_bonds: Vec::new(),
+    };
+
+    (wallet, account)
+}
+
+fn block_range_from_heights(heights: (u64, u64)) -> BlockRange {
+    BlockRange {
+        start: Some(BlockId { height: heights.0, hash: Vec::new() }),
+        end: Some(BlockId { height: heights.1, hash: Vec::new() }),
+    }
 }
 
 pub fn default_p2pkh_from_entropy<P: Parameters>(params: P, entropy: &[u8; 32]) -> Option<TransparentAddress> {

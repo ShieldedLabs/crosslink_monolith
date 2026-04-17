@@ -10,6 +10,7 @@ repository = "https://github.com/ZcashFoundation/zebra"
 
 [workspace]
 members = [
+        "staking-cli",
         "wallet",
         "zebrad",
         "zebra-chain",
