@@ -949,17 +949,52 @@ impl Default for HeightAndHashOr0 {
         }
     }
 }
+impl SliceRead for HeightAndHashOr0 {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(Self{
+            height: block::Height(SliceRead::read_from(buf)?),
+            hash_or_0: block::Hash(SliceRead::read_from(buf)?),
+        })
+    }
+}
+impl SliceWrite for HeightAndHashOr0 {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.height.0.write_to(&mut buf[o..]);
+        o += self.hash_or_0.0.write_to(&mut buf[o..]);
+        o
+    }
+}
+
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PeerPowBlockRequest {
     height_hash: HeightAndHashOr0,
     offset: u32,
 }
+impl SliceRead for PeerPowBlockRequest {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(Self{
+            height_hash: SliceRead::read_from(buf)?,
+            offset: SliceRead::read_from(buf)?,
+        })
+    }
+}
+impl SliceWrite for PeerPowBlockRequest {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.height_hash.write_to(&mut buf[o..]);
+        o += self.offset.write_to(&mut buf[o..]);
+        o
+    }
+}
+
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PeerPowBlockDownload {
     height_hash: HeightAndHashOr0,
-    reassembly: ReassemblySlot,
+    reassembly: ReassemblySlot, // needed for requests
+    offset: u32, // needed for responses
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -976,10 +1011,7 @@ impl SliceRead for PeerPowBlockResponseChunkHdr {
         Some(Self{
             offset: SliceRead::read_from(buf)?,
             size: SliceRead::read_from(buf)?,
-            height_hash: HeightAndHashOr0 {
-                height: block::Height(SliceRead::read_from(buf)?),
-                hash_or_0: block::Hash(SliceRead::read_from(buf)?),
-            }
+            height_hash: SliceRead::read_from(buf)?,
         })
     }
 }
@@ -988,11 +1020,11 @@ impl SliceWrite for PeerPowBlockResponseChunkHdr {
         let mut o = 0;
         o += self.offset.write_to(&mut buf[o..]);
         o += self.size.write_to(&mut buf[o..]);
-        o += self.height_hash.height.0.write_to(&mut buf[o..]);
-        o += self.height_hash.hash_or_0.0.write_to(&mut buf[o..]);
+        o += self.height_hash.write_to(&mut buf[o..]);
         o
     }
 }
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BlockDownloads {
     slots: [PeerPowBlockDownload; 32],
@@ -1005,6 +1037,7 @@ impl BlockDownloads {
             self.slots[dl_i] = PeerPowBlockDownload {
                 height_hash: height_hash,
                 reassembly: ReassemblySlot::default(),
+                offset: 0,
             };
             self.used_flags |= 1 << dl_i;
             Some(dl_i)
@@ -1048,8 +1081,8 @@ pub struct Peer {
     their_queue: HashSet<Hash>,
 
     // sending to peer
-    // requests_from_them: [PeerPowBlockRequest; 32],
-    // request_flags: u64,
+    // TODO: handle requests arriving out of order, minimising oversending
+    block_requests: BlockDownloads,
 
     // receiving from peer
     // TODO: this is a poor substitute for proper reliable streams
@@ -1212,8 +1245,8 @@ pub fn sync(
     let peer_request_interval = std::time::Duration::from_millis(PEER_REQUEST_MS);
     let peer_respond_interval = std::time::Duration::from_millis(PEER_RESPOND_MS);
 
-    let mut blocks_to_commit:  Vec<(Hash, std::sync::Arc<Block>)> = Vec::new();
-    let mut blocks_to_send:    Vec<(ConnectionKey, Hash, u32)>    = Vec::new();
+    let mut blocks_to_commit:  Vec<(Hash, std::sync::Arc<Block>)>     = Vec::new();
+    let mut blocks_to_send:    Vec<(ConnectionKey, Hash, u32, usize)> = Vec::new();
     let mut serialized_blocks: HashMap<Hash, Vec<u8>>             = HashMap::new(); // @Todo: cap max memory storage size for this map.
 
     use rand::Rng;
@@ -1231,6 +1264,8 @@ pub fn sync(
     let mut next_block_send   = std::time::Instant::now();
     let mut next_peer_gossip  = std::time::Instant::now();
     let mut next_peer_connect = std::time::Instant::now();
+    let mut next_peer_request = std::time::Instant::now();
+    let mut next_peer_respond = std::time::Instant::now();
 
     let stp_address_get_short_string = |address| {
         let addr = format!("{:?}", address);
@@ -1457,10 +1492,10 @@ pub fn sync(
         }
 
 
-        blocks_to_send.sort_by_key(|(_, _, height)| *height);
+        blocks_to_send.sort_by_key(|(_, _, height, _)| *height);
 
         // TODO: rate limit production!
-        for (connection_key, hash, height) in &blocks_to_send {
+        for (connection_key, hash, height, offset) in &blocks_to_send {
             let hash = *hash;
             let Some(connection) = get_connected(&connections_map, connection_key) else {
                 if TRACE { println!("NewNet: Can't send block that was queued for sending: Peer was disconnected: {connection_key:?}"); }
@@ -1494,7 +1529,13 @@ pub fn sync(
             if TRACE { println!("NewNet: Sending BLOCK (Height: {height}, Hash: {hash})"); }
 
             let serialized_block = &serialized_blocks[&hash];
-            let rem_slice = &serialized_block[0..];
+
+            if *offset >= serialized_block.len() {
+                // TODO: fix macro/fn for: kill!("out-of-range block offset request");
+                continue;
+            }
+
+            let rem_slice = &serialized_block[*offset..];
 
             let mut pkt_buf = [0u8; JUMBO_FRAG_SIZE];
             let mut hdr = PeerPowBlockResponseChunkHdr {
@@ -1556,10 +1597,11 @@ pub fn sync(
         // Discard statuses of disconnected peers
         peers.retain(|connection_key, _| get_connected(&connections_map, connection_key).is_some());
 
+        // TODO: limit total requests sum(popcount(downloads))
         if std::time::Instant::now() >= next_block_send {
             const MAX_PEERS_TO_SEND_BLOCKS_TO: usize = 8;
 
-            'send_to_peers: for (connection_key, Peer { origin, their_tree, their_queue, ref mut block_downloads }) in peers.iter_mut().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_SEND_BLOCKS_TO) {
+            'send_to_peers: for (connection_key, Peer { origin, their_tree, their_queue, ref mut block_downloads, .. }) in peers.iter_mut().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_SEND_BLOCKS_TO) {
                 // @Duplicate with packet status parsing
 
                 if *their_tree == NearTipBranches::default() {
@@ -1610,6 +1652,7 @@ pub fn sync(
                     if their_tree.tip_height < near_tip_chains.finalized_height {
 
                         for height in their_tree.tip_height..near_tip_chains.finalized_height {
+                            // TODO: merge in get_bc_hash_at_height
                             let res = rt.block_on(async {
                                 read_state.clone().oneshot(ReadRequest::BestChainBlockHash(Height(height).into())).await
                             });
@@ -1697,7 +1740,7 @@ pub fn sync(
                     }
 
                     for (block, height) in blocks_to_queue {
-                        blocks_to_send.push((*connection_key, block, height));
+                        blocks_to_send.push((*connection_key, block, height, 0));
                     }
                 };
                 if false {
@@ -1788,6 +1831,59 @@ pub fn sync(
             }
 
             next_block_send = std::time::Instant::now() + block_send_interval;
+        }
+
+        if std::time::Instant::now() >= next_peer_request {
+            for (connection_key, peer) in peers.iter_mut() {
+                // TODO: can we pack these into packlets now?
+                for dl in &peer.block_downloads.slots {
+                    // determine the lowest offset before which we have every byte already
+                    let prefix = dl.reassembly.received.first().unwrap_or(&(0,0));
+                    let offset = if prefix.0 == 0 {
+                        prefix.1
+                    } else {
+                        0
+                    };
+
+                    let mut buf = [0u8; JUMBO_FRAG_SIZE];
+                    let mut o = 0;
+                    o += PACKET_TYPE_BLOCK_REQ.write_to(&mut buf[o..]);
+                    o += PeerPowBlockRequest {
+                        height_hash: dl.height_hash,
+                        offset,
+                    }.write_to(&mut buf[o..]);
+
+                    packets_to_send.push((*connection_key, Vec::from(&buf[..o]), None));
+                }
+            }
+
+            next_peer_request = std::time::Instant::now() + peer_request_interval;
+        }
+
+        if std::time::Instant::now() >= next_peer_respond {
+            for (connection_key, peer) in peers.iter_mut() {
+                // TODO: can we pack these into packlets now?
+                for dl_i in 0..peer.block_requests.slots.len() {
+                    if ((peer.block_requests.used_flags >> dl_i) & 1) != 0 {
+                        let mut height_hash = peer.block_requests.slots[dl_i].height_hash;
+                        if height_hash.hash_or_0 == block::Hash([0;32]) {
+                            if let Some(hash) = get_bc_hash_at_height(&read_state, &rt, height_hash.height) {
+                                height_hash.hash_or_0 = hash;
+                                peer.block_requests.slots[dl_i].height_hash = height_hash;
+                            } else {
+                                println!("Height requested that doesn't exist on BC: {:?}", height_hash.height);
+                                peer.block_requests.remove(dl_i);
+                                continue;
+                            }
+                        }
+
+                        blocks_to_send.push((*connection_key, height_hash.hash_or_0, height_hash.height.0, peer.block_requests.slots[dl_i].offset as usize));
+                        peer.block_requests.remove(dl_i);
+                    }
+                }
+            }
+
+            next_peer_respond = std::time::Instant::now() + peer_respond_interval;
         }
 
         pending_selected_addresses.retain(|addr, time| std::time::Instant::now().saturating_duration_since(*time).as_secs() < 30);
@@ -1976,7 +2072,14 @@ pub fn sync(
                 peer.their_queue = their_queue;
 
             } else if packet_type == PACKET_TYPE_BLOCK_REQ {
-                todo!();
+
+                let Some(request) = some_or_kill!(PeerPowBlockRequest::read_from(&mut msg), "PeerPowBlockRequest read failed") else {
+                    continue 'process_packets;
+                };
+
+                if let Some(dl_i) = peer.block_requests.insert_or_position_of_download(request.height_hash) {
+                    peer.block_requests.slots[dl_i].offset = peer.block_requests.slots[dl_i].offset.max(request.offset);
+                }
 
             } else if packet_type == PACKET_TYPE_BLOCK_CHUNK {
 
