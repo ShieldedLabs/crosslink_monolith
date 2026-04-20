@@ -1113,7 +1113,7 @@ pub fn sync(
     // @Todo: @Refactor into a fn we can call to flush and reset the NearTipChains state.
     'init_near_tip_chains: {
         let ((tip_height, tip_hash), (finalized_tip_height, finalized_tip_hash)) = get_tips_blocking(&read_state, &rt);
-        println!("NewNet: Starting at height={} hash={:?} finalized_height={} finalized_hash={}", tip_height.0, tip_hash, finalized_tip_height.0, finalized_tip_hash);
+        tracing::info!("NewNet: Starting at height={} hash={:?} finalized_height={} finalized_hash={}", tip_height.0, tip_hash, finalized_tip_height.0, finalized_tip_hash);
 
         near_tip_chains.finalized_height = finalized_tip_height.0;
 
@@ -1175,7 +1175,7 @@ pub fn sync(
     else {
         network_keypair = new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap();
     }
-    println!("NewNet: KEYPAIR: {}", network_keypair);
+    tracing::info!("NewNet: KEYPAIR: {}", network_keypair);
 
     // STP networking setup
     socket_setup();
@@ -1192,7 +1192,7 @@ pub fn sync(
 
     let socket = match setup_and_bind_udp_socket(actual_network_local_port) {
         Some(s) => {
-            println!("NewNet: Bound to port {}", actual_network_local_port);
+            tracing::info!("NewNet: Bound to port {}", actual_network_local_port);
             s
         }
         None => {
@@ -1224,9 +1224,9 @@ pub fn sync(
                         tenderlink::bandwidth_test::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
                         );
             }
-            println!("NewNet: Connecting to peer: {:?}", address);
+            tracing::info!("NewNet: Connecting to peer: {:?}", address);
             match connect_to(socket, &mut connections_map, &my_keypairs, &address) {
-                Err(e) => println!("NewNet: Initial peer connect: connect_to failed: {e}"),
+                Err(e) => tracing::warn!("NewNet: Initial peer connect: connect_to failed: {e}"),
                 Ok(()) => {},
             }
             initial_peer_addresses.push(address);
@@ -1235,7 +1235,7 @@ pub fn sync(
         }
     }
 
-    println!("NewNet: STP setup complete, port={}, peers={}", actual_network_local_port, initial_peer_addresses.len());
+    tracing::info!("NewNet: STP setup complete, port={}, peers={}", actual_network_local_port, initial_peer_addresses.len());
 
     // Sync state
     let tick_duration = std::time::Duration::from_millis(IDLE_MS);
@@ -1282,7 +1282,7 @@ pub fn sync(
                 my_peers_to_print.push(stp_address_get_short_string(connection.address()));
             }
         }
-        println!("tip height: {:?}, finalized height: {:?}, peers: {:?}", near_tip_chains.tip_height(), near_tip_chains.finalized_height, my_peers_to_print);
+        tracing::info!("tip height: {:?}, finalized height: {:?}, peers: {:?}", near_tip_chains.tip_height(), near_tip_chains.finalized_height, my_peers_to_print);
 
         let loop_start = std::time::Instant::now();
 
@@ -1299,7 +1299,7 @@ pub fn sync(
                         }
 
                         _ => {
-                            println!("NewNet: block_event: {:?}", block_event);
+                            tracing::info!("NewNet: block_event: {:?}", block_event);
                         }
                     }
                 }
@@ -1317,9 +1317,9 @@ pub fn sync(
         // Try to reconnect to trusted initial seed peers
         for address in &initial_peer_addresses {
             if !connections_map.contains_key(&address.connection_key()) {
-                println!("NewNet: Connecting to {:?}...", address);
+                tracing::info!("NewNet: Connecting to {:?}...", address);
                 match connect_to(socket, &mut connections_map, &my_keypairs, address) {
-                    Err(e) => println!("NewNet: Initial peer reconnect: connect_to failed: {e}"),
+                    Err(e) => tracing::warn!("NewNet: Initial peer reconnect: connect_to failed: {e}"),
                     Ok(()) => {},
                 }
             }
@@ -1382,7 +1382,7 @@ pub fn sync(
 
                 match connect_to(socket, &mut connections_map, &my_keypairs, address) {
                     Err(e) => {
-                        println!("NewNet: Recent-address reconnect: connect_to failed: {e}");
+                        tracing::warn!("NewNet: Recent-address reconnect: connect_to failed: {e}");
                         continue;
                     }
                     Ok(()) => {},
@@ -1417,7 +1417,7 @@ pub fn sync(
 
                 match connect_to(socket, &mut connections_map, &my_keypairs, address) {
                     Err(e) => {
-                        println!("NewNet: Alleged-address reconnect: connect_to failed: {e}");
+                        tracing::warn!("NewNet: Alleged-address reconnect: connect_to failed: {e}");
                         continue;
                     }
                     Ok(()) => {},
@@ -1622,7 +1622,7 @@ pub fn sync(
                 macro_rules! warning {
                     ($($arg:tt)*) => {{
                         // let msg = format!("NewNet: Peer {:?}: {}", connection_address, format!($($arg)*));
-                        eprintln!("{}", format!("NewNet: Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
+                        tracing::warn!("{}", format!("NewNet: Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
                     }};
                 }
 
@@ -1960,13 +1960,13 @@ pub fn sync(
             macro_rules! warning {
                 ($($arg:tt)*) => {{
                     // let msg = format!("Peer {:?}: {}", connection_address, format!($($arg)*));
-                    eprintln!("{}", format!("NewNet: Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
+                    tracing::warn!("{}", format!("NewNet: Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
                 }};
             }
             macro_rules! kill {
                 ($($arg:tt)*) => {{
                     // let msg = format!("Killing peer {:?}: {}", connection_address, format!($($arg)*));
-                    eprintln!("{}", format!("NewNet: Killing peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
+                    tracing::error!("{}", format!("NewNet: Killing peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
                     connections_map.remove(&connection_key);
                     let kill_bucket = address_bucket(local_addresses_secret, &connection_address) & (MAX_RECENT_BUCKETS - 1);
                     if let Some(recents) = recent_peer_addresses.get_mut(&(kill_bucket as u16)) {
