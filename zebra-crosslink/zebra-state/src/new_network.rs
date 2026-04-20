@@ -1057,6 +1057,7 @@ impl BlockDownloads {
 
     fn insert_or_position_of_download(&mut self, height_hash: HeightAndHashOr0) -> Option<usize> {
         self.position_of_download(height_hash).or_else(|| {
+            if TRACE { tracing::info!("Inserting new download for height {} hash {}", height_hash.height.0, height_hash.hash_or_0); }
             self.insert_download(height_hash)
         })
     }
@@ -1397,7 +1398,7 @@ pub fn sync(
                 o += ConnectionKey::from(address).write_to(&mut buf[o..]);
 
                 for (key, _conn) in connections_map.iter().filter(|(_, c)| c.is_connected()).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_RECENTS) {
-                    if TRACE { println!("NewNet: Requesting hole punch to recent address {:?} via random peer: {:?}...", address, _conn.address()); }
+                    if TRACE { tracing::info!("Requesting hole punch to recent address {:?} via random peer: {:?}...", address, _conn.address()); }
                     packets_to_send.push((*key, Vec::from(&buf[..o]), None));
                 }
             }
@@ -1430,12 +1431,12 @@ pub fn sync(
                 o += ConnectionKey::from(address).write_to(&mut buf[o..]);
 
                 for (key, _conn) in connections_map.iter().filter(|(k, c)| c.is_connected() && *k != sender_connection_key).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_ALLEGEDS) {
-                    if TRACE { println!("NewNet: Requesting hole punch to alleged address {:?} via random peer: {:?}...", address, _conn.address()); }
+                    if TRACE { tracing::info!("Requesting hole punch to alleged address {:?} via random peer: {:?}...", address, _conn.address()); }
                     packets_to_send.push((*key, Vec::from(&buf[..o]), None));
                 }
 
                 if get_connected(&connections_map, &sender_connection_key).is_some() {
-                    if TRACE { println!("NewNet: Requesting hole punch to alleged address {:?} via the original sender: {:?}...", address, sender_connection_key); }
+                    if TRACE { tracing::info!("Requesting hole punch to alleged address {:?} via the original sender: {:?}...", address, sender_connection_key); }
                     packets_to_send.push((*sender_connection_key, Vec::from(&buf[..o]), None));
                 }
             }
@@ -1498,11 +1499,11 @@ pub fn sync(
         for (connection_key, hash, height, offset) in &blocks_to_send {
             let hash = *hash;
             let Some(connection) = get_connected(&connections_map, connection_key) else {
-                if TRACE { println!("NewNet: Can't send block that was queued for sending: Peer was disconnected: {connection_key:?}"); }
+                if TRACE { tracing::info!("Can't send block that was queued for sending: Peer was disconnected: {connection_key:?}"); }
                 continue;
             };
             let Some(peer) = peers.get_mut(connection_key) else {
-                if TRACE { println!("NewNet: Can't send block that was queued for sending: Peer does not exist for address: {:?}", connection.address()); }
+                if TRACE { tracing::info!("Can't send block that was queued for sending: Peer does not exist for address: {:?}", connection.address()); }
                 continue;
             };
 
@@ -1526,7 +1527,7 @@ pub fn sync(
                 }
             }
 
-            if TRACE { println!("NewNet: Sending BLOCK (Height: {height}, Hash: {hash})"); }
+            if TRACE { tracing::info!("Sending BLOCK (Height: {height}, Hash: {hash})"); }
 
             let serialized_block = &serialized_blocks[&hash];
 
@@ -1584,7 +1585,7 @@ pub fn sync(
 
             for (key, connection) in &connections_map {
                 if !connection.is_connected() {
-                    if TRACE { println!("NewNet: Trying to send a STATUS to {:?}, but was disconnected!", connection.address()); }
+                    if TRACE { tracing::info!("Trying to send a STATUS to {:?}, but was disconnected!", connection.address()); }
                     continue;
                 }
 
@@ -1664,7 +1665,7 @@ pub fn sync(
                                     };
 
                                     if their_queue.contains(&hash) {
-                                        if TRACE { println!("NewNet: Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
+                                        if TRACE { tracing::info!("Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
                                         continue;
                                     }
 
@@ -1724,7 +1725,7 @@ pub fn sync(
                             let hash = block_to_queue.this_hash;
 
                             if their_queue.contains(&hash) {
-                                if TRACE { println!("NewNet: Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
+                                if TRACE { tracing::info!("Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
                                 continue;
                             }
 
@@ -1810,7 +1811,7 @@ pub fn sync(
                             let hash = block_to_queue.this_hash;
 
                             if blocks_to_commit.iter().any(|(block_hash, _)| *block_hash == hash) {
-                                if TRACE { println!("NewNet: Skipped requesting block already in our queue. Peer {connection_address:?}. Hash: {hash}"); }
+                                if TRACE { tracing::info!("Skipped requesting block already in our queue. Peer {connection_address:?}. Hash: {hash}"); }
                                 continue;
                             }
 
@@ -1852,6 +1853,8 @@ pub fn sync(
                         height_hash: dl.height_hash,
                         offset,
                     }.write_to(&mut buf[o..]);
+
+                    if TRACE { tracing::info!("Requesting height {} hash {} from peer {connection_key:?}", dl.height_hash.height.0, dl.height_hash.hash_or_0); }
 
                     packets_to_send.push((*connection_key, Vec::from(&buf[..o]), None));
                 }
@@ -1898,7 +1901,7 @@ pub fn sync(
         // @Todo: real scheduling. Right now I just want to receive everything!
         for (_, buf, _) in &packets_to_send {
             assert!(buf.len() > 0);
-            if TRACE { println!("NewNet: Sending message type: {} ({})", packet_name_from_type(buf[0]), buf[0]); }
+            if TRACE { tracing::info!("Sending message type: {} ({})", packet_name_from_type(buf[0]), buf[0]); }
         }
         for _ in 0..128 {
             more_packets_likely_available = service_connections(&mut connections_map,
@@ -1983,7 +1986,7 @@ pub fn sync(
                 continue 'process_packets;
             };
 
-            if TRACE { println!("NewNet: Got message type: {} ({})", packet_name_from_type(packet_type), packet_type); }
+            if TRACE { tracing::info!("Got message type: {} ({})", packet_name_from_type(packet_type), packet_type); }
 
             if packet_type == PACKET_TYPE_PEER_ADDRESS_LIST {
                 // @Todo: rate limit consumption
@@ -2013,7 +2016,7 @@ pub fn sync(
                             map.remove(&map.keys().choose(&mut rand::thread_rng()).cloned().unwrap());
                         }
                     }
-                    if TRACE { println!("NewNet: Adding new address to alleged addresses: {address_clone_for_printing:?}"); }
+                    if TRACE { tracing::info!("Adding new address to alleged addresses: {address_clone_for_printing:?}"); }
                 }
 
             } else if packet_type == PACKET_TYPE_WANT_HOLE_PUNCH {
@@ -2029,7 +2032,7 @@ pub fn sync(
                     o += PACKET_TYPE_TRY_HOLE_PUNCH.write_to(&mut buf[o..]);
                     o += connection_address        .write_to(&mut buf[o..]);
 
-                    if TRACE { println!("NewNet: Relaying hole punch request from {:?} to {:?}...", connection_address, relay_to_connection_key); }
+                    if TRACE { tracing::info!("Relaying hole punch request from {:?} to {:?}...", connection_address, relay_to_connection_key); }
                     packets_to_send.push((relay_to_connection_key, Vec::from(&buf[..o]), None));
                 }
 
@@ -2041,7 +2044,7 @@ pub fn sync(
                 };
 
                 if !connections_map.contains_key(&address_to_punch_to.connection_key()) {
-                    if TRACE { println!("NewNet: Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, connection_address); }
+                    if TRACE { tracing::info!("Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, connection_address); }
                     let _ = connect_to(socket, &mut connections_map, &my_keypairs, &address_to_punch_to);
                 }
 
@@ -2110,7 +2113,7 @@ pub fn sync(
                 // is "not even worth" submitting to Zebra (rejected due to being too far back).
                 let min_height = near_tip_chains.chains[0].blocks[0].this_height; // @Todo: this assumes :AssumeGenesisBlockIncludedInNearTipChains
 
-                if TRACE { println!("NewNet: Block @ {alleged_height}..."); }
+                if TRACE { tracing::info!("Block @ {alleged_height}..."); }
 
                 if alleged_height < min_height {
                     warning!("Block at height {alleged_height} is below our near-tip-chain height {min_height}");
@@ -2153,7 +2156,7 @@ pub fn sync(
                 // @Note: the hash could be computed from the block header, so this is an early-out optimization.
                 let alleged_hash = hdr.height_hash.hash_or_0;
 
-                if TRACE { println!("NewNet: Block @ {alleged_height} hash {alleged_hash}..."); }
+                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}..."); }
 
                 if alleged_hash == block::Hash([0;32]) {
                     kill!("the provided hash should not be 0");
@@ -2165,7 +2168,7 @@ pub fn sync(
                     continue 'process_packets;
                 }
 
-                if TRACE { println!("NewNet: Block @ {alleged_height} hash {alleged_hash}, not already queued..."); }
+                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not already queued..."); }
 
                 for our_chain in &near_tip_chains.chains {
                     if our_chain.blocks.iter().any(|block| block.this_hash == alleged_hash) {
@@ -2174,7 +2177,7 @@ pub fn sync(
                     }
                 }
 
-                if TRACE { println!("NewNet: Block @ {alleged_height} hash {alleged_hash}, not already in near_tip_chains..."); }
+                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not already in near_tip_chains..."); }
 
 
                 // try to construct a full block from the data available
@@ -2214,7 +2217,7 @@ pub fn sync(
                     continue 'process_packets;
                 }
 
-                if TRACE { println!("NewNet: Block @ {alleged_height} hash {alleged_hash}, valid hash and height and links somewhere known..."); }
+                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, valid hash and height and links somewhere known..."); }
 
                 use zebra_chain::serialization::ZcashDeserializeInto;
                 let Some(block) = some_or_kill!(block_data.zcash_deserialize_into::<Block>().ok(), "Failed to deserialize block") else {
@@ -2226,7 +2229,7 @@ pub fn sync(
                 //        - call it at the top of the place where they are currently used
                 //        - call that right here
 
-                if TRACE { println!("NewNet: Block @ {alleged_height} hash {alleged_hash}, deserialized..."); }
+                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, deserialized..."); }
 
                 let hash = block.hash();
                 if hash != alleged_hash {
@@ -2312,7 +2315,7 @@ pub fn sync(
                     failure_count: 0u32, // @Todo: Implement this counter!
                 });
                 if prev.is_none() {
-                    if TRACE { println!("NewNet: Added address to recent addresses: {connection_address:?}"); }
+                    if TRACE { tracing::info!("Added address to recent addresses: {connection_address:?}"); }
                 }
             }
 

@@ -1038,7 +1038,7 @@ pub fn service_connections(
 
                                     match slot.insert(byte_idx, frag_data) {
                                         Ok(true) => {
-                                            // Message complete — deliver it
+                                            // Message complete - deliver it
                                             let completed = reasm.slots.remove(&frag_id).unwrap();
                                             packets_received_this_call.push((connection_key, completed.buf, Some(frag_id)));
                                         }
