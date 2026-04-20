@@ -1048,7 +1048,7 @@ impl BlockDownloads {
 
     /// NOTE: doesn't enforce height match if going by hash
     fn position_of_download(&self, height_hash: HeightAndHashOr0) -> Option<usize> {
-        self.slots.iter().position(|dl| if dl.height_hash.hash_or_0 == block::Hash([0;32]) {
+        self.slots.iter().position(|dl| if dl.height_hash.hash_or_0 == block::Hash([0;32]) || height_hash.hash_or_0 == block::Hash([0;32]) {
             dl.height_hash.height == height_hash.height
         } else {
             dl.height_hash.hash_or_0 == height_hash.hash_or_0
@@ -1766,6 +1766,7 @@ pub fn sync(
                         }).is_none() {
                             break;
                         }
+                        req_h += 1;
                     }
 
                     for their_branch in &their_tree.branches {
@@ -1837,26 +1838,30 @@ pub fn sync(
         if std::time::Instant::now() >= next_peer_request {
             for (connection_key, peer) in peers.iter_mut() {
                 // TODO: can we pack these into packlets now?
-                for dl in &peer.block_downloads.slots {
-                    // determine the lowest offset before which we have every byte already
-                    let prefix = dl.reassembly.received.first().unwrap_or(&(0,0));
-                    let offset = if prefix.0 == 0 {
-                        prefix.1
-                    } else {
-                        0
-                    };
+                for dl_i in 0..peer.block_requests.slots.len() {
+                    if ((peer.block_requests.used_flags >> dl_i) & 1) != 0 {
+                        let dl = &peer.block_requests.slots[dl_i];
 
-                    let mut buf = [0u8; JUMBO_FRAG_SIZE];
-                    let mut o = 0;
-                    o += PACKET_TYPE_BLOCK_REQ.write_to(&mut buf[o..]);
-                    o += PeerPowBlockRequest {
-                        height_hash: dl.height_hash,
-                        offset,
-                    }.write_to(&mut buf[o..]);
+                        // determine the lowest offset before which we have every byte already
+                        let prefix = dl.reassembly.received.first().unwrap_or(&(0,0));
+                        let offset = if prefix.0 == 0 {
+                            prefix.1
+                        } else {
+                            0
+                        };
 
-                    if TRACE { tracing::info!("Requesting height {} hash {} from peer {connection_key:?}", dl.height_hash.height.0, dl.height_hash.hash_or_0); }
+                        let mut buf = [0u8; JUMBO_FRAG_SIZE];
+                        let mut o = 0;
+                        o += PACKET_TYPE_BLOCK_REQ.write_to(&mut buf[o..]);
+                        o += PeerPowBlockRequest {
+                            height_hash: dl.height_hash,
+                            offset,
+                        }.write_to(&mut buf[o..]);
 
-                    packets_to_send.push((*connection_key, Vec::from(&buf[..o]), None));
+                        if TRACE { tracing::info!("Requesting height {} hash {} from peer {connection_key:?}", dl.height_hash.height.0, dl.height_hash.hash_or_0); }
+
+                        packets_to_send.push((*connection_key, Vec::from(&buf[..o]), None));
+                    }
                 }
             }
 
