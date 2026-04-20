@@ -872,7 +872,7 @@ pub fn is_parent_in_chains(rt: &tokio::runtime::Handle, state: &State, near_tip_
         }
         Ok(Response::KnownBlock(Some(block))) => {
             // @Note: if we don't find the parent in near tip chains, but we ask Zebra and Zebra is aware of it, warn loudly.
-            eprintln!("NewNet: WARNING!! Block hash {parent_hash} was NOT in near tip chains but contained by Zebra state!!");
+            tracing::warn!("NewNet: Block hash {parent_hash} was NOT in near tip chains but contained by Zebra state!!");
             //dbg_panic!();
             return true;
         }
@@ -1196,7 +1196,7 @@ pub fn sync(
             s
         }
         None => {
-            eprintln!("NewNet: Port {} unavailable, binding to ephemeral port", actual_network_local_port);
+            tracing::warn!("NewNet: Port {} unavailable, binding to ephemeral port", actual_network_local_port);
             setup_and_bind_udp_socket(0).expect("Failed to bind UDP socket on any port")
         }
     };
@@ -1231,7 +1231,7 @@ pub fn sync(
             }
             initial_peer_addresses.push(address);
         } else {
-            eprintln!("NewNet: Failed to parse peer address: {}", peer_str);
+            tracing::warn!("NewNet: Failed to parse peer address: {}", peer_str);
         }
     }
 
@@ -1519,7 +1519,7 @@ pub fn sync(
                     }
                     Ok(ReadResponse::Block(None)) => {
                         // @Todo: This needs fixing!!! :SidechainSync
-                        eprintln!("NewNet: Couldn't get block for hash {hash}!");
+                        tracing::warn!("NewNet: Couldn't get block for hash {hash}!");
                         continue;
                     }
                     Err(err) => { panic!("ReadRequest::Block({hash}): Error: {err:?}");              }
@@ -1613,7 +1613,7 @@ pub fn sync(
                 // Skip now-disconnected peers
                 let connection_address = {
                     let Some(connection) = get_connected(&connections_map, &connection_key) else {
-                        eprintln!("NewNet: Peer is disconnected even after we filtered out disconnected peers. Impossible!: {connection_key:?}");
+                        tracing::error!("NewNet: Peer is disconnected even after we filtered out disconnected peers. Impossible!: {connection_key:?}");
                         continue 'send_to_peers;
                     };
                     connection.address()
@@ -1943,7 +1943,7 @@ pub fn sync(
             // Skip processing packets from now-disconnected peers
             let connection_address = {
                 let Some(connection) = get_connected(&connections_map, &connection_key) else {
-                    eprintln!("NewNet: Dropping message from disconnected peer: {connection_key:?}");
+                    tracing::info!("NewNet: Dropping message from disconnected peer: {connection_key:?}");
                     continue 'process_packets;
                 };
                 connection.address()
@@ -2267,7 +2267,7 @@ pub fn sync(
                     continue 'process_packets;
                 }
 
-                eprintln!("NewNet: \x1b[93mGOT BLOCK HASH\x1b[0m: {}", hash);
+                if TRACE { tracing::info!("NewNet: \x1b[93mGOT BLOCK HASH\x1b[0m: {}", hash); }
 
                 // @Todo(Phil): Semantic verification.
 
