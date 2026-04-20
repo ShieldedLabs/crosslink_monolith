@@ -457,7 +457,7 @@ pub fn connect_to_endpoint(
             hello_packet_payload[6..6+32].copy_from_slice(&my_connect_keypair.public[..]);
             assert_eq!(list_of_protocols_len_bytes, 0,); // temp
             //hello_packet_payload[6+32..6+32+list_of_protocols_len_bytes].copy_from_slice(&packet_memory_send[0..list_of_protocols_len_bytes]);
-            
+
             let my_ip = if endpoint.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
                 ConnectionKey::from(endpoint),
@@ -542,14 +542,14 @@ impl PackletOneJumboFragment {
 // partial overlap: kill connection
 // out of bounds past total_len: kill connection
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct ReassemblySlot {
-    buf: Vec<u8>,
-    total_len: u32,
-    received: Vec<(u32, u32)>, // sorted non-overlapping non-adjacent ranges: [start, end)
+pub struct ReassemblySlot {
+    pub buf: Vec<u8>,
+    pub total_len: u32,
+    pub received: Vec<(u32, u32)>, // sorted non-overlapping non-adjacent ranges: [start, end)
 }
 
 impl ReassemblySlot {
-    fn new(total_len: u32) -> Self {
+    pub fn new(total_len: u32) -> Self {
         Self {
             buf: vec![0u8; total_len as usize],
             total_len,
@@ -557,7 +557,8 @@ impl ReassemblySlot {
         }
     }
 
-    fn insert(&mut self, offset: usize, data: &[u8]) -> Result<bool, ()> {
+    // @assume_fixed_size_packets
+    pub fn insert(&mut self, offset: usize, data: &[u8]) -> Result<bool, ()> {
         let start = offset as u32;
         if start >= self.total_len {
             return Err(());
@@ -568,6 +569,7 @@ impl ReassemblySlot {
             return Err(());
         }
 
+        // NOTE: I think this is ~equivalent to self.received.partition_point(|&(s, _)| s < start);
         // Binary search: find first range whose end > start (skip adjacent)
         let pos = self.received.partition_point(|&(_, e)| e <= start);
 
@@ -585,6 +587,7 @@ impl ReassemblySlot {
             }
         }
 
+        // TODO: loop over & merge all overlapping ranges; error if non-matching
         // Check overlap with the range at `pos`
         if pos < self.received.len() && self.received[pos].0 < end {
             return Err(());
@@ -691,7 +694,7 @@ pub fn service_connections(
                                 let list_of_protocols_len_bytes = buf_len - 6 - 32;
                                 assert_eq!(list_of_protocols_len_bytes, 0); // temp
                                 // TODO list of supported Application Level protocols for e.g. zcash network upgrades. Note: We will need to use a callback in order for application code on the server to select which magic2 we will use and whether to reject the client. This is because magic2's do not have a strict order preference and so we need to push that logic to the application layer.
-                                
+
                                 let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
                                 if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
                                     if &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key {
@@ -701,7 +704,7 @@ pub fn service_connections(
                                                 packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
                                                 // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
                                                 let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32]);
-                                                
+
                                                 existing_connection.connection_state = ConnectionState::SendingServerHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload };
                                                 if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
                                             } else {
@@ -721,7 +724,7 @@ pub fn service_connections(
                                     packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
                                     // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
                                     let hello_packet_payload = Vec::from(&packet_memory_send[0..6+32]);
-                                    
+
                                     let my_ip = if other_ip_addr.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
                                     connections_map.insert(
                                         connection_key,
@@ -790,10 +793,10 @@ pub fn service_connections(
                                         // TODO single chosen Application Level protocols for e.g. zcash network upgrades.
                                         let handshake_size = new_handshake.write_message(&[], &mut packet_memory_send[6..]).unwrap();
                                         let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
-                                        
+
                                         debug_assert!(new_handshake.is_handshake_finished());
                                         let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
-                                        
+
                                         let my_ip = if other_ip_addr.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
                                         connections_map.insert(
                                             connection_key,
@@ -867,7 +870,7 @@ pub fn service_connections(
                                     assert_eq!(payload_len, 0);
                                     // TODO receive and validate selected magic2
                                     if VERBOSE { println!("Connected to new server {:?}", handshake.get_remote_static().unwrap()); }
-                                    
+
                                     // Borrow Checker crazyness required here.
                                     let new_state = ConnectionState::Connected {
                                         cipher: None,
@@ -879,7 +882,7 @@ pub fn service_connections(
                                         recv_time_ns: timestamp_ns,
                                     };
                                     let old_state = std::mem::replace(&mut existing_connection.connection_state, new_state);
-                                    
+
                                     let ConnectionState::SendingClientHello { handshake, .. } = old_state else { panic!(); };
                                     let ConnectionState::Connected { cipher, .. } = &mut existing_connection.connection_state else { panic!(); };
                                     *cipher = Some(ConnectionCipherTriplet::new_from_old_init_only(handshake.into_stateless_transport_mode().expect("Cannot fail given assert above.")));
@@ -910,7 +913,7 @@ pub fn service_connections(
                         }
                         ConnectionState::SendingServerHello { cipher, magic1, last_sent_time_ns, hello_packet_payload } => {
                             let non_virtual_nonce = first_six_bytes >> 16; // Todo convert this to virtual.
-                            
+
                             let mut can_decrypt = false;
                             // Optimization done here. It can never be cipher.old so we skip checking.
                             can_decrypt |= cipher.current.read_message(non_virtual_nonce, &packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]).is_ok();
@@ -1133,7 +1136,7 @@ pub fn service_connections(
                 store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
                 store_u32(&mut packet_memory_encrypted[2..6], virtual_nonce as u32);
                 *send_sequence_number += 1;
-                
+
                 let packet_len;
                 if let Some(cipher) = cipher {
                     packet_len = cipher.current.write_message(virtual_nonce, &[], &mut packet_memory_encrypted[6..]).unwrap();
@@ -1141,7 +1144,7 @@ pub fn service_connections(
                 else {
                     packet_len = 0;
                 }
-                
+
                 udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21);
                 *last_sent_keep_alive_time_ns = current_time_now_ns;
                 return true;
@@ -1236,7 +1239,7 @@ pub fn service_connections(
             if o < mMTU_inside_stp {
                 packet_memory_send[o..mMTU_inside_stp].fill(0); // @Todo: real packlet framing
             }
-            
+
             send(&packet_memory_send[..mMTU_inside_stp]);
             packet_counter_index += 1;
             if packet_counter_index > 1000 {
