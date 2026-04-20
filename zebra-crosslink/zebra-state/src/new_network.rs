@@ -753,6 +753,8 @@ const BLOCK_SEND_MS: u64 = 2000; // fastest interval at which to send blocks to 
 const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 2;
 const PEER_CONNECT_MS: u64 = 6000;
 const PEER_GOSSIP_MS:  u64 = 2500;
+const PEER_REQUEST_MS: u64 = 1000;
+const PEER_RESPOND_MS: u64 = 2000;
 
 
 const IDLE_MS: u64 = 550;
@@ -991,6 +993,53 @@ impl SliceWrite for PeerPowBlockResponseChunkHdr {
         o
     }
 }
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BlockDownloads {
+    slots: [PeerPowBlockDownload; 32],
+    used_flags: u64,
+}
+impl BlockDownloads {
+    fn insert_download(&mut self, height_hash: HeightAndHashOr0) -> Option<usize> {
+        let dl_i = self.used_flags.trailing_ones() as usize;
+        if dl_i < self.slots.len() {
+            self.slots[dl_i] = PeerPowBlockDownload {
+                height_hash: height_hash,
+                reassembly: ReassemblySlot::default(),
+            };
+            self.used_flags |= 1 << dl_i;
+            Some(dl_i)
+        } else {
+            None
+        }
+    }
+
+    /// NOTE: doesn't enforce height match if going by hash
+    fn position_of_download(&self, height_hash: HeightAndHashOr0) -> Option<usize> {
+        self.slots.iter().position(|dl| if dl.height_hash.hash_or_0 == block::Hash([0;32]) {
+            dl.height_hash.height == height_hash.height
+        } else {
+            dl.height_hash.hash_or_0 == height_hash.hash_or_0
+        })
+    }
+
+    fn insert_or_position_of_download(&mut self, height_hash: HeightAndHashOr0) -> Option<usize> {
+        self.position_of_download(height_hash).or_else(|| {
+            self.insert_download(height_hash)
+        })
+    }
+
+    fn remove(&mut self, dl_i: usize) -> PeerPowBlockDownload {
+        let dl =  &mut self.slots[dl_i];
+        let mut dl2 = PeerPowBlockDownload::default();
+
+        std::mem::swap(&mut dl2, dl);
+
+        self.used_flags &= !(1 << dl_i);
+        self.slots[dl_i] = PeerPowBlockDownload::default();
+
+        dl2
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Peer {
@@ -1006,8 +1055,7 @@ pub struct Peer {
     // TODO: this is a poor substitute for proper reliable streams
     // TODO: also handle PoS
     // TODO: cross-peer tracking
-    block_downloads: [PeerPowBlockDownload; 32],
-    block_downloads_active_flags: u64,
+    block_downloads: BlockDownloads,
 }
 
 #[derive(Debug)]
@@ -1161,6 +1209,8 @@ pub fn sync(
     let block_send_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
     let peer_gossip_interval = std::time::Duration::from_millis(PEER_GOSSIP_MS);
     let peer_connect_interval = std::time::Duration::from_millis(PEER_CONNECT_MS);
+    let peer_request_interval = std::time::Duration::from_millis(PEER_REQUEST_MS);
+    let peer_respond_interval = std::time::Duration::from_millis(PEER_RESPOND_MS);
 
     let mut blocks_to_commit:  Vec<(Hash, std::sync::Arc<Block>)> = Vec::new();
     let mut blocks_to_send:    Vec<(ConnectionKey, Hash, u32)>    = Vec::new();
@@ -1509,7 +1559,7 @@ pub fn sync(
         if std::time::Instant::now() >= next_block_send {
             const MAX_PEERS_TO_SEND_BLOCKS_TO: usize = 8;
 
-            'send_to_peers: for (connection_key, Peer { origin, their_tree, their_queue, ref mut block_downloads, block_downloads_active_flags }) in peers.iter_mut().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_SEND_BLOCKS_TO) {
+            'send_to_peers: for (connection_key, Peer { origin, their_tree, their_queue, ref mut block_downloads }) in peers.iter_mut().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_SEND_BLOCKS_TO) {
                 // @Duplicate with packet status parsing
 
                 if *their_tree == NearTipBranches::default() {
@@ -1540,48 +1590,6 @@ pub fn sync(
                 };
 
 
-                let mut blocks_to_queue = HashSet::new();
-
-                // @Note: If the peer is far behind, beam them blocks from farther back in our chain to catch them up.
-                // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
-                if their_tree.tip_height < near_tip_chains.finalized_height {
-
-                    for height in their_tree.tip_height..near_tip_chains.finalized_height {
-                        let res = rt.block_on(async {
-                            read_state.clone().oneshot(ReadRequest::BestChainBlockHash(Height(height).into())).await
-                        });
-                        match res {
-                            Ok(ReadResponse::BlockHash(hash)) => {
-                                let Some(hash) = dbg_verify(hash) else {
-                                    warning!("Couldn't get block for height {height} which should be finalized! What happened?");
-                                    break;
-                                };
-
-                                if their_queue.contains(&hash) {
-                                    if TRACE { println!("NewNet: Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
-                                    continue;
-                                }
-
-                                if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
-                                    if blocks_to_queue.insert((hash, height)) {
-                                        blocks_to_this_peer += 1;
-                                    }
-                                } else {
-                                    break;
-                                }
-                            }
-                            Err(err) => { panic!("ReadRequest::BestChainBlockHash({height}): Error: {err:?}");              }
-                            _        => { panic!("ReadRequest::BestChainBlockHash({height}): Unhandled response: {res:?}"); }
-                        }
-                    }
-
-                }
-
-                // @Todo: If the peer is far ahead, request blocks from farther back in their chain to catch us up.
-                if our_tip_height < their_tree.finalized_height {
-                    warning!("Too far ahead of me");
-                    continue 'send_to_peers;
-                }
 
                 // rule to push:
                 //     per each of our chains:
@@ -1591,7 +1599,112 @@ pub fn sync(
                 //     per each of our chains:
                 //         if any of their branches is equal to or an extension of this chain, don't push
                 //         otherwise push the blocks after the intersection
-                //
+
+                // @Note: With this algorithm, another peer can systematically probe which
+                //        blocks we have on each branch. This may have implications.
+                let mut queue_blocks_to_send_unsolicited = || {
+                    let mut blocks_to_queue = HashSet::new();
+
+                    // @Note: If the peer is far behind, beam them blocks from farther back in our chain to catch them up.
+                    // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
+                    if their_tree.tip_height < near_tip_chains.finalized_height {
+
+                        for height in their_tree.tip_height..near_tip_chains.finalized_height {
+                            let res = rt.block_on(async {
+                                read_state.clone().oneshot(ReadRequest::BestChainBlockHash(Height(height).into())).await
+                            });
+                            match res {
+                                Ok(ReadResponse::BlockHash(hash)) => {
+                                    let Some(hash) = dbg_verify(hash) else {
+                                        warning!("Couldn't get block for height {height} which should be finalized! What happened?");
+                                        break;
+                                    };
+
+                                    if their_queue.contains(&hash) {
+                                        if TRACE { println!("NewNet: Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
+                                        continue;
+                                    }
+
+                                    if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
+                                        if blocks_to_queue.insert((hash, height)) {
+                                            blocks_to_this_peer += 1;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                Err(err) => { panic!("ReadRequest::BestChainBlockHash({height}): Error: {err:?}");              }
+                                _        => { panic!("ReadRequest::BestChainBlockHash({height}): Unhandled response: {res:?}"); }
+                            }
+                        }
+
+                    }
+
+                    for our_chain in &near_tip_chains.chains {
+                        assert!(our_chain.blocks.len() > 0);
+
+                        let our_chain_height_bgn = our_chain.blocks[0].this_height;
+                        let our_chain_height_end = our_chain.blocks.last().unwrap().this_height + 1;
+
+                        let mut max_height_we_both_share = None;
+
+                        for their_branch in &their_tree.branches {
+                            let their_branch_height_bgn = their_branch[0].this_height;
+                            let their_branch_height_end = their_branch.last().unwrap().this_height + 1;
+
+                            let prefix = chain_intersect_prefix(&their_branch, &our_chain.blocks);
+                            // print_shadow_block_intersection(&their_branch, &our_chain.blocks, 1);
+
+
+                            // If the prefix was empty, there was no overlap.
+                            if prefix.is_empty() {
+                                continue;
+                            }
+
+                            let height_of_match = prefix.last().unwrap().this_height;
+
+                            assert!(height_of_match < our_chain_height_end);
+                            assert!(height_of_match < their_branch_height_end);
+
+                            max_height_we_both_share = max_height_we_both_share.max(Some(height_of_match));
+                        }
+
+                        let Some(max_height_we_both_share) = max_height_we_both_share else {
+                            continue; // Nothing on this chain of ours that we can use to extend their branch.
+                        };
+
+                        for height in max_height_we_both_share + 1 .. our_chain_height_end {
+                            let chain_i = (height - our_chain_height_bgn) as usize;
+
+                            let block_to_queue = &our_chain.blocks[chain_i];
+
+                            let hash = block_to_queue.this_hash;
+
+                            if their_queue.contains(&hash) {
+                                if TRACE { println!("NewNet: Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
+                                continue;
+                            }
+
+                            // We may submit the same block multiple times (visit >1 of our chains that share a short prefix with their branch), and that's valid
+                            if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
+                                if blocks_to_queue.insert((hash, height)) {
+                                    blocks_to_this_peer += 1;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    for (block, height) in blocks_to_queue {
+                        blocks_to_send.push((*connection_key, block, height));
+                    }
+                };
+                if false {
+                    queue_blocks_to_send_unsolicited();
+                }
+
+
                 // rule to pull:
                 // per each of their branches:
                 //     per each of our chains:
@@ -1599,71 +1712,79 @@ pub fn sync(
                 //         track the maximum height of the intersections
                 //     request everything up from the maximum height all the way to their tip
                 //
-
-                // @Note: With this algorithm, another peer can systematically probe which
-                //        blocks we have on each branch. This may have implications.
-                for our_chain in &near_tip_chains.chains {
-                    assert!(our_chain.blocks.len() > 0);
-
-                    let our_chain_height_bgn = our_chain.blocks[0].this_height;
-                    let our_chain_height_end = our_chain.blocks.last().unwrap().this_height + 1;
-
-                    let mut max_height_we_both_share = None;
+                let mut queue_blocks_to_request = || {
+                    // If the peer is far ahead, request blocks from farther back in their chain to catch us up.
+                    let mut req_h = our_tip_height + 1;
+                    while req_h < their_tree.finalized_height {
+                        if block_downloads.insert_or_position_of_download(HeightAndHashOr0 {
+                            height: block::Height(req_h),
+                            hash_or_0: block::Hash([0;32]),
+                        }).is_none() {
+                            break;
+                        }
+                    }
 
                     for their_branch in &their_tree.branches {
                         let their_branch_height_bgn = their_branch[0].this_height;
                         let their_branch_height_end = their_branch.last().unwrap().this_height + 1;
 
-                        let prefix = chain_intersect_prefix(&their_branch, &our_chain.blocks);
-                        // print_shadow_block_intersection(&their_branch, &our_chain.blocks, 1);
+                        let mut max_height_we_both_share = None;
+
+                        for our_chain in &near_tip_chains.chains {
+                            assert!(our_chain.blocks.len() > 0);
+
+                            let our_chain_height_bgn = our_chain.blocks[0].this_height;
+                            let our_chain_height_end = our_chain.blocks.last().unwrap().this_height + 1;
 
 
-                        // If the prefix was empty, there was no overlap.
-                        if prefix.is_empty() {
-                            continue;
-                        }
+                            let prefix = chain_intersect_prefix(&their_branch, &our_chain.blocks);
+                            // print_shadow_block_intersection(&their_branch, &our_chain.blocks, 1);
 
-                        let height_of_match = prefix.last().unwrap().this_height;
 
-                        assert!(height_of_match < our_chain_height_end);
-                        assert!(height_of_match < their_branch_height_end);
-
-                        max_height_we_both_share = max_height_we_both_share.max(Some(height_of_match));
-                    }
-
-                    let Some(max_height_we_both_share) = max_height_we_both_share else {
-                        continue; // Nothing on this chain of ours that we can use to extend their branch.
-                    };
-
-                    for height in max_height_we_both_share + 1 .. our_chain_height_end {
-                        let chain_i = (height - our_chain_height_bgn) as usize;
-
-                        let block_to_queue = &our_chain.blocks[chain_i];
-
-                        let hash = block_to_queue.this_hash;
-
-                        if their_queue.contains(&hash) {
-                            if TRACE { println!("NewNet: Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
-                            continue;
-                        }
-
-                        // We may submit the same block multiple times (visit >1 of our chains that share a short prefix with their branch), and that's valid
-                        if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
-                            if blocks_to_queue.insert((hash, height)) {
-                                blocks_to_this_peer += 1;
+                            // If the prefix was empty, there was no overlap.
+                            if prefix.is_empty() {
+                                continue;
                             }
-                        } else {
-                            break;
+
+                            let height_of_match = prefix.last().unwrap().this_height;
+
+                            assert!(height_of_match < our_chain_height_end);
+                            assert!(height_of_match < their_branch_height_end);
+
+                            max_height_we_both_share = max_height_we_both_share.max(Some(height_of_match));
+                            // TODO: early out if fully contained
+                        }
+
+                        let Some(max_height_we_both_share) = max_height_we_both_share else {
+                            continue; // Nothing on this chain of ours that we can use to extend their branch.
+                        };
+
+                        for height in max_height_we_both_share + 1 .. their_branch_height_end {
+                            let chain_i = (height - their_branch_height_bgn) as usize;
+
+                            let block_to_queue = &their_branch[chain_i];
+
+                            let hash = block_to_queue.this_hash;
+
+                            if blocks_to_commit.iter().any(|(block_hash, _)| *block_hash == hash) {
+                                if TRACE { println!("NewNet: Skipped requesting block already in our queue. Peer {connection_address:?}. Hash: {hash}"); }
+                                continue;
+                            }
+
+                            // We may submit the same block multiple times (visit >1 of our chains that share a short prefix with their branch), and that's valid
+                            if let Some(dl_i) = block_downloads.insert_or_position_of_download(HeightAndHashOr0 {
+                                height: block::Height(height),
+                                hash_or_0: hash,
+                            }) {
+                                // successfully pushed download
+                            } else {
+                                break; // not enough space for more downloads
+                            }
                         }
                     }
-                }
+                };
 
-                for (block, height) in blocks_to_queue {
-                    blocks_to_send.push((*connection_key, block, height));
-                }
-
-                // @Todo: Pull.
-
+                queue_blocks_to_request();
             }
 
             next_block_send = std::time::Instant::now() + block_send_interval;
@@ -1899,37 +2020,30 @@ pub fn sync(
                 }
 
 
-                // "Did we actually request this?"
-                let dl_i = {
-                    if let Some(dl_i) = peer.block_downloads.iter().position(|dl| if dl.height_hash.hash_or_0 == block::Hash([0;32]) {
-                        dl.height_hash.height == hdr.height_hash.height
-                    } else {
-                        dl.height_hash.hash_or_0 == hdr.height_hash.hash_or_0
-                    }) {
-                        dl_i
-                    } else { // :nocommit
-                        let dl_i = peer.block_downloads_active_flags.trailing_ones() as usize;
-                        if dl_i < peer.block_downloads.len() {
-                            peer.block_downloads[dl_i] = PeerPowBlockDownload {
-                                height_hash: hdr.height_hash,
-                                reassembly: ReassemblySlot::new(hdr.size),
-                            };
-                            peer.block_downloads_active_flags |= 1 << dl_i;
-                            dl_i
-                        } else {
-                            continue 'process_packets;
-                        }
-
-                        // TODO: always continue 'process_packets;
-                    }
+                // "Did we actually request this?" if not; insert unsolicited... // TODO: distinguish unsolicited
+                let Some(dl_i) = peer.block_downloads.insert_or_position_of_download(hdr.height_hash) else {
+                    continue 'process_packets;
                 };
 
-                let dl = &mut peer.block_downloads[dl_i];
-                if dl.height_hash.height != hdr.height_hash.height {
-                    kill!("the hash matches but the height doesn't");
-                    continue 'process_packets;
+                {
+                    let dl = &mut peer.block_downloads.slots[dl_i];
+                    if (dl.reassembly.total_len != 0 &&
+                        dl.reassembly.total_len != hdr.size) {
+                        kill!("peer tried to change size of block mid-send (from {} to {})", dl.reassembly.total_len, hdr.size);
+                        continue 'process_packets;
+                    }
+                    if hdr.size as u64 > zebra_chain::block::MAX_BLOCK_BYTES {
+                        kill!("peer tried to send a block larger than consensus allows: {}", hdr.size);
+                        continue 'process_packets;
+                    }
+                    dl.reassembly = ReassemblySlot::new(hdr.size);
+
+                    if dl.height_hash.height != hdr.height_hash.height {
+                        kill!("the hash matches but the height doesn't");
+                        continue 'process_packets;
+                    }
+                    dl.height_hash.hash_or_0 = hdr.height_hash.hash_or_0;
                 }
-                dl.height_hash.hash_or_0 = hdr.height_hash.hash_or_0;
 
 
 
@@ -1961,7 +2075,7 @@ pub fn sync(
 
 
                 // try to construct a full block from the data available
-                match dl.reassembly.insert(hdr.offset as usize, msg) {
+                match peer.block_downloads.slots[dl_i].reassembly.insert(hdr.offset as usize, msg) {
                     Ok(true) => {}, // we have a full block; verify it etc
                     Ok(false) => continue 'process_packets, // we validly have a partial block;
                                                             // wait for more fragments
@@ -1971,14 +2085,9 @@ pub fn sync(
                     }
                 }
 
-                let mut dl2 = PeerPowBlockDownload::default();
-                std::mem::swap(&mut dl2, dl);
-                let block_data = dl2.reassembly.buf;
-                let block_data = &block_data[..];
-
                 // download completed; remove from peer's list
-                peer.block_downloads_active_flags &= !(1 << dl_i);
-                peer.block_downloads[dl_i] = PeerPowBlockDownload::default();
+                let block_data = peer.block_downloads.remove(dl_i).reassembly.buf;
+                let block_data = &block_data[..];
 
 
                 // TODO: we should be able to early out once we have chunk 0 or a hdr-contained parent hash
