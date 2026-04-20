@@ -1008,7 +1008,7 @@ pub struct PeerPowBlockResponseChunkHdr {
 
 impl SliceRead for PeerPowBlockResponseChunkHdr {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
-        Some(Self{
+        Some(Self {
             offset: SliceRead::read_from(buf)?,
             size: SliceRead::read_from(buf)?,
             height_hash: SliceRead::read_from(buf)?,
@@ -1763,7 +1763,9 @@ pub fn sync(
                         if block_downloads.insert_or_position_of_download(HeightAndHashOr0 {
                             height: block::Height(req_h),
                             hash_or_0: block::Hash([0;32]),
-                        }).is_none() {
+                        }).is_some() {
+                            if TRACE { tracing::info!("Inserted! New DL count for peer: {}", block_downloads.used_flags.count_ones()); }
+                        } else {
                             break;
                         }
                         req_h += 1;
@@ -1838,9 +1840,10 @@ pub fn sync(
         if std::time::Instant::now() >= next_peer_request {
             for (connection_key, peer) in peers.iter_mut() {
                 // TODO: can we pack these into packlets now?
-                for dl_i in 0..peer.block_requests.slots.len() {
-                    if ((peer.block_requests.used_flags >> dl_i) & 1) != 0 {
-                        let dl = &peer.block_requests.slots[dl_i];
+                if TRACE { tracing::info!("Sending {} DL requests for peer", peer.block_downloads.used_flags.count_ones()); }
+                for dl_i in 0..peer.block_downloads.slots.len() {
+                    if ((peer.block_downloads.used_flags >> dl_i) & 1) != 0 {
+                        let dl = &peer.block_downloads.slots[dl_i];
 
                         // determine the lowest offset before which we have every byte already
                         let prefix = dl.reassembly.received.first().unwrap_or(&(0,0));
@@ -2147,13 +2150,16 @@ pub fn sync(
                         kill!("peer tried to send a block larger than consensus allows: {}", hdr.size);
                         continue 'process_packets;
                     }
-                    dl.reassembly = ReassemblySlot::new(hdr.size);
-
                     if dl.height_hash.height != hdr.height_hash.height {
                         kill!("the hash matches but the height doesn't");
                         continue 'process_packets;
                     }
+
                     dl.height_hash.hash_or_0 = hdr.height_hash.hash_or_0;
+
+                    if dl.reassembly.total_len <= 0 {
+                        dl.reassembly = ReassemblySlot::new(hdr.size);
+                    }
                 }
 
 
@@ -2184,12 +2190,17 @@ pub fn sync(
 
                 if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not already in near_tip_chains..."); }
 
+                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: Inserting fragment at offset {} with length {}", hdr.offset as usize, msg.len()); }
 
                 // try to construct a full block from the data available
                 match peer.block_downloads.slots[dl_i].reassembly.insert(hdr.offset as usize, msg) {
-                    Ok(true) => {}, // we have a full block; verify it etc
-                    Ok(false) => continue 'process_packets, // we validly have a partial block;
-                                                            // wait for more fragments
+                    Ok(true) => { // we have a full block; verify it etc
+                        if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: All fragments downloaded! Processing..."); }
+                    }
+                    Ok(false) => { // we validly have a partial block; wait for more fragments
+                        if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not done downloading all fragments. Continuing."); }
+                        continue 'process_packets;
+                    }
                     Err(()) => {
                         kill!("overlapping/out-of-bounds fragment, killing connection");
                         continue 'process_packets;
