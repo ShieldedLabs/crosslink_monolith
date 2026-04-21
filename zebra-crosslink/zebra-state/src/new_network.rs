@@ -1226,7 +1226,7 @@ pub fn sync(
             setup_and_bind_udp_socket(0).expect("Failed to bind UDP socket on any port")
         }
     };
-    let my_keypairs = vec![&network_keypair];
+    let my_keypairs = vec![network_keypair.clone()];
 
     let mut packet_memory_encrypted = new_packet_memory();
     let mut packet_memory_recv      = new_packet_memory();
@@ -1249,9 +1249,9 @@ pub fn sync(
                         tenderlink::bandwidth_test::b64(&CRYPTO_MAGIC  .to_le_bytes()[..6]),
                         tenderlink::bandwidth_test::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
                         );
-            }
+            }            
             tracing::info!("NewNet: Connecting to peer: {:?}", address);
-            match connect_to(socket, &mut connections_map, &my_keypairs, &address) {
+            match connect_to(&mut connections_map, &my_keypairs, &address) {
                 Err(e) => tracing::warn!("NewNet: Initial peer connect: connect_to failed: {e}"),
                 Ok(()) => {},
             }
@@ -1346,7 +1346,7 @@ pub fn sync(
         for address in &initial_peer_addresses {
             if !connections_map.contains_key(&address.connection_key()) {
                 tracing::info!("NewNet: Connecting to {:?}...", address);
-                match connect_to(socket, &mut connections_map, &my_keypairs, address) {
+                match connect_to(&mut connections_map, &my_keypairs, address) {
                     Err(e) => tracing::warn!("NewNet: Initial peer reconnect: connect_to failed: {e}"),
                     Ok(()) => {},
                 }
@@ -1408,7 +1408,7 @@ pub fn sync(
                     continue;
                 }
 
-                match connect_to(socket, &mut connections_map, &my_keypairs, address) {
+                match connect_to(&mut connections_map, &my_keypairs, address) {
                     Err(e) => {
                         tracing::warn!("NewNet: Recent-address reconnect: connect_to failed: {e}");
                         continue;
@@ -1443,7 +1443,7 @@ pub fn sync(
                     continue;
                 }
 
-                match connect_to(socket, &mut connections_map, &my_keypairs, address) {
+                match connect_to(&mut connections_map, &my_keypairs, address) {
                     Err(e) => {
                         tracing::warn!("NewNet: Alleged-address reconnect: connect_to failed: {e}");
                         continue;
@@ -2147,7 +2147,7 @@ pub fn sync(
 
                 if !connections_map.contains_key(&address_to_punch_to.connection_key()) {
                     if TRACE { tracing::info!("Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, connection_address); }
-                    let _ = connect_to(socket, &mut connections_map, &my_keypairs, &address_to_punch_to);
+                    let _ = connect_to(&mut connections_map, &my_keypairs, &address_to_punch_to);
                 }
 
             } else if packet_type == PACKET_TYPE_STATUS {

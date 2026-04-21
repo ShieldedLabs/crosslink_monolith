@@ -30,7 +30,7 @@ const ANSI_BLU: &'static str = "\x1b[34m";
 const ANSI_RST: &'static str = "\x1b[0m";
 
 // @Todo: MTU discovery // @Duplicate with NewNet.
-const UDP_mMTU:        usize = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
+const UDP_mMTU:        usize = 1400; // Note(Sam): This number informs cryptography. BAD! For season one we must now not change this number. Even if it means sending jumbos to compensate. :(
 const STP_HEADER_SIZE: usize = 6 + crypto_overhead_from_connect_magic1(CRYPTO_MAGIC).unwrap();
 const STP_PACKLET_HDR: usize = std::mem::size_of::<crate::bandwidth_test::PackletHeader>();
 const PATH_MTU: usize = UDP_mMTU
@@ -1093,7 +1093,6 @@ pub use crate::bandwidth_test::CONNECT_MAGIC1_PLAIN_TEXT;
 pub use crate::bandwidth_test::crypto_overhead_from_connect_magic1;
 pub use crate::bandwidth_test::new_keypair_from_connect_magic1_with_seed;
 pub use crate::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
-pub use crate::native_sockets::ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
 
 
 pub const MAX_P2P_DISCOVERY_PUBKEY_SIZE: usize = 32;
@@ -1336,24 +1335,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     use crate::bandwidth_test::*;
     use crate::native_sockets::*;
 
-    // STP setup
-    socket_setup();
-    monotonic_clock_setup();
-
     let my_port = my_endpoint.map(|e|e.port).unwrap_or(23485); // @Todo! Get local port after sock creation! @@@
-
-    let socket = setup_and_bind_udp_socket(my_port).expect("Failed to bind socket, try again.");
-
-    let my_keypairs = vec![&my_stp_keypair];
-
-    let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
-    let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
-    let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
-
-    let mut packets_to_send:  Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
-    let mut packets_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
-
-    let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
+    let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port);
+    let mut current_connections = Vec::<STPAddress>::new();
+    let mut messages_to_send = Vec::new();
+    
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
     let mut bft_key_address_map = BftAddressMap::new();
 
@@ -1390,10 +1376,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         {
             let mut peers = peers.iter().map(|(ck, p)| {
-                let bft_key = connections_map.get(ck)
-                    .and_then(|c| bft_key_address_map.get_key(&c.address()))
-                    .copied()
-                    .unwrap_or(PubKeyID::NIL);
+                let mut bft_key = PubKeyID::NIL;
+                for c in &current_connections {
+                    if let Some(k) = bft_key_address_map.get_key(c) {
+                        bft_key = *k;
+                        break;
+                    }
+                }
                 p.info(true, bft_key)
             }).collect::<Vec<PeerInfo>>();
             bft_state.update_peers_cmd_closure.0(peers).await;
@@ -1496,7 +1485,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             loop {
                 // TICK CODE
                 peers.retain(|connection_key, peer| {
-                    if connections_map.get(connection_key).is_none() {
+                    if current_connections.iter().position(|x| ConnectionKey::from(x) == *connection_key).is_none() {
                         println!("{:05}: Disconnected from peer {:?}.", my_port, connection_key);
                         false
                     } else {
@@ -1506,8 +1495,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 // Try to reconnect to known but disconnected peers
                 for (address, _bft_key) in bft_key_address_map.all_addrs() {
-                    if !connections_map.contains_key(&address.connection_key()) {
-                        let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
+                    if current_connections.iter().position(|x| x == address).is_none() {
+                        current_connections.push(address.clone());
                     }
                 }
 
@@ -1521,22 +1510,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                  0x7A, 0x56, 0x29, 0x87, 0xC5, 0x35, 0xAC, 0xE9, 0xBA, 0x67, 0xF2, 0x0D, 0x74, 0x13, 0xA7, 0xCD]);
                 let server_b_pub_key = PubKeyID([0xE6, 0x00, 0x6A, 0x82, 0xD9, 0xA0, 0xDA, 0xB4, 0x6B, 0xD4, 0xC1, 0xDD, 0x69, 0x14, 0xF0, 0x3B,
                                                  0xEC, 0x27, 0xB4, 0xEC, 0xD3, 0xD9, 0x09, 0xD1, 0x62, 0x34, 0x2D, 0xFD, 0xA5, 0x13, 0x78, 0x1E]);
-
-// @sam_now_work
-                if !bft_key_address_map.contains_key(&server_a_pub_key) && server_a_pub_key != PubKeyID(my_root_public_bft_key.into()) {
-                    let address = STPAddress::parse("[::ffff:45.76.30.90]:8234:AQAAAAAA:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(); // @Todo
-
-                    bft_key_address_map.insert(&server_a_pub_key, &address);
-
-                    // peers.push(Peer { root_public_bft_key: server_a_pub_key, endpoint: Some(evidence.address), ..Peer::default() });
-                }
-
-                if !bft_key_address_map.contains_key(&server_b_pub_key) && server_b_pub_key != PubKeyID(my_root_public_bft_key.into()) {
-                    let address = STPAddress::parse("[::ffff:70.34.201.202]:8234:AQAAAAAA:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").unwrap(); // @Todo
-
-                    bft_key_address_map.insert(&server_b_pub_key, &address);
-                    // peers.push(Peer { root_public_bft_key: server_b_pub_key, endpoint: Some(evidence.address), ..Peer::default() });
-                }
 
                 fn send_round_data_to_peer(bft_state: &TMState,
                                            should_send_prevotes: bool,
@@ -1735,18 +1708,28 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 }
 
                 if PRINT_PEERS { println!("{ctx_str} {ANSI_GRY}PEERS{ANSI_RST}: {:?}", peers.iter().map(|(ck, p)| {
-                    let bft_key = connections_map.get(ck)
-                        .and_then(|c| bft_key_address_map.get_key(&c.address()))
-                        .copied()
-                        .unwrap_or(PubKeyID::NIL);
+                    let mut bft_key = PubKeyID::NIL;
+                    for c in &current_connections {
+                        if ConnectionKey::from(c) == *ck {
+                            if let Some(k) = bft_key_address_map.get_key(&c) {
+                                bft_key = *k;
+                            }
+                            break;
+                        }
+                    }
                     (bft_key, p.latest_status.clone())
                 }).collect::<Vec<_>>()); }
 
                 for (connection_key, peer) in &mut peers {
-                    let peer_bft_key = connections_map.get(connection_key)
-                        .and_then(|c| bft_key_address_map.get_key(&c.address()))
-                        .copied()
-                        .unwrap_or(PubKeyID::NIL);
+                    let mut peer_bft_key = PubKeyID::NIL;
+                    for c in &current_connections {
+                        if ConnectionKey::from(c) == *connection_key {
+                            if let Some(k) = bft_key_address_map.get_key(&c) {
+                                peer_bft_key = *k;
+                            }
+                            break;
+                        }
+                    }
                     if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
                         peer.latest_status_request_height = None;
                         send_round_data_to_peer(&bft_state,
@@ -1754,7 +1737,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                 &bft_state.recent_commit_round_cache[height as usize],
                                                 &ctx_str,
                                                 &roster,
-                                                &mut packets_to_send,
+                                                &mut messages_to_send,
                                                 &mut send_buf1,
                                                 peer,
                                                 connection_key,
@@ -1771,7 +1754,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                     &round_data,
                                                     &ctx_str,
                                                     &roster,
-                                                    &mut packets_to_send,
+                                                    &mut messages_to_send,
                                                     &mut send_buf1,
                                                     peer,
                                                     connection_key,
@@ -1813,27 +1796,15 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         }
         
         use rand::seq::SliceRandom;
-        packets_to_send.shuffle(&mut rand::thread_rng());
-        for _ in 0..256 {
-            let more = service_connections(&mut connections_map,
-                                           &mut packets_received,
-                                           &packets_to_send,
-                                           &mut packet_memory_encrypted,
-                                           &mut packet_memory_recv,
-                                           &mut packet_memory_send,
-                                           socket,
-                                           &my_keypairs);
-            packets_to_send.clear();
-            if more == false {
-                break;
-            } else {
-                print!("");
-            }
-        }
+        messages_to_send.shuffle(&mut rand::thread_rng());
+        let resp = new_service_connections(&network_thread_handle, NetworkThreadPush { wanted_connections: current_connections, messages_to_send });
+        current_connections = resp.current_connections;
+        let mut messages_received = resp.messages_received;
+        messages_to_send = Vec::new();
 
         // Ensure a Peer entry exists for every active connection
-        for key in connections_map.keys() {
-            peers.entry(*key).or_insert_with(|| Peer::default());
+        for stp_address in &current_connections {
+            peers.entry(stp_address.into()).or_insert_with(|| Peer::default());
         }
 
         // Note(Sam): Disabled this due to confusion. I am not sure it is the right thing.
@@ -1846,13 +1817,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         // });
         
         // Remove peer entries for dropped connections
-        peers.retain(|key, _| connections_map.contains_key(key));
+        peers.retain(|key, _| current_connections.iter().position(|x| ConnectionKey::from(x) == *key).is_some());
         
 
         // READ
-        while packets_received.len() > 0 {
+        while messages_received.len() > 0 {
             let (mut connection_key, mut peer, mut msg) = {
-                let (key, packet, _) = packets_received.remove(0);
+                let (key, packet, _) = messages_received.remove(0);
                 let Some(peer) = peers.get_mut(&key)
                 else {
                     continue;

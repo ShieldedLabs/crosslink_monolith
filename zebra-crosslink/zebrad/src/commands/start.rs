@@ -710,8 +710,10 @@ impl StartCmd {
         {
             use std::path::PathBuf;
             let zebra_port_base = config.network.listen_addr.port();
-            let mut path = config.state.cache_dir.clone();
-            path.push(PathBuf::from("zaino"));
+            let mut zaino_db_path = config.state.cache_dir.clone();
+            zaino_db_path.push(PathBuf::from("zaino"));
+            std::fs::remove_dir_all(&zaino_db_path);
+            
 
             let zaino_config = zainodlib::config::ZainodConfig {
                 backend: zaino_state::BackendType::Fetch,
@@ -740,7 +742,7 @@ impl StartCmd {
                         shard_power: 4,
                     },
                     database: zaino_common::DatabaseConfig {
-                        path,
+                        path: zaino_db_path,
                         size: zaino_common::DatabaseSize::Gb(4),
                     },
                 },

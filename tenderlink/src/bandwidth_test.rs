@@ -70,9 +70,9 @@ fn contested_encrypted_test() {
     monotonic_clock_setup();
 
     let _handle = std::thread::spawn(move || {
-        do_the_test_program2(32845, vec![&kp1], Some((&kp1, &STPAddress { ip: Ipv6Addr::LOCALHOST, port: 29853, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp2_pub })));
+        do_the_test_program2(32845, vec![kp1], Some((&kp1, &STPAddress { ip: Ipv6Addr::LOCALHOST, port: 29853, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp2_pub })));
     });
-    do_the_test_program2(29853, vec![&kp2], Some((&kp2, &STPAddress { ip: Ipv6Addr::LOCALHOST, port: 32845, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp1_pub })));
+    do_the_test_program2(29853, vec![kp2], Some((&kp2, &STPAddress { ip: Ipv6Addr::LOCALHOST, port: 32845, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp1_pub })));
 }
 
 // LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
@@ -296,7 +296,7 @@ impl ConnectionTrackingData {
     pub fn is_connected(&self) -> bool { self.connection_state.is_connected() }
 }
 
-pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, my_keypairs: &Vec<&IdentityKeyPair>, address: &STPAddress) -> Result<(), String> {
+pub fn connect_to(connections_map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, my_keypairs: &Vec<IdentityKeyPair>, address: &STPAddress) -> Result<(), String> {
     let key = ConnectionKey {
         ip: address.ip,
         port: address.port,
@@ -308,7 +308,7 @@ pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKe
 
     for keypair in my_keypairs {
         if address.magic1 == keypair.magic1 {
-            connect_to_endpoint(socket, connections_map, keypair, address);
+            connect_to_endpoint(connections_map, keypair, address);
             return Ok(());
         }
     }
@@ -415,7 +415,7 @@ pub fn connection_state_string(state: &ConnectionState) -> &'static str {
     return "<INVALID>";
 }
 
-pub fn do_the_test_program2(my_port: u16, my_listen_keypairs: Vec<&IdentityKeyPair>, beam_to: Option<(&IdentityKeyPair, &STPAddress)>) {
+pub fn do_the_test_program2(my_port: u16, my_listen_keypairs: Vec<IdentityKeyPair>, beam_to: Option<(&IdentityKeyPair, &STPAddress)>) {
     let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
     let mut packet_memory_recv = new_packet_memory(); // Incoming Decrypted
     let mut packet_memory_send = new_packet_memory(); // Outgoing Decrypted
@@ -425,7 +425,7 @@ pub fn do_the_test_program2(my_port: u16, my_listen_keypairs: Vec<&IdentityKeyPa
     let socket = setup_and_bind_udp_socket(my_port).unwrap();
 
     if let Some((my_connect_keypair, beam_to)) = beam_to {
-        connect_to_endpoint(socket, &mut connections_map, my_connect_keypair, beam_to);
+        connect_to_endpoint(&mut connections_map, my_connect_keypair, beam_to);
     }
 
     //println!("{:#?}", connections_map);
@@ -436,7 +436,6 @@ pub fn do_the_test_program2(my_port: u16, my_listen_keypairs: Vec<&IdentityKeyPa
 }
 
 pub fn connect_to_endpoint(
-    socket: SockHandle,
     connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
     my_connect_keypair: &IdentityKeyPair,
     endpoint: &STPAddress,
@@ -665,6 +664,147 @@ impl SliceWrite for PackletReliableStreamed {
     }
 }
 
+#[derive(Default)]
+pub struct NetworkThreadPush {
+    pub wanted_connections: Vec<STPAddress>,
+    pub messages_to_send: Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
+}
+
+#[derive(Default)]
+pub struct NetworkThreadPull {
+    pub current_connections: Vec<STPAddress>,
+    pub messages_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
+}
+
+struct NetworkThreadInner {
+    state: std::sync::atomic::AtomicUsize, // 0 empty, 1 full
+    push: std::cell::UnsafeCell<NetworkThreadPush>,
+    pull: std::cell::UnsafeCell<NetworkThreadPull>,
+}
+
+unsafe impl std::marker::Sync for NetworkThreadInner {}
+
+// Note(Sam): Using this handle from two threads at once is UB. Only one thread may call new_service_connections at any given time.
+pub struct NetworkThreadHandle {
+    inner: std::sync::Arc<NetworkThreadInner>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> NetworkThreadHandle {
+
+    // STP setup
+    socket_setup();
+    monotonic_clock_setup();
+    
+    let socket = setup_and_bind_udp_socket(my_port).expect("Failed to bind socket, try again.");
+
+    let inner = std::sync::Arc::new(NetworkThreadInner {
+        state: std::sync::atomic::AtomicUsize::new(0),
+        push: std::cell::UnsafeCell::new(NetworkThreadPush::default()),
+        pull: std::cell::UnsafeCell::new(NetworkThreadPull::default()),
+    });
+
+    let thread_inner = inner.clone();
+
+    let thread = std::thread::spawn(move || {
+    
+        let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
+        let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
+        let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
+    
+        let mut packets_to_send:  Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
+        let mut packets_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
+    
+        let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
+    
+        loop {
+            if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 1 {
+                let mut req = NetworkThreadPush::default();
+
+                unsafe {
+                    std::mem::swap(&mut *thread_inner.push.get(), &mut req);
+                }
+                
+                let current_time_now_ns = monotonic_clock_ns();
+                connections_map.retain(|key, value| {
+                    let stp_address = value.address();
+                    if value.creation_time_ns + 30_000_000_000 < current_time_now_ns && req.wanted_connections.iter().position(|x| x == &stp_address).is_none() && value.is_connected() {
+                        println!("############################# KILLING CONNECTION {:?}", value);
+                        return false;
+                    }
+                    true
+                });
+                for w in &req.wanted_connections {
+                    connect_to(&mut connections_map, &my_keypairs, w);
+                }
+                packets_to_send.extend(req.messages_to_send);
+                // if packets_to_send.len() > 2_000 {
+                //     packets_to_send.truncate(2_000);
+                // }
+
+                let mut resp = NetworkThreadPull::default();
+                resp.current_connections = connections_map.iter().filter_map(|(key, value)| {
+                    if value.is_connected() {
+                        Some(value.address().clone())
+                    } else {
+                        None
+                    }
+                }).collect();
+                std::mem::swap(&mut resp.messages_received, &mut packets_received);
+
+                unsafe {
+                    std::mem::swap(&mut *thread_inner.pull.get(), &mut resp);
+                }
+
+                thread_inner.state.store(0, std::sync::atomic::Ordering::Release);
+            } else {
+                let got_packet = service_connections(
+                    &mut connections_map,
+                    &mut packets_received,
+                    &mut packets_to_send,
+                    &mut packet_memory_encrypted,
+                    &mut packet_memory_recv,
+                    &mut packet_memory_send,
+                    socket,
+                    &my_keypairs,
+                );
+                packets_to_send.clear();
+                if got_packet == false { std::thread::yield_now(); }
+            }
+        }
+    });
+
+    NetworkThreadHandle {
+        inner,
+        thread,
+    }
+}
+
+pub fn new_service_connections(network_thread_handle: &NetworkThreadHandle, mut req: NetworkThreadPush) -> NetworkThreadPull {
+    while network_thread_handle.inner.state.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        std::hint::spin_loop();
+    }
+
+    unsafe {
+        std::mem::swap(&mut *network_thread_handle.inner.push.get(), &mut req);
+    }
+
+    network_thread_handle.inner.state.store(1, std::sync::atomic::Ordering::Release);
+
+    while network_thread_handle.inner.state.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        //std::hint::spin_loop();
+        std::thread::yield_now();
+    }
+
+    let mut resp = NetworkThreadPull::default();
+
+    unsafe {
+        std::mem::swap(&mut *network_thread_handle.inner.pull.get(), &mut resp);
+    }
+
+    resp
+}
+
 // Returns true if a packet was received. You should use this information to decide how to schedule your connection servicing.
 pub fn service_connections(
     connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
@@ -674,7 +814,7 @@ pub fn service_connections(
     packet_memory_recv: &mut PacketMemory,
     packet_memory_send: &mut PacketMemory,
     socket: SockHandle,
-    my_listen_keypairs: &Vec<&IdentityKeyPair>,
+    my_listen_keypairs: &Vec<IdentityKeyPair>,
 ) -> bool {
     let mut result = false;
 
@@ -692,7 +832,7 @@ pub fn service_connections(
                 let magic1 = first_six_bytes;
                 if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
                     for key_i in 0..my_listen_keypairs.len() {
-                        let my_kp = my_listen_keypairs[key_i];
+                        let my_kp = &my_listen_keypairs[key_i];
                         if my_kp.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
                             if buf_len >= 6 + 32 {
                                 let client_key = &packet_memory_encrypted[6..6+32];
@@ -755,7 +895,7 @@ pub fn service_connections(
                 }
                 else if let Some(crypto_string) = crypto_string_from_connect_magic1(magic1) {
                     for key_i in 0..my_listen_keypairs.len() {
-                        let my_kp = my_listen_keypairs[key_i];
+                        let my_kp = &my_listen_keypairs[key_i];
                         if my_kp.magic1 == magic1 {
                             let mut new_handshake = snow::Builder::new(crypto_string.parse().unwrap())
                                 .prologue(&packet_memory_encrypted[0..6]).unwrap()
@@ -1162,7 +1302,6 @@ pub fn service_connections(
     } true});
 
 
-    let mut packet_counter_index = 0;
     for (connection_key, data, jumbo_id_override) in packets_to_send {
         let Some(ref mut connection) = connections_map.get_mut(connection_key)
         else {
@@ -1229,11 +1368,6 @@ pub fn service_connections(
                 }
 
                 send(&packet_memory_send[..mMTU_inside_stp]);
-                packet_counter_index += 1;
-                if packet_counter_index > 1000 {
-                    return result;
-                }
-                std::thread::sleep(std::time::Duration::from_micros(200));
             }
         } else {
             let hdr  = PackletHeader::new(PackletTag::AnEntireDatagram, data.len());
@@ -1246,11 +1380,6 @@ pub fn service_connections(
             }
 
             send(&packet_memory_send[..mMTU_inside_stp]);
-            // packet_counter_index += 1;
-            // if packet_counter_index > 1000 {
-            //     return result;
-            // }
-            // std::thread::sleep(std::time::Duration::from_micros(200));
         }
     }
 
