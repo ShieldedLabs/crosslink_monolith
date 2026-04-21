@@ -2190,10 +2190,10 @@ pub fn sync(
 
                 if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not already in near_tip_chains..."); }
 
-                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: Inserting fragment at offset {} with length {}", hdr.offset as usize, msg.len()); }
+                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: Inserting fragment at offset {} with length {}, total length {}", hdr.offset as usize, msg.len(), peer.block_downloads.slots[dl_i].reassembly.total_len); }
 
                 // try to construct a full block from the data available
-                match peer.block_downloads.slots[dl_i].reassembly.insert(hdr.offset as usize, msg) {
+                match peer.block_downloads.slots[dl_i].reassembly.insert(hdr.offset as usize, &mut msg) {
                     Ok(true) => { // we have a full block; verify it etc
                         if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: All fragments downloaded! Processing..."); }
                     }

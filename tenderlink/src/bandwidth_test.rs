@@ -561,11 +561,13 @@ impl ReassemblySlot {
     pub fn insert(&mut self, offset: usize, data: &[u8]) -> Result<bool, ()> {
         let start = offset as u32;
         if start >= self.total_len {
+            if OVERLY_VERBOSE { tracing::error!("Reassembly: Start {start} was >= total_len {}.", self.total_len); }
             return Err(());
         }
 
         let end = (offset + data.len()) as u32;
         if end > self.total_len {
+            if OVERLY_VERBOSE { tracing::error!("Reassembly: End {end} was >= total_len {}.", self.total_len); }
             return Err(());
         }
 
@@ -583,6 +585,7 @@ impl ReassemblySlot {
             if self.buf[offset..offset + data.len()] == *data {
                 return Ok(self.received.len() == 1 && self.received[0] == (0, self.total_len));
             } else {
+                if OVERLY_VERBOSE { tracing::error!("Reassembly: Fragment with range ({start}, {end}) did not match existing data."); }
                 return Err(()); // same range, different data - kill connection
             }
         }
@@ -590,10 +593,12 @@ impl ReassemblySlot {
         // TODO: loop over & merge all overlapping ranges; error if non-matching
         // Check overlap with the range at `pos`
         if pos < self.received.len() && self.received[pos].0 < end {
+            if OVERLY_VERBOSE { tracing::error!("Reassembly: Fragment ({start}, {end}) partially overlaps existing range ({}, {}).", self.received[pos].0, self.received[pos].1); }
             return Err(());
         }
         // Check overlap with the range before `pos`
         if pos > 0 && self.received[pos - 1].1 > start {
+            if OVERLY_VERBOSE { tracing::error!("Reassembly: Fragment ({start}, {end}) partially overlaps existing range ({}, {}).", self.received[pos - 1].0, self.received[pos - 1].1); }
             return Err(());
         }
 

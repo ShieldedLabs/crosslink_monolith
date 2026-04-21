@@ -19,6 +19,7 @@ byteorder = "1.5.0"
 ed25519-zebra = "4.1.0"
 hex = "0.4.3"
 crossterm = "0.27" # Only for p2p terminal
+tracing = "0.1.41"
 base64 = "0.22"
 libc = "0.2.182"
 rand = "0.9.2"
