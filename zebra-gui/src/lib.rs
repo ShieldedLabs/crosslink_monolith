@@ -1384,7 +1384,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 }
                                                 return;
                                             }
-                                            
+
                                             // Note(Sam): Single threaded time is too long right now. 3 ms! So w cannot perform the wakeup here. It is too early. Optimistic wakeup should be at most 100 us early.
                                             // { // Tell workers: WAKE UP WAKE UP WAKE UP!!!
                                             //     while (*p_thread_context).workers_that_have_passed_the_wake_up_gate.load(Ordering::Relaxed) != (*p_thread_context).thread_count - 1 { spin_loop(); }
@@ -1701,7 +1701,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             assert!(*draw_ctx.draw_command_count <= DRAW_CALL_MAX);
                                             if *draw_ctx.draw_command_count == DRAW_CALL_MAX { println!("WARNING, we are at max capacity for draw commands."); }
                                             prev_frame_time_single_threaded_us = begin_frame_instant.elapsed().as_micros() as usize;
-                                            
+
                                             // Note(Sam): We want to do this earlier but we are too slow. See comment above.
                                             { // Tell workers: WAKE UP WAKE UP WAKE UP!!!
                                                 while (*p_thread_context).workers_that_have_passed_the_wake_up_gate.load(Ordering::Relaxed) != (*p_thread_context).thread_count - 1 { spin_loop(); }

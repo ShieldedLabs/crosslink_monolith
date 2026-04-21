@@ -1031,8 +1031,7 @@ pub struct BlockDownloads {
     used_flags: u64,
 }
 impl BlockDownloads {
-    fn insert_download(&mut self, height_hash: HeightAndHashOr0) -> Option<usize> {
-        let dl_i = self.used_flags.trailing_ones() as usize;
+    fn fill_slot(&mut self, dl_i: usize, height_hash: HeightAndHashOr0) -> Option<usize> {
         if dl_i < self.slots.len() {
             self.slots[dl_i] = PeerPowBlockDownload {
                 height_hash: height_hash,
@@ -1046,8 +1045,13 @@ impl BlockDownloads {
         }
     }
 
+    fn insert(&mut self, height_hash: HeightAndHashOr0) -> Option<usize> {
+        if TRACE { tracing::info!("Inserting new download for height {} hash {}", height_hash.height.0, height_hash.hash_or_0); }
+        self.fill_slot(self.used_flags.trailing_ones() as usize, height_hash)
+    }
+
     /// NOTE: doesn't enforce height match if going by hash
-    fn position_of_download(&self, height_hash: HeightAndHashOr0) -> Option<usize> {
+    fn position(&self, height_hash: HeightAndHashOr0) -> Option<usize> {
         self.slots.iter().position(|dl| if dl.height_hash.hash_or_0 == block::Hash([0;32]) || height_hash.hash_or_0 == block::Hash([0;32]) {
             dl.height_hash.height == height_hash.height
         } else {
@@ -1055,10 +1059,9 @@ impl BlockDownloads {
         })
     }
 
-    fn insert_or_position_of_download(&mut self, height_hash: HeightAndHashOr0) -> Option<usize> {
-        self.position_of_download(height_hash).or_else(|| {
-            if TRACE { tracing::info!("Inserting new download for height {} hash {}", height_hash.height.0, height_hash.hash_or_0); }
-            self.insert_download(height_hash)
+    fn insert_or_position(&mut self, height_hash: HeightAndHashOr0) -> Option<usize> {
+        self.position(height_hash).or_else(|| {
+            self.insert(height_hash)
         })
     }
 
@@ -1072,6 +1075,17 @@ impl BlockDownloads {
         self.slots[dl_i] = PeerPowBlockDownload::default();
 
         dl2
+    }
+
+    /// actual position if it's currently there, or where it would be inserted if it fits
+    fn prospective_position_or_end(&self, height_hash: HeightAndHashOr0) -> usize {
+        self.position(height_hash).unwrap_or_else(|| {
+            self.used_flags.trailing_ones() as usize
+        })
+    }
+
+    fn slot_is_used(&self, dl_i: usize) -> bool {
+        dl_i < self.slots.len() && ((self.used_flags >> dl_i) & 1) != 0
     }
 }
 
@@ -1279,7 +1293,9 @@ pub fn sync(
         let mut my_peers_to_print = Vec::new();
         for (connection_key, connection) in &connections_map {
             if connection.is_connected() {
-                my_peers_to_print.push(stp_address_get_short_string(connection.address()));
+                if let Some(peer) = peers.get(connection_key) {
+                    my_peers_to_print.push(format!("{}@{}/{}", stp_address_get_short_string(connection.address()), peer.their_tree.finalized_height, peer.their_tree.tip_height));
+                }
             }
         }
         tracing::info!("tip height: {:?}, finalized height: {:?}, peers: {:?}", near_tip_chains.tip_height(), near_tip_chains.finalized_height, my_peers_to_print);
@@ -1760,7 +1776,7 @@ pub fn sync(
                     // If the peer is far ahead, request blocks from farther back in their chain to catch us up.
                     let mut req_h = our_tip_height + 1;
                     while req_h < their_tree.finalized_height {
-                        if block_downloads.insert_or_position_of_download(HeightAndHashOr0 {
+                        if block_downloads.insert_or_position(HeightAndHashOr0 {
                             height: block::Height(req_h),
                             hash_or_0: block::Hash([0;32]),
                         }).is_some() {
@@ -1819,7 +1835,7 @@ pub fn sync(
                             }
 
                             // We may submit the same block multiple times (visit >1 of our chains that share a short prefix with their branch), and that's valid
-                            if let Some(dl_i) = block_downloads.insert_or_position_of_download(HeightAndHashOr0 {
+                            if let Some(dl_i) = block_downloads.insert_or_position(HeightAndHashOr0 {
                                 height: block::Height(height),
                                 hash_or_0: hash,
                             }) {
@@ -1841,8 +1857,21 @@ pub fn sync(
             for (connection_key, peer) in peers.iter_mut() {
                 // TODO: can we pack these into packlets now?
                 if TRACE { tracing::info!("Sending {} DL requests for peer", peer.block_downloads.used_flags.count_ones()); }
-                for dl_i in 0..peer.block_downloads.slots.len() {
-                    if ((peer.block_downloads.used_flags >> dl_i) & 1) != 0 {
+                'downloads: for dl_i in 0..peer.block_downloads.slots.len() { // ALT: iterate LSB on flags directly
+                    if peer.block_downloads.slot_is_used(dl_i) {
+                        // Prevent cycles of receiving a sub-chunk after completing, then re-requesting a block we now have
+                        // TODO: there may be a neater way to achieve the same thing
+                        let HeightAndHashOr0 { height: block::Height(height), hash_or_0 } = peer.block_downloads.slots[dl_i].height_hash;
+                        if hash_or_0 != block::Hash([0;32]) {
+                            for our_chain in &near_tip_chains.chains {
+                                if our_chain.blocks.iter().any(|block| block.this_hash == hash_or_0) {
+                                    tracing::warn!("Don't need to re-request: block @ {height}, {hash_or_0} was already committed!");
+                                    peer.block_downloads.remove(dl_i);
+                                    continue 'downloads;
+                                }
+                            }
+                        }
+
                         let dl = &peer.block_downloads.slots[dl_i];
 
                         // determine the lowest offset before which we have every byte already
@@ -1861,7 +1890,7 @@ pub fn sync(
                             offset,
                         }.write_to(&mut buf[o..]);
 
-                        if TRACE { tracing::info!("Requesting height {} hash {} from peer {connection_key:?}", dl.height_hash.height.0, dl.height_hash.hash_or_0); }
+                        if TRACE { tracing::info!("Requesting height {} hash {} offset {offset} from peer {connection_key:?}", dl.height_hash.height.0, dl.height_hash.hash_or_0); }
 
                         packets_to_send.push((*connection_key, Vec::from(&buf[..o]), None));
                     }
@@ -1875,7 +1904,7 @@ pub fn sync(
             for (connection_key, peer) in peers.iter_mut() {
                 // TODO: can we pack these into packlets now?
                 for dl_i in 0..peer.block_requests.slots.len() {
-                    if ((peer.block_requests.used_flags >> dl_i) & 1) != 0 {
+                    if peer.block_requests.slot_is_used(dl_i) {
                         let mut height_hash = peer.block_requests.slots[dl_i].height_hash;
                         if height_hash.hash_or_0 == block::Hash([0;32]) {
                             if let Some(hash) = get_bc_hash_at_height(&read_state, &rt, height_hash.height) {
@@ -2088,11 +2117,17 @@ pub fn sync(
                     continue 'process_packets;
                 };
 
-                if let Some(dl_i) = peer.block_requests.insert_or_position_of_download(request.height_hash) {
+                if TRACE { tracing::info!("Received request for height {} hash {} offset {} from peer {connection_key:?}", request.height_hash.height.0, request.height_hash.hash_or_0, request.offset); }
+
+                if let Some(dl_i) = peer.block_requests.insert_or_position(request.height_hash) {
                     peer.block_requests.slots[dl_i].offset = peer.block_requests.slots[dl_i].offset.max(request.offset);
                 }
 
             } else if packet_type == PACKET_TYPE_BLOCK_CHUNK {
+                let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height()) else {
+                    warning!("I don't have a tip height yet");
+                    continue 'process_packets;
+                };
 
                 let Some(hdr) = some_or_kill!(PeerPowBlockResponseChunkHdr::read_from(&mut msg), "failed to read PoW chunk header") else {
                     continue 'process_packets;
@@ -2100,9 +2135,9 @@ pub fn sync(
 
                 // @Todo: rate limit consumption
 
-                let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height())
-                else {
-                    warning!("I don't have a tip height yet");
+                // NOTE: this has to change if we want to support both push & pull options
+                let Some(dl_i) = peer.block_downloads.position(hdr.height_hash) else {
+                    if TRACE { tracing::info!("block @ {}, {} not requested (any longer), skip it", hdr.height_hash.height.0, hdr.height_hash.hash_or_0); }
                     continue 'process_packets;
                 };
 
@@ -2121,23 +2156,31 @@ pub fn sync(
                 // is "not even worth" submitting to Zebra (rejected due to being too far back).
                 let min_height = near_tip_chains.chains[0].blocks[0].this_height; // @Todo: this assumes :AssumeGenesisBlockIncludedInNearTipChains
 
-                if TRACE { tracing::info!("Block @ {alleged_height}..."); }
+                if TRACE { tracing::info!("Block @ {alleged_height}, offset {}...", hdr.offset); }
 
                 if alleged_height < min_height {
                     warning!("Block at height {alleged_height} is below our near-tip-chain height {min_height}");
+                    peer.block_downloads.remove(dl_i);
                     continue 'process_packets; // Deciding that it's "not even worth" sending to Zebra
                 }
 
                 if alleged_height <= near_tip_chains.finalized_height {
                     warning!("Block at height {alleged_height} is already finalized");
+                    peer.block_downloads.remove(dl_i);
                     continue 'process_packets; // Definitely already committed :)
                 }
 
 
-                // "Did we actually request this?" if not; insert unsolicited... // TODO: distinguish unsolicited
-                let Some(dl_i) = peer.block_downloads.insert_or_position_of_download(hdr.height_hash) else {
+                // @Note: the hash could be computed from the block header, so this is an early-out optimization.
+                let alleged_hash = hdr.height_hash.hash_or_0;
+
+                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, offset {}...", hdr.offset); }
+
+                if alleged_hash == block::Hash([0;32]) {
+                    kill!("the provided hash should not be 0");
                     continue 'process_packets;
-                };
+                }
+
 
                 {
                     let dl = &mut peer.block_downloads.slots[dl_i];
@@ -2163,27 +2206,19 @@ pub fn sync(
                 }
 
 
-
-                // @Note: the hash could be computed from the block header, so this is an early-out optimization.
-                let alleged_hash = hdr.height_hash.hash_or_0;
-
-                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}..."); }
-
-                if alleged_hash == block::Hash([0;32]) {
-                    kill!("the provided hash should not be 0");
-                    continue 'process_packets;
-                }
-
                 if blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == alleged_hash) {
                     warning!("Block was already queued to commit!: {alleged_hash}");
+                    peer.block_downloads.remove(dl_i);
                     continue 'process_packets;
                 }
 
                 if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not already queued..."); }
 
+                // TODO: we can accelerate with a height check, but this may change the semantics
                 for our_chain in &near_tip_chains.chains {
                     if our_chain.blocks.iter().any(|block| block.this_hash == alleged_hash) {
                         warning!("Block was already committed!: {alleged_hash}");
+                        peer.block_downloads.remove(dl_i);
                         continue 'process_packets;
                     }
                 }
