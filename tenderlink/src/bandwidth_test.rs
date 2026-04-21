@@ -70,9 +70,9 @@ fn contested_encrypted_test() {
     monotonic_clock_setup();
 
     let _handle = std::thread::spawn(move || {
-        do_the_test_program2(32845, vec![&kp1], Some((&kp1, &STPAddress { ip: Ipv6Addr::LOCALHOST, port: 29853, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp2_pub })));
+        do_the_test_program2(32845, vec![kp1], Some((&kp1, &STPAddress { ip: Ipv6Addr::LOCALHOST, port: 29853, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp2_pub })));
     });
-    do_the_test_program2(29853, vec![&kp2], Some((&kp2, &STPAddress { ip: Ipv6Addr::LOCALHOST, port: 32845, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp1_pub })));
+    do_the_test_program2(29853, vec![kp2], Some((&kp2, &STPAddress { ip: Ipv6Addr::LOCALHOST, port: 32845, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: kp1_pub })));
 }
 
 // LSB of this 48 bit value must be 1 for this to be recognized as an incoming connect handshake.
@@ -296,7 +296,7 @@ impl ConnectionTrackingData {
     pub fn is_connected(&self) -> bool { self.connection_state.is_connected() }
 }
 
-pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, my_keypairs: &Vec<&IdentityKeyPair>, address: &STPAddress) -> Result<(), String> {
+pub fn connect_to(connections_map: &mut HashMap<ConnectionKey, ConnectionTrackingData>, my_keypairs: &Vec<IdentityKeyPair>, address: &STPAddress) -> Result<(), String> {
     let key = ConnectionKey {
         ip: address.ip,
         port: address.port,
@@ -308,7 +308,7 @@ pub fn connect_to(socket: SockHandle, connections_map: &mut HashMap<ConnectionKe
 
     for keypair in my_keypairs {
         if address.magic1 == keypair.magic1 {
-            connect_to_endpoint(socket, connections_map, keypair, address);
+            connect_to_endpoint(connections_map, keypair, address);
             return Ok(());
         }
     }
@@ -415,7 +415,7 @@ pub fn connection_state_string(state: &ConnectionState) -> &'static str {
     return "<INVALID>";
 }
 
-pub fn do_the_test_program2(my_port: u16, my_listen_keypairs: Vec<&IdentityKeyPair>, beam_to: Option<(&IdentityKeyPair, &STPAddress)>) {
+pub fn do_the_test_program2(my_port: u16, my_listen_keypairs: Vec<IdentityKeyPair>, beam_to: Option<(&IdentityKeyPair, &STPAddress)>) {
     let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
     let mut packet_memory_recv = new_packet_memory(); // Incoming Decrypted
     let mut packet_memory_send = new_packet_memory(); // Outgoing Decrypted
@@ -425,7 +425,7 @@ pub fn do_the_test_program2(my_port: u16, my_listen_keypairs: Vec<&IdentityKeyPa
     let socket = setup_and_bind_udp_socket(my_port).unwrap();
 
     if let Some((my_connect_keypair, beam_to)) = beam_to {
-        connect_to_endpoint(socket, &mut connections_map, my_connect_keypair, beam_to);
+        connect_to_endpoint(&mut connections_map, my_connect_keypair, beam_to);
     }
 
     //println!("{:#?}", connections_map);
@@ -436,7 +436,6 @@ pub fn do_the_test_program2(my_port: u16, my_listen_keypairs: Vec<&IdentityKeyPa
 }
 
 pub fn connect_to_endpoint(
-    socket: SockHandle,
     connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
     my_connect_keypair: &IdentityKeyPair,
     endpoint: &STPAddress,
@@ -657,6 +656,99 @@ impl SliceWrite for PackletReliableStreamed {
     }
 }
 
+#[derive(Default)]
+pub struct NetworkThreadPush {
+    wanted_connections: Vec<STPAddress>,
+    messages_to_send: Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
+}
+
+#[derive(Default)]
+pub struct NetworkThreadPull {
+    current_connections: Vec<STPAddress>,
+    messages_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
+}
+
+struct NetworkThreadInner {
+    state: std::sync::atomic::AtomicUsize, // 0 empty, 1 full
+    push: std::cell::UnsafeCell<NetworkThreadPush>,
+    pull: std::cell::UnsafeCell<NetworkThreadPull>,
+}
+
+unsafe impl std::marker::Sync for NetworkThreadInner {}
+
+pub struct NetworkThreadHandle {
+    inner: std::sync::Arc<NetworkThreadInner>,
+    thread: std::thread::JoinHandle<()>,
+    _no_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>) -> NetworkThreadHandle {
+    let inner = std::sync::Arc::new(NetworkThreadInner {
+        state: std::sync::atomic::AtomicUsize::new(0),
+        push: std::cell::UnsafeCell::new(NetworkThreadPush::default()),
+        pull: std::cell::UnsafeCell::new(NetworkThreadPull::default()),
+    });
+
+    let thread_inner = inner.clone();
+
+    let thread = std::thread::spawn(move || {
+    
+        let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
+        let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
+        let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
+    
+        let mut packets_to_send:  Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
+        let mut packets_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
+    
+        let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
+    
+        loop {
+            if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 1 {
+                let mut req = NetworkThreadPush::default();
+
+                unsafe {
+                    std::mem::swap(&mut *thread_inner.push.get(), &mut req);
+                }
+                
+                connections_map.retain(|key, value| {
+                    let stp_address = value.address();
+                    req.wanted_connections.iter().position(|x| x == &stp_address).is_some()
+                });
+                for w in &req.wanted_connections {
+                    if connections_map.contains_key(&w.into()) == false {
+                        connect_to(&mut connections_map, &my_keypairs, w).unwrap();
+                    }
+                }
+                std::mem::swap(&mut packets_to_send, &mut req.messages_to_send);
+
+                let mut resp = NetworkThreadPull::default();
+                resp.current_connections = connections_map.iter().filter_map(|(key, value)| {
+                    if value.is_connected() {
+                        Some(value.address().clone())
+                    } else {
+                        None
+                    }
+                }).collect();
+                std::mem::swap(&mut resp.messages_received, &mut packets_received);
+
+                unsafe {
+                    std::mem::swap(&mut *thread_inner.pull.get(), &mut resp);
+                }
+
+                thread_inner.state.store(0, std::sync::atomic::Ordering::Release);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    });
+
+    NetworkThreadHandle {
+        inner,
+        thread,
+        _no_send_sync: std::marker::PhantomData,
+    }
+}
+
 // Returns true if a packet was received. You should use this information to decide how to schedule your connection servicing.
 pub fn service_connections(
     connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
@@ -666,7 +758,7 @@ pub fn service_connections(
     packet_memory_recv: &mut PacketMemory,
     packet_memory_send: &mut PacketMemory,
     socket: SockHandle,
-    my_listen_keypairs: &Vec<&IdentityKeyPair>,
+    my_listen_keypairs: &Vec<IdentityKeyPair>,
 ) -> bool {
     let mut result = false;
 
@@ -684,7 +776,7 @@ pub fn service_connections(
                 let magic1 = first_six_bytes;
                 if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
                     for key_i in 0..my_listen_keypairs.len() {
-                        let my_kp = my_listen_keypairs[key_i];
+                        let my_kp = &my_listen_keypairs[key_i];
                         if my_kp.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
                             if buf_len >= 6 + 32 {
                                 let client_key = &packet_memory_encrypted[6..6+32];
@@ -747,7 +839,7 @@ pub fn service_connections(
                 }
                 else if let Some(crypto_string) = crypto_string_from_connect_magic1(magic1) {
                     for key_i in 0..my_listen_keypairs.len() {
-                        let my_kp = my_listen_keypairs[key_i];
+                        let my_kp = &my_listen_keypairs[key_i];
                         if my_kp.magic1 == magic1 {
                             let mut new_handshake = snow::Builder::new(crypto_string.parse().unwrap())
                                 .prologue(&packet_memory_encrypted[0..6]).unwrap()

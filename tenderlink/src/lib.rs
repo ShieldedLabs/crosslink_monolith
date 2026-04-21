@@ -1343,7 +1343,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let socket = setup_and_bind_udp_socket(my_port).expect("Failed to bind socket, try again.");
 
-    let my_keypairs = vec![&my_stp_keypair];
+    let my_keypairs = vec![my_stp_keypair.clone()];
 
     let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
     let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
@@ -1506,7 +1506,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 // Try to reconnect to known but disconnected peers
                 for (address, _bft_key) in bft_key_address_map.all_addrs() {
                     if !connections_map.contains_key(&address.connection_key()) {
-                        let _ = connect_to(socket, &mut connections_map, &my_keypairs, address);
+                        let _ = connect_to(&mut connections_map, &my_keypairs, address);
                     }
                 }
 
