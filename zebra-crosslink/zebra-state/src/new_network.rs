@@ -1556,7 +1556,7 @@ pub fn sync(
             };
 
             for (chunk_i, chunk) in rem_slice.chunks(chunk_size).enumerate() { // TODO: Andrew wants to understand specific sizing
-                hdr.offset = (chunk_i * chunk_size).try_into().unwrap(); // simple & correct: just rewrite full header; ALT fitted: just rewrite diff
+                hdr.offset = *offset as u32 + (chunk_i * chunk_size) as u32; // simple & correct: just rewrite full header; ALT fitted: just rewrite diff
 
                 let mut o = 0;
                 o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut pkt_buf[o..]);
