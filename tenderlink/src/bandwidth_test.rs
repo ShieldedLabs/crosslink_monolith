@@ -658,14 +658,14 @@ impl SliceWrite for PackletReliableStreamed {
 
 #[derive(Default)]
 pub struct NetworkThreadPush {
-    wanted_connections: Vec<STPAddress>,
-    messages_to_send: Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
+    pub wanted_connections: Vec<STPAddress>,
+    pub messages_to_send: Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
 }
 
 #[derive(Default)]
 pub struct NetworkThreadPull {
-    current_connections: Vec<STPAddress>,
-    messages_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
+    pub current_connections: Vec<STPAddress>,
+    pub messages_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
 }
 
 struct NetworkThreadInner {
@@ -676,13 +676,20 @@ struct NetworkThreadInner {
 
 unsafe impl std::marker::Sync for NetworkThreadInner {}
 
+// Note(Sam): Using this handle from two threads at once is UB. Only one thread may call new_service_connections at any given time.
 pub struct NetworkThreadHandle {
     inner: std::sync::Arc<NetworkThreadInner>,
     thread: std::thread::JoinHandle<()>,
-    _no_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>) -> NetworkThreadHandle {
+pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> NetworkThreadHandle {
+
+    // STP setup
+    socket_setup();
+    monotonic_clock_setup();
+    
+    let socket = setup_and_bind_udp_socket(my_port).expect("Failed to bind socket, try again.");
+
     let inner = std::sync::Arc::new(NetworkThreadInner {
         state: std::sync::atomic::AtomicUsize::new(0),
         push: std::cell::UnsafeCell::new(NetworkThreadPush::default()),
@@ -710,16 +717,24 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>) -> NetworkThreadHan
                     std::mem::swap(&mut *thread_inner.push.get(), &mut req);
                 }
                 
+                let current_time_now_ns = monotonic_clock_ns();
                 connections_map.retain(|key, value| {
                     let stp_address = value.address();
-                    req.wanted_connections.iter().position(|x| x == &stp_address).is_some()
+                    if value.creation_time_ns + 30_000_000_000 < current_time_now_ns && req.wanted_connections.iter().position(|x| x == &stp_address).is_none() && value.is_connected() {
+                        println!("############################# KILLING CONNECTION {:?}", value);
+                        return false;
+                    }
+                    true
                 });
                 for w in &req.wanted_connections {
                     if connections_map.contains_key(&w.into()) == false {
-                        connect_to(&mut connections_map, &my_keypairs, w).unwrap();
+                        connect_to(&mut connections_map, &my_keypairs, w);
                     }
                 }
-                std::mem::swap(&mut packets_to_send, &mut req.messages_to_send);
+                packets_to_send.extend(req.messages_to_send);
+                if packets_to_send.len() > 2_000 {
+                    packets_to_send.truncate(2_000);
+                }
 
                 let mut resp = NetworkThreadPull::default();
                 resp.current_connections = connections_map.iter().filter_map(|(key, value)| {
@@ -737,7 +752,17 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>) -> NetworkThreadHan
 
                 thread_inner.state.store(0, std::sync::atomic::Ordering::Release);
             } else {
-                std::thread::yield_now();
+                let got_packet = service_connections(
+                    &mut connections_map,
+                    &mut packets_received,
+                    &mut packets_to_send,
+                    &mut packet_memory_encrypted,
+                    &mut packet_memory_recv,
+                    &mut packet_memory_send,
+                    socket,
+                    &my_keypairs,
+                );
+                if got_packet == false { std::thread::yield_now(); }
             }
         }
     });
@@ -745,8 +770,32 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>) -> NetworkThreadHan
     NetworkThreadHandle {
         inner,
         thread,
-        _no_send_sync: std::marker::PhantomData,
     }
+}
+
+pub fn new_service_connections(network_thread_handle: &NetworkThreadHandle, mut req: NetworkThreadPush) -> NetworkThreadPull {
+    while network_thread_handle.inner.state.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        std::hint::spin_loop();
+    }
+
+    unsafe {
+        std::mem::swap(&mut *network_thread_handle.inner.push.get(), &mut req);
+    }
+
+    network_thread_handle.inner.state.store(1, std::sync::atomic::Ordering::Release);
+
+    while network_thread_handle.inner.state.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        //std::hint::spin_loop();
+        std::thread::yield_now();
+    }
+
+    let mut resp = NetworkThreadPull::default();
+
+    unsafe {
+        std::mem::swap(&mut *network_thread_handle.inner.pull.get(), &mut resp);
+    }
+
+    resp
 }
 
 // Returns true if a packet was received. You should use this information to decide how to schedule your connection servicing.
@@ -1246,7 +1295,6 @@ pub fn service_connections(
     } true});
 
 
-    let mut packet_counter_index = 0;
     for (connection_key, data, jumbo_id_override) in packets_to_send {
         let Some(ref mut connection) = connections_map.get_mut(connection_key)
         else {
@@ -1313,11 +1361,6 @@ pub fn service_connections(
                 }
 
                 send(&packet_memory_send[..mMTU_inside_stp]);
-                packet_counter_index += 1;
-                if packet_counter_index > 1000 {
-                    return result;
-                }
-                std::thread::sleep(std::time::Duration::from_micros(200));
             }
         } else {
             let hdr  = PackletHeader::new(PackletTag::AnEntireDatagram, data.len());
@@ -1330,11 +1373,6 @@ pub fn service_connections(
             }
             
             send(&packet_memory_send[..mMTU_inside_stp]);
-            packet_counter_index += 1;
-            if packet_counter_index > 1000 {
-                return result;
-            }
-            std::thread::sleep(std::time::Duration::from_micros(200));
         }
     }
 
