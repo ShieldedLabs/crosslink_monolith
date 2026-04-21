@@ -161,7 +161,7 @@ impl SliceRead for PacketHashBranch {
     }
 }
 
-#[derive(Debug,          Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShadowBlock {
     pub this_hash:   Hash,
     pub parent_hash: Hash,
@@ -753,11 +753,16 @@ const BLOCK_SEND_MS: u64 = 2000; // fastest interval at which to send blocks to 
 const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 2;
 const PEER_CONNECT_MS: u64 = 6000;
 const PEER_GOSSIP_MS:  u64 = 2500;
-const PEER_REQUEST_MS: u64 = 1000;
-const PEER_RESPOND_MS: u64 = 2000;
+const PEER_REQUEST_MS: u64 = 400;
+const PEER_RESPOND_MS: u64 = 400;
 
 
-const IDLE_MS: u64 = 550;
+const IDLE_MS: u64 = 400;
+
+const MAX_BANDWIDTH_BYTES_PER_MS: usize = 5_000; // 5 MB/s
+const MAX_BANDWIDTH_BYTES_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_MS * PEER_RESPOND_MS as usize;
+const MAX_BANDWIDTH_BLOCKS_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_RES / zebra_chain::block::MAX_BLOCK_BYTES as usize;
+
 
 // use crate::crosslink::TFLServiceRequest;
 // use crate::crosslink::TFLServiceResponse;
@@ -1025,9 +1030,11 @@ impl SliceWrite for PeerPowBlockResponseChunkHdr {
     }
 }
 
+const BLOCK_DOWNLOADS_N: usize = 8;
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BlockDownloads {
-    slots: [PeerPowBlockDownload; 32],
+    slots: [PeerPowBlockDownload; BLOCK_DOWNLOADS_N],
     used_flags: u64,
 }
 impl BlockDownloads {
@@ -1045,8 +1052,9 @@ impl BlockDownloads {
         }
     }
 
+
     fn insert(&mut self, height_hash: HeightAndHashOr0) -> Option<usize> {
-        if TRACE { tracing::info!("Inserting new download for height {} hash {}", height_hash.height.0, height_hash.hash_or_0); }
+        // if TRACE { tracing::info!("Inserting new download for height {} hash {}", height_hash.height.0, height_hash.hash_or_0); }
         self.fill_slot(self.used_flags.trailing_ones() as usize, height_hash)
     }
 
@@ -1086,6 +1094,10 @@ impl BlockDownloads {
 
     fn slot_is_used(&self, dl_i: usize) -> bool {
         dl_i < self.slots.len() && ((self.used_flags >> dl_i) & 1) != 0
+    }
+
+    fn used_count(&self) -> usize {
+        self.used_flags.count_ones() as usize
     }
 }
 
@@ -1254,7 +1266,7 @@ pub fn sync(
     // Sync state
     let tick_duration = std::time::Duration::from_millis(IDLE_MS);
     let status_interval = std::time::Duration::from_millis(STATUS_MS);
-    let block_send_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
+    let dl_init_interval = std::time::Duration::from_millis(BLOCK_SEND_MS);
     let peer_gossip_interval = std::time::Duration::from_millis(PEER_GOSSIP_MS);
     let peer_connect_interval = std::time::Duration::from_millis(PEER_CONNECT_MS);
     let peer_request_interval = std::time::Duration::from_millis(PEER_REQUEST_MS);
@@ -1276,7 +1288,7 @@ pub fn sync(
     // let mut XXX_tick_loop_counter = 0usize;
 
     let mut next_status       = std::time::Instant::now();
-    let mut next_block_send   = std::time::Instant::now();
+    let mut next_dl_init      = std::time::Instant::now();
     let mut next_peer_gossip  = std::time::Instant::now();
     let mut next_peer_connect = std::time::Instant::now();
     let mut next_peer_request = std::time::Instant::now();
@@ -1543,9 +1555,9 @@ pub fn sync(
                 }
             }
 
-            if TRACE { tracing::info!("Sending BLOCK (Height: {height}, Hash: {hash})"); }
-
             let serialized_block = &serialized_blocks[&hash];
+
+            if TRACE { tracing::info!("Sending BLOCK (Height: {height}, Hash: {hash}, {offset}-{})", serialized_block.len()); }
 
             if *offset >= serialized_block.len() {
                 // TODO: fix macro/fn for: kill!("out-of-range block offset request");
@@ -1614,11 +1626,16 @@ pub fn sync(
         // Discard statuses of disconnected peers
         peers.retain(|connection_key, _| get_connected(&connections_map, connection_key).is_some());
 
-        // TODO: limit total requests sum(popcount(downloads))
-        if std::time::Instant::now() >= next_block_send {
-            const MAX_PEERS_TO_SEND_BLOCKS_TO: usize = 8;
+        if std::time::Instant::now() >= next_dl_init {
+            let mut active_block_dls = 0;
+            for (_, peer) in &peers {
+                active_block_dls += peer.block_downloads.used_count()
+            }
+            let prev_active_block_dls = active_block_dls;
 
-            'send_to_peers: for (connection_key, Peer { origin, their_tree, their_queue, ref mut block_downloads, .. }) in peers.iter_mut().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_SEND_BLOCKS_TO) {
+            const MAX_PEERS_TO_INIT_DLS_FROM: usize = 8;
+
+            'send_to_peers: for (connection_key, Peer { origin, their_tree, their_queue, ref mut block_downloads, .. }) in peers.iter_mut().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_INIT_DLS_FROM) {
                 // @Duplicate with packet status parsing
 
                 if *their_tree == NearTipBranches::default() {
@@ -1776,11 +1793,19 @@ pub fn sync(
                     // If the peer is far ahead, request blocks from farther back in their chain to catch us up.
                     let mut req_h = our_tip_height + 1;
                     while req_h < their_tree.finalized_height {
-                        if block_downloads.insert_or_position(HeightAndHashOr0 {
+                        if active_block_dls >= MAX_BANDWIDTH_BLOCKS_PER_RES {
+                            break;
+                        }
+
+                        let height_hash = HeightAndHashOr0 {
                             height: block::Height(req_h),
                             hash_or_0: block::Hash([0;32]),
-                        }).is_some() {
-                            if TRACE { tracing::info!("Inserted! New DL count for peer: {}", block_downloads.used_flags.count_ones()); }
+                        };
+                        if let Some(dl_i) = block_downloads.position(height_hash) {
+                            // already included
+                        } else if let Some(dl_i) = block_downloads.insert(height_hash) {
+                            active_block_dls += 1;
+                            if TRACE { tracing::info!("Include request for historical block @ {req_h}, offset {}! New DL count for peer: {}", block_downloads.slots[dl_i].offset, block_downloads.used_flags.count_ones()); }
                         } else {
                             break;
                         }
@@ -1822,26 +1847,37 @@ pub fn sync(
                             continue; // Nothing on this chain of ours that we can use to extend their branch.
                         };
 
-                        for height in max_height_we_both_share + 1 .. their_branch_height_end {
-                            let chain_i = (height - their_branch_height_bgn) as usize;
+                        let bgn_h = near_tip_chains.finalized_height.max(max_height_we_both_share) + 1; // have to do extra check because inverted ranges panic
+                        if bgn_h < their_branch_height_end {
+                            for height in bgn_h .. their_branch_height_end {
+                                if active_block_dls >= MAX_BANDWIDTH_BLOCKS_PER_RES {
+                                    break;
+                                }
 
-                            let block_to_queue = &their_branch[chain_i];
+                                let chain_i = (height - their_branch_height_bgn) as usize;
 
-                            let hash = block_to_queue.this_hash;
+                                let block_to_queue = &their_branch[chain_i];
 
-                            if blocks_to_commit.iter().any(|(block_hash, _)| *block_hash == hash) {
-                                if TRACE { tracing::info!("Skipped requesting block already in our queue. Peer {connection_address:?}. Hash: {hash}"); }
-                                continue;
-                            }
+                                let hash = block_to_queue.this_hash;
 
-                            // We may submit the same block multiple times (visit >1 of our chains that share a short prefix with their branch), and that's valid
-                            if let Some(dl_i) = block_downloads.insert_or_position(HeightAndHashOr0 {
-                                height: block::Height(height),
-                                hash_or_0: hash,
-                            }) {
-                                // successfully pushed download
-                            } else {
-                                break; // not enough space for more downloads
+                                if blocks_to_commit.iter().any(|(block_hash, _)| *block_hash == hash) {
+                                    if TRACE { tracing::info!("Skipped requesting block already in our queue. Peer {connection_address:?}. Hash: {hash}"); }
+                                    continue;
+                                }
+
+                                // We may submit the same block multiple times (visit >1 of our chains that share a short prefix with their branch), and that's valid
+                                let height_hash = HeightAndHashOr0 {
+                                    height: block::Height(height),
+                                    hash_or_0: hash,
+                                };
+                                if let Some(dl_i) = block_downloads.position(height_hash) {
+                                    // already included
+                                } else if let Some(dl_i) = block_downloads.insert(height_hash) {
+                                    active_block_dls += 1;
+                                    if TRACE { tracing::info!("Include request for near-tip   block @ {height}, {hash} offset {}! New DL count for peer: {}", block_downloads.slots[dl_i].offset, block_downloads.used_flags.count_ones()); }
+                                } else {
+                                    break; // not enough space for more downloads
+                                }
                             }
                         }
                     }
@@ -1850,7 +1886,8 @@ pub fn sync(
                 queue_blocks_to_request();
             }
 
-            next_block_send = std::time::Instant::now() + block_send_interval;
+            if TRACE { tracing::info!("Started {} new block dls (currently {active_block_dls}/{MAX_BANDWIDTH_BLOCKS_PER_RES})", active_block_dls - prev_active_block_dls); }
+            next_dl_init = std::time::Instant::now() + dl_init_interval;
         }
 
         if std::time::Instant::now() >= next_peer_request {
@@ -1938,7 +1975,7 @@ pub fn sync(
         // @Todo: real scheduling. Right now I just want to receive everything!
         for (_, buf, _) in &packets_to_send {
             assert!(buf.len() > 0);
-            if TRACE { tracing::info!("Sending message type: {} ({})", packet_name_from_type(buf[0]), buf[0]); }
+            // if TRACE { tracing::info!("Sending message type: {} ({})", packet_name_from_type(buf[0]), buf[0]); }
         }
         for _ in 0..128 {
             more_packets_likely_available = service_connections(&mut connections_map,
@@ -2023,7 +2060,7 @@ pub fn sync(
                 continue 'process_packets;
             };
 
-            if TRACE { tracing::info!("Got message type: {} ({})", packet_name_from_type(packet_type), packet_type); }
+            // if TRACE { tracing::info!("Got message type: {} ({})", packet_name_from_type(packet_type), packet_type); }
 
             if packet_type == PACKET_TYPE_PEER_ADDRESS_LIST {
                 // @Todo: rate limit consumption
@@ -2156,7 +2193,7 @@ pub fn sync(
                 // is "not even worth" submitting to Zebra (rejected due to being too far back).
                 let min_height = near_tip_chains.chains[0].blocks[0].this_height; // @Todo: this assumes :AssumeGenesisBlockIncludedInNearTipChains
 
-                if TRACE { tracing::info!("Block @ {alleged_height}, offset {}...", hdr.offset); }
+                // if TRACE { tracing::info!("Block @ {alleged_height}, offset {}...", hdr.offset); }
 
                 if alleged_height < min_height {
                     warning!("Block at height {alleged_height} is below our near-tip-chain height {min_height}");
@@ -2174,7 +2211,7 @@ pub fn sync(
                 // @Note: the hash could be computed from the block header, so this is an early-out optimization.
                 let alleged_hash = hdr.height_hash.hash_or_0;
 
-                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, offset {}...", hdr.offset); }
+                // if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, offset {}...", hdr.offset); }
 
                 if alleged_hash == block::Hash([0;32]) {
                     kill!("the provided hash should not be 0");
@@ -2212,7 +2249,7 @@ pub fn sync(
                     continue 'process_packets;
                 }
 
-                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not already queued..."); }
+                // if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not already queued..."); }
 
                 // TODO: we can accelerate with a height check, but this may change the semantics
                 for our_chain in &near_tip_chains.chains {
@@ -2223,7 +2260,7 @@ pub fn sync(
                     }
                 }
 
-                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not already in near_tip_chains..."); }
+                // if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not already in near_tip_chains..."); }
 
                 if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: Inserting fragment at offset {} with length {}, total length {}", hdr.offset as usize, msg.len(), peer.block_downloads.slots[dl_i].reassembly.total_len); }
 
@@ -2421,6 +2458,7 @@ pub fn sync(
             // Sleep remainder of tick
             let elapsed = loop_start.elapsed();
             if elapsed < tick_duration {
+                if TRACE { println!("Sleeping for {:?}", tick_duration - elapsed); }
                 std::thread::sleep(tick_duration - elapsed);
             }
         }
