@@ -718,23 +718,21 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                 }
                 
                 let current_time_now_ns = monotonic_clock_ns();
-                // connections_map.retain(|key, value| {
-                //     let stp_address = value.address();
-                //     if value.creation_time_ns + 30_000_000_000 < current_time_now_ns && req.wanted_connections.iter().position(|x| x == &stp_address).is_none() && value.is_connected() {
-                //         println!("############################# KILLING CONNECTION {:?}", value);
-                //         return false;
-                //     }
-                //     true
-                // });
-                for w in &req.wanted_connections {
-                    if connections_map.contains_key(&w.into()) == false {
-                        connect_to(&mut connections_map, &my_keypairs, w);
+                connections_map.retain(|key, value| {
+                    let stp_address = value.address();
+                    if value.creation_time_ns + 30_000_000_000 < current_time_now_ns && req.wanted_connections.iter().position(|x| x == &stp_address).is_none() && value.is_connected() {
+                        println!("############################# KILLING CONNECTION {:?}", value);
+                        return false;
                     }
+                    true
+                });
+                for w in &req.wanted_connections {
+                    connect_to(&mut connections_map, &my_keypairs, w);
                 }
                 packets_to_send.extend(req.messages_to_send);
-                if packets_to_send.len() > 2_000 {
-                    packets_to_send.truncate(2_000);
-                }
+                // if packets_to_send.len() > 2_000 {
+                //     packets_to_send.truncate(2_000);
+                // }
 
                 let mut resp = NetworkThreadPull::default();
                 resp.current_connections = connections_map.iter().filter_map(|(key, value)| {
@@ -762,6 +760,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                     socket,
                     &my_keypairs,
                 );
+                packets_to_send.clear();
                 if got_packet == false { std::thread::yield_now(); }
             }
         }
