@@ -1246,11 +1246,11 @@ pub fn service_connections(
             }
 
             send(&packet_memory_send[..mMTU_inside_stp]);
-            packet_counter_index += 1;
-            if packet_counter_index > 1000 {
-                return result;
-            }
-            std::thread::sleep(std::time::Duration::from_micros(200));
+            // packet_counter_index += 1;
+            // if packet_counter_index > 1000 {
+            //     return result;
+            // }
+            // std::thread::sleep(std::time::Duration::from_micros(200));
         }
     }
 

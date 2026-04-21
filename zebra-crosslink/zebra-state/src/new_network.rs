@@ -1521,6 +1521,7 @@ pub fn sync(
         }
 
 
+        // TODO: replace with a later block_packets_to_send, which should be sorted by (in-block offset, height)
         blocks_to_send.sort_by_key(|(_, _, height, _)| *height);
 
         // TODO: rate limit production!
@@ -1628,11 +1629,25 @@ pub fn sync(
 
         if std::time::Instant::now() >= next_dl_init {
             let mut active_block_dls = 0;
+            let mut requests_by_hash: HashMap<Hash, usize> = HashMap::new();
+            let mut requests_by_height: HashMap<u32, usize> = HashMap::new();
+            const MAX_REQUEST_DUPLICATES_N: usize = 2; // TODO: reconsider @Prod
             for (_, peer) in &peers {
-                active_block_dls += peer.block_downloads.used_count()
+                active_block_dls += peer.block_downloads.used_count();
+
+                for (dl_i, dl) in peer.block_downloads.slots.iter().enumerate() {
+                    if peer.block_downloads.slot_is_used(dl_i) {
+                        if dl.height_hash.hash_or_0 != block::Hash([0; 32]) {
+                            requests_by_hash.entry(dl.height_hash.hash_or_0).and_modify(|c| *c += 1).or_insert(1);
+                        } else {
+                            requests_by_height.entry(dl.height_hash.height.0).and_modify(|c| *c += 1).or_insert(1);
+                        }
+                    }
+                }
             }
             let prev_active_block_dls = active_block_dls;
 
+            // TODO: weight peers by observed quality
             const MAX_PEERS_TO_INIT_DLS_FROM: usize = 8;
 
             'send_to_peers: for (connection_key, Peer { origin, their_tree, their_queue, ref mut block_downloads, .. }) in peers.iter_mut().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_INIT_DLS_FROM) {
@@ -1803,11 +1818,17 @@ pub fn sync(
                         };
                         if let Some(dl_i) = block_downloads.position(height_hash) {
                             // already included
-                        } else if let Some(dl_i) = block_downloads.insert(height_hash) {
-                            active_block_dls += 1;
-                            if TRACE { tracing::info!("Include request for historical block @ {req_h}, offset {}! New DL count for peer: {}", block_downloads.slots[dl_i].offset, block_downloads.used_flags.count_ones()); }
                         } else {
-                            break;
+                            let dups = requests_by_height.entry(req_h).or_insert(0);
+                            if *dups < MAX_REQUEST_DUPLICATES_N {
+                                if let Some(dl_i) = block_downloads.insert(height_hash) {
+                                    active_block_dls += 1; // total in-flight
+                                    *dups += 1; // duplicates of "this block"
+                                    if TRACE { tracing::info!("Include request for historical block @ {req_h}, x{}, offset {}! New DL count for peer: {}", *dups, block_downloads.slots[dl_i].offset, block_downloads.used_flags.count_ones()); }
+                                } else {
+                                    break;
+                                }
+                            }
                         }
                         req_h += 1;
                     }
@@ -1870,13 +1891,20 @@ pub fn sync(
                                     height: block::Height(height),
                                     hash_or_0: hash,
                                 };
+
                                 if let Some(dl_i) = block_downloads.position(height_hash) {
                                     // already included
-                                } else if let Some(dl_i) = block_downloads.insert(height_hash) {
-                                    active_block_dls += 1;
-                                    if TRACE { tracing::info!("Include request for near-tip   block @ {height}, {hash} offset {}! New DL count for peer: {}", block_downloads.slots[dl_i].offset, block_downloads.used_flags.count_ones()); }
                                 } else {
-                                    break; // not enough space for more downloads
+                                    let dups = requests_by_hash.entry(hash).or_insert(0);
+                                    if *dups < MAX_REQUEST_DUPLICATES_N {
+                                        if let Some(dl_i) = block_downloads.insert(height_hash) {
+                                            active_block_dls += 1; // total in flight
+                                            *dups += 1; // duplicates of this block
+                                            if TRACE { tracing::info!("Include request for near-tip   block @ {height}, {hash}, x{}, offset {}! New DL count for peer: {}", *dups, block_downloads.slots[dl_i].offset, block_downloads.used_flags.count_ones()); }
+                                        } else {
+                                            break; // not enough space for more downloads
+                                        }
+                                    }
                                 }
                             }
                         }
