@@ -643,12 +643,6 @@ impl SliceRead for NearTipBranches {
 
             let end_height = dbg_verify(bgn_height.checked_add((end_i - hash_c) as u32))?;
 
-            // The first branch must be the best chain
-            if branches.is_empty() && end_height - 1 != hdr.tip_height {
-                dbg_panic!("The first branch must be the best chain and match the header's tip height! First branch height: {}, tip height: {}", end_height - 1, hdr.tip_height);
-                return None;
-            }
-
             let mut branch_blocks = Vec::with_capacity(branch_hashes_n);
 
             // We NEED to bounds check all the heights in this chain branch.
@@ -672,6 +666,41 @@ impl SliceRead for NearTipBranches {
 
         Some(Self { tip_height: hdr.tip_height, finalized_height: hdr.finalized_height, branches })
     }
+}
+
+
+fn max_shared_height_with_tree(their_tree: &NearTipBranches, blocks: &[ShadowBlock]) -> Option<u32> {
+    if blocks.len() == 0 {
+        dbg_panic!("0-length chain where there shouldn't be");
+        return None;
+    }
+
+    let our_chain_height_end = blocks.last().unwrap().this_height + 1;
+
+    let mut max_height_we_both_share = None;
+
+    for their_branch in &their_tree.branches {
+        let their_branch_height_bgn = their_branch[0].this_height;
+        let their_branch_height_end = their_branch.last().unwrap().this_height + 1;
+
+        let prefix = chain_intersect_prefix(&their_branch, blocks);
+        // print_shadow_block_intersection(&their_branch, &our_chain.blocks, 1);
+
+
+        // If the prefix was empty, there was no overlap.
+        if prefix.is_empty() {
+            continue;
+        }
+
+        let height_of_match = prefix.last().unwrap().this_height;
+
+        assert!(height_of_match < our_chain_height_end);
+        assert!(height_of_match < their_branch_height_end);
+
+        max_height_we_both_share = max_height_we_both_share.max(Some(height_of_match));
+    }
+
+    max_height_we_both_share
 }
 
 
@@ -860,6 +889,23 @@ pub fn get_hdrs_after_hash(read_state: &ReadState, rt: &tokio::runtime::Handle, 
                 None
             },
             _ => panic!("get_hdrs_after_hash({pre_first_hash}): Unhandled response: {res:?}"),
+        }
+    })
+}
+
+pub fn get_hashes_after_hash(read_state: &ReadState, rt: &tokio::runtime::Handle, pre_first_hash: Hash, last_hash: Option<Hash>) -> Option<Vec<block::Hash>> {
+    rt.block_on(async {
+        let res = read_state.clone().oneshot(ReadRequest::FindBlockHashes{
+            known_blocks: vec![pre_first_hash],
+            stop: last_hash,
+        }).await;
+        match res {
+            Ok(ReadResponse::BlockHashes(hashes)) => Some(hashes),
+            Err(err) => {
+                tracing::error!("get_hashes_after_hash({pre_first_hash}): Error: {err:?}");
+                None
+            },
+            _ => panic!("get_hashes_after_hash({pre_first_hash}): Unhandled response: {res:?}"),
         }
     })
 }
@@ -1632,7 +1678,75 @@ pub fn sync(
                     continue;
                 }
 
-                packets_to_send.push((*key, Vec::from(&buf[..o]), None));
+                let Some(peer) = peers.get(key) else {
+                    if TRACE { tracing::info!("Trying to send a STATUS to {:?} but they haven't finished being created", connection.address()); }
+                    continue;
+                };
+
+                let mut send_tip_chains = near_tip_chains.finalized_height < peer.their_tree.finalized_height;
+                if ! send_tip_chains {
+                    for our_chain in &near_tip_chains.chains {
+                        if max_shared_height_with_tree(&peer.their_tree, &our_chain.blocks).is_some() {
+                            send_tip_chains = true;
+                            break;
+                        }
+                    }
+                }
+
+                if ! send_tip_chains {
+                    send_tip_chains = 'try_send_historical: {
+                        // they are very far behind us: construct & send them a historical status
+
+                        let their_final_parent_height = peer.their_tree.finalized_height.saturating_sub(1);
+                        let Some(their_final_parent_hash) = get_bc_hash_at_height(&read_state, &rt, block::Height(their_final_parent_height)) else {
+                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we don't have blocks @ {}", connection.address(), their_final_parent_height); }
+                            break 'try_send_historical true; // fallback to tip chains if we don't successfully send historical here
+                        };
+
+                        let Some(mut hashes_from_their_final) = get_hashes_after_hash(&read_state, &rt, their_final_parent_hash, None) else {
+                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we couldn't find hashes after block @ {}, {}", connection.address(), their_final_parent_height, their_final_parent_hash); }
+                            break 'try_send_historical true;
+                        };
+                        if hashes_from_their_final.len() == 0 {
+                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we found 0 hashes after block @ {}, {}", connection.address(), their_final_parent_height, their_final_parent_hash); }
+                            break 'try_send_historical true;
+                        }
+
+                        hashes_from_their_final.truncate(NEAR_TIP_CHAIN_LEN as usize);
+
+                        let mut parent_hash = their_final_parent_hash;
+                        let mut this_height = their_final_parent_height + 1;
+                        let mut historical_chain: Vec<ShadowBlock> = Vec::new();
+                        for &this_hash in &hashes_from_their_final {
+                            historical_chain.push(ShadowBlock {
+                                parent_hash,
+                                this_height,
+                                this_hash,
+                            });
+                            parent_hash = this_hash;
+                        }
+                        let mut historical_chains = NearTipChains::default();
+                        historical_chains.push_chain(historical_chain);
+
+
+                        let (mut buf, mut o) = ([0u8; 1 + 1 + MAX_BLOCKS_TO_QUEUE_TO_COMMIT * 32 + PACKET_STATUS_MAX_SIZE], 0);
+                        o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
+                        o += queue_len         .write_to(&mut buf[o..]);
+                        for (queued_hash, _) in &blocks_to_commit {
+                            o += queued_hash.0 .write_to(&mut buf[o..]);
+                        }
+                        o += historical_chains .write_to(&mut buf[o..]);
+
+
+                        if TRACE { tracing::info!("Send a historical STATUS to {:?} @ {}", connection.address(), their_final_parent_height+1); }
+                        packets_to_send.push((*key, Vec::from(&buf[..o]), None));
+                        false
+                    };
+                }
+
+                if send_tip_chains {
+                    packets_to_send.push((*key, Vec::from(&buf[..o]), None));
+                }
             }
 
             next_status = std::time::Instant::now() + status_interval;
@@ -1760,32 +1874,9 @@ pub fn sync(
 
                     for our_chain in &near_tip_chains.chains {
                         assert!(our_chain.blocks.len() > 0);
-
                         let our_chain_height_bgn = our_chain.blocks[0].this_height;
                         let our_chain_height_end = our_chain.blocks.last().unwrap().this_height + 1;
-
-                        let mut max_height_we_both_share = None;
-
-                        for their_branch in &their_tree.branches {
-                            let their_branch_height_bgn = their_branch[0].this_height;
-                            let their_branch_height_end = their_branch.last().unwrap().this_height + 1;
-
-                            let prefix = chain_intersect_prefix(&their_branch, &our_chain.blocks);
-                            // print_shadow_block_intersection(&their_branch, &our_chain.blocks, 1);
-
-
-                            // If the prefix was empty, there was no overlap.
-                            if prefix.is_empty() {
-                                continue;
-                            }
-
-                            let height_of_match = prefix.last().unwrap().this_height;
-
-                            assert!(height_of_match < our_chain_height_end);
-                            assert!(height_of_match < their_branch_height_end);
-
-                            max_height_we_both_share = max_height_we_both_share.max(Some(height_of_match));
-                        }
+                        let max_height_we_both_share = max_shared_height_with_tree(their_tree, &our_chain.blocks);
 
                         let Some(max_height_we_both_share) = max_height_we_both_share else {
                             continue; // Nothing on this chain of ours that we can use to extend their branch.
@@ -1832,32 +1923,6 @@ pub fn sync(
                 //
                 let mut queue_blocks_to_request = || {
                     // If the peer is far ahead, request blocks from farther back in their chain to catch us up.
-                    let mut req_h = our_tip_height + 1;
-                    while req_h < their_tree.finalized_height {
-                        if active_block_dls >= MAX_BANDWIDTH_BLOCKS_PER_RES {
-                            break;
-                        }
-
-                        let height_hash = HeightAndHashOr0 {
-                            height: block::Height(req_h),
-                            hash_or_0: block::Hash([0;32]),
-                        };
-                        if let Some(dl_i) = block_downloads.position(height_hash) {
-                            // already included
-                        } else {
-                            let dups = requests_by_height.entry(req_h).or_insert(0);
-                            if *dups < MAX_REQUEST_DUPLICATES_N {
-                                if let Some(dl_i) = block_downloads.insert(height_hash) {
-                                    active_block_dls += 1; // total in-flight
-                                    *dups += 1; // duplicates of "this block"
-                                    if TRACE { tracing::info!("Include request for historical block @ {req_h}, x{}, offset {}! New DL count for peer: {}", *dups, block_downloads.slots[dl_i].offset, block_downloads.used_flags.count_ones()); }
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                        req_h += 1;
-                    }
 
                     for their_branch in &their_tree.branches {
                         let their_branch_height_bgn = their_branch[0].this_height;
@@ -1935,6 +2000,33 @@ pub fn sync(
                             }
                         }
                     }
+
+                    // let mut req_h = our_tip_height + 1;
+                    // while req_h < their_tree.finalized_height {
+                    //     if active_block_dls >= MAX_BANDWIDTH_BLOCKS_PER_RES {
+                    //         break;
+                    //     }
+
+                    //     let height_hash = HeightAndHashOr0 {
+                    //         height: block::Height(req_h),
+                    //         hash_or_0: block::Hash([0;32]),
+                    //     };
+                    //     if let Some(dl_i) = block_downloads.position(height_hash) {
+                    //         // already included
+                    //     } else {
+                    //         let dups = requests_by_height.entry(req_h).or_insert(0);
+                    //         if *dups < MAX_REQUEST_DUPLICATES_N {
+                    //             if let Some(dl_i) = block_downloads.insert(height_hash) {
+                    //                 active_block_dls += 1; // total in-flight
+                    //                 *dups += 1; // duplicates of "this block"
+                    //                 if TRACE { tracing::info!("Include request for historical block @ {req_h}, x{}, offset {}! New DL count for peer: {}", *dups, block_downloads.slots[dl_i].offset, block_downloads.used_flags.count_ones()); }
+                    //             } else {
+                    //                 break;
+                    //             }
+                    //         }
+                    //     }
+                    //     req_h += 1;
+                    // }
                 };
 
                 queue_blocks_to_request();

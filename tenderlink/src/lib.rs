@@ -1339,7 +1339,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port);
     let mut current_connections = Vec::<STPAddress>::new();
     let mut messages_to_send = Vec::new();
-    
+
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
     let mut bft_key_address_map = BftAddressMap::new();
 
@@ -1524,7 +1524,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                            stats: &mut NetworkStats) {
                     let height = round_data.height;
                     let round  = round_data.round;
-                    
+
                     // Make sure to always sent at least one status.
                     {
                         let header = PacketHeader::new_(0);
@@ -1794,7 +1794,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 next_tick_time += TICK_DURATION;
             }
         }
-        
+
         use rand::seq::SliceRandom;
         messages_to_send.shuffle(&mut rand::thread_rng());
         let resp = new_service_connections(&network_thread_handle, NetworkThreadPush { wanted_connections: current_connections, messages_to_send });
@@ -1812,13 +1812,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         // connections_map.retain(|key, value| {
         //     let stp_address = value.address();
         //     let Some(bft_key) = bft_key_address_map.get_key(&stp_address) else { return false; };
-        //     
+        //
         //     roster.iter().position(|x| x.pub_key == *bft_key).is_some()
         // });
-        
+
         // Remove peer entries for dropped connections
         peers.retain(|key, _| current_connections.iter().position(|x| ConnectionKey::from(x) == *key).is_some());
-        
+
 
         // READ
         while messages_received.len() > 0 {
@@ -1893,7 +1893,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             else {
             }
         }
-   }
+    }
 }
 
 // consensus
