@@ -622,18 +622,21 @@ impl StateService {
         let this_header_fat_pointer = semantically_verrified.block.header.fat_pointer_to_bft_block.clone();
         let semantically_verrified_height = semantically_verrified.height;
 
-        if self
-            .non_finalized_block_write_sent_hashes
-            .contains(&semantically_verrified.hash)
-        {
-            let (rsp_tx, rsp_rx) = oneshot::channel();
-            let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
-                ValidateContextError::DuplicateCommitRequest {
-                    block_hash: semantically_verrified.hash,
-                },
-            )));
-            return rsp_rx;
-        }
+        // BAD? Bug? This check prevents re-committing a block whose previous commit attempt
+        // failed, because sent_hashes is never cleaned up on failure. Disabled so that blocks
+        // can be retried.
+        // if self
+        //     .non_finalized_block_write_sent_hashes
+        //     .contains(&semantically_verrified.hash)
+        // {
+        //     let (rsp_tx, rsp_rx) = oneshot::channel();
+        //     let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
+        //         ValidateContextError::DuplicateCommitRequest {
+        //             block_hash: semantically_verrified.hash,
+        //         },
+        //     )));
+        //     return rsp_rx;
+        // }
 
         if self
             .read_service
