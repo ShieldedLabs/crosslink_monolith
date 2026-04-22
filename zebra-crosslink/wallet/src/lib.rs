@@ -1014,7 +1014,10 @@ impl WalletState {
 pub fn str_from_ctaz(val: u64) -> String {
     let full = val / 100_000_000;
     let part = val % 100_000_000;
-    let part_str = format!("{:08}", part);
+    let mut part_str = format!("{:08}", part);
+    if part_str.len() > 5 {
+        part_str = part_str[..5].to_string();
+    }
     let trim_part = part_str.trim_end_matches("0");
     format!("{full}.{}", &part_str[..trim_part.len().max(3)])
 }
