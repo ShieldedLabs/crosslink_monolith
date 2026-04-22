@@ -1548,7 +1548,6 @@ dependencies = [
  "socket2",
  "static_assertions",
  "tokio",
- "tracing",
  "windows-sys 0.61.2",
  "zcash_primitives",
 ]
