@@ -506,7 +506,7 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
         return None;
     }
 
-    let finality_candidate_height = ZebBlockHeight(finality_candidate_height.0.min(if let Some(v) = latest_final_block { v.0.0+10 } else { u32::MAX }));
+    let finality_candidate_height = ZebBlockHeight(finality_candidate_height.0.min(if let Some(v) = latest_final_block { v.0.0+40 } else { u32::MAX }));
 
     let resp = (call.state)(StateRequest::BlockHeader(finality_candidate_height.into())).await;
 
