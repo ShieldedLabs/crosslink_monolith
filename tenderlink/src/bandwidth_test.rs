@@ -557,7 +557,8 @@ impl ReassemblySlot {
     }
 
     // @assume_fixed_size_packets
-    pub fn insert(&mut self, offset: usize, data: &[u8]) -> Result<bool, ()> {
+    /// returns is_complete, new_bytes_n on Ok
+    pub fn insert(&mut self, offset: usize, data: &[u8]) -> Result<(bool, usize), ()> {
         let start = offset as u32;
         if start >= self.total_len {
             if OVERLY_VERBOSE { tracing::error!("Reassembly: Start {start} was >= total_len {}.", self.total_len); }
@@ -582,7 +583,7 @@ impl ReassemblySlot {
         if fully_covered {
             // Verify the data matches what we already have (detect corruption / adversarial tampering)
             if self.buf[offset..offset + data.len()] == *data {
-                return Ok(self.received.len() == 1 && self.received[0] == (0, self.total_len));
+                return Ok((self.received.len() == 1 && self.received[0] == (0, self.total_len), 0));
             } else {
                 if OVERLY_VERBOSE { tracing::error!("Reassembly: Fragment with range ({start}, {end}) did not match existing data."); }
                 return Err(()); // same range, different data - kill connection
@@ -623,7 +624,7 @@ impl ReassemblySlot {
             }
         }
 
-        Ok(self.received.len() == 1 && self.received[0] == (0, self.total_len))
+        Ok((self.received.len() == 1 && self.received[0] == (0, self.total_len), data.len()))
     }
 }
 
@@ -695,7 +696,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
     // STP setup
     socket_setup();
     monotonic_clock_setup();
-    
+
     let socket = setup_and_bind_udp_socket(my_port).expect("Failed to bind socket, try again.");
 
     let inner = std::sync::Arc::new(NetworkThreadInner {
@@ -707,16 +708,16 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
     let thread_inner = inner.clone();
 
     let thread = std::thread::spawn(move || {
-    
+
         let mut packet_memory_encrypted = new_packet_memory(); // Incoming Encrypted / Outgoing Encrypted
         let mut packet_memory_recv      = new_packet_memory(); // Incoming Decrypted
         let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
-    
+
         let mut packets_to_send:  Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
         let mut packets_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
-    
+
         let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
-    
+
         loop {
             if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 1 {
                 let mut req = NetworkThreadPush::default();
@@ -724,7 +725,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                 unsafe {
                     std::mem::swap(&mut *thread_inner.push.get(), &mut req);
                 }
-                
+
                 let current_time_now_ns = monotonic_clock_ns();
                 connections_map.retain(|key, value| {
                     let stp_address = value.address();
@@ -1182,12 +1183,12 @@ pub fn service_connections(
                                     }
 
                                     match slot.insert(byte_idx, frag_data) {
-                                        Ok(true) => {
+                                        Ok((true, _new_bytes_n)) => {
                                             // Message complete - deliver it
                                             let completed = reasm.slots.remove(&frag_id).unwrap();
                                             packets_received_this_call.push((connection_key, completed.buf, Some(frag_id)));
                                         }
-                                        Ok(false) => {
+                                        Ok((false, _)) => {
                                             // More fragments needed
                                         }
                                         Err(()) => {

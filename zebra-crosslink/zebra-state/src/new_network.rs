@@ -78,6 +78,8 @@ fn packet_name_from_type(packet_type: u8) -> &'static str {
 const PACKET_STATUS_MAX_HASHES: usize = 400; // @Lazy: gives room for 300 hashes plus room for 200 run metadatas
 const PACKET_STATUS_MAX_SIZE:   usize = ((PACKET_STATUS_MAX_HASHES * 32 + JUMBO_FRAG_SIZE - 1) / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE; // @Cleanup @Lazy.
 
+const DOWNLOAD_UNMODIFIED_TIMEOUT_DUR: std::time::Duration = std::time::Duration::from_secs(8);
+
 #[cfg(debug_assertions)] fn dbg_break() {
     #[cfg(target_arch = "x86_64")] unsafe { std::arch::asm!("int 3"); }
     // @Todo: AArch64 debugbreak.
@@ -995,11 +997,22 @@ impl SliceWrite for PeerPowBlockRequest {
 }
 
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PeerPowBlockDownload {
     height_hash: HeightAndHashOr0,
     reassembly: ReassemblySlot, // needed for requests
     offset: u32, // needed for responses
+    last_modified: std::time::Instant,
+}
+impl Default for PeerPowBlockDownload {
+    fn default() -> Self {
+        Self {
+            height_hash: HeightAndHashOr0::default(),
+            reassembly: ReassemblySlot::default(),
+            offset: 0,
+            last_modified: std::time::Instant::now(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1044,6 +1057,7 @@ impl BlockDownloads {
                 height_hash: height_hash,
                 reassembly: ReassemblySlot::default(),
                 offset: 0,
+                last_modified: std::time::Instant::now(),
             };
             self.used_flags |= 1 << dl_i;
             Some(dl_i)
@@ -1249,7 +1263,7 @@ pub fn sync(
                         tenderlink::bandwidth_test::b64(&CRYPTO_MAGIC  .to_le_bytes()[..6]),
                         tenderlink::bandwidth_test::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
                         );
-            }            
+            }
             tracing::info!("NewNet: Connecting to peer: {:?}", address);
             match connect_to(&mut connections_map, &my_keypairs, &address) {
                 Err(e) => tracing::warn!("NewNet: Initial peer connect: connect_to failed: {e}"),
@@ -1632,18 +1646,30 @@ pub fn sync(
             let mut requests_by_hash: HashMap<Hash, usize> = HashMap::new();
             let mut requests_by_height: HashMap<u32, usize> = HashMap::new();
             const MAX_REQUEST_DUPLICATES_N: usize = 2; // TODO: reconsider @Prod
-            for (_, peer) in &peers {
-                active_block_dls += peer.block_downloads.used_count();
-
-                for (dl_i, dl) in peer.block_downloads.slots.iter().enumerate() {
+            for (_, peer) in &mut peers {
+                for dl_i in 0..peer.block_downloads.slots.len() {
                     if peer.block_downloads.slot_is_used(dl_i) {
-                        if dl.height_hash.hash_or_0 != block::Hash([0; 32]) {
-                            requests_by_hash.entry(dl.height_hash.hash_or_0).and_modify(|c| *c += 1).or_insert(1);
+                        let HeightAndHashOr0 { height: block::Height(height), hash_or_0 } = peer.block_downloads.slots[dl_i].height_hash;
+
+                        if height <= near_tip_chains.finalized_height {
+                            if TRACE { tracing::info!("Cancelling download request for block @ {}, {} - <= finalized @ {}", height, hash_or_0, near_tip_chains.finalized_height); }
+                            peer.block_downloads.remove(dl_i);
+
+                        } else if peer.block_downloads.slots[dl_i].last_modified.elapsed() > DOWNLOAD_UNMODIFIED_TIMEOUT_DUR {
+                            if TRACE { tracing::info!("Cancelling download request for block @ {}, {} - timed out", height, hash_or_0); }
+                            peer.block_downloads.remove(dl_i);
+                            // TODO: lower weighting on this peer?
+
+                        } else if hash_or_0 != block::Hash([0; 32]) {
+                            requests_by_hash.entry(hash_or_0).and_modify(|c| *c += 1).or_insert(1);
+
                         } else {
-                            requests_by_height.entry(dl.height_hash.height.0).and_modify(|c| *c += 1).or_insert(1);
+                            requests_by_height.entry(height).and_modify(|c| *c += 1).or_insert(1);
                         }
                     }
                 }
+
+                active_block_dls += peer.block_downloads.used_count();
             }
             let prev_active_block_dls = active_block_dls;
 
@@ -2294,12 +2320,17 @@ pub fn sync(
 
                 // try to construct a full block from the data available
                 match peer.block_downloads.slots[dl_i].reassembly.insert(hdr.offset as usize, &mut msg) {
-                    Ok(true) => { // we have a full block; verify it etc
-                        if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: All fragments downloaded! Processing..."); }
-                    }
-                    Ok(false) => { // we validly have a partial block; wait for more fragments
-                        if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not done downloading all fragments. Continuing."); }
-                        continue 'process_packets;
+                    Ok((is_full, new_bytes_n)) => { // we have a full block; verify it etc
+                        if new_bytes_n > 0 {
+                            peer.block_downloads.slots[dl_i].last_modified = std::time::Instant::now();
+                        }
+
+                        if is_full {
+                            if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: All fragments downloaded! Processing..."); }
+                        } else { // we validly have a partial block; wait for more fragments
+                            if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not done downloading all fragments. Continuing."); }
+                            continue 'process_packets;
+                        }
                     }
                     Err(()) => {
                         kill!("overlapping/out-of-bounds fragment, killing connection");
