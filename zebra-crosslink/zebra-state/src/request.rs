@@ -985,6 +985,17 @@ pub enum ReadRequest {
     /// [`block::Height`] using `.into()`.
     Block(HashOrHeight),
 
+    /// Looks up a block by hash or height in all non-finalized chains, not just the best chain.
+    ///
+    /// Returns
+    ///
+    /// * [`ReadResponse::BlockButAlsoAllChains(Some(Arc<Block>))`](ReadResponse::BlockButAlsoAllChains) if the block is in any chain;
+    /// * [`ReadResponse::BlockButAlsoAllChains(None)`](ReadResponse::BlockButAlsoAllChains) otherwise.
+    ///
+    /// Note: the [`HashOrHeight`] can be constructed from a [`block::Hash`] or
+    /// [`block::Height`] using `.into()`.
+    BlockButAlsoAllChains(HashOrHeight),
+
     //// Same as Block, but also returns serialized block size.
     ////
     /// Returns
@@ -1250,6 +1261,7 @@ impl ReadRequest {
             ReadRequest::BlockInfo(_) => "block_info",
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",
+            ReadRequest::BlockButAlsoAllChains(_) => "block_but_also_all_chains",
             ReadRequest::BlockAndSize(_) => "block_and_size",
             ReadRequest::BlockHeader(_) => "block_header",
             ReadRequest::Transaction(_) => "transaction",
