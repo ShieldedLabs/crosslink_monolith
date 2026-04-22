@@ -838,8 +838,7 @@ pub fn service_connections(
                             if buf_len >= 6 + 32 {
                                 let client_key = &packet_memory_encrypted[6..6+32];
                                 let list_of_protocols_len_bytes = buf_len - 6 - 32;
-                                assert_eq!(list_of_protocols_len_bytes, 0); // temp
-                                // TODO list of supported Application Level protocols for e.g. zcash network upgrades. Note: We will need to use a callback in order for application code on the server to select which magic2 we will use and whether to reject the client. This is because magic2's do not have a strict order preference and so we need to push that logic to the application layer.
+                                // @Note: we will bring back magic2 soon
 
                                 let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
                                 if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
@@ -905,8 +904,7 @@ pub fn service_connections(
                             let read_message_maybe = new_handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]);
                             if let Ok(list_of_protocols_len_bytes) = read_message_maybe {
                                 if let Some(client_key) = new_handshake.get_remote_static() {
-                                    assert_eq!(list_of_protocols_len_bytes, 0); // temp
-                                    // TODO list of supported Application Level protocols for e.g. zcash network upgrades. Note: We will need to use a callback in order for application code on the server to select which magic2 we will use and whether to reject the client. This is because magic2's do not have a strict order preference and so we need to push that logic to the application layer.
+                                    // @Note: we will bring back magic2 soon
 
                                     let connection_key = ConnectionKey { ip: other_ip_addr, port: other_port, key_15_bits: load_u16(&client_key[0..2]) << 1 };
                                     if let Some(existing_connection) = connections_map.get_mut(&connection_key) {
