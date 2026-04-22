@@ -259,7 +259,7 @@ c.network.initial_testnet_peers.insert("70.34.209.18:8233".to_owned());
                     c.rpc.enable_cookie_auth = false;
                     c.state
                         .cache_dir
-                        .push("zebra_crosslink_workshop_season_one_v2_37482_cache_delete_me");
+                        .push("zebra_crosslink_workshop_season_one_v3_ehtedht_cache_delete_me");
 
                     c.state.network_initial_peers = vec![
 "[::ffff:70.34.201.146]:12001:1fgEw5Nx:_BA-d-zgMDO3lj5R-FgL3VwJQofnPVZarZSUzx9ZMhs".to_owned(),
