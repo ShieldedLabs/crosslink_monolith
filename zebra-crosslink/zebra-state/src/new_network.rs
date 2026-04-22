@@ -48,7 +48,7 @@ const JUMBO_FRAG_SIZE: usize = UDP_mMTU
 const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 //const CRYPTO_MAGIC: u64 = CONNECT_MAGIC1_PLAIN_TEXT;
 
-// @Todo: more of these, merge with Tenderlink, reintroduce peer discovery from p2p, etc.
+// @Todo: more of these, merge with Tenderlink, etc.
 const PACKET_TYPE_STATUS:            u8 = 1;
 const PACKET_TYPE_BLOCK_CHUNK:       u8 = 2;
 const PACKET_TYPE_BLOCK_REQ:         u8 = 3;
@@ -1697,33 +1697,48 @@ pub fn sync(
                     send_tip_chains = 'try_send_historical: {
                         // they are very far behind us: construct & send them a historical status
 
-                        let their_final_parent_height = peer.their_tree.finalized_height.saturating_sub(1);
-                        let Some(their_final_parent_hash) = get_bc_hash_at_height(&read_state, &rt, block::Height(their_final_parent_height)) else {
-                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we don't have blocks @ {}", connection.address(), their_final_parent_height); }
+                        // subtract once to get the finalized block at their height to confirm the attach point (because our chain_intersect_prefix() does not match parents),
+                        // subtract again because in order to send them that block we need to get that block's parent.
+                        let their_final_parent_parent_height = peer.their_tree.finalized_height.saturating_sub(2);
+                        let Some(their_final_parent_parent_hash) = get_bc_hash_at_height(&read_state, &rt, block::Height(their_final_parent_parent_height)) else {
+                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we don't have blocks @ {}", connection.address(), their_final_parent_parent_height); }
                             break 'try_send_historical true; // fallback to tip chains if we don't successfully send historical here
                         };
 
-                        let Some(mut hashes_from_their_final) = get_hashes_after_hash(&read_state, &rt, their_final_parent_hash, None) else {
-                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we couldn't find hashes after block @ {}, {}", connection.address(), their_final_parent_height, their_final_parent_hash); }
+                        let Some(mut hashes_from_their_final_parent) = get_hashes_after_hash(&read_state, &rt, their_final_parent_parent_hash, None) else {
+                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we couldn't find hashes after block @ {}, {}", connection.address(), their_final_parent_parent_height, their_final_parent_parent_hash); }
                             break 'try_send_historical true;
                         };
-                        if hashes_from_their_final.len() == 0 {
-                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we found 0 hashes after block @ {}, {}", connection.address(), their_final_parent_height, their_final_parent_hash); }
+                        if hashes_from_their_final_parent.len() == 0 {
+                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we found 0 hashes after block @ {}, {}", connection.address(), their_final_parent_parent_height, their_final_parent_parent_hash); }
                             break 'try_send_historical true;
                         }
 
-                        hashes_from_their_final.truncate(NEAR_TIP_CHAIN_LEN as usize);
+                        hashes_from_their_final_parent.truncate(NEAR_TIP_CHAIN_LEN as usize);
 
-                        let mut parent_hash = their_final_parent_hash;
-                        let mut this_height = their_final_parent_height + 1;
+                        let mut parent_hash = their_final_parent_parent_hash;
+                        let mut this_height = their_final_parent_parent_height + 1;
+
                         let mut historical_chain: Vec<ShadowBlock> = Vec::new();
-                        for &this_hash in &hashes_from_their_final {
+
+                        // if the first block we send is the block-after-genesis,
+                        // we need to manually include genesis.
+                        if this_height <= 1 {
+                            historical_chain.push(ShadowBlock {
+                                parent_hash: block::Hash([0;32]),
+                                this_height: 0,
+                                this_hash:   parent_hash,
+                            });
+                        }
+
+                        for &this_hash in &hashes_from_their_final_parent {
                             historical_chain.push(ShadowBlock {
                                 parent_hash,
                                 this_height,
                                 this_hash,
                             });
                             parent_hash = this_hash;
+                            this_height += 1;
                         }
                         let mut historical_chains = NearTipChains::default();
                         historical_chains.push_chain(historical_chain);
@@ -1738,7 +1753,7 @@ pub fn sync(
                         o += historical_chains .write_to(&mut buf[o..]);
 
 
-                        if TRACE { tracing::info!("Send a historical STATUS to {:?} @ {}", connection.address(), their_final_parent_height+1); }
+                        if TRACE { tracing::info!("Send a historical STATUS to {:?} @ {}", connection.address(), their_final_parent_parent_height + 1); }
                         packets_to_send.push((*key, Vec::from(&buf[..o]), None));
                         false
                     };
