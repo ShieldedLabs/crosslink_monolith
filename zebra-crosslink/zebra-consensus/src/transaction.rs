@@ -961,6 +961,14 @@ where
         }
 
         let block_height = height.0;
+
+        let excepted_heights = [ 1120, 2320, 2620, 2621, 3224 ];
+        if excepted_heights.contains(&block_height) {
+            // TODO: @Prod @Season2 remove this temporary cruft
+            return Ok(());
+        }
+
+
         let position_in_period = block_height % Self::STAKING_DAY_PERIOD;
 
         if position_in_period >= Self::STAKING_DAY_WINDOW {
