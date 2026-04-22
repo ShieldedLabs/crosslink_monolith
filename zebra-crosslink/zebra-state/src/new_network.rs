@@ -1716,11 +1716,8 @@ pub fn sync(
                             break 'try_send_historical true;
                         }
 
-                        hashes_from_their_final_parent.truncate(NEAR_TIP_CHAIN_LEN as usize);
-
                         let mut parent_hash = their_final_parent_parent_hash;
                         let mut this_height = their_final_parent_parent_height + 1;
-
                         let mut historical_chain: Vec<ShadowBlock> = Vec::new();
 
                         // if the first block we send is the block-after-genesis,
@@ -1742,6 +1739,13 @@ pub fn sync(
                             parent_hash = this_hash;
                             this_height += 1;
                         }
+
+                        if let Some(h) = max_shared_height_with_tree(&peer.their_tree, &historical_chain) {
+                            let h_d = h.saturating_sub(historical_chain[0].this_height).saturating_sub(2);
+                            historical_chain.drain(..h_d as usize);
+                        }
+
+                        historical_chain.truncate(NEAR_TIP_CHAIN_LEN as usize);
                         let mut historical_chains = NearTipChains::default();
                         historical_chains.finalized_height = near_tip_chains.finalized_height;
                         historical_chains.push_chain(historical_chain);
