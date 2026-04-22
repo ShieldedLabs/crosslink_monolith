@@ -228,6 +228,51 @@ impl IntoDisk for BondStatus {
     }
 }
 
+/// Aggregated stakes by finalizer, stored per finalized block hash.
+///
+/// This captures the bond aggregation at the moment a block is finalized,
+/// preserving information that would otherwise be lost as bond state changes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregatedStakes(pub Vec<([u8; 32], u64)>);
+
+impl IntoDisk for AggregatedStakes {
+    type Bytes = Vec<u8>;
+
+    fn as_bytes(&self) -> Self::Bytes {
+        let mut bytes = Vec::with_capacity(4 + self.0.len() * 40);
+        bytes.extend_from_slice(&(self.0.len() as u32).to_be_bytes());
+        for (finalizer, stake) in &self.0 {
+            bytes.extend_from_slice(finalizer);
+            bytes.extend_from_slice(&stake.to_be_bytes());
+        }
+        bytes
+    }
+}
+
+impl FromDisk for AggregatedStakes {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let bytes = bytes.as_ref();
+        assert!(
+            bytes.len() >= 4,
+            "AggregatedStakes needs at least 4 bytes for count"
+        );
+        let count = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            bytes.len(),
+            4 + count * 40,
+            "AggregatedStakes byte length mismatch"
+        );
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count {
+            let offset = 4 + i * 40;
+            let finalizer: [u8; 32] = bytes[offset..offset + 32].try_into().unwrap();
+            let stake = u64::from_be_bytes(bytes[offset + 32..offset + 40].try_into().unwrap());
+            entries.push((finalizer, stake));
+        }
+        AggregatedStakes(entries)
+    }
+}
+
 impl FromDisk for BondStatus {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         let bytes = bytes.as_ref();

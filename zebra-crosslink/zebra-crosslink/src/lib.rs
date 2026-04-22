@@ -642,6 +642,16 @@ async fn handle_new_decided_bft_block(
 
     if got_stakes.len() > 0 {
         internal.validators_at_current_height = got_stakes.into_iter().map(|s| RosterMember { pub_key: s.0, voting_power: s.1, txids: Vec::new() }).collect();
+    } else {
+        let mut any_non_zero = false;
+        for val in &internal.validators_at_current_height {
+            if val.voting_power > 1 {
+                any_non_zero = true;
+            }
+        }
+        if any_non_zero {
+            panic!("We must never get zero stakes except at init!");
+        }
     }
 
 //println!("Storing pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, internal.validators_at_current_height);

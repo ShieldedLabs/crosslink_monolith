@@ -2,13 +2,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use zebra_chain::{amount::Amount, block::Height};
+use zebra_chain::{amount::Amount, block, block::Height};
 
 use crate::{
     request::FinalizedBlock,
     service::finalized_state::{
         disk_db::{DiskDb, DiskWriteBatch, WriteDisk},
-        disk_format::{BondKey, BondStatus, DelegationBond, TransactionLocation},
+        disk_format::{AggregatedStakes, BondKey, BondStatus, DelegationBond, TransactionLocation},
         zebra_db::ZebraDb,
         TypedColumnFamily,
     },
@@ -21,11 +21,17 @@ pub const DELEGATION_BOND_BY_KEY: &str = "delegation_bond_by_key";
 /// The name of the bond status by key column family.
 pub const BOND_STATUS_BY_KEY: &str = "bond_status_by_key";
 
+/// The name of the aggregated stakes by hash column family.
+pub const AGGREGATED_STAKES_BY_HASH: &str = "aggregated_stakes_by_hash";
+
 /// The type for reading delegation bonds from the database.
 pub type DelegationBondByKeyCf<'cf> = TypedColumnFamily<'cf, BondKey, DelegationBond>;
 
 /// The type for reading bond status from the database.
 pub type BondStatusByKeyCf<'cf> = TypedColumnFamily<'cf, BondKey, BondStatus>;
+
+/// The type for reading aggregated stakes from the database.
+pub type AggregatedStakesByHashCf<'cf> = TypedColumnFamily<'cf, block::Hash, AggregatedStakes>;
 
 impl ZebraDb {
     // Column family convenience methods
@@ -39,6 +45,12 @@ impl ZebraDb {
     /// Returns a typed handle to the bond status by key column family.
     pub(crate) fn bond_status_by_key_cf(&self) -> BondStatusByKeyCf<'_> {
         BondStatusByKeyCf::new(&self.db, BOND_STATUS_BY_KEY)
+            .expect("column family was created when database was created")
+    }
+
+    /// Returns a typed handle to the aggregated stakes by hash column family.
+    pub(crate) fn aggregated_stakes_by_hash_cf(&self) -> AggregatedStakesByHashCf<'_> {
+        AggregatedStakesByHashCf::new(&self.db, AGGREGATED_STAKES_BY_HASH)
             .expect("column family was created when database was created")
     }
 
@@ -102,6 +114,23 @@ impl ZebraDb {
                 let bond = delegation_bond_cf.zs_get(&key)?;
                 Some((key, bond, status))
             })
+    }
+
+    /// Returns the aggregated stakes snapshot for a finalized block hash, if available.
+    pub fn aggregated_stakes(&self, hash: &block::Hash) -> Option<Vec<([u8; 32], u64)>> {
+        self.aggregated_stakes_by_hash_cf()
+            .zs_get(hash)
+            .map(|a| a.0)
+    }
+
+    /// Stores the aggregated stakes snapshot for a finalized block hash.
+    pub fn store_aggregated_stakes(&self, hash: block::Hash, stakes: Vec<([u8; 32], u64)>) {
+        let cf = self.db.cf_handle(AGGREGATED_STAKES_BY_HASH).unwrap();
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(&cf, hash, AggregatedStakes(stakes));
+        self.db
+            .write(batch)
+            .expect("writing aggregated stakes should succeed");
     }
 }
 

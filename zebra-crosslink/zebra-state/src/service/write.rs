@@ -383,20 +383,15 @@ impl WriteBlockWorkerTask {
                             }
                         }
 
-                        // Aggregate active bonds by target_finalizer
-                        let mut stakes_by_finalizer: std::collections::HashMap<[u8; 32], u64> =
-                            std::collections::HashMap::new();
-                        for (_bond_key, bond) in finalized_state.db.active_bonds() {
-                            let amount: u64 = bond.amount.into();
-                            *stakes_by_finalizer.entry(bond.target_finalizer).or_insert(0) += amount;
-                        }
-                        let aggregated_stakes: Vec<([u8; 32], u64)> =
-                            stakes_by_finalizer.into_iter().collect();
+                        let aggregated_stakes = finalized_state.db.aggregated_stakes(&hash)
+                            .unwrap_or_default();
 
                         let _ = rsp_tx.send(Ok((hash, aggregated_stakes)));
                     } else if finalized_state.db.contains_hash(hash) {
                         warn!("Crosslink finalization: already de-facto finalized as below reorg height");
-                        let _ = rsp_tx.send(Ok((hash, Vec::new())));
+                        let stakes = finalized_state.db.aggregated_stakes(&hash)
+                            .unwrap_or_default();
+                        let _ = rsp_tx.send(Ok((hash, stakes)));
                     } else {
                         let _ = rsp_tx.send(Err("Couldn't find finalized block".into()));
                     }
