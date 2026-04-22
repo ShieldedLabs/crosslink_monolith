@@ -683,6 +683,7 @@ struct NetworkThreadInner {
     pull: std::cell::UnsafeCell<NetworkThreadPull>,
 }
 
+#[allow(unsafe_code)]
 unsafe impl std::marker::Sync for NetworkThreadInner {}
 
 // Note(Sam): Using this handle from two threads at once is UB. Only one thread may call new_service_connections at any given time.
@@ -722,6 +723,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
             if thread_inner.state.load(std::sync::atomic::Ordering::Acquire) == 1 {
                 let mut req = NetworkThreadPush::default();
 
+                #[allow(unsafe_code)]
                 unsafe {
                     std::mem::swap(&mut *thread_inner.push.get(), &mut req);
                 }
@@ -753,6 +755,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                 }).collect();
                 std::mem::swap(&mut resp.messages_received, &mut packets_received);
 
+                #[allow(unsafe_code)]
                 unsafe {
                     std::mem::swap(&mut *thread_inner.pull.get(), &mut resp);
                 }
@@ -786,6 +789,7 @@ pub fn new_service_connections(network_thread_handle: &NetworkThreadHandle, mut 
         std::hint::spin_loop();
     }
 
+    #[allow(unsafe_code)]
     unsafe {
         std::mem::swap(&mut *network_thread_handle.inner.push.get(), &mut req);
     }
@@ -799,6 +803,7 @@ pub fn new_service_connections(network_thread_handle: &NetworkThreadHandle, mut 
 
     let mut resp = NetworkThreadPull::default();
 
+    #[allow(unsafe_code)]
     unsafe {
         std::mem::swap(&mut *network_thread_handle.inner.pull.get(), &mut resp);
     }

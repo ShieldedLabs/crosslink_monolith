@@ -81,7 +81,7 @@ const PACKET_STATUS_MAX_SIZE:   usize = ((PACKET_STATUS_MAX_HASHES * 32 + JUMBO_
 const DOWNLOAD_UNMODIFIED_TIMEOUT_DUR: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[cfg(debug_assertions)] fn dbg_break() {
-    #[cfg(target_arch = "x86_64")] unsafe { std::arch::asm!("int 3"); }
+    #[cfg(target_arch = "x86_64")] #[allow(unsafe_code)] unsafe { std::arch::asm!("int 3"); }
     // @Todo: AArch64 debugbreak.
 }
 
