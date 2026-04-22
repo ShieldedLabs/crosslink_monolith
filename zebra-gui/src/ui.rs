@@ -392,7 +392,7 @@ impl Element {
 }
 
 pub const PANE_PERCENT_LEFT:  f32 = 0.28; // @Todo: @PreventOverflowOnZoom
-pub const PANE_PERCENT_RIGHT: f32 = 0.22; // @Todo: @PreventOverflowOnZoom
+pub const PANE_PERCENT_RIGHT: f32 = 0.24; // @Todo: @PreventOverflowOnZoom
 
 pub const WHITE:            (u8, u8, u8, u8) = (0xff, 0xff, 0xff, 0xff);
 // pub const PANE_COL:         (u8, u8, u8, u8) = (0x12, 0x12, 0x12, 0xff); // @FigmaScreenshot
@@ -2693,11 +2693,11 @@ pub fn ui_right_pane(ui: &mut Context,
             let mut str = String::new();
             bytes.reverse();
 
-            for b in &bytes[0..4] {
+            for b in &bytes[0..3] {
                 str.push_str(&format!("{:02x}", b));
             }
             str.push_str("..");
-            for b in &bytes[bytes.len() - 4..] {
+            for b in &bytes[bytes.len() - 3..] {
                 str.push_str(&format!("{:02x}", b));
             }
 
@@ -2826,12 +2826,12 @@ pub fn ui_right_pane(ui: &mut Context,
                     }
                     if let _ = elem().decl(Decl {
                         id: id_index("Roster Member", index as u32),
-                        padding,
+                        padding: (padding.0/4f32, padding.1/4f32, padding.2, padding.3),
                         child_gap,
                         height: fixed!(ui.scale(48.0)),
                         width: percent!(1.0),
                         direction: LeftToRight,
-                        align: Center,
+                        align: Left,
                         ..Decl
                     }) {
                         // left icon
@@ -2859,10 +2859,10 @@ pub fn ui_right_pane(ui: &mut Context,
                         // info
                         if let _ = elem().decl(Decl {
                             id: id_index("Roster Member Info", index as u32),
-                            height: fit!(),
+                            height: fixed!(info_h),
                             width: grow!(),
                             direction: TopToBottom,
-                            align: Left,
+                            align: TopLeft,
                             ..Decl
                         }) {
                             ui.text(frame_strf!(data, "{}", display_str(&chunkify(&member.pub_key))), TextDecl { font: Mono, h: info_h, align: AlignX::Left, ..TextDecl });
@@ -2872,13 +2872,13 @@ pub fn ui_right_pane(ui: &mut Context,
                         if let _ = elem().decl(Decl {
                             id: id_index("Roster Member Amounts", index as u32),
                             height: fit!(),
-                            width: fit!(),
+                            width: grow!(),
                             direction: TopToBottom,
                             align: Right,
                             ..Decl
                         }) {
                             let colour = (0xff, 0xaf, 0x0e, 0xff);
-                            ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(member.voting_power)), TextDecl { font: Mono, h: ui.scale(16.0), colour, align: AlignX::Right, ..TextDecl });
+                            ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(member.voting_power)), TextDecl { font: Mono, h: ui.scale(14.0), colour, wrap: Wrap::None, align: AlignX::Right, ..TextDecl });
                         }
                     }
                 }
