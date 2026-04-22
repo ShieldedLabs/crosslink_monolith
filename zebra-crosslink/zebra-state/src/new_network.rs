@@ -297,7 +297,7 @@ pub struct NearTipChain {
 }
 impl NearTipChain {
     pub fn push_block(&mut self, block: ShadowBlock) -> usize {
-        if (self.blocks.len() == NEAR_TIP_CHAIN_LEN as usize) {
+        while self.blocks.len() >= NEAR_TIP_CHAIN_LEN as usize {
             self.blocks.remove(0);
         }
         self.work += block.work();
@@ -324,7 +324,9 @@ pub struct NearTipChains {
 impl NearTipChains {
     /// Height of *best* chain, which is probably, but not necessarily, the longest chain
     pub fn tip_height(&self) -> Option<u32> {
-        self.chains.first().and_then(|ch| ch.blocks.last()).map(|bl| bl.this_height)
+        let chain = self.chains.get(0)?;
+        let block = chain.blocks.get(chain.blocks.len() - 1)?;
+        Some(block.this_height)
     }
 
     pub fn min_packet_size() -> usize {
@@ -435,7 +437,7 @@ impl NearTipChains {
         }
 
         let buf = &mut [0u8; PACKET_STATUS_MAX_SIZE][..max_size];
-        let res = self.write_to(buf);
+        let res = self.write_to(buf, None);
         debug_assert!(res > 0, "failed to write packet");
 
         let branches = NearTipBranches::read_from(&mut &buf[..res]).unwrap();
@@ -446,9 +448,9 @@ impl NearTipChains {
     }
 }
 
-impl SliceWrite for NearTipChains {
+impl NearTipChains {
     // currently assumes each block arrives after its parent
-    fn write_to(&self, buf: &mut [u8]) -> usize {
+    fn write_to(&self, buf: &mut [u8], tip_height_override: Option<u32>) -> usize {
         { // Manually, at runtime, compute the min len for this function. Awful! Also, @Volatile. Fun.
             let min_len = NearTipChains::min_packet_size();
             assert!(buf.len() >= min_len, "NearTipChains::write_to() needs at least enough room for one best-chain run of {} hashes (i.e., >= {min_len} bytes).", NEAR_TIP_CHAIN_LEN + 1);
@@ -457,7 +459,7 @@ impl SliceWrite for NearTipChains {
         // doing parallel chains (redundantly keeping shared prefixes)
         // ALT: index tree in single buffer
 
-        let tip_height = self.tip_height().expect("programmer error: should be non-empty");
+        let tip_height = tip_height_override.unwrap_or(self.tip_height().expect("programmer error: should be non-empty"));
         let finalized_height = self.finalized_height;
         assert!(finalized_height <= tip_height);
 
@@ -1345,7 +1347,7 @@ pub fn sync(
     let mut peers: HashMap<ConnectionKey, Peer> = HashMap::new();
     let mut pending_selected_addresses: HashMap<ConnectionKey, std::time::Instant> = HashMap::new(); // store time for expiry
 
-    // let mut XXX_tick_loop_counter = 0usize;
+    let mut XXX_tick_loop_counter = 0usize;
 
     let mut next_status       = std::time::Instant::now();
     let mut next_dl_init      = std::time::Instant::now();
@@ -1396,11 +1398,11 @@ pub fn sync(
             }
         }
 
-        // #[cfg(debug_assertions)]
-        // { // @Dev @Debug: Roundtrip test.
-        //     near_tip_chains.roundtrip_to_branches(PACKET_STATUS_MAX_SIZE, if XXX_tick_loop_counter % 20 == 0 { 2 } else { 0 });
-        //     XXX_tick_loop_counter += 1;
-        // }
+        #[cfg(debug_assertions)]
+        if false { // @Dev @Debug: Roundtrip test.
+            near_tip_chains.roundtrip_to_branches(PACKET_STATUS_MAX_SIZE, if XXX_tick_loop_counter % 20 == 0 { 2 } else { 0 });
+            XXX_tick_loop_counter += 1;
+        }
 
         // Try to reconnect to trusted initial seed peers
         for address in &initial_peer_addresses {
@@ -1670,7 +1672,7 @@ pub fn sync(
             for (queued_hash, _) in &blocks_to_commit {
                 o += queued_hash.0.write_to(&mut buf[o..]);
             }
-            o += near_tip_chains   .write_to(&mut buf[o..]);
+            o += near_tip_chains   .write_to(&mut buf[o..], None);
 
             for (key, connection) in &connections_map {
                 if !connection.is_connected() {
@@ -1741,8 +1743,8 @@ pub fn sync(
                             this_height += 1;
                         }
                         let mut historical_chains = NearTipChains::default();
+                        historical_chains.finalized_height = near_tip_chains.finalized_height;
                         historical_chains.push_chain(historical_chain);
-
 
                         let (mut buf, mut o) = ([0u8; 1 + 1 + MAX_BLOCKS_TO_QUEUE_TO_COMMIT * 32 + PACKET_STATUS_MAX_SIZE], 0);
                         o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
@@ -1750,7 +1752,7 @@ pub fn sync(
                         for (queued_hash, _) in &blocks_to_commit {
                             o += queued_hash.0 .write_to(&mut buf[o..]);
                         }
-                        o += historical_chains .write_to(&mut buf[o..]);
+                        o += historical_chains .write_to(&mut buf[o..], Some(near_tip_chains.tip_height().expect("at least genesis block assumed included in near tip chains"))); // @TODO: this will break if we remove genesis...
 
 
                         if TRACE { tracing::info!("Send a historical STATUS to {:?} @ {}", connection.address(), their_final_parent_parent_height + 1); }
