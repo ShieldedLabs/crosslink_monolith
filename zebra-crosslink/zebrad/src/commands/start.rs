@@ -491,7 +491,7 @@ impl StartCmd {
             let sync_state = state.clone();
             let sync_read_state = read_only_state_service.clone();
             let sync_block_verifier = block_verifier_router.clone();
-            tokio::task::spawn_blocking(move ||{
+            tokio::task::spawn_blocking(move || {
                 use zebra_state::new_network::BlockCommitError;
                 let commit_block = |block: std::sync::Arc<zebra_chain::block::Block>| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<zebra_chain::block::Hash, BlockCommitError>> + Send>> {
                     let mut verifier = sync_block_verifier.clone();

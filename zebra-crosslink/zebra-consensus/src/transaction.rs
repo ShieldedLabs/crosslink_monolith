@@ -401,6 +401,17 @@ where
         async move {
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
+            // @Todo: In @Prod we don't want to do these checks before the cached verification result.
+            //        But because staking day rules don't currently walk the mempool and evict expired staking actions,
+            //        staking day violates the invariants of the mempool. Once we walk the mempool, we can move these
+            //        checks back to after the cache check.
+
+            // Check staking day window (staking actions only allowed during specific block ranges)
+            Self::check_staking_day_window(&tx, req.height())?;
+
+            // Check staking action delay (applies to both mempool and block transactions)
+            Self::check_staking_action_delay(&tx, req.height(), state.clone()).await?;
+
             if let Some(result) = Self::find_verified_unmined_tx(&req, mempool.clone(), state.clone()).await {
                 let verified_tx = result?;
 
@@ -448,12 +459,6 @@ where
             check::spend_conflicts(&tx)?;
 
             tracing::trace!(?tx_id, "passed quick checks");
-
-            // Check staking day window (staking actions only allowed during specific block ranges)
-            Self::check_staking_day_window(&tx, req.height())?;
-
-            // Check staking action delay (applies to both mempool and block transactions)
-            Self::check_staking_action_delay(&tx, req.height(), state.clone()).await?;
 
             if let Some(block_time) = req.block_time() {
                 check::lock_time_has_passed(&tx, req.height(), block_time)?;
