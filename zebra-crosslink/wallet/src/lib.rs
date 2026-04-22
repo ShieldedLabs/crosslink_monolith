@@ -8,7 +8,7 @@ const DUMP_FAUCET:    bool = false;
 const DUMP_NOTES:     bool = false;
 const DUMP_ODD_FEE:   bool = false;
 const DUMP_ROSTER:    bool = false;
-const DUMP_SYNC:      bool = true;
+const DUMP_SYNC:      bool = false;
 const DUMP_TREES:     bool = false;
 const DUMP_TX_BUILD:  bool = false;
 const DUMP_TX_RECV:   bool = false;
@@ -408,6 +408,8 @@ async fn wait_for_zainod() {
     }
 }
 
+pub const TIMERS_LOUD: bool = false;
+
 struct Timer<'a> { t_bgn: std::time::Instant, name: &'a str, loud: bool }
 impl<'a> Timer<'a> {
     pub fn scope_(name: &'a str, loud: bool) -> Self {
@@ -418,7 +420,7 @@ impl<'a> Timer<'a> {
     }
 
     pub fn scope(name: &'a str) -> Self {
-        Timer::scope_(name, true)
+        Timer::scope_(name, TIMERS_LOUD)
     }
 }
 impl Drop for Timer<'_> {

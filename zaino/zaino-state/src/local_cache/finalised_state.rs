@@ -461,10 +461,10 @@ impl FinalisedState {
                 {
                     Ok((hash, block)) => {
                         self.insert_block((Height(block_height), hash, block))?;
-                        info!(
-                            "Block at height {} successfully inserted in finalised state.",
-                            block_height
-                        );
+                        // info!(
+                        //     "Block at height {} successfully inserted in finalised state.",
+                        //     block_height
+                        // );
                         break;
                     }
                     Err(e) => {
@@ -497,10 +497,10 @@ impl FinalisedState {
                         {
                             Ok((hash, block)) => {
                                 self.insert_block((Height(block_height), hash, block))?;
-                                info!(
-                                    "Block at height {} successfully inserted in finalised state.",
-                                    block_height
-                                );
+                                // info!(
+                                //     "Block at height {} successfully inserted in finalised state.",
+                                //     block_height
+                                // );
                                 break;
                             }
                             Err(e) => {

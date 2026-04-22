@@ -881,7 +881,7 @@ pub fn service_connections(
                                 let client_key = &packet_memory_encrypted[6..6+32];
                                 let magic2_block = &packet_memory_encrypted[6+32..6+32+MAGIC2_BLOCK_SIZE];
                                 let Some(chosen_magic2) = negotiate_magic2(magic2_block) else {
-                                    if OVERLY_VERBOSE { println!("Did NOT respond to connection: magic2 negotiation failed."); }
+                                    // if OVERLY_VERBOSE { println!("Did NOT respond to connection: magic2 negotiation failed."); }
                                     break;
                                 };
 
@@ -950,7 +950,7 @@ pub fn service_connections(
                             if let Ok(magic2_block_len) = read_message_maybe {
                                 if let Some(client_key) = new_handshake.get_remote_static() {
                                     let Some(chosen_magic2) = negotiate_magic2(&packet_memory_recv[..magic2_block_len]) else {
-                                        if OVERLY_VERBOSE { println!("Did NOT respond to Client Hello from {:?}: magic2 negotiation failed.", (other_ip_addr, other_port)); }
+                                        // if OVERLY_VERBOSE { println!("Did NOT respond to Client Hello from {:?}: magic2 negotiation failed.", (other_ip_addr, other_port)); }
                                         break;
                                     };
 

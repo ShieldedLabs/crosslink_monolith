@@ -1405,7 +1405,7 @@ pub fn sync(
         // Try to reconnect to trusted initial seed peers
         for address in &initial_peer_addresses {
             if !connections_map.contains_key(&address.connection_key()) {
-                tracing::info!("NewNet: Connecting to {:?}...", address);
+                // tracing::info!("NewNet: Connecting to {:?}...", address);
                 match connect_to(&mut connections_map, &my_keypairs, address) {
                     Err(e) => tracing::warn!("NewNet: Initial peer reconnect: connect_to failed: {e}"),
                     Ok(()) => {},
@@ -1674,7 +1674,7 @@ pub fn sync(
 
             for (key, connection) in &connections_map {
                 if !connection.is_connected() {
-                    if TRACE { tracing::info!("Trying to send a STATUS to {:?}, but was disconnected!", connection.address()); }
+                    // if TRACE { tracing::info!("Trying to send a STATUS to {:?}, but was disconnected!", connection.address()); }
                     continue;
                 }
 
@@ -2054,7 +2054,10 @@ pub fn sync(
         if std::time::Instant::now() >= next_peer_request {
             for (connection_key, peer) in peers.iter_mut() {
                 // TODO: can we pack these into packlets now?
-                if TRACE { tracing::info!("Sending {} DL requests for peer", peer.block_downloads.used_flags.count_ones()); }
+                let dls_n = peer.block_downloads.used_flags.count_ones();
+                if dls_n > 0 {
+                    if TRACE { tracing::info!("Sending {} DL requests for peer", dls_n); }
+                }
                 'downloads: for dl_i in 0..peer.block_downloads.slots.len() { // ALT: iterate LSB on flags directly
                     if peer.block_downloads.slot_is_used(dl_i) {
                         // Prevent cycles of receiving a sub-chunk after completing, then re-requesting a block we now have
@@ -2624,7 +2627,7 @@ pub fn sync(
             // Sleep remainder of tick
             let elapsed = loop_start.elapsed();
             if elapsed < tick_duration {
-                if TRACE { println!("Sleeping for {:?}", tick_duration - elapsed); }
+                // if TRACE { println!("Sleeping for {:?}", tick_duration - elapsed); }
                 std::thread::sleep(tick_duration - elapsed);
             }
         }
