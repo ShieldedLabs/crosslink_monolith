@@ -316,6 +316,10 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::Block`] with the specified block.
     Block(Option<Arc<Block>>),
 
+    /// Response to [`ReadRequest::BlockButAlsoAllChains`] with the specified block
+    /// found in any chain (not just the best chain).
+    BlockButAlsoAllChains(Option<Arc<Block>>),
+
     /// Response to [`ReadRequest::BlockAndSize`] with the specified block and
     /// serialized size.
     BlockAndSize(Option<(Arc<Block>, usize)>),
@@ -516,6 +520,8 @@ impl TryFrom<ReadResponse> for Response {
 
             ReadResponse::AnyChainUtxo(_) => Err("ReadService does not track pending UTXOs. \
                                                   Manually unwrap the response, and handle pending UTXOs."),
+
+            ReadResponse::BlockButAlsoAllChains(_) => Err("Manually unwrap the response."),
 
             ReadResponse::BlockLocator(hashes) => Ok(Response::BlockLocator(hashes)),
             ReadResponse::BlockHashes(hashes) => Ok(Response::BlockHashes(hashes)),

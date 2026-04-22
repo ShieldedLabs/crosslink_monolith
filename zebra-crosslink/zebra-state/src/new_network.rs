@@ -1600,21 +1600,20 @@ pub fn sync(
 
             if !serialized_blocks.contains_key(&hash) {
                 let res = rt.block_on(async {
-                    read_state.clone().oneshot(ReadRequest::Block(hash.into())).await
+                    read_state.clone().oneshot(ReadRequest::BlockButAlsoAllChains(hash.into())).await
                 });
                 match res {
-                    Ok(ReadResponse::Block(Some(block))) => {
+                    Ok(ReadResponse::BlockButAlsoAllChains(Some(block))) => {
                         let serialized = dbg_verify(block.zcash_serialize_to_vec().ok()).unwrap();
                         assert!(serialized.len() as u64 <= zebra_chain::block::MAX_BLOCK_BYTES, "Internal block is too big! {} B", serialized.len());
                         serialized_blocks.insert(hash, serialized);
                     }
-                    Ok(ReadResponse::Block(None)) => {
-                        // @Todo: This needs fixing!!! :SidechainSync
+                    Ok(ReadResponse::BlockButAlsoAllChains(None)) => {
                         tracing::warn!("NewNet: Couldn't get block for hash {hash}!");
                         continue;
                     }
-                    Err(err) => { panic!("ReadRequest::Block({hash}): Error: {err:?}");              }
-                    _        => { panic!("ReadRequest::Block({hash}): Unhandled response: {res:?}"); }
+                    Err(err) => { panic!("ReadRequest::BlockButAlsoAllChains({hash}): Error: {err:?}");              }
+                    _        => { panic!("ReadRequest::BlockButAlsoAllChains({hash}): Unhandled response: {res:?}"); }
                 }
             }
 

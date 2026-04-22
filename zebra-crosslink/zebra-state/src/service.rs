@@ -1542,6 +1542,32 @@ impl Service<ReadRequest> for ReadStateService {
                 .wait_for_panics()
             }
 
+            // Like ReadRequest::Block, but searches all non-finalized chains.
+            ReadRequest::BlockButAlsoAllChains(hash_or_height) => {
+                let state = self.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || {
+                        let block = state.non_finalized_state_receiver.with_watch_data(
+                            |non_finalized_state| {
+                                for chain in non_finalized_state.chain_iter() {
+                                    if let Some(contextual) = chain.block(hash_or_height) {
+                                        return Some(contextual.block.clone());
+                                    }
+                                }
+
+                                state.db.block(hash_or_height)
+                            },
+                        );
+
+                        timer.finish(module_path!(), line!(), "ReadRequest::BlockButAlsoAllChains");
+
+                        Ok(ReadResponse::BlockButAlsoAllChains(block))
+                    })
+                })
+                .wait_for_panics()
+            }
+
             // Used by the get_block (raw) RPC and the StateService.
             ReadRequest::BlockAndSize(hash_or_height) => {
                 let state = self.clone();
