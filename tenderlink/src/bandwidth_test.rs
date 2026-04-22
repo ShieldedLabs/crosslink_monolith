@@ -1,4 +1,4 @@
-
+#![allow(unsafe_code)]
 use std::collections::HashMap;
 use rand::SeedableRng;
 use static_assertions::const_assert;
