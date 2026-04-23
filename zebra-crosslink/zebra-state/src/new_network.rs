@@ -341,7 +341,7 @@ impl NearTipChains {
         min_len
     }
 
-    pub fn push_chain(&mut self, blocks: Vec<ShadowBlock>) -> usize {
+    pub fn push_chain_unchecked(&mut self, blocks: Vec<ShadowBlock>) -> usize {
         let mut work = 0;
         for block in &blocks {
             work += block.work();
@@ -371,19 +371,19 @@ impl NearTipChains {
             let chain_idx = if let Some((mut chain_idx, parent_idx)) = found {
                 let blocks = &self.chains[chain_idx].blocks;
                 if parent_idx != blocks.len()-1 {
-                    self.push_chain(blocks[..parent_idx+1].to_vec())
+                    self.push_chain_unchecked(blocks[..parent_idx+1].to_vec())
                 } else {
                     chain_idx
                 }
             } else {
-                self.push_chain(Vec::new())
+                self.push_chain_unchecked(Vec::new())
             };
 
             self.chains[chain_idx].push_block(*block);
         }
 
-        // TODO: drop the bad chains if they're
-        // updated to the max(chain.tip_height, bc_tip_height).saturating_sub(NEAR_TIP_CHAIN_LEN)
+        self.chains.sort_by_key(|ch| std::cmp::Reverse(ch.work)); // ensure the new chain is BC if it should be
+
         let bc_tip_height = self.tip_height().expect("early-outed if there were no blocks");
         self.chains.retain_mut(|chain| {
             debug_assert!(chain.blocks.len() > 0, "should have been removed if empty");
@@ -1748,7 +1748,7 @@ pub fn sync(
                         historical_chain.truncate(NEAR_TIP_CHAIN_LEN as usize);
                         let mut historical_chains = NearTipChains::default();
                         historical_chains.finalized_height = near_tip_chains.finalized_height;
-                        historical_chains.push_chain(historical_chain);
+                        historical_chains.push_chain_unchecked(historical_chain);
 
                         let (mut buf, mut o) = ([0u8; 1 + 1 + MAX_BLOCKS_TO_QUEUE_TO_COMMIT * 32 + PACKET_STATUS_MAX_SIZE], 0);
                         o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
@@ -2476,7 +2476,8 @@ pub fn sync(
                 let have_parent_in_blocks_to_commit = blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == parent_hash);
 
                 if !have_parent_in_chains && !have_parent_in_blocks_to_commit {
-                    warning!("Block does not link anywhere known, neither to our chains nor to our blocks-to-commit queue! Not queueing; dropping: height {alleged_height} hash {alleged_hash}");
+                    // TODO: we should keep these, but have them easily evictable, for OoO block downloads
+                    warning!("Block does not link anywhere known, neither to our chains nor to our blocks-to-commit queue! Not queueing; dropping: height {alleged_height} hash {alleged_hash}, parent {parent_hash}");
                     continue 'process_packets;
                 }
 
