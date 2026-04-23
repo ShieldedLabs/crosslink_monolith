@@ -2604,11 +2604,12 @@ pub fn sync(
 
             any_blocks_in_the_queue_can_make_progress = true;
 
-            println!("Committing: {}", hash);
+            let height = block_arc.coinbase_height().expect("all blocks in the commit queue should already have been confirmed to have a height").0;
+            println!("Committing: @ {height}, {hash}");
             let res = rt.block_on(commit_block(block_arc));
             match res {
                 Ok(_) => {
-                    println!("committed!: {}", hash);
+                    println!("committed!: @ {height}, {hash}");
                     false // remove
                 }
                 Err(BlockCommitError::Duplicate) => {
