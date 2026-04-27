@@ -1353,6 +1353,7 @@ pub fn sync(
     let mut next_peer_gossip  = std::time::Instant::now();
     let mut next_peer_connect = std::time::Instant::now();
     let mut next_peer_request = std::time::Instant::now();
+    let mut next_console_status_print = std::time::Instant::now();
 
     let stp_address_get_short_string = |address| {
         let addr = format!("{:?}", address);
@@ -1362,17 +1363,22 @@ pub fn sync(
 
     // Main sync loop
     loop {
-        let mut my_peers_to_print = Vec::new();
-        for (connection_key, connection) in &connections_map {
-            if connection.is_connected() {
-                if let Some(peer) = peers.get(connection_key) {
-                    my_peers_to_print.push(format!("{}@{}/{}", stp_address_get_short_string(connection.address()), peer.their_tree.finalized_height, peer.their_tree.tip_height));
+        
+        let loop_start = std::time::Instant::now();
+
+        if loop_start > next_console_status_print {
+            let mut my_peers_to_print = Vec::new();
+            for (connection_key, connection) in &connections_map {
+                if connection.is_connected() {
+                    if let Some(peer) = peers.get(connection_key) {
+                        my_peers_to_print.push(format!("{}@{}/{}", stp_address_get_short_string(connection.address()), peer.their_tree.finalized_height, peer.their_tree.tip_height));
+                    }
                 }
             }
+            
+            tracing::info!("tip height: {:?}, finalized height: {:?}, peers: {:?}", near_tip_chains.tip_height(), near_tip_chains.finalized_height, my_peers_to_print);
+            next_console_status_print = loop_start + std::time::Duration::from_secs(5);
         }
-        tracing::info!("tip height: {:?}, finalized height: {:?}, peers: {:?}", near_tip_chains.tip_height(), near_tip_chains.finalized_height, my_peers_to_print);
-
-        let loop_start = std::time::Instant::now();
 
         // Drain block events
         loop {
