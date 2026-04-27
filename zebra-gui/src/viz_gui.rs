@@ -970,13 +970,19 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 let dx = px-x;
                 let dy = py-y;
                 let (dx, dy, l) = split_vector(dx, dy);
-                draw_ctx.arrow(
-                    origin_x + (x + dx * 2.0) * screen_unit,
-                    origin_y + (y + dy * 2.0) * screen_unit,
-                    origin_x + (x + dx * (l - 2.0))*screen_unit,
-                    origin_y + (y + dy * (l - 2.0) )*screen_unit,
-                    arrow_and_line_width, COLOR_BFT_LINK | (((on_screen_bc.alpha*on_screen_bc.bft_arrow_alpha*255.0) as u32) << 24),
-                );
+                let x1 = origin_x + (x + dx * 2.0) * screen_unit;
+                let y1 = origin_y + (y + dy * 2.0) * screen_unit;
+                let x2 = origin_x + (x + dx * (l - 2.0))*screen_unit;
+                let y2 = origin_y + (y + dy * (l - 2.0) )*screen_unit;
+                // Don't draw if neither end point is anywhere near on screen.
+                if  y1.min(y2) > -2.0 * draw_ctx.window_height as f32 ||
+                    y1.max(y2) < 2.0 * draw_ctx.window_height as f32
+                {
+                    draw_ctx.arrow(
+                        x1, y1, x2, y2,
+                        arrow_and_line_width, COLOR_BFT_LINK | (((on_screen_bc.alpha*on_screen_bc.bft_arrow_alpha*255.0) as u32) << 24),
+                    );
+                }
             }
         }
     }

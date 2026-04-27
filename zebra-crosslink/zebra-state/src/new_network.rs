@@ -1843,96 +1843,96 @@ pub fn sync(
 
 
 
-                // rule to push:
-                //     per each of our chains:
-                //         find the longest prefix branch they have with the chain
-                //         send everything after the end of the prefix branch
-                //     OR
-                //     per each of our chains:
-                //         if any of their branches is equal to or an extension of this chain, don't push
-                //         otherwise push the blocks after the intersection
+                // // rule to push:
+                // //     per each of our chains:
+                // //         find the longest prefix branch they have with the chain
+                // //         send everything after the end of the prefix branch
+                // //     OR
+                // //     per each of our chains:
+                // //         if any of their branches is equal to or an extension of this chain, don't push
+                // //         otherwise push the blocks after the intersection
 
-                // @Note: With this algorithm, another peer can systematically probe which
-                //        blocks we have on each branch. This may have implications.
-                let mut queue_blocks_to_send_unsolicited = || {
-                    let mut blocks_to_queue = HashSet::new();
+                // // @Note: With this algorithm, another peer can systematically probe which
+                // //        blocks we have on each branch. This may have implications.
+                // let mut queue_blocks_to_send_unsolicited = || {
+                //     let mut blocks_to_queue = HashSet::new();
 
-                    // @Note: If the peer is far behind, beam them blocks from farther back in our chain to catch them up.
-                    // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
-                    if their_tree.tip_height < near_tip_chains.finalized_height {
+                //     // @Note: If the peer is far behind, beam them blocks from farther back in our chain to catch them up.
+                //     // There's surely a (more expensive) Zebra lookup to check if their tip is inside our finalized chain.
+                //     if their_tree.tip_height < near_tip_chains.finalized_height {
 
-                        for height in their_tree.tip_height..near_tip_chains.finalized_height {
-                            // TODO: merge in get_bc_hash_at_height
-                            let res = rt.block_on(async {
-                                read_state.clone().oneshot(ReadRequest::BestChainBlockHash(Height(height).into())).await
-                            });
-                            match res {
-                                Ok(ReadResponse::BlockHash(hash)) => {
-                                    let Some(hash) = dbg_verify(hash) else {
-                                        warning!("Couldn't get block for height {height} which should be finalized! What happened?");
-                                        break;
-                                    };
+                //         for height in their_tree.tip_height..near_tip_chains.finalized_height {
+                //             // TODO: merge in get_bc_hash_at_height
+                //             let res = rt.block_on(async {
+                //                 read_state.clone().oneshot(ReadRequest::BestChainBlockHash(Height(height).into())).await
+                //             });
+                //             match res {
+                //                 Ok(ReadResponse::BlockHash(hash)) => {
+                //                     let Some(hash) = dbg_verify(hash) else {
+                //                         warning!("Couldn't get block for height {height} which should be finalized! What happened?");
+                //                         break;
+                //                     };
 
-                                    if their_queue.contains(&hash) {
-                                        if TRACE { tracing::info!("Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
-                                        continue;
-                                    }
+                //                     if their_queue.contains(&hash) {
+                //                         if TRACE { tracing::info!("Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
+                //                         continue;
+                //                     }
 
-                                    if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
-                                        if blocks_to_queue.insert((hash, height)) {
-                                            blocks_to_this_peer += 1;
-                                        }
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                Err(err) => { panic!("ReadRequest::BestChainBlockHash({height}): Error: {err:?}");              }
-                                _        => { panic!("ReadRequest::BestChainBlockHash({height}): Unhandled response: {res:?}"); }
-                            }
-                        }
+                //                     if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
+                //                         if blocks_to_queue.insert((hash, height)) {
+                //                             blocks_to_this_peer += 1;
+                //                         }
+                //                     } else {
+                //                         break;
+                //                     }
+                //                 }
+                //                 Err(err) => { panic!("ReadRequest::BestChainBlockHash({height}): Error: {err:?}");              }
+                //                 _        => { panic!("ReadRequest::BestChainBlockHash({height}): Unhandled response: {res:?}"); }
+                //             }
+                //         }
 
-                    }
+                //     }
 
-                    for our_chain in &near_tip_chains.chains {
-                        assert!(our_chain.blocks.len() > 0);
-                        let our_chain_height_bgn = our_chain.blocks[0].this_height;
-                        let our_chain_height_end = our_chain.blocks.last().unwrap().this_height + 1;
-                        let max_height_we_both_share = max_shared_height_with_tree(their_tree, &our_chain.blocks);
+                //     for our_chain in &near_tip_chains.chains {
+                //         assert!(our_chain.blocks.len() > 0);
+                //         let our_chain_height_bgn = our_chain.blocks[0].this_height;
+                //         let our_chain_height_end = our_chain.blocks.last().unwrap().this_height + 1;
+                //         let max_height_we_both_share = max_shared_height_with_tree(their_tree, &our_chain.blocks);
 
-                        let Some(max_height_we_both_share) = max_height_we_both_share else {
-                            continue; // Nothing on this chain of ours that we can use to extend their branch.
-                        };
+                //         let Some(max_height_we_both_share) = max_height_we_both_share else {
+                //             continue; // Nothing on this chain of ours that we can use to extend their branch.
+                //         };
 
-                        for height in max_height_we_both_share + 1 .. our_chain_height_end {
-                            let chain_i = (height - our_chain_height_bgn) as usize;
+                //         for height in max_height_we_both_share + 1 .. our_chain_height_end {
+                //             let chain_i = (height - our_chain_height_bgn) as usize;
 
-                            let block_to_queue = &our_chain.blocks[chain_i];
+                //             let block_to_queue = &our_chain.blocks[chain_i];
 
-                            let hash = block_to_queue.this_hash;
+                //             let hash = block_to_queue.this_hash;
 
-                            if their_queue.contains(&hash) {
-                                if TRACE { tracing::info!("Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
-                                continue;
-                            }
+                //             if their_queue.contains(&hash) {
+                //                 if TRACE { tracing::info!("Skipped sending block already in peer's queue. Peer {connection_address:?}. Hash: {hash}"); }
+                //                 continue;
+                //             }
 
-                            // We may submit the same block multiple times (visit >1 of our chains that share a short prefix with their branch), and that's valid
-                            if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
-                                if blocks_to_queue.insert((hash, height)) {
-                                    blocks_to_this_peer += 1;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
+                //             // We may submit the same block multiple times (visit >1 of our chains that share a short prefix with their branch), and that's valid
+                //             if blocks_to_this_peer < MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
+                //                 if blocks_to_queue.insert((hash, height)) {
+                //                     blocks_to_this_peer += 1;
+                //                 }
+                //             } else {
+                //                 break;
+                //             }
+                //         }
+                //     }
 
-                    for (block, height) in blocks_to_queue {
-                        blocks_to_send.push((*connection_key, block, height, 0));
-                    }
-                };
-                if false {
-                    queue_blocks_to_send_unsolicited();
-                }
+                //     for (block, height) in blocks_to_queue {
+                //         blocks_to_send.push((*connection_key, block, height, 0));
+                //     }
+                // };
+                // if false {
+                //     queue_blocks_to_send_unsolicited();
+                // }
 
 
                 // rule to pull:
@@ -2260,7 +2260,8 @@ pub fn sync(
                             map.remove(&map.keys().choose(&mut rand::thread_rng()).cloned().unwrap());
                         }
                     }
-                    if TRACE { tracing::info!("Adding new address to alleged addresses: {address_clone_for_printing:?}"); }
+                    // Note(Sam): Too noisy.
+                    //if TRACE { tracing::info!("Adding new address to alleged addresses: {address_clone_for_printing:?}"); }
                 }
 
             } else if packet_type == PACKET_TYPE_WANT_HOLE_PUNCH {
@@ -2329,7 +2330,20 @@ pub fn sync(
                 if let Some(dl_i) = peer.block_requests.insert_or_position(request.height_hash) {
                     peer.block_requests.slots[dl_i].offset = peer.block_requests.slots[dl_i].offset.max(request.offset);
                 }
+                
+                let mut height_hash = peer.block_requests.slots[dl_i].height_hash;
+                if height_hash.hash_or_0 == block::Hash([0;32]) {
+                    if let Some(hash) = get_bc_hash_at_height(&read_state, &rt, height_hash.height) {
+                        height_hash.hash_or_0 = hash;
+                        peer.block_requests.slots[dl_i].height_hash = height_hash;
+                    } else {
+                        println!("Height requested that doesn't exist on BC: {:?}", height_hash.height);
+                        peer.block_requests.remove(dl_i);
+                        continue;
+                    }
+                }
 
+                blocks_to_send.push((*connection_key, height_hash.hash_or_0, height_hash.height.0, peer.block_requests.slots[dl_i].offset as usize));
             } else if packet_type == PACKET_TYPE_BLOCK_CHUNK {
                 let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height()) else {
                     warning!("I don't have a tip height yet");

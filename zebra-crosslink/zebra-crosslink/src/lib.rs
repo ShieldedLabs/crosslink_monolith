@@ -129,6 +129,10 @@ pub mod config {
         pub do_not_manipulate_config: bool,
         /// I am the unstaker.
         pub i_am_the_unstaker: bool,
+        /// Disable the headless wallet.
+        pub disable_the_headless_wallet: bool,
+        /// Disable zaino.
+        pub disable_zaino: bool,
     }
     impl Default for Config {
         fn default() -> Self {
@@ -138,6 +142,8 @@ pub mod config {
                 bft_peers: Vec::new(),
                 do_not_manipulate_config: false,
                 i_am_the_unstaker: false,
+                disable_the_headless_wallet: false,
+                disable_zaino: false,
             }
         }
     }
@@ -621,22 +627,25 @@ async fn handle_new_decided_bft_block(
     internal.fat_pointer_to_tip = fat_pointer.clone();
     internal.latest_final_block = Some((new_final_height, new_final_hash));
 
-    let mut got_stakes = Vec::new();
     drop(internal); // Note(Sam): IT IS VERY IMPORTANT THAT WE DROP THE LOCK BECAUSE ZEBRA_STATE MAY CALL US BACK
-    match (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(new_final_hash)).await {
-        Ok(zebra_state::Response::CrosslinkFinalized(hash, aggregated_stakes)) => {
-            info!("Successfully crosslink-finalized {}, active stakes: {:?}", hash, aggregated_stakes);
-            got_stakes = aggregated_stakes;
-            assert_eq!(
-                hash, new_final_hash,
-                "PoW finalized hash should now match ours"
-            );
+    let got_stakes = loop {
+        match (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(new_final_hash)).await {
+            Ok(zebra_state::Response::CrosslinkFinalized(hash, aggregated_stakes)) => {
+                info!("Successfully crosslink-finalized {}, active stakes: {:?}", hash, aggregated_stakes);
+                assert_eq!(
+                    hash, new_final_hash,
+                    "PoW finalized hash should now match ours"
+                );
+                break aggregated_stakes;
+            }
+            Ok(_) => unreachable!("wrong response type"),
+            Err(err) => {
+                error!(?err);
+                warn!("I'm just going to sleep for one second and try the race condition again.");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
         }
-        Ok(_) => unreachable!("wrong response type"),
-        Err(err) => {
-            error!(?err);
-        }
-    }
+    };
 
     internal = tfl_handle.internal.lock().await;
 

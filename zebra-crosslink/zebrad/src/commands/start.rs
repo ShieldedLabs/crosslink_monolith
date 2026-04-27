@@ -115,13 +115,16 @@ pub struct StartCmd {
 impl StartCmd {
     async fn start(&self) -> Result<(), Report> {
 
+        let config = APPLICATION.config();
+        
         #[cfg(not(feature = "viz_gui"))]
         {
-            let wallet_state = Arc::new(std::sync::Mutex::new(wallet::WalletState::new()));
-            tokio::spawn(zebra_crosslink::wallet::wallet_main(wallet_state));
+            if config.crosslink.disable_headless_wallet == false {
+                let wallet_state = Arc::new(std::sync::Mutex::new(wallet::WalletState::new()));
+                tokio::spawn(zebra_crosslink::wallet::wallet_main(wallet_state));
+            }
         }
 
-        let config = APPLICATION.config();
         let is_regtest = config.network.network.is_regtest();
 
         let is_clt0 = 'is_clt0: { // Crosslink_Testnet_0
@@ -705,8 +708,16 @@ impl StartCmd {
         let old_databases_task_handle_fused = (&mut old_databases_task_handle).fuse();
         pin!(old_databases_task_handle_fused);
 
-        if true
-        // if false // @Phillip
+        let mut zaino_enabled = true;
+        
+        #[cfg(not(feature = "viz_gui"))]
+        {
+            if config.crosslink.disable_zaino {
+                zaino_enabled = false;
+            }
+        }
+
+        if zaino_enabled
         {
             use std::path::PathBuf;
             let zebra_port_base = config.network.listen_addr.port();
