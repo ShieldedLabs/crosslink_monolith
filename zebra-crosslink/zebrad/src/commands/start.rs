@@ -119,7 +119,7 @@ impl StartCmd {
         
         #[cfg(not(feature = "viz_gui"))]
         {
-            if config.crosslink.disable_headless_wallet == false {
+            if config.crosslink.disable_the_headless_wallet == false {
                 let wallet_state = Arc::new(std::sync::Mutex::new(wallet::WalletState::new()));
                 tokio::spawn(zebra_crosslink::wallet::wallet_main(wallet_state));
             }
