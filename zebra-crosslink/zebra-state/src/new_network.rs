@@ -1332,7 +1332,6 @@ pub fn sync(
     let peer_gossip_interval = std::time::Duration::from_millis(PEER_GOSSIP_MS);
     let peer_connect_interval = std::time::Duration::from_millis(PEER_CONNECT_MS);
     let peer_request_interval = std::time::Duration::from_millis(PEER_REQUEST_MS);
-    let peer_respond_interval = std::time::Duration::from_millis(PEER_RESPOND_MS);
 
     let mut blocks_to_commit:  Vec<(Hash, std::sync::Arc<Block>)>     = Vec::new();
     let mut blocks_to_send:    Vec<(ConnectionKey, Hash, u32, usize)> = Vec::new();
@@ -1354,7 +1353,6 @@ pub fn sync(
     let mut next_peer_gossip  = std::time::Instant::now();
     let mut next_peer_connect = std::time::Instant::now();
     let mut next_peer_request = std::time::Instant::now();
-    let mut next_peer_respond = std::time::Instant::now();
 
     let stp_address_get_short_string = |address| {
         let addr = format!("{:?}", address);
@@ -1612,7 +1610,6 @@ pub fn sync(
                         tracing::warn!("NewNet: Couldn't get block for hash {hash}!");
                         continue;
                     }
-                    Err(err) => { panic!("ReadRequest::BlockButAlsoAllChains({hash}): Error: {err:?}");              }
                     _        => { panic!("ReadRequest::BlockButAlsoAllChains({hash}): Unhandled response: {res:?}"); }
                 }
             }
@@ -1779,7 +1776,7 @@ pub fn sync(
             let mut active_block_dls = 0;
             let mut requests_by_hash: HashMap<Hash, usize> = HashMap::new();
             let mut requests_by_height: HashMap<u32, usize> = HashMap::new();
-            const MAX_REQUEST_DUPLICATES_N: usize = 2; // TODO: reconsider @Prod
+            const MAX_REQUEST_DUPLICATES_N: usize = 3; // TODO: reconsider @Prod
             for (_, peer) in &mut peers {
                 for dl_i in 0..peer.block_downloads.slots.len() {
                     if peer.block_downloads.slot_is_used(dl_i) {
@@ -1809,9 +1806,22 @@ pub fn sync(
 
             // TODO: weight peers by observed quality
             const MAX_PEERS_TO_INIT_DLS_FROM: usize = 8;
+            
+            /*  Note(Sam): CRITICAL BUG THAT I AM ADDRESSING NOW. We cannot randomly select a fixed number of
+                peers. We must first filter the peers by who has something we can download. Otherwise we will
+                fail in the case where most of the peers are behind us.
+            */
 
-            'send_to_peers: for (connection_key, Peer { origin, their_tree, their_queue, ref mut block_downloads, .. }) in peers.iter_mut().choose_multiple(&mut rand::thread_rng(), MAX_PEERS_TO_INIT_DLS_FROM) {
-                // @Duplicate with packet status parsing
+            let mut peer_random_keys: Vec<ConnectionKey> = peers.keys().cloned().collect();
+            // shuffle in-place
+            peer_random_keys.shuffle(&mut rand::thread_rng());
+
+            let mut count_of_peers_we_started_download_from = 0;
+            'send_to_peers: for connection_key in peer_random_keys {                
+                let Peer { origin, their_tree, their_queue, ref mut block_downloads, .. } = peers.get_mut(&connection_key).unwrap();
+                if count_of_peers_we_started_download_from >= MAX_PEERS_TO_INIT_DLS_FROM { break 'send_to_peers; }
+                let mut did_we_actually_start_a_download_bool_for_increment_at_the_end = false;
+                
 
                 if *their_tree == NearTipBranches::default() {
                     continue 'send_to_peers; // No messages yet.
@@ -2009,6 +2019,7 @@ pub fn sync(
                                     let dups = requests_by_hash.entry(hash).or_insert(0);
                                     if *dups < MAX_REQUEST_DUPLICATES_N {
                                         if let Some(dl_i) = block_downloads.insert(height_hash) {
+                                            did_we_actually_start_a_download_bool_for_increment_at_the_end = true;
                                             active_block_dls += 1; // total in flight
                                             *dups += 1; // duplicates of this block
                                             if TRACE { tracing::info!("Include request for near-tip   block @ {height}, {hash}, x{}, offset {}! New DL count for peer: {}", *dups, block_downloads.slots[dl_i].offset, block_downloads.used_flags.count_ones()); }
@@ -2050,6 +2061,10 @@ pub fn sync(
                 };
 
                 queue_blocks_to_request();
+                
+                if did_we_actually_start_a_download_bool_for_increment_at_the_end {
+                    count_of_peers_we_started_download_from += 1;
+                }
             }
 
             if TRACE { tracing::info!("Started {} new block dls (currently {active_block_dls}/{MAX_BANDWIDTH_BLOCKS_PER_RES})", active_block_dls - prev_active_block_dls); }
@@ -2104,32 +2119,6 @@ pub fn sync(
             }
 
             next_peer_request = std::time::Instant::now() + peer_request_interval;
-        }
-
-        if std::time::Instant::now() >= next_peer_respond {
-            for (connection_key, peer) in peers.iter_mut() {
-                // TODO: can we pack these into packlets now?
-                for dl_i in 0..peer.block_requests.slots.len() {
-                    if peer.block_requests.slot_is_used(dl_i) {
-                        let mut height_hash = peer.block_requests.slots[dl_i].height_hash;
-                        if height_hash.hash_or_0 == block::Hash([0;32]) {
-                            if let Some(hash) = get_bc_hash_at_height(&read_state, &rt, height_hash.height) {
-                                height_hash.hash_or_0 = hash;
-                                peer.block_requests.slots[dl_i].height_hash = height_hash;
-                            } else {
-                                println!("Height requested that doesn't exist on BC: {:?}", height_hash.height);
-                                peer.block_requests.remove(dl_i);
-                                continue;
-                            }
-                        }
-
-                        blocks_to_send.push((*connection_key, height_hash.hash_or_0, height_hash.height.0, peer.block_requests.slots[dl_i].offset as usize));
-                        peer.block_requests.remove(dl_i);
-                    }
-                }
-            }
-
-            next_peer_respond = std::time::Instant::now() + peer_respond_interval;
         }
 
         pending_selected_addresses.retain(|addr, time| std::time::Instant::now().saturating_duration_since(*time).as_secs() < 30);
@@ -2325,24 +2314,19 @@ pub fn sync(
                 };
 
                 if TRACE { tracing::info!("Received request for height {} hash {} offset {} from peer {connection_key:?}", request.height_hash.height.0, request.height_hash.hash_or_0, request.offset); }
-
-                if let Some(dl_i) = peer.block_requests.insert_or_position(request.height_hash) {
-                    peer.block_requests.slots[dl_i].offset = peer.block_requests.slots[dl_i].offset.max(request.offset);
-                }
                 
-                let mut height_hash = peer.block_requests.slots[dl_i].height_hash;
+                let mut height_hash = request.height_hash;
                 if height_hash.hash_or_0 == block::Hash([0;32]) {
                     if let Some(hash) = get_bc_hash_at_height(&read_state, &rt, height_hash.height) {
                         height_hash.hash_or_0 = hash;
-                        peer.block_requests.slots[dl_i].height_hash = height_hash;
-                    } else {
-                        println!("Height requested that doesn't exist on BC: {:?}", height_hash.height);
-                        peer.block_requests.remove(dl_i);
-                        continue;
                     }
                 }
 
-                blocks_to_send.push((*connection_key, height_hash.hash_or_0, height_hash.height.0, peer.block_requests.slots[dl_i].offset as usize));
+                if height_hash.hash_or_0 != block::Hash([0;32]) {
+                    blocks_to_send.push((connection_key, height_hash.hash_or_0, height_hash.height.0, request.offset as usize));
+                } else {
+                    println!("Height requested that doesn't exist on BC: {:?}", height_hash.height);
+                }
             } else if packet_type == PACKET_TYPE_BLOCK_CHUNK {
                 let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height()) else {
                     warning!("I don't have a tip height yet");
