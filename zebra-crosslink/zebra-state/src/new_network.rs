@@ -1377,7 +1377,7 @@ pub fn sync(
             }
             
             tracing::info!("tip height: {:?}, finalized height: {:?}, peers: {:?}", near_tip_chains.tip_height(), near_tip_chains.finalized_height, my_peers_to_print);
-            next_console_status_print = loop_start + std::time::Duration::from_secs(5);
+            next_console_status_print = loop_start + std::time::Duration::from_secs(2);
         }
 
         // Drain block events
@@ -1761,7 +1761,7 @@ pub fn sync(
                         o += historical_chains .write_to(&mut buf[o..], Some(near_tip_chains.tip_height().expect("at least genesis block assumed included in near tip chains"))); // @TODO: this will break if we remove genesis...
 
 
-                        if TRACE { tracing::info!("Send a historical STATUS to {:?} @ {}", connection.address(), their_final_parent_parent_height + 1); }
+                        // if TRACE { tracing::info!("Send a historical STATUS to {:?} @ {}", connection.address(), their_final_parent_parent_height + 1); }
                         packets_to_send.push((*key, Vec::from(&buf[..o]), None));
                         false
                     };
@@ -2582,7 +2582,7 @@ pub fn sync(
                     failure_count: 0u32, // @Todo: Implement this counter!
                 });
                 if prev.is_none() {
-                    if TRACE { tracing::info!("Added address to recent addresses: {connection_address:?}"); }
+                    // if TRACE { tracing::info!("Added address to recent addresses: {connection_address:?}"); }
                 }
             }
 
