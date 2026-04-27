@@ -779,8 +779,8 @@ const TRACE     :bool=0!=       1;
 //        coprime millisecond intervals, so we can make sure our code is not relying on
 //        any kind of consistent or clean timing in order to function properly.
 
-const STATUS_MS: u64 = IDLE_MS;  // fastest interval at which to send status messages
-const BLOCK_SEND_MS: u64 = 2000; // fastest interval at which to send blocks to peers
+const STATUS_MS: u64 = 8000;  // fastest interval at which to send status messages
+const BLOCK_SEND_MS: u64 = 1000; // fastest interval at which to send blocks to peers
 
 
 const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 2;
@@ -1782,7 +1782,7 @@ pub fn sync(
             let mut active_block_dls = 0;
             let mut requests_by_hash: HashMap<Hash, usize> = HashMap::new();
             let mut requests_by_height: HashMap<u32, usize> = HashMap::new();
-            const MAX_REQUEST_DUPLICATES_N: usize = 3; // TODO: reconsider @Prod
+            const MAX_REQUEST_DUPLICATES_N: usize = 2; // TODO: reconsider @Prod
             for (_, peer) in &mut peers {
                 for dl_i in 0..peer.block_downloads.slots.len() {
                     if peer.block_downloads.slot_is_used(dl_i) {
