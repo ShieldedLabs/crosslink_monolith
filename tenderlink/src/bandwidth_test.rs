@@ -549,7 +549,7 @@ pub fn connect_to_endpoint(
 }
 
 const        VERBOSE                :bool=0!=                (1);
-const OVERLY_VERBOSE                :bool=0!=                (1);
+const OVERLY_VERBOSE                :bool=0!=                (0);
 
 macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
 
