@@ -3193,29 +3193,66 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
                 if let _ = elem().decl(Decl {
                     width: grow!(),
-                    align: TopRight,
+                    height: fit!(),
+                    align: Right,
+                    direction: TopToBottom,
                     ..Decl
-                }) {
-                    let id = id("Mute Toggle");
-
-                    let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, true, winit::window::CursorIcon::Pointer);
-
-                    let icon = if ui.global_audio_volume > 0.5 { ICON_VOLUME_HIGH } else { ICON_VOLUME_OFF_1 };
-                    if ui.global_audio_volume > 0.5 { ui.global_audio_volume = 1.0 } else { ui.global_audio_volume = 0.0 };
+                })
+                {
                     if let _ = elem().decl(Decl {
-                        id,
-                        child_gap,
-                        align: Center,
-                        direction: TopToBottom,
-                        width: fit!(),
-                        height: fit!(),
+                        width: grow!(),
+                        align: TopRight,
                         ..Decl
                     }) {
-                        ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(32.0), align: AlignX::Center, ..TextDecl });
+                        let id = id("Mute Toggle");
+
+                        let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, true, winit::window::CursorIcon::Pointer);
+
+                        let icon = if ui.global_audio_volume > 0.5 { ICON_VOLUME_HIGH } else { ICON_VOLUME_OFF_1 };
+                        if ui.global_audio_volume > 0.5 { ui.global_audio_volume = 1.0 } else { ui.global_audio_volume = 0.0 };
+                        if let _ = elem().decl(Decl {
+                            id,
+                            child_gap,
+                            align: Center,
+                            direction: TopToBottom,
+                            width: fit!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(32.0), align: AlignX::Center, ..TextDecl });
+                        }
+
+                        if clicked {
+                            if ui.global_audio_volume > 0.5 { ui.global_audio_volume = 0.0 } else { ui.global_audio_volume = 1.0 };
+                        }
                     }
 
-                    if clicked {
-                        if ui.global_audio_volume > 0.5 { ui.global_audio_volume = 0.0 } else { ui.global_audio_volume = 1.0 };
+                    if let _ = elem().decl(Decl {
+                        width: grow!(),
+                        align: BottomRight,
+                        ..Decl
+                    }) {
+                        let id = id("Mining Toggle");
+
+                        let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, true, winit::window::CursorIcon::Pointer);
+
+                        let actively_mining: bool = *wallet::GUI_ENABLE_MINE.lock().unwrap();
+                        let icon = ["NOT MINING", "MINING"][actively_mining as usize];
+                        if let _ = elem().decl(Decl {
+                            id,
+                            child_gap,
+                            align: Center,
+                            direction: TopToBottom,
+                            width: fit!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            ui.text(icon, TextDecl { font: Mono, colour, h: ui.scale(32.0), align: AlignX::Center, ..TextDecl });
+                        }
+
+                        if clicked {
+                            *wallet::GUI_ENABLE_MINE.lock().unwrap() = !actively_mining;
+                        }
                     }
                 }
             }

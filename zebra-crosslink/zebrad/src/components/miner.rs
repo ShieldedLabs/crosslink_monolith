@@ -355,9 +355,20 @@ where
     let mut parameters =
         GetBlockTemplateParameters::new(Template, None, vec![LongPoll, CoinbaseTxn], None, None);
 
+    let mut cached_is_mining = true;
+
     // Shut down the task when all the template receivers are dropped, or Zebra shuts down.
     while !template_sender.is_closed() && !is_shutting_down() {
         let template: Result<_, _> = rpc.get_block_template(Some(parameters.clone())).await;
+
+        if let Ok(is_mining) = zebra_crosslink::wallet::GUI_ENABLE_MINE.try_lock() {
+            cached_is_mining = *is_mining;
+        }
+        if cached_is_mining == false {
+            info!("mining disabled, sleeping");
+            sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
+            continue;
+        }
 
         // Wait for the chain to sync so we get a valid template.
         let Ok(template) = template else {

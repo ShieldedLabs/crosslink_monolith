@@ -105,6 +105,8 @@ use zcash_protocol::consensus::{NetworkType, Parameters, MAIN_NETWORK, TEST_NETW
 #[derive(Clone)]
 pub struct FaucetRequestClosure(pub Arc<dyn Fn(String) -> Result<u64, String> + Sync + Send + 'static>);
 pub static FAUCET_REQUEST: Mutex<Option<FaucetRequestClosure>> = Mutex::new(None);
+pub static GUI_ENABLE_MINE: Mutex<bool> = Mutex::new(true);
+
 
 // NOTE: this has slightly different semantics from the protocol version, hence the different type
 // TODO: some code becomes simpler with a u64, but I'm leaving this the same as default for now
