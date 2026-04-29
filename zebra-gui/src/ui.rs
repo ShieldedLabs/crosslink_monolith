@@ -12,11 +12,16 @@ use clay::render_commands::RenderCommandConfig;
 use clay::render_commands::RenderCommandConfig::{Rectangle, ScissorStart, ScissorEnd};
 use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 use std::collections::HashMap;
+use std::cell::RefCell;
 //use clay::*; // @Temporary
 
 use wallet::{ BlockHeight, TxParts, TxStatus, WalletState, WalletTxKind, WalletTxPart, WalletRosterMember, str_from_ctaz };
 
 use super::*;
+
+thread_local! {
+    static TEXT_MEASURE_CACHE: RefCell<HashMap<(u32, u32, String), f32, ahash::RandomState>> = RefCell::new(HashMap::with_hasher(ahash::RandomState::new()));
+}
 
 pub fn magic<'a, 'b, T>(mut_ref: &'a mut T) -> &'b mut T {
     let mut_ref = mut_ref as *mut T;
@@ -62,6 +67,8 @@ impl UiData {
 }
 
 pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
+
+
     if ui.input().key_pressed(KeyCode::Backquote) {
         ui.debug = !ui.debug;
     }
@@ -490,6 +497,7 @@ impl HSVA_RGBA for (u8, u8, u8, u8) {
 impl Context {
     pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, global_audio_volume: 1.0, ..Default::default() } }
     pub fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw     } }
+    pub fn draw_mut(&mut self) -> &mut DrawCtx { unsafe { &mut *(self.draw as *mut DrawCtx) } }
     pub fn input(&self) -> &InputCtx { unsafe { &*self.input    } }
     pub fn clay(&self)  -> &mut Clay { unsafe { &mut *self.clay } }
 
@@ -1026,6 +1034,7 @@ fn colour_from_hash(hash: &[u8; 32]) -> (u8, u8, u8, u8) {
 }
 
 pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[WalletRosterMember], total_val: u64) {
+
     let finalizer_pill_rad = ui.scale(8.0);
     if finalizers.len() > 0 && total_val > 0 && let _ = elem().decl(Decl {
         id: ui::id("Finalizer Ratio Bar Container"),
@@ -2647,6 +2656,9 @@ pub fn ui_right_pane(ui: &mut Context,
                  radius:  (f32, f32, f32, f32),
                  dummy_1: &mut Id,
                  dummy_2: &mut Id) {
+
+    
+
     // @TODO: MAKE THESE NOT USE TABS, JUST USE HEADERS
     let mut tab_id_faucet = Id::default();
     let mut tab_id_roster = Id::default();
@@ -2679,6 +2691,7 @@ pub fn ui_right_pane(ui: &mut Context,
         ..Decl
     }) {
         fn display_str(chunks: &[u64; 4]) -> String {
+
             let mut bytes = {
                 let mut out = [0u8; 32];
                 let mut i = 0;
@@ -2705,6 +2718,8 @@ pub fn ui_right_pane(ui: &mut Context,
         }
 
         let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
+            
+
             let id = id(label);
             let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
             if let _ = elem().decl(Decl {
@@ -2738,6 +2753,7 @@ pub fn ui_right_pane(ui: &mut Context,
         };
 
         let clickable_icon = |ui: &mut Context, id, icon, enabled | {
+
             let (clicked, colour, _) = ui.button_ex(false, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
             if let _ = elem().decl(Decl {
                 id,
@@ -2763,6 +2779,8 @@ pub fn ui_right_pane(ui: &mut Context,
             height: fit!(),
             ..Decl
         }) {
+
+
             let mut recv_address = String::new();
             for b in wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().0.iter().rev() {
                 recv_address.push_str(&format!("{:02x}", b));
@@ -2790,6 +2808,7 @@ pub fn ui_right_pane(ui: &mut Context,
         let scroll = *scroll;
         ui.scroll_container_bgn(data, padding, child_gap * 0.5, id, clip, scroll, content_h, viewport_h, max);
         {
+
             if wallet_is_init == false || roster.len() == 0 {
                 let h = ui.scale(24.0);
                 if let _ = elem().decl(Decl {
@@ -3038,6 +3057,8 @@ fn animated_loading_icon(ui: &Context) -> &str {
 }
 
 pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
+    
+    
     data.per_frame_strs.clear();
 
     let mut result = false;
@@ -3046,6 +3067,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
     const MAX_ZOOM: f32 = 1.75; // @Todo: @PreventOverflowOnZoom
 
     if ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight) {
+
+        
         if ui.input().key_pressed(KeyCode::Equal) {
             let new_zoom = ui.zoom * (1.0f32 + 1.0f32 / 8f32);
             if new_zoom <= MAX_ZOOM {
@@ -3093,15 +3116,51 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
     data.tooltip_text.clear();
 
-    // Begin the layout
+
     let clay = magic(ui).clay();
     clay.set_layout_dimensions((window_w as f32, window_h as f32).into());
     clay.pointer_state(mouse_pos.into(), mouse_held);
+
     clay.set_measure_text_function_user_data(ui.draw(), |string, text_config, draw| {
-        let font_kind = match text_config.font_id { 0 => FontKind::Normal, 1 => FontKind::Mono, 2 => FontKind::Icons, _ => todo!() };
-        let h = text_config.font_size as f32;
-        let w = draw.measure_text_line(font_kind, h, string);
-        clay::math::Dimensions::new(w, h)
+
+        let cache_key = (text_config.font_id as u32, text_config.font_size as u32, string.to_string());
+        TEXT_MEASURE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() > 4096 {
+                cache.clear();
+            }
+            let w = cache.entry(cache_key).or_insert_with(|| {
+                let font_kind = match text_config.font_id { 0 => FontKind::Normal, 1 => FontKind::Mono, 2 => FontKind::Icons, _ => todo!() };
+                let h = text_config.font_size as f32;
+
+                if h <= 0.0 || !h.is_normal() { return 0.0; }
+                let h_norm = h.min(8192.0);
+                if h_norm < 3.0 {
+                    let factor = match font_kind {
+                        FontKind::Normal => 1.0,
+                        FontKind::Mono   => 4.0,
+                        FontKind::Icons  => 2.0,
+                    };
+                    return (factor * h_norm * string.len() as f32) / 3.0;
+                }
+
+                let text_height_px = h_norm.floor() as usize;
+                if let Some(&width) = draw.measure_cache.get(&MeasureKey { font_kind, text_height: text_height_px, text_content: string.to_string() }) {
+                    return width;
+                }
+
+                let (tracker, _) = draw._find_or_create_font_tracker(text_height_px, font_kind);
+                let mut buf = UnicodeBuffer::new();
+                buf.set_direction(rustybuzz::Direction::LeftToRight);
+                buf.push_str(string);
+                let shaped = shape(&tracker.cached_rusty_buzz, &[], buf);
+                shaped.glyph_positions().iter().map(|g_pos| {
+                    let px_advance = ((g_pos.x_advance as f32 / tracker.units_per_em) * tracker.ppem).ceil() as usize;
+                    px_advance.min(1usize << tracker.glyph_row_shift)
+                }).sum::<usize>() as f32
+            });
+            clay::math::Dimensions::new(*w, text_config.font_size as f32)
+        })
     });
 
     let mut c = clay.begin::<(), ()>();
@@ -3129,6 +3188,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             clip: ClipX,
             ..Decl
         }) {
+
             let id = _elem.decl.id;
             if ui.hovered(id) {
                 ui.capture = true;
@@ -3393,6 +3453,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
     let render_commands = c.end();
 
     {
+
         let mut nav_bbox: Option<(isize, isize, isize, isize)> = None;
 
         for mut command in render_commands {
@@ -3444,7 +3505,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 _ => { 0 }
             };
 
-            let draw_debug_rect = || {
+            let draw_debug_rect = |ui: &mut Context| {
                 if ui.debug {
                     let thickness = 2.0;
                     let color = 0x80ff00ff;
@@ -3459,7 +3520,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
             // @Hack for generating nav highlight rectangle via draw commands.
             if colour == 0x01000000 {
-                draw_debug_rect();
+                draw_debug_rect(ui);
                 continue;
             }
 
@@ -3500,16 +3561,23 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
                 let padding = ui.scale(12.0); // @Duplicate :TextBox
 
-                let compute_x = |idx: usize| {
-                    let n = idx.min(textbox_state.text_buf.len());
-                    let mut str = String::with_capacity(n * 4);
-                    str.extend(textbox_state.text_buf[..n].iter().copied());
-                    let xoff = ui.draw().measure_text_line(FontKind::Normal, textbox_state.h, &str);
-                    x1 + padding as isize + xoff as isize
+                let head_str = {
+                    let n = textbox_state.selection.0.min(textbox_state.text_buf.len());
+                    let mut s = String::with_capacity(n * 4);
+                    s.extend(textbox_state.text_buf[..n].iter().copied());
+                    s
+                };
+                let tail_str = {
+                    let n = textbox_state.selection.1.min(textbox_state.text_buf.len());
+                    let mut s = String::with_capacity(n * 4);
+                    s.extend(textbox_state.text_buf[..n].iter().copied());
+                    s
                 };
 
-                let head_x = compute_x(textbox_state.selection.0);
-                let tail_x = compute_x(textbox_state.selection.1);
+                let head_xoff = ui.draw_mut().measure_text_line(FontKind::Normal, h, &head_str);
+                let tail_xoff = ui.draw_mut().measure_text_line(FontKind::Normal, h, &tail_str);
+                let head_x = x1 + padding as isize + head_xoff as isize;
+                let tail_x = x1 + padding as isize + tail_xoff as isize;
 
                 let y_centre = (y1 + y2) / 2;
                 let y1 = y_centre - (h * 0.5).ceil() as isize;
@@ -3533,7 +3601,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 }
             }
 
-            draw_debug_rect();
+            draw_debug_rect(ui);
         }
 
         if ui.nav_enable && let Some((x1, y1, x2, y2)) = nav_bbox && !data.textboxes.contains_key(&ui.nav_id) {
@@ -3578,7 +3646,7 @@ pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet
     if ui.tx_loading_animation_timer >= 1.0 {
         ui.tx_loading_animation_timer = 0.0;
     }
-
+    
     let dummy_input = InputCtx {
         this_mouse_pos: ui.input().this_mouse_pos,
         last_mouse_pos: ui.input().this_mouse_pos,

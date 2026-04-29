@@ -410,7 +410,7 @@ async fn wait_for_zainod() {
 
 pub const TIMERS_LOUD: bool = false;
 
-struct Timer<'a> { t_bgn: std::time::Instant, name: &'a str, loud: bool }
+pub struct Timer<'a> { t_bgn: std::time::Instant, name: &'a str, loud: bool }
 impl<'a> Timer<'a> {
     pub fn scope_(name: &'a str, loud: bool) -> Self {
         if loud {
@@ -426,7 +426,7 @@ impl<'a> Timer<'a> {
 impl Drop for Timer<'_> {
     fn drop(&mut self) {
         if self.loud {
-            println!("{} took {}ms", self.name, self.t_bgn.elapsed().as_millis());
+            println!("{} took {}us", self.name, self.t_bgn.elapsed().as_micros());
         }
     }
 }

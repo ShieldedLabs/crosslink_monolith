@@ -12,6 +12,7 @@ use fontello_icons::*;
 
 use std::sync::{Arc, Mutex};
 use wallet;
+//use wallet::Timer;
 
 mod viz_gui;
 pub use viz_gui::*;
@@ -180,6 +181,18 @@ fn dennis_parallel_for(p_thread_context: *mut ThreadContext, is_last_time: bool,
     }
 }
 
+use std::collections::HashMap;
+
+// Note(Giovanni): Cache key for text measurement.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct MeasureKey {
+    pub font_kind: FontKind,
+    pub text_height: usize, // We use the floored usize
+    pub text_content: String,
+}
+
+const MEASURE_CACHE_MAX_CAPACITY: usize = 4096;
+
 impl DrawCtx {
 
     pub fn _init_font_tracker(&self, ttf_file: &'static [u8], target_px_height: usize, font_kind: FontKind, fudge_to_px_height: usize) -> *mut FontTracker {
@@ -309,45 +322,57 @@ impl DrawCtx {
         }
         return false;
     }
-    pub fn measure_text_line(&self, font_kind: FontKind, text_height: f32, text_line: &str) -> f32 {
-        if text_height <= 0.0 || text_height.is_normal() == false { return 0.0; }
-        let text_height = text_height.min(8192.0);
+    
+    pub fn measure_text_line(&mut self, font_kind: FontKind, text_height: f32, text_line: &str) -> f32 {
+        if text_height <= 0.0 || !text_height.is_normal() { return 0.0; }
+        let text_height_norm = text_height.min(8192.0);
 
-        if text_height < 3.0 {
+        if text_height_norm < 3.0 {
             let factor = match font_kind {
                 FontKind::Normal => 1.0,
                 FontKind::Mono   => 4.0,
-                FontKind::Icons  => 2.0, // TODO: idk??
+                FontKind::Icons  => 2.0,
             };
-            return (factor * text_height * text_line.len() as f32) / 3.0;
+            return (factor * text_height_norm * text_line.len() as f32) / 3.0;
         }
-        let text_height = text_height.floor() as usize;
 
-        // TODO: hash parameters right here, use result as key into memoization cache/hashmap
+        let text_height_px = text_height_norm.floor() as usize;
 
-        let (tracker, _) = self._find_or_create_font_tracker(text_height, font_kind);
+        // Note(Giovanni): Cache Lookup
+        let cache_key = MeasureKey {
+            font_kind,
+            text_height: text_height_px,
+            text_content: text_line.to_string(),
+        };
+        if let Some(&width) = self.measure_cache.get(&cache_key) {
+            return width;
+        }
+
+        let (tracker, _) = self._find_or_create_font_tracker(text_height_px, font_kind);
         tracker.how_many_times_was_i_used += 1;
 
         let mut buf = UnicodeBuffer::new();
         buf.set_direction(rustybuzz::Direction::LeftToRight);
         buf.push_str(text_line);
-        buf.set_direction(rustybuzz::Direction::LeftToRight);
 
         let shaped = shape(&tracker.cached_rusty_buzz, &[], buf);
-        let infos = shaped.glyph_infos();
         let poss = shaped.glyph_positions();
-        assert_eq!(infos.len(), poss.len());
 
-        if poss.len() > 0 {
-            poss.iter().map(|g_pos| {
-                let px_advance = (((g_pos.x_advance as f32 / tracker.units_per_em) * tracker.ppem).ceil() as usize).min(1usize << tracker.glyph_row_shift);
-                px_advance
-            }).reduce(|acc, a| acc + a).unwrap() as f32
-        } else {
-            0.0
+        let total_width = poss.iter().map(|g_pos| {
+            let px_advance = ((g_pos.x_advance as f32 / tracker.units_per_em) * tracker.ppem).ceil() as usize;
+            px_advance.min(1usize << tracker.glyph_row_shift)
+        }).sum::<usize>() as f32;
+
+        // Note(Giovanni): Memoize and Return
+        if self.measure_cache.len() >= MEASURE_CACHE_MAX_CAPACITY {
+            if let Some(key) = self.measure_cache.keys().next().cloned() {
+                self.measure_cache.remove(&key);
+            }
         }
+        self.measure_cache.insert(cache_key, total_width);
+        
+        total_width
     }
-
     pub fn text_line(&self, font_kind: FontKind, text_x: f32, text_y: f32, text_height: f32, text_line: &str, color: u32) {
         if text_y + text_height <= 0.0 || text_y >= self.window_height as f32 { return; }
 
@@ -761,7 +786,7 @@ impl InputCtx {
     }
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq)] pub enum FontKind { #[default] Normal, Mono, Icons }
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)] pub enum FontKind { #[default] Normal, Mono, Icons }
 use FontKind::{Mono, Icons};
 
 struct FontTracker {
@@ -792,6 +817,7 @@ struct DrawCtx {
     font_tracker_count: *mut usize,
     debug_pixel_inspector: *mut Option<(usize, usize)>,
     debug_pixel_inspector_last_color: *mut u32,
+    measure_cache: HashMap<MeasureKey, f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1081,6 +1107,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
         font_tracker_count: (&mut _font_tracker_count) as *mut usize,
         debug_pixel_inspector: (&mut _debug_pixel_inspector) as *mut Option<(usize, usize)>,
         debug_pixel_inspector_last_color: (&mut _debug_pixel_inspector_last_color) as *mut u32,
+        measure_cache: HashMap::new(),
     }};
 
     draw_ctx._init_font_tracker(FONT_PIXEL_3X3_MONO, 2, FontKind::Mono,  4);
@@ -1462,9 +1489,13 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             ui.draw  = &draw_ctx;
                                             ui.dpi_scale = window.scale_factor() as f32;
                                             ui.delta = dt as f32;
-
-                                            viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut ui, &draw_ctx, dt as f32, &input_ctx);
-
+                                            
+                                            // NOTE(Giovanni): Timer thingy //
+                                            //{
+                                            //    let timer = Timer::scope_("viz_gui_draw_the_stuff_for_the_things", true);
+                                                   viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut ui, &mut draw_ctx, dt as f32, &input_ctx);
+                                            //}
+                                            //////////////////////////////////
                                             {
                                                 let should_quit = ui_update(&mut ui, &mut data, &mut viz_state, wallet_state.clone());
                                                 if should_quit {
