@@ -1,13 +1,15 @@
 pub use std::net::Ipv6Addr;
 
-pub const ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE: usize = 15972;
-pub const ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY: usize = 1400; // ish
+pub const ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY: usize = 1200; // legacy
 
-pub type PacketMemory = Box<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE]>;
+pub const ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY: usize = 1184;
+pub const ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE: usize = 9216;
+
+pub type PacketMemory = Box<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE]>;
 
 // Note(Sam): We will be reusing this memory across packets so we already do not have memory safety with regards to contents.
 #[allow(unsafe_code)]
-pub fn new_packet_memory() -> PacketMemory { unsafe { Box::<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE]>::new_uninit().assume_init() } }
+pub fn new_packet_memory() -> PacketMemory { unsafe { Box::<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE]>::new_uninit().assume_init() } }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -271,6 +273,31 @@ mod linux {
             {
                 panic!("Failed to Enable IPv6 PKTINFO, error: {}", std::io::Error::last_os_error());
             }
+
+            // Disable fragmentation: force the kernel to return an error instead of fragmenting.
+            let pmtudisc: libc::c_int = libc::IPV6_PMTUDISC_DO;
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                &pmtudisc as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&pmtudisc) as libc::socklen_t,
+            ) != 0
+            {
+                panic!("Failed to set IPV6_MTU_DISCOVER: {}", std::io::Error::last_os_error());
+            }
+
+            let pmtudisc_v4: libc::c_int = libc::IP_PMTUDISC_DO;
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                &pmtudisc_v4 as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&pmtudisc_v4) as libc::socklen_t,
+            ) != 0
+            {
+                panic!("Failed to set IP_MTU_DISCOVER: {}", std::io::Error::last_os_error());
+            }
         }
         Some(SockHandle(fd, known_good_ipv6_address))
     }
@@ -282,7 +309,7 @@ mod linux {
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
-    ) -> std::io::Result<u64> {
+    ) -> u64 {
         let fd = udp_socket.0;
         let known_good_ipv6_address = udp_socket.1;
     
@@ -342,7 +369,7 @@ mod linux {
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg as *const _ as *mut _);
             if cmsg.is_null() {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, "CMSG_FIRSTHDR returned null"));
+                panic!("CMSG_FIRSTHDR returned null");
             }
     
             let val: libc::c_int = tclass_byte as libc::c_int;
@@ -360,7 +387,7 @@ mod linux {
                 if let Some(ip6) = known_good_ipv6_address {
                     let cmsg2 = libc::CMSG_NXTHDR(&msg as *const _ as *mut _, cmsg);
                     if cmsg2.is_null() {
-                        return Err(std::io::Error::new(std::io::ErrorKind::Other, "CMSG_NXTHDR returned null"));
+                        panic!("CMSG_NXTHDR returned null");
                     }
     
                     (*cmsg2).cmsg_level = libc::IPPROTO_IPV6;
@@ -382,16 +409,17 @@ mod linux {
             let timestamp_ns = monotonic_clock_ns();
             let n = libc::sendmsg(fd, &msg as *const _ as *mut _, 0);
             if n < 0 {
-                return Err(std::io::Error::last_os_error());
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EMSGSIZE) {
+                    return timestamp_ns;
+                }
+                panic!("UDP Socket error: {}", err);
             }
             let sent = n as usize;
             if sent != payload.len() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    format!("partial UDP send: {sent} of {}", payload.len()),
-                ));
+                panic!("partial UDP send: {sent} of {}", payload.len());
             }
-            Ok(timestamp_ns)
+            timestamp_ns
         }
     }
     
@@ -852,6 +880,16 @@ mod windows {
             return None;
         }
 
+        // Disable fragmentation
+        if setsockopt_u32(sock, IPPROTO_IPV6 as i32, IPV6_DONTFRAG as i32, 1) == SOCKET_ERROR {
+            eprintln!("setsockopt(IPV6_DONTFRAG=1) failed: {}", wsa_last_error());
+            return None;
+        }
+        if setsockopt_u32(sock, IPPROTO_IP as i32, IP_DONTFRAGMENT as i32, 1) == SOCKET_ERROR {
+            eprintln!("setsockopt(IP_DONTFRAGMENT=1) failed: {}", wsa_last_error());
+            return None;
+        }
+
         let recvmsg = get_wsarecvmsg(sock);
 
         Some(SockHandle(sock, recvmsg))
@@ -864,7 +902,7 @@ mod windows {
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
-    ) -> std::io::Result<u64> {
+    ) -> u64 {
         let sock = udp_socket.0;
 
         // full TCLASS/TOS byte: DSCP in upper 6 bits, ECN=ECT(0) (0b10)
@@ -886,7 +924,7 @@ mod windows {
             // Some Windows stacks/providers may reject IPV6_TCLASS. In that case,
             // continue untagged rather than failing the send.
             if !( !is_v4_mapped && e == WSAENOPROTOOPT ) {
-                return Err(std::io::Error::from_raw_os_error(e));
+                panic!("UDP Socket error: {}", std::io::Error::from_raw_os_error(e));
             }
         }
 
@@ -912,16 +950,17 @@ mod windows {
             )
         };
         if n == SOCKET_ERROR {
-            return Err(wsa_last_error());
+            let e = unsafe { WSAGetLastError() };
+            if e == WSAEMSGSIZE {
+                return timestamp_ns;
+            }
+            panic!("UDP Socket error: {}", std::io::Error::from_raw_os_error(e));
         }
         if n as usize != payload.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                format!("partial UDP send: {} of {}", n, payload.len()),
-            ));
+            panic!("partial UDP send: {} of {}", n, payload.len());
         }
 
-        Ok(timestamp_ns)
+        timestamp_ns
     }
 
     #[inline]
@@ -1315,6 +1354,32 @@ mod macos {
                 eprintln!("Failed to enable IPV6_RECVPKTINFO: {}", std::io::Error::last_os_error());
                 return None;
             }
+
+            // Disable fragmentation
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_DONTFRAG,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            ) != 0
+            {
+                eprintln!("Failed to set IPV6_DONTFRAG: {}", std::io::Error::last_os_error());
+                return None;
+            }
+
+            let ip_dontfrag: libc::c_int = 1;
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_DONTFRAG,
+                &ip_dontfrag as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&ip_dontfrag) as libc::socklen_t,
+            ) != 0
+            {
+                eprintln!("Failed to set IP_DONTFRAG: {}", std::io::Error::last_os_error());
+                return None;
+            }
         }
 
         Some(SockHandle(fd))
@@ -1333,7 +1398,7 @@ mod macos {
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
-    ) -> std::io::Result<u64> {
+    ) -> u64 {
         // Darwin constants (not always exposed by Rust libc)
         const SO_NET_SERVICE_TYPE: libc::c_int = 0x1116;
 
@@ -1361,7 +1426,7 @@ mod macos {
                 std::mem::size_of_val(&svc) as libc::socklen_t,
             ) != 0
             {
-                return Err(std::io::Error::last_os_error());
+                panic!("UDP Socket error: {}", std::io::Error::last_os_error());
             }
         }
 
@@ -1395,10 +1460,7 @@ mod macos {
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg as *const _ as *mut _);
             if cmsg.is_null() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "CMSG_FIRSTHDR returned null",
-                ));
+                panic!("CMSG_FIRSTHDR returned null");
             }
 
             (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
@@ -1415,17 +1477,18 @@ mod macos {
             let timestamp_ns = monotonic_clock_ns();
             let n = libc::sendmsg(fd, &msg as *const _ as *mut _, 0);
             if n < 0 {
-                return Err(std::io::Error::last_os_error());
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EMSGSIZE) {
+                    return timestamp_ns;
+                }
+                panic!("UDP Socket error: {}", err);
             }
 
             if n as usize != payload.len() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    format!("partial UDP send: {n} of {}", payload.len()),
-                ));
+                panic!("partial UDP send: {n} of {}", payload.len());
             }
 
-            Ok(timestamp_ns)
+            timestamp_ns
         }
     }
 
