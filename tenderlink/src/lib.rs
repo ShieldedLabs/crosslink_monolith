@@ -63,7 +63,7 @@ const ANSI_RST: &'static str = "\x1b[0m";
 
 // @Todo: MTU discovery // @Duplicate with NewNet.
 const UDP_mMTU:        usize = 1400; // Note(Sam): This number informs cryptography. BAD! For season one we must now not change this number. Even if it means sending jumbos to compensate. :(
-const STP_HEADER_SIZE: usize = 6 + crypto_overhead_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+const STP_HEADER_SIZE: usize = total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(CRYPTO_MAGIC).unwrap();
 const STP_PACKLET_HDR: usize = std::mem::size_of::<crate::bandwidth_test::PackletHeader>();
 const PATH_MTU: usize = UDP_mMTU
                       - STP_HEADER_SIZE
@@ -1145,7 +1145,7 @@ pub use crate::bandwidth_test::fmt_byte_str_rev;
 pub use crate::bandwidth_test::fmt_prefixed_byte_str;
 pub use crate::bandwidth_test::fmt_prefixed_byte_str_rev;
 pub use crate::bandwidth_test::CONNECT_MAGIC1_PLAIN_TEXT;
-pub use crate::bandwidth_test::crypto_overhead_from_connect_magic1;
+pub use crate::bandwidth_test::total_packet_payload_overhead_from_connect_magic1_inside_udp_payload;
 pub use crate::bandwidth_test::new_keypair_from_connect_magic1_with_seed;
 pub use crate::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 
@@ -1401,7 +1401,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     use crate::native_sockets::*;
 
     let my_port = my_endpoint.map(|e| e.port).unwrap_or(23485); // @Dev: .unwrap_or(0); // @Todo! Get local port after sock creation! @@@
-    let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port);
+    let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024));
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
     let mut messages_to_send = Vec::new();
 
@@ -1953,9 +1953,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         use rand::seq::SliceRandom;
         messages_to_send.shuffle(&mut rand::thread_rng());
-        let resp = new_service_connections(&network_thread_handle, NetworkThreadPush { wanted_connections: current_connections.clone(), messages_to_send: messages_to_send.clone() });
+        let resp = new_service_connections(&network_thread_handle, NetworkThreadPush { wanted_connections: current_connections.clone(), send_unreliable: Vec::new(), }); // messages_to_send @not_done
         current_connections = resp.current_connections;
-        let mut messages_received = resp.messages_received;
+        let mut messages_received : Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();// = resp.messages_received;
         messages_to_send = Vec::new();
 
         // Ensure a Peer entry exists for every active connection
@@ -2941,6 +2941,7 @@ pub fn run_instances(i: usize) {
 pub mod bandwidth_test;
 pub mod p2p_test;
 pub mod native_sockets;
+pub mod nym_sockets;
 pub mod helpers;
 
 use helpers::*;

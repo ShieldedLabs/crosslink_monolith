@@ -1,13 +1,15 @@
 pub use std::net::Ipv6Addr;
 
-pub const ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE: usize = 15972;
-pub const ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY: usize = 1400; // ish
+pub const ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY: usize = 1200; // legacy
 
-pub type PacketMemory = Box<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE]>;
+pub const ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY: usize = 1184;
+pub const ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE: usize = 9216;
+
+pub type PacketMemory = Box<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE]>;
 
 // Note(Sam): We will be reusing this memory across packets so we already do not have memory safety with regards to contents.
 #[allow(unsafe_code)]
-pub fn new_packet_memory() -> PacketMemory { unsafe { Box::<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_FRAME_ON_EXISTING_HARDWARE]>::new_uninit().assume_init() } }
+pub fn new_packet_memory() -> PacketMemory { unsafe { Box::<[u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE]>::new_uninit().assume_init() } }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -52,30 +54,30 @@ mod linux {
             (ts.tv_sec as u64) * 1_000_000_000u64 + (ts.tv_nsec as u64)
         }
     }
-    
+
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     pub struct SockHandle(libc::c_int, Option<Ipv6Addr>); // Linux
-    
+
     /*
         This procedure is needed because on some vps' the ipv6 setup is wrong so that
         we end up using only the prefix address. Here is an example bad setup.
 2: enp1s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP qlen 1000
-    inet6 2001:19f0:5c00:48f2::/64 scope global noprefixroute 
+    inet6 2001:19f0:5c00:48f2::/64 scope global noprefixroute
        valid_lft forever preferred_lft forever
-    inet6 2001:19f0:5c00:48f2:5400:5ff:fec9:bad/64 scope global noprefixroute 
+    inet6 2001:19f0:5c00:48f2:5400:5ff:fec9:bad/64 scope global noprefixroute
        valid_lft forever preferred_lft forever
-    inet6 fe80::5400:5ff:fec9:bad/64 scope link noprefixroute 
+    inet6 fe80::5400:5ff:fec9:bad/64 scope link noprefixroute
        valid_lft forever preferred_lft forever
-       
+
        Versus the good a setup.
 2: enp5s0f3u1u2u1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP qlen 1000
-    inet6 2001:2043:9c85:9800:1f2e:cb54:e493:5106/64 scope global dynamic noprefixroute 
+    inet6 2001:2043:9c85:9800:1f2e:cb54:e493:5106/64 scope global dynamic noprefixroute
        valid_lft 304sec preferred_lft 303sec
-    inet6 fd85:130a:53bf:0:39ee:50cb:ce14:1b86/64 scope global noprefixroute 
+    inet6 fd85:130a:53bf:0:39ee:50cb:ce14:1b86/64 scope global noprefixroute
        valid_lft forever preferred_lft forever
-    inet6 fe80::8e37:1f3e:4c28:db95/64 scope link noprefixroute 
+    inet6 fe80::8e37:1f3e:4c28:db95/64 scope link noprefixroute
        valid_lft forever preferred_lft forever
-       
+
        I think it is as simple as the 128 bit full address not being at the top of
        the list. So instead of requiring Linux config to be run like most bad software
        this function puts in the effort to work around this issue.
@@ -87,55 +89,55 @@ mod linux {
             if libc::getifaddrs(&mut ifap) != 0 {
                 panic!("getifaddrs failed: {}", std::io::Error::last_os_error());
             }
-    
+
             let mut index = 0;
             let mut first_is_loopback = false;
-            
+
             let mut cur = ifap;
             while !cur.is_null() {
                 let ifa = &*cur;
-    
+
                 if !ifa.ifa_addr.is_null()
                     && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET6
                 {
                     index += 1;
                     let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
                     let addr = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-    
+
                     if addr.is_loopback() {
                         cur = (*cur).ifa_next;
                         if index == 1 { first_is_loopback = true; }
                         continue;
                     }
-    
+
                     if addr.is_multicast() {
                         cur = (*cur).ifa_next;
                         continue;
                     }
-    
+
                     if (addr.segments()[0] & 0xffc0) == 0xfe80 {
                         cur = (*cur).ifa_next;
                         continue;
                     }
-    
+
                     let seg = addr.segments();
                     if seg[4] == 0 && seg[5] == 0 && seg[6] == 0 && seg[7] == 0 {
                         cur = (*cur).ifa_next;
                         continue;
                     }
-    
+
                     libc::freeifaddrs(ifap);
-                    
+
                     if index == 2 && first_is_loopback {
                         return None;
                     }
                     eprintln!("[WARNING] This linux machine has incorrectly configured it's ipv6 addresses causing a bug when sending ipv6 packets. We will be overriding the sender ip field with '{}' in order to try and work around this issue.", addr);
                     return Some(addr);
                 }
-    
+
                 cur = (*cur).ifa_next;
             }
-    
+
             libc::freeifaddrs(ifap);
             None
         }
@@ -249,7 +251,7 @@ mod linux {
             {
                 panic!("Failed to Enable IPv4 TOS, error: {}", std::io::Error::last_os_error());
             }
-    
+
             if libc::setsockopt(
                 fd,
                 libc::IPPROTO_IPV6,
@@ -260,7 +262,7 @@ mod linux {
             {
                 panic!("Failed to Enable IPv6 TOS, error: {}", std::io::Error::last_os_error());
             }
-    
+
             if libc::setsockopt(
                 fd,
                 libc::IPPROTO_IPV6,
@@ -270,6 +272,31 @@ mod linux {
             ) != 0
             {
                 panic!("Failed to Enable IPv6 PKTINFO, error: {}", std::io::Error::last_os_error());
+            }
+
+            // Disable fragmentation: force the kernel to return an error instead of fragmenting.
+            let pmtudisc: libc::c_int = libc::IPV6_PMTUDISC_DO;
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                &pmtudisc as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&pmtudisc) as libc::socklen_t,
+            ) != 0
+            {
+                panic!("Failed to set IPV6_MTU_DISCOVER: {}", std::io::Error::last_os_error());
+            }
+
+            let pmtudisc_v4: libc::c_int = libc::IP_PMTUDISC_DO;
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                &pmtudisc_v4 as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&pmtudisc_v4) as libc::socklen_t,
+            ) != 0
+            {
+                panic!("Failed to set IP_MTU_DISCOVER: {}", std::io::Error::last_os_error());
             }
         }
         Some(SockHandle(fd, known_good_ipv6_address))
@@ -282,15 +309,16 @@ mod linux {
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
-    ) -> std::io::Result<u64> {
+        ecn_signal: bool,
+    ) -> u64 {
         let fd = udp_socket.0;
         let known_good_ipv6_address = udp_socket.1;
-    
+
         let mut iov = libc::iovec {
             iov_base: payload.as_ptr() as *mut libc::c_void,
             iov_len: payload.len(),
         };
-    
+
         let (mut name_buf, name_len, is_v4) = if let Some(v4) = dst_ip6.to_ipv4_mapped() {
             let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
             sin.sin_family = libc::AF_INET as _;
@@ -298,7 +326,7 @@ mod linux {
             sin.sin_addr = libc::in_addr {
                 s_addr: u32::from_le_bytes(v4.octets()),
             };
-    
+
             let mut buf = vec![0u8; std::mem::size_of::<libc::sockaddr_in>()];
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -314,7 +342,7 @@ mod linux {
             sin6.sin6_family = libc::AF_INET6 as _;
             sin6.sin6_port = dst_port.to_be();
             sin6.sin6_addr = libc::in6_addr { s6_addr: dst_ip6.octets() };
-    
+
             let mut buf = vec![0u8; std::mem::size_of::<libc::sockaddr_in6>()];
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -326,9 +354,9 @@ mod linux {
             let buf_len = buf.len() as libc::socklen_t;
             (buf, buf_len, false)
         };
-    
+
         let mut cbuf = [0u8; 256];
-    
+
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_name = name_buf.as_mut_ptr() as *mut libc::c_void;
         msg.msg_namelen = name_len;
@@ -336,80 +364,83 @@ mod linux {
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = cbuf.len();
-    
-        let tclass_byte = ((dscp as u8) << 2) | 0b10;
-    
+
+        let tclass_byte = ((dscp as u8) << 2) | if ecn_signal { 0b11 } else { 0b10 };
+
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg as *const _ as *mut _);
             if cmsg.is_null() {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, "CMSG_FIRSTHDR returned null"));
+                panic!("CMSG_FIRSTHDR returned null");
             }
-    
+
             let val: libc::c_int = tclass_byte as libc::c_int;
-    
+
             (*cmsg).cmsg_level = if is_v4 { libc::IPPROTO_IP } else { libc::IPPROTO_IPV6 };
             (*cmsg).cmsg_type = if is_v4 { libc::IP_TOS } else { libc::IPV6_TCLASS };
             (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as _;
-    
+
             let data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
             *data = val;
-    
+
             let mut used = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) as usize;
-    
+
             if !is_v4 {
                 if let Some(ip6) = known_good_ipv6_address {
                     let cmsg2 = libc::CMSG_NXTHDR(&msg as *const _ as *mut _, cmsg);
                     if cmsg2.is_null() {
-                        return Err(std::io::Error::new(std::io::ErrorKind::Other, "CMSG_NXTHDR returned null"));
+                        panic!("CMSG_NXTHDR returned null");
                     }
-    
+
                     (*cmsg2).cmsg_level = libc::IPPROTO_IPV6;
                     (*cmsg2).cmsg_type = libc::IPV6_PKTINFO;
                     (*cmsg2).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as _) as _;
-    
+
                     let pkt6 = libc::CMSG_DATA(cmsg2) as *mut libc::in6_pktinfo;
                     std::ptr::write_bytes(pkt6 as *mut u8, 0, std::mem::size_of::<libc::in6_pktinfo>());
-    
+
                     (*pkt6).ipi6_ifindex = 0;
                     (*pkt6).ipi6_addr = libc::in6_addr { s6_addr: ip6.octets() };
-    
+
                     used += libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as _) as usize;
                 }
             }
-    
+
             msg.msg_controllen = used as _;
-    
+
             let timestamp_ns = monotonic_clock_ns();
             let n = libc::sendmsg(fd, &msg as *const _ as *mut _, 0);
             if n < 0 {
-                return Err(std::io::Error::last_os_error());
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EMSGSIZE) || err.raw_os_error() == Some(libc::EAGAIN)
+                    || err.raw_os_error() == Some(libc::ENETUNREACH) || err.raw_os_error() == Some(libc::EHOSTUNREACH)
+                    || err.raw_os_error() == Some(libc::ENETDOWN) || err.raw_os_error() == Some(libc::ECONNREFUSED) {
+                    return timestamp_ns;
+                }
+                panic!("UDP Socket error: {}", err);
             }
             let sent = n as usize;
             if sent != payload.len() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    format!("partial UDP send: {sent} of {}", payload.len()),
-                ));
+                panic!("partial UDP send: {sent} of {}", payload.len());
             }
-            Ok(timestamp_ns)
+            timestamp_ns
         }
     }
-    
+
     #[inline]
     pub fn udp_recv_with_congestion_and_dscp( // Linux
         udp_socket: SockHandle,
         buf: &mut [u8],
     ) -> std::io::Result<(usize, Ipv6Addr, u16, bool, bool, Dscp, u64)> {
         let fd = udp_socket.0;
-    
+
         let mut iov = libc::iovec {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
         };
-    
+
         let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let mut cbuf = [0u8; 128];
-    
+
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_name = (&mut addr_storage as *mut _) as *mut libc::c_void;
         msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
@@ -417,20 +448,20 @@ mod linux {
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = cbuf.len();
-    
+
         let n = unsafe { libc::recvmsg(fd, &mut msg as *mut libc::msghdr, 0) };
         let timestamp_ns = monotonic_clock_ns();
         if n < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        
+
         if (msg.msg_flags & libc::MSG_TRUNC) != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "UDP datagram truncated (buffer too small)",
             ));
         }
-    
+
         let (src_ip6, src_port) = if (addr_storage.ss_family as i32) == libc::AF_INET {
             let sin: &libc::sockaddr_in =
                 unsafe { &*(&addr_storage as *const _ as *const libc::sockaddr_in) };
@@ -446,18 +477,18 @@ mod linux {
         } else {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown sockaddr family"));
         };
-    
+
         let mut congested = false;
         let mut ecn_enabled = false;
         let mut dscp = Dscp::BestEffort;
-    
+
         unsafe {
             let mut cmsg_ptr = libc::CMSG_FIRSTHDR(&msg as *const _);
             while !cmsg_ptr.is_null() {
                 let cmsg = &*cmsg_ptr;
-    
+
                 let mut tclass_opt: Option<u8> = None;
-    
+
                 if cmsg.cmsg_level == libc::IPPROTO_IP && cmsg.cmsg_type == libc::IP_TOS {
                     let data = libc::CMSG_DATA(cmsg_ptr) as *const u8;
                     tclass_opt = Some(*data);
@@ -465,7 +496,7 @@ mod linux {
                     let data = libc::CMSG_DATA(cmsg_ptr) as *const libc::c_int;
                     tclass_opt = Some((*data as u8));
                 }
-    
+
                 if let Some(tclass) = tclass_opt {
                     let ecn_bits = tclass & 0b11;
                     congested = ecn_bits == 0b11;
@@ -473,14 +504,14 @@ mod linux {
                     dscp = Dscp::from_u8(tclass >> 2);
                     break;
                 }
-    
+
                 cmsg_ptr = libc::CMSG_NXTHDR(&msg as *const _, cmsg_ptr);
             }
         }
-    
+
         Ok((n as usize, src_ip6, src_port, congested, ecn_enabled, dscp, timestamp_ns))
     }
-    
+
     #[inline]
     pub fn udp_probe_source_addresses( // Linux
         udp_socket: SockHandle,
@@ -497,14 +528,14 @@ mod linux {
                 if ipv4_probe_fd < 0 {
                     panic!("socket() failed: {}", std::io::Error::last_os_error());
                 }
-            
+
                 let mut dst: libc::sockaddr_in = std::mem::zeroed();
                 dst.sin_family = libc::AF_INET as _;
                 dst.sin_port = 53u16.to_be();
                 dst.sin_addr = libc::in_addr {
                     s_addr: u32::from_be_bytes([1, 1, 1, 1]),
                 };
-            
+
                 let ret = if libc::connect(
                     ipv4_probe_fd,
                     &dst as *const _ as *const libc::sockaddr,
@@ -522,7 +553,7 @@ mod linux {
                     let mut local: libc::sockaddr_in = std::mem::zeroed();
                     let mut local_len =
                         std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-            
+
                     if libc::getsockname(
                         ipv4_probe_fd,
                         &mut local as *mut _ as *mut libc::sockaddr,
@@ -531,27 +562,27 @@ mod linux {
                     {
                         panic!("ipv4 probe getsockname() failed: {}", std::io::Error::last_os_error());
                     }
-            
+
                     let addr = std::net::Ipv4Addr::from(u32::from_be(local.sin_addr.s_addr)).to_ipv6_mapped();
-            
+
                     if addr.is_unspecified() || addr.is_loopback() || addr.is_unicast_link_local() {
                         None
                     } else {
                         Some(addr)
                     }
                 };
-                
+
                 if libc::close(ipv4_probe_fd) != 0 {
                     panic!("close() failed: {}", std::io::Error::last_os_error());
                 }
                 ret
             };
-            
+
             let known_good_ipv6_address = udp_socket.1;
             if known_good_ipv6_address.is_some() {
                 return (ipv4, known_good_ipv6_address);
             }
-    
+
             let ipv6 = {
                 let ipv6_probe_fd = unsafe {
                     libc::socket(
@@ -563,7 +594,7 @@ mod linux {
                 if ipv6_probe_fd < 0 {
                     panic!("socket() failed: {}", std::io::Error::last_os_error());
                 }
-        
+
                 let mut dst: libc::sockaddr_in6 = std::mem::zeroed();
                 dst.sin6_family = libc::AF_INET6 as _;
                 dst.sin6_port = 53u16.to_be();
@@ -575,7 +606,7 @@ mod linux {
                         0x00, 0x00, 0x11, 0x11,
                     ],
                 };
-    
+
                 let ret = if libc::connect(
                     ipv6_probe_fd,
                     &dst as *const _ as *const libc::sockaddr,
@@ -593,7 +624,7 @@ mod linux {
                     let mut local: libc::sockaddr_in6 = std::mem::zeroed();
                     let mut local_len =
                         std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
-    
+
                     if libc::getsockname(
                         ipv6_probe_fd,
                         &mut local as *mut _ as *mut libc::sockaddr,
@@ -602,10 +633,10 @@ mod linux {
                     {
                         panic!("ipv6 probe getsockname() failed: {}", std::io::Error::last_os_error());
                     }
-    
+
                     let addr = Ipv6Addr::from(local.sin6_addr.s6_addr);
                     let seg = addr.segments();
-    
+
                     if addr.is_unspecified()
                         || addr.is_loopback()
                         || addr.is_multicast()
@@ -617,13 +648,13 @@ mod linux {
                         Some(addr)
                     }
                 };
-                
+
                 if libc::close(ipv6_probe_fd) != 0 {
                     panic!("close() failed: {}", std::io::Error::last_os_error());
                 }
                 ret
             };
-    
+
             (ipv4, ipv6)
         }
     }
@@ -742,7 +773,7 @@ mod windows {
             }
         }
     }
-    
+
     #[inline]
     pub fn monotonic_clock_setup() { // Windows
         unsafe {
@@ -852,6 +883,16 @@ mod windows {
             return None;
         }
 
+        // Disable fragmentation
+        if setsockopt_u32(sock, IPPROTO_IPV6 as i32, IPV6_DONTFRAG as i32, 1) == SOCKET_ERROR {
+            eprintln!("setsockopt(IPV6_DONTFRAG=1) failed: {}", wsa_last_error());
+            return None;
+        }
+        if setsockopt_u32(sock, IPPROTO_IP as i32, IP_DONTFRAGMENT as i32, 1) == SOCKET_ERROR {
+            eprintln!("setsockopt(IP_DONTFRAGMENT=1) failed: {}", wsa_last_error());
+            return None;
+        }
+
         let recvmsg = get_wsarecvmsg(sock);
 
         Some(SockHandle(sock, recvmsg))
@@ -864,29 +905,26 @@ mod windows {
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
-    ) -> std::io::Result<u64> {
+        ecn_signal: bool,
+    ) -> u64 {
         let sock = udp_socket.0;
 
-        // full TCLASS/TOS byte: DSCP in upper 6 bits, ECN=ECT(0) (0b10)
-        let tclass_byte: u8 = ((dscp as u8) << 2) | 0b10;
+        let tclass_byte: u8 = ((dscp as u8) << 2) | if ecn_signal { 0b11 } else { 0b10 };
         let tclass_i32 = tclass_byte as i32;
 
-        // Best-effort per-send tagging via socket option before send.
-        // For v4-mapped destinations, use IP_TOS.
-        // For v6, use IPV6_TCLASS (some providers may not support it).
-        let is_v4_mapped = dst_ip6.to_ipv4_mapped().is_some();
-        let set_rc = if is_v4_mapped {
-            setsockopt_i32(sock, IPPROTO_IP as i32, IP_TOS as i32, tclass_i32)
-        } else {
-            setsockopt_i32(sock, IPPROTO_IPV6 as i32, IPV6_TCLASS as i32, tclass_i32)
-        };
-
-        if set_rc == SOCKET_ERROR {
-            let e = unsafe { WSAGetLastError() };
-            // Some Windows stacks/providers may reject IPV6_TCLASS. In that case,
-            // continue untagged rather than failing the send.
-            if !( !is_v4_mapped && e == WSAENOPROTOOPT ) {
-                return Err(std::io::Error::from_raw_os_error(e));
+        // Best-effort per-send TOS/TCLASS tagging. The socket is AF_INET6
+        // dual-stack bound to [::], so try both IP_TOS and IPV6_TCLASS.
+        // One or both may fail depending on Windows version and whether IPv4
+        // is enabled — absorb WSAEINVAL/WSAENOPROTOOPT and send untagged.
+        for &(proto, opt) in &[
+            (IPPROTO_IP as i32, IP_TOS as i32),
+            (IPPROTO_IPV6 as i32, IPV6_TCLASS as i32),
+        ] {
+            if setsockopt_i32(sock, proto, opt, tclass_i32) == SOCKET_ERROR {
+                let e = unsafe { WSAGetLastError() };
+                if e != WSAEINVAL && e != WSAENOPROTOOPT {
+                    panic!("UDP Socket error: {}", std::io::Error::from_raw_os_error(e));
+                }
             }
         }
 
@@ -912,16 +950,18 @@ mod windows {
             )
         };
         if n == SOCKET_ERROR {
-            return Err(wsa_last_error());
+            let e = unsafe { WSAGetLastError() };
+            if e == WSAEMSGSIZE || e == WSAEWOULDBLOCK || e == WSAENETUNREACH
+                || e == WSAEHOSTUNREACH || e == WSAECONNREFUSED || e == WSAECONNRESET {
+                return timestamp_ns;
+            }
+            panic!("UDP Socket error: {}", std::io::Error::from_raw_os_error(e));
         }
         if n as usize != payload.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                format!("partial UDP send: {} of {}", n, payload.len()),
-            ));
+            panic!("partial UDP send: {} of {}", n, payload.len());
         }
 
-        Ok(timestamp_ns)
+        timestamp_ns
     }
 
     #[inline]
@@ -1226,10 +1266,10 @@ mod macos {
             time * info.numer as u64 / info.denom as u64
         }
     }
-    
+
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     pub struct SockHandle(libc::c_int); // Mac
-    
+
     #[inline]
     pub fn setup_and_bind_udp_socket(port: u16) -> Option<SockHandle> { // Mac
         // Create an IPv6 UDP socket (we'll run it dual-stack via IPV6_V6ONLY=0).
@@ -1315,6 +1355,32 @@ mod macos {
                 eprintln!("Failed to enable IPV6_RECVPKTINFO: {}", std::io::Error::last_os_error());
                 return None;
             }
+
+            // Disable fragmentation
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_DONTFRAG,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            ) != 0
+            {
+                eprintln!("Failed to set IPV6_DONTFRAG: {}", std::io::Error::last_os_error());
+                return None;
+            }
+
+            let ip_dontfrag: libc::c_int = 1;
+            if libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_DONTFRAG,
+                &ip_dontfrag as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&ip_dontfrag) as libc::socklen_t,
+            ) != 0
+            {
+                eprintln!("Failed to set IP_DONTFRAG: {}", std::io::Error::last_os_error());
+                return None;
+            }
         }
 
         Some(SockHandle(fd))
@@ -1333,7 +1399,8 @@ mod macos {
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
-    ) -> std::io::Result<u64> {
+        ecn_signal: bool,
+    ) -> u64 {
         // Darwin constants (not always exposed by Rust libc)
         const SO_NET_SERVICE_TYPE: libc::c_int = 0x1116;
 
@@ -1361,7 +1428,7 @@ mod macos {
                 std::mem::size_of_val(&svc) as libc::socklen_t,
             ) != 0
             {
-                return Err(std::io::Error::last_os_error());
+                panic!("UDP Socket error: {}", std::io::Error::last_os_error());
             }
         }
 
@@ -1389,16 +1456,12 @@ mod macos {
         msg.msg_control = cbuf.as_mut_ptr().cast::<libc::c_void>();
         msg.msg_controllen = cbuf.len() as u32;
 
-        // 4) DSCP + ECN (ECT(0) = 0b10).
-        let tclass_byte: u8 = ((dscp as u8) << 2) | 0b10;
+        let tclass_byte: u8 = ((dscp as u8) << 2) | if ecn_signal { 0b11 } else { 0b10 };
 
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg as *const _ as *mut _);
             if cmsg.is_null() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "CMSG_FIRSTHDR returned null",
-                ));
+                panic!("CMSG_FIRSTHDR returned null");
             }
 
             (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
@@ -1415,17 +1478,20 @@ mod macos {
             let timestamp_ns = monotonic_clock_ns();
             let n = libc::sendmsg(fd, &msg as *const _ as *mut _, 0);
             if n < 0 {
-                return Err(std::io::Error::last_os_error());
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EMSGSIZE) || err.raw_os_error() == Some(libc::EAGAIN)
+                    || err.raw_os_error() == Some(libc::ENETUNREACH) || err.raw_os_error() == Some(libc::EHOSTUNREACH)
+                    || err.raw_os_error() == Some(libc::ENETDOWN) || err.raw_os_error() == Some(libc::ECONNREFUSED) {
+                    return timestamp_ns;
+                }
+                panic!("UDP Socket error: {}", err);
             }
 
             if n as usize != payload.len() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    format!("partial UDP send: {n} of {}", payload.len()),
-                ));
+                panic!("partial UDP send: {n} of {}", payload.len());
             }
 
-            Ok(timestamp_ns)
+            timestamp_ns
         }
     }
 
@@ -1683,7 +1749,7 @@ mod macos {
             (ipv4, ipv6)
         }
     }
-    
+
 }
 
 //#[test]

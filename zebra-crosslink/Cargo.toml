@@ -274,3 +274,13 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(tokio_unstable)', # Used by tokio-console
     'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu7"))' # Used in Zebra and librustzcash
 ] }
+
+# core2 has been yanked from crates.io
+[patch.crates-io.core2]
+git = "https://github.com/technocreatives/core2.git"
+tag = "v0.3.3"
+
+# Widen libsqlite3-sys requirement to be compatible with rusqlite 0.37
+[patch.crates-io.sqlx-sqlite]
+path = "../patches/sqlx-sqlite-0.8.6"
+

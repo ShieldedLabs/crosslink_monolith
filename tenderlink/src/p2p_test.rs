@@ -128,9 +128,9 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
         if !use_ipv6 && address.is_ipv6() {
             continue;
         }
-        if let Err(s) = connect_to(&mut connections_map, &my_keypairs, address) {
-            println_redraw!(chat_buf, name, "{}", s);
-        }
+        //if let Err(s) = connect_to(&mut connections_map, &my_keypairs, address) {
+        //    println_redraw!(chat_buf, name, "{}", s);
+        //}
     }
 
     println_redraw!(chat_buf, name, "");
@@ -251,7 +251,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
 
                 if PRINT_PEER_LIST { clear_line(); print!("Got PACKET_TYPE_PEER_LIST, with {} peer addresses: ", chunks.len()); }
 
-                let mut new_peers = Vec::new();
+                let mut new_peers: Vec<(STPAddress, Result<(), String>)> = Vec::new();
 
                 let mut comma = false;
                 for chunk in chunks {
@@ -294,7 +294,7 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
                     if !use_ipv6 && address.is_ipv6() {
                         continue;
                     }
-                    new_peers.push((address.clone(), connect_to(&mut connections_map, &my_keypairs, &address)));
+                    //new_peers.push((address.clone(), connect_to(&mut connections_map, &my_keypairs, &address)));
                 }
 
                 if PRINT_PEER_LIST { println!(""); redraw(&chat_buf, &name); }
