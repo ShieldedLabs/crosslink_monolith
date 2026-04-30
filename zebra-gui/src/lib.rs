@@ -1226,9 +1226,14 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                         winit::event::Event::WindowEvent { window_id: _window_id, event } => {
                             // println!("Event! :) {:?}", event);
                             match event {
-                                winit::event::WindowEvent::CursorEntered { device_id } |
+                                winit::event::WindowEvent::CursorEntered { device_id } => {
+                                    input_ctx.should_process_mouse_events = true;
+                                },
                                 winit::event::WindowEvent::CursorLeft    { device_id } => {
-                                    input_ctx.should_process_mouse_events = event == winit::event::WindowEvent::CursorEntered{ device_id };
+                                    input_ctx.should_process_mouse_events = false;
+                                    input_ctx.mouse_down     &= !MOUSE_LEFT;
+                                    input_ctx.mouse_pressed  &= !MOUSE_LEFT;
+                                    input_ctx.mouse_released |=  MOUSE_LEFT;
                                 },
                                 winit::event::WindowEvent::CursorMoved { device_id, position } => {
                                     input_ctx.this_mouse_pos = (position.x as isize, position.y as isize);
