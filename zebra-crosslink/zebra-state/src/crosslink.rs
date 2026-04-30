@@ -26,7 +26,7 @@ pub enum TFLBlockFinality {
 /// Types of requests that can be made to the TFLService.
 ///
 /// These map one to one to the variants of the same name in [`TFLServiceResponse`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum TFLServiceRequest {
     /// Is the TFL service activated yet?
     IsTFLActivated,
@@ -48,6 +48,8 @@ pub enum TFLServiceRequest {
     StakingCmd(String),
     /// faucet
     Faucet(String),
+    /// For crosslink testnet 1
+    TotalIssuanceFromKey(zcash_keys::keys::UnifiedFullViewingKey),
 }
 
 /// Types of responses that can be returned by the TFLService.
@@ -75,6 +77,8 @@ pub enum TFLServiceResponse {
     StakingCmd,
     /// Faucet
     Faucet(Result<u64, String>),
+    /// Response to [`ReadRequest::TotalIssuanceFromKey`]
+    TotalIssuanceFromKey(Result<u64, String>),
 }
 
 /// Errors that can occur when interacting with the TFLService.

@@ -560,6 +560,10 @@ pub trait Rpc {
     #[method(name = "getbestblockheightandhash")]
     fn get_best_block_height_and_hash(&self) -> Result<GetBlockHeightAndHashResponse>;
 
+    /// For crosslink testnet 1
+    #[method(name = "get_total_issuance")]
+    async fn get_total_issuance(&self, ufvk: String) -> Result<u64>;
+
     /// Returns all transaction ids in the memory pool, as a JSON array.
     ///
     /// # Parameters
@@ -2441,6 +2445,25 @@ where
             .best_tip_height_and_hash()
             .map(|(height, hash)| GetBlockHeightAndHashResponse { height, hash })
             .ok_or_misc_error("No blocks in state")
+    }
+
+    async fn get_total_issuance(&self, ufvk_str: String) -> Result<u64> {
+        // TODO: @Prod @Testnet
+        let network = &zcash_protocol::consensus::TEST_NETWORK;
+        let ufvk = zcash_keys::keys::UnifiedFullViewingKey::decode(network, &ufvk_str)
+            .map_error(server::error::LegacyCode::InvalidAddressOrKey)?;
+
+        let res = self
+            .tfl_service
+            .clone()
+            .oneshot(TFLServiceRequest::TotalIssuanceFromKey(ufvk))
+            .await;
+        if let Ok(TFLServiceResponse::TotalIssuanceFromKey(res)) = res {
+            res.map_error(server::error::LegacyCode::InvalidAddressOrKey)
+        } else {
+            tracing::error!(?res, "Bad tfl service return.");
+            Err("invalid call").map_error(server::error::LegacyCode::InvalidParameter)
+        }
     }
 
     async fn get_raw_mempool(&self, verbose: Option<bool>) -> Result<GetRawMempoolResponse> {
