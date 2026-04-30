@@ -1,6 +1,6 @@
 pushd %~dp0\zebra-crosslink\
 
-$env:RUSTFLAGS="-Awarnings"
-cargo run -F viz_gui --profile release-debug
+set RUSTFLAGS=-Awarnings
+cargo build -F viz_gui
 
 popd

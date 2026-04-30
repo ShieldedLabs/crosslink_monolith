@@ -1275,7 +1275,8 @@ async fn total_issuance_from_key(
             Err(err) => return Err(format!("failed to serialize coinbase tx at height {height}: {err:?}")),
         };
 
-        pass tx to wallet::scanner::scan
+        wallet::scanner::scan(&coinbase_tx_bytes, height, &ufvk);
+        
     }
 
     Ok(1)
