@@ -17,6 +17,8 @@ use wallet;
 mod viz_gui;
 pub use viz_gui::*;
 
+use std::collections::HashMap;
+
 const TURN_OFF_HASH_BASED_LAZY_RENDER: usize = 0;
 
 #[derive(Clone, Copy, PartialOrd, PartialEq, Ord, Eq, Debug, Default)]
@@ -181,7 +183,6 @@ fn dennis_parallel_for(p_thread_context: *mut ThreadContext, is_last_time: bool,
     }
 }
 
-use std::collections::HashMap;
 
 // Note(Giovanni): Cache key for text measurement.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1226,9 +1227,14 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                         winit::event::Event::WindowEvent { window_id: _window_id, event } => {
                             // println!("Event! :) {:?}", event);
                             match event {
-                                winit::event::WindowEvent::CursorEntered { device_id } |
+                                winit::event::WindowEvent::CursorEntered { device_id } => {
+                                    input_ctx.should_process_mouse_events = true;
+                                },
                                 winit::event::WindowEvent::CursorLeft    { device_id } => {
-                                    input_ctx.should_process_mouse_events = event == winit::event::WindowEvent::CursorEntered{ device_id };
+                                    input_ctx.should_process_mouse_events = false;
+                                    input_ctx.mouse_down     &= !MOUSE_LEFT;
+                                    input_ctx.mouse_pressed  &= !MOUSE_LEFT;
+                                    input_ctx.mouse_released |=  MOUSE_LEFT;
                                 },
                                 winit::event::WindowEvent::CursorMoved { device_id, position } => {
                                     input_ctx.this_mouse_pos = (position.x as isize, position.y as isize);
@@ -1492,11 +1498,13 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             
                                             // NOTE(Giovanni): Timer thingy //
                                             //{
-                                            //    let timer = Timer::scope_("viz_gui_draw_the_stuff_for_the_things", true);
-                                                   viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut ui, &mut draw_ctx, dt as f32, &input_ctx);
+                                            //  let timer = Timer::scope_("viz_gui_draw_the_stuff_for_the_things", true);
+                                                viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut ui, &mut draw_ctx, dt as f32, &input_ctx);
                                             //}
                                             //////////////////////////////////
                                             {
+                                                //let timer = Timer::scope_("ui_update", true);
+
                                                 let should_quit = ui_update(&mut ui, &mut data, &mut viz_state, wallet_state.clone());
                                                 if should_quit {
                                                     elwt.exit();
@@ -1803,20 +1811,25 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                             let draw_command_count = *(*ctx.draw_ctx).draw_command_count;
                                                             for cmd_i in 0..draw_command_count {
                                                                 match *draw_commands.byte_add(size_of::<DrawCommand>()*cmd_i) {
-                                                                    DrawCommand::ClearScreenToColor { color } => {
-                                                                        hasher.write_u64(0x83459345890234);
-                                                                        hasher.write_u32(color);
-                                                                        if should_draw == false { continue; }
-                                                                        let mut row_pixels = ctx.render_target_0.byte_add(((tile_pixel_x + (tile_pixel_y << pixel_row_shift)) as usize) << 2);
-                                                                        for _y in tile_pixel_y..tile_pixel_y2 {
-                                                                            let mut cursor_pixels = row_pixels;
-                                                                            for _x in tile_pixel_x..tile_pixel_x2 {
-                                                                                *(cursor_pixels as *mut u32) = color;
-                                                                                cursor_pixels = cursor_pixels.byte_add(4);
-                                                                            }
-                                                                            row_pixels = row_pixels.byte_add(4 << pixel_row_shift);
-                                                                        }
-                                                                    }
+                                                                     DrawCommand::ClearScreenToColor { color } => {
+                                                                         hasher.write_u64(0x83459345890234);
+                                                                         hasher.write_u32(color);
+                                                                         if should_draw == false { continue; }
+                                                                         let tile_w = (tile_pixel_x2 - tile_pixel_x) as usize;
+                                                                         let tile_h = (tile_pixel_y2 - tile_pixel_y) as usize;
+                                                                         let row_start = ctx.render_target_0.byte_add(((tile_pixel_x + (tile_pixel_y << pixel_row_shift)) as usize) << 2);
+                                                                         let row_stride = 4 << pixel_row_shift;
+                                                                         if tile_w > 0 && tile_h > 0 {
+                                                                             let first_row = row_start as *mut u32;
+                                                                             for x in 0..tile_w {
+                                                                                 *first_row.add(x) = color;
+                                                                             }
+                                                                             for y in 1..tile_h {
+                                                                                 let dst = row_start.byte_add(y * row_stride) as *mut u32;
+                                                                                 copy_nonoverlapping(first_row, dst, tile_w);
+                                                                             }
+                                                                         }
+                                                                     }
                                                                     DrawCommand::Scissor { x1, y1, x2, y2 } => {
                                                                         hasher.write_u64(0x897235923645643);
                                                                         hasher.write_isize(x1);
@@ -1829,187 +1842,168 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                                         scissor_x2 = x2;
                                                                         scissor_y2 = y2;
                                                                     }
-                                                                    DrawCommand::RoundedRectangle {
-                                                                        x: ofx,
-                                                                        x2: ofx2,
-                                                                        y: ofy,
-                                                                        y2: ofy2,
-                                                                        radius_tl,
-                                                                        radius_tr,
-                                                                        radius_bl,
-                                                                        radius_br,
-                                                                        color
-                                                                    } => {
-                                                                        let radius_tl = radius_tl as f32;
-                                                                        let radius_tr = radius_tr as f32;
-                                                                        let radius_bl = radius_bl as f32;
-                                                                        let radius_br = radius_br as f32;
+                                                                     DrawCommand::RoundedRectangle {
+                                                                         x: ofx,
+                                                                         x2: ofx2,
+                                                                         y: ofy,
+                                                                         y2: ofy2,
+                                                                         radius_tl,
+                                                                         radius_tr,
+                                                                         radius_bl,
+                                                                         radius_br,
+                                                                         color
+                                                                     } => {
+                                                                         let radius_tl = radius_tl as f32;
+                                                                         let radius_tr = radius_tr as f32;
+                                                                         let radius_bl = radius_bl as f32;
+                                                                         let radius_br = radius_br as f32;
 
-                                                                        // let radius_t = radius_tl.min(radius_tr);
-                                                                        // let radius_t = radius_tl.min(radius_tr);
+                                                                         let ix = (ofx.floor() as u32).max(tile_pixel_x);
+                                                                         let ix2 = (ofx2.ceil() as u32).min(tile_pixel_x2);
+                                                                         let iy = (ofy.floor() as u32).max(tile_pixel_y);
+                                                                         let iy2 = (ofy2.ceil() as u32).min(tile_pixel_y2);
+                                                                         if ix >= ix2 || iy >= iy2 { continue; }
+                                                                         hasher.write_u64(0x854893982097);
+                                                                         hasher.write_u32(ofx.to_bits());
+                                                                         hasher.write_u32(ofx2.to_bits());
+                                                                         hasher.write_u32(ofy.to_bits());
+                                                                         hasher.write_u32(ofy2.to_bits());
+                                                                         hasher.write_u32(radius_tl.to_bits());
+                                                                         hasher.write_u32(radius_tr.to_bits());
+                                                                         hasher.write_u32(radius_bl.to_bits());
+                                                                         hasher.write_u32(radius_br.to_bits());
+                                                                         hasher.write_u32(color);
+                                                                         if should_draw == false { continue; }
+                                                                         if scissor_x1 >= scissor_x2 { continue; }
+                                                                         if scissor_y1 >= scissor_y2 { continue; }
 
+                                                                         let eff_x1 = ix.max(scissor_x1 as u32);
+                                                                         let eff_x2 = ix2.min(scissor_x2 as u32);
+                                                                         let eff_y1 = iy.max(scissor_y1 as u32);
+                                                                         let eff_y2 = iy2.min(scissor_y2 as u32);
+                                                                         if eff_x1 >= eff_x2 || eff_y1 >= eff_y2 { continue; }
 
-                                                                        let ix = (ofx.floor() as u32).max(tile_pixel_x);
-                                                                        let ix2 = (ofx2.ceil() as u32).min(tile_pixel_x2);
-                                                                        let iy = (ofy.floor() as u32).max(tile_pixel_y);
-                                                                        let iy2 = (ofy2.ceil() as u32).min(tile_pixel_y2);
-                                                                        if ix >= ix2 || iy >= iy2 { continue; }
-                                                                        hasher.write_u64(0x854893982097);
-                                                                        // hasher.write_u32(ofx.max(tile_pixel_x as f32 - radius).to_bits());
-                                                                        // hasher.write_u32(ofx2.min(tile_pixel_x2 as f32 + radius).to_bits());
-                                                                        // hasher.write_u32(ofy.max(tile_pixel_y as f32 - radius).to_bits());
-                                                                        // hasher.write_u32(ofy2.min(tile_pixel_y2 as f32 + radius).to_bits());
-                                                                        hasher.write_u32(ofx.to_bits());
-                                                                        hasher.write_u32(ofx2.to_bits());
-                                                                        hasher.write_u32(ofy.to_bits());
-                                                                        hasher.write_u32(ofy2.to_bits());
-                                                                        hasher.write_u32(radius_tl.to_bits());
-                                                                        hasher.write_u32(radius_tr.to_bits());
-                                                                        hasher.write_u32(radius_bl.to_bits());
-                                                                        hasher.write_u32(radius_br.to_bits());
-                                                                        hasher.write_u32(color);
-                                                                        if should_draw == false { continue; }
-                                                                        if scissor_x1 >= scissor_x2 { continue; }
-                                                                        if scissor_y1 >= scissor_y2 { continue; }
-                                                                        let mut row_pixels = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
-                                                                        let color_alpha = (color >> 24) as f32 / 255.0;
-                                                                        for _y in iy..iy2 {
-                                                                            let _fy = _y as f32;
-                                                                            let row_alpha = (1.0 - (ofy - _fy).clamp(0.0, 1.0)) * (ofy2 - _fy).clamp(0.0, 1.0);
-                                                                            let mut cursor_pixels = row_pixels;
-                                                                            for _x in ix..ix2 {
-                                                                                let _fx = _x as f32;
-                                                                                let mut cover_alpha = (1.0 - (ofx - _fx).clamp(0.0, 1.0)) * (ofx2 - _fx).clamp(0.0, 1.0) * row_alpha;
-                                                                                // top left
-                                                                                {
-                                                                                    let lx = _fx-ofx2+radius_tl;
-                                                                                    let ly = ofy-(_fy+1.0)+radius_tl;
-                                                                                    let v1 = lx*lx.abs()+ly*ly.abs();
-                                                                                    let new_alpha = radius_tl - v1.sqrt();
-                                                                                    cover_alpha = select_float(v1 >= 0.0, cover_alpha.min(new_alpha), cover_alpha,);
-                                                                                }
-                                                                                // top right
-                                                                                {
-                                                                                    let lx = ofx-(_fx+1.0)+radius_tr;
-                                                                                    let ly = ofy-(_fy+1.0)+radius_tr;
-                                                                                    let v1 = lx*lx.abs()+ly*ly.abs();
-                                                                                    let new_alpha = radius_tr - v1.sqrt();
-                                                                                    cover_alpha = select_float(v1 >= 0.0, cover_alpha.min(new_alpha), cover_alpha,);
-                                                                                }
-                                                                                // bottom left
-                                                                                {
-                                                                                    let lx = _fx-ofx2+radius_bl;
-                                                                                    let ly = _fy-ofy2+radius_bl;
-                                                                                    let v1 = lx*lx.abs()+ly*ly.abs();
-                                                                                    let new_alpha = radius_bl - v1.sqrt();
-                                                                                    cover_alpha = select_float(v1 >= 0.0, cover_alpha.min(new_alpha), cover_alpha,);
-                                                                                }
-                                                                                // bottom right
-                                                                                {
-                                                                                    let lx = ofx-(_fx+1.0)+radius_br;
-                                                                                    let ly = _fy-ofy2+radius_br;
-                                                                                    let v1 = lx*lx.abs()+ly*ly.abs();
-                                                                                    let new_alpha = radius_br - v1.sqrt();
-                                                                                    cover_alpha = select_float(v1 >= 0.0, cover_alpha.min(new_alpha), cover_alpha,);
-                                                                                }
-                                                                                let pixel_alpha = color_alpha * cover_alpha;
+                                                                         let color_alpha = (color >> 24) as f32 / 255.0;
+                                                                         let mut row_pixels = ctx.render_target_0.byte_add(((eff_x1 + (eff_y1 << pixel_row_shift)) as usize) << 2);
+                                                                         let row_stride_bytes = 4 << pixel_row_shift;
+                                                                         let row_pixel_count = (eff_x2 - eff_x1) as usize;
 
-                                                                                if (_x as isize) >= scissor_x1 && (_x as isize) < scissor_x2 &&
-                                                                                   (_y as isize) >= scissor_y1 && (_y as isize) < scissor_y2 {  // @Scissor
-                                                                                    *(cursor_pixels as *mut u32) = blend_u32(*(cursor_pixels as *mut u32), color,  (pixel_alpha * 255.0).round() as u32);
-                                                                                }
-                                                                                cursor_pixels = cursor_pixels.byte_add(4);
-                                                                            }
-                                                                            row_pixels = row_pixels.byte_add(4 << pixel_row_shift);
-                                                                        }
-                                                                    },
-                                                                    DrawCommand::TextRow { y, glyph_row_shift, color, font_tracker_id, font_row_index, glyph_bitmap_run, glyph_bitmap_run_len } => {
-                                                                        if (y as u32) < tile_pixel_y || (y as u32) >= tile_pixel_y2 { continue; }
-                                                                        if (y as isize) < scissor_y1 || (y as isize) >= scissor_y2 { continue; } // @Scissor
+                                                                         for _y in eff_y1..eff_y2 {
+                                                                             let _fy = _y as f32;
+                                                                             let row_alpha = (1.0 - (ofy - _fy).clamp(0.0, 1.0)) * (ofy2 - _fy).clamp(0.0, 1.0);
+                                                                             let mut cursor_pixels = row_pixels as *mut u32;
+                                                                             for _x in eff_x1..eff_x2 {
+                                                                                 let _fx = _x as f32;
+                                                                                 let mut cover_alpha = (1.0 - (ofx - _fx).clamp(0.0, 1.0)) * (ofx2 - _fx).clamp(0.0, 1.0) * row_alpha;
+                                                                                 let tl_dist = { let lx = _fx-ofx2+radius_tl; let ly = ofy-(_fy+1.0)+radius_tl; lx*lx.abs()+ly*ly.abs() };
+                                                                                 if tl_dist >= 0.0 { let a = radius_tl - tl_dist.sqrt(); if a < cover_alpha { cover_alpha = a; } }
+                                                                                 let tr_dist = { let lx = ofx-(_fx+1.0)+radius_tr; let ly = ofy-(_fy+1.0)+radius_tr; lx*lx.abs()+ly*ly.abs() };
+                                                                                 if tr_dist >= 0.0 { let a = radius_tr - tr_dist.sqrt(); if a < cover_alpha { cover_alpha = a; } }
+                                                                                 let bl_dist = { let lx = _fx-ofx2+radius_bl; let ly = _fy-ofy2+radius_bl; lx*lx.abs()+ly*ly.abs() };
+                                                                                 if bl_dist >= 0.0 { let a = radius_bl - bl_dist.sqrt(); if a < cover_alpha { cover_alpha = a; } }
+                                                                                 let br_dist = { let lx = ofx-(_fx+1.0)+radius_br; let ly = _fy-ofy2+radius_br; lx*lx.abs()+ly*ly.abs() };
+                                                                                 if br_dist >= 0.0 { let a = radius_br - br_dist.sqrt(); if a < cover_alpha { cover_alpha = a; } }
+                                                                                 let pixel_alpha = color_alpha * cover_alpha;
+                                                                                 *cursor_pixels = blend_u32(*cursor_pixels, color, (pixel_alpha * 255.0).round() as u32);
+                                                                                 cursor_pixels = cursor_pixels.add(1);
+                                                                             }
+                                                                             row_pixels = row_pixels.byte_add(row_stride_bytes);
+                                                                         }
+                                                                     },
+                                                                     DrawCommand::TextRow { y, glyph_row_shift, color, font_tracker_id, font_row_index, glyph_bitmap_run, glyph_bitmap_run_len } => {
+                                                                         if (y as u32) < tile_pixel_y || (y as u32) >= tile_pixel_y2 { continue; }
+                                                                         if (y as isize) < scissor_y1 || (y as isize) >= scissor_y2 { continue; }
 
-                                                                        let font_tracker = &*(*ctx.draw_ctx).font_tracker_buffer.add(font_tracker_id as usize);
-                                                                        let bitmap_widths = font_tracker.cached_bitmap_widths.as_ptr();
-                                                                        let row_bitmaps = font_tracker.row_buffers[font_row_index as usize].as_ptr();
+                                                                         let font_tracker = &*(*ctx.draw_ctx).font_tracker_buffer.add(font_tracker_id as usize);
+                                                                         let bitmap_widths = font_tracker.cached_bitmap_widths.as_ptr();
+                                                                         let row_bitmaps = font_tracker.row_buffers[font_row_index as usize].as_ptr();
 
-                                                                        for i in 0..glyph_bitmap_run_len {
-                                                                            let (lookup_index, start_x) = *glyph_bitmap_run.add(i);
-                                                                            let width = *bitmap_widths.add(lookup_index as usize) as usize;
+                                                                         let tile_scissor_x1 = tile_pixel_x as isize;
+                                                                         let tile_scissor_x2 = tile_pixel_x2 as isize;
+                                                                         let eff_scissor_x1 = scissor_x1.max(tile_scissor_x1);
+                                                                         let eff_scissor_x2 = scissor_x2.min(tile_scissor_x2);
+                                                                         if eff_scissor_x1 >= eff_scissor_x2 { continue; }
 
-                                                                            if (start_x as isize + width as isize - 1) < tile_pixel_x as isize { continue; }
-                                                                            if (start_x as isize) >= tile_pixel_x2 as isize { break; }
-                                                                            hasher.write_u64(0x8936730958944);
-                                                                            hasher.write_u16(lookup_index);
-                                                                            hasher.write_i16(start_x);
-                                                                            hasher.write_u16(y);
-                                                                            hasher.write_usize(row_bitmaps as usize);
-                                                                            hasher.write_usize(bitmap_widths as usize);
-                                                                            hasher.write_u32(color);
-                                                                            // TODO rethink, font id?
-                                                                            if should_draw == false { continue; }
-                                                                            if scissor_x1 >= scissor_x2 { continue; }
-                                                                            if scissor_y1 >= scissor_y2 { continue; }
+                                                                         let base_row_ptr = ctx.render_target_0.byte_add((y as usize) << (pixel_row_shift+2)) as *mut u32;
 
-                                                                            let mut copy_data = row_bitmaps.byte_add((lookup_index as usize) << glyph_row_shift);
-                                                                            let mut put_data = ctx.render_target_0.byte_add((y as usize) << (pixel_row_shift+2)).byte_offset(start_x as isize *4);
+                                                                         for i in 0..glyph_bitmap_run_len {
+                                                                             let (lookup_index, start_x) = *glyph_bitmap_run.add(i);
+                                                                             let width = *bitmap_widths.add(lookup_index as usize) as usize;
+                                                                             let glyph_x1 = start_x as isize;
+                                                                             let glyph_x2 = start_x as isize + width as isize;
 
-                                                                            let mut x1 = start_x as isize;
-                                                                            let x2 = (start_x as isize + width as isize).min(tile_pixel_x2 as isize);
-                                                                            if x1 < tile_pixel_x as isize {
-                                                                                copy_data = copy_data.byte_add((tile_pixel_x as isize - x1) as usize);
-                                                                                put_data = put_data.byte_add((tile_pixel_x as isize - x1) as usize * 4);
-                                                                                x1 = tile_pixel_x as isize;
-                                                                            }
-                                                                            let len = x2 - x1;
-                                                                            if len <= 0 { continue; }
-                                                                            for _x in x1..x2 {
-                                                                                let blend = *copy_data as u32;
-                                                                                copy_data = copy_data.byte_add(1);
-                                                                                if (_x as isize) >= scissor_x1 && (_x as isize) < scissor_x2 { // @Scissor
-                                                                                    *(put_data as *mut u32) = blend_u32(*(put_data as *mut u32), color, blend);
-                                                                                }
-                                                                                put_data = put_data.byte_add(4);
-                                                                            }
-                                                                        }
-                                                                    },
-                                                                    DrawCommand::PixelLineXDef { x1, y1, x2, y2, color, thickness, } => {
-                                                                        if thickness <= 1.0 {
-                                                                            let x1 = x1.round() as isize;
-                                                                            let y1 = y1.round() as isize;
-                                                                            let x2 = x2.round() as isize;
-                                                                            let y2 = y2.round() as isize;
-                                                                            let start_x = (x1 as isize).max(tile_pixel_x as isize);
-                                                                            let end_x = (x2 as isize).min(tile_pixel_x2 as isize);
-                                                                            if start_x >= end_x { continue; }
-                                                                            let dy = (y2 as f32 - y1 as f32) / x2.wrapping_sub(x1) as f32;
-                                                                            hasher.write_u64(0x75634593484);
-                                                                            hasher.write_isize(x1);
-                                                                            hasher.write_isize(x2);
-                                                                            hasher.write_isize(y1);
-                                                                            hasher.write_isize(y2);
-                                                                            hasher.write_u32(color);
-                                                                            hasher.write_u32(dy.to_bits());
-                                                                            if should_draw == false { continue; }
-                                                                            for real_x in start_x..end_x {
-                                                                                let fy = y1 as f32 + dy * (real_x - x1 as isize) as f32;
-                                                                                let iy1 = fy.floor() as isize;
-                                                                                let iy2 = iy1+1;
-                                                                                let coverage1 = (iy2 as f32 - fy).clamp(0.0, thickness);
-                                                                                let coverage2 = thickness - coverage1;
-                                                                                let blend1 = 255.0 * linear_to_srgb_one_channel_float(coverage1);
-                                                                                let blend2 = 255.0 * linear_to_srgb_one_channel_float(coverage2);
+                                                                             if glyph_x2 <= tile_scissor_x1 { continue; }
+                                                                             if glyph_x1 >= tile_scissor_x2 { break; }
 
-                                                                                if iy1 >= tile_pixel_y as isize && iy1 < tile_pixel_y2 as isize {
-                                                                                    let pixel = ctx.render_target_0.byte_add(((real_x + (iy1 << pixel_row_shift)) as usize) << 2);
-                                                                                    let this_color = blend_u32(*(pixel as *mut u32), color, blend1 as u32);
-                                                                                    *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
-                                                                                }
-                                                                                if iy2 >= tile_pixel_y as isize && iy2 < tile_pixel_y2 as isize {
-                                                                                    let pixel = ctx.render_target_0.byte_add(((real_x + (iy2 << pixel_row_shift)) as usize) << 2);
-                                                                                    let this_color = blend_u32(*(pixel as *mut u32), color, blend2 as u32);
-                                                                                    *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
-                                                                                }
-                                                                            }
-                                                                        } else {
+                                                                             hasher.write_u64(0x8936730958944);
+                                                                             hasher.write_u16(lookup_index);
+                                                                             hasher.write_i16(start_x);
+                                                                             hasher.write_u16(y);
+                                                                             hasher.write_usize(row_bitmaps as usize);
+                                                                             hasher.write_usize(bitmap_widths as usize);
+                                                                             hasher.write_u32(color);
+                                                                             if should_draw == false { continue; }
+                                                                             if scissor_x1 >= scissor_x2 { continue; }
+                                                                             if scissor_y1 >= scissor_y2 { continue; }
+
+                                                                             let x1 = glyph_x1.max(eff_scissor_x1);
+                                                                             let x2 = glyph_x2.min(eff_scissor_x2);
+                                                                             if x1 >= x2 { continue; }
+
+                                                                             let copy_offset = (x1 - glyph_x1) as usize;
+                                                                             let mut copy_data = row_bitmaps.byte_add((lookup_index as usize) << glyph_row_shift).byte_add(copy_offset);
+                                                                             let mut put_data = base_row_ptr.offset(start_x as isize).add(copy_offset);
+                                                                             let len = (x2 - x1) as usize;
+
+                                                                             for _ in 0..len {
+                                                                                 let blend = *copy_data as u32;
+                                                                                 copy_data = copy_data.byte_add(1);
+                                                                                 *put_data = blend_u32(*put_data, color, blend);
+                                                                                 put_data = put_data.add(1);
+                                                                             }
+                                                                         }
+                                                                     },
+                                                                     DrawCommand::PixelLineXDef { x1, y1, x2, y2, color, thickness, } => {
+                                                                         if thickness <= 1.0 {
+                                                                             let x1 = x1.round() as isize;
+                                                                             let y1 = y1.round() as isize;
+                                                                             let x2 = x2.round() as isize;
+                                                                             let y2 = y2.round() as isize;
+                                                                             let start_x = x1.max(tile_pixel_x as isize);
+                                                                             let end_x = x2.min(tile_pixel_x2 as isize);
+                                                                             if start_x >= end_x { continue; }
+                                                                             let dx = (x2 - x1) as f32;
+                                                                             let dy = (y2 as f32 - y1 as f32) / dx;
+                                                                             let inv_dx = 1.0 / dx;
+                                                                             let color_alpha = color >> 24;
+                                                                             hasher.write_u64(0x75634593484);
+                                                                             hasher.write_isize(x1);
+                                                                             hasher.write_isize(x2);
+                                                                             hasher.write_isize(y1);
+                                                                             hasher.write_isize(y2);
+                                                                             hasher.write_u32(color);
+                                                                             hasher.write_u32(dy.to_bits());
+                                                                             if should_draw == false { continue; }
+                                                                             for real_x in start_x..end_x {
+                                                                                 let fy = y1 as f32 + dy * (real_x - x1) as f32;
+                                                                                 let iy1 = fy.floor() as isize;
+                                                                                 let iy2 = iy1 + 1;
+                                                                                 let frac = fy - iy1 as f32;
+                                                                                 let coverage1 = (1.0 - frac).clamp(0.0, thickness);
+                                                                                 let coverage2 = thickness - coverage1;
+                                                                                 let blend1 = (255.0 * linear_to_srgb_one_channel_float(coverage1) * color_alpha as f32 / 255.0) as u32;
+                                                                                 let blend2 = (255.0 * linear_to_srgb_one_channel_float(coverage2) * color_alpha as f32 / 255.0) as u32;
+
+                                                                                 if iy1 >= tile_pixel_y as isize && iy1 < tile_pixel_y2 as isize {
+                                                                                     let pixel = ctx.render_target_0.byte_add(((real_x + (iy1 << pixel_row_shift)) as usize) << 2) as *mut u32;
+                                                                                     *pixel = blend_u32(*pixel, color, blend1);
+                                                                                 }
+                                                                                 if iy2 >= tile_pixel_y as isize && iy2 < tile_pixel_y2 as isize {
+                                                                                     let pixel = ctx.render_target_0.byte_add(((real_x + (iy2 << pixel_row_shift)) as usize) << 2) as *mut u32;
+                                                                                     *pixel = blend_u32(*pixel, color, blend2);
+                                                                                 }
+                                                                             }
+                                                                         } else {
                                                                             // x1 is known to be less than x2 but this does not apply to y.
                                                                             let by_min = y1.min(y2);
                                                                             let by_max = y1.max(y2);
@@ -2025,70 +2019,72 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                                             hasher.write_u32(y1.to_bits());
                                                                             hasher.write_u32(y2.to_bits());
                                                                             hasher.write_u32(thickness.to_bits());
-                                                                            hasher.write_u32(color);
-                                                                            if should_draw == false { continue; }
+                                                                             hasher.write_u32(color);
+                                                                             if should_draw == false { continue; }
 
-                                                                            let dx = (x2 - x1) / (y2 - y1);
-                                                                            for iy in iy1..iy2 {
-                                                                                let fx = x1 as f32 + dx * (iy - y1 as isize) as f32;
-                                                                                let h = (thickness / 2.0 + 1.0) / f32::sin(f32::atan(1.0/dx.abs()));
-                                                                                let cull_ix1;
-                                                                                let cull_ix2;
-                                                                                if h.is_normal() {
-                                                                                    cull_ix1 = (fx - h).floor() as isize;
-                                                                                    cull_ix2 = (fx + h).ceil() as isize;
-                                                                                } else {
-                                                                                    cull_ix1 = 0;
-                                                                                    cull_ix2 = 9999999999;
-                                                                                }
-                                                                                for ix in ix1.max(cull_ix1)..ix2.min(cull_ix2) {
-                                                                                    let pixel = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
-                                                                                    let coverage = (1.0 - sd_segment((ix as f32, iy as f32), (x1, y1), (x2, y2), thickness / 2.0)).clamp(0.0, 1.0);
-                                                                                    let this_color = blend_u32(*(pixel as *mut u32), color, (coverage * 255.0) as u32);
-                                                                                    *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    },
-                                                                    DrawCommand::PixelLineYDef { x1, y1, x2, y2, color, thickness, } => {
-                                                                        if thickness <= 1.0 {
-                                                                            let x1 = x1.round() as i16;
-                                                                            let y1 = y1.round() as i16;
-                                                                            let x2 = x2.round() as i16;
-                                                                            let y2 = y2.round() as i16;
-                                                                            let start_y = (y1 as isize).max(tile_pixel_y as isize);
-                                                                            let end_y = (y2 as isize).min(tile_pixel_y2 as isize);
-                                                                            if start_y >= end_y { continue; }
-                                                                            let dx = (x2 as f32 - x1 as f32) / y2.wrapping_sub(y1) as f32;
-                                                                            hasher.write_u64(0x83248923897);
-                                                                            hasher.write_i16(x1);
-                                                                            hasher.write_i16(x2);
-                                                                            hasher.write_i16(y1);
-                                                                            hasher.write_i16(y2);
-                                                                            hasher.write_u32(color);
-                                                                            hasher.write_u32(dx.to_bits());
-                                                                            if should_draw == false { continue; }
-                                                                            for real_y in start_y..end_y {
-                                                                                let fx = x1 as f32 + dx * (real_y - y1 as isize) as f32;
-                                                                                let ix1 = fx.floor() as isize;
-                                                                                let ix2 = ix1+1;
-                                                                                let coverage1 = (ix2 as f32 - fx).clamp(0.0, thickness);
-                                                                                let coverage2 = thickness - coverage1;
-                                                                                let blend1 = 255.0 * linear_to_srgb_one_channel_float(coverage1);
-                                                                                let blend2 = 255.0 * linear_to_srgb_one_channel_float(coverage2);
+                                                                             let dx = (x2 - x1) / (y2 - y1);
+                                                                             let color_alpha = color >> 24;
+                                                                             for iy in iy1..iy2 {
+                                                                                 let fx = x1 as f32 + dx * (iy - y1 as isize) as f32;
+                                                                                 let h = (thickness / 2.0 + 1.0) / f32::sin(f32::atan(1.0/dx.abs()));
+                                                                                 let cull_ix1;
+                                                                                 let cull_ix2;
+                                                                                 if h.is_normal() {
+                                                                                     cull_ix1 = (fx - h).floor() as isize;
+                                                                                     cull_ix2 = (fx + h).ceil() as isize;
+                                                                                 } else {
+                                                                                     cull_ix1 = 0;
+                                                                                     cull_ix2 = 9999999999;
+                                                                                 }
+                                                                                 for ix in ix1.max(cull_ix1)..ix2.min(cull_ix2) {
+                                                                                     let pixel = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2) as *mut u32;
+                                                                                     let coverage = (1.0 - sd_segment((ix as f32, iy as f32), (x1, y1), (x2, y2), thickness / 2.0)).clamp(0.0, 1.0);
+                                                                                     let blend = (coverage * color_alpha as f32) as u32;
+                                                                                     *pixel = blend_u32(*pixel, color, blend);
+                                                                                 }
+                                                                             }
+                                                                         }
+                                                                     },
+                                                                     DrawCommand::PixelLineYDef { x1, y1, x2, y2, color, thickness, } => {
+                                                                         if thickness <= 1.0 {
+                                                                             let x1 = x1.round() as isize;
+                                                                             let y1 = y1.round() as isize;
+                                                                             let x2 = x2.round() as isize;
+                                                                             let y2 = y2.round() as isize;
+                                                                             let start_y = y1.max(tile_pixel_y as isize);
+                                                                             let end_y = y2.min(tile_pixel_y2 as isize);
+                                                                             if start_y >= end_y { continue; }
+                                                                             let dy = (y2 - y1) as f32;
+                                                                             let dx = (x2 as f32 - x1 as f32) / dy;
+                                                                             let color_alpha = color >> 24;
+                                                                             hasher.write_u64(0x83248923897);
+                                                                             hasher.write_isize(x1);
+                                                                             hasher.write_isize(x2);
+                                                                             hasher.write_isize(y1);
+                                                                             hasher.write_isize(y2);
+                                                                             hasher.write_u32(color);
+                                                                             hasher.write_u32(dx.to_bits());
+                                                                             if should_draw == false { continue; }
+                                                                             for real_y in start_y..end_y {
+                                                                                 let fx = x1 as f32 + dx * (real_y - y1) as f32;
+                                                                                 let ix1 = fx.floor() as isize;
+                                                                                 let ix2 = ix1 + 1;
+                                                                                 let frac = fx - ix1 as f32;
+                                                                                 let coverage1 = (1.0 - frac).clamp(0.0, thickness);
+                                                                                 let coverage2 = thickness - coverage1;
+                                                                                 let blend1 = (255.0 * linear_to_srgb_one_channel_float(coverage1) * color_alpha as f32 / 255.0) as u32;
+                                                                                 let blend2 = (255.0 * linear_to_srgb_one_channel_float(coverage2) * color_alpha as f32 / 255.0) as u32;
 
-                                                                                if ix1 >= tile_pixel_x as isize && ix1 < tile_pixel_x2 as isize {
-                                                                                    let pixel = ctx.render_target_0.byte_add(((ix1 + (real_y << pixel_row_shift)) as usize) << 2);
-                                                                                    let this_color = blend_u32(*(pixel as *mut u32), color, blend1 as u32);
-                                                                                    *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
-                                                                                }
-                                                                                if ix2 >= tile_pixel_x as isize && ix2 < tile_pixel_x2 as isize {
-                                                                                    let pixel = ctx.render_target_0.byte_add(((ix2 + (real_y << pixel_row_shift)) as usize) << 2);
-                                                                                    let this_color = blend_u32(*(pixel as *mut u32), color, blend2 as u32);
-                                                                                    *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
-                                                                                }
-                                                                            }
-                                                                        } else {
+                                                                                 if ix1 >= tile_pixel_x as isize && ix1 < tile_pixel_x2 as isize {
+                                                                                     let pixel = ctx.render_target_0.byte_add(((ix1 + (real_y << pixel_row_shift)) as usize) << 2) as *mut u32;
+                                                                                     *pixel = blend_u32(*pixel, color, blend1);
+                                                                                 }
+                                                                                 if ix2 >= tile_pixel_x as isize && ix2 < tile_pixel_x2 as isize {
+                                                                                     let pixel = ctx.render_target_0.byte_add(((ix2 + (real_y << pixel_row_shift)) as usize) << 2) as *mut u32;
+                                                                                     *pixel = blend_u32(*pixel, color, blend2);
+                                                                                 }
+                                                                             }
+                                                                         } else {
                                                                             // y1 is known to be less than y2 but this does not apply to x.
                                                                             let bx_min = x1.min(x2);
                                                                             let bx_max = x1.max(x2);
@@ -2104,35 +2100,36 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                                             hasher.write_u32(y1.to_bits());
                                                                             hasher.write_u32(y2.to_bits());
                                                                             hasher.write_u32(thickness.to_bits());
-                                                                            hasher.write_u32(color);
-                                                                            if should_draw == false { continue; }
+                                                                             hasher.write_u32(color);
+                                                                             if should_draw == false { continue; }
 
-                                                                            let dx = (x2 - x1) / (y2 - y1);
-                                                                            for iy in iy1..iy2 {
-                                                                                let fx = x1 as f32 + dx * (iy - y1 as isize) as f32;
-                                                                                let h = (thickness / 2.0 + 1.0) / f32::sin(f32::atan(1.0/dx.abs()));
-                                                                                let cull_ix1;
-                                                                                let cull_ix2;
-                                                                                if h.is_normal() {
-                                                                                    cull_ix1 = (fx - h).floor() as isize;
-                                                                                    cull_ix2 = (fx + h).ceil() as isize;
-                                                                                } else {
-                                                                                    cull_ix1 = 0;
-                                                                                    cull_ix2 = 9999999999;
-                                                                                }
-                                                                                for ix in ix1.max(cull_ix1)..ix2.min(cull_ix2) {
-                                                                                    let pixel = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2);
-                                                                                    let coverage = (1.0 - sd_segment((ix as f32, iy as f32), (x1, y1), (x2, y2), thickness / 2.0)).clamp(0.0, 1.0);
-                                                                                    let this_color = blend_u32(*(pixel as *mut u32), color, (coverage * 255.0) as u32);
-                                                                                    *(pixel as *mut u32) = blend_u32(*(pixel as *mut u32), this_color, color >> 24);
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    },
-                                                                }
-                                                            }
-                                                            got_hash = hasher.finish();
-                                                        }
+                                                                             let dx = (x2 - x1) / (y2 - y1);
+                                                                             let color_alpha = color >> 24;
+                                                                             for iy in iy1..iy2 {
+                                                                                 let fx = x1 as f32 + dx * (iy - y1 as isize) as f32;
+                                                                                 let h = (thickness / 2.0 + 1.0) / f32::sin(f32::atan(1.0/dx.abs()));
+                                                                                 let cull_ix1;
+                                                                                 let cull_ix2;
+                                                                                 if h.is_normal() {
+                                                                                     cull_ix1 = (fx - h).floor() as isize;
+                                                                                     cull_ix2 = (fx + h).ceil() as isize;
+                                                                                 } else {
+                                                                                     cull_ix1 = 0;
+                                                                                     cull_ix2 = 9999999999;
+                                                                                 }
+                                                                                 for ix in ix1.max(cull_ix1)..ix2.min(cull_ix2) {
+                                                                                     let pixel = ctx.render_target_0.byte_add(((ix + (iy << pixel_row_shift)) as usize) << 2) as *mut u32;
+                                                                                     let coverage = (1.0 - sd_segment((ix as f32, iy as f32), (x1, y1), (x2, y2), thickness / 2.0)).clamp(0.0, 1.0);
+                                                                                     let blend = (coverage * color_alpha as f32) as u32;
+                                                                                     *pixel = blend_u32(*pixel, color, blend);
+                                                                                 }
+                                                                             }
+                                                                         }
+                                                                     },
+                                                                 }
+                                                             }
+                                                             got_hash = hasher.finish();
+                                                         }
                                                     }
                                                 });
 
@@ -2239,36 +2236,39 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                 // draw those commands *manually*
                                                 for cmd_i in 0..*draw_ctx.draw_command_count {
                                                     match *draw_ctx.draw_command_buffer.add(cmd_i) {
-                                                        DrawCommand::TextRow { y, glyph_row_shift, color, font_tracker_id, font_row_index, glyph_bitmap_run, glyph_bitmap_run_len } => {
-                                                            let font_tracker = &*draw_ctx.font_tracker_buffer.add(font_tracker_id as usize);
-                                                            let bitmap_widths = font_tracker.cached_bitmap_widths.as_ptr();
-                                                            let row_bitmaps = font_tracker.row_buffers[font_row_index as usize].as_ptr();
+                                                         DrawCommand::TextRow { y, glyph_row_shift, color, font_tracker_id, font_row_index, glyph_bitmap_run, glyph_bitmap_run_len } => {
+                                                             let font_tracker = &*draw_ctx.font_tracker_buffer.add(font_tracker_id as usize);
+                                                             let bitmap_widths = font_tracker.cached_bitmap_widths.as_ptr();
+                                                             let row_bitmaps = font_tracker.row_buffers[font_row_index as usize].as_ptr();
 
-                                                            for i in 0..glyph_bitmap_run_len {
-                                                                let (lookup_index, start_x) = *glyph_bitmap_run.add(i);
-                                                                let width = *bitmap_widths.add(lookup_index as usize) as usize;
+                                                             let base_row_ptr = final_output_blit_buffer.byte_add(y as usize * window_width * 4) as *mut u32;
 
-                                                                let mut copy_data = row_bitmaps.byte_add((lookup_index as usize) << glyph_row_shift);
-                                                                let mut put_data = final_output_blit_buffer.byte_add(y as usize *window_width*4).byte_offset(start_x as isize *4);
+                                                             for i in 0..glyph_bitmap_run_len {
+                                                                 let (lookup_index, start_x) = *glyph_bitmap_run.add(i);
+                                                                 let width = *bitmap_widths.add(lookup_index as usize) as usize;
 
-                                                                let mut x1 = start_x as isize;
-                                                                let x2 = (start_x as isize + width as isize).min(window_width as isize);
-                                                                if x1 < 0 {
-                                                                    copy_data = copy_data.byte_add((0 - x1) as usize);
-                                                                    put_data = put_data.byte_add((0 - x1) as usize * 4);
-                                                                    x1 = 0;
-                                                                }
-                                                                if x1 >= x2 { continue; }
-                                                                let len = x2 - x1;
-                                                                debug_assert!(len != 0);
-                                                                for _ in 0..len {
-                                                                    let blend = *copy_data as u32;
-                                                                    copy_data = copy_data.byte_add(1);
-                                                                    *(put_data as *mut u32) = blend_u32(*(put_data as *mut u32), color, blend);
-                                                                    put_data = put_data.byte_add(4);
-                                                                }
-                                                            }
-                                                        },
+                                                                 let mut x1 = start_x as isize;
+                                                                 let x2 = (start_x as isize + width as isize).min(window_width as isize);
+                                                                 if x1 >= x2 { continue; }
+
+                                                                 let mut copy_data = row_bitmaps.byte_add((lookup_index as usize) << glyph_row_shift);
+                                                                 let mut put_data = base_row_ptr.offset(start_x as isize);
+                                                                 if x1 < 0 {
+                                                                     copy_data = copy_data.byte_add((-x1) as usize);
+                                                                     put_data = put_data.offset(-x1);
+                                                                     x1 = 0;
+                                                                 }
+                                                                 let len = (x2 - x1) as usize;
+                                                                 if len == 0 { continue; }
+
+                                                                 let put_ptr = put_data as *mut u32;
+                                                                 for idx in 0..len {
+                                                                     let blend = *copy_data.add(idx) as u32;
+                                                                     *put_ptr.add(idx) = blend_u32(*put_ptr.add(idx), color, blend);
+                                                                 }
+                                                                 copy_data = copy_data.byte_add(len);
+                                                             }
+                                                         },
                                                         _ => panic!("ehm what?"),
                                                     }
                                                 }
@@ -2288,17 +2288,20 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                     for t in 0..thick {
                                                         if y+t >= window_height { continue; }
                                                         let mut put_ptr = final_output_blit_buffer.byte_add((y+t)*window_width*4) as *mut u32;
-                                                        for x in 0..single_w {
-                                                            *put_ptr = blend_u32(*put_ptr, single_color, 128);
-                                                            put_ptr = put_ptr.byte_add(4);
+                                                        for _ in 0..single_w {
+                                                            let bg = *put_ptr;
+                                                            *put_ptr = ((bg & 0x00FEFEFE) >> 1) + ((single_color & 0x00FEFEFE) >> 1);
+                                                            put_ptr = put_ptr.add(1);
                                                         }
-                                                        for x in 0..work_w {
-                                                            *put_ptr = blend_u32(*put_ptr, work_color, 128);
-                                                            put_ptr = put_ptr.byte_add(4);
+                                                        for _ in 0..work_w {
+                                                            let bg = *put_ptr;
+                                                            *put_ptr = ((bg & 0x00FEFEFE) >> 1) + ((work_color & 0x00FEFEFE) >> 1);
+                                                            put_ptr = put_ptr.add(1);
                                                         }
-                                                        for x in 0..full_w {
-                                                            *put_ptr = blend_u32(*put_ptr, full_color, 128);
-                                                            put_ptr = put_ptr.byte_add(4);
+                                                        for _ in 0..full_w {
+                                                            let bg = *put_ptr;
+                                                            *put_ptr = ((bg & 0x00FEFEFE) >> 1) + ((full_color & 0x00FEFEFE) >> 1);
+                                                            put_ptr = put_ptr.add(1);
                                                         }
                                                     }
                                                 }
@@ -2454,22 +2457,11 @@ fn select_u32(b: bool, f1: u32, f2: u32) -> u32 {
 
 #[inline(always)]
 fn blend_u32(color_1: u32, color_2: u32, blend: u32) -> u32 {
-    let b1 = (color_1 >> 0) & 0xff;
-    let g1 = (color_1 >> 8) & 0xff;
-    let r1 = (color_1 >> 16) & 0xff;
-    let b2 = (color_2 >> 0) & 0xff;
-    let g2 = (color_2 >> 8) & 0xff;
-    let r2 = (color_2 >> 16) & 0xff;
-    let blend = clamp_u32(blend, 0, 255);
-    let b = (b1 as u32 * (255 - blend) + b2 * blend) / 255;
-    let g = (g1 as u32 * (255 - blend) + g2 * blend) / 255;
-    let r = (r1 as u32 * (255 - blend) + r2 * blend) / 255;
-    r << 16 | g << 8 | b
-}
-#[inline(always)]
-fn clamp_u32(u: u32, min: u32, max: u32) -> u32 {
-    let v1 = select_u32(u <= min, min, u);
-    select_u32(v1 >= max, max, v1)
+    let blend = blend.min(255);
+    let inv_blend = 255 - blend;
+    let rb = ((color_1 & 0x00FF00FF).wrapping_mul(inv_blend) + (color_2 & 0x00FF00FF).wrapping_mul(blend)) >> 8;
+    let g  = ((color_1 & 0x0000FF00).wrapping_mul(inv_blend) + (color_2 & 0x0000FF00).wrapping_mul(blend)) >> 8;
+    (rb & 0x00FF00FF) | (g & 0x0000FF00)
 }
 #[inline(always)]
 fn linear_to_srgb_one_channel_float(linear: f32) -> f32 {
