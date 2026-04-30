@@ -19,11 +19,9 @@ pub fn scan(tx_bytes: &[u8], height: u32, ufvk: &UnifiedFullViewingKey) -> Resul
                 if let Some(matched_addr) = output.recipient_address(){
                     if matched_addr == t_addr{
                         let value = output.value();
-                        
-                        println!("Found a match in a coinbase transaction at height {height}! Value: {value:?}");
-                        
-                        total_value += value;
-                        
+                        // println!("Found a match in a coinbase transaction at height {height}! Value: {value:?}");
+                        total_value += u64::from(value);
+
                     }
                 }
             }

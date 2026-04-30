@@ -1247,7 +1247,9 @@ async fn total_issuance_from_key(
         _ => return Err(format!("unexpectedly failed to get tip: {res:?}")),
     };
 
-    for height in 1 ..= tip_height.0 {
+    let mut total_issuance = 0u64; 
+
+    for height in 1..=tip_height.0 {
         let res = (call.state)(StateRequest::Block(ZebBlockHeight(height).into())).await;
         let block = match res {
             Ok(StateResponse::Block(Some(block))) => block,
@@ -1259,27 +1261,21 @@ async fn total_issuance_from_key(
             return Err(format!("block at height {height} had 0 transactions"));
         }
 
-        // let block_bytes = match block.zcash_serialize_to_vec() {
-        //     Ok(block) => block,
-        //     Err(err) => return Err(format!("failed to serialize block at height {height}: {err:?}")),
-        // };
-
-        // let lrz_block = match zcash_primitives::Block::read(&block_bytes) {
-        //     Ok(block) => block,
-        //     Err(err) => return Err(format!("failed to deserialize block at height {height}: {err:?}")),
-        // };
-
-
         let coinbase_tx_bytes = match block.transactions[0].zcash_serialize_to_vec() {
             Ok(tx) => tx,
             Err(err) => return Err(format!("failed to serialize coinbase tx at height {height}: {err:?}")),
         };
 
-        wallet::scanner::scan(&coinbase_tx_bytes, height, &ufvk);
-        
+        // TODO(Giovanni): Check if this is correct!!!
+        let tx_id = block.transactions[0].unmined_id().mined_id();
+
+        match wallet::scanner::scan(&coinbase_tx_bytes, height, &ufvk) {
+            Ok(value) => total_issuance += value,
+            Err(err) => return Err(format!("failed to scan {tx_id:?} at height {height}: {err}")),
+        }
     }
 
-    Ok(1)
+    Ok(total_issuance)
 }
 
 async fn tfl_service_incoming_request(
