@@ -3240,6 +3240,23 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     ui.text(frame_strf!(data, "Staking (Unbonded) Pool Zatoshis: {}", viz.staking_unbonded_pool_balance), decl);
                     ui.text(frame_strf!(data, "Wallet Sync: {}/{}", wallets_sync_h, wallets_tip_h), decl);
 
+                    // NOTE(Giovanni): Morning UX Idea: Block height quick-jump navigator, users can type a height and jump the camera directly to that block
+                    {
+                        let goto_id = id("Goto Height Input");
+                        let goto_text = ui.textbox(data, goto_id, "Go to height...", TextDecl { h: ui.scale(16.0), align: AlignX::Left, ..TextDecl });
+
+                        // TODO(Giovanni): Should probably add some kind of bounds checking and error feedback here
+                        // Because what if the user types in a non-numeric value, or a height that's above the current tip, etc.?
+                        // They would need some kind of feedback letting them know their input was invalid, instead of just nothing happening when they press enter
+                        let enter_pressed = ui.input().key_pressed(KeyCode::Enter) && ui.nav_id == goto_id.id;
+                        if enter_pressed {
+                            if let Ok(h) = goto_text.trim().parse::<u64>() {
+                                viz.camera_y = -10.0 * h as f32;
+                                viz.zoom = 2.0;
+                            }
+                        }
+                    }
+
                     if ui.debug {
                         ui.text("------------------", decl);
                         for peer in &viz.peer_strings {
