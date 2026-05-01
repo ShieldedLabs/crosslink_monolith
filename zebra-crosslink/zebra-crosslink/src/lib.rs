@@ -1261,16 +1261,18 @@ async fn total_issuance_from_key(
             return Err(format!("block at height {height} had 0 transactions"));
         }
 
-        let coinbase_tx_bytes = match block.transactions[0].zcash_serialize_to_vec() {
-            Ok(tx) => tx,
-            Err(err) => return Err(format!("failed to serialize coinbase tx at height {height}: {err:?}")),
-        };
+        for (tx_i, tx) in block.transactions.iter().enumerate() {
+            let coinbase_tx_bytes = match tx.zcash_serialize_to_vec() {
+                Ok(tx) => tx,
+                Err(err) => return Err(format!("failed to serialize coinbase tx at height {height}: {err:?}")),
+            };
 
-        let txid = block.transactions[0].unmined_id().mined_id();
-        match wallet::scanner::scan_tx(&mut scan_info, &coinbase_tx_bytes, height, &ufvk, txid.0) {
-            Ok(false) => {},
-            Ok(true) => println!("scan info at {height}: {scan_info:?}"),
-            Err(err) => return Err(format!("failed to scan {txid:?} at height {height}: {err}")),
+            let txid = tx.unmined_id().mined_id();
+            match wallet::scanner::scan_tx(&mut scan_info, &coinbase_tx_bytes, tx_i, height, &ufvk, txid.0) {
+                Ok(false) => {},
+                Ok(true) => println!("scan info at {height}: {scan_info:?}"),
+                Err(err) => return Err(format!("failed to scan {txid:?} at height {height}: {err}")),
+            }
         }
     }
 
