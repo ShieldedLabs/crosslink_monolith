@@ -12,7 +12,6 @@ use fontello_icons::*;
 
 use std::sync::{Arc, Mutex};
 use wallet;
-//use wallet::Timer;
 
 mod viz_gui;
 pub use viz_gui::*;
@@ -59,7 +58,21 @@ impl InteractiveVizOp {
 
 
 #[allow(unused_imports)]
-use std::{alloc::{alloc, dealloc, Layout}, hash::Hasher, hint::spin_loop, mem::{swap, transmute, MaybeUninit}, ptr::{copy_nonoverlapping, slice_from_raw_parts}, rc::Rc, sync::{atomic::{AtomicU32, Ordering, AtomicBool}, Barrier}, time::{Duration, Instant}, u32};
+use std::{
+    alloc::{alloc, dealloc, Layout},
+    cell::RefCell,
+    hash::Hasher,
+    hint::spin_loop,
+    mem::{swap, transmute, MaybeUninit},
+    ptr::{copy_nonoverlapping, slice_from_raw_parts},
+    rc::Rc,
+    sync::{
+        atomic::{AtomicU32, Ordering, AtomicBool},
+        Barrier,
+    },
+    time::{Duration, Instant},
+    u32,
+};
 use winit::{dpi::Size, keyboard::KeyCode};
 
 use rustybuzz::{shape, Face as RbFace, UnicodeBuffer};
@@ -193,6 +206,15 @@ pub struct MeasureKey {
 }
 
 const MEASURE_CACHE_MAX_CAPACITY: usize = 4096;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct TextShapeKey {
+    pub font_kind: FontKind,
+    pub text_height: usize,
+    pub text_content: String,
+}
+
+const TEXT_SHAPE_CACHE_MAX_CAPACITY: usize = 8192;
 
 impl DrawCtx {
 
@@ -339,6 +361,15 @@ impl DrawCtx {
 
         let text_height_px = text_height_norm.floor() as usize;
 
+        let shape_key = TextShapeKey {
+            font_kind,
+            text_height: text_height_px,
+            text_content: text_line.to_string(),
+        };
+        if let Some(glyph_run) = self.text_shape_cache.borrow().get(&shape_key) {
+            return glyph_run.iter().map(|(_, adv)| *adv as usize).sum::<usize>() as f32;
+        }
+
         // Note(Giovanni): Cache Lookup
         let cache_key = MeasureKey {
             font_kind,
@@ -357,12 +388,29 @@ impl DrawCtx {
         buf.push_str(text_line);
 
         let shaped = shape(&tracker.cached_rusty_buzz, &[], buf);
+        let infos = shaped.glyph_infos();
         let poss = shaped.glyph_positions();
-
-        let total_width = poss.iter().map(|g_pos| {
+        let mut glyph_run = Vec::<(u16, u16)>::with_capacity(infos.len());
+        let mut total_width = 0usize;
+        for i in 0..infos.len() {
+            let g_info = &infos[i];
+            let g_pos = &poss[i];
             let px_advance = ((g_pos.x_advance as f32 / tracker.units_per_em) * tracker.ppem).ceil() as usize;
-            px_advance.min(1usize << tracker.glyph_row_shift)
-        }).sum::<usize>() as f32;
+            let px_advance = px_advance.min(1usize << tracker.glyph_row_shift);
+            total_width += px_advance;
+            glyph_run.push((g_info.glyph_id as u16, px_advance as u16));
+        }
+        let total_width = total_width as f32;
+
+        {
+            let mut text_shape_cache = self.text_shape_cache.borrow_mut();
+            if text_shape_cache.len() >= TEXT_SHAPE_CACHE_MAX_CAPACITY {
+                if let Some(key) = text_shape_cache.keys().next().cloned() {
+                    text_shape_cache.remove(&key);
+                }
+            }
+            text_shape_cache.insert(shape_key, glyph_run);
+        }
 
         // Note(Giovanni): Memoize and Return
         if self.measure_cache.len() >= MEASURE_CACHE_MAX_CAPACITY {
@@ -398,34 +446,53 @@ impl DrawCtx {
 
             let (tracker, tracker_id) = self._find_or_create_font_tracker(text_height, font_kind);
             tracker.how_many_times_was_i_used += 1;
-
-            let mut buf = UnicodeBuffer::new();
-            buf.set_direction(rustybuzz::Direction::LeftToRight);
-            buf.push_str(text_line);
-            buf.set_direction(rustybuzz::Direction::LeftToRight);
-
-            let shaped = shape(&tracker.cached_rusty_buzz, &[], buf);
-            let infos = shaped.glyph_infos();
-            let poss = shaped.glyph_positions();
-            assert_eq!(infos.len(), poss.len());
+            let shape_key = TextShapeKey {
+                font_kind,
+                text_height,
+                text_content: text_line.to_string(),
+            };
+            {
+                let mut text_shape_cache = self.text_shape_cache.borrow_mut();
+                if !text_shape_cache.contains_key(&shape_key) {
+                    let mut buf = UnicodeBuffer::new();
+                    buf.set_direction(rustybuzz::Direction::LeftToRight);
+                    buf.push_str(text_line);
+                    let shaped = shape(&tracker.cached_rusty_buzz, &[], buf);
+                    let infos = shaped.glyph_infos();
+                    let poss = shaped.glyph_positions();
+                    let mut glyph_run = Vec::<(u16, u16)>::with_capacity(infos.len());
+                    for i in 0..infos.len() {
+                        let g_info = &infos[i];
+                        let g_pos = &poss[i];
+                        let px_advance = (((g_pos.x_advance as f32 / tracker.units_per_em) * tracker.ppem).ceil() as usize)
+                            .min(1usize << tracker.glyph_row_shift);
+                        glyph_run.push((g_info.glyph_id as u16, px_advance as u16));
+                    }
+                    if text_shape_cache.len() >= TEXT_SHAPE_CACHE_MAX_CAPACITY {
+                        if let Some(key) = text_shape_cache.keys().next().cloned() {
+                            text_shape_cache.remove(&key);
+                        }
+                    }
+                    text_shape_cache.insert(shape_key.clone(), glyph_run);
+                }
+            }
+            let text_shape_cache = self.text_shape_cache.borrow();
+            let glyph_run = text_shape_cache.get(&shape_key).unwrap();
 
             let glyph_bitmap_run_start = self.glyph_bitmap_run_allocator.add(*self.glyph_bitmap_run_allocator_position);
             let mut glyph_bitmap_run_count = 0usize;
 
             let mut acc_x = text_x;
-            for text_index in 0..infos.len() {
-                let g_info = &infos[text_index];
-                let g_pos = &poss[text_index];
-
-                let px_advance = (((g_pos.x_advance as f32 / tracker.units_per_em) * tracker.ppem).ceil() as usize).min(1usize << tracker.glyph_row_shift);
+            for (glyph_id, px_advance) in glyph_run.iter() {
+                let px_advance = *px_advance as usize;
 
                 // TODO: Scissor?
                 if (acc_x + px_advance as isize) <= 0 { acc_x += px_advance as isize; continue; }
                 if acc_x > self.window_width { break; }
 
-                Self::_render_glyph_if_not_cached(tracker, g_info.glyph_id as u16);
+                Self::_render_glyph_if_not_cached(tracker, *glyph_id);
 
-                *glyph_bitmap_run_start.add(glyph_bitmap_run_count) = (tracker.glyph_to_bitmap_index[g_info.glyph_id as usize], acc_x as i16);
+                *glyph_bitmap_run_start.add(glyph_bitmap_run_count) = (tracker.glyph_to_bitmap_index[*glyph_id as usize], acc_x as i16);
                 glyph_bitmap_run_count += 1;
                 acc_x += px_advance as isize;
 
@@ -819,6 +886,7 @@ struct DrawCtx {
     debug_pixel_inspector: *mut Option<(usize, usize)>,
     debug_pixel_inspector_last_color: *mut u32,
     measure_cache: HashMap<MeasureKey, f32>,
+    text_shape_cache: RefCell<HashMap<TextShapeKey, Vec<(u16, u16)>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1109,6 +1177,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
         debug_pixel_inspector: (&mut _debug_pixel_inspector) as *mut Option<(usize, usize)>,
         debug_pixel_inspector_last_color: (&mut _debug_pixel_inspector_last_color) as *mut u32,
         measure_cache: HashMap::new(),
+        text_shape_cache: RefCell::new(HashMap::new()),
     }};
 
     draw_ctx._init_font_tracker(FONT_PIXEL_3X3_MONO, 2, FontKind::Mono,  4);
@@ -1139,6 +1208,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
     let mut window: Option<Rc<winit::window::Window>> = None;
     let mut softbuffer_context: Option<softbuffer::Context<Rc<winit::window::Window>>> = None;
     let mut softbuffer_surface: Option<softbuffer::Surface<Rc<winit::window::Window>, Rc<winit::window::Window>>> = None;
+    let mut softbuffer_surface_size: (usize, usize) = (0, 0);
 
     let mut modifiers = winit::keyboard::ModifiersState::default();
 
@@ -1216,6 +1286,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                 window = Some(twindow);
                 softbuffer_context = Some(context);
                 softbuffer_surface = Some(surface);
+                softbuffer_surface_size = (0, 0);
 
                 setup_audio();
             },
@@ -1432,7 +1503,10 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             let target_frame_time_us = (1000000000.0 / (frame_interval_milli_hertz as f64)) as usize;
                                             let begin_frame_instant = Instant::now();
 
-                                            softbuffer_surface.resize((window_width as u32).try_into().unwrap(), (window_height as u32).try_into().unwrap()).unwrap();
+                                            if softbuffer_surface_size != (window_width, window_height) {
+                                                softbuffer_surface.resize((window_width as u32).try_into().unwrap(), (window_height as u32).try_into().unwrap()).unwrap();
+                                                softbuffer_surface_size = (window_width, window_height);
+                                            }
 
                                             let mut buffer = softbuffer_surface.buffer_mut().unwrap();
                                             let final_output_blit_buffer = buffer.as_mut_ptr() as *mut u8;
@@ -1496,15 +1570,8 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                             ui.dpi_scale = window.scale_factor() as f32;
                                             ui.delta = dt as f32;
                                             
-                                            // NOTE(Giovanni): Timer thingy //
-                                            //{
-                                            //  let timer = Timer::scope_("viz_gui_draw_the_stuff_for_the_things", true);
-                                                viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut ui, &mut draw_ctx, dt as f32, &input_ctx);
-                                            //}
-                                            //////////////////////////////////
+                                            viz_gui_draw_the_stuff_for_the_things(&mut viz_state, &mut ui, &mut draw_ctx, dt as f32, &input_ctx);
                                             {
-                                                //let timer = Timer::scope_("ui_update", true);
-
                                                 let should_quit = ui_update(&mut ui, &mut data, &mut viz_state, wallet_state.clone());
                                                 if should_quit {
                                                     elwt.exit();
