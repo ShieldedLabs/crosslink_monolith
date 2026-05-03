@@ -253,6 +253,59 @@ impl VizState {
             (0.0, 0.0, false)
         }
     }
+
+    fn camera_y_for_bft_hash(&self, mut bft_hash: Hash32) -> Option<f32> {
+        for _ in 0usize..65536 {
+            let bft = self.on_screen_bfts.get(&bft_hash)?;
+            if let Some(bc) = self.on_screen_bcs.get(&bft.block.points_at_bc_block) {
+                return Some(bc.t_y - 10.0 / 2.0);
+            }
+            if bft.block.parent_hash == Hash32::from_u64(0) {
+                return None;
+            }
+            bft_hash = bft.block.parent_hash;
+        }
+        None
+    }
+
+    pub fn goto_pow_height(&mut self, h: u64) {
+        self.camera_y = -10.0 * h as f32;
+        self.zoom = 2.0;
+    }
+
+    pub fn goto_pos_height(&mut self, h: u64) -> bool {
+        let Some(bft) = self
+            .on_screen_bfts
+            .values()
+            .find(|b| b.block.this_height == h)
+        else {
+            return false;
+        };
+        let Some(cy) = self.camera_y_for_bft_hash(bft.block.this_hash) else {
+            return false;
+        };
+        self.camera_x = 5.0;
+        self.camera_y = cy;
+        self.zoom = 2.0;
+        true
+    }
+
+    fn nearest_bft_height_to_camera_y(&self, camera_y: f32) -> u64 {
+        let (fallback, _) = bft_minimap_height_span(self);
+        let mut best: Option<(f32, u64)> = None;
+        for bft in self.on_screen_bfts.values() {
+            let y_ref = self
+                .camera_y_for_bft_hash(bft.block.this_hash)
+                .unwrap_or(bft.t_y);
+            let d = (y_ref - camera_y).abs();
+            best = Some(match best {
+                None => (d, bft.block.this_height),
+                Some((bd, bh)) if d < bd => (d, bft.block.this_height),
+                Some(prev) => prev,
+            });
+        }
+        best.map(|(_, h)| h).unwrap_or(fallback)
+    }
 }
 
 pub fn bc_at_h(state: &VizState, height: u64) -> Hash32 {
@@ -652,10 +705,32 @@ fn chain_minimap_screen_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32,
     (x0, y0, x1, y1)
 }
 
+fn pos_minimap_screen_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
+    let w = draw_ctx.window_width as f32;
+    let h = draw_ctx.window_height as f32;
+    let ds = ui.dpi_scale;
+    let gx = 10.0 * ds;
+    let strip = 46.0 * ds;
+    let x1 = w * (1.0 - PANE_PERCENT_RIGHT) - gx;
+    let x0 = x1 - strip;
+    let y0 = 50.0 * ds;
+    let y1 = h - 86.0 * ds;
+    (x0, y0, x1, y1)
+}
+
 // NOTE(Giovanni): drawn card sticks title and legend outside the core strip rect, users aim wheel there
 //   and nothing happened bc hit test used the tight inner box only. pad is eyeballed vs draw_chain_minimap_overlay.
 fn chain_minimap_interaction_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
     let (x0, y0, x1, y1) = chain_minimap_screen_rect(draw_ctx, ui);
+    let ds = ui.dpi_scale;
+    let px = 8.0 * ds;
+    let py_top = 46.0 * ds;
+    let py_bot = 26.0 * ds;
+    (x0 - px, y0 - py_top, x1 + px, y1 + py_bot)
+}
+
+fn pos_minimap_interaction_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
+    let (x0, y0, x1, y1) = pos_minimap_screen_rect(draw_ctx, ui);
     let ds = ui.dpi_scale;
     let px = 8.0 * ds;
     let py_top = 46.0 * ds;
@@ -683,6 +758,42 @@ fn chain_minimap_height_span(viz_state: &VizState) -> (u64, u64) {
         h_max = h_min;
     }
     (h_min, h_max)
+}
+
+fn bft_minimap_height_span(viz_state: &VizState) -> (u64, u64) {
+    let mut h_min = u64::MAX;
+    let mut h_max = 0u64;
+    for bft in viz_state.on_screen_bfts.values() {
+        h_min = h_min.min(bft.block.this_height);
+        h_max = h_max.max(bft.block.this_height);
+    }
+    if h_min == u64::MAX {
+        h_min = 0;
+    }
+    h_max = h_max.max(viz_state.bft_tip_height);
+    if h_max < h_min {
+        h_max = h_min;
+    }
+    (h_min, h_max)
+}
+
+fn apply_scrub_bft_height(viz: &mut VizState, mut h: u64) {
+    let (lo, hi) = bft_minimap_height_span(viz);
+    h = h.clamp(lo, hi);
+    if viz.goto_pos_height(h) {
+        return;
+    }
+    if let Some((_, bh)) = viz
+        .on_screen_bfts
+        .values()
+        .map(|b| {
+            let d = b.block.this_height.abs_diff(h);
+            (d, b.block.this_height)
+        })
+        .min_by_key(|x| x.0)
+    {
+        let _ = viz.goto_pos_height(bh);
+    }
 }
 
 // NOTE(Giovanni): y goes down the screen but higher block numbers are "up" in the metaphor so we flip
@@ -845,6 +956,123 @@ fn draw_chain_minimap_overlay(
     draw_ctx.text_line(FontKind::Mono, lx2 + dot + 5.0 * ds, leg_y - 1.0 * ds, tick_h * 0.88, "open", label_mute);
 }
 
+fn draw_pos_minimap_overlay(
+    viz_state: &VizState,
+    ui: &ui::Context,
+    draw_ctx: &mut DrawCtx,
+    origin_y: f32,
+    screen_unit: f32,
+    mm_rect: (f32, f32, f32, f32),
+) {
+    let (mx0, my0, mx1, my1) = mm_rect;
+    if my1 <= my0 + 8.0 || mx1 <= mx0 + 4.0 {
+        return;
+    }
+    let (h_min, h_max) = bft_minimap_height_span(viz_state);
+    if viz_state.on_screen_bfts.is_empty() && viz_state.bft_tip_height == 0 {
+        return;
+    }
+    let ds = ui.dpi_scale;
+    let track_l = mx0 + 3.5 * ds;
+    let track_r = mx1 - 2.0 * ds;
+    let xc = (track_l + track_r) * 0.5;
+    let title_h = (11.0 * ds).max(9.0);
+    let tick_h = (9.0 * ds).max(7.0);
+    let outer_pad = 4.0 * ds;
+    let title_band = title_h + 6.0 * ds;
+    let legend_h = tick_h + 4.0 * ds;
+    let ox0 = mx0 - outer_pad;
+    let oy0 = my0 - outer_pad - title_band;
+    let ox1 = mx1 + outer_pad;
+    let oy1 = my1 + outer_pad + legend_h;
+
+    let frame_outer = 0xe01f2528_u32;
+    let frame_mid = blend_u32(0xff131618, 0xffa24545, 56);
+    let track_deep = blend_u32(0xff0c0e10, 0xffff8a8a, 24);
+    let grid_col = 0x28ff8a8a_u32;
+    let viewport_fill = 0x34ff8a8a_u32;
+    let tick_col = blend_u32(0xff1a0f0f, 0xffff8a8a, 210);
+    let title_col = 0xffffecec_u32;
+    let subtitle_col = blend_u32(0xfff0d0d0, 0xffa24545, 96);
+    let label_mute = blend_u32(0xffe8caca, 0xffa24545, 110);
+
+    draw_ctx.rectangle_r(ox0, oy0, ox1, oy1, 5, frame_outer);
+    draw_ctx.rectangle_r(ox0 + 1.5, oy0 + 1.5, ox1 - 1.5, oy1 - 1.5, 4, frame_mid);
+    draw_ctx.rectangle(mx0 - 0.5, my0 - 0.5, mx1 + 0.5, my1 + 0.5, track_deep);
+    draw_ctx.rectangle(mx1 - 2.5 * ds, my0, mx1, my1, 0xffa24545);
+
+    for q in 1..4 {
+        let t = q as f32 / 4.0;
+        let yy = my0 + (my1 - my0) * t;
+        draw_ctx.rectangle(track_l, yy, track_r, yy + 1.0, grid_col);
+    }
+
+    let wy_top = (0.0 - origin_y) / screen_unit;
+    let wy_bot = ((draw_ctx.window_height as f32) - origin_y) / screen_unit;
+    let y_lo = wy_top.min(wy_bot);
+    let y_hi = wy_top.max(wy_bot);
+    let mut in_view: Vec<u64> = viz_state
+        .on_screen_bfts
+        .values()
+        .filter(|b| b.y >= y_lo && b.y <= y_hi)
+        .map(|b| b.block.this_height)
+        .collect();
+    let (vy0, vy1) = if !in_view.is_empty() {
+        let b_lo = *in_view.iter().min().unwrap();
+        let b_hi = *in_view.iter().max().unwrap();
+        let vy_a = chain_minimap_h_to_y(b_lo, h_min, h_max, my0, my1);
+        let vy_b = chain_minimap_h_to_y(b_hi, h_min, h_max, my0, my1);
+        if vy_a <= vy_b { (vy_a, vy_b) } else { (vy_b, vy_a) }
+    } else {
+        let hc = viz_state.nearest_bft_height_to_camera_y(viz_state.camera_y) as f32;
+        let vy_a = chain_minimap_hf_to_y(hc - 0.5, h_min, h_max, my0, my1);
+        let vy_b = chain_minimap_hf_to_y(hc + 0.5, h_min, h_max, my0, my1);
+        if vy_a <= vy_b { (vy_a, vy_b) } else { (vy_b, vy_a) }
+    };
+    draw_ctx.rectangle(track_l, vy0, track_r, vy1, viewport_fill);
+    draw_ctx.rectangle_r(track_l, vy0, track_r, vy1, 1, 0x55ff8a8a_u32);
+
+    let mut heights: Vec<u64> = viz_state
+        .on_screen_bfts
+        .values()
+        .map(|bft| bft.block.this_height)
+        .collect();
+    heights.sort_unstable();
+    heights.dedup();
+    let step = (heights.len() / 900 + 1).max(1);
+    for (i, &ht) in heights.iter().enumerate() {
+        if i % step != 0 {
+            continue;
+        }
+        let yy = chain_minimap_h_to_y(ht, h_min, h_max, my0, my1);
+        draw_ctx.rectangle(xc - 2.5 * ds, yy - 0.8, xc + 2.5 * ds, yy + 0.8, tick_col);
+    }
+
+    let h_mid = h_min.saturating_add(h_max.saturating_sub(h_min) / 2);
+    let s_top = format!("{}", h_max);
+    let s_mid = format!("{}", h_mid);
+    let s_bot = format!("{}", h_min);
+    let max_lab_w = draw_ctx
+        .measure_text_line(FontKind::Mono, tick_h, &s_top)
+        .max(draw_ctx.measure_text_line(FontKind::Mono, tick_h, &s_mid))
+        .max(draw_ctx.measure_text_line(FontKind::Mono, tick_h, &s_bot));
+    let label_x = (track_r - 3.0 * ds - max_lab_w).max(track_l + 6.0 * ds);
+    let y_top_lab = chain_minimap_h_to_y(h_max, h_min, h_max, my0, my1) - tick_h * 0.35;
+    let y_mid_lab = chain_minimap_h_to_y(h_mid, h_min, h_max, my0, my1) - tick_h * 0.35;
+    let y_bot_lab = chain_minimap_h_to_y(h_min, h_min, h_max, my0, my1) - tick_h * 0.35;
+    draw_ctx.text_line(FontKind::Mono, label_x, y_top_lab, tick_h, &s_top, label_mute);
+    draw_ctx.text_line(FontKind::Mono, label_x, y_mid_lab, tick_h, &s_mid, label_mute);
+    draw_ctx.text_line(FontKind::Mono, label_x, y_bot_lab, tick_h, &s_bot, label_mute);
+
+    draw_ctx.text_line(FontKind::Mono, mx0, oy0 + 3.0 * ds, title_h, "PoS heights", title_col);
+    draw_ctx.text_line(FontKind::Mono, mx0, oy0 + 3.0 * ds + title_h * 0.92, tick_h * 0.9, "drag to scrub", subtitle_col);
+
+    let dot = 4.0 * ds;
+    let leg_y = my1 + 5.0 * ds;
+    draw_ctx.rectangle(mx0, leg_y, mx0 + dot, leg_y + dot, tick_col);
+    draw_ctx.text_line(FontKind::Mono, mx0 + dot + 5.0 * ds, leg_y - 1.0 * ds, tick_h * 0.88, "bft blocks", label_mute);
+}
+
 pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui: &mut ui::Context, draw_ctx: &mut DrawCtx, dt: f32, input_ctx: &InputCtx) {
     // NOTE(Giovanni): reset every frame so ui_update doesnt see a stale suppress from last frame if
     //   we bail early somewhere later (shouldnt happen much but cheap insurance). real value gets
@@ -852,13 +1080,20 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     ui.suppress_scroll_for_clay = false;
 
     let mm_rect = chain_minimap_screen_rect(draw_ctx, ui);
-    let (mm_x0, mm_y0, mm_x1, mm_y1) = mm_rect;
+    let (_, mm_y0, _, mm_y1) = mm_rect;
     let hit_rect = chain_minimap_interaction_rect(draw_ctx, ui);
     let (hit_x0, hit_y0, hit_x1, hit_y1) = hit_rect;
+    let pos_mm_rect = pos_minimap_screen_rect(draw_ctx, ui);
+    let (_, pos_mm_y0, _, pos_mm_y1) = pos_mm_rect;
+    let pos_hit_rect = pos_minimap_interaction_rect(draw_ctx, ui);
+    let (pos_hit_x0, pos_hit_y0, pos_hit_x1, pos_hit_y1) = pos_hit_rect;
     let mx_scr = input_ctx.mouse_pos().0.clamp(0, draw_ctx.window_width) as f32;
     let my_scr = input_ctx.mouse_pos().1.clamp(0, draw_ctx.window_height) as f32;
-    let inside_minimap =
+    let inside_pow_minimap =
         mx_scr >= hit_x0 && mx_scr <= hit_x1 && my_scr >= hit_y0 && my_scr <= hit_y1;
+    let inside_pos_minimap =
+        mx_scr >= pos_hit_x0 && mx_scr <= pos_hit_x1 && my_scr >= pos_hit_y0 && my_scr <= pos_hit_y1;
+    let inside_any_minimap = inside_pow_minimap || inside_pos_minimap;
 
     if !ui.capture {
         let dxm = (input_ctx.mouse_pos().0.clamp(0, draw_ctx.window_width) - draw_ctx.window_width/2) as f32;
@@ -882,27 +1117,38 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     }
 
     let mut minimap_wheel_scrubbed = false;
-    if inside_minimap {
+    if inside_any_minimap {
         let dy = effective_vertical_wheel_for_scrub(input_ctx);
         if dy.abs() > 1e-6
             || input_ctx.scroll_delta.0.abs() > 1e-6
             || input_ctx.scroll_delta.1.abs() > 1e-6
             || input_ctx.zoom_delta.abs() > 1e-12
         {
-            let strip_h = (mm_y1 - mm_y0).max(1.0);
-            let (h_min, h_max) = chain_minimap_height_span(viz_state);
-            let span_h = h_max.saturating_sub(h_min).max(1) as f32;
-            let dh = -(dy / strip_h) * span_h * 0.45;
-            let h_cur = ((-viz_state.camera_y) / 10.0).clamp(h_min as f32, h_max as f32);
-            let h_next = (h_cur + dh).clamp(h_min as f32, h_max as f32);
-            viz_state.camera_y = -10.0 * h_next;
-            viz_state.camera_x = 0.0;
-            minimap_wheel_scrubbed = true;
+            if inside_pos_minimap {
+                let (bft_min, bft_max) = bft_minimap_height_span(viz_state);
+                let strip_h = (pos_mm_y1 - pos_mm_y0).max(1.0);
+                let span_b = bft_max.saturating_sub(bft_min).max(1) as f32;
+                let dh_b = -(dy / strip_h) * span_b * 0.45;
+                let h_cur = viz_state.nearest_bft_height_to_camera_y(viz_state.camera_y) as f32;
+                let h_next = (h_cur + dh_b).round() as u64;
+                apply_scrub_bft_height(viz_state, h_next);
+                minimap_wheel_scrubbed = true;
+            } else {
+                let (h_min, h_max) = chain_minimap_height_span(viz_state);
+                let strip_h = (mm_y1 - mm_y0).max(1.0);
+                let span_h = h_max.saturating_sub(h_min).max(1) as f32;
+                let dh = -(dy / strip_h) * span_h * 0.45;
+                let h_cur = ((-viz_state.camera_y) / 10.0).clamp(h_min as f32, h_max as f32);
+                let h_next = (h_cur + dh).clamp(h_min as f32, h_max as f32);
+                viz_state.camera_y = -10.0 * h_next;
+                viz_state.camera_x = 0.0;
+                minimap_wheel_scrubbed = true;
+            }
         }
     }
 
     viz_state.camera_x -= input_ctx.scroll_delta.0 as f32 / screen_unit;
-    if !inside_minimap || !minimap_wheel_scrubbed {
+    if !inside_any_minimap || !minimap_wheel_scrubbed {
         viz_state.camera_y -= input_ctx.scroll_delta.1 as f32 / screen_unit;
     }
 
@@ -914,32 +1160,58 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
 
     // NOTE(Giovanni): scrub flag is for "this frame we treated the pointer as minimap business" so we
     //   dont also fire block inspect or the click to recenter camera on a node underneath. drag uses
-    //   CHAIN_MINIMAP as mouse_pressed_id so viz pan (VIZ_GUI) doesnt steal the gesture, same id trick
+    //   CHAIN_MINIMAP_POW as mouse_pressed_id so viz pan (VIZ_GUI) doesnt steal the gesture, same id trick
     //   as before for disambiguation.
     let mut minimap_scrub_this_frame = false;
-    if !ui.capture || inside_minimap {
-        if ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP && input_ctx.mouse_held(MouseButton::Left) {
-            let (h_min, h_max) = chain_minimap_height_span(viz_state);
-            let ht = chain_minimap_y_to_h(my_scr.clamp(mm_y0, mm_y1), h_min, h_max, mm_y0, mm_y1);
-            viz_state.camera_y = -10.0 * ht as f32;
-            viz_state.camera_x = 0.0;
-            minimap_scrub_this_frame = true;
+    if !ui.capture || inside_any_minimap {
+        if (ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POW || ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POS)
+            && input_ctx.mouse_held(MouseButton::Left)
+        {
+            if ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POS {
+                let (bft_min, bft_max) = bft_minimap_height_span(viz_state);
+                let ht = chain_minimap_y_to_h(
+                    my_scr.clamp(pos_mm_y0, pos_mm_y1),
+                    bft_min,
+                    bft_max,
+                    pos_mm_y0,
+                    pos_mm_y1,
+                );
+                apply_scrub_bft_height(viz_state, ht);
+                minimap_scrub_this_frame = true;
+            } else {
+                let (h_min, h_max) = chain_minimap_height_span(viz_state);
+                let ht = chain_minimap_y_to_h(my_scr.clamp(mm_y0, mm_y1), h_min, h_max, mm_y0, mm_y1);
+                viz_state.camera_y = -10.0 * ht as f32;
+                viz_state.camera_x = 0.0;
+                minimap_scrub_this_frame = true;
+            }
         }
         if ui.mouse_pressed_id == ui::Id::default()
             && input_ctx.mouse_pressed(MouseButton::Left)
-            && inside_minimap
+            && inside_pow_minimap
         {
             let (h_min, h_max) = chain_minimap_height_span(viz_state);
             let ht = chain_minimap_y_to_h(my_scr, h_min, h_max, mm_y0, mm_y1);
             viz_state.camera_y = -10.0 * ht as f32;
             viz_state.camera_x = 0.0;
             viz_state.zoom = 2.0;
-            ui.mouse_pressed_id = ui::Id::CHAIN_MINIMAP;
+            ui.mouse_pressed_id = ui::Id::CHAIN_MINIMAP_POW;
+            minimap_scrub_this_frame = true;
+        }
+        if ui.mouse_pressed_id == ui::Id::default()
+            && input_ctx.mouse_pressed(MouseButton::Left)
+            && inside_pos_minimap
+        {
+            let (bft_min, bft_max) = bft_minimap_height_span(viz_state);
+            let ht = chain_minimap_y_to_h(my_scr, bft_min, bft_max, pos_mm_y0, pos_mm_y1);
+            apply_scrub_bft_height(viz_state, ht);
+            viz_state.zoom = 2.0;
+            ui.mouse_pressed_id = ui::Id::CHAIN_MINIMAP_POS;
             minimap_scrub_this_frame = true;
         }
     }
     if !ui.capture {
-        if ui.mouse_pressed_id == ui::Id::default() && input_ctx.mouse_pressed(MouseButton::Left) && !inside_minimap {
+        if ui.mouse_pressed_id == ui::Id::default() && input_ctx.mouse_pressed(MouseButton::Left) && !inside_any_minimap {
             ui.mouse_pressed_id = ui::Id::VIZ_GUI;
         }
     }
@@ -1010,7 +1282,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     // NOTE(Giovanni): minimap isnt a clay element so world space hover can still think theres a block
     //   under the finger. zero hovered_block here so we dont highlight something you cant see, and
     //   the hover blip sound doesnt spam when youre just trying to read the strip.
-    if inside_minimap {
+    if inside_any_minimap {
         hovered_block = Hash32::from_u64(0);
     }
 
@@ -1362,6 +1634,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     }
 
     draw_chain_minimap_overlay(viz_state, ui, draw_ctx, origin_y, screen_unit, mm_rect);
+    draw_pos_minimap_overlay(viz_state, ui, draw_ctx, origin_y, screen_unit, pos_mm_rect);
 
     if viz_state.last_frame_hovered_hash != hovered_block {
         viz_state.last_frame_hovered_hash = hovered_block;
@@ -1397,8 +1670,8 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         input_ctx.scroll_delta != (0.0, 0.0) || input_ctx.zoom_delta != 0.0;
     // NOTE(Giovanni): minimap_wheel_scrubbed catches the frame where we ate wheel-as-height; pair with
     //   inside_minimap && wheelish for clay suppress when windows sent zoom_delta but scrub already ran.
-    ui.suppress_scroll_for_clay = ((inside_minimap && wheelish) || minimap_wheel_scrubbed)
-        || (ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP
+    ui.suppress_scroll_for_clay = ((inside_any_minimap && wheelish) || minimap_wheel_scrubbed)
+        || ((ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POW || ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POS)
             && input_ctx.mouse_held(MouseButton::Left))
         || (in_center_column && wheelish && !ui.capture);
 }

@@ -227,7 +227,8 @@ impl Id {
     //   press so the normal VIZ_GUI left drag path doesnt think were panning the graph, and so block
     //   inspect / fly to camera dont double fire from the same click. value is just ascii "minm"
     //   stuffed in a u32, not a clay hash, keep it away from small ints if you add more sentinel ids.
-    pub const CHAIN_MINIMAP: Self = Self { id: 0x6d69_6e6d, ..Id };
+    pub const CHAIN_MINIMAP_POW: Self = Self { id: 0x6d69_6e6d, ..Id };
+    pub const CHAIN_MINIMAP_POS: Self = Self { id: 0x6d70_6f73, ..Id };
     fn clay(&self) -> clay::id::Id {
         clay::id::Id {
             id: clay::Clay_ElementId {
@@ -3248,19 +3249,32 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     ui.text(frame_strf!(data, "Staking (Unbonded) Pool Zatoshis: {}", viz.staking_unbonded_pool_balance), decl);
                     ui.text(frame_strf!(data, "Wallet Sync: {}/{}", wallets_sync_h, wallets_tip_h), decl);
 
-                    // NOTE(Giovanni): Morning UX Idea: Block height quick-jump navigator, users can type a height and jump the camera directly to that block
                     {
-                        let goto_id = id("Goto Height Input");
-                        let goto_text = ui.textbox(data, goto_id, "Go to height...", TextDecl { h: ui.scale(16.0), align: AlignX::Left, ..TextDecl });
-
-                        // TODO(Giovanni): Should probably add some kind of bounds checking and error feedback here
-                        // Because what if the user types in a non-numeric value, or a height that's above the current tip, etc.?
-                        // They would need some kind of feedback letting them know their input was invalid, instead of just nothing happening when they press enter
-                        let enter_pressed = ui.input().key_pressed(KeyCode::Enter) && ui.nav_id == goto_id.id;
-                        if enter_pressed {
-                            if let Ok(h) = goto_text.trim().parse::<u64>() {
-                                viz.camera_y = -10.0 * h as f32;
-                                viz.zoom = 2.0;
+                        let goto_decl = TextDecl { h: ui.scale(12.0), align: AlignX::Left, ..TextDecl };
+                        if let _ = elem().decl(Decl {
+                            direction: LeftToRight,
+                            child_gap: child_gap * 0.5,
+                            width: grow!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            let pow_id = id("Goto PoW Height Input");
+                            let pos_id = id("Goto PoS Height Input");
+                            if let _ = elem().decl(Decl { width: grow!(), ..Decl }) {
+                                let pow_text = ui.textbox(data, pow_id, "PoW height…", goto_decl);
+                                if ui.input().key_pressed(KeyCode::Enter) && ui.nav_id == pow_id.id {
+                                    if let Ok(h) = pow_text.trim().parse::<u64>() {
+                                        viz.goto_pow_height(h);
+                                    }
+                                }
+                            }
+                            if let _ = elem().decl(Decl { width: grow!(), ..Decl }) {
+                                let pos_text = ui.textbox(data, pos_id, "PoS height…", goto_decl);
+                                if ui.input().key_pressed(KeyCode::Enter) && ui.nav_id == pos_id.id {
+                                    if let Ok(h) = pos_text.trim().parse::<u64>() {
+                                        let _ = viz.goto_pos_height(h);
+                                    }
+                                }
                             }
                         }
                     }
@@ -3443,10 +3457,13 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             ui.nav_enable = false;
         }
         ui.nav_id = ui.mouse_pressed_id.id;
-        // NOTE(Giovanni): VIZ_GUI and CHAIN_MINIMAP are viz side sentinels, not clay ids. treating them like
+        // NOTE(Giovanni): VIZ_GUI and CHAIN_MINIMAP_POW / CHAIN_MINIMAP_POS are viz side sentinels, not clay ids. treating them like
         //   a textbox capture made viz_gui skip minimap drag on every frame after press bc of the !ui.capture
         //   guard there, so click to scrub felt dead on win especially after the first frame.
-        if ui.mouse_pressed_id != Id::VIZ_GUI && ui.mouse_pressed_id != Id::CHAIN_MINIMAP {
+        if ui.mouse_pressed_id != Id::VIZ_GUI
+            && ui.mouse_pressed_id != Id::CHAIN_MINIMAP_POW
+            && ui.mouse_pressed_id != Id::CHAIN_MINIMAP_POS
+        {
             ui.capture = true;
         }
     }
