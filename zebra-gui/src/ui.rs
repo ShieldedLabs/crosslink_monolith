@@ -3293,6 +3293,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 if let _ = elem().decl(Decl {
                     width: grow!(),
                     align: TopRight,
+                    padding: (0.0, ui.scale(48.0), 0.0, 0.0),
                     ..Decl
                 }) {
                     let id = id("Mute Toggle");

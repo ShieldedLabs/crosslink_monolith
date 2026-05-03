@@ -943,7 +943,7 @@ fn draw_chain_minimap_overlay(
     draw_ctx.text_line(FontKind::Mono, label_x, y_mid_lab, tick_h, &s_mid, label_mute);
     draw_ctx.text_line(FontKind::Mono, label_x, y_bot_lab, tick_h, &s_bot, label_mute);
 
-    draw_ctx.text_line(FontKind::Mono, mx0, oy0 + 3.0 * ds, title_h, "PoW heights", title_col);
+    draw_ctx.text_line(FontKind::Mono, mx0, oy0 + 3.0 * ds, title_h, "PoW", title_col);
     let sub = "drag to scrub";
     draw_ctx.text_line(FontKind::Mono, mx0, oy0 + 3.0 * ds + title_h * 0.92, tick_h * 0.9, sub, subtitle_col);
 
@@ -1064,7 +1064,7 @@ fn draw_pos_minimap_overlay(
     draw_ctx.text_line(FontKind::Mono, label_x, y_mid_lab, tick_h, &s_mid, label_mute);
     draw_ctx.text_line(FontKind::Mono, label_x, y_bot_lab, tick_h, &s_bot, label_mute);
 
-    draw_ctx.text_line(FontKind::Mono, mx0, oy0 + 3.0 * ds, title_h, "PoS heights", title_col);
+    draw_ctx.text_line(FontKind::Mono, mx0, oy0 + 3.0 * ds, title_h, "PoS", title_col);
     draw_ctx.text_line(FontKind::Mono, mx0, oy0 + 3.0 * ds + title_h * 0.92, tick_h * 0.9, "drag to scrub", subtitle_col);
 
     let dot = 4.0 * ds;
