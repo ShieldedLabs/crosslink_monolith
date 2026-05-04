@@ -3289,13 +3289,104 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         ui.text(frame_strf!(data, "Visualizing op: {:?}", ui.viz_op), decl);
                     }
                 }
-
+                
                 if let _ = elem().decl(Decl {
                     width: grow!(),
                     align: TopRight,
                     padding: (0.0, ui.scale(48.0), 0.0, 0.0),
+                    direction: LeftToRight,
+                    child_gap: child_gap * 0.5,
                     ..Decl
                 }) {
+                    let (wallets_sync_h, wallets_tip_h) = {
+                        let state = wallet_state.lock().unwrap();
+                        (state.wallets_sync_h, state.wallets_tip_h)
+                    };
+                    let peer_count = viz.peer_strings.len();
+                    let behind = wallets_tip_h.saturating_sub(wallets_sync_h);
+                    let sync_pct = if wallets_tip_h > 0 {
+                        100.0 * (wallets_sync_h as f64 / wallets_tip_h as f64)
+                    } else {
+                        0.0
+                    };
+                    let (health_label, health_colour, summary) = if peer_count == 0 {
+                        ("Disconnected", (0xbf, 0x36, 0x39, 0xff), "No peers connected.")
+                    } else if wallets_tip_h > 0 && behind > 3 {
+                        ("Syncing", (0xa8, 0x72, 0x13, 0xff), "Connected and catching up.")
+                    } else {
+                        ("Healthy", (0x2d, 0x8a, 0x57, 0xff), "Connected and near chain tip.")
+                    };
+
+                    if let _ = elem().decl(Decl {
+                        direction: TopToBottom,
+                        align: TopRight,
+                        child_gap: ui.scale(8.0),
+                        width: fit!(),
+                        height: fit!(),
+                        ..Decl
+                    }) {
+                        let combo_id = id("Network Health Combo");
+                        let base = BUTTON_GREY.mul(0.85);
+                        let (activated, colour, text_colour) = ui.button_ex(true, base, combo_id, true, winit::window::CursorIcon::Pointer);
+                        if let _ = elem().decl(Decl {
+                            id: combo_id,
+                            colour,
+                            radius: ui.scale(18.0).dup4(),
+                            child_gap: ui.scale(8.0),
+                            padding: (ui.scale(8.0), ui.scale(14.0), ui.scale(8.0), ui.scale(14.0)),
+                            direction: LeftToRight,
+                            align: Center,
+                            width: fit!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            if let _ = elem().decl(Decl {
+                                colour: health_colour,
+                                radius: ui.scale(8.0).dup4(),
+                                width: fixed!(ui.scale(16.0)),
+                                height: fixed!(ui.scale(16.0)),
+                                ..Decl
+                            }) {}
+                            ui.text("Network", TextDecl { h: ui.scale(16.0), colour: WHITE.mul(0.75), align: AlignX::Left, ..TextDecl });
+                            ui.text(health_label, TextDecl { h: ui.scale(16.0), colour: text_colour, align: AlignX::Left, ..TextDecl });
+                            ui.text(ICON_DOWN_OPEN, TextDecl { font: Icons, h: ui.scale(14.0), colour: WHITE.mul(0.6), align: AlignX::Right, ..TextDecl });
+                        }
+                        if ui.hovered(combo_id) {
+                            set_tooltip_text!(data, "{} Click to expand.", summary);
+                        }
+
+                        if ui.openable(data, combo_id, activated, false) {
+                            if let _ = elem().decl(Decl {
+                                colour: BUTTON_GREY.mul(0.92),
+                                radius: ui.scale(14.0).dup4(),
+                                padding: (ui.scale(10.0), ui.scale(14.0), ui.scale(10.0), ui.scale(14.0)),
+                                child_gap: ui.scale(8.0),
+                                direction: TopToBottom,
+                                width: fit!(ui.scale(320.0)),
+                                height: fit!(),
+                                align: TopRight,
+                                ..Decl
+                            }) {
+                                let row = |ui: &mut Context, data: &mut UiData, label: &str, value: &str| {
+                                    if let _ = elem().decl(Decl {
+                                        direction: LeftToRight,
+                                        width: grow!(),
+                                        height: fit!(),
+                                        ..Decl
+                                    }) {
+                                        ui.text(label, TextDecl { h: ui.scale(15.0), colour: WHITE.mul(0.78), align: AlignX::Left, ..TextDecl });
+                                        let _ = elem().decl(Decl { width: grow!(), ..Decl });
+                                        ui.text(frame_strf!(data, "{}", value), TextDecl { font: Mono, h: ui.scale(15.0), align: AlignX::Right, ..TextDecl });
+                                    }
+                                };
+                                row(ui, data, "Summary", summary);
+                                row(ui, data, "Peers", &format!("{}", peer_count));
+                                row(ui, data, "Wallet Sync", &format!("{}/{} ({:.1}%)", wallets_sync_h, wallets_tip_h, sync_pct));
+                                row(ui, data, "Blocks Behind", &format!("{}", behind));
+                            }
+                        }
+                    }
+
                     let id = id("Mute Toggle");
 
                     let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, true, winit::window::CursorIcon::Pointer);
