@@ -3289,7 +3289,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         ui.text(frame_strf!(data, "Visualizing op: {:?}", ui.viz_op), decl);
                     }
                 }
-                
+
                 if let _ = elem().decl(Decl {
                     width: grow!(),
                     align: TopRight,
@@ -3387,26 +3387,92 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         }
                     }
 
-                    let id = id("Mute Toggle");
-
-                    let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, true, winit::window::CursorIcon::Pointer);
-
-                    let icon = if ui.global_audio_volume > 0.5 { ICON_VOLUME_HIGH } else { ICON_VOLUME_OFF_1 };
-                    if ui.global_audio_volume > 0.5 { ui.global_audio_volume = 1.0 } else { ui.global_audio_volume = 0.0 };
                     if let _ = elem().decl(Decl {
-                        id,
-                        child_gap,
-                        align: Center,
                         direction: TopToBottom,
+                        align: TopRight,
+                        child_gap: ui.scale(6.0),
                         width: fit!(),
                         height: fit!(),
                         ..Decl
                     }) {
-                        ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(32.0), align: AlignX::Center, ..TextDecl });
-                    }
+                        let mute_id = id("Mute Toggle");
+                        let (clicked, colour, _) = ui.button_ex(true, BUTTON_GREY.mul(0.9), mute_id, true, winit::window::CursorIcon::Pointer);
 
-                    if clicked {
-                        if ui.global_audio_volume > 0.5 { ui.global_audio_volume = 0.0 } else { ui.global_audio_volume = 1.0 };
+                        let icon = if ui.global_audio_volume > 0.01 { ICON_VOLUME_HIGH } else { ICON_VOLUME_OFF_1 };
+                        if let _ = elem().decl(Decl {
+                            id: mute_id,
+                            colour,
+                            radius: ui.scale(16.0).dup4(),
+                            padding: (ui.scale(8.0), ui.scale(10.0), ui.scale(8.0), ui.scale(10.0)),
+                            child_gap,
+                            align: Center,
+                            direction: TopToBottom,
+                            width: fit!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            ui.text(icon, TextDecl { font: Icons, colour: WHITE.mul(0.95), h: ui.scale(32.0), align: AlignX::Center, ..TextDecl });
+                        }
+
+                        if clicked {
+                            if ui.global_audio_volume > 0.01 { ui.global_audio_volume = 0.0 } else { ui.global_audio_volume = 1.0 };
+                        }
+
+                        if let _ = elem().decl(Decl {
+                            colour: BUTTON_GREY.mul(0.9),
+                            radius: ui.scale(12.0).dup4(),
+                            padding: (ui.scale(7.0), ui.scale(8.0), ui.scale(7.0), ui.scale(8.0)),
+                            child_gap: ui.scale(5.0),
+                            direction: TopToBottom,
+                            align: Center,
+                            width: fit!(ui.scale(42.0)),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            let volume_pct = (ui.global_audio_volume * 100.0).round() as u32;
+                            ui.text(frame_strf!(data, "{}%", volume_pct), TextDecl { h: ui.scale(12.0), align: AlignX::Center, colour: WHITE.mul(0.8), ..TextDecl });
+                            if let _ = elem().decl(Decl {
+                                direction: TopToBottom,
+                                align: Center,
+                                child_gap: ui.scale(1.0),
+                                width: fit!(),
+                                height: fit!(),
+                                ..Decl
+                            }) {
+                                let steps = 22usize;
+                                let handle_idx = ((ui.global_audio_volume * (steps - 1) as f32).round() as usize).min(steps - 1);
+                                let handle_id = id("Volume Slider Handle");
+                                if ui.mouse_pressed_id == handle_id {
+                                    ui.global_audio_volume = (ui.global_audio_volume - ui.input().mouse_delta().1 as f32 / ui.scale(140.0)).clamp(0.0, 1.0);
+                                }
+                                for i in (0..steps).rev() {
+                                    let step_id = id_index("Volume Slider Step", i as u32);
+                                    let step_level = i as f32 / (steps - 1) as f32;
+                                    let active = step_level <= ui.global_audio_volume + 0.001;
+                                    let is_handle = i == handle_idx;
+                                    let col = if is_handle {
+                                        WHITE.mul(0.92)
+                                    } else if active {
+                                        BUTTON_BLUE.mul(0.95)
+                                    } else {
+                                        BUTTON_GREY.mul(0.68)
+                                    };
+                                    let draw_id = if is_handle { handle_id } else { step_id };
+                                    let (step_clicked, col, _) = ui.button_ex(true, col, draw_id, true, winit::window::CursorIcon::Pointer);
+                                    if let _ = elem().decl(Decl {
+                                        id: draw_id,
+                                        colour: col,
+                                        radius: ui.scale(3.0).dup4(),
+                                        width: fixed!(if is_handle { ui.scale(14.0) } else { ui.scale(8.0) }),
+                                        height: fixed!(if is_handle { ui.scale(7.0) } else { ui.scale(4.0) }),
+                                        ..Decl
+                                    }) {}
+                                    if step_clicked {
+                                        ui.global_audio_volume = step_level;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
