@@ -44,6 +44,7 @@ pub struct UiData {
     pub openables: HashMap<u32, OpenableState>,
 
     pub tooltip_text: String,
+    pub jump_target_pos: bool,
 }
 
 
@@ -428,6 +429,7 @@ pub const fn clay_colour(colour: (u8, u8, u8, u8)) -> clay::Color { clay::Color:
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 pub enum Modal {
     #[default] None,
+    Jump,
     Send,
     Receive,
     Stake,
@@ -1200,19 +1202,33 @@ pub fn ui_left_pane(ui: &mut Context,
             total_bonded += position;
         }
     }
-
-
-
+    let modal_container_direction = if ui.modal == Modal::Jump { TopToBottom } else { LeftToRight };
+    let modal_container_floating = if ui.modal == Modal::Jump {
+        Floating::Root(0.0, 0.0)
+    } else {
+        Floating::Parent
+    };
+    let modal_container_width = if ui.modal == Modal::Jump {
+        fixed!(ui.draw().window_width as f32)
+    } else {
+        grow!()
+    };
+    let modal_container_height = if ui.modal == Modal::Jump {
+        fixed!(ui.draw().window_height as f32)
+    } else {
+        grow!()
+    };
     if ui.modal != Modal::None && let _elem = elem().decl(Decl {
         child_gap,
         id: id("Modal Container"),
         padding: padding.mul(2.0),
         radius: (radius.0, 0.0, radius.2, 0.0),
-        floating: Floating::Parent,
+        floating: modal_container_floating,
         colour: (0, 0, 0, 0xC0),
+        direction: modal_container_direction,
         align: Center,
-        width:  grow!(),
-        height: grow!(),
+        width:  modal_container_width,
+        height: modal_container_height,
         ..Decl
     }) {
         let container_id = _elem.decl.id;
@@ -1221,21 +1237,29 @@ pub fn ui_left_pane(ui: &mut Context,
         if container_hovered { ui.capture = true; }
 
         let mut height = grow!(ui.scale(192.0), ui.scale(384.0));
-        if ui.modal == Modal::Stake || ui.modal == Modal::Send {
+        if ui.modal == Modal::Stake || ui.modal == Modal::Send || ui.modal == Modal::Jump {
             height = fit!();
         }
         if ui.modal == Modal::Unstake {
             height = percent!(0.9);
         }
 
+        let modal_align = if ui.modal == Modal::Jump { Center } else { Top };
+        let modal_floating = if ui.modal == Modal::Jump { Floating::Parent } else { Floating::None };
+        let modal_width = if ui.modal == Modal::Jump {
+            fit!(ui.scale(520.0))
+        } else {
+            grow!(ui.scale(192.0)/* , ui.scale(384.0) */)
+        };
         if let _elem = elem().decl(Decl {
             child_gap, radius,
             id: id("Modal Contents"),
             padding: padding.mul(2.0),
             colour: MODAL_COL,
-            width:  grow!(ui.scale(192.0)/* , ui.scale(384.0) */),
+            width:  modal_width,
             height,
-            align: Top,
+            floating: modal_floating,
+            align: modal_align,
             direction: TopToBottom,
             ..Decl
         }) {
@@ -1327,6 +1351,82 @@ pub fn ui_left_pane(ui: &mut Context,
 
             match ui.modal {
                 Modal::None => {}
+                Modal::Jump => {
+                    title_bar(ui, true, "Jump To Height", id("Jump To Height Title Bar"));
+
+                    if let _ = elem().decl(Decl {
+                        child_gap,
+                        width: grow!(),
+                        height: fit!(),
+                        align: Center,
+                        direction: TopToBottom,
+                        ..Decl
+                    }) {
+                        if let _ = elem().decl(Decl {
+                            direction: LeftToRight,
+                            child_gap: ui.scale(8.0),
+                            width: fit!(),
+                            height: fit!(),
+                            align: Center,
+                            ..Decl
+                        }) {
+                            let pow_id = id("Jump To Pow");
+                            let (pow_clicked, pow_col, pow_txt) = ui.button_ex(true, BUTTON_GREY.mul(if !data.jump_target_pos { 1.0 } else { 0.8 }), pow_id, true, winit::window::CursorIcon::Pointer);
+                            if let _ = elem().decl(Decl {
+                                id: pow_id,
+                                colour: pow_col,
+                                radius: ui.scale(14.0).dup4(),
+                                padding: (ui.scale(8.0), ui.scale(14.0), ui.scale(8.0), ui.scale(14.0)),
+                                width: fit!(),
+                                height: fit!(),
+                                ..Decl
+                            }) {
+                                ui.text("PoW", TextDecl { h: ui.scale(16.0), colour: pow_txt, align: AlignX::Center, ..TextDecl });
+                            }
+
+                            let pos_id = id("Jump To Pos");
+                            let (pos_clicked, pos_col, pos_txt) = ui.button_ex(true, BUTTON_GREY.mul(if data.jump_target_pos { 1.0 } else { 0.8 }), pos_id, true, winit::window::CursorIcon::Pointer);
+                            if let _ = elem().decl(Decl {
+                                id: pos_id,
+                                colour: pos_col,
+                                radius: ui.scale(14.0).dup4(),
+                                padding: (ui.scale(8.0), ui.scale(14.0), ui.scale(8.0), ui.scale(14.0)),
+                                width: fit!(),
+                                height: fit!(),
+                                ..Decl
+                            }) {
+                                ui.text("PoS", TextDecl { h: ui.scale(16.0), colour: pos_txt, align: AlignX::Center, ..TextDecl });
+                            }
+
+                            if pow_clicked {
+                                data.jump_target_pos = false;
+                            }
+                            if pos_clicked {
+                                data.jump_target_pos = true;
+                            }
+                        }
+
+                        let jump_input_id = id("Goto Height Input");
+                        let jump_text = ui.textbox(
+                            data,
+                            jump_input_id,
+                            if data.jump_target_pos { "Enter PoS height..." } else { "Enter PoW height..." },
+                            TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
+                        );
+
+                        let can_jump = jump_text.trim().len() > 0;
+                        if button_ex(ui, id("Jump To Selected Height"), "Jump", can_jump) || (ui.input().key_pressed(KeyCode::Enter) && ui.nav_id == jump_input_id.id) {
+                            if let Ok(h) = jump_text.trim().parse::<u64>() {
+                                if data.jump_target_pos {
+                                    let _ = viz.goto_pos_height(h);
+                                } else {
+                                    viz.goto_pow_height(h);
+                                }
+                                ui.modal = Modal::None;
+                            }
+                        }
+                    }
+                }
                 Modal::Send => {
                     title_bar(ui, true, "Send",    id("Send Title Bar"));
 
@@ -3261,6 +3361,9 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
     let shift_held = (ui.input().key_held(KeyCode::ShiftLeft)   || ui.input().key_held(KeyCode::ShiftRight));
     let ctrl_held  = (ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight));
+    if ctrl_held && ui.input().key_pressed(KeyCode::KeyJ) {
+        ui.modal = Modal::Jump;
+    }
 
     ui.capture = false;
     // let prev_nav_idx_to_id = ui.nav_idx_to_id.clone();
@@ -3390,49 +3493,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     colour: (0, 0, 0, 127),
                     ..Decl
                 }) {
-                    let (wallets_sync_h, wallets_tip_h) = {
-                        let state = wallet_state.lock().unwrap();
-                        (state.wallets_sync_h, state.wallets_tip_h)
-                    };
-                    // @todo: two vertical panes with right aligned label and left aligned height
                     let decl = TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl };
-                    ui.text(frame_strf!(data, "PoS Height: {}", viz.bft_tip_height), decl);
-                    ui.text(frame_strf!(data, "PoW Height: {}", viz.bc_tip_height), decl);
-                    ui.text(frame_strf!(data, "PoW Finalized Height: {}", viz.bc_finalized_tip_height), decl);
-                    ui.text(frame_strf!(data, "Orchard Pool Zatoshis: {}", viz.orchard_pool_balance), decl);
-                    ui.text(frame_strf!(data, "Staking (Bonded) Pool Zatoshis: {}", viz.staking_bonded_pool_balance), decl);
-                    ui.text(frame_strf!(data, "Staking (Unbonded) Pool Zatoshis: {}", viz.staking_unbonded_pool_balance), decl);
-                    ui.text(frame_strf!(data, "Wallet Sync: {}/{}", wallets_sync_h, wallets_tip_h), decl);
-
-                    {
-                        let goto_decl = TextDecl { h: ui.scale(12.0), align: AlignX::Left, ..TextDecl };
-                        if let _ = elem().decl(Decl {
-                            direction: LeftToRight,
-                            child_gap: child_gap * 0.5,
-                            width: grow!(),
-                            height: fit!(),
-                            ..Decl
-                        }) {
-                            let pow_id = id("Goto PoW Height Input");
-                            let pos_id = id("Goto PoS Height Input");
-                            if let _ = elem().decl(Decl { width: grow!(), ..Decl }) {
-                                let pow_text = ui.textbox(data, pow_id, "PoW height…", goto_decl);
-                                if ui.input().key_pressed(KeyCode::Enter) && ui.nav_id == pow_id.id {
-                                    if let Ok(h) = pow_text.trim().parse::<u64>() {
-                                        viz.goto_pow_height(h);
-                                    }
-                                }
-                            }
-                            if let _ = elem().decl(Decl { width: grow!(), ..Decl }) {
-                                let pos_text = ui.textbox(data, pos_id, "PoS height…", goto_decl);
-                                if ui.input().key_pressed(KeyCode::Enter) && ui.nav_id == pos_id.id {
-                                    if let Ok(h) = pos_text.trim().parse::<u64>() {
-                                        let _ = viz.goto_pos_height(h);
-                                    }
-                                }
-                            }
-                        }
-                    }
 
                     if ui.debug {
                         ui.text("------------------", decl);
@@ -3512,12 +3573,12 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
                         if ui.openable(data, combo_id, activated, false) {
                             if let _ = elem().decl(Decl {
-                                colour: BUTTON_GREY.mul(0.92),
-                                radius: ui.scale(14.0).dup4(),
-                                padding: (ui.scale(10.0), ui.scale(14.0), ui.scale(10.0), ui.scale(14.0)),
-                                child_gap: ui.scale(8.0),
+                                colour: BUTTON_GREY.mul(0.90),
+                                radius: ui.scale(16.0).dup4(),
+                                padding: (ui.scale(12.0), ui.scale(16.0), ui.scale(12.0), ui.scale(16.0)),
+                                child_gap: ui.scale(10.0),
                                 direction: TopToBottom,
-                                width: fit!(ui.scale(320.0)),
+                                width: fit!(ui.scale(400.0)),
                                 height: fit!(),
                                 align: TopRight,
                                 ..Decl
@@ -3534,10 +3595,69 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                         ui.text(frame_strf!(data, "{}", value), TextDecl { font: Mono, h: ui.scale(15.0), align: AlignX::Right, ..TextDecl });
                                     }
                                 };
-                                row(ui, data, "Summary", summary);
-                                row(ui, data, "Peers", &format!("{}", peer_count));
-                                row(ui, data, "Wallet Sync", &format!("{}/{} ({:.1}%)", wallets_sync_h, wallets_tip_h, sync_pct));
-                                row(ui, data, "Blocks Behind", &format!("{}", behind));
+                                if let _ = elem().decl(Decl {
+                                    colour: BUTTON_GREY.mul(0.75),
+                                    radius: ui.scale(12.0).dup4(),
+                                    padding: (ui.scale(10.0), ui.scale(12.0), ui.scale(10.0), ui.scale(12.0)),
+                                    child_gap: ui.scale(8.0),
+                                    direction: TopToBottom,
+                                    width: grow!(),
+                                    height: fit!(),
+                                    ..Decl
+                                }) {
+                                    if let _ = elem().decl(Decl {
+                                        direction: LeftToRight,
+                                        child_gap: ui.scale(8.0),
+                                        width: grow!(),
+                                        height: fit!(),
+                                        ..Decl
+                                    }) {
+                                        if let _ = elem().decl(Decl {
+                                            colour: health_colour,
+                                            radius: ui.scale(6.0).dup4(),
+                                            width: fixed!(ui.scale(12.0)),
+                                            height: fixed!(ui.scale(12.0)),
+                                            ..Decl
+                                        }) {}
+                                        ui.text(health_label, TextDecl { h: ui.scale(17.0), colour: WHITE, align: AlignX::Left, ..TextDecl });
+                                    }
+                                    ui.text(summary, TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.76), align: AlignX::Left, ..TextDecl });
+                                }
+
+                                if let _ = elem().decl(Decl {
+                                    colour: BUTTON_GREY.mul(0.72),
+                                    radius: ui.scale(12.0).dup4(),
+                                    padding: (ui.scale(10.0), ui.scale(12.0), ui.scale(10.0), ui.scale(12.0)),
+                                    child_gap: ui.scale(6.0),
+                                    direction: TopToBottom,
+                                    width: grow!(),
+                                    height: fit!(),
+                                    ..Decl
+                                }) {
+                                    ui.text("Live Network", TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.70), align: AlignX::Left, ..TextDecl });
+                                    row(ui, data, "PoS Height", &format!("{}", viz.bft_tip_height));
+                                    row(ui, data, "PoW Height", &format!("{}", viz.bc_tip_height));
+                                    row(ui, data, "PoW Finalized", &format!("{}", viz.bc_finalized_tip_height));
+                                    row(ui, data, "Peers", &format!("{}", peer_count));
+                                    row(ui, data, "Wallet Sync", &format!("{}/{} ({:.1}%)", wallets_sync_h, wallets_tip_h, sync_pct));
+                                    row(ui, data, "Blocks Behind", &format!("{}", behind));
+                                }
+
+                                if let _ = elem().decl(Decl {
+                                    colour: BUTTON_GREY.mul(0.68),
+                                    radius: ui.scale(12.0).dup4(),
+                                    padding: (ui.scale(10.0), ui.scale(12.0), ui.scale(10.0), ui.scale(12.0)),
+                                    child_gap: ui.scale(6.0),
+                                    direction: TopToBottom,
+                                    width: grow!(),
+                                    height: fit!(),
+                                    ..Decl
+                                }) {
+                                    ui.text("Pool Balances", TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.70), align: AlignX::Left, ..TextDecl });
+                                    row(ui, data, "Orchard", &format!("{}", viz.orchard_pool_balance));
+                                    row(ui, data, "Staking Bonded", &format!("{}", viz.staking_bonded_pool_balance));
+                                    row(ui, data, "Staking Unbonded", &format!("{}", viz.staking_unbonded_pool_balance));
+                                }
                             }
                         }
                     }
