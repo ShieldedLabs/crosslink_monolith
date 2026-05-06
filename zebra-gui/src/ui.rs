@@ -666,6 +666,7 @@ impl Context {
             let mut textbox_state = &mut data.textboxes.entry(id.id).or_default();
 
             textbox_state.h = text_decl.h;
+            textbox_state.font = text_decl.font;
 
             if self.nav_id == id.id {
                 let mut moved = false;
@@ -968,6 +969,7 @@ pub struct TextboxState {
     pub selection: (usize, usize),
     pub bbox: (isize, isize, isize, isize),
     pub h: f32,
+    pub font: FontKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -4054,8 +4056,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     s
                 };
 
-                let head_xoff = ui.draw_mut().measure_text_line(FontKind::Normal, h, &head_str);
-                let tail_xoff = ui.draw_mut().measure_text_line(FontKind::Normal, h, &tail_str);
+                let head_xoff = ui.draw_mut().measure_text_line(textbox_state.font, h, &head_str);
+                let tail_xoff = ui.draw_mut().measure_text_line(textbox_state.font, h, &tail_str);
                 let head_x = x1 + padding as isize + head_xoff as isize;
                 let tail_x = x1 + padding as isize + tail_xoff as isize;
 
