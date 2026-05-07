@@ -674,6 +674,43 @@ fn e_lerp(from: f32, to: f32, dt: f32) -> f32 {
     }
 }
 
+fn hovered_hash_in_world<T>(
+    items: impl Iterator<Item = T>,
+    world_mouse_x: f32,
+    world_mouse_y: f32,
+    sample: impl Fn(T) -> (f32, f32, Hash32),
+) -> Option<Hash32> {
+    let mut hovered = None;
+    for item in items {
+        let (x, y, hash) = sample(item);
+        let dx = x - world_mouse_x;
+        let dy = y - world_mouse_y;
+        if (dx * dx + dy * dy).sqrt() < 1.0 {
+            hovered = Some(hash);
+        }
+    }
+    hovered
+}
+
+fn animate_bc_towards_target(on_screen_bc: &mut OnScreenBc, dt: f32) {
+    on_screen_bc.x = e_lerp(on_screen_bc.x, on_screen_bc.t_x, dt);
+    on_screen_bc.y = e_lerp(on_screen_bc.y, on_screen_bc.t_y, dt);
+    on_screen_bc.roundness = e_lerp(on_screen_bc.roundness, on_screen_bc.t_roundness, dt);
+    on_screen_bc.darkness = e_lerp(on_screen_bc.darkness, on_screen_bc.t_darkness, dt);
+    on_screen_bc.alpha = e_lerp(on_screen_bc.alpha, on_screen_bc.t_alpha, dt);
+    on_screen_bc.bft_arrow_alpha = e_lerp(on_screen_bc.bft_arrow_alpha, on_screen_bc.t_bft_arrow_alpha, dt);
+    on_screen_bc.finalized_alpha = e_lerp(on_screen_bc.finalized_alpha, on_screen_bc.t_finalized_alpha, dt);
+    on_screen_bc.implicated_by_bft_alpha = e_lerp(on_screen_bc.implicated_by_bft_alpha, on_screen_bc.t_implicated_by_bft_alpha, dt);
+}
+
+fn animate_bft_towards_target(on_screen_bft: &mut OnScreenBft, dt: f32) {
+    on_screen_bft.x = e_lerp(on_screen_bft.x, on_screen_bft.t_x, dt);
+    on_screen_bft.y = e_lerp(on_screen_bft.y, on_screen_bft.t_y, dt);
+    on_screen_bft.roundness = e_lerp(on_screen_bft.roundness, on_screen_bft.t_roundness, dt);
+    on_screen_bft.darkness = e_lerp(on_screen_bft.darkness, on_screen_bft.t_darkness, dt);
+    on_screen_bft.alpha = e_lerp(on_screen_bft.alpha, on_screen_bft.t_alpha, dt);
+}
+
 const ZOOM_FACTOR : f32 = 1.2;
 const SCREEN_UNIT_CONST : f32 = 10.0;
 
@@ -692,36 +729,45 @@ fn effective_vertical_wheel_for_scrub(input_ctx: &InputCtx) -> f32 {
     -(input_ctx.zoom_delta as f32) * 28.0
 }
 
-fn chain_minimap_screen_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
+#[derive(Clone, Copy)]
+enum MinimapLane {
+    Pow,
+    Pos,
+}
+
+fn minimap_screen_rect(draw_ctx: &DrawCtx, ui: &ui::Context, lane: MinimapLane) -> (f32, f32, f32, f32) {
     let w = draw_ctx.window_width as f32;
     let h = draw_ctx.window_height as f32;
     let ds = ui.dpi_scale;
     let gx = 10.0 * ds;
     let strip = 46.0 * ds;
-    let x0 = w * PANE_PERCENT_LEFT + gx;
-    let x1 = x0 + strip;
+    let (x0, x1) = match lane {
+        MinimapLane::Pow => {
+            let x0 = w * PANE_PERCENT_LEFT + gx;
+            (x0, x0 + strip)
+        }
+        MinimapLane::Pos => {
+            let x1 = w * (1.0 - PANE_PERCENT_RIGHT) - gx;
+            (x1 - strip, x1)
+        }
+    };
     let y0 = 50.0 * ds;
     let y1 = h - 86.0 * ds;
     (x0, y0, x1, y1)
 }
 
+fn chain_minimap_screen_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
+    minimap_screen_rect(draw_ctx, ui, MinimapLane::Pow)
+}
+
 fn pos_minimap_screen_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
-    let w = draw_ctx.window_width as f32;
-    let h = draw_ctx.window_height as f32;
-    let ds = ui.dpi_scale;
-    let gx = 10.0 * ds;
-    let strip = 46.0 * ds;
-    let x1 = w * (1.0 - PANE_PERCENT_RIGHT) - gx;
-    let x0 = x1 - strip;
-    let y0 = 50.0 * ds;
-    let y1 = h - 86.0 * ds;
-    (x0, y0, x1, y1)
+    minimap_screen_rect(draw_ctx, ui, MinimapLane::Pos)
 }
 
 // NOTE(Giovanni): drawn card sticks title and legend outside the core strip rect, users aim wheel there
 //   and nothing happened bc hit test used the tight inner box only. pad is eyeballed vs draw_chain_minimap_overlay.
-fn chain_minimap_interaction_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
-    let (x0, y0, x1, y1) = chain_minimap_screen_rect(draw_ctx, ui);
+fn minimap_interaction_rect(mm_rect: (f32, f32, f32, f32), ui: &ui::Context) -> (f32, f32, f32, f32) {
+    let (x0, y0, x1, y1) = mm_rect;
     let ds = ui.dpi_scale;
     let px = 8.0 * ds;
     let py_top = 46.0 * ds;
@@ -729,13 +775,12 @@ fn chain_minimap_interaction_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32,
     (x0 - px, y0 - py_top, x1 + px, y1 + py_bot)
 }
 
+fn chain_minimap_interaction_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
+    minimap_interaction_rect(chain_minimap_screen_rect(draw_ctx, ui), ui)
+}
+
 fn pos_minimap_interaction_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
-    let (x0, y0, x1, y1) = pos_minimap_screen_rect(draw_ctx, ui);
-    let ds = ui.dpi_scale;
-    let px = 8.0 * ds;
-    let py_top = 46.0 * ds;
-    let py_bot = 26.0 * ds;
-    (x0 - px, y0 - py_top, x1 + px, y1 + py_bot)
+    minimap_interaction_rect(pos_minimap_screen_rect(draw_ctx, ui), ui)
 }
 
 // NOTE(Giovanni): span comes from whats actually in on_screen_bcs for the best chain, plus we
@@ -794,6 +839,16 @@ fn apply_scrub_bft_height(viz: &mut VizState, mut h: u64) {
     {
         let _ = viz.goto_pos_height(bh);
     }
+}
+
+fn apply_scrub_pow_height(viz: &mut VizState, h: f32, h_min: u64, h_max: u64) {
+    let h_next = h.clamp(h_min as f32, h_max as f32);
+    viz.camera_y = -10.0 * h_next;
+    viz.camera_x = 0.0;
+}
+
+fn minimap_wheel_delta_height(dy: f32, strip_h: f32, span_h: f32) -> f32 {
+    -(dy / strip_h.max(1.0)) * span_h * 0.45
 }
 
 // NOTE(Giovanni): y goes down the screen but higher block numbers are "up" in the metaphor so we flip
@@ -1125,7 +1180,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 let (bft_min, bft_max) = bft_minimap_height_span(viz_state);
                 let strip_h = (pos_mm_y1 - pos_mm_y0).max(1.0);
                 let span_b = bft_max.saturating_sub(bft_min).max(1) as f32;
-                let dh_b = -(dy / strip_h) * span_b * 0.45;
+                let dh_b = minimap_wheel_delta_height(dy, strip_h, span_b);
                 let h_cur = viz_state.nearest_bft_height_to_camera_y(viz_state.camera_y) as f32;
                 let h_next = (h_cur + dh_b).round() as u64;
                 apply_scrub_bft_height(viz_state, h_next);
@@ -1134,11 +1189,9 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 let (h_min, h_max) = chain_minimap_height_span(viz_state);
                 let strip_h = (mm_y1 - mm_y0).max(1.0);
                 let span_h = h_max.saturating_sub(h_min).max(1) as f32;
-                let dh = -(dy / strip_h) * span_h * 0.45;
+                let dh = minimap_wheel_delta_height(dy, strip_h, span_h);
                 let h_cur = ((-viz_state.camera_y) / 10.0).clamp(h_min as f32, h_max as f32);
-                let h_next = (h_cur + dh).clamp(h_min as f32, h_max as f32);
-                viz_state.camera_y = -10.0 * h_next;
-                viz_state.camera_x = 0.0;
+                apply_scrub_pow_height(viz_state, h_cur + dh, h_min, h_max);
                 minimap_wheel_scrubbed = true;
             }
         }
@@ -1178,8 +1231,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             } else {
                 let (h_min, h_max) = chain_minimap_height_span(viz_state);
                 let ht = chain_minimap_y_to_h(my_scr.clamp(mm_y0, mm_y1), h_min, h_max, mm_y0, mm_y1);
-                viz_state.camera_y = -10.0 * ht as f32;
-                viz_state.camera_x = 0.0;
+                apply_scrub_pow_height(viz_state, ht as f32, h_min, h_max);
                 minimap_scrub_this_frame = true;
             }
         }
@@ -1189,8 +1241,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         {
             let (h_min, h_max) = chain_minimap_height_span(viz_state);
             let ht = chain_minimap_y_to_h(my_scr, h_min, h_max, mm_y0, mm_y1);
-            viz_state.camera_y = -10.0 * ht as f32;
-            viz_state.camera_x = 0.0;
+            apply_scrub_pow_height(viz_state, ht as f32, h_min, h_max);
             viz_state.zoom = 2.0;
             ui.mouse_pressed_id = ui::Id::CHAIN_MINIMAP_POW;
             minimap_scrub_this_frame = true;
@@ -1261,19 +1312,21 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     let mut hovered_block = Hash32::from_u64(0);
     let mut hovered_block_screen_x = 0.0;
     let mut hovered_block_screen_y = 0.0;
-    for on_screen_bc in viz_state.on_screen_bcs.values() {
-        let dx = on_screen_bc.x - world_mouse_x;
-        let dy = on_screen_bc.y - world_mouse_y;
-        if (dx*dx + dy*dy).sqrt() < 1.0 {
-            hovered_block = on_screen_bc.block.this_hash;
-        }
+    if let Some(hash) = hovered_hash_in_world(
+        viz_state.on_screen_bcs.values(),
+        world_mouse_x,
+        world_mouse_y,
+        |on_screen_bc| (on_screen_bc.x, on_screen_bc.y, on_screen_bc.block.this_hash),
+    ) {
+        hovered_block = hash;
     }
-    for on_screen_bft in viz_state.on_screen_bfts.values() {
-        let dx = on_screen_bft.x - world_mouse_x;
-        let dy = on_screen_bft.y - world_mouse_y;
-        if (dx*dx + dy*dy).sqrt() < 1.0 {
-            hovered_block = on_screen_bft.block.this_hash;
-        }
+    if let Some(hash) = hovered_hash_in_world(
+        viz_state.on_screen_bfts.values(),
+        world_mouse_x,
+        world_mouse_y,
+        |on_screen_bft| (on_screen_bft.x, on_screen_bft.y, on_screen_bft.block.this_hash),
+    ) {
+        hovered_block = hash;
     }
 
     // NOTE(Giovanni): minimap isnt a clay element so world space hover can still think theres a block
@@ -1408,21 +1461,10 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
 
     // animate to targets
     for on_screen_bc in viz_state.on_screen_bcs.values_mut() {
-        on_screen_bc.x = e_lerp(on_screen_bc.x, on_screen_bc.t_x, dt);
-        on_screen_bc.y = e_lerp(on_screen_bc.y, on_screen_bc.t_y, dt);
-        on_screen_bc.roundness = e_lerp(on_screen_bc.roundness, on_screen_bc.t_roundness, dt);
-        on_screen_bc.darkness = e_lerp(on_screen_bc.darkness, on_screen_bc.t_darkness, dt);
-        on_screen_bc.alpha = e_lerp(on_screen_bc.alpha, on_screen_bc.t_alpha, dt);
-        on_screen_bc.bft_arrow_alpha = e_lerp(on_screen_bc.bft_arrow_alpha, on_screen_bc.t_bft_arrow_alpha, dt);
-        on_screen_bc.finalized_alpha = e_lerp(on_screen_bc.finalized_alpha, on_screen_bc.t_finalized_alpha, dt);
-        on_screen_bc.implicated_by_bft_alpha = e_lerp(on_screen_bc.implicated_by_bft_alpha, on_screen_bc.t_implicated_by_bft_alpha, dt);
+        animate_bc_towards_target(on_screen_bc, dt);
     }
     for on_screen_bft in viz_state.on_screen_bfts.values_mut() {
-        on_screen_bft.x = e_lerp(on_screen_bft.x, on_screen_bft.t_x, dt);
-        on_screen_bft.y = e_lerp(on_screen_bft.y, on_screen_bft.t_y, dt);
-        on_screen_bft.roundness = e_lerp(on_screen_bft.roundness, on_screen_bft.t_roundness, dt);
-        on_screen_bft.darkness = e_lerp(on_screen_bft.darkness, on_screen_bft.t_darkness, dt);
-        on_screen_bft.alpha = e_lerp(on_screen_bft.alpha, on_screen_bft.t_alpha, dt);
+        animate_bft_towards_target(on_screen_bft, dt);
     }
 
     //draw_ctx.circle(origin_x as f32, origin_y as f32, (screen_unit/2.0) as f32, 0xff_0000bb);

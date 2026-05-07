@@ -984,7 +984,7 @@ pub struct OpenableState {
     pub open: bool,
 }
 
-fn display_str(chunks: &[u64; 4]) -> String {
+fn display_str_with_edge_bytes(chunks: &[u64; 4], edge_bytes: usize) -> String {
     let mut bytes = {
         let mut out = [0u8; 32];
         let mut i = 0;
@@ -999,15 +999,28 @@ fn display_str(chunks: &[u64; 4]) -> String {
     let mut str = String::new();
     bytes.reverse();
 
-    for b in &bytes[0..4] {
+    let edge = edge_bytes.min(bytes.len() / 2).max(1);
+    for b in &bytes[0..edge] {
         str.push_str(&format!("{:02x}", b));
     }
     str.push_str("..");
-    for b in &bytes[bytes.len() - 4..] {
+    for b in &bytes[bytes.len() - edge..] {
         str.push_str(&format!("{:02x}", b));
     }
 
     str
+}
+
+fn display_str(chunks: &[u64; 4]) -> String {
+    display_str_with_edge_bytes(chunks, 4)
+}
+
+fn format_stake_amount(stake_amount: i64) -> String {
+    let full = stake_amount / 100_000_000;
+    let part = stake_amount % 100_000_000;
+    let part_str = format!("{part}00");
+    let trim_part = part_str.trim_end_matches("0");
+    format!("{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)])
 }
 
 fn chunkify(bytes: &[u8; 32]) -> [u64; 4] {
@@ -1021,6 +1034,96 @@ fn chunkify(bytes: &[u8; 32]) -> [u64; 4] {
     }
 
     chunks
+}
+
+fn modal_action_button(
+    ui: &mut Context,
+    padding: (f32, f32, f32, f32),
+    child_gap: f32,
+    label: &str,
+    act_on_press: bool,
+    enabled: bool,
+) -> bool {
+    let id = id(label);
+    let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
+    if let _ = elem().decl(Decl {
+        id,
+        child_gap,
+        align: Center,
+        direction: TopToBottom,
+        width: fit!(),
+        height: fit!(),
+        ..Decl
+    }) {
+        let radius = ui.scale(24.0);
+        if let _ = elem().decl(Decl {
+            colour,
+            padding,
+            child_gap,
+            radius: radius.dup4(),
+            align: Center,
+            width: fit!(ui.scale(192.0)),
+            height: fit!(radius * 2.0),
+            ..Decl
+        }) {
+            let h = ui.scale(20.0);
+            ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
+        }
+    }
+    clicked
+}
+
+fn modal_clickable_icon(
+    ui: &mut Context,
+    child_gap: f32,
+    id: Id,
+    icon: &str,
+    icon_hovered: &str,
+    enabled: bool,
+) -> bool {
+    let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff), id, enabled, winit::window::CursorIcon::Pointer);
+    let icon = if ui.hovered(id) { icon_hovered } else { icon };
+    if let _ = elem().decl(Decl {
+        id,
+        child_gap,
+        align: Center,
+        direction: TopToBottom,
+        width: fit!(),
+        height: fit!(),
+        ..Decl
+    }) {
+        ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
+    }
+    clicked
+}
+
+fn scroll_container_begin(
+    ui: &mut Context,
+    data: &mut UiData,
+    padding: (f32, f32, f32, f32),
+    top_pad: f32,
+    id: Id,
+    clip: ClipMode,
+    scroll: f32,
+    content_h: f32,
+    viewport_h: f32,
+    max: f32,
+) {
+    ui.scroll_container_bgn(data, padding, top_pad, id, clip, scroll, content_h, viewport_h, max);
+}
+
+fn scroll_container_finish(
+    ui: &mut Context,
+    data: &mut UiData,
+    padding: (f32, f32, f32, f32),
+    id: Id,
+    clip: ClipMode,
+    scroll: f32,
+    content_h: f32,
+    viewport_h: f32,
+    max: f32,
+) {
+    ui.scroll_container_end(data, padding, id, clip, scroll, content_h, viewport_h, max);
 }
 
 
@@ -1841,59 +1944,6 @@ pub fn ui_left_pane(ui: &mut Context,
                 Modal::Unstake => {
                     title_bar(ui, true, "Edit Stake", id("Edit Stake Title Bar"));
 
-                    let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
-                        let id = id(label);
-                        let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
-                        if let _ = elem().decl(Decl {
-                            id,
-                            child_gap,
-                            align: Center,
-                            direction: TopToBottom,
-                            width: fit!(),
-                            height: fit!(),
-                            ..Decl
-                        }) {
-                            let radius = ui.scale(24.0);
-
-                            // Button
-                            if let _ = elem().decl(Decl {
-                                colour,
-                                padding,
-                                child_gap,
-                                radius: radius.dup4(),
-                                align: Center,
-                                width:  fit!(ui.scale(192.0)),
-                                height: fit!(radius * 2.0),
-                                ..Decl
-                            }) {
-                                let h = ui.scale(20.0);
-                                ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
-                            }
-                        }
-
-                        clicked
-                    };
-
-                    let clickable_icon = |ui: &mut Context, id, icon, icon_hovered, enabled | {
-                        let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
-
-                        let icon = if ui.hovered(id) { icon_hovered } else { icon };
-                        if let _ = elem().decl(Decl {
-                            id,
-                            child_gap,
-                            align: Center,
-                            direction: TopToBottom,
-                            width: fit!(),
-                            height: fit!(),
-                            ..Decl
-                        }) {
-                            ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
-                        }
-
-                        clicked
-                    };
-
-
                     let can = is_staking_day;
 
                     let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Edit Stake Scroll Container"), 48.0);
@@ -1902,7 +1952,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         *scroll = 0.0;
                     }
                     let scroll = *scroll;
-                    ui.scroll_container_bgn(data, padding, 0.0, id, clip, scroll, content_h, viewport_h, max);
+                    scroll_container_begin(ui, data, padding, 0.0, id, clip, scroll, content_h, viewport_h, max);
                     {
                         if (staked_roster_unbonded.len() + staked_roster_bonded.len()) == 0 {
                             let h = ui.scale(24.0);
@@ -1995,7 +2045,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }) {
                                                 let (icon, icon_hovered) = (ICON_MONEY, ICON_WALLET);
                                                 let id = id_index("Unstake Button", index as u32);
-                                                if clickable_icon(ui, id, icon, icon_hovered, can) {
+                                                if modal_clickable_icon(ui, child_gap, id, icon, icon_hovered, can) {
                                                     wallet_state.lock().unwrap().claim_bond(bond_key);
                                                 }
                                                 if !can && !is_staking_day && ui.hovered(id) {
@@ -2024,24 +2074,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 align: Right,
                                                 ..Decl
                                             }) {
-                                                // TODO: let accumulated_stake_amount;
-                                                let full = stake_amount / 100_000_000;
-                                                let part = stake_amount % 100_000_000;
-                                                let part_str = format!("{part}00");
-                                                let trim_part = part_str.trim_end_matches("0");
-
                                                 let id = id_index("Unstake Clickable Text", index as u32);
                                                 let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
-                                                let mut str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
+                                                let mut str = frame_strf!(data, "{}", format_stake_amount(stake_amount));
                                                 if ui.hovered(id) {
-                                                    // TODO: let initial_stake_amount;
-                                                    let full = stake_amount / 100_000_000;
-                                                    let part = stake_amount % 100_000_000;
-                                                    let part_str = format!("{part}00");
-                                                    let trim_part = part_str.trim_end_matches("0");
-
                                                     colour = WHITE;
-                                                    str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
+                                                    str = frame_strf!(data, "{}", format_stake_amount(stake_amount));
                                                 }
 
                                                 if let _ = elem().decl(Decl {
@@ -2208,7 +2246,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }) {
                                                 let (icon, icon_hovered) = (ICON_LINK_1, ICON_UNLINK);
                                                 let id = id_index("Unstake Button", index as u32);
-                                                if clickable_icon(ui, id, icon, icon_hovered, can) {
+                                                if modal_clickable_icon(ui, child_gap, id, icon, icon_hovered, can) {
                                                     wallet_state.lock().unwrap().unstake_from_finalizer(bond_key);
                                                 }
                                                 if !can && !is_staking_day && ui.hovered(id) {
@@ -2226,7 +2264,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }) {
                                                 let (icon, icon_hovered) = (ICON_MOVE, ICON_RESIZE_FULL_ALT);
                                                 let id = id_index("Retarget Button", index as u32);
-                                                if clickable_icon(ui, id, icon, icon_hovered, true) {
+                                                if modal_clickable_icon(ui, child_gap, id, icon, icon_hovered, true) {
                                                     ui.modal = Modal::Retarget;
                                                     ui.retarget_modal_bond_key = bond_key;
                                                 }
@@ -2253,24 +2291,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 align: Right,
                                                 ..Decl
                                             }) {
-                                                // TODO: let accumulated_stake_amount;
-                                                let full = stake_amount / 100_000_000;
-                                                let part = stake_amount % 100_000_000;
-                                                let part_str = format!("{part}00");
-                                                let trim_part = part_str.trim_end_matches("0");
-
                                                 let id = id_index("Unstake Clickable Text", index as u32);
                                                 let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
-                                                let mut str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
+                                                let mut str = frame_strf!(data, "{}", format_stake_amount(stake_amount));
                                                 if ui.hovered(id) {
-                                                    // TODO: let initial_stake_amount;
-                                                    let full = stake_amount / 100_000_000;
-                                                    let part = stake_amount % 100_000_000;
-                                                    let part_str = format!("{part}00");
-                                                    let trim_part = part_str.trim_end_matches("0");
-
                                                     colour = WHITE;
-                                                    str = frame_strf!(data, "{}.{} cTAZ", full, &part_str[..trim_part.len().max(3)]);
+                                                    str = frame_strf!(data, "{}", format_stake_amount(stake_amount));
                                                 }
 
                                                 if let _ = elem().decl(Decl {
@@ -2292,83 +2318,30 @@ pub fn ui_left_pane(ui: &mut Context,
                             }
                         }
                     }
-                    ui.scroll_container_end(data, padding, id, clip, scroll, content_h, viewport_h, max);
+                    scroll_container_finish(ui, data, padding, id, clip, scroll, content_h, viewport_h, max);
                 }
 
                 Modal::User => {
                     title_bar(ui, true, "User", id("User Title Bar"));
 
-                    let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
-                        let id = id(label);
-                        let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
-                        if let _ = elem().decl(Decl {
-                            id,
-                            child_gap,
-                            align: Center,
-                            direction: TopToBottom,
-                            width: fit!(),
-                            height: fit!(),
-                            ..Decl
-                        }) {
-                            let radius = ui.scale(24.0);
-
-                            // Button
-                            if let _ = elem().decl(Decl {
-                                colour,
-                                padding,
-                                child_gap,
-                                radius: radius.dup4(),
-                                align: Center,
-                                width:  fit!(ui.scale(192.0)),
-                                height: fit!(radius * 2.0),
-                                ..Decl
-                            }) {
-                                let h = ui.scale(20.0);
-                                ui.text(label, TextDecl { h, colour: text_colour, align: AlignX::Center, ..TextDecl });
-                            }
-                        }
-
-                        clicked
-                    };
-
-                    let clickable_icon = |ui: &mut Context, id, icon, icon_hovered, enabled | {
-                        let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
-
-                        let icon = if ui.hovered(id) { icon_hovered } else { icon };
-                        if let _ = elem().decl(Decl {
-                            id,
-                            child_gap,
-                            align: Center,
-                            direction: TopToBottom,
-                            width: fit!(),
-                            height: fit!(),
-                            ..Decl
-                        }) {
-                            ui.text(icon, TextDecl { font: Icons, colour, h: ui.scale(24.0), align: AlignX::Center, ..TextDecl });
-                        }
-
-                        clicked
-                    };
-
-
                     let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("User Scroll Container"), 48.0);
                     let scroll = *scroll;
-                    ui.scroll_container_bgn(data, padding, 0.0, id, clip, scroll, content_h, viewport_h, max);
+                    scroll_container_begin(ui, data, padding, 0.0, id, clip, scroll, content_h, viewport_h, max);
                     {
                         let (seed, ufvk) = {
                             let state = wallet_state.lock().unwrap();
                             (state.user_seed_mnemonic.clone(), state.user_ufvk.clone())
                         };
-                        if button_ex(ui, "Copy Seed", true, true) {
+                        if modal_action_button(ui, padding, child_gap, "Copy Seed", true, true) {
                             ui.input().send_to_clipboard(&seed);
                         }
 
-                        if button_ex(ui, "Copy Viewing Key", true, true) {
+                        if modal_action_button(ui, padding, child_gap, "Copy Viewing Key", true, true) {
                             ui.input().send_to_clipboard(&ufvk);
                         }
 
                     }
-                    ui.scroll_container_end(data, padding, id, clip, scroll, content_h, viewport_h, max);
+                    scroll_container_finish(ui, data, padding, id, clip, scroll, content_h, viewport_h, max);
                 }
             }
         }
@@ -2956,33 +2929,6 @@ pub fn ui_right_pane(ui: &mut Context,
         height: grow!(),
         ..Decl
     }) {
-        fn display_str(chunks: &[u64; 4]) -> String {
-
-            let mut bytes = {
-                let mut out = [0u8; 32];
-                let mut i = 0;
-                for &chunk in chunks {
-                    let le = chunk.to_le_bytes(); // linear memory bytes for a LE u64
-                    out[i..i + 8].copy_from_slice(&le);
-                    i += 8;
-                }
-                out
-            };
-
-            let mut str = String::new();
-            bytes.reverse();
-
-            for b in &bytes[0..3] {
-                str.push_str(&format!("{:02x}", b));
-            }
-            str.push_str("..");
-            for b in &bytes[bytes.len() - 3..] {
-                str.push_str(&format!("{:02x}", b));
-            }
-
-            str
-        }
-
         let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
             
 
@@ -3150,7 +3096,7 @@ pub fn ui_right_pane(ui: &mut Context,
                             align: TopLeft,
                             ..Decl
                         }) {
-                            ui.text(frame_strf!(data, "{}", display_str(&chunkify(&member.pub_key))), TextDecl { font: Mono, h: info_h, align: AlignX::Left, ..TextDecl });
+                            ui.text(frame_strf!(data, "{}", display_str_with_edge_bytes(&chunkify(&member.pub_key), 3)), TextDecl { font: Mono, h: info_h, align: AlignX::Left, ..TextDecl });
                         }
 
                         // right info
