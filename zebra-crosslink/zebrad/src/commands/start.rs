@@ -124,6 +124,7 @@ impl StartCmd {
                 tokio::spawn(zebra_crosslink::wallet::wallet_main(wallet_state));
             }
         }
+        *zebra_crosslink::wallet::GUI_ENABLE_MINE.lock().unwrap() = config.mining.internal_miner;
 
         let is_regtest = config.network.network.is_regtest();
 
