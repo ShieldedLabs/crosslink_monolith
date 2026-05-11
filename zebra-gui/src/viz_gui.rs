@@ -714,14 +714,6 @@ fn animate_bft_towards_target(on_screen_bft: &mut OnScreenBft, dt: f32) {
 const ZOOM_FACTOR : f32 = 1.2;
 const SCREEN_UNIT_CONST : f32 = 10.0;
 
-// NOTE(Giovanni): minimap lives in a fixed slot on purpose. we briefly tried picking between a few
-//   rects (left nudged, right gutter) based on how many PoW circles overlapped the strip, idea was
-//   less clutter on screen. in practice the strip jumping around felt worse than occasional overlap
-//   with the graph, and when it parked on the right youd scroll the tx list by accident anyway bc
-//   the pointer was over pane chrome. so: one rect, same numbers as the center column gutter, dpi
-//   scaled so it tracks zoom of the rest of the ui-ish layout.
-// NOTE(Giovanni): pinch still lands in zoom_delta only, so if youre scrubbing minimap with a gesture
-//   that never touches scroll_delta this still gives a vertical fake delta. rare but cheap.
 fn effective_vertical_wheel_for_scrub(input_ctx: &InputCtx) -> f32 {
     if input_ctx.scroll_delta.1.abs() > 1e-6 || input_ctx.scroll_delta.0.abs() > 1e-6 {
         return input_ctx.scroll_delta.1 as f32;
@@ -756,16 +748,6 @@ fn minimap_screen_rect(draw_ctx: &DrawCtx, ui: &ui::Context, lane: MinimapLane) 
     (x0, y0, x1, y1)
 }
 
-fn chain_minimap_screen_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
-    minimap_screen_rect(draw_ctx, ui, MinimapLane::Pow)
-}
-
-fn pos_minimap_screen_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
-    minimap_screen_rect(draw_ctx, ui, MinimapLane::Pos)
-}
-
-// NOTE(Giovanni): drawn card sticks title and legend outside the core strip rect, users aim wheel there
-//   and nothing happened bc hit test used the tight inner box only. pad is eyeballed vs draw_chain_minimap_overlay.
 fn minimap_interaction_rect(mm_rect: (f32, f32, f32, f32), ui: &ui::Context) -> (f32, f32, f32, f32) {
     let (x0, y0, x1, y1) = mm_rect;
     let ds = ui.dpi_scale;
@@ -775,17 +757,6 @@ fn minimap_interaction_rect(mm_rect: (f32, f32, f32, f32), ui: &ui::Context) -> 
     (x0 - px, y0 - py_top, x1 + px, y1 + py_bot)
 }
 
-fn chain_minimap_interaction_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
-    minimap_interaction_rect(chain_minimap_screen_rect(draw_ctx, ui), ui)
-}
-
-fn pos_minimap_interaction_rect(draw_ctx: &DrawCtx, ui: &ui::Context) -> (f32, f32, f32, f32) {
-    minimap_interaction_rect(pos_minimap_screen_rect(draw_ctx, ui), ui)
-}
-
-// NOTE(Giovanni): span comes from whats actually in on_screen_bcs for the best chain, plus we
-//   force h_max up to bc_tip_height so the strip still makes sense when blocks are still streaming
-//   in or the map is sparse. not the full chain from genesis, just what we have in memory this frame.
 fn chain_minimap_height_span(viz_state: &VizState) -> (u64, u64) {
     let mut h_min = u64::MAX;
     let mut h_max = 0u64;
@@ -851,8 +822,6 @@ fn minimap_wheel_delta_height(dy: f32, strip_h: f32, span_h: f32) -> f32 {
     -(dy / strip_h.max(1.0)) * span_h * 0.45
 }
 
-// NOTE(Giovanni): y goes down the screen but higher block numbers are "up" in the metaphor so we flip
-//   with (1 - t). matches the main viz where larger height is more negative world y, tip near top of strip.
 fn chain_minimap_h_to_y(h: u64, h_min: u64, h_max: u64, y_top: f32, y_bot: f32) -> f32 {
     let span = h_max.saturating_sub(h_min).max(1) as f32;
     let t = (h.saturating_sub(h_min)) as f32 / span;
@@ -872,12 +841,6 @@ fn chain_minimap_hf_to_y(hf: f32, h_min: u64, h_max: u64, y_top: f32, y_bot: f32
     y_top + (1.0 - t) * (y_bot - y_top)
 }
 
-// NOTE(Giovanni): colors are basically stolen from the main viz (COLOR_BC, link green, NBC gray) and
-//   blended onto dark panels so it doesnt look like a random HUD floating over the chain. labels for
-//   h max mid min sit inside the strip on the right so we dont stick text outside the window when
-//   the strip hugs the left edge of the center column (learned that the hard way with the old layout).
-// TODO(Giovanni): if we ever add horizontal span for forks in the minimap, hf_to_y clamping on side
-//   blocks will need a rethink, right now we clamp off chain heights into the best chain span for dots only.
 fn draw_chain_minimap_overlay(
     viz_state: &VizState,
     ui: &ui::Context,
@@ -1116,7 +1079,7 @@ fn draw_pos_minimap_overlay(
     draw_ctx.text_line(FontKind::Mono, label_x, y_top_lab, tick_h, &s_top, label_mute);
     draw_ctx.text_line(FontKind::Mono, label_x, y_mid_lab, tick_h, &s_mid, label_mute);
     draw_ctx.text_line(FontKind::Mono, label_x, y_bot_lab, tick_h, &s_bot, label_mute);
-
+    
     draw_ctx.text_line(FontKind::Mono, mx0, oy0 + 3.0 * ds, title_h, "PoS", title_col);
 
     let dot = 4.0 * ds;
@@ -1126,18 +1089,14 @@ fn draw_pos_minimap_overlay(
 }
 
 pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui: &mut ui::Context, draw_ctx: &mut DrawCtx, dt: f32, input_ctx: &InputCtx) {
-    // NOTE(Giovanni): reset every frame so ui_update doesnt see a stale suppress from last frame if
-    //   we bail early somewhere later (shouldnt happen much but cheap insurance). real value gets
-    //   assigned at the bottom after we know pointer + minimap drag state.
     ui.suppress_scroll_for_clay = false;
-
-    let mm_rect = chain_minimap_screen_rect(draw_ctx, ui);
+    let mm_rect = minimap_screen_rect(draw_ctx, ui, MinimapLane::Pow);
     let (_, mm_y0, _, mm_y1) = mm_rect;
-    let hit_rect = chain_minimap_interaction_rect(draw_ctx, ui);
+    let hit_rect = minimap_interaction_rect(mm_rect, ui);
     let (hit_x0, hit_y0, hit_x1, hit_y1) = hit_rect;
-    let pos_mm_rect = pos_minimap_screen_rect(draw_ctx, ui);
+    let pos_mm_rect = minimap_screen_rect(draw_ctx, ui, MinimapLane::Pos);
     let (_, pos_mm_y0, _, pos_mm_y1) = pos_mm_rect;
-    let pos_hit_rect = pos_minimap_interaction_rect(draw_ctx, ui);
+    let pos_hit_rect = minimap_interaction_rect(pos_mm_rect, ui);
     let (pos_hit_x0, pos_hit_y0, pos_hit_x1, pos_hit_y1) = pos_hit_rect;
     let mx_scr = input_ctx.mouse_pos().0.clamp(0, draw_ctx.window_width) as f32;
     let my_scr = input_ctx.mouse_pos().1.clamp(0, draw_ctx.window_height) as f32;
@@ -1208,10 +1167,6 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     let mut world_mouse_x = viz_state.camera_x + ((input_ctx.mouse_pos().0.clamp(0, draw_ctx.window_width) - draw_ctx.window_width/2) as f32) / screen_unit;
     let mut world_mouse_y = viz_state.camera_y + ((input_ctx.mouse_pos().1.clamp(0, draw_ctx.window_height) - draw_ctx.window_height/2) as f32) / screen_unit;
 
-    // NOTE(Giovanni): scrub flag is for "this frame we treated the pointer as minimap business" so we
-    //   dont also fire block inspect or the click to recenter camera on a node underneath. drag uses
-    //   CHAIN_MINIMAP_POW as mouse_pressed_id so viz pan (VIZ_GUI) doesnt steal the gesture, same id trick
-    //   as before for disambiguation.
     let mut minimap_scrub_this_frame = false;
     if !ui.capture || inside_any_minimap {
         if (ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POW || ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POS)
@@ -1264,9 +1219,6 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         }
     }
 
-    // NOTE(Giovanni): minimap scrub mutates camera_y after the first origin pass, so recompute origin and
-    //   world mouse before hover tests and drawing. otherwise youd get one frame of wrong hover sound
-    //   or staking band alignment which is subtle but annoying when youre dragging fast.
     origin_x = (draw_ctx.window_width / 2) as f32 - viz_state.camera_x * screen_unit;
     origin_y = (draw_ctx.window_height / 2) as f32 - viz_state.camera_y * screen_unit;
     world_mouse_x = viz_state.camera_x + ((input_ctx.mouse_pos().0.clamp(0, draw_ctx.window_width) - draw_ctx.window_width/2) as f32) / screen_unit;
@@ -1329,9 +1281,6 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         hovered_block = hash;
     }
 
-    // NOTE(Giovanni): minimap isnt a clay element so world space hover can still think theres a block
-    //   under the finger. zero hovered_block here so we dont highlight something you cant see, and
-    //   the hover blip sound doesnt spam when youre just trying to read the strip.
     if inside_any_minimap {
         hovered_block = Hash32::from_u64(0);
     }
@@ -1347,8 +1296,6 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 on_screen_bc.y = 0.0;
                 on_screen_bc.alpha = 0.0;
             }
-            // NOTE(Giovanni): without this guard a minimap click still counts as a world click on whatever
-            //   node happens to share the screen y math, camera jumps twice and feels broken.
             if input_ctx.mouse_pressed(MouseButton::Left) && !minimap_scrub_this_frame {
                 viz_state.camera_x = on_screen_bc.t_x;
                 viz_state.camera_y = on_screen_bc.t_y;
@@ -1681,8 +1628,6 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         { play_sound(SOUND_UI_HOVER, 0.5, 1.0); }
     }
 
-    // NOTE(Giovanni): scrub sets hovered to zero already but keep this check anyway so inspect doesnt
-    //   clear json state weirdly on the same frame we grabbed the strip.
     if !ui.capture && input_ctx.mouse_pressed(MouseButton::Left) && !minimap_scrub_this_frame {
         viz_state.inspecting_block_hash = hovered_block;
         viz_state.inspecting_block_screen_x = hovered_block_screen_x;
@@ -1690,25 +1635,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         viz_state.inspect_block_json_text = None;
     }
 
-    // NOTE(Giovanni): big ugly gotcha of this codebase is viz runs before clay layout in the same frame,
-    //   and scroll_delta is global. so viz already panned the chain off the wheel, then every hovered
-    //   scroll_container in the wallet panes also ate the same delta and your tx list jumped. fix is
-    //   not "zero the delta" bc viz needs it, fix is tell clay scroll_container to ignore wheel for this
-    //   frame when pointer is on the minimap, while dragging the minimap strip, or generally in the
-    //   middle column with wheel activity (thats the dead zone between pane percents where theres no
-    //   list to scroll anyway, only viz pixels). we still respect ui.capture so if youre typing in a
-    //   field we dont randomly block pane scroll logic you might care about in weird edge cases.
-    //
-    // TODO(Giovanni): if the center column ever gets a real scrollable clay subtree, this center column
-    //   branch needs to shrink to "over viz only" or we need per widget z order hit testing instead of
-    //   this rectangle hack.
     let ww = draw_ctx.window_width as f32;
     let in_center_column =
         mx_scr >= ww * PANE_PERCENT_LEFT && mx_scr <= ww * (1.0 - PANE_PERCENT_RIGHT);
     let wheelish =
         input_ctx.scroll_delta != (0.0, 0.0) || input_ctx.zoom_delta != 0.0;
-    // NOTE(Giovanni): minimap_wheel_scrubbed catches the frame where we ate wheel-as-height; pair with
-    //   inside_minimap && wheelish for clay suppress when windows sent zoom_delta but scrub already ran.
     ui.suppress_scroll_for_clay = ((inside_any_minimap && wheelish) || minimap_wheel_scrubbed)
         || ((ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POW || ui.mouse_pressed_id == ui::Id::CHAIN_MINIMAP_POS)
             && input_ctx.mouse_held(MouseButton::Left))

@@ -226,10 +226,6 @@ pub const TextDecl: TextDecl = TextDecl {
 
 impl Id {
     pub const VIZ_GUI: Self = Self { id: 1, ..Id };
-    // NOTE(Giovanni): magic id for "user started a gesture on the chain minimap". viz sets this on
-    //   press so the normal VIZ_GUI left drag path doesnt think were panning the graph, and so block
-    //   inspect / fly to camera dont double fire from the same click. value is just ascii "minm"
-    //   stuffed in a u32, not a clay hash, keep it away from small ints if you add more sentinel ids.
     pub const CHAIN_MINIMAP_POW: Self = Self { id: 0x6d69_6e6d, ..Id };
     pub const CHAIN_MINIMAP_POS: Self = Self { id: 0x6d70_6f73, ..Id };
     fn clay(&self) -> clay::id::Id {
@@ -799,9 +795,6 @@ impl Context {
         };
         let max = scroll_container_state.content_height / self.scale - scroll_end_height;
 
-        // NOTE(Giovanni): see suppress_scroll_for_clay on Context, tl dr dont steal wheel from viz when
-        //   user is scrubbing the chain strip or throwing scroll at the middle column. zoom_delta here
-        //   is also how some trackpads fake "smooth scroll" so we gate that too not just vertical delta.
         if self.hovered(id) && !self.suppress_scroll_for_clay {
             scroll_container_state.scroll -= self.input().zoom_delta     as f32 * 32.0;
             scroll_container_state.scroll -= self.input().scroll_delta.1 as f32 * 32.0;
@@ -3866,9 +3859,6 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             ui.nav_enable = false;
         }
         ui.nav_id = ui.mouse_pressed_id.id;
-        // NOTE(Giovanni): VIZ_GUI and CHAIN_MINIMAP_POW / CHAIN_MINIMAP_POS are viz side sentinels, not clay ids. treating them like
-        //   a textbox capture made viz_gui skip minimap drag on every frame after press bc of the !ui.capture
-        //   guard there, so click to scrub felt dead on win especially after the first frame.
         if ui.mouse_pressed_id != Id::VIZ_GUI
             && ui.mouse_pressed_id != Id::CHAIN_MINIMAP_POW
             && ui.mouse_pressed_id != Id::CHAIN_MINIMAP_POS
@@ -4142,9 +4132,6 @@ pub struct Context {
 
     pub capture: bool,
 
-    // NOTE(Giovanni): set from viz pass after it knows if wheel should stay "viz only" this frame.
-    //   scroll_container checks it bc clay has no idea the minimap exists (its drawn in pixels before
-    //   layout). kinda a bandaid but way smaller than threading hit rects through clay for one strip.
     pub suppress_scroll_for_clay: bool,
 
     pub mouse_pressed_id:             Id,
