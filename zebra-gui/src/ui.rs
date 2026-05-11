@@ -3700,6 +3700,34 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 }
             }
 
+            if let _ = elem().decl(Decl {
+                width: grow!(),
+                align: BottomRight,
+                ..Decl
+            }) {
+                let id = id("Mining Toggle");
+
+                let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, true, winit::window::CursorIcon::Pointer);
+
+                let actively_mining: bool = *wallet::GUI_ENABLE_MINE.lock().unwrap();
+                let icon = ["NOT MINING", "MINING"][actively_mining as usize];
+                if let _ = elem().decl(Decl {
+                    id,
+                    child_gap,
+                    align: Center,
+                    direction: TopToBottom,
+                    width: fit!(),
+                    height: fit!(),
+                    ..Decl
+                }) {
+                    ui.text(icon, TextDecl { font: Mono, colour, h: ui.scale(32.0), align: AlignX::Center, ..TextDecl });
+                }
+
+                if clicked {
+                    *wallet::GUI_ENABLE_MINE.lock().unwrap() = !actively_mining;
+                }
+            }
+
             // spacer
             if let _ = elem().decl(Decl { height: grow!(), ..Decl }) {}
 

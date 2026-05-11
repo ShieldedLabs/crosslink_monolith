@@ -24,6 +24,10 @@ fn funding_stream_address_index(
         return None;
     }
 
+    if network.magic().0 == [b'C',b'l',b'T',b'0'] {
+        return Some(0);
+    }
+
     let funding_streams = network.funding_streams(height)?;
     let num_addresses = funding_streams.recipient(receiver)?.addresses().len();
 
