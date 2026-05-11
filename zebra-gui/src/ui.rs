@@ -3601,6 +3601,29 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 }
                             }
                         }
+
+                        let mining_label = "MINING";
+                        let mining_id = id(mining_label);
+                        let actively_mining: bool = *wallet::GUI_ENABLE_MINE.lock().unwrap();
+                        let label = ["NOT MINING", "MINING"][actively_mining as usize];
+                        let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, mining_id, true, winit::window::CursorIcon::Pointer);
+                        let radius = ui.scale(16.0);
+                        if let _ = elem().decl(Decl {
+                            id: mining_id,
+                            colour,
+                            padding,
+                            child_gap,
+                            radius: radius.dup4(),
+                            align: Center,
+                            width:  fit!(ui.scale(128.0)),
+                            height: fit!(radius * 2.0),
+                            ..Decl
+                        }) {
+                            ui.text(label, TextDecl { font: Mono, h: ui.scale(16.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
+                        }
+                        if clicked {
+                            *wallet::GUI_ENABLE_MINE.lock().unwrap() = !actively_mining;
+                        }
                     }
 
                     if let _ = elem().decl(Decl {
@@ -3690,34 +3713,6 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             }
                         }
                     }
-                }
-            }
-
-            if let _ = elem().decl(Decl {
-                width: grow!(),
-                align: BottomRight,
-                ..Decl
-            }) {
-                let id = id("Mining Toggle");
-
-                let (clicked, colour, _) = ui.button_ex(true, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, true, winit::window::CursorIcon::Pointer);
-
-                let actively_mining: bool = *wallet::GUI_ENABLE_MINE.lock().unwrap();
-                let icon = ["NOT MINING", "MINING"][actively_mining as usize];
-                if let _ = elem().decl(Decl {
-                    id,
-                    child_gap,
-                    align: Center,
-                    direction: TopToBottom,
-                    width: fit!(),
-                    height: fit!(),
-                    ..Decl
-                }) {
-                    ui.text(icon, TextDecl { font: Mono, colour, h: ui.scale(32.0), align: AlignX::Center, ..TextDecl });
-                }
-
-                if clicked {
-                    *wallet::GUI_ENABLE_MINE.lock().unwrap() = !actively_mining;
                 }
             }
 
