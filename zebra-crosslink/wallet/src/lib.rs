@@ -100,6 +100,9 @@ use zcash_client_backend::{
     },
 };
 
+// @TODO (Giovanni): Move to better location
+pub mod scanner;
+
 use zcash_protocol::consensus::{NetworkType, Parameters, MAIN_NETWORK, TEST_NETWORK};
 
 #[derive(Clone)]

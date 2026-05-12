@@ -54,6 +54,7 @@ byteorder = { workspace = true }
 ed25519-zebra = { workspace = true }
 zcash_primitives = { workspace = true }
 zcash_protocol = { workspace = true }
+zcash_keys = { workspace = true }
 
 static_assertions = { workspace = true }
 

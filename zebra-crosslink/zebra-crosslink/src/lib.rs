@@ -1234,6 +1234,52 @@ async fn tfl_block_finality_from_height_hash(
     }
 }
 
+async fn total_issuance_from_key(
+    internal_handle: TFLServiceHandle,
+    ufvk: zcash_keys::keys::UnifiedFullViewingKey
+) -> Result<u64, String> {
+    let call = internal_handle.call.clone();
+
+    let res = (call.state)(StateRequest::Tip).await;
+    let tip_height = match res {
+        Ok(StateResponse::Tip(Some((tip_height, _)))) => tip_height,
+        Ok(StateResponse::Tip(None)) => return Err(format!("failed to get tip: {res:?}")),
+        _ => return Err(format!("unexpectedly failed to get tip: {res:?}")),
+    };
+
+    let mut scan_info = wallet::scanner::ScanInfo::default();
+
+    for height in 1..=tip_height.0 {
+        let res = (call.state)(StateRequest::Block(ZebBlockHeight(height).into())).await;
+        let block = match res {
+            Ok(StateResponse::Block(Some(block))) => block,
+            Ok(StateResponse::Block(None)) => return Err(format!("failed to get block at height {height}")),
+            _ => return Err(format!("unexpectedly failed to get block at height {height}: {res:?}")),
+        };
+
+        if block.transactions.len() == 0 {
+            return Err(format!("block at height {height} had 0 transactions"));
+        }
+
+        for (tx_i, tx) in block.transactions.iter().enumerate() {
+            let coinbase_tx_bytes = match tx.zcash_serialize_to_vec() {
+                Ok(tx) => tx,
+                Err(err) => return Err(format!("failed to serialize coinbase tx at height {height}: {err:?}")),
+            };
+
+            let txid = tx.unmined_id().mined_id();
+            match wallet::scanner::scan_tx(&mut scan_info, &coinbase_tx_bytes, tx_i, height, &ufvk, txid.0) {
+                Ok(false) => {},
+                Ok(true) => println!("scan info at {height}: {scan_info:?}"),
+                Err(err) => return Err(format!("failed to scan {txid:?} at height {height}: {err}")),
+            }
+        }
+    }
+
+
+    Ok(scan_info.total_value())
+}
+
 async fn tfl_service_incoming_request(
     internal_handle: TFLServiceHandle,
     request: TFLServiceRequest,
@@ -1319,6 +1365,12 @@ async fn tfl_service_incoming_request(
                 } else {
                     Err("No faucet available".to_owned())
                 }
+            }))
+        }
+
+        TFLServiceRequest::TotalIssuanceFromKey(ufvk_str) => {
+            Ok(TFLServiceResponse::TotalIssuanceFromKey({
+                total_issuance_from_key(internal_handle.clone(), ufvk_str).await
             }))
         }
 
