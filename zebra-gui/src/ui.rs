@@ -1120,7 +1120,7 @@ fn scroll_container_finish(
 }
 
 
-fn colour_from_hash(hash: &[u8; 32]) -> (u8, u8, u8, u8) {
+fn colour_from_hash(hash: &[u8; 32], is_online:bool) -> (u8, u8, u8, u8) {
     // let (mut h, mut s, mut v) = (0u8, 0u8, 0u8);
     // for i in 0..32 {
     //     h = ((h ^ hash[i]) as u32).wrapping_mul(hash[i] as u32).wrapping_mul(17*i as u32).wrapping_mul(402653189) as u8;
@@ -1137,12 +1137,23 @@ fn colour_from_hash(hash: &[u8; 32]) -> (u8, u8, u8, u8) {
     let mut v = (val >> 16) as u8;
 
     s /= 4;
-    s += 64;
-
     v /= 4;
-    v += 64;
+
+
+    if is_online{    
+        s += 64;
+        v += 64;
+    }
+    else{
+        s += 64;
+        v += 32;
+    }
 
     (h, s, v, 0xff).rgba()
+}
+
+fn finalizer_is_online_fake(finalizer: [u8; 32]) -> bool {
+    finalizer[0] > 128
 }
 
 pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[WalletRosterMember], total_val: u64) {
@@ -1165,10 +1176,10 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[Wa
                 rem += finalizer.voting_power;
                 continue;
             }
-
+            let is_online = finalizer_is_online_fake(finalizer.pub_key);
             if let el = elem().decl(Decl {
                 id: id_index("finalizer bar", i as u32),
-                colour: colour_from_hash(&finalizer.pub_key),
+                colour: colour_from_hash(&finalizer.pub_key, is_online),
                 radius: {
                     let l = if !done_once { finalizer_pill_rad } else { 0.0 };
                     let r = if i == finalizers.len()-1 && rem == 0 { finalizer_pill_rad } else { 0.0 };
@@ -1179,11 +1190,18 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[Wa
                 height: grow!(),
                 ..Decl
             }) {
-                if ui.hovered(el.decl.id) {
-                    set_tooltip_text!(data, "{}    {} cTAZ    {:.2}%",
-                        display_str(&chunkify(&finalizer.pub_key)),
-                        str_from_ctaz(finalizer.voting_power), 100.0*pct);
+                if ui.hovered(el.decl.id)  {
+                    if (is_online){
+                        set_tooltip_text!(data, "{}    {} cTAZ    {:.2}%",
+                            display_str(&chunkify(&finalizer.pub_key)),
+                            str_from_ctaz(finalizer.voting_power), 100.0*pct);
+                    }
+                    else{
+                        set_tooltip_text!(data, "{}     currently offline",display_str(&chunkify(&finalizer.pub_key)));
+                    }
+
                 }
+
             }
 
             done_once = true;
@@ -2191,12 +2209,12 @@ pub fn ui_left_pane(ui: &mut Context,
                                             {
                                                 // ui.text("Staked to:", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
                                                 let h = ui.scale(18.0);
-                                                let _ = elem().decl(Decl { width: fixed!(h), height: fixed!(h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&finalizer), ..Decl });
+                                                let _ = elem().decl(Decl { width: fixed!(h), height: fixed!(h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&finalizer, finalizer_is_online_fake(finalizer)), ..Decl });
 
                                                 ui.text(label, TextDecl { colour: text_colour, h, align: AlignX::Left, ..TextDecl });
                                                 let _ = elem().decl(Decl { width: grow!(), ..Decl });
                                                 let pct = 100.0 * (total_bonded_to_finalizer as f64 / total_bonded as f64);
-                                                let colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
+                                                let colour = (0xff, 0xaf, 0x0e, 0xff);
                                                 ui.text(frame_strf!(data, "{} cTAZ ({:.2}%)", str_from_ctaz(total_bonded_to_finalizer), pct), TextDecl { font: Mono, colour, h: ui.scale(18.0), align: AlignX::Right, ..TextDecl });
                                             }
 
@@ -2975,6 +2993,7 @@ pub fn ui_right_pane(ui: &mut Context,
             clicked
         };
 
+
         // @todo(judah): incorporate into list below? (i.e. always at the top of the list (and doesn't scroll with the rest), styled different from the others)
         if let _ = elem().decl(Decl {
             id: id("Finalizers Buttons"),
@@ -3078,7 +3097,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
                         // finalizer colour token
                         let info_h = ui.scale(18.0);
-                        let _ = elem().decl(Decl { width: fixed!(info_h), height: fixed!(info_h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&member.pub_key), ..Decl });
+                        let _ = elem().decl(Decl { width: fixed!(info_h), height: fixed!(info_h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&member.pub_key, finalizer_is_online_fake(member.pub_key)), ..Decl });
 
                         // info
                         if let _ = elem().decl(Decl {
@@ -3101,8 +3120,9 @@ pub fn ui_right_pane(ui: &mut Context,
                             align: Right,
                             ..Decl
                         }) {
-                            let colour = (0xff, 0xaf, 0x0e, 0xff);
+                            let mut colour = (0xff, 0xaf, 0x0e, 0xff);
                             ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(member.voting_power)), TextDecl { font: Mono, h: ui.scale(14.0), colour, wrap: Wrap::None, align: AlignX::Right, ..TextDecl });
+
                         }
                     }
                 }
