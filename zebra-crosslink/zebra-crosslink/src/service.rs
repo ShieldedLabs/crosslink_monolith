@@ -135,7 +135,7 @@ pub fn spawn_new_tfl_service(
     config: crate::config::Config,
     closure_from_state_to_here_mutex: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>>,
 ) -> (TFLServiceHandle, JoinHandle<Result<(), String>>) {
-    let (validators_at_current_height, validators_keys_to_names) = {
+    let (finalizers_at_current_height, finalizers_keys_to_names) = {
         let mut array = Vec::with_capacity(config.bft_peers.len());
         let mut map = std::collections::HashMap::with_capacity(config.bft_peers.len());
 
@@ -177,8 +177,8 @@ pub fn spawn_new_tfl_service(
         peer_strings: Vec::new(),
         our_set_bft_string: None,
         active_bft_string: None,
-        validators_at_current_height,
-        validators_keys_to_names,
+        finalizers_at_current_height,
+        finalizers_keys_to_names,
         current_bc_final: None,
         path_to_pos_store_file: path_to_pos_store_file.clone(),
     }));

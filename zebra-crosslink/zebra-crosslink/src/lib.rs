@@ -225,8 +225,8 @@ pub(crate) struct TFLServiceInternal {
     peer_strings: Vec<String>,
 
     // TODO: 2 versions of this: ever-added (in sequence) & currently non-0
-    validators_keys_to_names: HashMap<PubKeyID, String>,
-    validators_at_current_height: Vec<RosterMember>,
+    finalizers_keys_to_names: HashMap<PubKeyID, String>,
+    finalizers_at_current_height: Vec<RosterMember>,
 
     current_bc_final: Option<(ZebBlockHeight, ZebBlockHash)>,
     path_to_pos_store_file: PathBuf,
@@ -650,10 +650,10 @@ async fn handle_new_decided_bft_block(
     internal = tfl_handle.internal.lock().await;
 
     if got_stakes.len() > 0 {
-        internal.validators_at_current_height = got_stakes.into_iter().map(|s| RosterMember { pub_key: s.0, voting_power: s.1, txids: Vec::new() }).collect();
+        internal.finalizers_at_current_height = got_stakes.into_iter().map(|s| RosterMember { pub_key: s.0, voting_power: s.1, txids: Vec::new() }).collect();
     } else {
         let mut any_non_zero = false;
-        for val in &internal.validators_at_current_height {
+        for val in &internal.finalizers_at_current_height {
             if val.voting_power > 1 {
                 any_non_zero = true;
             }
@@ -663,13 +663,13 @@ async fn handle_new_decided_bft_block(
         }
     }
 
-//println!("Storing pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, internal.validators_at_current_height);
+//println!("Storing pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, internal.finalizers_at_current_height);
     if internal.path_to_pos_store_file.to_str() != Some("") {
         let mut append_bytes: Vec<u8> = Vec::new();
         new_block.zcash_serialize(&mut append_bytes).unwrap();
         fat_pointer.zcash_serialize(&mut append_bytes).unwrap();
-        append_bytes.extend_from_slice(&(internal.validators_at_current_height.len() as u64).to_le_bytes());
-        for v in &internal.validators_at_current_height {
+        append_bytes.extend_from_slice(&(internal.finalizers_at_current_height.len() as u64).to_le_bytes());
+        for v in &internal.finalizers_at_current_height {
             v.write_to_vec(&mut append_bytes);
         }
         append_bytes.extend_from_slice(&(tender_proposal_sigs.len() as u64).to_le_bytes());
@@ -681,7 +681,7 @@ async fn handle_new_decided_bft_block(
         file.flush().unwrap();
     }
 
-    tenderlink_roster_from_internal(&internal.validators_at_current_height)
+    tenderlink_roster_from_internal(&internal.finalizers_at_current_height)
 }
 
 fn tenderlink_roster_from_internal(vals: &[RosterMember]) -> Vec<SortedRosterMember> {
@@ -875,8 +875,8 @@ pub fn run_tfl_test(internal_handle: TFLServiceHandle) {
 }
 
 fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> usize {
-    let roster = &mut internal.validators_at_current_height;
-    let validators_keys_to_names = &mut internal.validators_keys_to_names;
+    let roster = &mut internal.finalizers_at_current_height;
+    let finalizers_keys_to_names = &mut internal.finalizers_keys_to_names;
     let mut cmd_c = 0;
 
     for tx in &block.transactions {
@@ -888,7 +888,7 @@ fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> 
                 let txid = tx.unmined_id().mined_id();
                 info!("got staking action in txid: {}", StakingAction::str_from_addr(txid.0));
                 // TODO(Sam)
-                //cmd_c += update_roster_for_cmd(roster, txid.0, validators_keys_to_names, &staking_action);
+                //cmd_c += update_roster_for_cmd(roster, txid.0, finalizers_keys_to_names, &staking_action);
             }
         };
     }
@@ -966,7 +966,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             .internal
             .lock()
             .await
-            .validators_at_current_height
+            .finalizers_at_current_height
             .clone();
 
         use tenderlink::FinalizerPeerAddress;
@@ -1056,7 +1056,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             let mut internal = internal_handle.internal.lock().await;
 
             let roster = tenderlink_roster_from_internal(&unsorted_roster);
-            internal.validators_at_current_height = unsorted_roster;
+            internal.finalizers_at_current_height = unsorted_roster;
             internal.bft_blocks = i_bft_blocks;
             internal.fat_pointer_to_tip = fat_pointer_to_tip;
             if new_final_hash != ZebBlockHash([0; 32]) {
@@ -1298,7 +1298,7 @@ async fn tfl_service_incoming_request(
         TFLServiceRequest::Roster => Ok(TFLServiceResponse::Roster({
             let internal = internal_handle.internal.lock().await;
             internal
-                .validators_at_current_height
+                .finalizers_at_current_height
                 .iter()
                 .map(|v| RosterMember{ pub_key:<[u8; 32]>::from(v.pub_key), voting_power: v.voting_power, txids: Vec::new() })
                 .collect()

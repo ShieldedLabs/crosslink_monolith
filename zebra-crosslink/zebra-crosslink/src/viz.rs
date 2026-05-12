@@ -543,9 +543,9 @@ pub struct VizGlobals {
     /// If true then we should propose no new BFT blocks.
     pub bft_pause_button: bool,
 
-    /// validators_at_current_height
-    pub validators_at_current_height: Vec<RosterMember>,
-    pub validators_keys_to_names: HashMap<PubKeyID, String>,
+    /// finalizers_at_current_height
+    pub finalizers_at_current_height: Vec<RosterMember>,
+    pub finalizers_keys_to_names: HashMap<PubKeyID, String>,
 }
 pub static VIZ_G: std::sync::Mutex<Option<VizGlobals>> = std::sync::Mutex::new(None);
 
@@ -610,8 +610,8 @@ pub async fn service_viz_requests(
         proposed_bft_string: None,
         consumed: true,
         bft_pause_button: false,
-        validators_at_current_height: Vec::new(),
-        validators_keys_to_names: HashMap::new(),
+        finalizers_at_current_height: Vec::new(),
+        finalizers_keys_to_names: HashMap::new(),
     });
 
     let mut had_bft_string = false;
@@ -649,8 +649,8 @@ pub async fn service_viz_requests(
 
         {
             let internal = tfl_handle.internal.lock().await;
-            new_g.validators_at_current_height = internal.validators_at_current_height.clone();
-            new_g.validators_keys_to_names = internal.validators_keys_to_names.clone();
+            new_g.finalizers_at_current_height = internal.finalizers_at_current_height.clone();
+            new_g.finalizers_keys_to_names = internal.finalizers_keys_to_names.clone();
         }
 
         // ALT: do 1 or the other of force/read, not both
@@ -3933,9 +3933,9 @@ pub async fn viz_main(
             );
             pt.y += font_size * 0.5;
 
-            for val in &g.validators_at_current_height {
+            for val in &g.finalizers_at_current_height {
                 let string =
-                    if let Some(user_name) = g.validators_keys_to_names.get(&PubKeyID(val.pub_key)) {
+                    if let Some(user_name) = g.finalizers_keys_to_names.get(&PubKeyID(val.pub_key)) {
                         user_name.clone()
                     } else {
                         let mut string = format!("{:?}", val.pub_key);
@@ -3969,7 +3969,7 @@ pub async fn viz_main(
 
             for sig in bft_sigs {
                 let string = if let Some(user_name) = g
-                    .validators_keys_to_names
+                    .finalizers_keys_to_names
                     .get(&sig.pub_key)
                 {
                     user_name.clone()

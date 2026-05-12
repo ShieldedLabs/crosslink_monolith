@@ -606,7 +606,7 @@ pub(crate) async fn handle_instr(
             let key = PubKeyID(pub_key);
             let internal = internal_handle.internal.lock().await;
             let finalizer = internal
-                .validators_at_current_height
+                .finalizers_at_current_height
                 .iter()
                 .find(|x| PubKeyID(x.pub_key) == key);
 
@@ -631,7 +631,7 @@ pub(crate) async fn handle_instr(
         TestInstr::RosterForceInclude(pub_key, stake) => {
             let mut internal = internal_handle.internal.lock().await;
             internal
-                .validators_at_current_height
+                .finalizers_at_current_height
                 .push(RosterMember { pub_key, voting_power: stake, txids: Vec::new() });
         }
     }
