@@ -874,29 +874,6 @@ pub fn run_tfl_test(internal_handle: TFLServiceHandle) {
     tokio::task::spawn(test_format::instr_reader(internal_handle));
 }
 
-fn update_roster_for_block(internal: &mut TFLServiceInternal, block: &Block) -> usize {
-    let roster = &mut internal.finalizers_at_current_height;
-    let finalizers_keys_to_names = &mut internal.finalizers_keys_to_names;
-    let mut cmd_c = 0;
-
-    for tx in &block.transactions {
-        let mut is_cmd = 0;
-        if let zebra_chain::transaction::Transaction::VCrosslink { staking_action, .. } =
-            tx.as_ref()
-        {
-            if let Some(staking_action) = staking_action {
-                let txid = tx.unmined_id().mined_id();
-                info!("got staking action in txid: {}", StakingAction::str_from_addr(txid.0));
-                // TODO(Sam)
-                //cmd_c += update_roster_for_cmd(roster, txid.0, finalizers_keys_to_names, &staking_action);
-            }
-        };
-    }
-
-    // TODO: retain stake > 0?
-    cmd_c
-}
-
 async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [u8; 32], path_to_pos_store_file: PathBuf) -> Result<(), String> {
     let call = internal_handle.call.clone();
     let config = internal_handle.config.clone();
