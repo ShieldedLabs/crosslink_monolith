@@ -1114,7 +1114,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
                     // ~current height
                     for round in &bft_state.rounds_data {
-                        let is_my_height_round = round.height == my_height && round.round == my_round;
+                        let is_my_height_round = round.height == my_height;// && round.round == my_round;
 
                         for (roster_i, member) in round.roster.iter().enumerate() {
                             use zcash_primitives::bft::TMSig;

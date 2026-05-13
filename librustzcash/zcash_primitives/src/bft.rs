@@ -670,8 +670,8 @@ impl Vote {
 pub struct FinalizerRecencyStatus {
     pub voted_in_my_height_round: (bool, bool), // prevote, precommit
     pub highest_round_vote: u32,
-    pub last_seen_new_info_utc: u32,
-    pub last_direct_connection_utc: u32,
+    pub last_seen_new_info_utc: i64,
+    pub last_direct_connection_utc: i64,
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
