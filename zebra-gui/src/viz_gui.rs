@@ -48,6 +48,8 @@ pub struct ResponseFromZebra {
     pub staking_unbonded_pool_balance: i64,
 
     pub peer_strings: Vec<String>,
+
+    pub bft_recency: wallet::TFLRecencyStatus,
 }
 impl ResponseFromZebra {
     pub fn _0() -> Self {
@@ -65,6 +67,7 @@ impl ResponseFromZebra {
             staking_bonded_pool_balance: 0,
             staking_unbonded_pool_balance: 0,
             peer_strings: Vec::new(),
+            bft_recency: wallet::TFLRecencyStatus::default(),
         }
     }
 }
@@ -217,6 +220,9 @@ pub struct VizState {
     pub on_screen_bfts: HashMap<Hash32, OnScreenBft>,
     pub send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
     pub receive_from_zebra: std::sync::mpsc::Receiver<ResponseFromZebra>,
+
+    // TODO: move to zaino
+    pub bft_recency_status: wallet::TFLRecencyStatus,
 
     pub time_since_last_animation: std::time::Instant,
 
@@ -466,6 +472,8 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 
         time_since_last_animation: Instant::now(),
 
+        bft_recency_status: wallet::TFLRecencyStatus::default(),
+
         bft_ack_height: 0,
         bc_ack_height: 0,
 
@@ -552,6 +560,9 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
     while let Ok(message) = viz_state.receive_from_zebra.try_recv() {
         anything_happened |= viz_state.bc_tip_height != message.bc_tip_height;
         viz_state.bc_tip_height = message.bc_tip_height;
+
+        anything_happened |= viz_state.bft_recency_status != message.bft_recency;
+        viz_state.bft_recency_status = message.bft_recency;
 
         anything_happened |= viz_state.bft_tip_height != message.bft_tip_height;
         viz_state.bft_tip_height = message.bft_tip_height;
@@ -1079,7 +1090,7 @@ fn draw_pos_minimap_overlay(
     draw_ctx.text_line(FontKind::Mono, label_x, y_top_lab, tick_h, &s_top, label_mute);
     draw_ctx.text_line(FontKind::Mono, label_x, y_mid_lab, tick_h, &s_mid, label_mute);
     draw_ctx.text_line(FontKind::Mono, label_x, y_bot_lab, tick_h, &s_bot, label_mute);
-    
+
     draw_ctx.text_line(FontKind::Mono, mx0, oy0 + 3.0 * ds, title_h, "PoS", title_col);
 
     let dot = 4.0 * ds;

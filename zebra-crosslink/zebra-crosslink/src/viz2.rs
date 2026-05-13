@@ -153,6 +153,7 @@ pub async fn service_viz_requests(
                 if let Ok(request) = request_queue.try_recv() {
                     let mut internal = tfl_handle.internal.lock().await;
                     let mut response = visualizer_zcash::ResponseFromZebra::_0();
+                    response.bft_recency = internal.recency_status.clone(); // TODO: do we want a better way of communicating singleton data
                     response.bc_tip_height = bc_tip_height;
                     response.bc_finalized_tip_height = if let Some(latest_finalized_block) = internal.latest_final_block {
                         latest_finalized_block.0.0 as u64

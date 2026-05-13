@@ -665,3 +665,22 @@ impl Vote {
         }
     }
 }
+
+#[derive(Default, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FinalizerRecencyStatus {
+    pub voted_in_my_height_round: (bool, bool), // prevote, precommit
+    pub highest_round_vote: u32,
+    pub last_seen_new_info_utc: u32,
+    pub last_direct_connection_utc: u32,
+}
+
+#[derive(Default, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TFLRecencyStatus {
+    /// reference point for other absolute times
+    pub now_utc: i64,
+    pub my_height: u64,
+    pub my_round: u32,
+    pub finalizer_statuses: Vec<(PubKeyID, FinalizerRecencyStatus)>,
+    // pub round_step_utc_rngs: Vec<[(u32, u32); 3]>,
+}
+

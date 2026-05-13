@@ -1186,7 +1186,7 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[Wa
             }
             let is_online = finalizer_is_online(height, seconds_since_connected, filters);
 
-            
+
             if let el = elem().decl(Decl {
                 id: id_index("finalizer bar", i as u32),
                 colour: colour_from_hash(&finalizer.pub_key, is_online),
@@ -2137,7 +2137,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
                                 let (activated, colour, text_colour) = ui.button_ex(true, colour, id, true, winit::window::CursorIcon::Pointer);
                                 /*@TODO(Giovanni) FILL THESEEEEEE WTH ACTUAL DATA*/
-                                let height = 3000; 
+                                let height = 3000;
                                 let seconds_since_connected = 300;
                                 /*-------------------------------------*/
                                 if let _ = elem().decl(Decl {
@@ -2160,7 +2160,7 @@ pub fn ui_left_pane(ui: &mut Context,
 
 
                                 finalizer_ratio_bar(ui, data, &bonded_finalizers, total_bonded, height, seconds_since_connected, &filters, ui::id("Left Pane Ratio Bar"), true);
-                                
+
 
                                 if ui.openable(data, id, activated, true) {
                                     let mut prev_finalizer:   Option<[u8; 32]> = None;
@@ -2208,7 +2208,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 direction: TopToBottom,
                                                 ..Decl
                                             });
-                                            
+
 
                                             if let _ = elem().decl(Decl {
                                                 id,
@@ -2227,7 +2227,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 let h = ui.scale(18.0);
 
                                                 /*@TODO(Giovanni) FILL THESEEEEEE WTH ACTUAL DATA*/
-                                                // let height = 3000; 
+                                                // let height = 3000;
                                                 // let seconds_since_connected = 300;
                                                 /*-------------------------------------*/
                                                 //@TODO(Giovanni): Fix the actual call to finalizer_is_online with real data....
@@ -2929,7 +2929,8 @@ pub fn ui_right_pane(ui: &mut Context,
                  dummy_1: &mut Id,
                  dummy_2: &mut Id) {
 
-    
+    // let bft_recency = &viz.bft_recency_status;
+    // ui.text(frame_strf!(data, "BFT recency: {bft_recency:#?}"), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
 
     // @TODO: MAKE THESE NOT USE TABS, JUST USE HEADERS
     let mut tab_id_faucet = Id::default();
@@ -2967,7 +2968,7 @@ pub fn ui_right_pane(ui: &mut Context,
         ..Decl
     }) {
         let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
-            
+
 
             let id = id(label);
             let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
@@ -3082,13 +3083,13 @@ pub fn ui_right_pane(ui: &mut Context,
 
                     if ui.openable(data, combo_id, activated, false) {
                         let id = id("Matches Height Button");
-                        
+
 
                         let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, id, true, winit::window::CursorIcon::Pointer);
                         let radius = ui.scale(16.0);
-                        
+
                         let mut state = wallet_state.lock().unwrap();
-                        
+
                         if let _ = elem().decl(Decl {
                             id: id,
                             colour,
@@ -3100,7 +3101,7 @@ pub fn ui_right_pane(ui: &mut Context,
                             height: fit!(radius * 2.0),
                             ..Decl
                         }) {
-                    
+
                             if filters.filter_height {
                                 ui.text("Matches my height/round [ON]", TextDecl { font: Mono, h: ui.scale(16.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
                             }
@@ -3161,10 +3162,10 @@ pub fn ui_right_pane(ui: &mut Context,
         let offline_stake = total_stake - online_stake;
 
         /*@TODO(Giovanni) FILL THESEEEEEE WTH ACTUAL DATA*/
-        let height = 3000; 
+        let height = 3000;
         let seconds_since_connected = 300;
         /*-------------------------------------*/
-        
+
         let online_offline_roster_members = [
         WalletRosterMember{
             pub_key:[0xAA;32],
@@ -3178,7 +3179,7 @@ pub fn ui_right_pane(ui: &mut Context,
         }];
 
         finalizer_ratio_bar(ui, data, &online_offline_roster_members, total_stake, height, seconds_since_connected, &FinalizerFilters::default(), ui::id("Right Pane Ratio Bar 1"), false);
-        
+
         finalizer_ratio_bar(ui, data, &roster, total_stake, height, seconds_since_connected, &filters, ui::id("Right Pane Ratio Bar 2"), true);
 
         let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
@@ -3257,7 +3258,7 @@ pub fn ui_right_pane(ui: &mut Context,
                         let info_h = ui.scale(18.0);
 
                         /*@TODO(Giovanni) FILL THESEEEEEE WTH ACTUAL DATA*/
-                        let height = 3000; 
+                        let height = 3000;
                         let seconds_since_connected = 300;
                         /*-------------------------------------*/
                         let _ = elem().decl(Decl { width: fixed!(info_h), height: fixed!(info_h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&member.pub_key, finalizer_is_online(height, seconds_since_connected, &filters)), ..Decl });
@@ -3445,8 +3446,8 @@ fn animated_loading_icon(ui: &Context) -> &str {
 }
 
 pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mut UiData, viz: &mut VizState, is_rendering: bool) -> bool {
-    
-    
+
+
     data.per_frame_strs.clear();
 
     let mut result = false;
@@ -3456,7 +3457,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
     if ui.input().key_held(KeyCode::ControlLeft) || ui.input().key_held(KeyCode::ControlRight) {
 
-        
+
         if ui.input().key_pressed(KeyCode::Equal) {
             let new_zoom = ui.zoom * (1.0f32 + 1.0f32 / 8f32);
             if new_zoom <= MAX_ZOOM {
@@ -4270,7 +4271,7 @@ pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet
     if ui.tx_loading_animation_timer >= 1.0 {
         ui.tx_loading_animation_timer = 0.0;
     }
-    
+
     let dummy_input = InputCtx {
         this_mouse_pos: ui.input().this_mouse_pos,
         last_mouse_pos: ui.input().this_mouse_pos,

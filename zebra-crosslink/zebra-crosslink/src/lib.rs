@@ -1110,7 +1110,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 Box::pin(async move {
                     let now_utc = chrono::Utc::now().timestamp();
                     let (my_height, my_round) = (bft_state.height, bft_state.round);
-                    let mut finalizer_statuses = HashMap::<PubKeyID, FinalizerRecencyStatus>::new();
+                    let mut finalizer_statuses = Vec::<(PubKeyID, FinalizerRecencyStatus)>::new();
 
                     // ~current height
                     for round in &bft_state.rounds_data {
@@ -1120,12 +1120,20 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                             use zcash_primitives::bft::TMSig;
                             let votes = &round.msg_val_sigs[roster_i];
                             let (has_prevote_sig, has_precommit_sig) = (votes[0].1 != TMSig::NIL, votes[1].1 != TMSig::NIL);
-                            let st = finalizer_statuses.entry(member.pub_key).or_default();
+
+                            let st = if let Some(v) = finalizer_statuses.iter_mut().find(|(key, _st)| *key == member.pub_key) {
+                                v
+                            } else {
+                                let last_i = finalizer_statuses.len();
+                                finalizer_statuses.push((member.pub_key, FinalizerRecencyStatus::default()));
+                                &mut finalizer_statuses[last_i]
+                            };
+
                             if has_prevote_sig | has_precommit_sig {
                                 if is_my_height_round {
-                                    st.voted_in_my_height_round = (has_prevote_sig, has_precommit_sig);
+                                    st.1.voted_in_my_height_round = (has_prevote_sig, has_precommit_sig);
                                 }
-                                st.highest_round_vote = st.highest_round_vote.max(round.round);
+                                st.1.highest_round_vote = st.1.highest_round_vote.max(round.round);
                             }
                         }
                     }

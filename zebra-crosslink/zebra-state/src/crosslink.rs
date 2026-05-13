@@ -8,6 +8,8 @@ use zebra_chain::block::{Hash as BlockHash, Height as BlockHeight};
 
 use serde_with::serde_as;
 
+pub use zcash_primitives::bft::{FinalizerRecencyStatus, TFLRecencyStatus};
+
 /// The finality status of a block
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TFLBlockFinality {
@@ -23,26 +25,6 @@ pub enum TFLBlockFinality {
     /// The block cannot be finalized: it's height is below the finalized height and
     /// it is not in the best chain.
     CantBeFinalized,
-}
-
-#[derive(Default, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct FinalizerRecencyStatus {
-    pub voted_in_my_height_round: (bool, bool), // prevote, precommit
-    pub highest_round_vote: u32,
-    pub last_seen_new_info_utc: u32,
-    pub last_direct_connection_utc: u32,
-}
-
-#[serde_as]
-#[derive(Default, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct TFLRecencyStatus {
-    /// reference point for other absolute times
-    pub now_utc: i64,
-    pub my_height: u64,
-    pub my_round: u32,
-    #[serde_as(as = "Vec<(_, _)>")]
-    pub finalizer_statuses: std::collections::HashMap<zcash_primitives::bft::PubKeyID, FinalizerRecencyStatus>,
-    // pub round_step_utc_rngs: Vec<[(u32, u32); 3]>,
 }
 
 /// Types of requests that can be made to the TFLService.
