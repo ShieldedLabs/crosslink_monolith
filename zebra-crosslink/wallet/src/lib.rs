@@ -941,6 +941,9 @@ pub struct WalletState {
 
     pub stake_positions_bonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* initial */)>,
     pub stake_positions_unbonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* initial */)>,
+
+    pub finalizer_height_round_match: bool,
+    pub finalizer_seconds_since_connected: u32,
 }
 
 impl WalletState {
