@@ -1140,12 +1140,12 @@ fn colour_from_hash(hash: &[u8; 32], is_online:bool) -> (u8, u8, u8, u8) {
     v /= 4;
 
 
-    if is_online{    
+    if is_online {
         s += 64;
         v += 64;
     }
-    else{
-        //TODO(Giovanni): flashing effect
+    else {
+        // TODO(Giovanni): flashing effect
         s += 8;
         v += 8;
     }

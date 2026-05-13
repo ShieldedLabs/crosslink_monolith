@@ -325,6 +325,7 @@ pub struct ConnectionTrackingData {
     pub other_transport_identity: Vec<u8>,
     pub connection_state: ConnectionState,
     pub jumbo_reassembly: JumboReassembly,
+    pub handshake_hash: [u8; 64],
     // pub reliable_streams: ReliableStreams,
 }
 impl ConnectionTrackingData {
@@ -512,6 +513,7 @@ pub fn connect_to_endpoint(
                     other_transport_identity: endpoint.key.clone(),
                     connection_state: ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns: 0, hello_packet_payload },
                     jumbo_reassembly: Default::default(),
+                    handshake_hash: [0u8; 64],
                 },
             );
         }
@@ -542,6 +544,7 @@ pub fn connect_to_endpoint(
                     other_transport_identity: endpoint.key.clone(),
                     connection_state: ConnectionState::SendingClientHello { magic1: my_connect_keypair.magic1, last_sent_time_ns: 0, hello_packet_payload, handshake },
                     jumbo_reassembly: Default::default(),
+                    handshake_hash: [0u8; 64],
                 },
             );
         }
@@ -709,13 +712,13 @@ impl SliceWrite for PackletReliableStreamed {
 
 #[derive(Default)]
 pub struct NetworkThreadPush {
-    pub wanted_connections: Vec<STPAddress>,
+    pub wanted_connections: Vec<(STPAddress, [u8; 64])>,
     pub messages_to_send: Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
 }
 
 #[derive(Default)]
 pub struct NetworkThreadPull {
-    pub current_connections: Vec<STPAddress>,
+    pub current_connections: Vec<(STPAddress, [u8; 64])>,
     pub messages_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
 }
 
@@ -773,13 +776,13 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                 let current_time_now_ns = monotonic_clock_ns();
                 connections_map.retain(|key, value| {
                     let stp_address = value.address();
-                    if value.creation_time_ns + 30_000_000_000 < current_time_now_ns && req.wanted_connections.iter().position(|x| x == &stp_address).is_none() && value.is_connected() {
+                    if value.creation_time_ns + 30_000_000_000 < current_time_now_ns && req.wanted_connections.iter().position(|(x, _)| x == &stp_address).is_none() && value.is_connected() {
                         println!("############################# KILLING CONNECTION {:?}", value);
                         return false;
                     }
                     true
                 });
-                for w in &req.wanted_connections {
+                for (w, _) in &req.wanted_connections {
                     connect_to(&mut connections_map, &my_keypairs, w);
                 }
                 packets_to_send.extend(req.messages_to_send);
@@ -790,7 +793,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                 let mut resp = NetworkThreadPull::default();
                 resp.current_connections = connections_map.iter().filter_map(|(key, value)| {
                     if value.is_connected() {
-                        Some(value.address().clone())
+                        Some((value.address().clone(), value.handshake_hash))
                     } else {
                         None
                     }
@@ -851,6 +854,15 @@ pub fn new_service_connections(network_thread_handle: &NetworkThreadHandle, mut 
     }
 
     resp
+}
+
+pub fn get_handshake_hash(handshake: &snow::HandshakeState) -> [u8; 64] {
+    let handshake_hash_slice = handshake.get_handshake_hash();
+    assert!(handshake_hash_slice.len() <= 64);
+    let mut handshake_hash = [0u8; 64];
+    handshake_hash[..handshake_hash_slice.len()].copy_from_slice(handshake_hash_slice);
+
+    handshake_hash
 }
 
 // Returns true if a packet was received. You should use this information to decide how to schedule your connection servicing.
@@ -933,6 +945,7 @@ pub fn service_connections(
                                             other_transport_identity: client_key,
                                             connection_state: ConnectionState::SendingServerHelloPlaintext { magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload },
                                             jumbo_reassembly: Default::default(),
+                                            handshake_hash: [0u8; 64],
                                         },
                                     );
                                     if OVERLY_VERBOSE { println!("Transitioned connection {} to SendingServerHelloPlaintext.", connection_key.key_15_bits); }
@@ -971,6 +984,7 @@ pub fn service_connections(
                                                     let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
 
                                                     debug_assert!(new_handshake.is_handshake_finished());
+                                                    existing_connection.handshake_hash = get_handshake_hash(&new_handshake);
                                                     let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
 
                                                     existing_connection.connection_state = ConnectionState::SendingServerHello { cipher, magic1: *magic1, magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload };
@@ -994,6 +1008,7 @@ pub fn service_connections(
                                         let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
 
                                         debug_assert!(new_handshake.is_handshake_finished());
+                                        let handshake_hash = get_handshake_hash(&new_handshake);
                                         let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
 
                                         let my_ip = if other_ip_addr.to_ipv4_mapped().is_some() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
@@ -1009,6 +1024,7 @@ pub fn service_connections(
                                                 other_transport_identity: client_key,
                                                 connection_state: ConnectionState::SendingServerHello { cipher, magic1, magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload },
                                                 jumbo_reassembly: Default::default(),
+                                                handshake_hash,
                                             },
                                         );
 
@@ -1069,6 +1085,7 @@ pub fn service_connections(
                             if first_six_bytes >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
                                 if let Ok(payload_len) = handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
                                     debug_assert!(handshake.is_handshake_finished());
+                                    existing_connection.handshake_hash = get_handshake_hash(&handshake);
                                     if payload_len != 8 {
                                         if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}: server hello payload was {payload_len} bytes, expected 8 (magic2)."); }
                                         break 'conn;

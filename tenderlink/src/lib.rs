@@ -53,7 +53,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_pcg::Lcg128CmDxsm64 as SimRng;
 use snow::resolvers::CryptoResolver;
 use tokio::time::Instant;
-use zcash_primitives::bft::{ HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
+use zcash_primitives::bft::{ HashKey, HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
 
 const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(1000);
 
@@ -1335,9 +1335,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     use crate::bandwidth_test::*;
     use crate::native_sockets::*;
 
-    let my_port = my_endpoint.map(|e|e.port).unwrap_or(23485); // @Todo! Get local port after sock creation! @@@
+    let my_port = my_endpoint.map(|e| e.port).unwrap_or(23485); // @Todo! Get local port after sock creation! @@@
     let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port);
-    let mut current_connections = Vec::<STPAddress>::new();
+    let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
     let mut messages_to_send = Vec::new();
 
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
@@ -1377,7 +1377,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         {
             let mut peers = peers.iter().map(|(ck, p)| {
                 let mut bft_key = PubKeyID::NIL;
-                for c in &current_connections {
+                for (c, _) in &current_connections {
                     if let Some(k) = bft_key_address_map.get_key(c) {
                         bft_key = *k;
                         break;
@@ -1466,13 +1466,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
             o
         }
-        fn send_noise_msg(packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
-                          connection_key: &ConnectionKey,
-                          msg: &[u8],
-                          stats: &mut NetworkStats) {
+        fn send_stp_msg(messages_to_send: &mut Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
+                        connection_key: &ConnectionKey,
+                        msg: &[u8],
+                        stats: &mut NetworkStats) {
             stats.packets_sent += 1;
             stats.bytes_sent += msg.len();
-            packets_to_send.push((*connection_key, Vec::from(msg), None));
+            messages_to_send.push((*connection_key, Vec::from(msg), None));
         }
 
         if net_stats_window_start.elapsed() >= 10*ONE_SECOND {
@@ -1485,7 +1485,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             loop {
                 // TICK CODE
                 peers.retain(|connection_key, peer| {
-                    if current_connections.iter().position(|x| ConnectionKey::from(x) == *connection_key).is_none() {
+                    if current_connections.iter().position(|(x, _)| ConnectionKey::from(x) == *connection_key).is_none() {
                         println!("{:05}: Disconnected from peer {:?}.", my_port, connection_key);
                         false
                     } else {
@@ -1495,8 +1495,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 // Try to reconnect to known but disconnected peers
                 for (address, _bft_key) in bft_key_address_map.all_addrs() {
-                    if current_connections.iter().position(|x| x == address).is_none() {
-                        current_connections.push(address.clone());
+                    if current_connections.iter().position(|(x, _)| x == address).is_none() {
+                        current_connections.push((address.clone(), [0u8; 64]));
                     }
                 }
 
@@ -1504,19 +1504,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&mut roster).await;
 
-                // Note(Sam): I am going to emulate the future production p2p network by always adding the two ShieldedLabs servers as known validator peers with zero voting power if they are not
-                // already in the roster.
-                let server_a_pub_key = PubKeyID([0x73, 0xBC, 0xD5, 0x4F, 0x3C, 0x1C, 0x6B, 0x42, 0x28, 0x76, 0x9D, 0x7E, 0x75, 0x9B, 0xB2, 0x87,
-                                                 0x7A, 0x56, 0x29, 0x87, 0xC5, 0x35, 0xAC, 0xE9, 0xBA, 0x67, 0xF2, 0x0D, 0x74, 0x13, 0xA7, 0xCD]);
-                let server_b_pub_key = PubKeyID([0xE6, 0x00, 0x6A, 0x82, 0xD9, 0xA0, 0xDA, 0xB4, 0x6B, 0xD4, 0xC1, 0xDD, 0x69, 0x14, 0xF0, 0x3B,
-                                                 0xEC, 0x27, 0xB4, 0xEC, 0xD3, 0xD9, 0x09, 0xD1, 0x62, 0x34, 0x2D, 0xFD, 0xA5, 0x13, 0x78, 0x1E]);
-
                 fn send_round_data_to_peer(bft_state: &TMState,
                                            should_send_prevotes: bool,
                                            round_data: &RoundData,
                                            ctx_str: &str,
                                            roster: &[SortedRosterMember],
-                                           packets_to_send: &mut Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
+                                           messages_to_send: &mut Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
                                            send_buf1: &mut [u8],
                                            peer: &mut Peer,
                                            connection_key: &ConnectionKey,
@@ -1528,13 +1521,14 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     // Make sure to always sent at least one status.
                     {
                         let header = PacketHeader::new_(0);
-                        let o = write_header_and_maybe_status(header, true,
-                                                                       bft_state,
-                                                                       roster,
-                                                                       &mut send_buf1[..],
-                                                                       peer.index_counter);
+                        let mut o = 0;
+                        o += write_header_and_maybe_status(header, true,
+                                                           bft_state,
+                                                           roster,
+                                                           &mut send_buf1[o..],
+                                                           peer.index_counter);
                         peer.index_counter += 1;
-                        send_noise_msg(packets_to_send, connection_key, &send_buf1[..o], stats);
+                        send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
                     }
 
                     let mut chunk_hdr = PacketProposalChunkHeader {
@@ -1585,7 +1579,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 if PRINT_SENDS { println!("{ctx_str} {ANSI_GRY}SENDS{ANSI_RST}: sending proposal chunk {} to {:?}", chunk_i, peer_bft_key); }
                                 sent_chunk_cs += 1;
                                 print_packet_tag_send(header);
-                                send_noise_msg(packets_to_send, connection_key, &send_buf1[..o], stats);
+                                send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
                             }
                         }
                     }
@@ -1665,7 +1659,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                     peer.index_counter += 1;
 
                                     o += packet.write_to(&mut send_buf1[o..]);
-                                    send_noise_msg(packets_to_send, connection_key, &send_buf1[..o], stats);
+                                    send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
 
                                     packet.no_votes_n  = 0;
                                     packet.yes_votes_n = 0;
@@ -1698,7 +1692,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             o += packet.write_to(&mut send_buf1[o..]);
                             // TODO: maybe status
                             print_packet_tag_send(header);
-                            send_noise_msg(packets_to_send, connection_key, &send_buf1[..o], stats);
+                            send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
                         }
                     }
 
@@ -1709,7 +1703,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 if PRINT_PEERS { println!("{ctx_str} {ANSI_GRY}PEERS{ANSI_RST}: {:?}", peers.iter().map(|(ck, p)| {
                     let mut bft_key = PubKeyID::NIL;
-                    for c in &current_connections {
+                    for (c, _) in &current_connections {
                         if ConnectionKey::from(c) == *ck {
                             if let Some(k) = bft_key_address_map.get_key(&c) {
                                 bft_key = *k;
@@ -1722,7 +1716,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 for (connection_key, peer) in &mut peers {
                     let mut peer_bft_key = PubKeyID::NIL;
-                    for c in &current_connections {
+                    for (c, _) in &current_connections {
                         if ConnectionKey::from(c) == *connection_key {
                             if let Some(k) = bft_key_address_map.get_key(&c) {
                                 peer_bft_key = *k;
@@ -1797,14 +1791,22 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         use rand::seq::SliceRandom;
         messages_to_send.shuffle(&mut rand::thread_rng());
-        let resp = new_service_connections(&network_thread_handle, NetworkThreadPush { wanted_connections: current_connections, messages_to_send });
+        let resp = new_service_connections(&network_thread_handle, NetworkThreadPush { wanted_connections: current_connections.clone(), messages_to_send: messages_to_send.clone() });
         current_connections = resp.current_connections;
         let mut messages_received = resp.messages_received;
         messages_to_send = Vec::new();
 
         // Ensure a Peer entry exists for every active connection
-        for stp_address in &current_connections {
-            peers.entry(stp_address.into()).or_insert_with(|| Peer::default());
+        for (stp_address, handshake_hash) in &current_connections {
+            let mut new = false;
+
+            let key = stp_address.connection_key();
+
+            let peer = &mut peers.entry(key).or_insert_with(|| { new = true; Peer::default() });
+
+            if !new {
+                continue;
+            }
         }
 
         // Note(Sam): Disabled this due to confusion. I am not sure it is the right thing.
@@ -1817,7 +1819,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         // });
 
         // Remove peer entries for dropped connections
-        peers.retain(|key, _| current_connections.iter().position(|x| ConnectionKey::from(x) == *key).is_some());
+        peers.retain(|key, _| current_connections.iter().position(|(x, _)| ConnectionKey::from(x) == *key).is_some());
 
 
         // READ
@@ -1896,10 +1898,21 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     }
 }
 
+// networking
+
+// ID verification hello         - BFT pk + BFT sig of noise handshake hash
+// ID verification hello ack     - BFT pk + BFT sig of noise handshake hash + client's view of server ip:port + BFT sig of {ip,port,magic1,key,srv BFT pk, cli BFT pk}
+// ID verification hello ack ack -                                          + server's view of client ip:port + BFT sig of {ip,port,magic1,key,cli BFT pk, srv BFT pk}
+
+const PACKET_TYPE_ID_HELLO:         u8 = 0;
+const PACKET_TYPE_ID_HELLO_ACK:     u8 = 1;
+const PACKET_TYPE_ID_HELLO_ACK_ACK: u8 = 2;
+
 // consensus
 const PACKET_TYPE_PROPOSAL_CHUNK:       u8 =  7;
 const PACKET_TYPE_PREVOTE_SIGNATURES:   u8 =  8;
 const PACKET_TYPE_PRECOMMIT_SIGNATURES: u8 =  9;
+
 // misc
 const PACKET_TYPE_COUNT:                u8 = 11;
 
