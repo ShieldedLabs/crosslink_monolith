@@ -900,6 +900,12 @@ pub struct WalletRosterMember {
     pub txids: std::vec::Vec<StakeTxId>,
 }
 
+#[derive(Default, Debug, Clone, Copy)]
+pub struct FinalizerFilters{
+    pub filter_height: bool,
+    pub filter_seconds_since_connected: u32,
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct WalletState {
     pub wallet_is_init: bool,
@@ -942,8 +948,7 @@ pub struct WalletState {
     pub stake_positions_bonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* initial */)>,
     pub stake_positions_unbonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* initial */)>,
 
-    pub finalizer_height_round_match: bool,
-    pub finalizer_seconds_since_connected: u32,
+    pub filters: FinalizerFilters,
 }
 
 impl WalletState {

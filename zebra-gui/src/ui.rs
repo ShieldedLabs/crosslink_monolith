@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::cell::RefCell;
 //use clay::*; // @Temporary
 
-use wallet::{ BlockHeight, TxParts, TxStatus, WalletState, WalletTxKind, WalletTxPart, WalletRosterMember, str_from_ctaz };
+use wallet::{ BlockHeight, TxParts, TxStatus, WalletState, WalletTxKind, WalletTxPart, WalletRosterMember, FinalizerFilters, str_from_ctaz };
 
 use super::*;
 
@@ -1145,22 +1145,27 @@ fn colour_from_hash(hash: &[u8; 32], is_online:bool) -> (u8, u8, u8, u8) {
         v += 64;
     }
     else{
-        s += 64;
-        v += 32;
+        //TODO(Giovanni): flashing effect
+        s += 8;
+        v += 8;
     }
 
     (h, s, v, 0xff).rgba()
 }
 
-fn finalizer_is_online_fake(finalizer: [u8; 32]) -> bool {
-    finalizer[0] > 128
+
+fn finalizer_is_online(height: u32, seconds_since_connected: u64, filters:&FinalizerFilters) -> bool {
+    let mut ok:bool = true;
+    ok &= !filters.filter_height || height > 0;
+    ok &= filters.filter_seconds_since_connected == 0 || seconds_since_connected < filters.filter_seconds_since_connected as u64;
+    ok
 }
 
-pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[WalletRosterMember], total_val: u64) {
+pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[WalletRosterMember], total_val: u64, height:u32, seconds_since_connected:u64, filters:&FinalizerFilters, id:ui::Id, show_text:bool) {
 
     let finalizer_pill_rad = ui.scale(8.0);
     if finalizers.len() > 0 && total_val > 0 && let _ = elem().decl(Decl {
-        id: ui::id("Finalizer Ratio Bar Container"),
+        id,
         child_gap: ui.scale(5.0),
         align: Left,
         direction: LeftToRight,
@@ -1170,19 +1175,25 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[Wa
     }) {
         let mut rem = 0;
         let mut done_once = false; // need for the left pill rad
+        let mut seen_voting_power = 0;
         for (i, finalizer) in finalizers.iter().enumerate() {
+            seen_voting_power += finalizer.voting_power;
             let pct = finalizer.voting_power as f32 / total_val as f32;
+
             if pct <= 0.01 {
                 rem += finalizer.voting_power;
                 continue;
             }
-            let is_online = finalizer_is_online_fake(finalizer.pub_key);
+            let is_online = finalizer_is_online(height, seconds_since_connected, filters);
+
+            
             if let el = elem().decl(Decl {
                 id: id_index("finalizer bar", i as u32),
                 colour: colour_from_hash(&finalizer.pub_key, is_online),
+
                 radius: {
                     let l = if !done_once { finalizer_pill_rad } else { 0.0 };
-                    let r = if i == finalizers.len()-1 && rem == 0 { finalizer_pill_rad } else { 0.0 };
+                    let r = if seen_voting_power == total_val { finalizer_pill_rad } else { 0.0 };
                     (r, l, r, l) // TODO: order??
                 },
                 align: Left,
@@ -1191,11 +1202,12 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, finalizers: &[Wa
                 ..Decl
             }) {
                 if ui.hovered(el.decl.id)  {
-                    if (is_online){
-                        set_tooltip_text!(data, "{}  [CURRENTLY ONLINE]  {} cTAZ    {:.2}%", display_str(&chunkify(&finalizer.pub_key)), str_from_ctaz(finalizer.voting_power), 100.0*pct);
+                    let online_string = if is_online {"ONLINE"} else {"OFFLINE"};
+                    if !show_text{
+                        set_tooltip_text!(data, "[{online_string}]  {} cTAZ    {:.2}%", str_from_ctaz(finalizer.voting_power), 100.0*pct);
                     }
                     else{
-                        set_tooltip_text!(data, "{}  [CURRENTLY OFFLINE]  {} cTAZ    {:.2}%", display_str(&chunkify(&finalizer.pub_key)), str_from_ctaz(finalizer.voting_power), 100.0*pct);
+                        set_tooltip_text!(data, "{}  [{online_string}]  {} cTAZ    {:.2}%", display_str(&chunkify(&finalizer.pub_key)), str_from_ctaz(finalizer.voting_power), 100.0*pct);
                     }
                 }
 
@@ -2124,7 +2136,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                 });
 
                                 let (activated, colour, text_colour) = ui.button_ex(true, colour, id, true, winit::window::CursorIcon::Pointer);
-
+                                /*@TODO(Giovanni) FILL THESEEEEEE WTH ACTUAL DATA*/
+                                let height = 3000; 
+                                let seconds_since_connected = 300;
+                                /*-------------------------------------*/
                                 if let _ = elem().decl(Decl {
                                     id,
                                     colour,
@@ -2141,8 +2156,11 @@ pub fn ui_left_pane(ui: &mut Context,
                                     let colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
                                     ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(total_bonded)), TextDecl { font: Mono, colour, h: ui.scale(18.0), align: AlignX::Right, ..TextDecl });
                                 }
+                                let filters = FinalizerFilters::default();
 
-                                finalizer_ratio_bar(ui, data, &bonded_finalizers, total_bonded);
+
+                                finalizer_ratio_bar(ui, data, &bonded_finalizers, total_bonded, height, seconds_since_connected, &filters, ui::id("Left Pane Ratio Bar"), true);
+                                
 
                                 if ui.openable(data, id, activated, true) {
                                     let mut prev_finalizer:   Option<[u8; 32]> = None;
@@ -2190,6 +2208,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 direction: TopToBottom,
                                                 ..Decl
                                             });
+                                            
 
                                             if let _ = elem().decl(Decl {
                                                 id,
@@ -2206,7 +2225,13 @@ pub fn ui_left_pane(ui: &mut Context,
                                             {
                                                 // ui.text("Staked to:", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
                                                 let h = ui.scale(18.0);
-                                                let _ = elem().decl(Decl { width: fixed!(h), height: fixed!(h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&finalizer, finalizer_is_online_fake(finalizer)), ..Decl });
+
+                                                /*@TODO(Giovanni) FILL THESEEEEEE WTH ACTUAL DATA*/
+                                                // let height = 3000; 
+                                                // let seconds_since_connected = 300;
+                                                /*-------------------------------------*/
+                                                //@TODO(Giovanni): Fix the actual call to finalizer_is_online with real data....
+                                                let _ = elem().decl(Decl { width: fixed!(h), height: fixed!(h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&finalizer, true), ..Decl });
 
                                                 ui.text(label, TextDecl { colour: text_colour, h, align: AlignX::Left, ..TextDecl });
                                                 let _ = elem().decl(Decl { width: grow!(), ..Decl });
@@ -2910,10 +2935,14 @@ pub fn ui_right_pane(ui: &mut Context,
     let mut tab_id_faucet = Id::default();
     let mut tab_id_roster = Id::default();
 
-    let (wallet_is_init, mut roster) = {
+    let (mut filters, wallet_is_init, mut roster) = {
         let state = wallet_state.lock().unwrap();
-        (state.wallet_is_init, state.roster.clone())
+
+        (state.filters, state.wallet_is_init, state.roster.clone())
     };
+
+    let mut filters_modified = true;
+
     roster.sort_by_key(|member| std::cmp::Reverse(member.voting_power));
     let roster = roster;
 
@@ -3072,7 +3101,7 @@ pub fn ui_right_pane(ui: &mut Context,
                             ..Decl
                         }) {
                     
-                            if state.finalizer_height_round_match {
+                            if filters.filter_height {
                                 ui.text("Matches my height/round [ON]", TextDecl { font: Mono, h: ui.scale(16.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
                             }
                             else{
@@ -3080,7 +3109,7 @@ pub fn ui_right_pane(ui: &mut Context,
                             }
 
                             if clicked{
-                                state.finalizer_height_round_match = !state.finalizer_height_round_match;
+                                filters.filter_height = !filters.filter_height;
                             }
                         }
 
@@ -3099,8 +3128,8 @@ pub fn ui_right_pane(ui: &mut Context,
                                 "Seconds since connected...",
                                 TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
                             ).trim().parse::<u32>(){
-                                state.finalizer_seconds_since_connected = value;
-                                println!("{:?}", state.finalizer_seconds_since_connected);
+                                filters.filter_seconds_since_connected = value;
+                                //println!("{:?}", state.finalizer_seconds_since_connected);
                             }
                             else{
 
@@ -3118,11 +3147,39 @@ pub fn ui_right_pane(ui: &mut Context,
             }
         }
 
+        let mut online_stake = 0u64;
+
         let mut total_stake = 0u64;
         for member in &roster {
             total_stake += member.voting_power;
+            //fn finalizer_is_online(height: u32, seconds_since_connected: u64, filters:&FinalizerFilters) -> bool {
+
+            if finalizer_is_online(300, 300, &filters){
+                online_stake += member.voting_power;
+            }
         }
-        finalizer_ratio_bar(ui, data, &roster, total_stake);
+        let offline_stake = total_stake - online_stake;
+
+        /*@TODO(Giovanni) FILL THESEEEEEE WTH ACTUAL DATA*/
+        let height = 3000; 
+        let seconds_since_connected = 300;
+        /*-------------------------------------*/
+        
+        let online_offline_roster_members = [
+        WalletRosterMember{
+            pub_key:[0xAA;32],
+            voting_power:online_stake,
+            txids:Vec::new(),
+        },
+        WalletRosterMember{
+            pub_key:[0xBB;32],
+            voting_power:offline_stake,
+            txids:Vec::new(),
+        }];
+
+        finalizer_ratio_bar(ui, data, &online_offline_roster_members, total_stake, height, seconds_since_connected, &FinalizerFilters::default(), ui::id("Right Pane Ratio Bar 1"), false);
+        
+        finalizer_ratio_bar(ui, data, &roster, total_stake, height, seconds_since_connected, &filters, ui::id("Right Pane Ratio Bar 2"), true);
 
         let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
         if roster.len() == 0 {
@@ -3155,6 +3212,7 @@ pub fn ui_right_pane(ui: &mut Context,
             else {
                 let kind_text_h = ui.scale(18.0);
                 let transaction_text_h = ui.scale(16.0);
+                let state = wallet_state.lock().unwrap();
 
                 for (index, member) in roster.iter().enumerate() {
                     if index > 0 { // separator
@@ -3197,7 +3255,12 @@ pub fn ui_right_pane(ui: &mut Context,
 
                         // finalizer colour token
                         let info_h = ui.scale(18.0);
-                        let _ = elem().decl(Decl { width: fixed!(info_h), height: fixed!(info_h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&member.pub_key, finalizer_is_online_fake(member.pub_key)), ..Decl });
+
+                        /*@TODO(Giovanni) FILL THESEEEEEE WTH ACTUAL DATA*/
+                        let height = 3000; 
+                        let seconds_since_connected = 300;
+                        /*-------------------------------------*/
+                        let _ = elem().decl(Decl { width: fixed!(info_h), height: fixed!(info_h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&member.pub_key, finalizer_is_online(height, seconds_since_connected, &filters)), ..Decl });
 
                         // info
                         if let _ = elem().decl(Decl {
@@ -3370,6 +3433,9 @@ pub fn ui_right_pane(ui: &mut Context,
                 set_tooltip_text!(data, "The faucet is mining more funds.");
             }
         }
+    }
+    if filters_modified{
+        wallet_state.lock().unwrap().filters = filters;
     }
 }
 
