@@ -1807,6 +1807,46 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             if !new {
                 continue;
             }
+
+            let pk_bytes = my_root_public_bft_key.as_ref();
+            assert!(pk_bytes.len() == 32);
+            tracing::error!("ID send: pk: {}", PubKeyID(pk_bytes.try_into().expect("already asserted length of 32")));
+
+            let hash_key_for_handshake_hash = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO Handshake Hash").finalize().into());
+            assert!(handshake_hash.len() == 64);
+            let keyed_hash_of_handshake_hash = hash_key_for_handshake_hash.hash(&handshake_hash[..]);
+            let sig = my_root_private_key.sign(&keyed_hash_of_handshake_hash[..]).to_bytes();
+            tracing::error!("ID send: sig: {:?}", sig);
+
+            let mut o = 0;
+
+            // send hello to start verifying identity
+            let header = PacketHeader::new::<PACKET_TYPE_ID_HELLO>();
+            o += write_header_and_maybe_status(header, true,
+                                               &bft_state,
+                                               &roster,
+                                               &mut send_buf1[o..],
+                                               peer.index_counter);
+            peer.index_counter += 1;
+            o += pk_bytes.write_to(&mut send_buf1[o..]);
+            o += sig     .write_to(&mut send_buf1[o..]);
+
+
+            {
+                let mut msg = &send_buf1[..o];
+                let (header, status, read_o) = read_header_and_maybe_status(&msg[..]).expect("nocheckin deleteme");
+                msg = &msg[read_o..];
+                let pk      = PubKeyID(<[u8; 32]>::read_from(&mut msg).expect("nocheckin deleteme"));
+                tracing::error!("ID recv: pk: {}", pk);
+                let sig     = TMSig(<[u8; 64]>::read_from(&mut msg).expect("nocheckin deleteme"));
+                tracing::error!("ID recv: sig: {:?}", sig.0);
+                match sig.verify(pk, &keyed_hash_of_handshake_hash[..]) { Ok(()) => {}, Err((err, str)) => {
+                    panic!("Round-trip handshake hash signature failed");
+                } };
+            }
+
+            print_packet_tag_send(header);
+            send_stp_msg(&mut messages_to_send, &key, &send_buf1[..o], &mut net_stats);
         }
 
         // Note(Sam): Disabled this due to confusion. I am not sure it is the right thing.
