@@ -228,6 +228,8 @@ pub(crate) struct TFLServiceInternal {
     finalizers_keys_to_names: HashMap<PubKeyID, String>,
     finalizers_at_current_height: Vec<RosterMember>,
 
+    recency_status: TFLRecencyStatus,
+
     current_bc_final: Option<(ZebBlockHeight, ZebBlockHash)>,
     path_to_pos_store_file: PathBuf,
 }
@@ -931,6 +933,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         let tfl_handle6 = internal_handle.clone();
         let tfl_handle7 = internal_handle.clone();
         let tfl_handle8 = internal_handle.clone();
+        let tfl_handle9 = internal_handle.clone();
 
         *wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap() = my_public_key;
 
@@ -1100,6 +1103,44 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                             peer.latest_status_request_height,
                         ));
                     }
+                })
+            })),
+            tenderlink::ClosureToAllowBftAccess(Arc::new(move |bft_state: &tenderlink::TMState| {
+                let tfl_handle = tfl_handle9.clone();
+                Box::pin(async move {
+                    let now_utc = chrono::Utc::now().timestamp();
+                    let (my_height, my_round) = (bft_state.height, bft_state.round);
+                    let mut finalizer_statuses = HashMap::<PubKeyID, FinalizerRecencyStatus>::new();
+
+                    // ~current height
+                    for round in &bft_state.rounds_data {
+                        let is_my_height_round = round.height == my_height && round.round == my_round;
+
+                        for (roster_i, member) in round.roster.iter().enumerate() {
+                            use zcash_primitives::bft::TMSig;
+                            let votes = &round.msg_val_sigs[roster_i];
+                            let (has_prevote_sig, has_precommit_sig) = (votes[0].1 != TMSig::NIL, votes[1].1 != TMSig::NIL);
+                            let st = finalizer_statuses.entry(member.pub_key).or_default();
+                            if has_prevote_sig | has_precommit_sig {
+                                if is_my_height_round {
+                                    st.voted_in_my_height_round = (has_prevote_sig, has_precommit_sig);
+                                }
+                                st.highest_round_vote = st.highest_round_vote.max(round.round);
+                            }
+                        }
+                    }
+
+                    // for data in &bft_state.recent_commit_round_cache {
+                    //     println!("LIVENESS recent_commit_round_cache: height: {}, round: {}", data.height, data.round);
+                    // }
+
+                    let mut internal = tfl_handle.internal.lock().await;
+                    internal.recency_status = TFLRecencyStatus {
+                        now_utc,
+                        my_height,
+                        my_round,
+                        finalizer_statuses,
+                    };
                 })
             })),
             ingest_data_for_tenderlink,
@@ -1334,6 +1375,7 @@ async fn tfl_service_incoming_request(
             ))
         }
 
+        // wallet
         TFLServiceRequest::Faucet(request) => {
             Ok(TFLServiceResponse::Faucet({
                 let closure = wallet::FAUCET_REQUEST.lock().unwrap();
@@ -1345,13 +1387,21 @@ async fn tfl_service_incoming_request(
             }))
         }
 
+        // workshop - mining & staking via PoW
         TFLServiceRequest::TotalIssuanceFromKey(ufvk_str) => {
             Ok(TFLServiceResponse::TotalIssuanceFromKey({
                 total_issuance_from_key(internal_handle.clone(), ufvk_str).await
             }))
         }
 
-        _ => Err(TFLServiceError::NotImplemented),
+        // crosslink direct
+        TFLServiceRequest::FinalizersRecencyStatus => {
+            let internal = internal_handle.internal.lock().await;
+            println!("FinalizersRecencyStatus: {:?}", internal.recency_status);
+            Ok(TFLServiceResponse::FinalizersRecencyStatus(internal.recency_status.clone()))
+        }
+
+        TFLServiceRequest::StakingCmd(String) => Err(TFLServiceError::NotImplemented),
     }
 }
 

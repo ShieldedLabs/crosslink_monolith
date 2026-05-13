@@ -181,6 +181,7 @@ pub fn spawn_new_tfl_service(
         finalizers_keys_to_names,
         current_bc_final: None,
         path_to_pos_store_file: path_to_pos_store_file.clone(),
+        recency_status: TFLRecencyStatus::default(),
     }));
 
     let handle_mtx = Arc::new(std::sync::Mutex::new(None));

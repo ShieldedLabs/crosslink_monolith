@@ -520,6 +520,22 @@ pub trait Rpc {
         hash: GetTxHash,
     ) -> Option<TFLBlockFinality>;
 
+    /// Get metrics from which we can determine finalizer liveness
+    ///
+    /// zcashd reference: none
+    /// method: ?
+    /// tags: tfl
+    ///
+    /// ## Example Usage
+    /// ```bash
+    /// curl -X POST -H "Content-Type: application/json" -d \
+    /// '{ "jsonrpc": "2.0", "method": "get_tfl_recency_status", "params": [], "id": 1 }' \
+    /// http://127.0.0.1:8232
+    /// ```
+    /// *(The `address:port` matches the value in `zebrad.toml > [rpc] > listen_addr`)*
+    #[method(name = "get_tfl_recency_status")]
+    async fn get_tfl_recency_status(&self) -> Option<zebra_state::crosslink::TFLRecencyStatus>;
+
     /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
     /// If the block is not in Zebra's state,
     /// returns [error code `-8`.](https://github.com/zcash/zcash/issues/5758)
@@ -2303,6 +2319,24 @@ where
                     }
                 }
             }
+        }
+    }
+
+    async fn get_tfl_recency_status(&self) -> Option<zebra_state::crosslink::TFLRecencyStatus> {
+        let res = self
+            .tfl_service
+            .clone()
+            .oneshot(TFLServiceRequest::FinalizersRecencyStatus)
+            .await;
+        match res {
+            Ok(TFLServiceResponse::FinalizersRecencyStatus(status)) => {
+                Some(status)
+            }
+            Err(err) => {
+                tracing::error!("{err:?}");
+                None
+            }
+            _ => unreachable!("invalid enum: {res:?}"),
         }
     }
 

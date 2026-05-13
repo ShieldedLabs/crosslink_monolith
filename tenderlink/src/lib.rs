@@ -128,6 +128,11 @@ pub struct ClosureToUpdatePeers(pub Arc<dyn Fn(Vec<PeerInfo>) -> core::pin::Pin<
 impl std::fmt::Debug for ClosureToUpdatePeers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToUpdatePeers(..)") }
 }
+#[derive(Clone)]
+pub struct ClosureToAllowBftAccess(pub Arc<dyn for<'a> Fn(&'a TMState) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send + Sync + 'static>);
+impl std::fmt::Debug for ClosureToAllowBftAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToAllowBftAccess(..)") }
+}
 
 fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMember]) -> FatPointerToBftBlock {
     let vote_for_block_without_finalizer_public_key: [u8; 76 - 32];
@@ -380,31 +385,32 @@ fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 
 
 #[derive(Debug)]
-struct TMState {
-    hash_keys: HashKeys,
-    my_port: u16,
-    my_signing_key: SigningKey,
-    my_pub_key: PubKeyID,
-    round: u32,
-    step: TMStep,
+pub struct TMState {
+    pub hash_keys: HashKeys,
+    pub my_port: u16,
+    pub my_signing_key: SigningKey,
+    pub my_pub_key: PubKeyID,
+    pub round: u32,
+    pub step: TMStep,
     /// basically the chain of agreed blocks
-    height: u64,
+    pub height: u64,
     /// most recent "possible decision value" - successful proposal + prevote
     /// when valid_value was updated
-    valid_value_round: (Option<BlockValue>, i64), // TODO
+    pub valid_value_round: (Option<BlockValue>, i64), // TODO
     /// last value sent for precommit // TODO: non-nil only?
     /// last round on which a *non-nil* value was sent
-    locked_value_round: (Option<BlockValue>, i64), // TODO
+    pub locked_value_round: (Option<BlockValue>, i64), // TODO
 
-    rounds_data: Vec<RoundData>,
+    pub rounds_data: Vec<RoundData>,
 
-    recent_commit_round_cache: Vec<RoundData>, // for now will hold all completed heights
+    pub recent_commit_round_cache: Vec<RoundData>, // for now will hold all completed heights
 
     propose_closure: ClosureToProposeNewBlock,
     validate_closure: ClosureToValidateProposedBlock,
     push_block_closure: ClosureToPushDecidedBlock,
 
     update_peers_cmd_closure: ClosureToUpdatePeers,
+    bft_access_closure: ClosureToAllowBftAccess,
 }
 impl TMState {
     fn init(
@@ -413,6 +419,7 @@ impl TMState {
         validate_closure: ClosureToValidateProposedBlock,
         push_block_closure: ClosureToPushDecidedBlock,
         update_peers_cmd_closure: ClosureToUpdatePeers,
+        bft_access_closure: ClosureToAllowBftAccess,
     ) -> Self {
         Self {
             hash_keys: HashKeys::default(),
@@ -432,6 +439,7 @@ impl TMState {
             validate_closure,
             push_block_closure,
             update_peers_cmd_closure,
+            bft_access_closure,
         }
     }
 
@@ -1235,6 +1243,9 @@ async fn instance(
         ClosureToUpdatePeers(Arc::new(move |_all_peers| { Box::pin(async move {
         })})),
 
+        ClosureToAllowBftAccess(Arc::new(move |_bft_state| { Box::pin(async move {
+        })})),
+
         Vec::new(),
     ).await
 }
@@ -1308,6 +1319,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          validate_closure: ClosureToValidateProposedBlock,
                          push_block_closure: ClosureToPushDecidedBlock,
                          peer_cmd_closure: ClosureToUpdatePeers,
+                         bft_access_closure: ClosureToAllowBftAccess,
                          ingest_startup_data: Vec<RoundData>,
                         ) -> std::io::Result<()> {
     hook_fail_on_panic();
@@ -1358,6 +1370,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         validate_closure,
         push_block_closure,
         peer_cmd_closure,
+        bft_access_closure,
     ); // TODO: double-check this is the right key
 
     bft_state.height = ingest_startup_data.len() as u64;
@@ -1499,6 +1512,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         current_connections.push((address.clone(), [0u8; 64]));
                     }
                 }
+
+                bft_state.bft_access_closure.0(&bft_state).await;
 
                 // BFT CONSENSUS
                 // account for the state updates we've accumulated

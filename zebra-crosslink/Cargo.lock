@@ -10028,6 +10028,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_with",
  "spandoc",
  "static_assertions",
  "tempfile",

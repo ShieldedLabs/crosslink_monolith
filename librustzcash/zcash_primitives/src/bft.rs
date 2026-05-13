@@ -350,11 +350,44 @@ pub fn fmt_prefixed_byte_str_rev(f: &mut std::fmt::Formatter<'_>, pre: &str, byt
 
 
 /// equivalent to [ed25519_zebra::VerificationKeyBytes]
-#[derive(Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PubKeyID(pub [u8; 32]);
 impl PubKeyID { pub const NIL: Self = Self([0; 32]); }
 impl std::fmt::Display for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_byte_str_rev(f, &self.0) } }
 impl std::fmt::Debug   for PubKeyID { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str_rev(f, "Pub{", &self.0[..2])?; write!(f, "}}") } }
+
+impl serde::Serialize for PubKeyID {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer,
+    {
+        let mut le_bytes = self.0;
+        le_bytes.reverse();
+
+        let mut buf = [0u8; 64];
+        hex::encode_to_slice(&le_bytes, &mut buf).map_err(serde::ser::Error::custom)?;
+        let le_str = std::str::from_utf8(&buf).expect("encoding should be ASCII-only");
+        le_str.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PubKeyID {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let le_str = <&str>::deserialize(deserializer)?;
+        if le_str.len() != 64 {
+            return Err(serde::de::Error::invalid_length(le_str.len(), &"32 bytes => 64 hex characters"));
+        }
+
+        let mut buf = [0u8; 32];
+        hex::decode_to_slice(le_str, &mut buf).map_err(serde::de::Error::custom)?;
+        buf.reverse();
+
+        Ok(PubKeyID(buf))
+    }
+}
+
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TMSig(pub [u8; 64]);
