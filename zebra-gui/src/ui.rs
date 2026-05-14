@@ -3201,7 +3201,7 @@ pub fn ui_right_pane(ui: &mut Context,
                 if ui.input().mouse_pressed(winit::event::MouseButton::Right) {
                     filters.show_popup = !filters.show_popup;
                     
-                    if filters.show_popup && filters.popup_pos.is_none() {
+                    if filters.show_popup {
                         let mouse_pos = ui.input().mouse_pos();
                         let dpi = ui.dpi_scale;
                         filters.popup_pos = Some((
