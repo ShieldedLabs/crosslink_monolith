@@ -668,10 +668,11 @@ impl Vote {
 
 #[derive(Default, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FinalizerRecencyStatus {
-    pub voted_in_my_height_round: (bool, bool), // prevote, precommit
+    pub no_yes_votes_in_my_height: [[u64; 2]; 2], // prevote, precommit
     pub highest_round_vote: u32,
     pub last_seen_new_info_utc: i64,
     pub last_direct_connection_utc: i64,
+    // TODO: locked, valid
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -680,6 +681,11 @@ pub struct TFLRecencyStatus {
     pub now_utc: i64,
     pub my_height: u64,
     pub my_round: u32,
+    pub my_step: u8, // propose, prevote, precommit
+    pub my_locked_round: i64,
+    pub my_valid_round: i64,
+
+    // TODO: pub proposal_parts: Vec<bool>,
     pub finalizer_statuses: Vec<(PubKeyID, FinalizerRecencyStatus)>,
     // pub round_step_utc_rngs: Vec<[(u32, u32); 3]>,
 }

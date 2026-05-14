@@ -1151,7 +1151,11 @@ fn get_finalizer_status(bft_status: &wallet::TFLRecencyStatus, pub_key: [u8;32])
 fn finalizer_is_online_ex(f: &FinalizerRecencyStatus, bft_status: &wallet::TFLRecencyStatus, filters: &FinalizerFilters) -> bool {
     let mut ok:bool = true;
     if filters.filter_height {
-        let any_vote = f.voted_in_my_height_round.0 | f.voted_in_my_height_round.1;
+        let mut any_vote = false;
+        any_vote |= f.no_yes_votes_in_my_height[0][0] > 0;
+        any_vote |= f.no_yes_votes_in_my_height[0][1] > 0;
+        any_vote |= f.no_yes_votes_in_my_height[1][0] > 0;
+        any_vote |= f.no_yes_votes_in_my_height[1][1] > 0;
         ok &= any_vote;
     }
 
@@ -3200,7 +3204,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
                 if ui.input().mouse_pressed(winit::event::MouseButton::Right) {
                     filters.show_popup = !filters.show_popup;
-                    
+
                     if filters.show_popup {
                         let mouse_pos = ui.input().mouse_pos();
                         let dpi = ui.dpi_scale;
@@ -3219,7 +3223,14 @@ pub fn ui_right_pane(ui: &mut Context,
             }
             //@TODO(Giovanni): Maybe lock behind a key-input (hold to open the popup)...
             if(ui.hovered(id("Finalizers Buttons"))){
-                #[cfg(debug_assertions)]  set_tooltip_text!(data, "last checked: {}, height: {}, round: {}", bft_status.now_utc, bft_status.my_height, bft_status.my_round);
+                set_tooltip_text!(data, "last checked: {}\nheight: {}\nround: {}\nstep: {}\n\"valid\" round: {}\n\"locked\" round: {}",
+                    bft_status.now_utc,
+                    bft_status.my_height,
+                    bft_status.my_round,
+                    ["Proposal", "Prevote", "Precommit"][bft_status.my_step as usize],
+                    bft_status.my_valid_round,
+                    bft_status.my_locked_round,
+                );
             }
             ui.text("Your Finalizer Identity", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
             ui.text(frame_strf!(data, "[{}..{}]", &recv_address[0..8], &recv_address[recv_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });

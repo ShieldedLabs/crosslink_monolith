@@ -1109,17 +1109,15 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 let tfl_handle = tfl_handle9.clone();
                 Box::pin(async move {
                     let now_utc = chrono::Utc::now().timestamp();
-                    let (my_height, my_round) = (bft_state.height, bft_state.round);
                     let mut finalizer_statuses = Vec::<(PubKeyID, FinalizerRecencyStatus)>::new();
 
                     // ~current height
                     for round in &bft_state.rounds_data {
-                        let is_my_height_round = round.height == my_height;// && round.round == my_round;
+                        let is_my_height = round.height == bft_state.height;// && round.round == bft_state.round;
 
                         for (roster_i, member) in round.roster.iter().enumerate() {
                             use zcash_primitives::bft::TMSig;
-                            let votes = &round.msg_val_sigs[roster_i];
-                            let (has_prevote_sig, has_precommit_sig) = (votes[0].1 != TMSig::NIL, votes[1].1 != TMSig::NIL);
+                            use tenderlink::ConsensusCounts;
 
                             let st = if let Some(v) = finalizer_statuses.iter_mut().find(|(key, _st)| *key == member.pub_key) {
                                 v
@@ -1129,11 +1127,16 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                                 &mut finalizer_statuses[last_i]
                             };
 
-                            if has_prevote_sig | has_precommit_sig {
-                                if is_my_height_round {
-                                    st.1.voted_in_my_height_round = (has_prevote_sig, has_precommit_sig);
+                            let cs = ConsensusCounts::from(&(round.msg_val_sigs[roster_i], 1)); // simple (not weighted) counts
+                            if cs.anys > 0 {
+                                if is_my_height {
+                                    st.1.no_yes_votes_in_my_height[0][0] += cs.nil_prevotes;
+                                    st.1.no_yes_votes_in_my_height[0][1] += cs.yes_prevotes;
+                                    st.1.no_yes_votes_in_my_height[1][0] += cs.precommits.saturating_sub(cs.yes_precommits); // no explicit nil_precommits
+                                    st.1.no_yes_votes_in_my_height[1][1] += cs.yes_precommits;
+
+                                    st.1.highest_round_vote = st.1.highest_round_vote.max(round.round);
                                 }
-                                st.1.highest_round_vote = st.1.highest_round_vote.max(round.round);
                             }
 
                             if let Some(utc) = bft_key_address_map.last_packet_utcs.get(&member.pub_key) {
@@ -1149,8 +1152,15 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     let mut internal = tfl_handle.internal.lock().await;
                     internal.recency_status = TFLRecencyStatus {
                         now_utc,
-                        my_height,
-                        my_round,
+                        my_height: bft_state.height,
+                        my_round:  bft_state.round,
+                        my_step: match bft_state.step {
+                            tenderlink::TMStep::Propose => 0,
+                            tenderlink::TMStep::Prevote => 1,
+                            tenderlink::TMStep::Precommit => 2,
+                        },
+                        my_locked_round: bft_state.locked_value_round.1,
+                        my_valid_round:  bft_state.valid_value_round.1,
                         finalizer_statuses,
                     };
                 })

@@ -110,7 +110,7 @@ pub struct SortedRosterMember {
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
-enum TMStep {
+pub enum TMStep {
     Propose,
     Prevote,
     // ALT: extra sign step
