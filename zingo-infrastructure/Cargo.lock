@@ -5193,6 +5193,7 @@ dependencies = [
  "rocksdb",
  "semver",
  "serde",
+ "serde_with",
  "static_assertions",
  "tempfile",
  "tenderlink",

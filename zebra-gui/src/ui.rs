@@ -3103,7 +3103,7 @@ pub fn ui_right_pane(ui: &mut Context,
                         align: Center,
                         width:  fit!(),
                         height: fit!(),
-                        radius: ui.scale(16.0).dup4(),
+                        radius: ui.scale(4.0).dup4(),
                         ..Decl
                     }) {
                         if let _ = elem().decl(Decl {
@@ -3112,8 +3112,11 @@ pub fn ui_right_pane(ui: &mut Context,
                             height: fit!(),
                             ..Decl
                         }) {}
-                        ui.text("Finalizer Filters", TextDecl { h: ui.scale(24.0), colour: WHITE.mul(0.75), align: AlignX::Left, ..TextDecl });
-                        ui.text(ICON_DOWN_OPEN, TextDecl { font: Icons, h: ui.scale(14.0), colour: WHITE.mul(0.6), align: AlignX::Right, ..TextDecl });
+                        // NOTE(Giovanni): NEED THAT SPACING
+                        ui.text(" ", TextDecl { h: ui.scale(24.0), colour: WHITE.mul(0.75), align: AlignX::Right, ..TextDecl });
+                        ui.text(ICON_FOLDER_1, TextDecl { font: Icons, h: ui.scale(14.0), colour: WHITE.mul(0.6), align: AlignX::Left, ..TextDecl });
+                        ui.text(" Finalizer Filters", TextDecl { h: ui.scale(24.0), colour: WHITE.mul(0.75), align: AlignX::Right, ..TextDecl });
+                    
                     }
                     if ui.hovered(combo_id) {
                         set_tooltip_text!(data, "Click to expand.");
@@ -3121,7 +3124,6 @@ pub fn ui_right_pane(ui: &mut Context,
 
                     if ui.openable(data, combo_id, activated, false) {
                         let id = id("Matches Height Button");
-
 
                         let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, id, true, winit::window::CursorIcon::Pointer);
                         let radius = ui.scale(16.0);
@@ -3133,38 +3135,27 @@ pub fn ui_right_pane(ui: &mut Context,
                             colour,
                             padding,
                             child_gap,
-                            radius: radius.dup4(),
+                            radius: ui.scale(4.0).dup4(),
                             align: Center,
                             width:  fit!(ui.scale(128.0)),
                             height: fit!(radius * 2.0),
                             ..Decl
                         }) {
 
-                            // TODO: select a BFT node and check which finalizers voted in prevote/precommit then
-                            let text = if filters.filter_height {
-                                "Matches my height/round [ON]"
-                            } else {
-                                "Matches my height/round [OFF]"
-                            };
-                            ui.text(text, TextDecl { font: Mono, h: ui.scale(16.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
-
-                            if clicked{
-                                filters.filter_height = !filters.filter_height;
-                            }
+                            let text = if filters.filter_height {"Matches my height/round [ON]"} else {"Matches my height/round [OFF]"};
+                            ui.text(text, TextDecl {font: Mono, h: ui.scale(16.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
+                            if clicked{ filters.filter_height = !filters.filter_height; }
                         }
-
-                        let id_2 = ui::id("Finalizer Status Container");
-                        let id_3 = ui::id("Seconds since connected Textbox");
-
                         if let _ = elem().decl(Decl {
-                            id:id_2,
+                            id:ui::id("Finalizer Status Container"),
                             width: grow!(),
                             height: fit!(),
+                            radius: ui.scale(4.0).dup4(),
                             ..Decl
                         }) {
                             if let Ok (value) = ui.textbox(
                                 data,
-                                id_3,
+                                ui::id("Seconds since connected Textbox"),
                                 "Seconds since connected...",
                                 TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
                             ).trim().parse::<u32>(){
@@ -3176,13 +3167,17 @@ pub fn ui_right_pane(ui: &mut Context,
                             }
 
                         }
+                        
                     }
+
                 }
+            }
+            //@TODO(Giovanni): Maybe lock behind a key-input (hold to open the popup)...
+            if(ui.hovered(id("Finalizers Buttons"))){
+                #[cfg(debug_assertions)]  set_tooltip_text!(data, "last checked: {}, height: {}, round: {}", bft_status.now_utc, bft_status.my_height, bft_status.my_round);
             }
             ui.text("Your Finalizer Identity", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
             ui.text(frame_strf!(data, "[{}..{}]", &recv_address[0..8], &recv_address[recv_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-            // TODO: make presentable
-            #[cfg(debug_assertions)] ui.text(frame_strf!(data, "last checked: {}, height: {}, round: {}", bft_status.now_utc, bft_status.my_height, bft_status.my_round), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Left, ..TextDecl });
 
             if button_ex(ui, "Copy Identity", true, true) {
                 ui.input().send_to_clipboard(&recv_address);
