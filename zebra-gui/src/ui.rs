@@ -46,6 +46,8 @@ pub struct UiData {
     pub tooltip_text: String,
     pub tooltip_wrap: Wrap,
     pub jump_target_pos: bool,
+
+    pub hovered_finalizer_pk: [u8; 32],
 }
 
 
@@ -1281,8 +1283,9 @@ fn show_finalizer_popup(
         }
     }
 }
-pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wallet::TFLRecencyStatus, finalizers: &[WalletRosterMember], total_val: u64, height:u32, seconds_since_connected:u64, filters:&FinalizerFilters, id:ui::Id, is_real_finalizers: bool) {
 
+pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wallet::TFLRecencyStatus, finalizers: &[WalletRosterMember], total_val: u64, height:u32, seconds_since_connected:u64, filters:&FinalizerFilters, id:ui::Id, is_real_finalizers: bool) {
+    let mut rem_hovered = false;
     let finalizer_pill_rad = ui.scale(8.0);
     if finalizers.len() > 0 && total_val > 0 && let _ = elem().decl(Decl {
         id,
@@ -1299,9 +1302,11 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wal
         for (i, finalizer) in finalizers.iter().enumerate() {
             seen_voting_power += finalizer.voting_power;
             let pct = finalizer.voting_power as f32 / total_val as f32;
+            let is_hovered_finalizer = is_real_finalizers && data.hovered_finalizer_pk == finalizer.pub_key;
 
             if pct <= 0.01 {
                 rem += finalizer.voting_power;
+                rem_hovered |= is_hovered_finalizer;
                 continue;
             }
             let is_online = if is_real_finalizers {
@@ -1310,9 +1315,7 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wal
                 i == 0
             };
 
-
-            if let el = elem().decl(Decl {
-                id: id_index("finalizer bar", i as u32),
+            let final_decl = Decl {
                 colour: if is_real_finalizers {
                     colour_from_hash(&finalizer.pub_key, is_online)
                 } else {
@@ -1326,27 +1329,55 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wal
                     (r, l, r, l) // TODO: order??
                 },
                 align: Center,
-                width:  Sizing::Percent(pct),
                 height: grow!(),
                 ..Decl
+            };
+
+            if let el = elem().decl(Decl {
+                id: id_index("finalizer bar", i as u32),
+                colour: if is_hovered_finalizer {
+                    WHITE
+                } else {
+                    final_decl.colour
+                },
+                width:  Sizing::Percent(pct),
+                padding: ui.scale(2.0).dup4(),
+                ..final_decl
             }) {
+                if is_hovered_finalizer {
+                    elem_bgn();
+                    decl(Decl {
+                        id: id_index("finalizer bar inner", final_decl.id.id),
+                        radius: (
+                            0.0_f32.max(final_decl.radius.0 - ui.scale(1.0)),
+                            0.0_f32.max(final_decl.radius.1 - ui.scale(1.0)),
+                            0.0_f32.max(final_decl.radius.2 - ui.scale(1.0)),
+                            0.0_f32.max(final_decl.radius.3 - ui.scale(1.0)),
+                        ),
+                        width: grow!(),
+                        ..final_decl
+                    });
+                }
+
                 let icon = [ICON_ATTENTION_1, ICON_WIFI][is_online as usize];
-                let online_str = ["Offline ", " Online"][is_online as usize];
                 let text_col = [WHITE.mul(0.5), WHITE][is_online as usize];
 
-                let text_decl = TextDecl { h: ui.scale(16.0), font: Mono, colour: text_col, align: AlignX::Left, ..TextDecl };
+                let text_decl = TextDecl { h: ui.scale(16.0), /*font: Mono,*/ wrap: Wrap::None, colour: text_col, align: AlignX::Left, ..TextDecl };
                 let icon_decl = TextDecl { font: Icons, ..text_decl };
 
                 if pct > 0.05 { // TODO: account for scaling
                     ui.text(icon, icon_decl);
 
                     if ! is_real_finalizers {
-                        ui.text(" ", text_decl); // TODO: proper padding
-                        ui.text(online_str, text_decl);
+                        ui.text([" Offline ", " Online"][is_online as usize], text_decl);
                     }
                 }
 
                 if ui.hovered(el.decl.id)  {
+                    if is_real_finalizers {
+                        data.hovered_finalizer_pk = finalizer.pub_key;
+                    }
+
                     let online_str = ["OFFLINE", "ONLINE"][is_online as usize];
                     if is_real_finalizers{
                         set_tooltip_text!(data, "{}  {}  {} cTAZ    {:.2}%", display_str(&chunkify(&finalizer.pub_key)), online_str, str_from_ctaz(finalizer.voting_power), 100.0*pct);
@@ -1355,6 +1386,10 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wal
                     }
                     data.tooltip_wrap = Wrap::None;
                 }
+
+                if is_hovered_finalizer {
+                    elem_end();
+                }
             }
 
             done_once = true;
@@ -1362,22 +1397,45 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wal
 
         if rem != 0 {
             let pct = rem as f32 / total_val as f32;
-            if let el = elem().decl(Decl {
-                id: id_index("final bar", !0u32),
-                colour: (0x40, 0x40, 0x40, 0xff),
-                radius: {
+            if let _ = elem() {
+                let id = id_index("final bar", !0u32);
+                let hovered = ui.hovered(id);
+
+                let radius = {
                     let l = if rem == total_val { finalizer_pill_rad } else { 0.0 };
                     let r = finalizer_pill_rad;
                     (r, l, r, l) // TODO: order??
-                },
-                align: Left,
-                width:  Sizing::Percent(pct),
-                height: grow!(),
-                ..Decl
-            }) {
-                if ui.hovered(el.decl.id) {
+                };
+
+                let rem_grey = (0x40, 0x40, 0x40, 0xff);
+                decl(Decl {
+                    id,
+                    colour: if hovered || rem_hovered { WHITE } else { rem_grey },
+                    radius,
+                    align: Left,
+                    padding: ui.scale(2.0).dup4(),
+                    width:  Sizing::Percent(pct),
+                    height: grow!(),
+                    ..Decl
+                });
+
+                if hovered {
                     set_tooltip_text!(data, "(Other)    {} cTAZ    {:.2}%", str_from_ctaz(rem), 100.0*pct);
                 }
+
+                let _ = elem().decl(Decl {
+                    id: id_index("finalizer bar inner", id.id),
+                    colour: rem_grey,
+                    radius: (
+                        0.0_f32.max(radius.0 - ui.scale(1.0)),
+                        0.0_f32.max(radius.1 - ui.scale(1.0)),
+                        0.0_f32.max(radius.2 - ui.scale(1.0)),
+                        0.0_f32.max(radius.3 - ui.scale(1.0)),
+                    ),
+                    width: grow!(),
+                    height: grow!(),
+                    ..Decl
+                });
             }
         }
     }
@@ -2342,9 +2400,10 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 total_bonded_to_finalizer += staked_roster_bonded[i].2;
                                             }
 
+                                            let mut is_hovered = data.hovered_finalizer_pk == finalizer;
                                             let label = frame_strf!(data, "{}", display_str(&chunkify(&finalizer)));
-
                                             let id = id_index(label, index);
+                                            is_hovered |= ui.hovered(id);
 
                                             let colour = BUTTON_GREY.mul(0.6);
 
@@ -2380,7 +2439,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 // ui.text("Staked to:", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
                                                 let h = ui.scale(18.0);
 
-                                                let _ = elem().decl(Decl { width: fixed!(h), height: fixed!(h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&finalizer, is_online), ..Decl });
+                                                ui_colour_chip(ui, h, colour_from_hash(&finalizer, is_online), is_hovered);
 
                                                 ui.text(label, TextDecl { colour: text_colour, h, align: AlignX::Left, ..TextDecl });
                                                 let _ = elem().decl(Decl { width: grow!(), ..Decl });
@@ -2389,6 +2448,9 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 ui.text(frame_strf!(data, "{} cTAZ ({:.2}%)", str_from_ctaz(total_bonded_to_finalizer), pct), TextDecl { font: Mono, colour, h: ui.scale(18.0), align: AlignX::Right, ..TextDecl });
                                             }
 
+                                            if is_hovered {
+                                                data.hovered_finalizer_pk = finalizer;
+                                            }
                                             open_finalizer = ui.openable(data, id, activated, false);
                                         }
 
@@ -3068,6 +3130,18 @@ pub fn ui_left_pane(ui: &mut Context,
     ui.nav_skip = false;
 }
 
+pub fn ui_colour_chip(ui: &mut Context, h: f32, colour: (u8, u8, u8, u8), is_hovered: bool) {
+    let chip_decl = Decl { width: fixed!(h), height: fixed!(h), radius: ui.scale(4.0).dup4(), padding: ui.scale(2.0).dup4(), colour, ..Decl };
+    if is_hovered {
+        if let _ = elem().decl(Decl { colour: WHITE, ..chip_decl }) {
+            let _ = elem().decl(Decl { width: grow!(), height: grow!(), radius: ui.scale(3.0).dup4(), ..chip_decl });
+        };
+    } else {
+        let _ = elem().decl(chip_decl);
+    }
+
+}
+
 pub fn ui_right_pane(ui: &mut Context,
                  wallet_state: Arc<Mutex<WalletState>>,
                  viz: &mut VizState,
@@ -3381,9 +3455,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
                         // finalizer colour token
                         let info_h = ui.scale(18.0);
-
-
-                        let _ = elem().decl(Decl { width: fixed!(info_h), height: fixed!(info_h), radius: ui.scale(4.0).dup4(), colour: colour_from_hash(&member.pub_key, is_online), ..Decl });
+                        ui_colour_chip(ui, info_h, colour_from_hash(&member.pub_key, is_online), data.hovered_finalizer_pk == member.pub_key);
 
                         // info
                         if let _ = elem().decl(Decl {
@@ -3417,6 +3489,8 @@ pub fn ui_right_pane(ui: &mut Context,
                     }
 
                     if ui.hovered(roster_member_id) {
+                        data.hovered_finalizer_pk = member.pub_key;
+
                         let pct = (member.voting_power as f32 / total_stake as f32) * 100.0;
                         set_tooltip_text!(data, "{:.2}% of stake", pct);
 
@@ -4406,6 +4480,8 @@ pub fn ui_update(ui: &mut Context, data: &mut UiData, viz: &mut VizState, wallet
     if ui.tx_loading_animation_timer >= 1.0 {
         ui.tx_loading_animation_timer = 0.0;
     }
+
+    data.hovered_finalizer_pk = [0xff;32];
 
     let dummy_input = InputCtx {
         this_mouse_pos: ui.input().this_mouse_pos,
