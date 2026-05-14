@@ -1065,12 +1065,22 @@ impl TMState {
     }
 }
 
-// TODO: can we megastruct these and collapse the codepaths?
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
     pub latest_status_request_height: Option<u64>,
     pub latest_status: Option<PacketStatus>,
     pub index_counter: u64, // for some peer randomness
+    pub stp_address: STPAddress,      // for convenience
+    pub stp_handshake_hash: [u8; 64], // for convenience
+}
+impl Default for Peer {
+    fn default() -> Self { Self {
+        latest_status_request_height: Default::default(),
+        latest_status:                Default::default(),
+        index_counter:                Default::default(),
+        stp_address:                  Default::default(),
+        stp_handshake_hash:           [0u8; 64],
+    } }
 }
 impl Peer {
     fn info(&self, connected: bool, bft_key: PubKeyID) -> PeerInfo {
@@ -1812,7 +1822,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         messages_to_send = Vec::new();
 
         // Ensure a Peer entry exists for every active connection
-        for (stp_address, handshake_hash) in &current_connections {
+        for &(ref stp_address, handshake_hash) in &current_connections {
             let mut new = false;
 
             let key = stp_address.connection_key();
@@ -1823,15 +1833,19 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 continue;
             }
 
+            peer.stp_handshake_hash = handshake_hash;
+            peer.stp_address = stp_address.clone();
+            let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO STP Handshake Hash").finalize().into());
+            assert!(peer.stp_handshake_hash.len() == 64);
+            let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
+
+
             let pk_bytes = my_root_public_bft_key.as_ref();
             assert!(pk_bytes.len() == 32);
-            tracing::error!("ID send: pk: {}", PubKeyID(pk_bytes.try_into().expect("already asserted length of 32")));
+            let pk = PubKeyID(pk_bytes.try_into().expect("already asserted length of 32"));
+            let sig = TMSig(my_root_private_key.sign(&keyed_hash_of_stp_handshake_hash[..]).to_bytes());
 
-            let hash_key_for_handshake_hash = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO Handshake Hash").finalize().into());
-            assert!(handshake_hash.len() == 64);
-            let keyed_hash_of_handshake_hash = hash_key_for_handshake_hash.hash(&handshake_hash[..]);
-            let sig = my_root_private_key.sign(&keyed_hash_of_handshake_hash[..]).to_bytes();
-            tracing::error!("ID send: sig: {:?}", sig);
+            let packet = PacketIdHello { pk, sig };
 
             let mut o = 0;
 
@@ -1843,22 +1857,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                &mut send_buf1[o..],
                                                peer.index_counter);
             peer.index_counter += 1;
-            o += pk_bytes.write_to(&mut send_buf1[o..]);
-            o += sig     .write_to(&mut send_buf1[o..]);
-
-
-            {
-                let mut msg = &send_buf1[..o];
-                let (header, status, read_o) = read_header_and_maybe_status(&msg[..]).expect("nocheckin deleteme");
-                msg = &msg[read_o..];
-                let pk      = PubKeyID(<[u8; 32]>::read_from(&mut msg).expect("nocheckin deleteme"));
-                tracing::error!("ID recv: pk: {}", pk);
-                let sig     = TMSig(<[u8; 64]>::read_from(&mut msg).expect("nocheckin deleteme"));
-                tracing::error!("ID recv: sig: {:?}", sig.0);
-                match sig.verify(pk, &keyed_hash_of_handshake_hash[..]) { Ok(()) => {}, Err((err, str)) => {
-                    panic!("Round-trip handshake hash signature failed");
-                } };
-            }
+            o += packet.write_to(&mut send_buf1[o..]);
 
             print_packet_tag_send(header);
             send_stp_msg(&mut messages_to_send, &key, &send_buf1[..o], &mut net_stats);
@@ -1876,10 +1875,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         // Remove peer entries for dropped connections
         peers.retain(|key, _| current_connections.iter().position(|(x, _)| ConnectionKey::from(x) == *key).is_some());
 
+        let mut connection_keys_to_disconnect = Vec::new();
 
         // READ
         while messages_received.len() > 0 {
-            let (mut connection_key, mut peer, mut msg) = {
+            let (connection_key, mut peer, msg) = {
                 let (key, packet, _) = messages_received.remove(0);
                 let Some(peer) = peers.get_mut(&key)
                 else {
@@ -1947,9 +1947,28 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 }
             }
 
+            else if packet_type == PACKET_TYPE_ID_HELLO {
+
+                let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO STP Handshake Hash").finalize().into());
+                assert!(peer.stp_handshake_hash.len() == 64);
+                let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
+
+                if let Some(packet) = PacketIdHello::read_from(&mut &msg[read_o..]) {
+                    match packet.sig.verify(packet.pk, &keyed_hash_of_stp_handshake_hash[..]) { Ok(()) => {}, Err((err, str)) => {
+                        tracing::warn!("Handshake hash signature failed -- peer failed ID verification");
+                        connection_keys_to_disconnect.push(connection_key);
+                    } };
+
+                    bft_key_address_map.insert(&packet.pk, &peer.stp_address);
+                }
+            }
+
             else {
             }
         }
+
+        current_connections.retain(|(address, _)| !connection_keys_to_disconnect.contains(&address.connection_key()));
+
     }
 }
 
@@ -2148,6 +2167,28 @@ impl PacketVotes {
             packet.votes[i].sig.0    = SliceRead::read_from(buf)?;
         }
         Some(packet)
+    }
+}
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PacketIdHello {
+    pk:  PubKeyID,
+    sig: TMSig,
+}
+impl SliceWrite for PacketIdHello {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.pk.0 .write_to(&mut buf[o..]);
+        o += self.sig.0.write_to(&mut buf[o..]);
+        o
+    }
+}
+impl SliceRead for PacketIdHello {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(Self {
+            pk: PubKeyID(SliceRead::read_from(buf)?),
+            sig:   TMSig(SliceRead::read_from(buf)?),
+        })
     }
 }
 
