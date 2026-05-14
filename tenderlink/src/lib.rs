@@ -22,6 +22,38 @@ const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
 const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
 
+#[cfg(debug_assertions)] pub fn dbg_break() {
+    #[cfg(target_arch = "x86_64")] #[allow(unsafe_code)] unsafe { std::arch::asm!("int 3"); }
+    // @Todo: AArch64 debugbreak.
+}
+
+#[cfg(debug_assertions)] #[track_caller] pub fn dbg_panic_internal(msg: std::fmt::Arguments<'_>) -> ! {
+    dbg_break();
+    unsafe { std::env::set_var("RUST_BACKTRACE", "full"); }
+    panic!("{msg}");
+}
+#[macro_export] macro_rules! dbg_panic {
+    ()            => { #[cfg(debug_assertions)] dbg_panic_internal(format_args!("explicit panic")); };
+    ($($arg:tt)*) => { #[cfg(debug_assertions)] dbg_panic_internal(format_args!($($arg)*)); };
+}
+
+pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
+    #[cfg(debug_assertions)] {
+        if t.is_none() { dbg_break(); }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        return Some(t.unwrap());
+    }
+
+    t
+}
+pub fn verify<T>(t: Option<T>) -> T {
+    #[cfg(debug_assertions)] if t.is_none() { dbg_break(); }
+
+    t.unwrap()
+}
+
+
 const ANSI_GRY: &'static str = "\x1b[90m";
 const ANSI_RED: &'static str = "\x1b[91m";
 const ANSI_GRN: &'static str = "\x1b[92m";
@@ -1070,15 +1102,16 @@ pub struct Peer {
     pub latest_status_request_height: Option<u64>,
     pub latest_status: Option<PacketStatus>,
     pub index_counter: u64, // for some peer randomness
-    pub bft_pk: PubKeyID,             // for convenience
-    pub stp_address: STPAddress,      // for convenience
-    pub stp_handshake_hash: [u8; 64], // for convenience
+    pub bft_pk: PubKeyID,             // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
+    pub stp_address: STPAddress,      // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
+    pub stp_handshake_hash: [u8; 64], // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
 }
 impl Default for Peer {
     fn default() -> Self { Self {
         latest_status_request_height: Default::default(),
         latest_status:                Default::default(),
         index_counter:                Default::default(),
+        bft_pk:                       Default::default(),
         stp_address:                  Default::default(),
         stp_handshake_hash:           [0u8; 64],
     } }
@@ -1547,7 +1580,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                     // Make sure to always sent at least one status.
                     {
-                        let header = PacketHeader::new_(0);
+                        let header = PacketHeader::new::<PACKET_TYPE_EMPTY>();
                         let mut o = 0;
                         o += write_header_and_maybe_status(header, true,
                                                            bft_state,
@@ -1837,17 +1870,22 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
             peer.stp_handshake_hash = handshake_hash;
             peer.stp_address = stp_address.clone();
-            let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO STP Handshake Hash").finalize().into());
-            assert!(peer.stp_handshake_hash.len() == 64);
-            let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
 
+            let verification = { // almost @Duplicate
+                let pk_bytes = my_root_public_bft_key.as_ref();
+                assert!(pk_bytes.len() == 32);
+                let pk = PubKeyID(pk_bytes.try_into().expect("already asserted length of 32"));
+                let sig = {
+                    // @Duplicate
+                    let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO STP Handshake Hash").finalize().into());
+                    assert!(peer.stp_handshake_hash.len() == 64);
+                    let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
 
-            let pk_bytes = my_root_public_bft_key.as_ref();
-            assert!(pk_bytes.len() == 32);
-            let pk = PubKeyID(pk_bytes.try_into().expect("already asserted length of 32"));
-            let sig = TMSig(my_root_private_key.sign(&keyed_hash_of_stp_handshake_hash[..]).to_bytes());
+                    TMSig(my_root_private_key.sign(&keyed_hash_of_stp_handshake_hash[..]).to_bytes())
+                };
 
-            let verification = PacketIdVerification { pk, sig };
+                PacketIdVerification { pk, sig }
+            };
 
             let mut o = 0;
 
@@ -1951,19 +1989,89 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
             else if packet_type == PACKET_TYPE_ID_HELLO {
 
-                let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO STP Handshake Hash").finalize().into());
-                assert!(peer.stp_handshake_hash.len() == 64);
-                let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
+                let Some(packet) = PacketIdVerification::read_from(&mut &msg[read_o..]) else {
+                    tracing::warn!("Peer failed ID verification: Failed to read ID Hello packet");
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                };
+                {
+                    // @Duplicate
+                    let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO STP Handshake Hash").finalize().into());
+                    assert!(peer.stp_handshake_hash.len() == 64);
+                    let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
 
-                if let Some(packet) = PacketIdVerification::read_from(&mut &msg[read_o..]) {
                     match packet.sig.verify(packet.pk, &keyed_hash_of_stp_handshake_hash[..]) { Ok(()) => {}, Err((err, str)) => {
-                        tracing::warn!("Handshake hash signature failed -- peer failed ID verification");
+                        tracing::warn!("Peer failed ID verification: Handshake hash signature invalid");
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     } };
-
-                    bft_key_address_map.insert(&packet.pk, &peer.stp_address);
                 }
+
+                bft_key_address_map.insert(&packet.pk, &peer.stp_address);
+                peer.bft_pk = packet.pk;
+
+                let verification = { // almost @Duplicate
+                    let pk_bytes = my_root_public_bft_key.as_ref();
+                    assert!(pk_bytes.len() == 32);
+                    let pk = PubKeyID(pk_bytes.try_into().expect("already asserted length of 32"));
+                    let sig = {
+                        let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO_ACK STP Handshake Hash").finalize().into());
+                        assert!(peer.stp_handshake_hash.len() == 64);
+                        let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
+
+                        TMSig(my_root_private_key.sign(&keyed_hash_of_stp_handshake_hash[..]).to_bytes())
+                    };
+
+                    PacketIdVerification { pk, sig }
+                };
+
+                let attestation = { // @Duplicate
+                    let addr = peer.stp_address.clone();
+                    let expiry = {
+                        let seconds_per_minute = 60;
+                        let minutes_per_hour   = 60;
+                        let hours_per_day      = 24;
+                        let days_expiry        =  1;
+
+                        let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
+
+                        now + (seconds_per_minute * minutes_per_hour * hours_per_day * days_expiry)
+                    };
+                    let sig = {
+                        let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO_ACK Attestation").finalize().into());
+                        assert!(peer.stp_handshake_hash.len() == 64);
+
+                        let mut hasher = hash_key_for_attestation.hasher();
+                        hasher.update(&expiry.to_le_bytes()[..]);
+                        hasher.update(&peer.stp_address.ip.octets()[..]);
+                        hasher.update(&peer.stp_address.port.to_le_bytes()[..]);
+                        hasher.update(&peer.stp_address.magic1.to_le_bytes()[..]);
+                        hasher.update(&peer.stp_address.key[..]);
+                        hasher.update(&peer.bft_pk.0[..]);
+                        hasher.update(&my_root_public_bft_key.as_ref()[..]);
+                        let keyed_hash_of_attestation = hasher.finalize();
+
+                        TMSig(my_root_private_key.sign(&keyed_hash_of_attestation.as_bytes()[..]).to_bytes())
+                    };
+
+                    PacketIdAttestation { addr, expiry, sig }
+                };
+
+                let mut o = 0;
+
+                // send hello to start verifying identity
+                let header = PacketHeader::new::<PACKET_TYPE_ID_HELLO_ACK>();
+                o += write_header_and_maybe_status(header, true,
+                                                   &bft_state,
+                                                   &roster,
+                                                   &mut send_buf1[o..],
+                                                   peer.index_counter);
+                peer.index_counter += 1;
+                o += verification.write_to(&mut send_buf1[o..]);
+                o += attestation .write_to(&mut send_buf1[o..]);
+
+                print_packet_tag_send(header);
+                send_stp_msg(&mut messages_to_send, &connection_key, &send_buf1[..o], &mut net_stats);
             }
 
             else {
@@ -1984,17 +2092,19 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 // ID verification - BFT pk + BFT sig of noise handshake hash
 // ID attestation  - my view of your ip:port + BFT sig of {your ip,your port,our magic1,your key,your BFT pk, my BFT pk}
 
+const PACKET_TYPE_EMPTY:            u8 = 0;
+
 // ID hello         - ID verification
 // ID hello ack     - ID verification + ID attestation
 // ID hello ack ack -                   ID attestation
 
-const PACKET_TYPE_ID_HELLO:         u8 = 0;
-const PACKET_TYPE_ID_HELLO_ACK:     u8 = 1;
-const PACKET_TYPE_ID_HELLO_ACK_ACK: u8 = 2;
+const PACKET_TYPE_ID_HELLO:         u8 = 1;
+const PACKET_TYPE_ID_HELLO_ACK:     u8 = 2;
+const PACKET_TYPE_ID_HELLO_ACK_ACK: u8 = 3;
 
-const PACKET_TYPE_PEER_ADDRESS_LIST: u8 = 3;
-const PACKET_TYPE_WANT_HOLE_PUNCH:   u8 = 4;
-const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 5;
+const PACKET_TYPE_PEER_ATTESTATION: u8 = 4;
+const PACKET_TYPE_WANT_HOLE_PUNCH:  u8 = 5;
+const PACKET_TYPE_TRY_HOLE_PUNCH:   u8 = 6;
 
 // consensus
 const PACKET_TYPE_PROPOSAL_CHUNK:       u8 =  7;
@@ -2016,13 +2126,17 @@ const PACKET_TAG_MASK:                  u8 = ((1 << PACKET_TAG_BITS as u64) - 1)
 
 
 const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
-    let mut names = [["<MISSING>"; 2]; PACKET_TYPE_COUNT as usize];
+    let mut names = [["<MISSING>", "STATUS+<MISSING>"]; PACKET_TYPE_COUNT as usize];
+    names[PACKET_TYPE_EMPTY                as usize] = ["EMPTY",                    "STATUS+EMPTY"];
+
     names[PACKET_TYPE_ID_HELLO             as usize] = ["ID_HELLO",                 "STATUS+ID_HELLO"];
     names[PACKET_TYPE_ID_HELLO_ACK         as usize] = ["ID_HELLO_ACK",             "STATUS+ID_HELLO_ACK"];
     names[PACKET_TYPE_ID_HELLO_ACK_ACK     as usize] = ["ID_HELLO_ACK_ACK",         "STATUS+ID_HELLO_ACK_ACK"];
-    names[PACKET_TYPE_PEER_ADDRESS_LIST    as usize] = ["PEER_ADDRESS_LIST",        "STATUS+PEER_ADDRESS_LIST"];
+
+    names[PACKET_TYPE_PEER_ATTESTATION     as usize] = ["PEER_ATTESTATION",         "STATUS+PEER_ATTESTATION"];
     names[PACKET_TYPE_WANT_HOLE_PUNCH      as usize] = ["WANT_HOLE_PUNCH",          "STATUS+WANT_HOLE_PUNCH"];
     names[PACKET_TYPE_TRY_HOLE_PUNCH       as usize] = ["TRY_HOLE_PUNCH",           "STATUS+TRY_HOLE_PUNCH"];
+
     names[PACKET_TYPE_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",           "STATUS+PROPOSAL_CHUNK"];
     names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES",     "STATUS+PRECOMMIT_SIGNATURES"];
@@ -2214,14 +2328,16 @@ impl SliceRead for PacketIdVerification {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct PacketIdAttestation {
-    pub addr: STPAddress,
-    pub sig:  TMSig,
+    pub addr:   STPAddress,
+    pub expiry: u64, // Unix timestamp for when this attestation expires
+    pub sig:    TMSig,
 }
 impl SliceWrite for PacketIdAttestation {
     fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = 0;
-        o += self.addr .write_to(&mut buf[o..]);
-        o += self.sig.0.write_to(&mut buf[o..]);
+        o += self.addr  .write_to(&mut buf[o..]);
+        o += self.expiry.write_to(&mut buf[o..]);
+        o += self.sig.0 .write_to(&mut buf[o..]);
         o
     }
 }
@@ -2229,6 +2345,7 @@ impl SliceRead for PacketIdAttestation {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
         Some(Self {
             addr:      SliceRead::read_from(buf)?,
+            expiry:    SliceRead::read_from(buf)?,
             sig: TMSig(SliceRead::read_from(buf)?),
         })
     }

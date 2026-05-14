@@ -12,6 +12,7 @@ use tenderlink::bandwidth_test::*;
 use tenderlink::native_sockets::*;
 use tenderlink::parse_to_ipv6_bytes;
 use tenderlink::{SliceWrite, SliceRead};
+use tenderlink::{dbg_panic, dbg_panic_internal, dbg_verify};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum BlockEvent {
@@ -79,38 +80,6 @@ const PACKET_STATUS_MAX_HASHES: usize = 400; // @Lazy: gives room for 300 hashes
 const PACKET_STATUS_MAX_SIZE:   usize = ((PACKET_STATUS_MAX_HASHES * 32 + JUMBO_FRAG_SIZE - 1) / JUMBO_FRAG_SIZE) * JUMBO_FRAG_SIZE; // @Cleanup @Lazy.
 
 const DOWNLOAD_UNMODIFIED_TIMEOUT_DUR: std::time::Duration = std::time::Duration::from_secs(8);
-
-#[cfg(debug_assertions)] fn dbg_break() {
-    #[cfg(target_arch = "x86_64")] #[allow(unsafe_code)] unsafe { std::arch::asm!("int 3"); }
-    // @Todo: AArch64 debugbreak.
-}
-
-#[cfg(debug_assertions)] #[track_caller] fn dbg_panic_internal(msg: std::fmt::Arguments<'_>) -> ! {
-    dbg_break();
-    std::env::set_var("RUST_BACKTRACE", "full");
-    panic!("{msg}");
-}
-macro_rules! dbg_panic {
-    ()            => { #[cfg(debug_assertions)] dbg_panic_internal(format_args!("explicit panic")); };
-    ($($arg:tt)*) => { #[cfg(debug_assertions)] dbg_panic_internal(format_args!($($arg)*)); };
-}
-
-pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
-    #[cfg(debug_assertions)] {
-        if t.is_none() { dbg_break(); }
-
-        #[cfg(not(target_arch = "x86_64"))]
-        return Some(t.unwrap());
-    }
-
-    t
-}
-pub fn verify<T>(t: Option<T>) -> T {
-    #[cfg(debug_assertions)] if t.is_none() { dbg_break(); }
-
-    t.unwrap()
-}
-
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PacketHashTreeHdr {
