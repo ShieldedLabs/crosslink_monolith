@@ -290,9 +290,8 @@ impl VizState {
         let Some(cy) = self.camera_y_for_bft_hash(bft.block.this_hash) else {
             return false;
         };
-        self.camera_x = 5.0;
+        // self.camera_x = 5.0;
         self.camera_y = cy;
-        self.zoom = 2.0;
         true
     }
 
@@ -826,7 +825,7 @@ fn apply_scrub_bft_height(viz: &mut VizState, mut h: u64) {
 fn apply_scrub_pow_height(viz: &mut VizState, h: f32, h_min: u64, h_max: u64) {
     let h_next = h.clamp(h_min as f32, h_max as f32);
     viz.camera_y = -10.0 * h_next;
-    viz.camera_x = 0.0;
+    // viz.camera_x = 0.0;
 }
 
 fn minimap_wheel_delta_height(dy: f32, strip_h: f32, span_h: f32) -> f32 {
