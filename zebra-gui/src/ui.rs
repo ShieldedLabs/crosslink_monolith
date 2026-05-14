@@ -1133,22 +1133,13 @@ fn colour_from_hash(hash: &[u8; 32], is_online:bool) -> (u8, u8, u8, u8) {
     let val = hasher.finish();
 
     let h = (val) as u8;
-    let mut s = (val >> 8) as u8;
-    let mut v = (val >> 16) as u8;
-
-    s /= 4;
-    v /= 4;
-
-
+    let mut s = 60;
+    let mut v = 80;
     if is_online {
-        s += 64;
-        v += 64;
+        s = 120;
+        v = 170;
     }
-    else {
-        // TODO(Giovanni): flashing effect
-        s += 48;
-        v += 24;
-    }
+    // TODO(Giovanni): flashing effect
 
     (h, s, v, 0xff).rgba()
 }
@@ -3116,7 +3107,7 @@ pub fn ui_right_pane(ui: &mut Context,
                         ui.text(" ", TextDecl { h: ui.scale(24.0), colour: WHITE.mul(0.75), align: AlignX::Right, ..TextDecl });
                         ui.text(ICON_FOLDER_1, TextDecl { font: Icons, h: ui.scale(14.0), colour: WHITE.mul(0.6), align: AlignX::Left, ..TextDecl });
                         ui.text(" Finalizer Filters", TextDecl { h: ui.scale(24.0), colour: WHITE.mul(0.75), align: AlignX::Right, ..TextDecl });
-                    
+
                     }
                     if ui.hovered(combo_id) {
                         set_tooltip_text!(data, "Click to expand.");
@@ -3153,23 +3144,21 @@ pub fn ui_right_pane(ui: &mut Context,
                             radius: ui.scale(4.0).dup4(),
                             ..Decl
                         }) {
-                            if let Ok (value) = ui.textbox(
+                            let secs_string = ui.textbox(
                                 data,
                                 ui::id("Seconds since connected Textbox"),
                                 "Seconds since connected...",
                                 TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
-                            ).trim().parse::<u32>(){
+                            );
+                            let secs_str = secs_string.trim();
+                            if let Ok (value) = secs_str.parse::<u32>(){
                                 filters.filter_seconds_since_connected = value;
                                 //println!("{:?}", state.finalizer_seconds_since_connected);
+                            } else if secs_str.len() == 0 {
+                                filters.filter_seconds_since_connected = 0;
                             }
-                            else{
-
-                            }
-
                         }
-                        
                     }
-
                 }
             }
             //@TODO(Giovanni): Maybe lock behind a key-input (hold to open the popup)...
