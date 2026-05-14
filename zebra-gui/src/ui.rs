@@ -3691,13 +3691,13 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     } else {
                         0.0
                     };
-                    let (health_label, health_colour, summary) = if peer_count == 0 {
-                        ("Disconnected", (0xbf, 0x36, 0x39, 0xff), "No peers connected.")
-                    } else if wallets_tip_h > 0 && behind > 3 {
-                        ("Syncing", (0xa8, 0x72, 0x13, 0xff), "Connected and catching up.")
-                    } else {
-                        ("Healthy", (0x2d, 0x8a, 0x57, 0xff), "Connected and near chain tip.")
-                    };
+                    // let (health_label, health_colour, summary) = if peer_count == 0 {
+                    //     ("Disconnected", (0xbf, 0x36, 0x39, 0xff), "No peers connected.")
+                    // } else if wallets_tip_h > 0 && behind > 3 {
+                    //     ("Syncing", (0xa8, 0x72, 0x13, 0xff), "Connected and catching up.")
+                    // } else {
+                    //     ("Healthy", (0x2d, 0x8a, 0x57, 0xff), "Connected and near chain tip.")
+                    // };
 
                     if let _ = elem().decl(Decl {
                         direction: TopToBottom,
@@ -3722,19 +3722,19 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             height: fit!(),
                             ..Decl
                         }) {
-                            if let _ = elem().decl(Decl {
-                                colour: health_colour,
-                                radius: ui.scale(8.0).dup4(),
-                                width: fixed!(ui.scale(16.0)),
-                                height: fixed!(ui.scale(16.0)),
-                                ..Decl
-                            }) {}
-                            ui.text("Network", TextDecl { h: ui.scale(16.0), colour: WHITE.mul(0.75), align: AlignX::Left, ..TextDecl });
-                            ui.text(health_label, TextDecl { h: ui.scale(16.0), colour: text_colour, align: AlignX::Left, ..TextDecl });
+                            // if let _ = elem().decl(Decl {
+                            //     colour: health_colour,
+                            //     radius: ui.scale(8.0).dup4(),
+                            //     width: fixed!(ui.scale(16.0)),
+                            //     height: fixed!(ui.scale(16.0)),
+                            //     ..Decl
+                            // }) {}
+                            ui.text("Network Info", TextDecl { h: ui.scale(16.0), colour: WHITE.mul(0.75), align: AlignX::Left, ..TextDecl });
+                            // ui.text(health_label, TextDecl { h: ui.scale(16.0), colour: text_colour, align: AlignX::Left, ..TextDecl });
                             ui.text(ICON_DOWN_OPEN, TextDecl { font: Icons, h: ui.scale(14.0), colour: WHITE.mul(0.6), align: AlignX::Right, ..TextDecl });
                         }
                         if ui.hovered(combo_id) {
-                            set_tooltip_text!(data, "{} Click to expand.", summary);
+                            set_tooltip_text!(data, /*"{summary} "*/"Click to expand.");
                         }
 
                         if ui.openable(data, combo_id, activated, false) {
@@ -3761,36 +3761,36 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                         ui.text(frame_strf!(data, "{}", value), TextDecl { font: Mono, h: ui.scale(15.0), align: AlignX::Right, ..TextDecl });
                                     }
                                 };
-                                if let _ = elem().decl(Decl {
-                                    colour: BUTTON_GREY.mul(0.75),
-                                    radius: ui.scale(12.0).dup4(),
-                                    padding: (ui.scale(10.0), ui.scale(12.0), ui.scale(10.0), ui.scale(12.0)),
-                                    child_gap: ui.scale(8.0),
-                                    direction: TopToBottom,
-                                    width: grow!(),
-                                    height: fit!(),
-                                    ..Decl
-                                }) {
-                                    if let _ = elem().decl(Decl {
-                                        direction: LeftToRight,
-                                        child_gap: ui.scale(8.0),
-                                        width: grow!(),
-                                        height: fit!(),
-                                        ..Decl
-                                    }) {
-                                        if let _ = elem().decl(Decl {
-                                            colour: health_colour,
-                                            radius: ui.scale(6.0).dup4(),
-                                            width: fixed!(ui.scale(12.0)),
-                                            height: fixed!(ui.scale(12.0)),
-                                            ..Decl
-                                        }) {}
-                                        ui.text(health_label, TextDecl { h: ui.scale(17.0), colour: WHITE, align: AlignX::Left, ..TextDecl });
-                                    }
-                                    ui.text(summary, TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.76), align: AlignX::Left, ..TextDecl });
-                                }
+                                // if let _ = elem().decl(Decl {
+                                //     colour: BUTTON_GREY.mul(0.75),
+                                //     radius: ui.scale(12.0).dup4(),
+                                //     padding: (ui.scale(10.0), ui.scale(12.0), ui.scale(10.0), ui.scale(12.0)),
+                                //     child_gap: ui.scale(8.0),
+                                //     direction: TopToBottom,
+                                //     width: grow!(),
+                                //     height: fit!(),
+                                //     ..Decl
+                                // }) {
+                                    // if let _ = elem().decl(Decl {
+                                    //     direction: LeftToRight,
+                                    //     child_gap: ui.scale(8.0),
+                                    //     width: grow!(),
+                                    //     height: fit!(),
+                                    //     ..Decl
+                                    // }) {
+                                    //     if let _ = elem().decl(Decl {
+                                    //         colour: health_colour,
+                                    //         radius: ui.scale(6.0).dup4(),
+                                    //         width: fixed!(ui.scale(12.0)),
+                                    //         height: fixed!(ui.scale(12.0)),
+                                    //         ..Decl
+                                    //     }) {}
+                                    //     ui.text(health_label, TextDecl { h: ui.scale(17.0), colour: WHITE, align: AlignX::Left, ..TextDecl });
+                                    // }
+                                    // ui.text(summary, TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.76), align: AlignX::Left, ..TextDecl });
+                                // }
 
-                                if let _ = elem().decl(Decl {
+                                let group_decl = Decl {
                                     colour: BUTTON_GREY.mul(0.72),
                                     radius: ui.scale(12.0).dup4(),
                                     padding: (ui.scale(10.0), ui.scale(12.0), ui.scale(10.0), ui.scale(12.0)),
@@ -3799,27 +3799,25 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                     width: grow!(),
                                     height: fit!(),
                                     ..Decl
-                                }) {
-                                    ui.text("Live Network", TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.70), align: AlignX::Left, ..TextDecl });
+                                };
+                                let hdr_text_decl = TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.70), align: AlignX::Left, ..TextDecl };
+
+                                if let _ = elem().decl(group_decl) {
+                                    ui.text("Network", hdr_text_decl);
                                     row(ui, data, "PoS Height", &format!("{}", viz.bft_tip_height));
                                     row(ui, data, "PoW Height", &format!("{}", viz.bc_tip_height));
                                     row(ui, data, "PoW Finalized", &format!("{}", viz.bc_finalized_tip_height));
-                                    row(ui, data, "Peers", &format!("{}", peer_count));
-                                    row(ui, data, "Wallet Sync", &format!("{}/{} ({:.1}%)", wallets_sync_h, wallets_tip_h, sync_pct));
-                                    row(ui, data, "Blocks Behind", &format!("{}", behind));
+                                    row(ui, data, "BFT Peers", &format!("{}", peer_count));
                                 }
 
-                                if let _ = elem().decl(Decl {
-                                    colour: BUTTON_GREY.mul(0.68),
-                                    radius: ui.scale(12.0).dup4(),
-                                    padding: (ui.scale(10.0), ui.scale(12.0), ui.scale(10.0), ui.scale(12.0)),
-                                    child_gap: ui.scale(6.0),
-                                    direction: TopToBottom,
-                                    width: grow!(),
-                                    height: fit!(),
-                                    ..Decl
-                                }) {
-                                    ui.text("Pool Balances", TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.70), align: AlignX::Left, ..TextDecl });
+                                if let _ = elem().decl(group_decl) {
+                                    ui.text("Wallet", hdr_text_decl);
+                                    row(ui, data, "Wallet Sync", &format!("{}/{} ({:.1}%)", wallets_sync_h, wallets_tip_h, sync_pct));
+                                    row(ui, data, "Blocks Behind Known PoW", &format!("{}", behind));
+                                }
+
+                                if let _ = elem().decl(group_decl) {
+                                    ui.text("Pool Balances", hdr_text_decl);
                                     row(ui, data, "Orchard", &format!("{}", viz.orchard_pool_balance));
                                     row(ui, data, "Staking Bonded", &format!("{}", viz.staking_bonded_pool_balance));
                                     row(ui, data, "Staking Unbonded", &format!("{}", viz.staking_unbonded_pool_balance));
