@@ -140,6 +140,7 @@ pub const ICON_PAPER_PLANE_EMPTY: &str = "\u{f1d9}";
 pub const ICON_HISTORY: &str = "\u{f1da}";
 pub const ICON_CIRCLE_THIN: &str = "\u{f1db}";
 pub const ICON_SLIDERS: &str = "\u{f1de}";
+pub const ICON_WIFI: &str = "\u{f1eb}";
 pub const ICON_TRASH_1: &str = "\u{f1f8}";
 pub const ICON_COPYRIGHT: &str = "\u{f1f9}";
 pub const ICON_EYEDROPPER: &str = "\u{f1fb}";

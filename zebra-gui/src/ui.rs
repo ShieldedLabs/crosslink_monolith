@@ -1135,10 +1135,10 @@ fn colour_from_hash(hash: &[u8; 32], is_online:bool) -> (u8, u8, u8, u8) {
     let val = hasher.finish();
 
     let h = (val) as u8;
-    let mut s = 60;
-    let mut v = 80;
+    let mut s = 50;
+    let mut v = 60;
     if is_online {
-        s = 120;
+        s = 130;
         v = 170;
     }
     // TODO(Giovanni): flashing effect
@@ -1214,12 +1214,12 @@ fn show_finalizer_popup(
         floating: Floating::Root(popup_pos.0, popup_pos.1),
         ..Decl
     }) {
-
+        // "Your criteria for considering finalizers online"
         let toggle_id = id("Matches Height Button");
         let toggle_text = if filters.filter_height {
-            "Matches my height/round [ON]"
+            "[X] Must have voted at the latest height"
         } else {
-            "Matches my height/round [OFF]"
+            "[ ] Must have voted at the latest height"
         };
 
         let (toggle_clicked, toggle_colour, toggle_text_colour) = ui.button_ex(
@@ -1325,20 +1325,36 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wal
                     let r = if seen_voting_power == total_val { finalizer_pill_rad } else { 0.0 };
                     (r, l, r, l) // TODO: order??
                 },
-                align: Left,
+                align: Center,
                 width:  Sizing::Percent(pct),
                 height: grow!(),
                 ..Decl
             }) {
-                if ui.hovered(el.decl.id)  {
-                    let online_string = if is_online {"ONLINE"} else {"OFFLINE"};
-                    if is_real_finalizers{
-                        set_tooltip_text!(data, "{}  [{online_string}]  {} cTAZ    {:.2}%", display_str(&chunkify(&finalizer.pub_key)), str_from_ctaz(finalizer.voting_power), 100.0*pct);
-                    } else {
-                        set_tooltip_text!(data, "[{online_string}]  {} cTAZ    {:.2}%", str_from_ctaz(finalizer.voting_power), 100.0*pct);
+                let icon = [ICON_ATTENTION_1, ICON_WIFI][is_online as usize];
+                let online_str = ["Offline ", " Online"][is_online as usize];
+                let text_col = [WHITE.mul(0.5), WHITE][is_online as usize];
+
+                let text_decl = TextDecl { h: ui.scale(16.0), font: Mono, colour: text_col, align: AlignX::Left, ..TextDecl };
+                let icon_decl = TextDecl { font: Icons, ..text_decl };
+
+                if pct > 0.05 { // TODO: account for scaling
+                    ui.text(icon, icon_decl);
+
+                    if ! is_real_finalizers {
+                        ui.text(" ", text_decl); // TODO: proper padding
+                        ui.text(online_str, text_decl);
                     }
                 }
 
+                if ui.hovered(el.decl.id)  {
+                    let online_str = ["OFFLINE", "ONLINE"][is_online as usize];
+                    if is_real_finalizers{
+                        set_tooltip_text!(data, "{}  {}  {} cTAZ    {:.2}%", display_str(&chunkify(&finalizer.pub_key)), online_str, str_from_ctaz(finalizer.voting_power), 100.0*pct);
+                    } else {
+                        set_tooltip_text!(data, "Total: {}  {} cTAZ    {:.2}%", str_from_ctaz(finalizer.voting_power), online_str, 100.0*pct);
+                    }
+                    data.tooltip_wrap = Wrap::None;
+                }
             }
 
             done_once = true;
@@ -3339,10 +3355,10 @@ pub fn ui_right_pane(ui: &mut Context,
                             false
                         };
 
-                        let text_colour = if is_online {
-                            WHITE
+                        let (text_colour, icon) = if is_online {
+                            (WHITE, ICON_WIFI)
                         } else {
-                            WHITE.mul(0.6)
+                            (WHITE.mul(0.5), ICON_ATTENTION_1)
                         };
 
                         // left icon
@@ -3374,11 +3390,12 @@ pub fn ui_right_pane(ui: &mut Context,
                             id: id_index("Roster Member Info", index as u32),
                             height: fixed!(info_h),
                             width: grow!(),
-                            direction: TopToBottom,
+                            direction: LeftToRight,
                             align: TopLeft,
                             ..Decl
                         }) {
-                            ui.text(frame_strf!(data, "{}", display_str_with_edge_bytes(&chunkify(&member.pub_key), 3)), TextDecl { font: Mono, colour: text_colour, h: info_h, align: AlignX::Left, ..TextDecl });
+                            ui.text(icon, TextDecl { font: Icons, h: ui.scale(16.0), colour: text_colour, align: AlignX::Left, ..TextDecl });
+                            ui.text(frame_strf!(data, " {}", display_str_with_edge_bytes(&chunkify(&member.pub_key), 3)), TextDecl { font: Mono, colour: text_colour, h: info_h, align: AlignX::Left, ..TextDecl });
                         }
 
                         // right info
