@@ -903,6 +903,8 @@ pub struct WalletRosterMember {
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct FinalizerFilters{
+    pub show_popup: bool,
+    pub popup_pos: Option<(f32, f32)>,
     pub filter_height: bool,
     pub filter_seconds_since_connected: u32,
 }

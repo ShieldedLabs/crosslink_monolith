@@ -1177,6 +1177,104 @@ fn finalizer_is_online(pub_key: [u8;32], bft_status: &wallet::TFLRecencyStatus, 
     finalizer_is_online_ex(&f, bft_status, filters)
 }
 
+fn show_finalizer_popup(
+    ui: &mut Context,
+    data: &mut UiData,
+    filters: &mut FinalizerFilters,
+    popup_pos: (f32, f32),
+) {
+    let width = ui.scale(160.0);
+    let radius = ui.scale(16.0);
+
+    let container_id = ui::id("Finalizer Popup Container");
+
+    let (clicked, colour, text_colour) = ui.button_ex(
+        true,
+        BUTTON_GREY,
+        container_id,
+        true,
+        winit::window::CursorIcon::Default,
+    );
+
+    if let _ = elem().decl(Decl {
+        id: container_id,
+        colour,
+        child_gap: ui.scale(8.0),
+        radius: ui.scale(6.0).dup4(),
+        align: Center,
+        direction: TopToBottom,
+        width: fit!(width),
+        height: fit!(),
+        floating: Floating::Root(popup_pos.0, popup_pos.1),
+        ..Decl
+    }) {
+
+        let toggle_id = id("Matches Height Button");
+        let toggle_text = if filters.filter_height {
+            "Matches my height/round [ON]"
+        } else {
+            "Matches my height/round [OFF]"
+        };
+
+        let (toggle_clicked, toggle_colour, toggle_text_colour) = ui.button_ex(
+            true,
+            colour,
+            toggle_id,
+            true,
+            winit::window::CursorIcon::Pointer,
+        );
+
+        if let _ = elem().decl(Decl {
+            id: toggle_id,
+            colour: toggle_colour,
+            radius: ui.scale(4.0).dup4(),
+            align: Center,
+            direction: TopToBottom,
+
+            width: fit!(width),
+            ..Decl
+        }) {
+            ui.text(
+                toggle_text,
+                TextDecl {
+                    font: Mono,
+                    h: ui.scale(16.0),
+                    colour: toggle_text_colour,
+                    align: AlignX::Center,
+                    ..TextDecl
+                },
+            );
+
+            if toggle_clicked {
+                filters.filter_height = !filters.filter_height;
+            }
+        }
+
+        if let _ = elem().decl(Decl {
+            id: ui::id("Finalizer Status Container"),
+            width: fit!(width),
+            height: fit!(radius * 2.0),
+            direction: TopToBottom,
+            radius: ui.scale(4.0).dup4(),
+            ..Decl
+        }) {
+
+            let secs_string = ui.textbox(
+                data,
+                ui::id("Seconds since connected Textbox"),
+                "Seconds since connected...",
+                TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
+            );
+            let secs_str = secs_string.trim();
+            if let Ok (value) = secs_str.parse::<u32>(){
+                filters.filter_seconds_since_connected = value;
+                //println!("{:?}", state.finalizer_seconds_since_connected);
+            } else if secs_str.len() == 0 {
+                filters.filter_seconds_since_connected = 0;
+            }
+        }
+    }
+}
 pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wallet::TFLRecencyStatus, finalizers: &[WalletRosterMember], total_val: u64, height:u32, seconds_since_connected:u64, filters:&FinalizerFilters, id:ui::Id, is_real_finalizers: bool) {
 
     let finalizer_pill_rad = ui.scale(8.0);
@@ -3060,7 +3158,6 @@ pub fn ui_right_pane(ui: &mut Context,
             ..Decl
         }) {
 
-
             let mut recv_address = String::new();
             for b in wallet::TENDERLINK_PUBLIC_KEY.lock().unwrap().0.iter().rev() {
                 recv_address.push_str(&format!("{:02x}", b));
@@ -3068,96 +3165,55 @@ pub fn ui_right_pane(ui: &mut Context,
 
             if let _ = elem().decl(Decl {
                 id: id("Finalizers Buttons"),
-                padding, child_gap, align: Center,
+                padding,
+                child_gap,
+                align: Center,
                 direction: LeftToRight,
                 width: percent!(1.0),
                 height: fit!(),
                 ..Decl
             }) {
-                //NOTE(Giovanni): New finalizer status bar
+                let combo_id = id("Finalizer Online Status");
+                let base_color = BUTTON_GREY.mul(0.85);
+
+                let (_activated, colour, _text_colour) =
+                    ui.button_ex(true, base_color, combo_id, true, winit::window::CursorIcon::Pointer);
+
                 if let _ = elem().decl(Decl {
-                    direction: TopToBottom,
+                    id: combo_id,
+                    colour,
+                    direction: LeftToRight,
                     align: Center,
-                    radius: ui.scale(18.0).dup4(),
-                    child_gap: ui.scale(8.0),
                     width: fit!(),
                     height: fit!(),
+                    radius: ui.scale(4.0).dup4(),
                     ..Decl
                 }) {
-                    let combo_id = id("Finalizer Online Status");
-                    let base = BUTTON_GREY.mul(0.85);
-                    let (activated, colour, text_colour) = ui.button_ex(true, base, combo_id, true, winit::window::CursorIcon::Pointer);
                     if let _ = elem().decl(Decl {
-                        id: combo_id,
                         colour,
-                        direction: LeftToRight,
-                        align: Center,
-                        width:  fit!(),
+                        width: fit!(),
                         height: fit!(),
-                        radius: ui.scale(4.0).dup4(),
                         ..Decl
-                    }) {
-                        if let _ = elem().decl(Decl {
-                            colour: colour,
-                            width:  fit!(),
-                            height: fit!(),
-                            ..Decl
-                        }) {}
-                        // NOTE(Giovanni): NEED THAT SPACING
-                        ui.text(" ", TextDecl { h: ui.scale(24.0), colour: WHITE.mul(0.75), align: AlignX::Right, ..TextDecl });
-                        ui.text(ICON_FOLDER_1, TextDecl { font: Icons, h: ui.scale(14.0), colour: WHITE.mul(0.6), align: AlignX::Left, ..TextDecl });
-                        ui.text(" Finalizer Filters", TextDecl { h: ui.scale(24.0), colour: WHITE.mul(0.75), align: AlignX::Right, ..TextDecl });
 
+                    }) {}
+                }
+
+                if ui.input().mouse_pressed(winit::event::MouseButton::Right) {
+                    filters.show_popup = !filters.show_popup;
+                    
+                    if filters.show_popup && filters.popup_pos.is_none() {
+                        let mouse_pos = ui.input().mouse_pos();
+                        let dpi = ui.dpi_scale;
+                        filters.popup_pos = Some((
+                            (mouse_pos.0 as f32 + 8.0 * dpi).min(ui.draw().window_width as f32 - 200.0),
+                            (mouse_pos.1 as f32 + 6.0 * dpi).min(ui.draw().window_height as f32 - 150.0),
+                        ));
                     }
-                    if ui.hovered(combo_id) {
-                        set_tooltip_text!(data, "Click to expand.");
-                    }
+                }
 
-                    if ui.openable(data, combo_id, activated, false) {
-                        let id = id("Matches Height Button");
-
-                        let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, id, true, winit::window::CursorIcon::Pointer);
-                        let radius = ui.scale(16.0);
-
-                        let mut state = wallet_state.lock().unwrap();
-
-                        if let _ = elem().decl(Decl {
-                            id: id,
-                            colour,
-                            padding,
-                            child_gap,
-                            radius: ui.scale(4.0).dup4(),
-                            align: Center,
-                            width:  fit!(ui.scale(128.0)),
-                            height: fit!(radius * 2.0),
-                            ..Decl
-                        }) {
-
-                            let text = if filters.filter_height {"Matches my height/round [ON]"} else {"Matches my height/round [OFF]"};
-                            ui.text(text, TextDecl {font: Mono, h: ui.scale(16.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
-                            if clicked{ filters.filter_height = !filters.filter_height; }
-                        }
-                        if let _ = elem().decl(Decl {
-                            id:ui::id("Finalizer Status Container"),
-                            width: grow!(),
-                            height: fit!(),
-                            radius: ui.scale(4.0).dup4(),
-                            ..Decl
-                        }) {
-                            let secs_string = ui.textbox(
-                                data,
-                                ui::id("Seconds since connected Textbox"),
-                                "Seconds since connected...",
-                                TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
-                            );
-                            let secs_str = secs_string.trim();
-                            if let Ok (value) = secs_str.parse::<u32>(){
-                                filters.filter_seconds_since_connected = value;
-                                //println!("{:?}", state.finalizer_seconds_since_connected);
-                            } else if secs_str.len() == 0 {
-                                filters.filter_seconds_since_connected = 0;
-                            }
-                        }
+                if filters.show_popup {
+                    if let Some(pos) = filters.popup_pos {
+                        show_finalizer_popup(ui, data, &mut filters, pos);
                     }
                 }
             }

@@ -1208,7 +1208,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             let (h_min, h_max) = chain_minimap_height_span(viz_state);
             let ht = chain_minimap_y_to_h(my_scr, h_min, h_max, mm_y0, mm_y1);
             apply_scrub_pow_height(viz_state, ht as f32, h_min, h_max);
-            viz_state.zoom = 2.0;
+            //viz_state.zoom = 2.0;
             ui.mouse_pressed_id = ui::Id::CHAIN_MINIMAP_POW;
             minimap_scrub_this_frame = true;
         }
@@ -1219,7 +1219,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             let (bft_min, bft_max) = bft_minimap_height_span(viz_state);
             let ht = chain_minimap_y_to_h(my_scr, bft_min, bft_max, pos_mm_y0, pos_mm_y1);
             apply_scrub_bft_height(viz_state, ht);
-            viz_state.zoom = 2.0;
+            //viz_state.zoom = 2.0;
             ui.mouse_pressed_id = ui::Id::CHAIN_MINIMAP_POS;
             minimap_scrub_this_frame = true;
         }
