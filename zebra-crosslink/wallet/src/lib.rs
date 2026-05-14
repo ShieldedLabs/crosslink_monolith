@@ -901,12 +901,22 @@ pub struct WalletRosterMember {
     pub txids: std::vec::Vec<StakeTxId>,
 }
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct FinalizerFilters{
     pub show_popup: bool,
     pub popup_pos: Option<(f32, f32)>,
     pub filter_height: bool,
     pub filter_seconds_since_connected: u32,
+}
+impl Default for FinalizerFilters {
+    fn default() -> Self {
+        Self {
+            show_popup: false,
+            popup_pos: None,
+            filter_height: true,
+            filter_seconds_since_connected: 0,
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone)]
