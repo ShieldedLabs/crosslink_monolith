@@ -1070,6 +1070,7 @@ pub struct Peer {
     pub latest_status_request_height: Option<u64>,
     pub latest_status: Option<PacketStatus>,
     pub index_counter: u64, // for some peer randomness
+    pub bft_pk: PubKeyID,             // for convenience
     pub stp_address: STPAddress,      // for convenience
     pub stp_handshake_hash: [u8; 64], // for convenience
 }
@@ -1846,7 +1847,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             let pk = PubKeyID(pk_bytes.try_into().expect("already asserted length of 32"));
             let sig = TMSig(my_root_private_key.sign(&keyed_hash_of_stp_handshake_hash[..]).to_bytes());
 
-            let packet = PacketIdHello { pk, sig };
+            let verification = PacketIdVerification { pk, sig };
 
             let mut o = 0;
 
@@ -1858,7 +1859,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                &mut send_buf1[o..],
                                                peer.index_counter);
             peer.index_counter += 1;
-            o += packet.write_to(&mut send_buf1[o..]);
+            o += verification.write_to(&mut send_buf1[o..]);
 
             print_packet_tag_send(header);
             send_stp_msg(&mut messages_to_send, &key, &send_buf1[..o], &mut net_stats);
@@ -1954,10 +1955,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 assert!(peer.stp_handshake_hash.len() == 64);
                 let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
 
-                if let Some(packet) = PacketIdHello::read_from(&mut &msg[read_o..]) {
+                if let Some(packet) = PacketIdVerification::read_from(&mut &msg[read_o..]) {
                     match packet.sig.verify(packet.pk, &keyed_hash_of_stp_handshake_hash[..]) { Ok(()) => {}, Err((err, str)) => {
                         tracing::warn!("Handshake hash signature failed -- peer failed ID verification");
                         connection_keys_to_disconnect.push(connection_key);
+                        continue;
                     } };
 
                     bft_key_address_map.insert(&packet.pk, &peer.stp_address);
@@ -1979,13 +1981,20 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
 // networking
 
-// ID verification hello         - BFT pk + BFT sig of noise handshake hash
-// ID verification hello ack     - BFT pk + BFT sig of noise handshake hash + client's view of server ip:port + BFT sig of {ip,port,magic1,key,srv BFT pk, cli BFT pk}
-// ID verification hello ack ack -                                          + server's view of client ip:port + BFT sig of {ip,port,magic1,key,cli BFT pk, srv BFT pk}
+// ID verification - BFT pk + BFT sig of noise handshake hash
+// ID attestation  - my view of your ip:port + BFT sig of {your ip,your port,our magic1,your key,your BFT pk, my BFT pk}
+
+// ID hello         - ID verification
+// ID hello ack     - ID verification + ID attestation
+// ID hello ack ack -                   ID attestation
 
 const PACKET_TYPE_ID_HELLO:         u8 = 0;
 const PACKET_TYPE_ID_HELLO_ACK:     u8 = 1;
 const PACKET_TYPE_ID_HELLO_ACK_ACK: u8 = 2;
+
+const PACKET_TYPE_PEER_ADDRESS_LIST: u8 = 3;
+const PACKET_TYPE_WANT_HOLE_PUNCH:   u8 = 4;
+const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 5;
 
 // consensus
 const PACKET_TYPE_PROPOSAL_CHUNK:       u8 =  7;
@@ -2008,6 +2017,12 @@ const PACKET_TAG_MASK:                  u8 = ((1 << PACKET_TAG_BITS as u64) - 1)
 
 const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     let mut names = [["<MISSING>"; 2]; PACKET_TYPE_COUNT as usize];
+    names[PACKET_TYPE_ID_HELLO             as usize] = ["ID_HELLO",                 "STATUS+ID_HELLO"];
+    names[PACKET_TYPE_ID_HELLO_ACK         as usize] = ["ID_HELLO_ACK",             "STATUS+ID_HELLO_ACK"];
+    names[PACKET_TYPE_ID_HELLO_ACK_ACK     as usize] = ["ID_HELLO_ACK_ACK",         "STATUS+ID_HELLO_ACK_ACK"];
+    names[PACKET_TYPE_PEER_ADDRESS_LIST    as usize] = ["PEER_ADDRESS_LIST",        "STATUS+PEER_ADDRESS_LIST"];
+    names[PACKET_TYPE_WANT_HOLE_PUNCH      as usize] = ["WANT_HOLE_PUNCH",          "STATUS+WANT_HOLE_PUNCH"];
+    names[PACKET_TYPE_TRY_HOLE_PUNCH       as usize] = ["TRY_HOLE_PUNCH",           "STATUS+TRY_HOLE_PUNCH"];
     names[PACKET_TYPE_PROPOSAL_CHUNK       as usize] = ["PROPOSAL_CHUNK",           "STATUS+PROPOSAL_CHUNK"];
     names[PACKET_TYPE_PREVOTE_SIGNATURES   as usize] = ["PREVOTE_SIGNATURES",       "STATUS+PREVOTE_SIGNATURES"];
     names[PACKET_TYPE_PRECOMMIT_SIGNATURES as usize] = ["PRECOMMIT_SIGNATURES",     "STATUS+PRECOMMIT_SIGNATURES"];
@@ -2176,19 +2191,19 @@ impl PacketVotes {
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct PacketIdHello {
-    pk:  PubKeyID,
-    sig: TMSig,
+struct PacketIdVerification {
+    pub pk:  PubKeyID,
+    pub sig: TMSig,
 }
-impl SliceWrite for PacketIdHello {
+impl SliceWrite for PacketIdVerification {
     fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = 0;
-        o += self.pk.0 .write_to(&mut buf[o..]);
+        o += self.pk .0.write_to(&mut buf[o..]);
         o += self.sig.0.write_to(&mut buf[o..]);
         o
     }
 }
-impl SliceRead for PacketIdHello {
+impl SliceRead for PacketIdVerification {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
         Some(Self {
             pk: PubKeyID(SliceRead::read_from(buf)?),
@@ -2196,6 +2211,52 @@ impl SliceRead for PacketIdHello {
         })
     }
 }
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PacketIdAttestation {
+    pub addr: STPAddress,
+    pub sig:  TMSig,
+}
+impl SliceWrite for PacketIdAttestation {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.addr .write_to(&mut buf[o..]);
+        o += self.sig.0.write_to(&mut buf[o..]);
+        o
+    }
+}
+impl SliceRead for PacketIdAttestation {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(Self {
+            addr:      SliceRead::read_from(buf)?,
+            sig: TMSig(SliceRead::read_from(buf)?),
+        })
+    }
+}
+
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PacketIdHelloAck {
+    pub verification: PacketIdVerification,
+    pub attestation:  PacketIdAttestation,
+}
+impl SliceWrite for PacketIdHelloAck {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.verification.write_to(&mut buf[o..]);
+        o += self.attestation .write_to(&mut buf[o..]);
+        o
+    }
+}
+impl SliceRead for PacketIdHelloAck {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(Self {
+            verification: SliceRead::read_from(buf)?,
+            attestation:  SliceRead::read_from(buf)?,
+        })
+    }
+}
+
 
 const PROPOSAL_PACKET_EXTRA:    usize = (PACKET_HEADER_SIZE + PACKET_STATUS_SIZE + 56 + 64);
 const PROPOSAL_CHUNK_DATA_SIZE: usize = PATH_MTU - PROPOSAL_PACKET_EXTRA;
