@@ -7040,6 +7040,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "byteorder",
+ "chrono",
  "crossterm",
  "ed25519-zebra",
  "hex",

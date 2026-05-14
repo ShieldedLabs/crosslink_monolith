@@ -30,6 +30,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock", "Win
 static_assertions = "1.1.0"
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "net", "time"] }
 zcash_primitives = { path = "../librustzcash/zcash_primitives" } # version = "2.0"
+chrono = { version = "0.4.40", default-features = false }
 
 [dependencies.snow]
 git = "https://github.com/ShieldedLabs/snow.git"

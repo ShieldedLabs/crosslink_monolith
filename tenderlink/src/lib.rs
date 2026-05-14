@@ -129,7 +129,7 @@ impl std::fmt::Debug for ClosureToUpdatePeers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToUpdatePeers(..)") }
 }
 #[derive(Clone)]
-pub struct ClosureToAllowBftAccess(pub Arc<dyn for<'a> Fn(&'a TMState) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send + Sync + 'static>);
+pub struct ClosureToAllowBftAccess(pub Arc<dyn for<'a> Fn(&'a TMState, &'a BftAddressMap) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToAllowBftAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToAllowBftAccess(..)") }
 }
@@ -1253,7 +1253,7 @@ async fn instance(
         ClosureToUpdatePeers(Arc::new(move |_all_peers| { Box::pin(async move {
         })})),
 
-        ClosureToAllowBftAccess(Arc::new(move |_bft_state| { Box::pin(async move {
+        ClosureToAllowBftAccess(Arc::new(move |_bft_state, _key_addr_map| { Box::pin(async move {
         })})),
 
         Vec::new(),
@@ -1305,6 +1305,7 @@ pub fn addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, STPAddress) {
 pub struct BftAddressMap {
     pub by_key:  HashMap<PubKeyID, Vec<STPAddress>>,
     pub by_addr: HashMap<STPAddress, PubKeyID>,
+    pub last_packet_utcs: HashMap<PubKeyID, i64>,
 }
 impl BftAddressMap {
     pub fn new() -> Self { Self::default() }
@@ -1523,7 +1524,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     }
                 }
 
-                bft_state.bft_access_closure.0(&bft_state).await;
+                bft_state.bft_access_closure.0(&bft_state, &bft_key_address_map).await;
 
                 // BFT CONSENSUS
                 // account for the state updates we've accumulated
@@ -1964,6 +1965,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
 
             else {
+            }
+
+            if let Some(pk) = bft_key_address_map.get_key(&peer.stp_address) {
+                bft_key_address_map.last_packet_utcs.insert(*pk, chrono::Utc::now().timestamp());
             }
         }
 

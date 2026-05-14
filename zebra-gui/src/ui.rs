@@ -1198,7 +1198,7 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wal
         height: fixed!(finalizer_pill_rad * 4.0),
         ..Decl
     }) {
-        let mut rem = 0;
+        let mut rem = 0; // TODO: online_rem & offline_rem (or show %mixed)
         let mut done_once = false; // need for the left pill rad
         let mut seen_voting_power = 0;
         for (i, finalizer) in finalizers.iter().enumerate() {

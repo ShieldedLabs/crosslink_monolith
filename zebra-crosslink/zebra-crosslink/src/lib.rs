@@ -1105,7 +1105,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     }
                 })
             })),
-            tenderlink::ClosureToAllowBftAccess(Arc::new(move |bft_state: &tenderlink::TMState| {
+            tenderlink::ClosureToAllowBftAccess(Arc::new(move |bft_state: &tenderlink::TMState, bft_key_address_map: &tenderlink::BftAddressMap| {
                 let tfl_handle = tfl_handle9.clone();
                 Box::pin(async move {
                     let now_utc = chrono::Utc::now().timestamp();
@@ -1134,6 +1134,10 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                                     st.1.voted_in_my_height_round = (has_prevote_sig, has_precommit_sig);
                                 }
                                 st.1.highest_round_vote = st.1.highest_round_vote.max(round.round);
+                            }
+
+                            if let Some(utc) = bft_key_address_map.last_packet_utcs.get(&member.pub_key) {
+                                st.1.last_direct_connection_utc = st.1.last_direct_connection_utc.max(*utc);
                             }
                         }
                     }
