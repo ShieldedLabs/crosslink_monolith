@@ -1877,7 +1877,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let pk = PubKeyID(pk_bytes.try_into().expect("already asserted length of 32"));
                 let sig = {
                     // @Duplicate
-                    let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO STP Handshake Hash").finalize().into());
+                    let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("Tenderlink ID Hello STP Handshake Hash").finalize().into());
                     assert!(peer.stp_handshake_hash.len() == 64);
                     let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
 
@@ -1989,33 +1989,34 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
             else if packet_type == PACKET_TYPE_ID_HELLO {
 
-                let Some(packet) = PacketIdVerification::read_from(&mut &msg[read_o..]) else {
+                let Some(their_verification) = PacketIdVerification::read_from(&mut &msg[read_o..]) else {
                     tracing::warn!("Peer failed ID verification: Failed to read ID Hello packet");
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 };
                 {
                     // @Duplicate
-                    let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO STP Handshake Hash").finalize().into());
+                    let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("Tenderlink ID Hello STP Handshake Hash").finalize().into());
                     assert!(peer.stp_handshake_hash.len() == 64);
                     let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
 
-                    match packet.sig.verify(packet.pk, &keyed_hash_of_stp_handshake_hash[..]) { Ok(()) => {}, Err((err, str)) => {
+                    match their_verification.sig.verify(their_verification.pk, &keyed_hash_of_stp_handshake_hash[..]) { Ok(()) => {}, Err((err, str)) => {
                         tracing::warn!("Peer failed ID verification: Handshake hash signature invalid");
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     } };
                 }
 
-                bft_key_address_map.insert(&packet.pk, &peer.stp_address);
-                peer.bft_pk = packet.pk;
+                bft_key_address_map.insert(&their_verification.pk, &peer.stp_address);
+                peer.bft_pk = their_verification.pk;
 
-                let verification = { // almost @Duplicate
+                let my_verification = { // almost @Duplicate
                     let pk_bytes = my_root_public_bft_key.as_ref();
                     assert!(pk_bytes.len() == 32);
                     let pk = PubKeyID(pk_bytes.try_into().expect("already asserted length of 32"));
                     let sig = {
-                        let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO_ACK STP Handshake Hash").finalize().into());
+                        // @Duplicate
+                        let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("Tenderlink ID Hello-Ack STP Handshake Hash").finalize().into());
                         assert!(peer.stp_handshake_hash.len() == 64);
                         let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
 
@@ -2038,20 +2039,19 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         now + (seconds_per_minute * minutes_per_hour * hours_per_day * days_expiry)
                     };
                     let sig = {
-                        let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("PACKET_TYPE_ID_HELLO_ACK Attestation").finalize().into());
-                        assert!(peer.stp_handshake_hash.len() == 64);
+                        let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink One Party Signed Peer Attestation").finalize().into());
 
                         let mut hasher = hash_key_for_attestation.hasher();
                         hasher.update(&expiry.to_le_bytes()[..]);
-                        hasher.update(&peer.stp_address.ip.octets()[..]);
-                        hasher.update(&peer.stp_address.port.to_le_bytes()[..]);
-                        hasher.update(&peer.stp_address.magic1.to_le_bytes()[..]);
-                        hasher.update(&peer.stp_address.key[..]);
+                        hasher.update(&addr.ip.octets()[..]);
+                        hasher.update(&addr.port.to_le_bytes()[..]);
+                        hasher.update(&addr.magic1.to_le_bytes()[..]);
+                        hasher.update(&addr.key[..]);
                         hasher.update(&peer.bft_pk.0[..]);
                         hasher.update(&my_root_public_bft_key.as_ref()[..]);
-                        let keyed_hash_of_attestation = hasher.finalize();
+                        let keyed_hash_of_one_party_signed_attestation = hasher.finalize();
 
-                        TMSig(my_root_private_key.sign(&keyed_hash_of_attestation.as_bytes()[..]).to_bytes())
+                        TMSig(my_root_private_key.sign(&keyed_hash_of_one_party_signed_attestation.as_bytes()[..]).to_bytes())
                     };
 
                     PacketIdAttestation { addr, expiry, sig }
@@ -2067,11 +2067,95 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                    &mut send_buf1[o..],
                                                    peer.index_counter);
                 peer.index_counter += 1;
-                o += verification.write_to(&mut send_buf1[o..]);
+                o += my_verification.write_to(&mut send_buf1[o..]);
                 o += attestation .write_to(&mut send_buf1[o..]);
 
                 print_packet_tag_send(header);
                 send_stp_msg(&mut messages_to_send, &connection_key, &send_buf1[..o], &mut net_stats);
+            }
+            else if packet_type == PACKET_TYPE_ID_HELLO_ACK {
+
+                let msg = &mut &msg[read_o..];
+
+                let Some(their_verification) = PacketIdVerification::read_from(msg) else {
+                    tracing::warn!("Peer failed ID verification: Failed to read ID Hello Ack packet: Failed to read verification");
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                };
+                {
+                    // @Duplicate
+                    let hash_key_for_stp_handshake_hash = HashKey(blake3::Hasher::new_derive_key("Tenderlink ID Hello-Ack STP Handshake Hash").finalize().into());
+                    assert!(peer.stp_handshake_hash.len() == 64);
+                    let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
+
+                    match their_verification.sig.verify(their_verification.pk, &keyed_hash_of_stp_handshake_hash[..]) { Ok(()) => {}, Err((err, str)) => {
+                        tracing::warn!("Peer failed ID verification: Handshake hash signature invalid");
+                        connection_keys_to_disconnect.push(connection_key);
+                        continue;
+                    } };
+                }
+
+                bft_key_address_map.insert(&their_verification.pk, &peer.stp_address);
+                peer.bft_pk = their_verification.pk;
+
+                let Some(attestation) = PacketIdAttestation::read_from(msg) else {
+                    tracing::warn!("Peer failed ID verification: Failed to read ID Hello Ack packet: Failed to read attestation");
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                };
+
+                #[cfg(debug_assertions)] {
+                    eprintln!("attestation:            {:?}",  attestation);
+                    eprintln!("attestation.addr:       {:?}",  attestation.addr);
+                    eprintln!("attestation.addr.magic: {:x?}", attestation.addr.magic1);
+                    eprintln!("attestation.addr.key:   {:?}",  attestation.addr.key);
+                    eprintln!("my_stp_keypair:         {:?}",  my_stp_keypair);
+                    eprintln!("my_stp_keypair.magic1:  {:x?}", my_stp_keypair.magic1);
+                    eprintln!("my_stp_keypair.key:     {:?}",  my_stp_keypair.public);
+                }
+                // @Todo: list of multiple listen keypairs
+                if attestation.addr.magic1 != my_stp_keypair.magic1 ||
+                   attestation.addr.key    != my_stp_keypair.public {
+                    tracing::warn!("Peer failed ID attestation: STP address is not my address");
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                }
+                let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
+                if attestation.expiry <= now {
+                    tracing::warn!("Peer failed ID attestation: Attestation has already expired");
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                }
+                let keyed_hash_of_one_party_signed_attestation;
+                {
+                    // @Duplicate
+                    let addr = attestation.addr;
+                    let expiry = attestation.expiry;
+                    let sig = {
+                        let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink One Party Signed Peer Attestation").finalize().into());
+
+                        let mut hasher = hash_key_for_attestation.hasher();
+                        hasher.update(&expiry.to_le_bytes()[..]);
+                        hasher.update(&addr.ip.octets()[..]);
+                        hasher.update(&addr.port.to_le_bytes()[..]);
+                        hasher.update(&addr.magic1.to_le_bytes()[..]);
+                        hasher.update(&addr.key[..]);
+                        hasher.update(&my_root_public_bft_key.as_ref()[..]);
+                        hasher.update(&peer.bft_pk.0[..]);
+                        keyed_hash_of_one_party_signed_attestation = hasher.finalize();
+
+                        match attestation.sig.verify(their_verification.pk, &keyed_hash_of_one_party_signed_attestation.as_bytes()[..]) { Ok(()) => {}, Err((err, str)) => {
+                            tracing::warn!("Peer failed ID attestation: Attestation signature invalid");
+                            connection_keys_to_disconnect.push(connection_key);
+                            continue;
+                        } };
+                    };
+                };
+
+                // Sign their signed attestation with my signature
+                // let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink Two Party Signed Peer Attestation").finalize().into());
+                // assert!(peer.attestation.len() == 64);
+                // let keyed_hash_of_attestation = hash_key_for_attestation.hash(&peer.attestation[..]);
             }
 
             else {
@@ -2347,29 +2431,6 @@ impl SliceRead for PacketIdAttestation {
             addr:      SliceRead::read_from(buf)?,
             expiry:    SliceRead::read_from(buf)?,
             sig: TMSig(SliceRead::read_from(buf)?),
-        })
-    }
-}
-
-
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct PacketIdHelloAck {
-    pub verification: PacketIdVerification,
-    pub attestation:  PacketIdAttestation,
-}
-impl SliceWrite for PacketIdHelloAck {
-    fn write_to(&self, buf: &mut [u8]) -> usize {
-        let mut o = 0;
-        o += self.verification.write_to(&mut buf[o..]);
-        o += self.attestation .write_to(&mut buf[o..]);
-        o
-    }
-}
-impl SliceRead for PacketIdHelloAck {
-    fn read_from(buf: &mut &[u8]) -> Option<Self> {
-        Some(Self {
-            verification: SliceRead::read_from(buf)?,
-            attestation:  SliceRead::read_from(buf)?,
         })
     }
 }
