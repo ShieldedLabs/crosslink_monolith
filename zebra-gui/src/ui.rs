@@ -44,6 +44,7 @@ pub struct UiData {
     pub openables: HashMap<u32, OpenableState>,
 
     pub tooltip_text: String,
+    pub tooltip_wrap: Wrap,
     pub jump_target_pos: bool,
 }
 
@@ -59,6 +60,7 @@ macro_rules! frame_strf {
 macro_rules! set_tooltip_text {
     ($data:expr, $($arg:tt)*) => {
         $data.tooltip_text = format_args!($($arg)*).to_string();
+        $data.tooltip_wrap = Wrap::default();
     };
 }
 
@@ -3231,6 +3233,7 @@ pub fn ui_right_pane(ui: &mut Context,
                     bft_status.my_valid_round,
                     bft_status.my_locked_round,
                 );
+                data.tooltip_wrap = Wrap::None;
             }
             ui.text("Your Finalizer Identity", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
             ui.text(frame_strf!(data, "[{}..{}]", &recv_address[0..8], &recv_address[recv_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
@@ -3387,15 +3390,24 @@ pub fn ui_right_pane(ui: &mut Context,
                             align: Right,
                             ..Decl
                         }) {
-                            let colour = (0xff, 0xaf, 0x0e, 0xff);
+                            let mut colour = (0xff, 0xaf, 0x0e, 0xff);
+                            if !is_online {
+                                colour = colour.mul(0.5);
+                            }
                             ui.text(frame_strf!(data, "{} cTAZ", str_from_ctaz(member.voting_power)), TextDecl { font: Mono, h: ui.scale(14.0), colour, wrap: Wrap::None, align: AlignX::Right, ..TextDecl });
 
                         }
                     }
 
-                    #[cfg(debug_assertions)]
                     if ui.hovered(roster_member_id) {
-                        set_tooltip_text!(data, "{:#?}", finalizer_status);
+                        let pct = (member.voting_power as f32 / total_stake as f32) * 100.0;
+                        set_tooltip_text!(data, "{:.2}% of stake", pct);
+
+                        #[cfg(debug_assertions)]
+                        {
+                            set_tooltip_text!(data, "{}\n{:#?}", data.tooltip_text, finalizer_status);
+                            data.tooltip_wrap = Wrap::None;
+                        }
                     }
                 }
             }
@@ -4127,7 +4139,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             floating: Floating::Root(tooltip_pos.0, tooltip_pos.1),
             ..Decl
         }) {
-            ui.text(&data.tooltip_text, TextDecl { h: ui.scale(16.0), align: AlignX::Left, ..TextDecl });
+            ui.text(&data.tooltip_text, TextDecl { h: ui.scale(16.0), wrap: data.tooltip_wrap, align: AlignX::Left, ..TextDecl });
         }
     }
 
