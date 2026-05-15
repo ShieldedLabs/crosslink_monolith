@@ -2443,9 +2443,17 @@ pub fn ui_left_pane(ui: &mut Context,
                                             })
                                             {
                                                 // ui.text("Staked to:", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
-                                                let h = ui.scale(18.0);
+                                                let h      = ui.scale(18.0);
+                                                let chip_h = ui.scale(24.0);
 
-                                                ui_colour_chip(ui, h, colour_from_hash(&finalizer, is_online), is_hovered, "", (0, 0, 0, 0));
+                                                let (chip_icon_colour, chip_icon) = if is_online {
+                                                    (WHITE, ICON_WIFI)
+                                                } else {
+                                                    (WHITE.mul(0.5), ICON_ATTENTION_1)
+                                                };
+
+
+                                                ui_colour_chip(ui, h, colour_from_hash(&finalizer, is_online), is_hovered, chip_icon, chip_icon_colour);
 
                                                 ui.text(label, TextDecl { colour: text_colour, h, align: AlignX::Left, ..TextDecl });
                                                 let _ = elem().decl(Decl { width: grow!(), ..Decl });
