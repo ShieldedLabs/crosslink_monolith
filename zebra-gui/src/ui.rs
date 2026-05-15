@@ -1699,6 +1699,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         }
                     }
                 }
+
                 Modal::Send => {
                     title_bar(ui, true, "Send",    id("Send Title Bar"));
 
@@ -1715,37 +1716,51 @@ pub fn ui_left_pane(ui: &mut Context,
                         // spacer
                         if let _ = elem().decl(Decl { width: grow!(), height: fixed!(ui.scale(4.0)), ..Default::default() }) {}
 
-                        let send_address_id = id("Send Address Textbox");
-                        if data.send_address.len() != 0 {
-                            let send_address_buf: Vec<char> = data.send_address.chars().collect();
-                            let textbox_state = data.textboxes.entry(send_address_id.id).or_default();
-                            if textbox_state.text_buf != send_address_buf {
+                        if true {
+                            let mut send_address = "0000000000000000";
+                            if data.send_address.len() >= 16 {
+                                send_address = &data.send_address;
+                            }
+
+                            ui.text(frame_strf!(data, "[{}..{}]", &send_address[..8], &send_address[send_address.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                            if button(ui, "Paste Address", true) {
+                                data.send_address = ui.input().get_from_clipboard().trim().to_string();
+                            }
+
+                        } else {
+                            // New version: TODO: finish
+                            let send_address_id = id("Send Address Textbox");
+                            if data.send_address.len() != 0 {
+                                let send_address_buf: Vec<char> = data.send_address.chars().collect();
+                                let textbox_state = data.textboxes.entry(send_address_id.id).or_default();
+                                if textbox_state.text_buf != send_address_buf {
+                                    textbox_state.text_buf = send_address_buf;
+                                    let len = textbox_state.text_buf.len();
+                                    textbox_state.selection.0 = textbox_state.selection.0.min(len);
+                                    textbox_state.selection.1 = textbox_state.selection.1.min(len);
+                                }
+                            }
+                            if let _ = elem().decl(Decl {
+                                width: grow!(),
+                                height: fit!(),
+                                ..Decl
+                            }) {
+                                data.send_address = ui.textbox(
+                                    data,
+                                    send_address_id,
+                                    "Enter recipient address...",
+                                    TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
+                                ).trim().to_string();
+                            }
+                            if button(ui, "Paste Address", true) {
+                                data.send_address = ui.input().get_from_clipboard().trim().to_string();
+                                let send_address_buf: Vec<char> = data.send_address.chars().collect();
+                                let textbox_state = data.textboxes.entry(send_address_id.id).or_default();
                                 textbox_state.text_buf = send_address_buf;
                                 let len = textbox_state.text_buf.len();
-                                textbox_state.selection.0 = textbox_state.selection.0.min(len);
-                                textbox_state.selection.1 = textbox_state.selection.1.min(len);
+                                textbox_state.selection.0 = len;
+                                textbox_state.selection.1 = len;
                             }
-                        }
-                        if let _ = elem().decl(Decl {
-                            width: grow!(),
-                            height: fit!(),
-                            ..Decl
-                        }) {
-                            data.send_address = ui.textbox(
-                                data,
-                                send_address_id,
-                                "Enter recipient address...",
-                                TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
-                            ).trim().to_string();
-                        }
-                        if button(ui, "Paste Address", true) {
-                            data.send_address = ui.input().get_from_clipboard().trim().to_string();
-                            let send_address_buf: Vec<char> = data.send_address.chars().collect();
-                            let textbox_state = data.textboxes.entry(send_address_id.id).or_default();
-                            textbox_state.text_buf = send_address_buf;
-                            let len = textbox_state.text_buf.len();
-                            textbox_state.selection.0 = len;
-                            textbox_state.selection.1 = len;
                         }
 
                         // spacer
@@ -1791,42 +1806,53 @@ pub fn ui_left_pane(ui: &mut Context,
                                 ("141", 141*ONE_cTAZ),
                                 // ("250", 250*ONE_cTAZ),
                             ];
-                            if data.send_amount_index >= sends.len() {
-                                data.send_amount_index = 0;
-                            }
-                            if let _ = elem().decl(Decl {
-                                direction: LeftToRight,
-                                align: Center,
-                                child_gap,
-                                width: fit!(),
-                                height: fit!(),
-                                ..Decl
-                            }) {
-                                if button_ex(ui, id("Send Amount Down"), "-", data.send_amount_index > 0) {
-                                    data.send_amount_index = data.send_amount_index.saturating_sub(1);
+
+                            if true {
+                                for send in sends {
+                                    if button(ui, send.0, can && (balance as u64) >= send.1) {
+                                        wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), send.1);
+                                    }
+                                }
+
+                            } else {
+                                // new version: TODO: finish
+                                if data.send_amount_index >= sends.len() {
+                                    data.send_amount_index = 0;
                                 }
                                 if let _ = elem().decl(Decl {
-                                    colour: BUTTON_GREY,
-                                    radius: ui.scale(18.0).dup4(),
-                                    padding: (ui.scale(8.0), ui.scale(18.0), ui.scale(8.0), ui.scale(18.0)),
+                                    direction: LeftToRight,
+                                    align: Center,
+                                    child_gap,
                                     width: fit!(),
                                     height: fit!(),
-                                    align: Center,
                                     ..Decl
                                 }) {
-                                    ui.text(frame_strf!(data, "Amount: {}", sends[data.send_amount_index].0), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                                    if button_ex(ui, id("Send Amount Down"), "-", data.send_amount_index > 0) {
+                                        data.send_amount_index = data.send_amount_index.saturating_sub(1);
+                                    }
+                                    if let _ = elem().decl(Decl {
+                                        colour: BUTTON_GREY,
+                                        radius: ui.scale(18.0).dup4(),
+                                        padding: (ui.scale(8.0), ui.scale(18.0), ui.scale(8.0), ui.scale(18.0)),
+                                        width: fit!(),
+                                        height: fit!(),
+                                        align: Center,
+                                        ..Decl
+                                    }) {
+                                        ui.text(frame_strf!(data, "Amount: {}", sends[data.send_amount_index].0), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                                    }
+                                    if button_ex(ui, id("Send Amount Up"), "+", data.send_amount_index + 1 < sends.len()) {
+                                        data.send_amount_index += 1;
+                                    }
                                 }
-                                if button_ex(ui, id("Send Amount Up"), "+", data.send_amount_index + 1 < sends.len()) {
-                                    data.send_amount_index += 1;
+                                let selected = sends[data.send_amount_index];
+                                if button(
+                                    ui,
+                                    frame_strf!(data, "Send {}", selected.0),
+                                    can && (balance as u64) >= selected.1,
+                                ) {
+                                    wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), selected.1);
                                 }
-                            }
-                            let selected = sends[data.send_amount_index];
-                            if button(
-                                ui,
-                                frame_strf!(data, "Send {}", selected.0),
-                                can && (balance as u64) >= selected.1,
-                            ) {
-                                wallet_state.lock().unwrap().send_to_address(data.send_address.clone(), selected.1);
                             }
                         }
                     }
@@ -1847,33 +1873,38 @@ pub fn ui_left_pane(ui: &mut Context,
                     }) {
                         let ua = &wallet_state.lock().unwrap().user_recv_ua;
                         if ua.len() != 0 {
-                            let recv_address_id = id("Receive Address Textbox");
-                            let recv_address_buf: Vec<char> = ua.chars().collect();
-                            {
-                                let textbox_state = data.textboxes.entry(recv_address_id.id).or_default();
-                                textbox_state.text_buf = recv_address_buf.clone();
-                                let len = textbox_state.text_buf.len();
-                                textbox_state.selection.0 = textbox_state.selection.0.min(len);
-                                textbox_state.selection.1 = textbox_state.selection.1.min(len);
-                            }
-                            if let _ = elem().decl(Decl {
-                                width: grow!(),
-                                height: fit!(),
-                                ..Decl
-                            }) {
-                                let _ = ui.textbox(
-                                    data,
-                                    recv_address_id,
-                                    "Loading...",
-                                    TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
-                                );
-                            }
-                            {
-                                let textbox_state = data.textboxes.entry(recv_address_id.id).or_default();
-                                textbox_state.text_buf = recv_address_buf;
-                                let len = textbox_state.text_buf.len();
-                                textbox_state.selection.0 = textbox_state.selection.0.min(len);
-                                textbox_state.selection.1 = textbox_state.selection.1.min(len);
+                            if true {
+                                ui.text(frame_strf!(data, "[{}..{}]", &ua[..8], &ua[ua.len() - 8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                            } else {
+                                // TODO: finish new version
+                                let recv_address_id = id("Receive Address Textbox");
+                                let recv_address_buf: Vec<char> = ua.chars().collect();
+                                {
+                                    let textbox_state = data.textboxes.entry(recv_address_id.id).or_default();
+                                    textbox_state.text_buf = recv_address_buf.clone();
+                                    let len = textbox_state.text_buf.len();
+                                    textbox_state.selection.0 = textbox_state.selection.0.min(len);
+                                    textbox_state.selection.1 = textbox_state.selection.1.min(len);
+                                }
+                                if let _ = elem().decl(Decl {
+                                    width: grow!(),
+                                    height: fit!(),
+                                    ..Decl
+                                }) {
+                                    let _ = ui.textbox(
+                                        data,
+                                        recv_address_id,
+                                        "Loading...",
+                                        TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
+                                    );
+                                }
+                                {
+                                    let textbox_state = data.textboxes.entry(recv_address_id.id).or_default();
+                                    textbox_state.text_buf = recv_address_buf;
+                                    let len = textbox_state.text_buf.len();
+                                    textbox_state.selection.0 = textbox_state.selection.0.min(len);
+                                    textbox_state.selection.1 = textbox_state.selection.1.min(len);
+                                }
                             }
 
                             if button(ui, "Copy Address", true) {
@@ -1888,37 +1919,51 @@ pub fn ui_left_pane(ui: &mut Context,
                 Modal::Stake => {
                     title_bar(ui, true, "Stake", id("Stake Title Bar"));
 
-                    let stake_address_id = id("Stake Address Textbox");
-                    if data.stake_address.len() != 0 {
-                        let stake_address_buf: Vec<char> = data.stake_address.chars().collect();
-                        let textbox_state = data.textboxes.entry(stake_address_id.id).or_default();
-                        if textbox_state.text_buf != stake_address_buf {
+                    if true {
+                        let mut stake_address = "0000000000000000";
+                        if data.stake_address.len() >= 16 {
+                            stake_address = &data.stake_address;
+                        }
+
+                        ui.text(frame_strf!(data, "[{}..{}]", &stake_address[0..8], &stake_address[stake_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                        if button(ui, "Paste Identity", true) {
+                            data.stake_address = ui.input().get_from_clipboard().trim().to_string();
+                        }
+
+                    } else {
+                        // new version: TODO: finish
+                        let stake_address_id = id("Stake Address Textbox");
+                        if data.stake_address.len() != 0 {
+                            let stake_address_buf: Vec<char> = data.stake_address.chars().collect();
+                            let textbox_state = data.textboxes.entry(stake_address_id.id).or_default();
+                            if textbox_state.text_buf != stake_address_buf {
+                                textbox_state.text_buf = stake_address_buf;
+                                let len = textbox_state.text_buf.len();
+                                textbox_state.selection.0 = textbox_state.selection.0.min(len);
+                                textbox_state.selection.1 = textbox_state.selection.1.min(len);
+                            }
+                        }
+                        if let _ = elem().decl(Decl {
+                            width: grow!(),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            data.stake_address = ui.textbox(
+                                data,
+                                stake_address_id,
+                                "Enter validator identity...",
+                                TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
+                            ).trim().to_string();
+                        }
+                        if button(ui, "Paste Identity", true) {
+                            data.stake_address = ui.input().get_from_clipboard().trim().to_string();
+                            let stake_address_buf: Vec<char> = data.stake_address.chars().collect();
+                            let textbox_state = data.textboxes.entry(stake_address_id.id).or_default();
                             textbox_state.text_buf = stake_address_buf;
                             let len = textbox_state.text_buf.len();
-                            textbox_state.selection.0 = textbox_state.selection.0.min(len);
-                            textbox_state.selection.1 = textbox_state.selection.1.min(len);
+                            textbox_state.selection.0 = len;
+                            textbox_state.selection.1 = len;
                         }
-                    }
-                    if let _ = elem().decl(Decl {
-                        width: grow!(),
-                        height: fit!(),
-                        ..Decl
-                    }) {
-                        data.stake_address = ui.textbox(
-                            data,
-                            stake_address_id,
-                            "Enter validator identity...",
-                            TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
-                        ).trim().to_string();
-                    }
-                    if button(ui, "Paste Identity", true) {
-                        data.stake_address = ui.input().get_from_clipboard().trim().to_string();
-                        let stake_address_buf: Vec<char> = data.stake_address.chars().collect();
-                        let textbox_state = data.textboxes.entry(stake_address_id.id).or_default();
-                        textbox_state.text_buf = stake_address_buf;
-                        let len = textbox_state.text_buf.len();
-                        textbox_state.selection.0 = len;
-                        textbox_state.selection.1 = len;
                     }
 
                     // spacer
@@ -1977,61 +2022,79 @@ pub fn ui_left_pane(ui: &mut Context,
                         let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
 
                         let can = is_staking_day && !waiting_for_stake_to_finalizer && hex_dest.is_some();
-                        let stakes = [
-                            ("0.01", ONE_cTAZ / 100),
-                            ("0.1", ONE_cTAZ / 10),
-                            ("1", ONE_cTAZ),
-                            ("10", ONE_cTAZ * 10),
-                            ("100", ONE_cTAZ * 100),
-                            ("1000", ONE_cTAZ * 1000),
-                            ("10000", ONE_cTAZ * 10000),
-                        ];
-                        if data.stake_amount_index >= stakes.len() {
-                            data.stake_amount_index = 0;
-                        }
 
                         let mut hover = false;
-                        if let _ = elem().decl(Decl {
-                            direction: LeftToRight,
-                            align: Center,
-                            child_gap,
-                            width: fit!(),
-                            height: fit!(),
-                            ..Decl
-                        }) {
-                            let down_id = id("Stake Amount Down");
-                            if button_ex(ui, down_id, "-", data.stake_amount_index > 0) {
-                                data.stake_amount_index = data.stake_amount_index.saturating_sub(1);
+
+                        if true {
+                            { let label =  "+0.01 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ / 100)   { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ /   100, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label =   "+0.1 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ / 10)    { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ /    10, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label =     "+1 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ)         { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ,         hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label =    "+10 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ * 10)    { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ *    10, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label =   "+100 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ * 100)   { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ *   100, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label =  "+1000 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ * 1000)  { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ *  1000, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+                            { let label = "+10000 cTAZ"; let id = id(label); if button_ex(ui, id, label, can && (balance as u64) >= ONE_cTAZ * 10000) { wallet_state.lock().unwrap().stake_to_finalizer(ONE_cTAZ * 10000, hex_dest.unwrap()); } hover |= ui.hovered(id); }
+
+                        } else {
+                            // TODO: finish new version
+
+                            if !can && !is_staking_day && hover {
+                                set_tooltip_text!(data, "You can only stake during Staking Day.");
                             }
-                            hover |= ui.hovered(down_id);
+                            let stakes = [
+                                ("0.01", ONE_cTAZ / 100),
+                                ("0.1", ONE_cTAZ / 10),
+                                ("1", ONE_cTAZ),
+                                ("10", ONE_cTAZ * 10),
+                                ("100", ONE_cTAZ * 100),
+                                ("1000", ONE_cTAZ * 1000),
+                                ("10000", ONE_cTAZ * 10000),
+                            ];
+                            if data.stake_amount_index >= stakes.len() {
+                                data.stake_amount_index = 0;
+                            }
+
                             if let _ = elem().decl(Decl {
-                                colour: BUTTON_GREY,
-                                radius: ui.scale(18.0).dup4(),
-                                padding: (ui.scale(8.0), ui.scale(18.0), ui.scale(8.0), ui.scale(18.0)),
+                                direction: LeftToRight,
+                                align: Center,
+                                child_gap,
                                 width: fit!(),
                                 height: fit!(),
-                                align: Center,
                                 ..Decl
                             }) {
-                                ui.text(frame_strf!(data, "Amount: {} cTAZ", stakes[data.stake_amount_index].0), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                                let down_id = id("Stake Amount Down");
+                                if button_ex(ui, down_id, "-", data.stake_amount_index > 0) {
+                                    data.stake_amount_index = data.stake_amount_index.saturating_sub(1);
+                                }
+                                hover |= ui.hovered(down_id);
+                                if let _ = elem().decl(Decl {
+                                    colour: BUTTON_GREY,
+                                    radius: ui.scale(18.0).dup4(),
+                                    padding: (ui.scale(8.0), ui.scale(18.0), ui.scale(8.0), ui.scale(18.0)),
+                                    width: fit!(),
+                                    height: fit!(),
+                                    align: Center,
+                                    ..Decl
+                                }) {
+                                    ui.text(frame_strf!(data, "Amount: {} cTAZ", stakes[data.stake_amount_index].0), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                                }
+                                let up_id = id("Stake Amount Up");
+                                if button_ex(ui, up_id, "+", data.stake_amount_index + 1 < stakes.len()) {
+                                    data.stake_amount_index += 1;
+                                }
+                                hover |= ui.hovered(up_id);
                             }
-                            let up_id = id("Stake Amount Up");
-                            if button_ex(ui, up_id, "+", data.stake_amount_index + 1 < stakes.len()) {
-                                data.stake_amount_index += 1;
+                            let selected = stakes[data.stake_amount_index];
+                            let stake_id = id("Stake Selected Amount");
+                            if button_ex(
+                                ui,
+                                stake_id,
+                                frame_strf!(data, "+{} cTAZ", selected.0),
+                                can && (balance as u64) >= selected.1,
+                            ) {
+                                wallet_state.lock().unwrap().stake_to_finalizer(selected.1, hex_dest.unwrap());
                             }
-                            hover |= ui.hovered(up_id);
+                            hover |= ui.hovered(stake_id);
                         }
-                        let selected = stakes[data.stake_amount_index];
-                        let stake_id = id("Stake Selected Amount");
-                        if button_ex(
-                            ui,
-                            stake_id,
-                            frame_strf!(data, "+{} cTAZ", selected.0),
-                            can && (balance as u64) >= selected.1,
-                        ) {
-                            wallet_state.lock().unwrap().stake_to_finalizer(selected.1, hex_dest.unwrap());
-                        }
-                        hover |= ui.hovered(stake_id);
 
                         if !can && !is_staking_day && hover {
                             set_tooltip_text!(data, "You can only stake during Staking Day.");
@@ -3961,7 +4024,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     }
                     if clicked {
                         *wallet::GUI_ENABLE_MINE.lock().unwrap() = !actively_mining;
-                    }  
+                    }
                     if let _ = elem().decl(Decl {
                         direction: TopToBottom,
                         align: TopRight,
