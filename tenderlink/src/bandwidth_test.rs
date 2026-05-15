@@ -26,12 +26,12 @@ pub fn ack_test() {
         let mut send_unreliable = Vec::new();
         if wanted_connections.len() > 0 {
             for _ in 0..1000 {
-            //send_unreliable.push((wanted_connections[0].to_connection_key(), Vec::from(b"Test data...")));
+                send_unreliable.push((wanted_connections[0].0.to_connection_key(), Vec::from(b"Test data...")));
             }
         }
         let ret = new_service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable, });
         wanted_connections = ret.current_connections;
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(10000));
     }
 }
 
@@ -51,17 +51,17 @@ pub fn do_the_test_program3(port: u16, my_keypair: IdentityKeyPair, beam_to: Opt
         loop {
             let mut send_unreliable = Vec::new();
             if wanted_connections.len() > 0 {
-                for _ in 0..1000 {
-                //send_unreliable.push((wanted_connections[0].to_connection_key(), Vec::from(b"Test data...")));
+                for _ in 0..4000 {
+                    send_unreliable.push((wanted_connections[0].0.to_connection_key(), Vec::from(b"Test data...")));
                 }
             }
             let ret = new_service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable, });
             wanted_connections = ret.current_connections;
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
     else {
-        loop { std::thread::sleep(std::time::Duration::from_millis(500)); }
+        loop { std::thread::sleep(std::time::Duration::from_millis(10000)); }
     }
 }
 
@@ -492,8 +492,9 @@ pub struct ConnectionStateConnected {
 
     pub send_sequence_number: u64,
     pub jumbogram_index: u32,
-    pub last_sent_keep_alive_time_ns: u64,
+    pub last_sent_data_packet: u64,
     pub last_ack_received_time: u64,
+    pub last_status_print_time: u64,
 
     pub ack_field: AckField,
     pub ack_timer: u64,
@@ -518,6 +519,8 @@ pub struct ConnectionStateConnected {
     pub tu_probe_size: u64,
     pub tu_probe_size_advance: u64,
     pub tu_probe_failed_count: u64,
+    
+    pub packets_in_flight: u64,
 }
 pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, magic1: u64, magic2: u64, timestamp_ns: u64) -> ConnectionState {
     ConnectionState::Connected(ConnectionStateConnected {
@@ -526,8 +529,9 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         magic2,
         send_sequence_number: 0,
         jumbogram_index: 0,
-        last_sent_keep_alive_time_ns: 0,
+        last_sent_data_packet: 0,
         last_ack_received_time: timestamp_ns,
+        last_status_print_time: timestamp_ns,
         ack_field: Default::default(),
         ack_timer: u64::MAX,
         send_time_band: [0; 1024],
@@ -546,6 +550,8 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         tu_probe_size: 0,
         tu_probe_size_advance: 0,
         tu_probe_failed_count: 0,
+        
+        packets_in_flight: 0,
     })
 }
 
@@ -1306,7 +1312,6 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                         if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                                             state.last_ack_received_time = timestamp_ns;
-                                            println!("got ack for {}", index);
                                             
                                             if index == state.tu_probe_sequence_number {
                                                 state.tu_probe_sequence_number = u64::MAX;
@@ -1314,6 +1319,10 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                                 state.current_tu = state.tu_probe_size;
                                                 state.tu_probe_size_advance *= 2;
                                                 state.tu_probe_failed_count = 0;
+                                            }
+                                            else {
+                                                assert!(state.packets_in_flight > 0, "packets_in_flight underflow");
+                                                state.packets_in_flight -= 1;
                                             }
                                             
                                         }
@@ -1599,12 +1608,16 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                     if send_time != 0 && (state.RTT_p80 == 0 || (current_time_now_ns - send_time) < 3*(state.RTT_p80 as u64 * 100_000)) {
                                         break;
                                     }
-                                    println!("PACKET DROPPED {}", state.packets_waiting_ack_tail);
                                     
                                     if state.packets_waiting_ack_tail == state.tu_probe_sequence_number {
                                         state.tu_probe_sequence_number = u64::MAX;
                                         state.tu_probe_size_advance /= 5;
                                         state.tu_probe_failed_count += 1;
+                                    }
+                                    else {
+                                        println!("PACKET DROPPED {}", state.packets_waiting_ack_tail);
+                                        assert!(state.packets_in_flight > 0, "packets_in_flight underflow");
+                                        state.packets_in_flight -= 1;
                                     }
                                 }
                                 state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
@@ -1616,7 +1629,13 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             // blackhole detected, go to safe TU
                             state.current_tu = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64;
                             state.RTT_sample_cursor = 0;
-                            state.last_sent_keep_alive_time_ns = 0;
+                            state.last_sent_data_packet = 0;
+                            if state.tu_probe_sequence_number != u64::MAX {
+                                // Orphaning an in-flight TU probe. It was never counted in packets_in_flight,
+                                // but a late ack or the tail-advance loop will try to decrement it.
+                                // Count it now so the decrement balances.
+                                state.packets_in_flight += 1;
+                            }
                             state.tu_probe_sequence_number = u64::MAX;
                             state.tu_probe_failed_count = 0;
                             if OVERLY_VERBOSE { println!("Blackhole detected!"); }
@@ -1649,7 +1668,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             state.last_sent_tu_probe_time_ns = send_time_ns;
                         }
                         
-                        if state.last_sent_keep_alive_time_ns + 15_000_000_000/3 < current_time_now_ns {
+                        if state.last_sent_data_packet + 15_000_000_000/3 < current_time_now_ns {
                             let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                             let null_bytes = [0u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
                         
@@ -1668,35 +1687,52 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
 
                             let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21);
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
-                            state.last_sent_keep_alive_time_ns = send_time_ns;
-                            
-                            // bonus status debug print
-                            {
-                                let min = state.RTT_min as f64 / 10.0;
-                                let p80 = state.RTT_p80 as f64 / 10.0;
-                                let max = state.RTT_max as f64 / 10.0;
-                                let n = (state.RTT_sample_cursor as usize).min(128);
-                                println!("RTT (ms): min={min:.1} p80={p80:.1} max={max:.1} (n={n}) --- TU: {} B  failed probes: {}", state.current_tu, state.tu_probe_failed_count);
-                            }
+                            state.last_sent_data_packet = send_time_ns;
+                            state.packets_in_flight += 1;
                         }
+                        
+                        let allowed_bandwidth_upps = 400_000_000u64;
+                        // pps * 10^-6 * rtt * 10^-4 = p * 10^10
+                        let allowed_packets_in_flight = allowed_bandwidth_upps * state.RTT_p80 as u64 / 10_000_000_000;
+                        let allowed_packets_in_flight = allowed_packets_in_flight.max(1);
+                        
+                        // 1 / (upps * 10^-6) = 10^6 / upps <- seconds
+                        // ns = (10^6 / upps) * 10^9 = 10^15 / upps
+                        // We then divide by two because we can't actually get the pace exactly right.
+                        let time_between_sends_ns = (1_000_000_000_000_000 / allowed_bandwidth_upps) / 2;
+                        // If this number is less than 250 us we ignore it because it would be too expensive
+                        // to task switch with such high frequency.
 
-                        while let Some(unreliable_message) = connection_tracking_data.temp_send_unreliable.pop_front() {
+                        while (time_between_sends_ns < 250_000 || state.last_sent_data_packet + time_between_sends_ns < current_time_now_ns) && state.packets_in_flight < allowed_packets_in_flight && let Some(unreliable_message) = connection_tracking_data.temp_send_unreliable.pop_front() {
+                            let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
+                        
                             let virtual_nonce = state.send_sequence_number;
                             store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
                             store_u32(&mut packet_memory_encrypted[2..6], virtual_nonce as u32);
 
                             let packet_len;
                             if let Some(cipher) = &mut state.cipher {
-                                packet_len = cipher.current.write_message(virtual_nonce, &unreliable_message[..], &mut packet_memory_encrypted[6..]).unwrap();
+                                packet_len = cipher.current.write_message(virtual_nonce, &packet_memory_send[0..payload_size], &mut packet_memory_encrypted[6..]).unwrap();
                             }
                             else {
-                                (&unreliable_message[..]).write_to(&mut packet_memory_encrypted[6..]);
-                                packet_len = unreliable_message.len();
+                                (&packet_memory_send[0..payload_size]).write_to(&mut packet_memory_encrypted[6..]);
+                                packet_len = payload_size;
                             }
 
                             let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort);
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
-                            state.last_sent_keep_alive_time_ns = send_time_ns;
+                            state.last_sent_data_packet = send_time_ns;
+                            state.packets_in_flight += 1;
+                        }
+                        
+                        // bonus status debug print
+                        if state.last_status_print_time + 1_000_000_000 < current_time_now_ns {
+                            state.last_status_print_time = current_time_now_ns;
+                            let min = state.RTT_min as f64 / 10.0;
+                            let p80 = state.RTT_p80 as f64 / 10.0;
+                            let max = state.RTT_max as f64 / 10.0;
+                            let n = (state.RTT_sample_cursor as usize).min(128);
+                            println!("RTT (ms): min={min:.1} p80={p80:.1} max={max:.1} (n={n}) --- TU: {} B  failed probes: {} --- in flight: {}/{}  pacing: {} us", state.current_tu, state.tu_probe_failed_count, state.packets_in_flight, allowed_packets_in_flight, time_between_sends_ns / 1000);
                         }
                     }
                 } true});

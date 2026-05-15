@@ -410,7 +410,7 @@ mod linux {
             let n = libc::sendmsg(fd, &msg as *const _ as *mut _, 0);
             if n < 0 {
                 let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EMSGSIZE) {
+                if err.raw_os_error() == Some(libc::EMSGSIZE) || err.raw_os_error() == Some(libc::EAGAIN) {
                     return timestamp_ns;
                 }
                 panic!("UDP Socket error: {}", err);
@@ -422,7 +422,7 @@ mod linux {
             timestamp_ns
         }
     }
-    
+
     #[inline]
     pub fn udp_recv_with_congestion_and_dscp( // Linux
         udp_socket: SockHandle,
@@ -951,7 +951,7 @@ mod windows {
         };
         if n == SOCKET_ERROR {
             let e = unsafe { WSAGetLastError() };
-            if e == WSAEMSGSIZE {
+            if e == WSAEMSGSIZE || e == WSAEWOULDBLOCK {
                 return timestamp_ns;
             }
             panic!("UDP Socket error: {}", std::io::Error::from_raw_os_error(e));
@@ -1478,7 +1478,7 @@ mod macos {
             let n = libc::sendmsg(fd, &msg as *const _ as *mut _, 0);
             if n < 0 {
                 let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EMSGSIZE) {
+                if err.raw_os_error() == Some(libc::EMSGSIZE) || err.raw_os_error() == Some(libc::EAGAIN) {
                     return timestamp_ns;
                 }
                 panic!("UDP Socket error: {}", err);
