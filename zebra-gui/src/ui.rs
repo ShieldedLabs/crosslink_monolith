@@ -3287,7 +3287,7 @@ pub fn ui_right_pane(ui: &mut Context,
             }
             if filters.show_popup {
                 if let _ = elem().decl(Decl {
-                    id: ui::id("Finalizer Popup Container"),
+                    id: id("Finalizer Popup Container"),
                     colour: BUTTON_GREY,
                     child_gap: ui.scale(12.0),
                     padding: (ui.scale(12.0), ui.scale(12.0), ui.scale(12.0), ui.scale(12.0)),
@@ -3301,7 +3301,8 @@ pub fn ui_right_pane(ui: &mut Context,
 
                     ui.checkbox(id("Matches Height"), &mut filters.filter_height, "Must have voted at the latest height", width);
 
-                    if let _ = elem().decl(Decl {
+                    // Let's reintroduce this when everyone is reporting liveness.
+                    if false && let _ = elem().decl(Decl {
                         id: ui::id("Finalizer Status Container"),
                         width: fit!(width),
                         height: fit!(radius * 2.0),
@@ -3312,7 +3313,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
                         let secs_string = ui.textbox(
                             data,
-                            ui::id("Seconds since connected Textbox"),
+                            id("Seconds since connected Textbox"),
                             "Seconds since connected...",
                             TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
                         );
@@ -3327,20 +3328,31 @@ pub fn ui_right_pane(ui: &mut Context,
                 }
             }
 
+
+            let element_containing_the_phrase_your_finalizer_identity_and_the_key_which_you_can_hover_for_bft_details = id("Element Containing The Phrase \"Your Finalizer Identity\" And The Key Which You Can Hover For BFT Details");
+            if let _ = elem().decl(Decl {
+                id: element_containing_the_phrase_your_finalizer_identity_and_the_key_which_you_can_hover_for_bft_details,
+                child_gap,
+                align: Center,
+                direction: TopToBottom,
+                ..Decl
+            }) {
+                ui.text("Your Finalizer Identity", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+                ui.text(frame_strf!(data, "[{}..{}]", &recv_address[0..8], &recv_address[recv_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
+            }
+
             //@TODO(Giovanni): Maybe lock behind a key-input (hold to open the popup)...
-            if ui.hovered(id("Finalizers Buttons")) {
-                set_tooltip_text!(data, "last checked: {}\nheight: {}\nround: {}\nstep: {}\n\"valid\" round: {}\n\"locked\" round: {}",
-                    bft_status.now_utc,
+            if ui.hovered(element_containing_the_phrase_your_finalizer_identity_and_the_key_which_you_can_hover_for_bft_details) {
+                set_tooltip_text!(data, "BFT Details\n  Height: {}\n  Round: {}\n  Step: {}\n  \"Valid\" round: {}\n  \"Locked\" round: {}\n  Last checked: {}",
                     bft_status.my_height,
                     bft_status.my_round,
                     ["Proposal", "Prevote", "Precommit"][bft_status.my_step as usize],
                     bft_status.my_valid_round,
                     bft_status.my_locked_round,
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(bft_status.now_utc, 0).expect("recent Unix timestamp should be encodable as a UTC DateTime"),
                 );
                 data.tooltip_wrap = Wrap::None;
             }
-            ui.text("Your Finalizer Identity", TextDecl { h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
-            ui.text(frame_strf!(data, "[{}..{}]", &recv_address[0..8], &recv_address[recv_address.len()-8..]), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
 
             if button_ex(ui, "Copy Identity", true, true) {
                 ui.input().send_to_clipboard(&recv_address);
@@ -3508,8 +3520,7 @@ pub fn ui_right_pane(ui: &mut Context,
                         let pct = (member.voting_power as f32 / total_stake as f32) * 100.0;
                         set_tooltip_text!(data, "{:.2}% of stake", pct);
 
-                        #[cfg(debug_assertions)]
-                        {
+                        if ui.debug {
                             set_tooltip_text!(data, "{}\n{:#?}", data.tooltip_text, finalizer_status);
                             data.tooltip_wrap = Wrap::None;
                         }
