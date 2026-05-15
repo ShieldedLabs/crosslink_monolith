@@ -523,6 +523,44 @@ impl Context {
         self.mouse_pressed_id == Id::default() && self.hovered_id == id
     }
 
+    pub fn checkbox(
+        &mut self,
+        id: Id,
+        checked: &mut bool,
+        label: &str,
+        width: f32,
+    ) {
+        let icon = if *checked { ICON_CHECK } else { ICON_CIRCLE_EMPTY };
+        let (clicked, colour, text_colour) = self.button_ex(
+            true, BUTTON_GREY, id, true, winit::window::CursorIcon::Pointer,
+        );
+        if let _ = elem().decl(Decl {
+            id,
+            colour,
+            child_gap: self.scale(8.0),
+            radius: self.scale(4.0).dup4(),
+            align: Center,
+            direction: LeftToRight,
+            width: fit!(width),
+            ..Decl
+        }) {
+            self.text(icon, TextDecl {
+                font: Icons,
+                h: self.scale(16.0),
+                colour: text_colour,
+                align: AlignX::Center,
+                ..TextDecl
+            });
+            self.text(label, TextDecl {
+                font: Mono,
+                h: self.scale(16.0),
+                colour: text_colour,
+                align: AlignX::Left,
+                ..TextDecl
+            });
+            if clicked { *checked = !*checked; }
+        }
+    }
     pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: winit::window::CursorIcon) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
 
         let mouse_hover = self.hovered_raw(id);
@@ -3231,47 +3269,8 @@ pub fn ui_right_pane(ui: &mut Context,
                             height: fit!(),
                             ..Decl
                         }) {
-                            // "Your criteria for considering finalizers online"
-                            let toggle_id = id("Matches Height Button");
-                            let toggle_text = if filters.filter_height {
-                                "[X] Must have voted at the latest height"
-                            } else {
-                                "[ ] Must have voted at the latest height"
-                            };
-
-                            let (toggle_clicked, toggle_colour, toggle_text_colour) = ui.button_ex(
-                                true,
-                                BUTTON_GREY,
-                                toggle_id,
-                                true,
-                                winit::window::CursorIcon::Pointer,
-                            );
-
-                            if let _ = elem().decl(Decl {
-                                id: toggle_id,
-                                colour: toggle_colour,
-                                radius: ui.scale(4.0).dup4(),
-                                align: Center,
-                                direction: TopToBottom,
-
-                                width: fit!(width),
-                                ..Decl
-                            }) {
-                                ui.text(
-                                    toggle_text,
-                                    TextDecl {
-                                        font: Mono,
-                                        h: ui.scale(16.0),
-                                        colour: toggle_text_colour,
-                                        align: AlignX::Center,
-                                        ..TextDecl
-                                    },
-                                );
-
-                                if toggle_clicked {
-                                    filters.filter_height = !filters.filter_height;
-                                }
-                            }
+                            
+                            ui.checkbox(id("Matches Height"), &mut filters.filter_height, "Must have voted at the latest height", width);
 
                             if let _ = elem().decl(Decl {
                                 id: ui::id("Finalizer Status Container"),
@@ -3987,7 +3986,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         }
 
                     }
-
+                    // @TODO(Giovanni): Repalce with new ui.checkbox()
                     let mining_label = "MINING";
                     let mining_id = id(mining_label);
                     let actively_mining: bool = *wallet::GUI_ENABLE_MINE.lock().unwrap();
@@ -4009,7 +4008,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     }
                     if clicked {
                         *wallet::GUI_ENABLE_MINE.lock().unwrap() = !actively_mining;
-                    }
+                    }  
                     if let _ = elem().decl(Decl {
                         direction: TopToBottom,
                         align: TopRight,
