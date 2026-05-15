@@ -3123,7 +3123,7 @@ pub fn ui_right_pane(ui: &mut Context,
     }
     if let _ = elem().decl(Decl {
         id: id("Finalizers Contents"),
-        padding, child_gap,
+        padding: (padding.0, padding.1, 0.0, padding.3), child_gap,
         radius: (0.0, 0.0, 0.0, radius.3),
         colour: PANE_COL,
         direction: TopToBottom,
@@ -3188,7 +3188,7 @@ pub fn ui_right_pane(ui: &mut Context,
         // @todo(judah): incorporate into list below? (i.e. always at the top of the list (and doesn't scroll with the rest), styled different from the others)
         if let _ = elem().decl(Decl {
             id: id("Finalizers Buttons"),
-            padding, child_gap, align: Center,
+            child_gap, align: Center,
             direction: TopToBottom,
             width: percent!(1.0),
             height: fit!(),
@@ -3200,97 +3200,68 @@ pub fn ui_right_pane(ui: &mut Context,
                 recv_address.push_str(&format!("{:02x}", b));
             }
 
+            let width = ui.scale(160.0);
+            let radius = ui.scale(16.0);
+            let finalizer_popup_id = id("Finalizer Popup Button");
+            let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, finalizer_popup_id, true, winit::window::CursorIcon::Pointer);
+            let label = "Finalizer Filters";
             if let _ = elem().decl(Decl {
-                id: id("Finalizers Buttons"),
+                id: finalizer_popup_id,
+                colour,
                 padding,
-                child_gap,
+                child_gap: ui.scale(4.0),
+                radius: radius.dup4(),
                 align: Center,
-                direction: TopToBottom,
-                width: percent!(1.0),
-                height: fit!(),
+                width:  fit!(),
+                height: fit!(), // @Todo: still broken, needs fixing
                 ..Decl
             }) {
-                let combo_id = id("Finalizer Online Status");
-                let base_color = BUTTON_GREY.mul(0.85);
-
-                let (_activated, colour, _text_colour) = ui.button_ex(true, base_color, combo_id, true, winit::window::CursorIcon::Pointer);
-
+                ui.text(label, TextDecl { font: Normal, h: ui.scale(16.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
+                ui.text(ICON_DOWN_OPEN, TextDecl { font: Icons, h: ui.scale(10.0), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
+            }
+            if clicked {
+                filters.show_popup = !filters.show_popup;
+            }
+            if filters.show_popup {
                 if let _ = elem().decl(Decl {
-                    id: combo_id,
-                    colour,
-                    direction: TopToBottom,
+                    id: ui::id("Finalizer Popup Container"),
+                    colour: BUTTON_GREY,
+                    child_gap: ui.scale(12.0),
+                    padding: (ui.scale(12.0), ui.scale(12.0), ui.scale(12.0), ui.scale(12.0)),
+                    radius: ui.scale(16.0).dup4(),
                     align: Center,
-                    width: fit!(),
+                    direction: TopToBottom,
+                    width: fit!(width),
                     height: fit!(),
-                    radius: ui.scale(4.0).dup4(),
                     ..Decl
                 }) {
-                    let width = ui.scale(160.0);
-                    let radius = ui.scale(16.0);
-                    let finalizer_popup_id = id("Finalizer Popup Button");
-                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, finalizer_popup_id, true, winit::window::CursorIcon::Pointer);
-                    let label = "Finalizer Filters";
+
+                    ui.checkbox(id("Matches Height"), &mut filters.filter_height, "Must have voted at the latest height", width);
+
                     if let _ = elem().decl(Decl {
-                        id: finalizer_popup_id,
-                        colour,
-                        padding,
-                        child_gap,
-                        radius: radius.dup4(),
-                        align: Center,
-                        width:  fit!(ui.scale(128.0)),
+                        id: ui::id("Finalizer Status Container"),
+                        width: fit!(width),
                         height: fit!(radius * 2.0),
+                        direction: TopToBottom,
+                        radius: ui.scale(4.0).dup4(),
                         ..Decl
                     }) {
-                        ui.text(label, TextDecl { font: Normal, h: ui.scale(16.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
-                    }
-                    if clicked {
 
-                        filters.show_popup = !filters.show_popup;
-                    }
-                    if filters.show_popup{
-                        if let _ = elem().decl(Decl {
-                            id: ui::id("Finalizer Popup Container"),
-                            colour: BUTTON_GREY,
-                            child_gap: ui.scale(12.0),
-                            padding: (ui.scale(12.0), ui.scale(12.0), ui.scale(12.0), ui.scale(12.0)),
-                            radius: ui.scale(16.0).dup4(),
-                            align: Center,
-                            direction: TopToBottom,
-                            width: fit!(width),
-                            height: fit!(),
-                            ..Decl
-                        }) {
-                            
-                            ui.checkbox(id("Matches Height"), &mut filters.filter_height, "Must have voted at the latest height", width);
-
-                            if let _ = elem().decl(Decl {
-                                id: ui::id("Finalizer Status Container"),
-                                width: fit!(width),
-                                height: fit!(radius * 2.0),
-                                direction: TopToBottom,
-                                radius: ui.scale(4.0).dup4(),
-                                ..Decl
-                            }) {
-
-                                let secs_string = ui.textbox(
-                                    data,
-                                    ui::id("Seconds since connected Textbox"),
-                                    "Seconds since connected...",
-                                    TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
-                                );
-                                let secs_str = secs_string.trim();
-                                if let Ok (value) = secs_str.parse::<u32>(){
-                                    filters.filter_seconds_since_connected = value;
-                                    //println!("{:?}", state.finalizer_seconds_since_connected);
-                                } else if secs_str.len() == 0 {
-                                    filters.filter_seconds_since_connected = 0;
-                                }
-                            }
+                        let secs_string = ui.textbox(
+                            data,
+                            ui::id("Seconds since connected Textbox"),
+                            "Seconds since connected...",
+                            TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
+                        );
+                        let secs_str = secs_string.trim();
+                        if let Ok (value) = secs_str.parse::<u32>(){
+                            filters.filter_seconds_since_connected = value;
+                            //println!("{:?}", state.finalizer_seconds_since_connected);
+                        } else if secs_str.len() == 0 {
+                            filters.filter_seconds_since_connected = 0;
                         }
                     }
-
                 }
-
             }
 
             //@TODO(Giovanni): Maybe lock behind a key-input (hold to open the popup)...
