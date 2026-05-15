@@ -2452,14 +2452,13 @@ pub fn ui_left_pane(ui: &mut Context,
                                                     (WHITE.mul(0.5), ICON_ATTENTION_1)
                                                 };
 
-
-                                                ui_colour_chip(ui, h, colour_from_hash(&finalizer, is_online), is_hovered, chip_icon, chip_icon_colour);
+                                                ui_colour_chip(ui, chip_h, colour_from_hash(&finalizer, is_online), is_hovered, chip_icon, chip_icon_colour);
 
                                                 ui.text(label, TextDecl { colour: text_colour, h, align: AlignX::Left, ..TextDecl });
                                                 let _ = elem().decl(Decl { width: grow!(), ..Decl });
                                                 let pct = 100.0 * (total_bonded_to_finalizer as f64 / total_bonded as f64);
                                                 let colour = (0xff, 0xaf, 0x0e, 0xff);
-                                                ui.text(frame_strf!(data, "{} cTAZ ({:.2}%)", str_from_ctaz(total_bonded_to_finalizer), pct), TextDecl { font: Mono, colour, h: ui.scale(18.0), align: AlignX::Right, ..TextDecl });
+                                                ui.text(frame_strf!(data, "{} cTAZ ({:.2}%)", str_from_ctaz(total_bonded_to_finalizer), pct), TextDecl { font: Mono, colour, h: ui.scale(12.0), align: AlignX::Right, ..TextDecl });
                                             }
 
                                             if is_hovered {
@@ -3151,7 +3150,7 @@ pub fn ui_colour_chip(ui: &mut Context, h: f32, colour: (u8, u8, u8, u8), is_hov
         if let _ = elem().decl(Decl { colour: WHITE, padding: ui.scale(2.0).dup4(), ..chip_decl }) {
             if let _ = elem().decl(Decl { width: grow!(), height: grow!(), radius: ui.scale(3.0).dup4(), ..chip_decl }) {
                 if icon != "" {
-                    ui.text(icon, TextDecl { font: Icons, h: (h * 0.5).floor(), colour: icon_colour, align: AlignX::Left, ..TextDecl });
+                    ui.text(icon, TextDecl { font: Icons, h: (h * 0.6).floor(), colour: icon_colour, align: AlignX::Left, ..TextDecl });
                 }
             }
         };
@@ -3159,7 +3158,7 @@ pub fn ui_colour_chip(ui: &mut Context, h: f32, colour: (u8, u8, u8, u8), is_hov
         // @Todo: @Refactor @Duplicate.
         if let _ = elem().decl(chip_decl) {
             if icon != "" {
-                ui.text(icon, TextDecl { font: Icons, h: (h * 0.5).floor(), colour: icon_colour, align: AlignX::Left, ..TextDecl });
+                ui.text(icon, TextDecl { font: Icons, h: (h * 0.6).floor(), colour: icon_colour, align: AlignX::Left, ..TextDecl });
             }
         }
     }
@@ -3462,7 +3461,7 @@ pub fn ui_right_pane(ui: &mut Context,
                     if let _ = elem().decl(Decl {
                         id: roster_member_id,
                         padding: (padding.0/4f32, padding.1/4f32, padding.2, padding.3),
-                        child_gap: ui.scale(8.0),
+                        child_gap: ui.scale(10.0),
                         height: fixed!(ui.scale(48.0)),
                         width: percent!(1.0),
                         direction: LeftToRight,
@@ -3481,15 +3480,6 @@ pub fn ui_right_pane(ui: &mut Context,
                             (WHITE.mul(0.5), ICON_ATTENTION_1)
                         };
 
-                        // left icon
-                        // if let _ = elem().decl(Decl {
-                        //     id: id_index("Roster Member Left Icon", index as u32),
-                        //     height: fit!(),
-                        //     width: fixed!(ui.scale(32.0)),
-                        //     direction: TopToBottom,
-                        //     align: Center,
-                        //     ..Decl
-                        // })
                         {
                             if clickable_icon(ui, id_index("Copy Button", index as u32), ICON_DOCS_1, true) {
                                 let mut address_str = String::new();
