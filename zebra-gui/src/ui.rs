@@ -45,6 +45,7 @@ pub struct UiData {
 
     pub tooltip_text: String,
     pub tooltip_wrap: Wrap,
+    pub tooltip_font: FontKind,
     pub jump_target_pos: bool,
 
     pub hovered_finalizer_pk: [u8; 32],
@@ -63,6 +64,7 @@ macro_rules! set_tooltip_text {
     ($data:expr, $($arg:tt)*) => {
         $data.tooltip_text = format_args!($($arg)*).to_string();
         $data.tooltip_wrap = Wrap::default();
+        $data.tooltip_font = FontKind::Normal;
     };
 }
 
@@ -2443,7 +2445,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                                 // ui.text("Staked to:", TextDecl { colour: text_colour, h: ui.scale(18.0), align: AlignX::Center, ..TextDecl });
                                                 let h = ui.scale(18.0);
 
-                                                ui_colour_chip(ui, h, colour_from_hash(&finalizer, is_online), is_hovered);
+                                                ui_colour_chip(ui, h, colour_from_hash(&finalizer, is_online), is_hovered, "", (0, 0, 0, 0));
 
                                                 ui.text(label, TextDecl { colour: text_colour, h, align: AlignX::Left, ..TextDecl });
                                                 let _ = elem().decl(Decl { width: grow!(), ..Decl });
@@ -3134,14 +3136,24 @@ pub fn ui_left_pane(ui: &mut Context,
     ui.nav_skip = false;
 }
 
-pub fn ui_colour_chip(ui: &mut Context, h: f32, colour: (u8, u8, u8, u8), is_hovered: bool) {
-    let chip_decl = Decl { width: fixed!(h), height: fixed!(h), radius: ui.scale(4.0).dup4(), padding: ui.scale(2.0).dup4(), colour, ..Decl };
+pub fn ui_colour_chip(ui: &mut Context, h: f32, colour: (u8, u8, u8, u8), is_hovered: bool, icon: &'static str, icon_colour: (u8, u8, u8, u8)) {
+    let chip_decl = Decl { width: fixed!(h), height: fixed!(h), radius: ui.scale(4.0).dup4(), align: Center, colour, ..Decl };
     if is_hovered {
-        if let _ = elem().decl(Decl { colour: WHITE, ..chip_decl }) {
-            let _ = elem().decl(Decl { width: grow!(), height: grow!(), radius: ui.scale(3.0).dup4(), ..chip_decl });
+        // @Todo: @Refactor @Duplicate.
+        if let _ = elem().decl(Decl { colour: WHITE, padding: ui.scale(2.0).dup4(), ..chip_decl }) {
+            if let _ = elem().decl(Decl { width: grow!(), height: grow!(), radius: ui.scale(3.0).dup4(), ..chip_decl }) {
+                if icon != "" {
+                    ui.text(icon, TextDecl { font: Icons, h: (h * 0.5).floor(), colour: icon_colour, align: AlignX::Left, ..TextDecl });
+                }
+            }
         };
     } else {
-        let _ = elem().decl(chip_decl);
+        // @Todo: @Refactor @Duplicate.
+        if let _ = elem().decl(chip_decl) {
+            if icon != "" {
+                ui.text(icon, TextDecl { font: Icons, h: (h * 0.5).floor(), colour: icon_colour, align: AlignX::Left, ..TextDecl });
+            }
+        }
     }
 
 }
@@ -3442,7 +3454,7 @@ pub fn ui_right_pane(ui: &mut Context,
                     if let _ = elem().decl(Decl {
                         id: roster_member_id,
                         padding: (padding.0/4f32, padding.1/4f32, padding.2, padding.3),
-                        child_gap,
+                        child_gap: ui.scale(8.0),
                         height: fixed!(ui.scale(48.0)),
                         width: percent!(1.0),
                         direction: LeftToRight,
@@ -3462,14 +3474,15 @@ pub fn ui_right_pane(ui: &mut Context,
                         };
 
                         // left icon
-                        if let _ = elem().decl(Decl {
-                            id: id_index("Roster Member Left Icon", index as u32),
-                            height: fit!(),
-                            width: fixed!(ui.scale(32.0)),
-                            direction: TopToBottom,
-                            align: Center,
-                            ..Decl
-                        }) {
+                        // if let _ = elem().decl(Decl {
+                        //     id: id_index("Roster Member Left Icon", index as u32),
+                        //     height: fit!(),
+                        //     width: fixed!(ui.scale(32.0)),
+                        //     direction: TopToBottom,
+                        //     align: Center,
+                        //     ..Decl
+                        // })
+                        {
                             if clickable_icon(ui, id_index("Copy Button", index as u32), ICON_DOCS_1, true) {
                                 let mut address_str = String::new();
                                 for b in member.pub_key.iter().rev() {
@@ -3481,7 +3494,8 @@ pub fn ui_right_pane(ui: &mut Context,
 
                         // finalizer colour token
                         let info_h = ui.scale(18.0);
-                        ui_colour_chip(ui, info_h, colour_from_hash(&member.pub_key, is_online), data.hovered_finalizer_pk == member.pub_key);
+                        let chip_h = ui.scale(24.0);
+                        ui_colour_chip(ui, chip_h, colour_from_hash(&member.pub_key, is_online), data.hovered_finalizer_pk == member.pub_key, icon, text_colour);
 
                         // info
                         if let _ = elem().decl(Decl {
@@ -3492,8 +3506,7 @@ pub fn ui_right_pane(ui: &mut Context,
                             align: TopLeft,
                             ..Decl
                         }) {
-                            ui.text(icon, TextDecl { font: Icons, h: ui.scale(16.0), colour: text_colour, align: AlignX::Left, ..TextDecl });
-                            ui.text(frame_strf!(data, " {}", display_str_with_edge_bytes(&chunkify(&member.pub_key), 3)), TextDecl { font: Mono, colour: text_colour, h: info_h, align: AlignX::Left, ..TextDecl });
+                            ui.text(frame_strf!(data, "{}", display_str_with_edge_bytes(&chunkify(&member.pub_key), 3)), TextDecl { font: Mono, colour: text_colour, h: info_h, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
                         }
 
                         // right info
@@ -3516,13 +3529,30 @@ pub fn ui_right_pane(ui: &mut Context,
 
                     if ui.hovered(roster_member_id) {
                         data.hovered_finalizer_pk = member.pub_key;
-
                         let pct = (member.voting_power as f32 / total_stake as f32) * 100.0;
-                        set_tooltip_text!(data, "{:.2}% of stake", pct);
 
-                        if ui.debug {
-                            set_tooltip_text!(data, "{}\n{:#?}", data.tooltip_text, finalizer_status);
+                        if let Some(finalizer_status) = finalizer_status {
+                            let  no_votes_across_all_round_in_this_height = finalizer_status.no_yes_votes_in_my_height[0][0] + finalizer_status.no_yes_votes_in_my_height[1][0];
+                            let yes_votes_across_all_round_in_this_height = finalizer_status.no_yes_votes_in_my_height[0][1] + finalizer_status.no_yes_votes_in_my_height[1][1];
+                            let highest_round_this_finalizer_voted        = finalizer_status.highest_round_vote;
+                            // finalizer_status.last_seen_new_info_utc;     // "\n  Time Last Info Seen: {}"
+                            // finalizer_status.last_direct_connection_utc; // "\n  Time Last Connected: {}"
+
+                            set_tooltip_text!(data,
+                                              std::concat!("Finalizer {}:\n",
+                                                           "  {:.2}% of stake\n",
+                                                           "  No  Votes Across All Rounds In This Height: {}\n",
+                                                           "  Yes Votes Across All Rounds In This Height: {}\n",
+                                                           "  Highest Round This Finalizer Voted (Untrusted): {}"),
+                                              wallet::bft::PubKeyID(member.pub_key),
+                                              pct,
+                                              no_votes_across_all_round_in_this_height,
+                                              yes_votes_across_all_round_in_this_height,
+                                              highest_round_this_finalizer_voted);
                             data.tooltip_wrap = Wrap::None;
+                            data.tooltip_font = Mono;
+                        } else {
+                            set_tooltip_text!(data, "Finalizer {}:\n  {:.2}% of stake", wallet::bft::PubKeyID(member.pub_key), pct);
                         }
                     }
                 }
@@ -4249,7 +4279,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             floating: Floating::Root(tooltip_pos.0, tooltip_pos.1),
             ..Decl
         }) {
-            ui.text(&data.tooltip_text, TextDecl { h: ui.scale(16.0), wrap: data.tooltip_wrap, align: AlignX::Left, ..TextDecl });
+            let h    = ui.scale(16.0);
+            let wrap = data.tooltip_wrap;
+            let font = data.tooltip_font;
+            ui.text(&data.tooltip_text, TextDecl { h, wrap, font, align: AlignX::Left, ..TextDecl });
         }
     }
 
