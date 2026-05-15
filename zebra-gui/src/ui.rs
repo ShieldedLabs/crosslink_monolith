@@ -3212,8 +3212,7 @@ pub fn ui_right_pane(ui: &mut Context,
                 let combo_id = id("Finalizer Online Status");
                 let base_color = BUTTON_GREY.mul(0.85);
 
-                let (_activated, colour, _text_colour) =
-                    ui.button_ex(true, base_color, combo_id, true, winit::window::CursorIcon::Pointer);
+                let (_activated, colour, _text_colour) = ui.button_ex(true, base_color, combo_id, true, winit::window::CursorIcon::Pointer);
 
                 if let _ = elem().decl(Decl {
                     id: combo_id,
@@ -3225,15 +3224,6 @@ pub fn ui_right_pane(ui: &mut Context,
                     radius: ui.scale(4.0).dup4(),
                     ..Decl
                 }) {
-                    if let _ = elem().decl(Decl {
-                        colour,
-                        width: fit!(),
-                        height: fit!(),
-                        ..Decl
-
-                    }) {}
-                }
-
                     let width = ui.scale(160.0);
                     let radius = ui.scale(16.0);
                     let finalizer_popup_id = id("Finalizer Popup Button");
@@ -3295,13 +3285,15 @@ pub fn ui_right_pane(ui: &mut Context,
                                     filters.filter_seconds_since_connected = 0;
                                 }
                             }
-                        }                    
+                        }
                     }
-                        
+
+                }
 
             }
+
             //@TODO(Giovanni): Maybe lock behind a key-input (hold to open the popup)...
-            if(ui.hovered(id("Finalizers Buttons"))){
+            if ui.hovered(id("Finalizers Buttons")) {
                 set_tooltip_text!(data, "last checked: {}\nheight: {}\nround: {}\nstep: {}\n\"valid\" round: {}\n\"locked\" round: {}",
                     bft_status.now_utc,
                     bft_status.my_height,
