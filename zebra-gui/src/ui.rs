@@ -1217,7 +1217,7 @@ fn finalizer_is_online_ex(f: &FinalizerRecencyStatus, bft_status: &wallet::TFLRe
 fn finalizer_is_online(pub_key: [u8;32], bft_status: &wallet::TFLRecencyStatus, filters: &FinalizerFilters) -> bool {
     let mut ok:bool = true;
     let Some(f) = get_finalizer_status(bft_status, pub_key) else {
-        println!("Didn't find finalizer in list: {}", wallet::bft::PubKeyID(pub_key));
+        // println!("Didn't find finalizer in list: {}", wallet::bft::PubKeyID(pub_key));
         return false;
     };
 
