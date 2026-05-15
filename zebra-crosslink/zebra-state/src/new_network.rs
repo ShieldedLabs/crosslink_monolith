@@ -12,7 +12,7 @@ use tenderlink::bandwidth_test::*;
 use tenderlink::native_sockets::*;
 use tenderlink::parse_to_ipv6_bytes;
 use tenderlink::{SliceWrite, SliceRead};
-use tenderlink::{dbg_panic, dbg_panic_internal, dbg_verify};
+use tenderlink::{dbg_panic, dbg_verify};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum BlockEvent {

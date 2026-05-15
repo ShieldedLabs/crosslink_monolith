@@ -33,8 +33,8 @@ const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
     panic!("{msg}");
 }
 #[macro_export] macro_rules! dbg_panic {
-    ()            => { #[cfg(debug_assertions)] dbg_panic_internal(format_args!("explicit panic")); };
-    ($($arg:tt)*) => { #[cfg(debug_assertions)] dbg_panic_internal(format_args!($($arg)*)); };
+    ()            => { #[cfg(debug_assertions)] tenderlink::dbg_panic_internal(format_args!("explicit panic")); };
+    ($($arg:tt)*) => { #[cfg(debug_assertions)] tenderlink::dbg_panic_internal(format_args!($($arg)*)); };
 }
 
 pub fn dbg_verify<T>(t: Option<T>) -> Option<T> {
