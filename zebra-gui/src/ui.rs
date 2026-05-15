@@ -14,7 +14,7 @@ use clay::layout::{Alignment, LayoutAlignmentX, LayoutAlignmentY};
 use std::collections::HashMap;
 use std::cell::RefCell;
 //use clay::*; // @Temporary
-
+use FontKind::Normal;
 use wallet::{ BlockHeight, TxParts, TxStatus, WalletState, WalletTxKind, WalletTxPart, WalletRosterMember, FinalizerFilters, FinalizerRecencyStatus, str_from_ctaz };
 
 use super::*;
@@ -505,7 +505,7 @@ impl HSVA_RGBA for (u8, u8, u8, u8) {
 }
 
 impl Context {
-    pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, global_audio_volume: 1.0, ..Default::default() } }
+    pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, global_audio_volume: 0.4, ..Default::default() } }
     pub fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw     } }
     pub fn draw_mut(&mut self) -> &mut DrawCtx { unsafe { &mut *(self.draw as *mut DrawCtx) } }
     pub fn input(&self) -> &InputCtx { unsafe { &*self.input    } }
@@ -1185,104 +1185,6 @@ fn finalizer_is_online(pub_key: [u8;32], bft_status: &wallet::TFLRecencyStatus, 
     finalizer_is_online_ex(&f, bft_status, filters)
 }
 
-fn show_finalizer_popup(
-    ui: &mut Context,
-    data: &mut UiData,
-    filters: &mut FinalizerFilters,
-    popup_pos: (f32, f32),
-) {
-    let width = ui.scale(160.0);
-    let radius = ui.scale(16.0);
-
-    let container_id = ui::id("Finalizer Popup Container");
-
-    let (clicked, colour, text_colour) = ui.button_ex(
-        true,
-        BUTTON_GREY,
-        container_id,
-        true,
-        winit::window::CursorIcon::Default,
-    );
-
-    if let _ = elem().decl(Decl {
-        id: container_id,
-        colour,
-        child_gap: ui.scale(8.0),
-        radius: ui.scale(6.0).dup4(),
-        align: Center,
-        direction: TopToBottom,
-        width: fit!(width),
-        height: fit!(),
-        floating: Floating::Root(popup_pos.0, popup_pos.1),
-        ..Decl
-    }) {
-        // "Your criteria for considering finalizers online"
-        let toggle_id = id("Matches Height Button");
-        let toggle_text = if filters.filter_height {
-            "[X] Must have voted at the latest height"
-        } else {
-            "[ ] Must have voted at the latest height"
-        };
-
-        let (toggle_clicked, toggle_colour, toggle_text_colour) = ui.button_ex(
-            true,
-            colour,
-            toggle_id,
-            true,
-            winit::window::CursorIcon::Pointer,
-        );
-
-        if let _ = elem().decl(Decl {
-            id: toggle_id,
-            colour: toggle_colour,
-            radius: ui.scale(4.0).dup4(),
-            align: Center,
-            direction: TopToBottom,
-
-            width: fit!(width),
-            ..Decl
-        }) {
-            ui.text(
-                toggle_text,
-                TextDecl {
-                    font: Mono,
-                    h: ui.scale(16.0),
-                    colour: toggle_text_colour,
-                    align: AlignX::Center,
-                    ..TextDecl
-                },
-            );
-
-            if toggle_clicked {
-                filters.filter_height = !filters.filter_height;
-            }
-        }
-
-        if let _ = elem().decl(Decl {
-            id: ui::id("Finalizer Status Container"),
-            width: fit!(width),
-            height: fit!(radius * 2.0),
-            direction: TopToBottom,
-            radius: ui.scale(4.0).dup4(),
-            ..Decl
-        }) {
-
-            let secs_string = ui.textbox(
-                data,
-                ui::id("Seconds since connected Textbox"),
-                "Seconds since connected...",
-                TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
-            );
-            let secs_str = secs_string.trim();
-            if let Ok (value) = secs_str.parse::<u32>(){
-                filters.filter_seconds_since_connected = value;
-                //println!("{:?}", state.finalizer_seconds_since_connected);
-            } else if secs_str.len() == 0 {
-                filters.filter_seconds_since_connected = 0;
-            }
-        }
-    }
-}
 
 pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wallet::TFLRecencyStatus, finalizers: &[WalletRosterMember], total_val: u64, height:u32, seconds_since_connected:u64, filters:&FinalizerFilters, id:ui::Id, is_real_finalizers: bool) {
     let mut rem_hovered = false;
@@ -3264,7 +3166,7 @@ pub fn ui_right_pane(ui: &mut Context,
                 padding,
                 child_gap,
                 align: Center,
-                direction: LeftToRight,
+                direction: TopToBottom,
                 width: percent!(1.0),
                 height: fit!(),
                 ..Decl
@@ -3278,7 +3180,7 @@ pub fn ui_right_pane(ui: &mut Context,
                 if let _ = elem().decl(Decl {
                     id: combo_id,
                     colour,
-                    direction: LeftToRight,
+                    direction: TopToBottom,
                     align: Center,
                     width: fit!(),
                     height: fit!(),
@@ -3294,24 +3196,110 @@ pub fn ui_right_pane(ui: &mut Context,
                     }) {}
                 }
 
-                if ui.input().mouse_pressed(winit::event::MouseButton::Right) {
-                    filters.show_popup = !filters.show_popup;
-
-                    if filters.show_popup {
-                        let mouse_pos = ui.input().mouse_pos();
-                        let dpi = ui.dpi_scale;
-                        filters.popup_pos = Some((
-                            (mouse_pos.0 as f32 + 8.0 * dpi).min(ui.draw().window_width as f32 - 200.0),
-                            (mouse_pos.1 as f32 + 6.0 * dpi).min(ui.draw().window_height as f32 - 150.0),
-                        ));
+                    let width = ui.scale(160.0);
+                    let radius = ui.scale(16.0);
+                    let finalizer_popup_id = id("Finalizer Popup Button");
+                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, finalizer_popup_id, true, winit::window::CursorIcon::Pointer);
+                    let label = "Finalizer Filters";
+                    if let _ = elem().decl(Decl {
+                        id: finalizer_popup_id,
+                        colour,
+                        padding,
+                        child_gap,
+                        radius: radius.dup4(),
+                        align: Center,
+                        width:  fit!(ui.scale(128.0)),
+                        height: fit!(radius * 2.0),
+                        ..Decl
+                    }) {
+                        ui.text(label, TextDecl { font: Normal, h: ui.scale(16.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
                     }
-                }
+                    if clicked {
 
-                if filters.show_popup {
-                    if let Some(pos) = filters.popup_pos {
-                        show_finalizer_popup(ui, data, &mut filters, pos);
+                        filters.show_popup = !filters.show_popup;
                     }
-                }
+                    if filters.show_popup{
+                        if let _ = elem().decl(Decl {
+                            id: ui::id("Finalizer Popup Container"),
+                            colour: BUTTON_GREY,
+                            child_gap: ui.scale(12.0),
+                            padding: (ui.scale(12.0), ui.scale(12.0), ui.scale(12.0), ui.scale(12.0)),
+                            radius: ui.scale(16.0).dup4(),
+                            align: Center,
+                            direction: TopToBottom,
+                            width: fit!(width),
+                            height: fit!(),
+                            ..Decl
+                        }) {
+                            // "Your criteria for considering finalizers online"
+                            let toggle_id = id("Matches Height Button");
+                            let toggle_text = if filters.filter_height {
+                                "[X] Must have voted at the latest height"
+                            } else {
+                                "[ ] Must have voted at the latest height"
+                            };
+
+                            let (toggle_clicked, toggle_colour, toggle_text_colour) = ui.button_ex(
+                                true,
+                                BUTTON_GREY,
+                                toggle_id,
+                                true,
+                                winit::window::CursorIcon::Pointer,
+                            );
+
+                            if let _ = elem().decl(Decl {
+                                id: toggle_id,
+                                colour: toggle_colour,
+                                radius: ui.scale(4.0).dup4(),
+                                align: Center,
+                                direction: TopToBottom,
+
+                                width: fit!(width),
+                                ..Decl
+                            }) {
+                                ui.text(
+                                    toggle_text,
+                                    TextDecl {
+                                        font: Mono,
+                                        h: ui.scale(16.0),
+                                        colour: toggle_text_colour,
+                                        align: AlignX::Center,
+                                        ..TextDecl
+                                    },
+                                );
+
+                                if toggle_clicked {
+                                    filters.filter_height = !filters.filter_height;
+                                }
+                            }
+
+                            if let _ = elem().decl(Decl {
+                                id: ui::id("Finalizer Status Container"),
+                                width: fit!(width),
+                                height: fit!(radius * 2.0),
+                                direction: TopToBottom,
+                                radius: ui.scale(4.0).dup4(),
+                                ..Decl
+                            }) {
+
+                                let secs_string = ui.textbox(
+                                    data,
+                                    ui::id("Seconds since connected Textbox"),
+                                    "Seconds since connected...",
+                                    TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
+                                );
+                                let secs_str = secs_string.trim();
+                                if let Ok (value) = secs_str.parse::<u32>(){
+                                    filters.filter_seconds_since_connected = value;
+                                    //println!("{:?}", state.finalizer_seconds_since_connected);
+                                } else if secs_str.len() == 0 {
+                                    filters.filter_seconds_since_connected = 0;
+                                }
+                            }
+                        }                    
+                    }
+                        
+
             }
             //@TODO(Giovanni): Maybe lock behind a key-input (hold to open the popup)...
             if(ui.hovered(id("Finalizers Buttons"))){
@@ -3869,6 +3857,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                     //     ("Healthy", (0x2d, 0x8a, 0x57, 0xff), "Connected and near chain tip.")
                     // };
 
+
+
                     if let _ = elem().decl(Decl {
                         direction: TopToBottom,
                         align: TopRight,
@@ -3877,6 +3867,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         height: fit!(),
                         ..Decl
                     }) {
+
                         let combo_id = id("Network Health Combo");
                         let base = BUTTON_GREY.mul(0.85);
                         let (activated, colour, text_colour) = ui.button_ex(true, base, combo_id, true, winit::window::CursorIcon::Pointer);
@@ -3885,7 +3876,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             colour,
                             radius: ui.scale(18.0).dup4(),
                             child_gap: ui.scale(8.0),
-                            padding: (ui.scale(8.0), ui.scale(14.0), ui.scale(8.0), ui.scale(14.0)),
+                            padding: (ui.scale(8.0), ui.scale(8.0), ui.scale(8.0), ui.scale(8.0)),
                             direction: LeftToRight,
                             align: Center,
                             width: fit!(),
@@ -3899,9 +3890,9 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             //     height: fixed!(ui.scale(16.0)),
                             //     ..Decl
                             // }) {}
-                            ui.text("Network Info", TextDecl { h: ui.scale(16.0), colour: WHITE.mul(0.75), align: AlignX::Left, ..TextDecl });
+                            ui.text("Network Info", TextDecl { font: Mono, h: ui.scale(18.0), colour: WHITE.mul(0.75), align: AlignX::Center, ..TextDecl });
                             // ui.text(health_label, TextDecl { h: ui.scale(16.0), colour: text_colour, align: AlignX::Left, ..TextDecl });
-                            ui.text(ICON_DOWN_OPEN, TextDecl { font: Icons, h: ui.scale(14.0), colour: WHITE.mul(0.6), align: AlignX::Right, ..TextDecl });
+                            ui.text(ICON_DOWN_OPEN, TextDecl { font: Icons, h: ui.scale(10.0), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
                         }
                         if ui.hovered(combo_id) {
                             set_tooltip_text!(data, /*"{summary} "*/"Click to expand.");
@@ -3995,30 +3986,30 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             }
                         }
 
-                        let mining_label = "MINING";
-                        let mining_id = id(mining_label);
-                        let actively_mining: bool = *wallet::GUI_ENABLE_MINE.lock().unwrap();
-                        let label = ["NOT MINING", "MINING"][actively_mining as usize];
-                        let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, mining_id, true, winit::window::CursorIcon::Pointer);
-                        let radius = ui.scale(16.0);
-                        if let _ = elem().decl(Decl {
-                            id: mining_id,
-                            colour,
-                            padding,
-                            child_gap,
-                            radius: radius.dup4(),
-                            align: Center,
-                            width:  fit!(ui.scale(128.0)),
-                            height: fit!(radius * 2.0),
-                            ..Decl
-                        }) {
-                            ui.text(label, TextDecl { font: Mono, h: ui.scale(16.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
-                        }
-                        if clicked {
-                            *wallet::GUI_ENABLE_MINE.lock().unwrap() = !actively_mining;
-                        }
                     }
 
+                    let mining_label = "MINING";
+                    let mining_id = id(mining_label);
+                    let actively_mining: bool = *wallet::GUI_ENABLE_MINE.lock().unwrap();
+                    let label = ["NOT MINING", "MINING"][actively_mining as usize];
+                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, mining_id, true, winit::window::CursorIcon::Pointer);
+                    let radius = ui.scale(16.0);
+                    if let _ = elem().decl(Decl {
+                        id: mining_id,
+                        colour,
+                        padding,
+                        child_gap,
+                        radius: radius.dup4(),
+                        align: Center,
+                        width:  fit!(ui.scale(128.0)),
+                        height: fit!(radius * 2.0),
+                        ..Decl
+                    }) {
+                        ui.text(label, TextDecl { font: Normal, h: ui.scale(16.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
+                    }
+                    if clicked {
+                        *wallet::GUI_ENABLE_MINE.lock().unwrap() = !actively_mining;
+                    }
                     if let _ = elem().decl(Decl {
                         direction: TopToBottom,
                         align: TopRight,
@@ -4027,28 +4018,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         height: fit!(),
                         ..Decl
                     }) {
-                        let mute_id = id("Mute Toggle");
-                        let (clicked, colour, _) = ui.button_ex(true, BUTTON_GREY.mul(0.9), mute_id, true, winit::window::CursorIcon::Pointer);
 
-                        let icon = if ui.global_audio_volume > 0.01 { ICON_VOLUME_HIGH } else { ICON_VOLUME_OFF_1 };
-                        if let _ = elem().decl(Decl {
-                            id: mute_id,
-                            colour,
-                            radius: ui.scale(16.0).dup4(),
-                            padding: (ui.scale(8.0), ui.scale(10.0), ui.scale(8.0), ui.scale(10.0)),
-                            child_gap,
-                            align: Center,
-                            direction: TopToBottom,
-                            width: fit!(),
-                            height: fit!(),
-                            ..Decl
-                        }) {
-                            ui.text(icon, TextDecl { font: Icons, colour: WHITE.mul(0.95), h: ui.scale(32.0), align: AlignX::Center, ..TextDecl });
-                        }
-
-                        if clicked {
-                            if ui.global_audio_volume > 0.01 { ui.global_audio_volume = 0.0 } else { ui.global_audio_volume = 1.0 };
-                        }
 
                         if let _ = elem().decl(Decl {
                             colour: BUTTON_GREY.mul(0.9),
@@ -4057,12 +4027,35 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             child_gap: ui.scale(5.0),
                             direction: TopToBottom,
                             align: Center,
-                            width: fit!(ui.scale(42.0)),
+                            width: fit!(),
                             height: fit!(),
                             ..Decl
                         }) {
+
+                            let mute_id = id("Mute Toggle");
+                            let (clicked, colour, _) = ui.button_ex(true, BUTTON_GREY.mul(0.9), mute_id, true, winit::window::CursorIcon::Pointer);
+
+                            let icon = if ui.global_audio_volume > 0.01 { ICON_VOLUME_HIGH } else { ICON_VOLUME_OFF_1 };
+                            if let _ = elem().decl(Decl {
+                                id: mute_id,
+                                colour,
+                                radius: ui.scale(16.0).dup4(),
+                                padding: (ui.scale(8.0), ui.scale(10.0), ui.scale(8.0), ui.scale(10.0)),
+                                child_gap,
+                                align: Center,
+                                direction: TopToBottom,
+                                width: fit!(),
+                                height: fit!(),
+                                ..Decl
+                            }) {
+                                ui.text(icon, TextDecl { font: Icons, colour: WHITE.mul(0.95), h: ui.scale(32.0), align: AlignX::Center, ..TextDecl });
+                            }
+
+                            if clicked {
+                                if ui.global_audio_volume > 0.01 { ui.global_audio_volume = 0.0 } else { ui.global_audio_volume = 1.0 };
+                            }
                             let volume_pct = (ui.global_audio_volume * 100.0).round() as u32;
-                            ui.text(frame_strf!(data, "{}%", volume_pct), TextDecl { h: ui.scale(12.0), align: AlignX::Center, colour: WHITE.mul(0.8), ..TextDecl });
+                            ui.text(frame_strf!(data, "{}%", volume_pct), TextDecl { h: ui.scale(18.0), align: AlignX::Center, colour: WHITE.mul(0.8), ..TextDecl });
                             if let _ = elem().decl(Decl {
                                 direction: TopToBottom,
                                 align: Center,
