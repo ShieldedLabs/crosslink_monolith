@@ -76,8 +76,10 @@ impl UiData {
 pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
 
 
-    if ui.input().key_pressed(KeyCode::Backquote) {
+    if ui.input().key_pressed(KeyCode::F3) {
         ui.debug = !ui.debug;
+        let shift = (ui.input().key_held(KeyCode::ShiftLeft) || ui.input().key_held(KeyCode::ShiftRight));
+        ui.frame_graph = shift;
     }
     if ui.input().key_pressed(KeyCode::F5) {
         unsafe {
@@ -552,7 +554,6 @@ impl Context {
                 ..TextDecl
             });
             self.text(label, TextDecl {
-                font: Mono,
                 h: self.scale(16.0),
                 colour: text_colour,
                 align: AlignX::Left,
@@ -3275,7 +3276,7 @@ pub fn ui_right_pane(ui: &mut Context,
                                     data,
                                     ui::id("Seconds since connected Textbox"),
                                     "Seconds since connected...",
-                                    TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
+                                    TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
                                 );
                                 let secs_str = secs_string.trim();
                                 if let Ok (value) = secs_str.parse::<u32>(){
@@ -3798,28 +3799,6 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 ..Decl
             }) {
                 let _ = elem().decl(Decl { width: grow!(), ..Decl });
-                if let _ = elem().decl(Decl {
-                    radius,
-                    padding: padding.mul(0.5),
-                    // child_gap,
-                    align: Top,
-                    direction: TopToBottom,
-                    width: fit!(),
-                    colour: (0, 0, 0, 127),
-                    ..Decl
-                }) {
-                    let decl = TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl };
-
-                    if ui.debug {
-                        ui.text("------------------", decl);
-                        for peer in &viz.peer_strings {
-                            ui.text(peer, decl);
-                        }
-                    }
-                    if ui.viz_op != InteractiveVizOp::None {
-                        ui.text(frame_strf!(data, "Visualizing op: {:?}", ui.viz_op), decl);
-                    }
-                }
 
                 if let _ = elem().decl(Decl {
                     width: grow!(),
@@ -3867,7 +3846,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             colour,
                             radius: ui.scale(18.0).dup4(),
                             child_gap: ui.scale(8.0),
-                            padding: (ui.scale(8.0), ui.scale(8.0), ui.scale(8.0), ui.scale(8.0)),
+                            padding: ui.scale(10.0).dup4(),
                             direction: LeftToRight,
                             align: Center,
                             width: fit!(),
@@ -3881,7 +3860,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             //     height: fixed!(ui.scale(16.0)),
                             //     ..Decl
                             // }) {}
-                            ui.text("Network Info", TextDecl { font: Mono, h: ui.scale(18.0), colour: WHITE.mul(0.75), align: AlignX::Center, ..TextDecl });
+                            ui.text("Network Info", TextDecl { h: ui.scale(18.0), colour: WHITE.mul(0.75), align: AlignX::Center, ..TextDecl });
                             // ui.text(health_label, TextDecl { h: ui.scale(16.0), colour: text_colour, align: AlignX::Left, ..TextDecl });
                             ui.text(ICON_DOWN_OPEN, TextDecl { font: Icons, h: ui.scale(10.0), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
                         }
@@ -3974,6 +3953,17 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                     row(ui, data, "Staking Bonded", &format!("{}", viz.staking_bonded_pool_balance));
                                     row(ui, data, "Staking Unbonded", &format!("{}", viz.staking_unbonded_pool_balance));
                                 }
+
+                                let decl = TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl };
+                                if ui.viz_op != InteractiveVizOp::None {
+                                    ui.text(frame_strf!(data, "Visualizing op: {:?}", ui.viz_op), decl);
+                                }
+                                if ui.debug {
+                                    for peer in &viz.peer_strings {
+                                        ui.text(peer, decl);
+                                    }
+                                }
+
                             }
                         }
 
@@ -4495,6 +4485,7 @@ pub struct Context {
     pub prev_cursor: winit::window::Cursor,
 
     pub debug: bool,
+    pub frame_graph: bool,
     pub pixel_inspector_primed: bool,
 
     pub draw_commands: Vec<DrawCommand>,

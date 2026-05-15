@@ -1114,7 +1114,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
     for thread_id in 1..unsafe { (*p_thread_context).thread_count as usize } {
         let magic_int = p_thread_context as usize;
         let _ = std::thread::spawn(move || {
-            println!("Started worker thread#{}...", thread_id);
+            // println!("Started worker thread#{}...", thread_id);
             worker_thread_loop(thread_id, magic_int);
         });
     }
@@ -2349,6 +2349,9 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
 
 
                                                 for (i, stat) in frame_stats.iter().enumerate() {
+                                                    if !ui.frame_graph {
+                                                        break;
+                                                    }
                                                     let thick = 2;
                                                     let y = 40 + thick*i;
                                                     let single_w = (stat.single_threaded_time_us / 10).min(window_width);
