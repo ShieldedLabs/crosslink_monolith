@@ -45,3 +45,24 @@ fn args_with_subcommand_pass_through() {
         assert_eq!(matches!(args.cmd(), ZebradCmd::Start(_)), should_be_start,);
     }
 }
+
+#[test]
+fn rollback_tip_height_command_parses() {
+    let args = EntryPoint::try_parse_from([
+        "zebrad",
+        "rollback-tip-height",
+        "--height",
+        "123",
+        "--network",
+        "Mainnet",
+    ])
+    .expect("rollback-tip-height args should parse successfully");
+
+    assert!(matches!(args.cmd(), ZebradCmd::RollbackTipHeight(_)));
+}
+
+#[test]
+fn rollback_tip_height_requires_height() {
+    EntryPoint::try_parse_from(["zebrad", "rollback-tip-height"])
+        .expect_err("rollback-tip-height should require an explicit height");
+}
