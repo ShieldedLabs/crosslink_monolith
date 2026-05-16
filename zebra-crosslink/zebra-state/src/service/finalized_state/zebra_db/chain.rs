@@ -12,7 +12,7 @@
 //! each time the database format (column, serialization, etc) changes.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -268,25 +268,35 @@ impl DiskWriteBatch {
 
         // Apply bond rewards to the staking_bonded pool tally FIRST,
         // before unbonding moves value between pools (to match non-finalized state order)
-        let total_rewards: u64 = finalized.bond_rewards.iter().map(|(_, amount)| amount).sum();
+        let total_rewards: u64 = if finalized.bond_rewards.is_empty() {
+            checkpoint_replay_reward_total(db, finalized)
+        } else {
+            finalized
+                .bond_rewards
+                .iter()
+                .map(|(_, amount)| amount)
+                .sum()
+        };
         if total_rewards > 0 {
             let current_bonded = new_value_pool.staking_bonded_amount();
-            let new_bonded: Amount<NonNegative> = (current_bonded + Amount::try_from(total_rewards as i64)?)
-                .expect("staking_bonded pool should not overflow from rewards");
+            let new_bonded: Amount<NonNegative> = (current_bonded
+                + Amount::try_from(total_rewards as i64)?)
+            .expect("staking_bonded pool should not overflow from rewards");
             new_value_pool.set_staking_bonded_amount(new_bonded);
         }
 
         // Handle BeginDelegationUnbonding staking actions.
         // These move value from staking_bonded to staking_unbonded, but this transfer
         // is not captured by chain_value_pool_change (which only handles value entering/leaving pools).
-        // Use the pre-computed unbonding_amounts which include rewards from the non-finalized state.
-        for (_bond_key, bond_amount) in &finalized.unbonding_amounts {
-            let bond_amount: Amount<NonNegative> = Amount::try_from(*bond_amount as i64)?;
-
+        // Use the pre-computed unbonding_amounts from the non-finalized state when available.
+        // Checkpoint-style replay, used by copy-state and rollback-tip-height, bypasses the
+        // non-finalized state and therefore has to recover the amount from the finalized bond table.
+        let unbonding_amounts = finalized_unbonding_amounts(db, finalized)?;
+        for bond_amount in unbonding_amounts {
             // Move value from staking_bonded to staking_unbonded
             let current_bonded = new_value_pool.staking_bonded_amount();
-            let new_bonded: Amount<NonNegative> = (current_bonded - bond_amount)
-                .expect("staking_bonded pool should not underflow");
+            let new_bonded: Amount<NonNegative> =
+                (current_bonded - bond_amount).expect("staking_bonded pool should not underflow");
             new_value_pool.set_staking_bonded_amount(new_bonded);
 
             let current_unbonded = new_value_pool.staking_unbonded_amount();
@@ -313,4 +323,68 @@ impl DiskWriteBatch {
 
         Ok(())
     }
+}
+
+fn checkpoint_replay_reward_total(db: &ZebraDb, finalized: &FinalizedBlock) -> u64 {
+    let mut active_bonds: HashSet<_> = db
+        .all_bonds()
+        .filter_map(|(bond_key, _bond, status)| status.is_active().then_some(bond_key))
+        .collect();
+
+    for transaction in &finalized.block.transactions {
+        let Some(staking_action) = transaction.staking_action() else {
+            continue;
+        };
+
+        match staking_action.kind {
+            StakingActionKind::CreateNewDelegationBond => {
+                active_bonds.insert(staking_action.arg32_0);
+            }
+            StakingActionKind::BeginDelegationUnbonding
+            | StakingActionKind::WithdrawDelegationBond => {
+                active_bonds.remove(&staking_action.arg32_0);
+            }
+            _ => {}
+        }
+    }
+
+    if active_bonds.is_empty() {
+        0
+    } else {
+        500_000_000
+    }
+}
+
+fn finalized_unbonding_amounts(
+    db: &ZebraDb,
+    finalized: &FinalizedBlock,
+) -> Result<Vec<Amount<NonNegative>>, BoxError> {
+    if !finalized.unbonding_amounts.is_empty() {
+        return finalized
+            .unbonding_amounts
+            .iter()
+            .map(|(_bond_key, bond_amount)| {
+                let bond_amount = i64::try_from(*bond_amount)?;
+                Amount::try_from(bond_amount).map_err(Into::into)
+            })
+            .collect();
+    }
+
+    finalized
+        .block
+        .transactions
+        .iter()
+        .filter_map(|transaction| {
+            let staking_action = transaction.staking_action()?;
+            (staking_action.kind == StakingActionKind::BeginDelegationUnbonding)
+                .then_some(staking_action.arg32_0)
+        })
+        .map(|bond_key| {
+            db.delegation_bond(&bond_key)
+                .map(|bond| bond.amount)
+                .ok_or_else(|| {
+                    format!("bond {:?} not found while updating value pools", bond_key).into()
+                })
+        })
+        .collect()
 }

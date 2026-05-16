@@ -134,6 +134,74 @@ impl ZebraDb {
     }
 }
 
+fn checkpoint_replay_bond_rewards(
+    db: &ZebraDb,
+    bonds_modified_in_block: &HashMap<BondKey, DelegationBond>,
+    statuses_modified_in_block: &HashMap<BondKey, BondStatus>,
+) -> Vec<(BondKey, u64)> {
+    let mut active_bonds: Vec<(BondKey, DelegationBond)> = db
+        .all_bonds()
+        .filter_map(|(bond_key, bond, status)| {
+            let status = statuses_modified_in_block
+                .get(&bond_key)
+                .copied()
+                .unwrap_or(status);
+
+            status.is_active().then_some((
+                bond_key,
+                bonds_modified_in_block
+                    .get(&bond_key)
+                    .copied()
+                    .unwrap_or(bond),
+            ))
+        })
+        .collect();
+
+    for (bond_key, bond) in bonds_modified_in_block {
+        if db.delegation_bond(bond_key).is_none()
+            && statuses_modified_in_block
+                .get(bond_key)
+                .is_some_and(BondStatus::is_active)
+        {
+            active_bonds.push((*bond_key, *bond));
+        }
+    }
+
+    if active_bonds.is_empty() {
+        return Vec::new();
+    }
+
+    let total_staked_zats: u64 = active_bonds
+        .iter()
+        .map(|(_, bond)| u64::from(bond.amount))
+        .sum();
+    let Some(max_staker) = active_bonds
+        .iter()
+        .max_by_key(|(bond_key, bond)| (u64::from(bond.amount), std::cmp::Reverse(*bond_key)))
+        .map(|(bond_key, _)| *bond_key)
+    else {
+        return Vec::new();
+    };
+
+    let bond_reward_total = 500_000_000u64;
+    let mut paid_reward = 0u64;
+    let mut rewards = Vec::with_capacity(active_bonds.len());
+
+    for (bond_key, bond) in active_bonds {
+        if bond_key == max_staker {
+            continue;
+        }
+
+        let reward = ((u64::from(bond.amount) as u128) * (bond_reward_total as u128)
+            / (total_staked_zats as u128)) as u64;
+        paid_reward += reward;
+        rewards.push((bond_key, reward));
+    }
+
+    rewards.push((max_staker, bond_reward_total - paid_reward));
+    rewards
+}
+
 impl DiskWriteBatch {
     /// Prepare a database batch containing the delegation bonds in `finalized.block`,
     /// and return it (without actually writing anything).
@@ -150,9 +218,10 @@ impl DiskWriteBatch {
         // Process transactions to update bond state
         use zcash_primitives::transaction::StakingActionKind;
 
-        // Track bonds created in this block so we can apply rewards to them
-        // (they won't be in the DB yet when we apply rewards)
-        let mut bonds_created_in_block: HashMap<BondKey, DelegationBond> = HashMap::new();
+        // Track bonds modified in this block so we can apply rewards to the post-block bond state
+        // (they won't be in the DB yet when we apply rewards).
+        let mut bonds_modified_in_block: HashMap<BondKey, DelegationBond> = HashMap::new();
+        let mut statuses_modified_in_block: HashMap<BondKey, BondStatus> = HashMap::new();
 
         // Iterate through all transactions in the block
         for (transaction_index, transaction) in finalized.block.transactions.iter().enumerate() {
@@ -172,18 +241,41 @@ impl DiskWriteBatch {
                             DelegationBond::new(amount, target_finalizer, transaction_location);
 
                         // Track this bond for reward application
-                        bonds_created_in_block.insert(bond_key, bond.clone());
+                        bonds_modified_in_block.insert(bond_key, bond.clone());
+                        statuses_modified_in_block.insert(bond_key, BondStatus::Active);
 
                         // Insert new bond
                         self.prepare_new_delegation_bond(&db.db, bond_key, bond);
                     }
                     StakingActionKind::BeginDelegationUnbonding => {
                         // Mark bond as unbonding
-                        self.prepare_unbonding_delegation_bond(&db.db, db, bond_key, transaction_location)?;
+                        self.prepare_unbonding_delegation_bond(
+                            &db.db,
+                            db,
+                            bond_key,
+                            transaction_location,
+                        )?;
+                        statuses_modified_in_block.insert(
+                            bond_key,
+                            BondStatus::Unbonding {
+                                unbonded_at: transaction_location,
+                            },
+                        );
                     }
                     StakingActionKind::WithdrawDelegationBond => {
                         // Mark bond as withdrawn
-                        self.prepare_withdrawn_delegation_bond(&db.db, db, bond_key, transaction_location)?;
+                        self.prepare_withdrawn_delegation_bond(
+                            &db.db,
+                            db,
+                            bond_key,
+                            transaction_location,
+                        )?;
+                        statuses_modified_in_block.insert(
+                            bond_key,
+                            BondStatus::Withdrawn {
+                                withdrawn_at: transaction_location,
+                            },
+                        );
                     }
                     StakingActionKind::RetargetDelegationBond => {
                         // Update the bond's target_finalizer
@@ -193,7 +285,7 @@ impl DiskWriteBatch {
                             db,
                             bond_key,
                             new_target,
-                            &mut bonds_created_in_block,
+                            &mut bonds_modified_in_block,
                         )?;
                     }
                     // Other staking actions don't affect delegation bonds
@@ -202,12 +294,29 @@ impl DiskWriteBatch {
             }
         }
 
-        // Apply bond rewards accumulated in the non-finalized state
+        // Apply bond rewards accumulated in the non-finalized state.
+        // Checkpoint-style replay, used by copy-state and rollback-tip-height, bypasses the
+        // non-finalized state. In that case, derive the same deterministic rewards from the
+        // finalized bond table plus this block's pending bond/status changes.
+        let derived_bond_rewards;
+        let bond_rewards = if finalized.bond_rewards.is_empty() {
+            derived_bond_rewards = checkpoint_replay_bond_rewards(
+                db,
+                &bonds_modified_in_block,
+                &statuses_modified_in_block,
+            );
+            &derived_bond_rewards
+        } else {
+            &finalized.bond_rewards
+        };
+
         let delegation_bond_by_key_cf = db.db.cf_handle(DELEGATION_BOND_BY_KEY).unwrap();
-        for (bond_key, reward_amount) in &finalized.bond_rewards {
+        for (bond_key, reward_amount) in bond_rewards {
             // Get current bond from bonds modified in this block first, then fall back to DB.
             // This ensures we use the updated bond if it was retargeted/created in this block.
-            let bond_opt = bonds_created_in_block.get(bond_key).cloned()
+            let bond_opt = bonds_modified_in_block
+                .get(bond_key)
+                .cloned()
                 .or_else(|| db.delegation_bond(bond_key));
 
             if let Some(mut bond) = bond_opt {
@@ -237,7 +346,12 @@ impl DiskWriteBatch {
     /// Inserts into:
     /// - `delegation_bond_by_key`: stores the bond data
     /// - `bond_status_by_key`: stores Active status
-    fn prepare_new_delegation_bond(&mut self, db: &DiskDb, bond_key: BondKey, bond: DelegationBond) {
+    fn prepare_new_delegation_bond(
+        &mut self,
+        db: &DiskDb,
+        bond_key: BondKey,
+        bond: DelegationBond,
+    ) {
         let delegation_bond_by_key_cf = db.cf_handle(DELEGATION_BOND_BY_KEY).unwrap();
         let bond_status_by_key_cf = db.cf_handle(BOND_STATUS_BY_KEY).unwrap();
 
@@ -341,10 +455,13 @@ impl DiskWriteBatch {
 
         // Get current bond from bonds modified in this block first, then fall back to DB.
         // This ensures we use the updated bond if it was modified earlier in this block.
-        let bond_opt = bonds_created_in_block.get(&bond_key).cloned()
+        let bond_opt = bonds_created_in_block
+            .get(&bond_key)
+            .cloned()
             .or_else(|| zebra_db.delegation_bond(&bond_key));
 
-        let mut bond = bond_opt.ok_or_else(|| format!("bond {:?} not found for retarget", bond_key))?;
+        let mut bond =
+            bond_opt.ok_or_else(|| format!("bond {:?} not found for retarget", bond_key))?;
 
         // Update only target_finalizer (not created_at or amount)
         bond.target_finalizer = new_target;
