@@ -1778,10 +1778,10 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                                                         play_sound(voice_sound, global_sound_volume*voice_volume, 1.0);
                                                     }
 
-                                                    let text_h = window_height as f32 / 6.0;
+                                                    let text_h = (window_height as f32 / 3.0).min(window_width as f32 / 12.0);
 
                                                     let text_string = if current_animation_id & 1 != 0 { "Staking Day has Ended" } else { "Staking Day has Begun" };
-                                                    let text_y = cubic_hold((t - music_visual_delay) as f32 / 5.0, 0.1, 0.7, 0.4)*1.4 * window_height as f32 - text_h;
+                                                    let text_y = cubic_hold((t - music_visual_delay) as f32 / 5.0, 0.1, 0.7, 0.4)*1.4 * (window_height as f32 + text_h + 30.0) - (text_h + 30.0) * 1.4;
 
                                                     let text_w = draw_ctx.measure_text_line(FontKind::Normal, text_h, text_string);
                                                     let text_x = window_width as f32 / 2.0 - text_w / 2.0;
