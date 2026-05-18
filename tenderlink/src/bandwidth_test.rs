@@ -67,17 +67,6 @@ pub fn do_the_test_program3(port: u16, my_keypair: IdentityKeyPair, beam_to: Opt
 
 
 #[test]
-pub fn bwdth_test() {
-    println!("Begin the test!");
-
-    let _handle = std::thread::spawn(|| {
-        do_the_test_program(32345, None);
-    });
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    do_the_test_program(29453, Some((Ipv6Addr::LOCALHOST, 32345)));
-}
-
-#[test]
 pub fn handshake_test() {
     println!("Begin the test!");
 
@@ -495,6 +484,7 @@ pub struct ConnectionStateConnected {
     pub last_sent_data_packet: u64,
     pub last_ack_received_time: u64,
     pub last_status_print_time: u64,
+    pub packet_since_last_print: u64,
 
     pub ack_field: AckField,
     pub ack_timer: u64,
@@ -521,6 +511,7 @@ pub struct ConnectionStateConnected {
     pub tu_probe_failed_count: u64,
     
     pub packets_in_flight: u64,
+    pub send_pacer_acc_ns: u64,
 }
 pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, magic1: u64, magic2: u64, timestamp_ns: u64) -> ConnectionState {
     ConnectionState::Connected(ConnectionStateConnected {
@@ -532,6 +523,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         last_sent_data_packet: 0,
         last_ack_received_time: timestamp_ns,
         last_status_print_time: timestamp_ns,
+        packet_since_last_print: 0,
         ack_field: Default::default(),
         ack_timer: u64::MAX,
         send_time_band: [0; 1024],
@@ -552,6 +544,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         tu_probe_failed_count: 0,
         
         packets_in_flight: 0,
+        send_pacer_acc_ns: 0,
     })
 }
 
@@ -607,12 +600,11 @@ pub fn increment_sequence_number_and_account(send_time_ns: u64, send_sequence_nu
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug)]
 pub struct AckField {
-    pub latest_sequence_number: u32,
     pub field_base: u32,
     pub field: [u64; 128], // Each entry is 2 bits. 4096 entries total.
 }
 
-impl Default for AckField { fn default() -> Self { Self { latest_sequence_number: 0, field_base: 0, field: [0u64; 128], } } }
+impl Default for AckField { fn default() -> Self { Self { field_base: 0, field: [0u64; 128], } } }
 
 impl AckField {
     pub fn as_bytes(&self) -> &[u8] {
@@ -880,6 +872,8 @@ pub const MAX_REASSEMBLY_SLOTS: usize = 128; // @Todo: convert max slots into ma
 pub const MAX_JUMBOGRAM_LEN: usize = 1 << 23; // 8 MB, matches the 23-bit field
 pub const MAX_JUMBOGRAM_IDS: u32   = 1 << 18; // matches 18-bit field
 
+pub const ACK_BUFFER_TIME_NS: u64 = 250_000_000;
+
 impl SliceRead  for PackletHeader           { fn       read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self(u16::read_from(buf)?)) } }
 impl SliceWrite for PackletHeader           { fn write_to(&self, buf: &mut  [u8]) -> usize        { self.0  .write_to(buf) } }
 
@@ -1021,7 +1015,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                     for if we can send or not must be very cheap.
                 */
                 
-                let mut should_sleep = true;
+                let mut should_sleep = false;
                 
 //////// BEGIN RECEIVE ////////////////////////////////////////////////////////////////////////
                 if let Ok((buf_len, other_ip_addr, other_port, ecn_marked, ecn_enabled, service_class, timestamp_ns)) = udp_recv_with_congestion_and_dscp(socket, &mut packet_memory_encrypted[..]) && buf_len >= 6 {
@@ -1289,18 +1283,11 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                 payload = &packet_memory_encrypted[6..buf_len];
                             }
 
-                            if payload.len() == 1032 { // This is an ack packet.
+                            if payload.len() == 1028 { // This is an ack packet.
                                 let ack = unsafe { &*(payload.as_ptr() as *const AckField) };
 
-                                // Note(Sam): IT IS ESSENTIAL THAT THIS OCCURS WITHOUT CHECKING state.packets_waiting_ack_field.
-                                // This is because RTT is upstream from us determining dropped packets.
-                                let send_time_of_latest_ns = get_send_time_for_sequence_number(ack.latest_sequence_number as u64, &state.send_time_band, state.send_time_band_head_index);
-                                if send_time_of_latest_ns == 0 || send_time_of_latest_ns == u64::MAX {
-                                    break 'conn;
-                                }
-                                
-                                state.RTT_samples[(state.RTT_sample_cursor % 128) as usize] = ((timestamp_ns - send_time_of_latest_ns) / 100_000) as u16;
-                                state.RTT_sample_cursor += 1;
+                                let mut RTT_acc = 0u64;
+                                let mut RTT_count = 0u64;
                                 
                                 let field_base = ack.field_base as u64;
                                 for index in field_base..field_base+4096 {
@@ -1312,6 +1299,12 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                         if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                                             state.last_ack_received_time = timestamp_ns;
+                                            
+                                            let send_time_of_latest_ns = get_send_time_for_sequence_number(index, &state.send_time_band, state.send_time_band_head_index);
+                                            if send_time_of_latest_ns != 0 && send_time_of_latest_ns != u64::MAX {
+                                                RTT_acc += ((timestamp_ns - send_time_of_latest_ns) / 100_000);
+                                                RTT_count += 1;
+                                            }
                                             
                                             if index == state.tu_probe_sequence_number {
                                                 state.tu_probe_sequence_number = u64::MAX;
@@ -1327,6 +1320,11 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                             
                                         }
                                     }
+                                }
+                                
+                                if RTT_count > 0 {
+                                    state.RTT_samples[(state.RTT_sample_cursor % 128) as usize] = (RTT_acc / RTT_count) as u16;
+                                    state.RTT_sample_cursor += 1;
                                 }
                                 
                                 break 'conn;
@@ -1349,11 +1347,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                 break 'conn;
                             }
 
-                            // TODO: These also should handle 32 bit wrapping.
-                            state.ack_field.latest_sequence_number = nonce;
-
-                            // Several reasons for us to trigger an ack send right here.
-                            if timestamp_ns > state.ack_timer || nonce >= state.ack_field.field_base + 4096 {
+                            if nonce >= state.ack_field.field_base + 4096 {
                                 { // send ack
                                     let mut o = 0;
                                     let virtual_nonce = state.send_sequence_number;
@@ -1391,7 +1385,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             let bit_index = 2*(nonce-state.ack_field.field_base);
                             let store_num = 1u64 | ((ecn_marked as u64) << 1);
                             state.ack_field.field[bit_index as usize / 64] |= store_num << (bit_index % 64);
-                            if state.ack_timer == u64::MAX { state.ack_timer = timestamp_ns + 5_000_000; }
+                            if state.ack_timer == u64::MAX { state.ack_timer = timestamp_ns + ACK_BUFFER_TIME_NS; }
     
                             // if OVERLY_VERBOSE { println!("Got data from {:?}  data: {:?}", existing_connection.other_transport_identity, payload); }
 
@@ -1580,7 +1574,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                     state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                                     state.send_sequence_number += 1;
                                 }
-
+                                
                                 if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, state.ack_field.as_bytes(), &mut packet_memory_send[o..]).unwrap(); }
                                 else { o += state.ack_field.as_bytes().write_to(&mut packet_memory_send[o..]); }
                                 udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21);
@@ -1598,6 +1592,9 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                 state.RTT_p80 = sorted[n * 80 / 100];
                                 state.RTT_max = sorted[n - 1];
                             }
+                            
+                            // NOTE(Sam): We may experience black holes if RTT suddenly increases since
+                            // there is a cyclic dependency beteen RTT and measuring RTT because of drop.
                             
                             // TODO: Block sending until we have space.
                             assert!(state.send_sequence_number - state.packets_waiting_ack_tail < 2048*64);
@@ -1640,9 +1637,30 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             state.tu_probe_failed_count = 0;
                             if OVERLY_VERBOSE { println!("Blackhole detected!"); }
                         }
-                        state.current_tu = state.current_tu.min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                         
-                        if state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.last_sent_tu_probe_time_ns + state.tu_probe_failed_count.min(50)*state.tu_probe_failed_count.min(50)*250_000_000 < current_time_now_ns {
+                        let allowed_bandwidth_upps = 4183_000_000u64;
+                        // pps * 10^-6 * rtt * 10^-4 = p * 10^10
+                        // steady state + bulk ack sawtooth compensation
+                        let allowed_packets_in_flight = ((allowed_bandwidth_upps * state.RTT_p80 as u64 / 10_000) + (allowed_bandwidth_upps * (ACK_BUFFER_TIME_NS / 2) / 1_000_000_000)) / 1_000_000;
+                        let allowed_packets_in_flight = allowed_packets_in_flight.max(1);
+                        
+                        // 1 / (upps * 10^-6) = 10^6 / upps <- seconds
+                        // ns = (10^6 / upps) * 10^9 = 10^15 / upps
+                        let time_between_sends_ns = 1_000_000_000_000_000 / allowed_bandwidth_upps;
+                        // This is some Unity Game developer level crap approximation but it will have to do.
+                        let mut packet_send_allowance_now = (current_time_now_ns + 1 - state.last_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS))) / time_between_sends_ns;
+                        let send_allowance_time_remainder = (current_time_now_ns + 1 - state.last_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS)))
+                                                                - time_between_sends_ns*packet_send_allowance_now;
+                        
+                        if state.send_pacer_acc_ns > time_between_sends_ns {
+                            state.send_pacer_acc_ns -= time_between_sends_ns;
+                            packet_send_allowance_now += 1;
+                        }
+                        let could_have_sent = packet_send_allowance_now != 0;
+                        
+                        
+                        state.current_tu = state.current_tu.min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
+                        if state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.last_sent_tu_probe_time_ns + (state.tu_probe_failed_count.min(50)*state.tu_probe_failed_count.min(50)*250_000_000).max(time_between_sends_ns) < current_time_now_ns {
                             state.tu_probe_size_advance = state.tu_probe_size_advance.max(1).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                             state.tu_probe_size = (state.current_tu + state.tu_probe_size_advance).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                             let payload_size = state.tu_probe_size as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
@@ -1666,6 +1684,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21);
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
                             state.last_sent_tu_probe_time_ns = send_time_ns;
+                            state.packet_since_last_print += 1;
                         }
                         
                         if state.last_sent_data_packet + 15_000_000_000/3 < current_time_now_ns {
@@ -1687,28 +1706,21 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
 
                             let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21);
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
-                            state.last_sent_data_packet = send_time_ns;
+                            state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
                             state.packets_in_flight += 1;
+                            packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1);
+                            state.packet_since_last_print += 1;
                         }
-                        
-                        let allowed_bandwidth_upps = 400_000_000u64;
-                        // pps * 10^-6 * rtt * 10^-4 = p * 10^10
-                        let allowed_packets_in_flight = allowed_bandwidth_upps * state.RTT_p80 as u64 / 10_000_000_000;
-                        let allowed_packets_in_flight = allowed_packets_in_flight.max(1);
-                        
-                        // 1 / (upps * 10^-6) = 10^6 / upps <- seconds
-                        // ns = (10^6 / upps) * 10^9 = 10^15 / upps
-                        // We then divide by two because we can't actually get the pace exactly right.
-                        let time_between_sends_ns = (1_000_000_000_000_000 / allowed_bandwidth_upps) / 2;
-                        // If this number is less than 250 us we ignore it because it would be too expensive
-                        // to task switch with such high frequency.
 
-                        while (time_between_sends_ns < 250_000 || state.last_sent_data_packet + time_between_sends_ns < current_time_now_ns) && state.packets_in_flight < allowed_packets_in_flight && let Some(unreliable_message) = connection_tracking_data.temp_send_unreliable.pop_front() {
+                        while packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && let Some(unreliable_message) = connection_tracking_data.temp_send_unreliable.pop_front() {
                             let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                         
                             let virtual_nonce = state.send_sequence_number;
                             store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
                             store_u32(&mut packet_memory_encrypted[2..6], virtual_nonce as u32);
+
+                            // not keep alive
+                            packet_memory_send[0] = 1;
 
                             let packet_len;
                             if let Some(cipher) = &mut state.cipher {
@@ -1721,8 +1733,19 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
 
                             let send_time_ns = udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort);
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
-                            state.last_sent_data_packet = send_time_ns;
+                            state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
                             state.packets_in_flight += 1;
+                            packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1);
+                            state.packet_since_last_print += 1;
+                        }
+                        
+                        if could_have_sent {
+                            if packet_send_allowance_now == 0 {
+                                state.send_pacer_acc_ns += send_allowance_time_remainder;
+                            }
+                            else {
+                                state.send_pacer_acc_ns = 0;
+                            }
                         }
                         
                         // bonus status debug print
@@ -1732,7 +1755,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             let p80 = state.RTT_p80 as f64 / 10.0;
                             let max = state.RTT_max as f64 / 10.0;
                             let n = (state.RTT_sample_cursor as usize).min(128);
-                            println!("RTT (ms): min={min:.1} p80={p80:.1} max={max:.1} (n={n}) --- TU: {} B  failed probes: {} --- in flight: {}/{}  pacing: {} us", state.current_tu, state.tu_probe_failed_count, state.packets_in_flight, allowed_packets_in_flight, time_between_sends_ns / 1000);
+                            println!("RTT (ms): min={min:.1} p80={p80:.1} max={max:.1} (n={n}) --- TU: {} B  failed probes: {} --- in flight: {}/{}  pacing: {} us  packets_since_last_print: {}", state.current_tu, state.tu_probe_failed_count, state.packets_in_flight, allowed_packets_in_flight, time_between_sends_ns / 1000, state.packet_since_last_print);
+                            state.packet_since_last_print = 0;
                         }
                     }
                 } true});
@@ -1798,376 +1822,6 @@ pub fn service_connections(
     my_keypairs: &Vec<IdentityKeyPair>,
 ) -> bool {
     false
-}
-
-pub fn do_the_test_program(port: u16, beam_to: Option<(Ipv6Addr, u16)>) {
-    socket_setup();
-    monotonic_clock_setup();
-
-    let mut time_of_last_status_print = std::time::Instant::now();
-    let mut ecn_up = false;
-    let mut ecn_down = false;
-
-    struct SendState {
-        socket: SockHandle,
-        drop_cursor: u64,
-        serial_number: u64,
-        packet_buffer: Vec<u32>,
-    }
-    let mut send_state = SendState {
-        socket: setup_and_bind_udp_socket(port).unwrap(),
-        drop_cursor: 50,
-        serial_number: 50,
-        packet_buffer: vec![0; PACKET_HISTORY_BUFFER_LEN],
-    };
-
-    let mut bytes_on_the_wire = 0_u64;
-
-    let mut min_seen_rtt_buckets = [u64::MAX; 10];
-    let mut rtt_bucket_cursor = 0_u64;
-    let mut rtt_bucket_cursor_last_time = 0_u64;
-
-    let mut bytes_delivered_buckets = [0_u64; 20];
-    let mut bytes_delivered_bucket_cursor = 0_u64;
-    let mut bytes_delivered_bucket_cursor_last_time = 0_u64;
-
-    let mut state_machine_cursor = 0_u64;
-    let mut state_machine_cursor_last_time = 0_u64;
-    let mut old_measured_allowed_bytes_on_the_wire = 0_u64;
-
-
-    let mut buf = [0_u8; 16384];
-
-
-    struct AckState {
-        // temp
-        saved_other_ip_addr: Ipv6Addr,
-        saved_other_port: u16,
-
-        acks_in_waiting_min: u64,
-        acks_in_waiting_buf: [(u64, bool); ASSUMED_ACK_CAPACITY],
-        acks_in_waiting_count: usize,
-        first_waiting_ack_time_ns: u64,
-
-        ack_send_buf: [u8; 8 + ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE],
-    }
-    let mut ack_state = AckState {
-        saved_other_ip_addr: Ipv6Addr::LOCALHOST,
-        saved_other_port: 0,
-
-        acks_in_waiting_min: 0,
-        acks_in_waiting_buf: [(0, false); ASSUMED_ACK_CAPACITY],
-        acks_in_waiting_count: 0,
-        first_waiting_ack_time_ns: 0,
-
-        ack_send_buf: [0; 8 + ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE],
-    };
-    pub fn send_acks_helper(ack_state: &mut AckState, send_state: &mut SendState, ecn_down: bool) {
-        assert!(ack_state.acks_in_waiting_count > 0);
-
-        if send_state.serial_number + 1 >= send_state.drop_cursor + (PACKET_HISTORY_BUFFER_LEN as u64) {
-            eprintln!("Error! PACKET_HISTORY_BUFFER_LEN is too small.\n");
-            return;
-        }
-
-        store_u64(&mut ack_state.ack_send_buf[0..8], send_state.serial_number);
-        ack_state.ack_send_buf[8] = 2;
-        let mut o = 9;
-        store_u64(&mut ack_state.ack_send_buf[o..o+8], (ack_state.acks_in_waiting_min & 0x7fff_ffff_ffff_ffff) | ((ecn_down as u64) << 63));
-        o += 8;
-        for i in 0..ack_state.acks_in_waiting_count {
-            let val = ((ack_state.acks_in_waiting_buf[i].0 - ack_state.acks_in_waiting_min) as u32 & 0x7f_ffff) | ((ack_state.acks_in_waiting_buf[i].1 as u32) << 23);
-            store_u24(&mut ack_state.ack_send_buf[o..o+3], val);
-            o += 3;
-        }
-        let _timestamp_ns = udp_send_with_congestion_and_dscp(send_state.socket, ack_state.saved_other_ip_addr, ack_state.saved_other_port, &ack_state.ack_send_buf[0..o], Dscp::Af21);
-        send_state.packet_buffer[send_state.serial_number as usize % PACKET_HISTORY_BUFFER_LEN] = u32::MAX;
-        send_state.serial_number += 1;
-        ack_state.acks_in_waiting_count = 0;
-    };
-
-
-    loop {
-        // Send non full ack packet if needed.
-        if ack_state.acks_in_waiting_count > 0 && monotonic_clock_ns() - ack_state.first_waiting_ack_time_ns > MAX_WAIT_BEFORE_SENDING_NON_FULL_ACK {
-            send_acks_helper(&mut ack_state, &mut send_state, ecn_down);
-        }
-
-        let current_min_rtt_on_connection_ns = {
-            let a = min_seen_rtt_buckets[0].min(min_seen_rtt_buckets[1]);
-            let b = min_seen_rtt_buckets[2].min(min_seen_rtt_buckets[3]);
-            let c = min_seen_rtt_buckets[4].min(min_seen_rtt_buckets[5]);
-            let d = min_seen_rtt_buckets[6].min(min_seen_rtt_buckets[7]);
-            let e = min_seen_rtt_buckets[8].min(min_seen_rtt_buckets[9]);
-            a.min(b).min(c).min(d).min(e)
-                .min(10_000_000_000) // RTT assumed to be always less than 10 seconds.
-                .max(10_000) // The maths breaks down with RTT close to zero so we pad up to 10 us always.
-        };
-        let current_max_delivered_bucket_bytes = {
-            let a = bytes_delivered_buckets[0].max(bytes_delivered_buckets[1]);
-            let b = bytes_delivered_buckets[2].max(bytes_delivered_buckets[3]);
-            let c = bytes_delivered_buckets[4].max(bytes_delivered_buckets[5]);
-            let d = bytes_delivered_buckets[6].max(bytes_delivered_buckets[7]);
-            let e = bytes_delivered_buckets[8].max(bytes_delivered_buckets[9]);
-            let f = bytes_delivered_buckets[10].max(bytes_delivered_buckets[11]);
-            let g = bytes_delivered_buckets[12].max(bytes_delivered_buckets[13]);
-            let h = bytes_delivered_buckets[14].max(bytes_delivered_buckets[15]);
-            let i = bytes_delivered_buckets[16].max(bytes_delivered_buckets[17]);
-            let j = bytes_delivered_buckets[18].max(bytes_delivered_buckets[19]);
-            a.max(b).max(c).max(d).max(e).max(f).max(g).max(h).max(i).max(j)
-        };
-        let data_delivery_bucket_time = current_min_rtt_on_connection_ns / 4;
-
-        let tu_bytes = 0_u64.max(ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE as u64);
-
-        let bottleneck_bandwidth_Bps = (current_max_delivered_bucket_bytes*1_000_000_000) / data_delivery_bucket_time;
-        let measured_allowed_bytes_on_the_wire = (((bottleneck_bandwidth_Bps as u128 * current_min_rtt_on_connection_ns as u128) / 1_000_000_000) as u64).max(tu_bytes);
-
-        let drop_back_edge_timestamp_ns = monotonic_clock_ns();
-
-        if drop_back_edge_timestamp_ns > state_machine_cursor_last_time + data_delivery_bucket_time {
-            state_machine_cursor += 1;
-            state_machine_cursor_last_time = drop_back_edge_timestamp_ns;
-        }
-        if measured_allowed_bytes_on_the_wire > old_measured_allowed_bytes_on_the_wire*124/100 { state_machine_cursor = 0; println!("GROW"); }
-        old_measured_allowed_bytes_on_the_wire = measured_allowed_bytes_on_the_wire;
-        if state_machine_cursor >= 12 { state_machine_cursor = 2; }
-
-        let allowed_bytes_on_the_wire =
-            if state_machine_cursor < 2 { (measured_allowed_bytes_on_the_wire*130/100).max(measured_allowed_bytes_on_the_wire + tu_bytes*10) }
-            else if state_machine_cursor < 10 { measured_allowed_bytes_on_the_wire }
-            else { (measured_allowed_bytes_on_the_wire*125/100).max(measured_allowed_bytes_on_the_wire + tu_bytes) };
-
-        if time_of_last_status_print.elapsed() > std::time::Duration::from_millis(1000) {
-            time_of_last_status_print = std::time::Instant::now();
-            println!("ecn up/down:{}/{} rtt: {} us MaxBucket: {} B bottleneck bandwidth: {}", ecn_up as u8, ecn_down as u8, current_min_rtt_on_connection_ns / 1000, current_max_delivered_bucket_bytes, BytesPerSecond(bottleneck_bandwidth_Bps));
-            //println!("{} < m: {} t: {}", bytes_on_the_wire, measured_allowed_bytes_on_the_wire, allowed_bytes_on_the_wire);
-        }
-
-        while send_state.drop_cursor < send_state.serial_number { // The drop back edge.
-            let stored_int = send_state.packet_buffer[send_state.drop_cursor as usize % PACKET_HISTORY_BUFFER_LEN];
-            if stored_int != u32::MAX {
-                let (packet_size_bytes, send_timestamp_ns, _ecn_marked, acked) = decompress_packet_info(stored_int);
-                let time_since_send_ns = subtract_22_bit_timestamps_with_a_known_more_recent(drop_back_edge_timestamp_ns, send_timestamp_ns);
-                if time_since_send_ns < data_delivery_bucket_time * bytes_delivered_buckets.len() as u64 { break; }
-                if acked == false {
-                    bytes_on_the_wire -= packet_size_bytes as u64;
-                }
-            }
-            send_state.drop_cursor += 1;
-        }
-
-        let mut cannot_send_should_sleep = false;
-        if send_state.serial_number + 1 >= send_state.drop_cursor + (PACKET_HISTORY_BUFFER_LEN as u64) {
-            eprintln!("Error! PACKET_HISTORY_BUFFER_LEN is too small.\n");
-            cannot_send_should_sleep = true;
-        }
-        else {
-            let to_send_len_compressed = decompress_packet_size_to_8_bits(compress_packet_size_to_8_bits(tu_bytes as u16)) as u64;
-            if to_send_len_compressed + bytes_on_the_wire <= allowed_bytes_on_the_wire {
-                if let Some((beam_to_ip, beam_to_port)) = beam_to {
-                    store_u64(&mut buf[0..8], send_state.serial_number);
-                    buf[8] = 1;
-                    let packet_size = tu_bytes as usize;
-                    let timestamp_ns = udp_send_with_congestion_and_dscp(send_state.socket, beam_to_ip, beam_to_port, &buf[0..8+packet_size], Dscp::Af11);
-                    send_state.packet_buffer[send_state.serial_number as usize % PACKET_HISTORY_BUFFER_LEN] = compress_packet_info(packet_size as u16, timestamp_ns, false, false);
-                    send_state.serial_number += 1;
-                    bytes_on_the_wire += to_send_len_compressed;
-                } else {
-                    cannot_send_should_sleep = true;
-                }
-            } else {
-                cannot_send_should_sleep = true;
-            }
-        }
-
-        let res = udp_recv_with_congestion_and_dscp(send_state.socket, &mut buf);
-        if matches!(res, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock) { continue; }
-        //println!("{}: res = {:?}", port, res);
-        if res.is_err() {
-            if cannot_send_should_sleep { std::thread::yield_now(); }
-            continue;
-        }
-        let (buf_len, other_ip_addr, other_port, ecn_marked, _ecn_enabled, _service_class, timestamp_ns) = res.unwrap();
-        ecn_down = _ecn_enabled;
-        if buf_len < 8 { continue; }
-        let packet_serial = load_u64(&buf[0..8]);
-        let packet_plaintext = &buf[8..buf_len];
-
-        if packet_plaintext[0] == 2 {
-            if packet_plaintext.len() < 1+8+3 || (packet_plaintext.len()-1-8) % 3 != 0 {
-                eprintln!("Error! Bad Ack. data = {}\n", hex::encode(packet_plaintext));
-                continue;
-            }
-            let mut min_rtt_this_ack = u64::MAX;
-            let mut total_bytes_acked_this_ack = 0_u64;
-
-            let ack_base_and_ecn_info = load_u64(&packet_plaintext[1..9]);
-            let ack_base = ack_base_and_ecn_info & 0x7fff_ffff_ffff_ffff;
-            ecn_up = ack_base_and_ecn_info & (1 << 63) != 0;
-            let mut o = 9;
-            while o < packet_plaintext.len() {
-                let val = load_u24(&packet_plaintext[o..o+3]);
-                o += 3;
-                let ecn_marked = val & 0x80_0000 != 0;
-                let ack_number = ack_base + (val & 0x7f_ffff) as u64;
-                if ack_number >= send_state.serial_number {
-                    eprintln!("Error! Ack number out of range. Too new. {}\n", ack_number);
-                    continue;
-                }
-                if ack_number + (PACKET_HISTORY_BUFFER_LEN as u64) < send_state.serial_number {
-                    eprintln!("Error! Ack number out of range. Too old for buffer. {}\n", ack_number);
-                    continue;
-                }
-                let (packet_size_bytes, send_timestamp_ns, is_mtu_poll, acked) = decompress_packet_info(send_state.packet_buffer[ack_number as usize % PACKET_HISTORY_BUFFER_LEN]);
-                if acked {
-                    eprintln!("Error! Already recieved ack for {}\n", ack_number);
-                    continue;
-                }
-                send_state.packet_buffer[ack_number as usize % PACKET_HISTORY_BUFFER_LEN] |= 1;
-                let rtt_ns = subtract_22_bit_timestamps_with_a_known_more_recent(timestamp_ns, send_timestamp_ns);
-                min_rtt_this_ack = min_rtt_this_ack.min(rtt_ns);
-                if ack_number >= send_state.drop_cursor {
-                    total_bytes_acked_this_ack += packet_size_bytes as u64;
-                }
-
-                if ecn_marked { println!("ECN"); }
-            }
-            if total_bytes_acked_this_ack > 0 {
-                bytes_on_the_wire -= total_bytes_acked_this_ack;
-
-                let current_time_ns = monotonic_clock_ns();
-
-                if current_time_ns > rtt_bucket_cursor_last_time + 1_000_000_000 {
-                    rtt_bucket_cursor += 1;
-                    min_seen_rtt_buckets[rtt_bucket_cursor as usize % min_seen_rtt_buckets.len()] = u64::MAX;
-                    rtt_bucket_cursor_last_time = current_time_ns;
-                }
-                min_seen_rtt_buckets[rtt_bucket_cursor as usize % min_seen_rtt_buckets.len()] = min_seen_rtt_buckets[rtt_bucket_cursor as usize % min_seen_rtt_buckets.len()].min(min_rtt_this_ack);
-
-                if current_time_ns > bytes_delivered_bucket_cursor_last_time + data_delivery_bucket_time {
-                    bytes_delivered_bucket_cursor += 1;
-                    bytes_delivered_buckets[bytes_delivered_bucket_cursor as usize % bytes_delivered_buckets.len()] = 0;
-                    bytes_delivered_bucket_cursor_last_time = current_time_ns;
-                }
-                bytes_delivered_buckets[bytes_delivered_bucket_cursor as usize % bytes_delivered_buckets.len()] += total_bytes_acked_this_ack;
-            }
-        }
-        else {
-            if ecn_marked { println!("ECN!"); }
-
-            ack_state.saved_other_ip_addr = other_ip_addr;
-            ack_state.saved_other_port = other_port;
-
-            if ack_state.acks_in_waiting_count == 0 {
-                ack_state.acks_in_waiting_min = packet_serial;
-                ack_state.first_waiting_ack_time_ns = timestamp_ns;
-            }
-            else {
-                ack_state.acks_in_waiting_min = ack_state.acks_in_waiting_min.min(packet_serial);
-            }
-            ack_state.acks_in_waiting_buf[ack_state.acks_in_waiting_count] = (packet_serial, ecn_marked);
-            ack_state.acks_in_waiting_count += 1;
-            if ack_state.acks_in_waiting_count == ASSUMED_ACK_CAPACITY || monotonic_clock_ns() - ack_state.first_waiting_ack_time_ns > MIN_WAIT_BEFORE_SENDING_NON_FULL_ACK {
-                send_acks_helper(&mut ack_state, &mut send_state, ecn_down);
-            }
-        }
-    }
-}
-
-const ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE: usize = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY - 8;
-const ASSUMED_ACK_CAPACITY: usize = (ASSUMED_DELIVERY_INNER_PAYLOAD_SIZE-1-8)/3;
-
-const MIN_WAIT_BEFORE_SENDING_NON_FULL_ACK: u64 = 5_000_000;
-const MAX_WAIT_BEFORE_SENDING_NON_FULL_ACK: u64 = 20_000_000;
-
-const PACKET_HISTORY_BUFFER_LEN: usize = 1048576;
-
-#[inline]
-pub fn compress_packet_info(packet_size_bytes: u16, timestamp_ns: u64, is_mtu_poll: bool, acked: bool) -> u32 {
-    let size8 = compress_packet_size_to_8_bits(packet_size_bytes) as u32;
-    let ts22  = ((compress_timestamp_to_22_bits(timestamp_ns) >> 13) as u32) & ((1u32 << 22) - 1);
-    (size8 << 24) | (ts22 << 2) | ((is_mtu_poll as u32) << 1) | (acked as u32)
-}
-#[inline]
-pub fn decompress_packet_info(x: u32) -> (u16, u64, bool, bool) {
-    let size8 = (x >> 24) as u8;
-    let ts22  = (x >> 2) & ((1u32 << 22) - 1);
-    let is_mtu_poll   = ((x >> 1) & 1) != 0;
-    let ack   = (x & 1) != 0;
-
-    let packet_size_bytes = decompress_packet_size_to_8_bits(size8);
-    let timestamp_ns_quantized = (ts22 as u64) << 13;
-
-    (packet_size_bytes, timestamp_ns_quantized, is_mtu_poll, ack)
-}
-
-#[inline]
-pub fn subtract_22_bit_timestamps_with_a_known_more_recent(mut recent: u64, mut old: u64) -> u64 {
-    const ROUND_MASK: u64 = 0x1fff;                 // clear low 13 bits
-    const KEEP_MASK:  u64 = 0x0000_0007_ffff_ffff;  // keep low 35 bits
-    const MOD:        u64 = 0x8_0000_0000;            // 1 << 35
-
-    recent = recent.wrapping_add(ROUND_MASK) & !ROUND_MASK;
-    recent &= KEEP_MASK;
-
-    old = old.wrapping_add(ROUND_MASK) & !ROUND_MASK;
-    old &= KEEP_MASK;
-
-    recent = recent.wrapping_add(((recent < old) as u64) * MOD);
-    recent.wrapping_sub(old)
-}
-#[inline]
-pub fn compress_timestamp_to_22_bits(mut n: u64) -> u64 {
-    const ROUND_MASK: u64 = 0x1fff;
-    const KEEP_MASK:  u64 = 0x0000_0007_ffff_ffff;
-
-    n = n.wrapping_add(ROUND_MASK) & !ROUND_MASK;
-    n & KEEP_MASK
-}
-
-#[inline]
-pub fn compress_packet_size_to_8_bits(n: u16) -> u8 {
-    const BASE: u16 = 200;
-    const K: [u16; 8] = [16, 48, 128, 384, 768, 1408, 3136, 6656];
-
-    // remainder we need to represent as a subset-sum of K
-    let mut rem = n.saturating_sub(BASE);
-
-    // Greedy works because K is superincreasing.
-    let mut out: u8 = 0;
-
-    // i = 7 ..= 0
-    let t7 = (rem >= K[7]) as u16; rem = rem.wrapping_sub(t7 * K[7]); out |= (t7 as u8) << 7;
-    let t6 = (rem >= K[6]) as u16; rem = rem.wrapping_sub(t6 * K[6]); out |= (t6 as u8) << 6;
-    let t5 = (rem >= K[5]) as u16; rem = rem.wrapping_sub(t5 * K[5]); out |= (t5 as u8) << 5;
-    let t4 = (rem >= K[4]) as u16; rem = rem.wrapping_sub(t4 * K[4]); out |= (t4 as u8) << 4;
-    let t3 = (rem >= K[3]) as u16; rem = rem.wrapping_sub(t3 * K[3]); out |= (t3 as u8) << 3;
-    let t2 = (rem >= K[2]) as u16; rem = rem.wrapping_sub(t2 * K[2]); out |= (t2 as u8) << 2;
-    let t1 = (rem >= K[1]) as u16; rem = rem.wrapping_sub(t1 * K[1]); out |= (t1 as u8) << 1;
-    let t0 = (rem >= K[0]) as u16; rem = rem.wrapping_sub(t0 * K[0]); out |= (t0 as u8) << 0;
-
-    out
-}
-
-#[inline]
-pub fn decompress_packet_size_to_8_bits(n: u8) -> u16 {
-    const BASE: u16 = 200;
-    const K: [u16; 8] = [16, 48, 128, 384, 768, 1408, 3136, 6656];
-
-    let mut size = BASE;
-
-    // size = BASE + Σ K[i] * bit(i)
-    size += K[0] * ((n >> 0) & 1) as u16;
-    size += K[1] * ((n >> 1) & 1) as u16;
-    size += K[2] * ((n >> 2) & 1) as u16;
-    size += K[3] * ((n >> 3) & 1) as u16;
-    size += K[4] * ((n >> 4) & 1) as u16;
-    size += K[5] * ((n >> 5) & 1) as u16;
-    size += K[6] * ((n >> 6) & 1) as u16;
-    size += K[7] * ((n >> 7) & 1) as u16;
-
-    size
 }
 
 use crate::helpers::*;
