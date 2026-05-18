@@ -564,6 +564,50 @@ impl Context {
             if clicked { *checked = !*checked; }
         }
     }
+
+    // TODO(Giovanni): We should probably merge the two checkboxes and make
+    // a single more __customizabile__ one
+    pub fn checkbox_pill(
+        &mut self,
+        id: Id,
+        checked: &mut bool,
+        label: &str,
+        width: f32,
+    ) {
+        let icon = if *checked { ICON_CHECK } else { ICON_CIRCLE_EMPTY };
+        let base = BUTTON_GREY.mul(if *checked { 0.95 } else { 0.85 });
+        let (clicked, colour, text_colour) = self.button_ex(
+            true, base, id, true, winit::window::CursorIcon::Pointer,
+        );
+        let radius = self.scale(18.0);
+        if let _ = elem().decl(Decl {
+            id, colour,
+            child_gap: self.scale(8.0),
+            padding: self.scale(10.0).dup4(),
+            radius: radius.dup4(),
+            align: Center,
+            direction: LeftToRight,
+            width: fit!(width),
+            height: fit!(radius * 2.0),
+            ..Decl
+        }) {
+            self.text(icon, TextDecl {
+                font: Icons,
+                h: self.scale(16.0),
+                colour: text_colour,
+                align: AlignX::Center,
+                ..TextDecl
+            });
+            self.text(label, TextDecl {
+                h: self.scale(18.0),
+                colour: text_colour,
+                align: AlignX::Center,
+                ..TextDecl
+            });
+            if clicked { *checked = !*checked; }
+        }
+    }
+
     pub fn button_ex(&mut self, act_on_press: bool, colour: (u8, u8, u8, u8), id: Id, enabled: bool, pointer_on_hover: winit::window::CursorIcon) -> (bool, (u8, u8, u8, u8), (u8, u8, u8, u8)) {
 
         let mouse_hover = self.hovered_raw(id);
@@ -4041,29 +4085,11 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         }
 
                     }
-                    // @TODO(Giovanni): Repalce with new ui.checkbox()
-                    let mining_label = "MINING";
-                    let mining_id = id(mining_label);
-                    let actively_mining: bool = *wallet::GUI_ENABLE_MINE.lock().unwrap();
-                    let label = ["NOT MINING", "MINING"][actively_mining as usize];
-                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, mining_id, true, winit::window::CursorIcon::Pointer);
-                    let radius = ui.scale(16.0);
-                    if let _ = elem().decl(Decl {
-                        id: mining_id,
-                        colour,
-                        padding,
-                        child_gap,
-                        radius: radius.dup4(),
-                        align: Center,
-                        width:  fit!(ui.scale(128.0)),
-                        height: fit!(radius * 2.0),
-                        ..Decl
-                    }) {
-                        ui.text(label, TextDecl { font: Normal, h: ui.scale(16.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
-                    }
-                    if clicked {
-                        *wallet::GUI_ENABLE_MINE.lock().unwrap() = !actively_mining;
-                    }
+                    let mining_id = id("MINING");
+                    let mut actively_mining = *wallet::GUI_ENABLE_MINE.lock().unwrap();
+                    ui.checkbox_pill(mining_id, &mut actively_mining, "MINING", ui.scale(128.0));
+                    *wallet::GUI_ENABLE_MINE.lock().unwrap() = actively_mining;
+
                     if let _ = elem().decl(Decl {
                         direction: TopToBottom,
                         align: TopRight,
