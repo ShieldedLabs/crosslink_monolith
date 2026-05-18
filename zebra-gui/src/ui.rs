@@ -872,7 +872,8 @@ impl Context {
     }
 
     pub fn slider(&mut self, id: Id, value: f32) -> f32 {
-        let track_height = self.scale(4.0);
+        let track_thickness = self.scale(10.0);
+        let track_length = self.scale(96.0);
         let mut new_value = value;
         let mouse_hover = self.hovered_raw(id);
         if mouse_hover && self.input().mouse_pressed(MouseButton::Left) {
@@ -881,8 +882,8 @@ impl Context {
         if self.mouse_pressed_id == id &&
            (self.input().mouse_held(MouseButton::Left) || self.input().mouse_pressed(MouseButton::Left)) {
             let element_data = unsafe { clay::Clay_GetElementData(id.clay().id) };
-            if element_data.found && element_data.boundingBox.width > 0.0 {
-                new_value = ((self.input().mouse_pos().0 as f32 - element_data.boundingBox.x) / element_data.boundingBox.width).clamp(0.0, 1.0);
+            if element_data.found && element_data.boundingBox.height > 0.0 {
+                new_value = 1.0 - ((self.input().mouse_pos().1 as f32 - element_data.boundingBox.y) / element_data.boundingBox.height).clamp(0.0, 1.0);
             }
         }
         if mouse_hover {
@@ -894,17 +895,19 @@ impl Context {
         if let _ = elem().decl(Decl {
             id,
             colour: track_colour,
-            radius: (track_height / 2.0).dup4(),
-            width: grow!(),
-            height: fixed!(track_height),
-            clip: ClipX,
+            radius: (track_thickness / 2.0).dup4(),
+            width: fixed!(track_thickness),
+            height: fixed!(track_length),
+            direction: TopToBottom,
+            align: Bottom,
+            clip: ClipY,
             ..Decl
         }) {
             if let _ = elem().decl(Decl {
                 colour: fill_colour,
-                radius: (track_height / 2.0).dup4(),
-                width: Sizing::Percent(new_value),
-                height: grow!(),
+                radius: (track_thickness / 2.0).dup4(),
+                width: grow!(),
+                height: Sizing::Percent(new_value),
                 ..Decl
             }) {}
         }
@@ -4147,10 +4150,11 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             child_gap: ui.scale(6.0),
                             direction: TopToBottom,
                             align: Center,
-                            width: fixed!(ui.scale(140.0)),
+                            width: fixed!(ui.scale(60.0)),
                             height: fit!(),
                             ..Decl
                         }) {
+                            ui.nav_skip = true; // @Hack.
                             let mute_id = id("Mute Toggle");
                             let (clicked, colour, _) = ui.button_ex(true, BUTTON_GREY.mul(0.9), mute_id, true, winit::window::CursorIcon::Pointer);
                             let icon = if ui.global_audio_volume > 0.01 { ICON_VOLUME_HIGH } else { ICON_VOLUME_OFF_1 };
@@ -4171,6 +4175,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             if clicked {
                                 if ui.global_audio_volume > 0.01 { ui.global_audio_volume = 0.0 } else { ui.global_audio_volume = 1.0 };
                             }
+                             ui.nav_skip = false; // @Hack.
                             let volume_pct = (ui.global_audio_volume * 100.0).round() as u32;
                             ui.text(frame_strf!(data, "{}%", volume_pct), TextDecl { h: ui.scale(18.0), align: AlignX::Center, colour: WHITE.mul(0.8), ..TextDecl });
                             ui.global_audio_volume = ui.slider(id("Volume Slider"), ui.global_audio_volume);
