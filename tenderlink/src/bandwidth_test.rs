@@ -1605,7 +1605,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             }
                         }
                         
-                        if state.RTT_sample_cursor != 0 && state.last_ack_received_time + 15_000_000_000/3 < current_time_now_ns {
+                        if state.RTT_sample_cursor != 0 && state.last_ack_received_time + 15_000_000_000/2 < current_time_now_ns {
                             // blackhole detected, go to safe TU
                             state.current_tu = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64;
                             state.RTT_sample_cursor = 0;
