@@ -572,7 +572,7 @@ impl Context {
         id: Id,
         checked: &mut bool,
         label: &str,
-        width: f32,
+        width: Sizing,
     ) {
         let icon = if *checked { ICON_CHECK } else { ICON_CIRCLE_EMPTY };
         let base = BUTTON_GREY.mul(if *checked { 0.95 } else { 0.85 });
@@ -587,7 +587,7 @@ impl Context {
             radius: radius.dup4(),
             align: Center,
             direction: LeftToRight,
-            width: fit!(width),
+            width,
             height: fit!(radius * 2.0),
             ..Decl
         }) {
@@ -871,7 +871,7 @@ impl Context {
         text
     }
 
-    pub fn slider(&mut self, id: Id, value: f32) -> f32 {
+    pub fn slider(&mut self, id: Id, value: f32, horizontal: bool) -> f32 {
         let track_thickness = self.scale(10.0);
         let track_length = self.scale(96.0);
         let mut new_value = value;
@@ -882,8 +882,12 @@ impl Context {
         if self.mouse_pressed_id == id &&
            (self.input().mouse_held(MouseButton::Left) || self.input().mouse_pressed(MouseButton::Left)) {
             let element_data = unsafe { clay::Clay_GetElementData(id.clay().id) };
-            if element_data.found && element_data.boundingBox.height > 0.0 {
-                new_value = 1.0 - ((self.input().mouse_pos().1 as f32 - element_data.boundingBox.y) / element_data.boundingBox.height).clamp(0.0, 1.0);
+            if element_data.found {
+                if horizontal && element_data.boundingBox.width > 0.0 {
+                    new_value = ((self.input().mouse_pos().0 as f32 - element_data.boundingBox.x) / element_data.boundingBox.width).clamp(0.0, 1.0);
+                } else if !horizontal && element_data.boundingBox.height > 0.0 {
+                    new_value = 1.0 - ((self.input().mouse_pos().1 as f32 - element_data.boundingBox.y) / element_data.boundingBox.height).clamp(0.0, 1.0);
+                }
             }
         }
         if mouse_hover {
@@ -896,18 +900,18 @@ impl Context {
             id,
             colour: track_colour,
             radius: (track_thickness / 2.0).dup4(),
-            width: fixed!(track_thickness),
-            height: fixed!(track_length),
-            direction: TopToBottom,
-            align: Bottom,
-            clip: ClipY,
+            width: if horizontal { fixed!(track_length) } else { fixed!(track_thickness) },
+            height: if horizontal { fixed!(track_thickness) } else { fixed!(track_length) },
+            direction: if horizontal { LeftToRight } else { TopToBottom },
+            align: if horizontal { Left } else { Bottom },
+            clip: if horizontal { ClipX } else { ClipY },
             ..Decl
         }) {
             if let _ = elem().decl(Decl {
                 colour: fill_colour,
                 radius: (track_thickness / 2.0).dup4(),
-                width: grow!(),
-                height: Sizing::Percent(new_value),
+                width: if horizontal { Sizing::Percent(new_value) } else { grow!() },
+                height: if horizontal { grow!() } else { Sizing::Percent(new_value) },
                 ..Decl
             }) {}
         }
@@ -3961,10 +3965,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 let _ = elem().decl(Decl { width: grow!(), ..Decl });
 
                 if let _ = elem().decl(Decl {
-                    width: grow!(),
+                    width: fit!(),
                     align: TopRight,
                     padding: (0.0, ui.scale(48.0), 0.0, 0.0),
-                    direction: LeftToRight,
+                    direction: TopToBottom,
                     child_gap: child_gap * 0.5,
                     ..Decl
                 }) {
@@ -3989,18 +3993,24 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
 
 
+                    let combo_id = id("Network Health Combo");
+                    let mut net_activated = false;
+
                     if let _ = elem().decl(Decl {
+                        colour: BUTTON_GREY.mul(0.90),
+                        radius: ui.scale(16.0).dup4(),
+                        padding: (ui.scale(8.0), ui.scale(12.0), ui.scale(8.0), ui.scale(12.0)),
                         direction: TopToBottom,
-                        align: TopRight,
-                        child_gap: ui.scale(8.0),
+                        align: TopLeft,
+                        child_gap: ui.scale(6.0),
                         width: fit!(),
                         height: fit!(),
                         ..Decl
                     }) {
 
-                        let combo_id = id("Network Health Combo");
                         let base = BUTTON_GREY.mul(0.85);
                         let (activated, colour, text_colour) = ui.button_ex(true, base, combo_id, true, winit::window::CursorIcon::Pointer);
+                        net_activated = activated;
                         if let _ = elem().decl(Decl {
                             id: combo_id,
                             colour,
@@ -4013,144 +4023,38 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             height: fit!(),
                             ..Decl
                         }) {
-                            // if let _ = elem().decl(Decl {
-                            //     colour: health_colour,
-                            //     radius: ui.scale(8.0).dup4(),
-                            //     width: fixed!(ui.scale(16.0)),
-                            //     height: fixed!(ui.scale(16.0)),
-                            //     ..Decl
-                            // }) {}
                             ui.text("Network Info", TextDecl { h: ui.scale(18.0), colour: WHITE.mul(0.75), align: AlignX::Center, ..TextDecl });
-                            // ui.text(health_label, TextDecl { h: ui.scale(16.0), colour: text_colour, align: AlignX::Left, ..TextDecl });
                             ui.text(ICON_DOWN_OPEN, TextDecl { font: Icons, h: ui.scale(10.0), colour: WHITE.mul(0.6), align: AlignX::Center, ..TextDecl });
                         }
                         if ui.hovered(combo_id) {
-                            set_tooltip_text!(data, /*"{summary} "*/"Click to expand.");
+                            set_tooltip_text!(data, "Click to expand.");
                         }
-
-                        if ui.openable(data, combo_id, activated, false) {
-                            if let _ = elem().decl(Decl {
-                                colour: BUTTON_GREY.mul(0.90),
-                                radius: ui.scale(16.0).dup4(),
-                                padding: (ui.scale(12.0), ui.scale(16.0), ui.scale(12.0), ui.scale(16.0)),
-                                child_gap: ui.scale(10.0),
-                                direction: TopToBottom,
-                                width: fit!(ui.scale(400.0)),
-                                height: fit!(),
-                                align: TopRight,
-                                ..Decl
-                            }) {
-                                let row = |ui: &mut Context, data: &mut UiData, label: &str, value: &str| {
-                                    if let _ = elem().decl(Decl {
-                                        direction: LeftToRight,
-                                        width: grow!(),
-                                        height: fit!(),
-                                        ..Decl
-                                    }) {
-                                        ui.text(label, TextDecl { h: ui.scale(15.0), colour: WHITE.mul(0.78), align: AlignX::Left, ..TextDecl });
-                                        let _ = elem().decl(Decl { width: grow!(), ..Decl });
-                                        ui.text(frame_strf!(data, "{}", value), TextDecl { font: Mono, h: ui.scale(15.0), align: AlignX::Right, ..TextDecl });
-                                    }
-                                };
-                                // if let _ = elem().decl(Decl {
-                                //     colour: BUTTON_GREY.mul(0.75),
-                                //     radius: ui.scale(12.0).dup4(),
-                                //     padding: (ui.scale(10.0), ui.scale(12.0), ui.scale(10.0), ui.scale(12.0)),
-                                //     child_gap: ui.scale(8.0),
-                                //     direction: TopToBottom,
-                                //     width: grow!(),
-                                //     height: fit!(),
-                                //     ..Decl
-                                // }) {
-                                    // if let _ = elem().decl(Decl {
-                                    //     direction: LeftToRight,
-                                    //     child_gap: ui.scale(8.0),
-                                    //     width: grow!(),
-                                    //     height: fit!(),
-                                    //     ..Decl
-                                    // }) {
-                                    //     if let _ = elem().decl(Decl {
-                                    //         colour: health_colour,
-                                    //         radius: ui.scale(6.0).dup4(),
-                                    //         width: fixed!(ui.scale(12.0)),
-                                    //         height: fixed!(ui.scale(12.0)),
-                                    //         ..Decl
-                                    //     }) {}
-                                    //     ui.text(health_label, TextDecl { h: ui.scale(17.0), colour: WHITE, align: AlignX::Left, ..TextDecl });
-                                    // }
-                                    // ui.text(summary, TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.76), align: AlignX::Left, ..TextDecl });
-                                // }
-
-                                let group_decl = Decl {
-                                    colour: BUTTON_GREY.mul(0.72),
-                                    radius: ui.scale(12.0).dup4(),
-                                    padding: (ui.scale(10.0), ui.scale(12.0), ui.scale(10.0), ui.scale(12.0)),
-                                    child_gap: ui.scale(6.0),
-                                    direction: TopToBottom,
-                                    width: grow!(),
-                                    height: fit!(),
-                                    ..Decl
-                                };
-                                let hdr_text_decl = TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.70), align: AlignX::Left, ..TextDecl };
-
-                                if let _ = elem().decl(group_decl) {
-                                    ui.text("Network", hdr_text_decl);
-                                    row(ui, data, "PoS Height", &format!("{}", viz.bft_tip_height));
-                                    row(ui, data, "PoW Height", &format!("{}", viz.bc_tip_height));
-                                    row(ui, data, "PoW Finalized", &format!("{}", viz.bc_finalized_tip_height));
-                                    row(ui, data, "BFT Peers", &format!("{}", peer_count));
-                                }
-
-                                if let _ = elem().decl(group_decl) {
-                                    ui.text("Wallet", hdr_text_decl);
-                                    row(ui, data, "Wallet Sync", &format!("{}/{} ({:.1}%)", wallets_sync_h, wallets_tip_h, sync_pct));
-                                    row(ui, data, "Blocks Behind Known PoW", &format!("{}", behind));
-                                }
-
-                                if let _ = elem().decl(group_decl) {
-                                    ui.text("Pool Balances", hdr_text_decl);
-                                    row(ui, data, "Orchard", &format!("{}", viz.orchard_pool_balance));
-                                    row(ui, data, "Staking Bonded", &format!("{}", viz.staking_bonded_pool_balance));
-                                    row(ui, data, "Staking Unbonded", &format!("{}", viz.staking_unbonded_pool_balance));
-                                }
-
-                                let decl = TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl };
-                                if ui.viz_op != InteractiveVizOp::None {
-                                    ui.text(frame_strf!(data, "Visualizing op: {:?}", ui.viz_op), decl);
-                                }
-                                if ui.debug {
-                                    for peer in &viz.peer_strings {
-                                        ui.text(peer, decl);
-                                    }
-                                }
-
-                            }
-                        }
-
-                    }
-                    let mining_id = id("MINING");
-                    let mut actively_mining = *wallet::GUI_ENABLE_MINE.lock().unwrap();
-                    ui.checkbox_pill(mining_id, &mut actively_mining, "MINING", ui.scale(128.0));
-                    *wallet::GUI_ENABLE_MINE.lock().unwrap() = actively_mining;
-
-                    if let _ = elem().decl(Decl {
-                        direction: TopToBottom,
-                        align: TopRight,
-                        child_gap: ui.scale(6.0),
-                        width: fit!(),
-                        height: fit!(),
-                        ..Decl
-                    }) {
-
 
                         if let _ = elem().decl(Decl {
-                            colour: BUTTON_GREY.mul(0.9),
-                            radius: ui.scale(12.0).dup4(),
+                            colour: BUTTON_GREY.mul(0.70),
+                            width: grow!(),
+                            height: fixed!(ui.scale(1.0)),
+                            ..Decl
+                        }) {}
+
+                        let mining_id = id("MINING");
+                        let mut actively_mining = *wallet::GUI_ENABLE_MINE.lock().unwrap();
+                        ui.checkbox_pill(mining_id, &mut actively_mining, "MINING", grow!());
+                        *wallet::GUI_ENABLE_MINE.lock().unwrap() = actively_mining;
+
+                        if let _ = elem().decl(Decl {
+                            colour: BUTTON_GREY.mul(0.70),
+                            width: grow!(),
+                            height: fixed!(ui.scale(1.0)),
+                            ..Decl
+                        }) {}
+
+                        if let _ = elem().decl(Decl {
                             padding: (ui.scale(7.0), ui.scale(8.0), ui.scale(7.0), ui.scale(8.0)),
-                            child_gap: ui.scale(6.0),
-                            direction: TopToBottom,
+                            child_gap: ui.scale(8.0),
+                            direction: LeftToRight,
                             align: Center,
-                            width: fixed!(ui.scale(60.0)),
+                            width: grow!(),
                             height: fit!(),
                             ..Decl
                         }) {
@@ -4166,19 +4070,95 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 child_gap,
                                 align: Center,
                                 direction: TopToBottom,
-                                width: fit!(),
+                                width: fixed!(ui.scale(48.0)),
                                 height: fit!(),
                                 ..Decl
                             }) {
-                                ui.text(icon, TextDecl { font: Icons, colour: WHITE.mul(0.95), h: ui.scale(32.0), align: AlignX::Center, ..TextDecl });
+                                ui.text(icon, TextDecl { font: Icons, colour: WHITE.mul(0.95), h: ui.scale(28.0), align: AlignX::Center, ..TextDecl });
                             }
                             if clicked {
                                 if ui.global_audio_volume > 0.01 { ui.global_audio_volume = 0.0 } else { ui.global_audio_volume = 1.0 };
                             }
-                             ui.nav_skip = false; // @Hack.
+                            ui.nav_skip = false; // @Hack.
+                            ui.global_audio_volume = ui.slider(id("Volume Slider"), ui.global_audio_volume, true);
                             let volume_pct = (ui.global_audio_volume * 100.0).round() as u32;
-                            ui.text(frame_strf!(data, "{}%", volume_pct), TextDecl { h: ui.scale(18.0), align: AlignX::Center, colour: WHITE.mul(0.8), ..TextDecl });
-                            ui.global_audio_volume = ui.slider(id("Volume Slider"), ui.global_audio_volume);
+                            if let _ = elem().decl(Decl {
+                                width: fixed!(ui.scale(42.0)),
+                                height: fit!(),
+                                ..Decl
+                            }) {
+                                ui.text(frame_strf!(data, "{}%", volume_pct), TextDecl { font: Mono, h: ui.scale(18.0), align: AlignX::Center, colour: WHITE.mul(0.8), ..TextDecl });
+                            }
+                        }
+                    }
+
+                    if ui.openable(data, combo_id, net_activated, false) {
+                        if let _ = elem().decl(Decl {
+                            colour: BUTTON_GREY.mul(0.90),
+                            radius: ui.scale(16.0).dup4(),
+                            padding: (ui.scale(12.0), ui.scale(16.0), ui.scale(12.0), ui.scale(16.0)),
+                            child_gap: ui.scale(10.0),
+                            direction: TopToBottom,
+                            width: fit!(ui.scale(400.0)),
+                            height: fit!(),
+                            align: TopRight,
+                            ..Decl
+                        }) {
+                            let row = |ui: &mut Context, data: &mut UiData, label: &str, value: &str| {
+                                if let _ = elem().decl(Decl {
+                                    direction: LeftToRight,
+                                    width: grow!(),
+                                    height: fit!(),
+                                    ..Decl
+                                }) {
+                                    ui.text(label, TextDecl { h: ui.scale(15.0), colour: WHITE.mul(0.78), align: AlignX::Left, ..TextDecl });
+                                    let _ = elem().decl(Decl { width: grow!(), ..Decl });
+                                    ui.text(frame_strf!(data, "{}", value), TextDecl { font: Mono, h: ui.scale(15.0), align: AlignX::Right, ..TextDecl });
+                                }
+                            };
+
+                            let group_decl = Decl {
+                                colour: BUTTON_GREY.mul(0.72),
+                                radius: ui.scale(12.0).dup4(),
+                                padding: (ui.scale(10.0), ui.scale(12.0), ui.scale(10.0), ui.scale(12.0)),
+                                child_gap: ui.scale(6.0),
+                                direction: TopToBottom,
+                                width: grow!(),
+                                height: fit!(),
+                                ..Decl
+                            };
+                            let hdr_text_decl = TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.70), align: AlignX::Left, ..TextDecl };
+
+                            if let _ = elem().decl(group_decl) {
+                                ui.text("Network", hdr_text_decl);
+                                row(ui, data, "PoS Height", &format!("{}", viz.bft_tip_height));
+                                row(ui, data, "PoW Height", &format!("{}", viz.bc_tip_height));
+                                row(ui, data, "PoW Finalized", &format!("{}", viz.bc_finalized_tip_height));
+                                row(ui, data, "BFT Peers", &format!("{}", peer_count));
+                            }
+
+                            if let _ = elem().decl(group_decl) {
+                                ui.text("Wallet", hdr_text_decl);
+                                row(ui, data, "Wallet Sync", &format!("{}/{} ({:.1}%)", wallets_sync_h, wallets_tip_h, sync_pct));
+                                row(ui, data, "Blocks Behind Known PoW", &format!("{}", behind));
+                            }
+
+                            if let _ = elem().decl(group_decl) {
+                                ui.text("Pool Balances", hdr_text_decl);
+                                row(ui, data, "Orchard", &format!("{}", viz.orchard_pool_balance));
+                                row(ui, data, "Staking Bonded", &format!("{}", viz.staking_bonded_pool_balance));
+                                row(ui, data, "Staking Unbonded", &format!("{}", viz.staking_unbonded_pool_balance));
+                            }
+
+                            let decl = TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl };
+                            if ui.viz_op != InteractiveVizOp::None {
+                                ui.text(frame_strf!(data, "Visualizing op: {:?}", ui.viz_op), decl);
+                            }
+                            if ui.debug {
+                                for peer in &viz.peer_strings {
+                                    ui.text(peer, decl);
+                                }
+                            }
                         }
                     }
                 }
