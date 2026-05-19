@@ -48,16 +48,22 @@ pub fn do_the_test_program3(port: u16, my_keypair: IdentityKeyPair, beam_to: Opt
         let ret = new_service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable: vec![], });
         wanted_connections = ret.current_connections;
     
+        let mut i = 0;
+    
         loop {
             let mut send_unreliable = Vec::new();
             if wanted_connections.len() > 0 {
-                for _ in 0..40000 {
+                let mut num = 0;
+                if i % 30 == 0 { num = 10_000; println!("\n\n######                                small dump"); }
+                if i % 50 == 0 { num = 1000_000; println!("\n\n########################################big dump"); }
+                i += 1;
+                for _ in 0..num {
                     send_unreliable.push((wanted_connections[0].0.to_connection_key(), Vec::from(b"Test data...")));
                 }
             }
             let ret = new_service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable, });
             wanted_connections = ret.current_connections;
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(std::time::Duration::from_millis(1000));
         }
     }
     else {
@@ -494,8 +500,8 @@ pub struct ConnectionStateConnected {
     pub send_time_band: [u64; 1024], // 1024 buckets of 4.194 ms giving 4.295 seconds of tracking.
     pub send_time_band_head_index: u64, // monotonic time ns / 4_194_304 aka 0x400000
     
-    pub RTT_sample_sums: [u32; 32],   // sum of RTT measurements per ack, in 0.1 ms units
-    pub RTT_sample_counts: [u16; 32], // count of RTT measurements per ack
+    pub RTT_sample_sums: [u32; 16],   // sum of RTT measurements per ack, in 0.1 ms units
+    pub RTT_sample_counts: [u16; 16], // count of RTT measurements per ack
     pub RTT_sample_cursor: u64,
     pub RTT_mean: u16,
     
@@ -516,6 +522,8 @@ pub struct ConnectionStateConnected {
     pub congestion_event_rate_upps: u64,
     pub loss_window_start_ns: u64,
     pub loss_count_in_window: u64,
+    pub is_app_limited: bool,
+    pub app_limit_time_offset: u64,
 }
 pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, magic1: u64, magic2: u64, timestamp_ns: u64) -> ConnectionState {
     ConnectionState::Connected(ConnectionStateConnected {
@@ -533,10 +541,10 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         ack_timer: u64::MAX,
         send_time_band: [0; 1024],
         send_time_band_head_index: 0,
-        RTT_sample_sums: [0; 32],
-        RTT_sample_counts: [0; 32],
+        RTT_sample_sums: [0; 16],
+        RTT_sample_counts: [0; 16],
         RTT_sample_cursor: 0,
-        RTT_mean: 0,
+        RTT_mean: u16::MAX,
         packets_waiting_ack_field: [0; 2048],
         packets_waiting_ack_tail: 0,
         
@@ -553,6 +561,8 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         congestion_event_rate_upps: 0,
         loss_window_start_ns: 0,
         loss_count_in_window: 0,
+        is_app_limited: false,
+        app_limit_time_offset: 0,
     })
 }
 
@@ -1030,6 +1040,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                     should_sleep = false;
                     let first_six_bytes = load_u48(&packet_memory_encrypted[0..6]);
                     
+                    if ecn_marked { println!("ECN"); }
+                    
                     if first_six_bytes & 1 != 0 { // Client Hello
                         let magic1 = first_six_bytes;
                         if magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
@@ -1332,7 +1344,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                 }
                                 
                                 if RTT_count > 0 {
-                                    let slot = (state.RTT_sample_cursor % 32) as usize;
+                                    let slot = (state.RTT_sample_cursor % 16) as usize;
                                     state.RTT_sample_sums[slot] = RTT_acc as u32;
                                     state.RTT_sample_counts[slot] = RTT_count as u16;
                                     state.RTT_sample_cursor += 1;
@@ -1593,11 +1605,11 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             }
                         }
                         
-                        if state.RTT_sample_cursor != 0 && state.last_ack_received_time + 15_000_000_000/2 < current_time_now_ns {
+                        if state.RTT_sample_cursor != 0 && state.last_ack_received_time + 15_000_000_000/3 < current_time_now_ns {
                             // blackhole detected, go to safe TU
                             state.current_tu = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64;
                             state.RTT_sample_cursor = 0;
-                            state.RTT_mean = 0;
+                            state.RTT_mean = u16::MAX;
                             state.congestion_event_time_ns = 0;
                             state.congestion_event_rate_upps = 0;
                             state.last_sent_data_packet = 0;
@@ -1612,8 +1624,14 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             if OVERLY_VERBOSE { println!("Blackhole detected!"); }
                         }
                         
+                        if state.congestion_event_time_ns == 0 { state.congestion_event_time_ns = current_time_now_ns; }
+                        
                         {
-                            let n = (state.RTT_sample_cursor as usize).min(32);
+                            let old_k = CUBIC_K_RTT_MULTIPLIER * (state.RTT_mean as u64 * 100_000);
+                            let current_t = current_time_now_ns.saturating_sub(state.congestion_event_time_ns);
+                            let old_rate = cubic_rate(current_t, state.congestion_event_rate_upps, old_k);
+
+                            let n = (state.RTT_sample_cursor as usize).min(16);
                             if n > 0 {
                                 let mut total_sum = 0u64;
                                 let mut total_count = 0u64;
@@ -1623,9 +1641,27 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                 }
                                 state.RTT_mean = (total_sum / total_count) as u16;
                             }
+
+                            let new_k = CUBIC_K_RTT_MULTIPLIER * (state.RTT_mean as u64 * 100_000);
+                            if old_k > 0 && new_k > 0 {
+                                let mut lo = if new_k >= old_k { current_t } else { 0u64 };
+                                let mut hi = if new_k >= old_k { current_t * 2 + new_k } else { current_t };
+                                for _ in 0..64 {
+                                    let mid = lo + (hi - lo) / 2;
+                                    if cubic_rate(mid, state.congestion_event_rate_upps, new_k) >= old_rate {
+                                        hi = mid;
+                                    } else {
+                                        lo = mid + 1;
+                                    }
+                                }
+                                let new_event_time = current_time_now_ns.saturating_sub(hi);
+                                let delta = new_event_time as i64 - state.congestion_event_time_ns as i64;
+                                state.congestion_event_time_ns = new_event_time;
+                                state.app_limit_time_offset = (state.app_limit_time_offset as i64 + delta).max(0) as u64;
+                            }
                         }
 
-                        let time_to_bandwidth_recovery = 14*(state.RTT_mean as u64 * 100_000);
+                        let time_to_bandwidth_recovery = CUBIC_K_RTT_MULTIPLIER * (state.RTT_mean as u64 * 100_000);
                            
                         // NOTE(Sam): We may experience black holes if RTT suddenly increases since
                         // there is a cyclic dependency beteen RTT and measuring RTT because of drop.
@@ -1636,7 +1672,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             let bit_index = state.packets_waiting_ack_tail % (2048*64);
                             if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                 let mut send_time = get_send_time_for_sequence_number(state.packets_waiting_ack_tail, &state.send_time_band, state.send_time_band_head_index);
-                                if send_time != 0 && (state.RTT_mean == 0 || (current_time_now_ns - send_time) < 3*(state.RTT_mean as u64 * 100_000)) {
+                                if send_time != 0 && (state.RTT_mean == 0 || (current_time_now_ns - send_time) < ACK_BUFFER_TIME_NS + 3*(state.RTT_mean as u64 * 100_000)) {
                                     break;
                                 }
                                 if send_time == 0 { send_time = current_time_now_ns - 4_295_000_000; }
@@ -1658,6 +1694,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                     if state.loss_count_in_window >= 3 && send_time > state.congestion_event_time_ns + 2*(state.RTT_mean as u64 * 100_000) {
                                         state.congestion_event_rate_upps = cubic_rate(send_time - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery);
                                         state.congestion_event_time_ns = current_time_now_ns;
+                                        state.app_limit_time_offset = 0;
                                         state.loss_count_in_window = 0;
                                         println!("congestion event PACKET DROPPED {} ...  rate discovered: {} pps", state.packets_waiting_ack_tail, state.congestion_event_rate_upps as f64 / 1000000.0);
                                     }
@@ -1670,8 +1707,15 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             state.packets_waiting_ack_tail += 1;
                         }
                         
+                        if state.is_app_limited {
+                            state.congestion_event_time_ns = current_time_now_ns.saturating_sub(state.app_limit_time_offset);
+                            if connection_tracking_data.temp_send_unreliable.is_empty() == false {
+                                println!("####### END APP LIMITED ######");
+                                state.is_app_limited = false;
+                                state.last_sent_data_packet = current_time_now_ns;
+                            }
+                        }
                         
-                        if state.congestion_event_time_ns == 0 { state.congestion_event_time_ns = current_time_now_ns; }
                         state.congestion_event_rate_upps = state.congestion_event_rate_upps.max(1_000_000);
                         
                         let allowed_bandwidth_upps = cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery).max(1_000_000);
@@ -1748,7 +1792,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             packet_send_allowance_now = packet_send_allowance_now.saturating_sub(1);
                             state.packet_since_last_print += 1;
                         }
-
+                        
                         while ring_buffer_not_full && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && let Some(unreliable_message) = connection_tracking_data.temp_send_unreliable.pop_front() {
                             let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                         
@@ -1777,6 +1821,14 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             state.packet_since_last_print += 1;
                         }
                         
+                        if packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight {
+                            if state.is_app_limited == false {
+                                println!("####### START APP LIMITED ######");
+                                state.is_app_limited = true;
+                                state.app_limit_time_offset = current_time_now_ns - state.congestion_event_time_ns;
+                            }
+                        }
+                        
                         if could_have_sent {
                             if packet_send_allowance_now == 0 {
                                 state.send_pacer_acc_ns += send_allowance_time_remainder;
@@ -1787,10 +1839,10 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                         }
                         
                         // bonus status debug print
-                        if state.last_status_print_time + 1_000_000_00 < current_time_now_ns {
+                        if state.last_status_print_time + 1_000_000_000 < current_time_now_ns {
                             state.last_status_print_time = current_time_now_ns;
                             let mean = state.RTT_mean as f64 / 10.0;
-                            let n = (state.RTT_sample_cursor as usize).min(32);
+                            let n = (state.RTT_sample_cursor as usize).min(16);
                             println!("RTT (ms): mean={mean:.1} (n={n}) --- TU: {} B  failed probes: {} --- target: {} pps   in flight: {}/{}  pacing: {} us  lost/sent: {}/{}", state.current_tu, state.tu_probe_failed_count, allowed_bandwidth_upps as f64 / 1000000.0, state.packets_in_flight, allowed_packets_in_flight, time_between_sends_ns / 1000, state.packet_lost_since_last_print, state.packet_since_last_print);
                             state.packet_since_last_print = 0;
                             state.packet_lost_since_last_print = 0;
@@ -1812,8 +1864,10 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
 }
 
 const CUBIC_BETA: f64 = 0.6;
-const CUBIC_PROBE_SLOWDOWN: f64 = 1.2;
+const CUBIC_K_RTT_MULTIPLIER: u64 = 8;
+const CUBIC_PROBE_SLOWDOWN: f64 = 1.7;
 const CUBIC_MAX_PROBE_RATE_UPPS_PER_SEC: f64 = 7000_000_000.0;
+const CUBIC_MIN_GROWTH_UPPSPS: f64 = 1_000_000.0; // 1 pps per second minimum linear growth
 
 /// Evaluate the CUBIC sending-rate function.
 /// t_ns:  nanoseconds since the last congestion event.
@@ -1826,33 +1880,35 @@ pub fn cubic_rate(t_ns: u64, r_max: u64, k_ns: u64) -> u64 {
     let r = r_max as f64;
     let k = k_ns as f64;
     let drop = r * (1.0 - CUBIC_BETA);
+    let min_growth = CUBIC_MIN_GROWTH_UPPSPS / 1e9 * t; // linear floor growth
     if t <= k {
         // Recovery: quintic from r*beta up to r — very fast start, slow approach
         let p = 1.0 - t / k; // 1 at t=0, 0 at t=k
         let p2 = p * p;
-        let rate = r - drop * p2 * p2 * p;
+        let rate = r - drop * p2 * p2 * p + min_growth;
         (rate.max(r - drop)) as u64
     } else {
-        // Probing: p^6 from r upward, transitioning to linear where derivatives match
+        // Probing: p^4 from r upward, transitioning to linear where derivatives match
         let k_probe = k * CUBIC_PROBE_SLOWDOWN;
         let linear_slope = CUBIC_MAX_PROBE_RATE_UPPS_PER_SEC / 1e9; // upps per nanosecond
-        // Transition point: where d/dt(drop * p^6) = linear_slope
-        // drop * 6 * p^5 / k_probe = linear_slope
-        let p_transition = (linear_slope * k_probe / (6.0 * drop)).powf(0.2);
+        // Transition point: where d/dt(drop * p^4) = linear_slope
+        // drop * 4 * p^3 / k_probe = linear_slope
+        let p_transition = (linear_slope * k_probe / (4.0 * drop)).cbrt();
         let p = (t - k) / k_probe;
         let rate = if p <= p_transition {
             let p2 = p * p;
-            r + drop * p2 * p2 * p2
+            r + drop * p2 * p2 + min_growth
         } else {
             // Linear continuation from the transition point, matching value and slope
             let pt2 = p_transition * p_transition;
-            let value_at_transition = r + drop * pt2 * pt2 * pt2;
-            value_at_transition + linear_slope * (t - k - p_transition * k_probe)
+            let value_at_transition = r + drop * pt2 * pt2;
+            value_at_transition + linear_slope * (t - k - p_transition * k_probe) + min_growth
         };
         let rate = if rate.is_finite() { rate } else { r };
         rate as u64
     }
 }
+
 
 pub fn new_service_connections(network_thread_handle: &NetworkThreadHandle, mut req: NetworkThreadPush) -> NetworkThreadPull {
     while network_thread_handle.inner.state.load(std::sync::atomic::Ordering::Acquire) != 0 {
