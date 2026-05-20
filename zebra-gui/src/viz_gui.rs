@@ -238,6 +238,8 @@ pub struct VizState {
     pub inspecting_block_hash: Hash32,
     pub inspect_block_json_text: Option<String>,
 
+    pub should_reset_clay_text_cache: bool,
+
     pub inspecting_block_screen_x: f32,
     pub inspecting_block_screen_y: f32,
 
@@ -465,6 +467,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 
         inspecting_block_hash: Hash32::from_u64(0),
         inspect_block_json_text: None,
+        should_reset_clay_text_cache: false,
 
         inspecting_block_screen_x: 0.0,
         inspecting_block_screen_y: 0.0,
@@ -583,6 +586,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         }
 
         if message.what_block_it_is == viz_state.inspecting_block_hash {
+            viz_state.should_reset_clay_text_cache = true;
             viz_state.inspect_block_json_text = Some(message.json_dump_of_the_block);
         }
 

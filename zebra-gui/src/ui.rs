@@ -4259,13 +4259,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { font: Mono, wrap: Wrap::Chars, h: text_h, align: AlignX::Left, ..TextDecl });
                 let text = {
                     if let Some(text) = viz.inspect_block_json_text.as_ref() {
-                        // NOTE(Giovanni): Temporarely fixing Clay's crash when rendering very long texts by
-                        // capping text length to 2000 characters...
-                        if text.len() > 2000 {
-                            format!("{}...\n[truncated, {} bytes total]", &text[..2000], text.len())
-                        } else {
-                            text.to_string()
-                        }
+
+                        text.to_string()
                     } else {
                         frame_strf!(data, "Loading info for block {}...", viz.inspecting_block_hash).to_string()
                     }
@@ -4533,7 +4528,12 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             }
         }
     }
-
+    if(viz.should_reset_clay_text_cache)
+    {
+        viz.should_reset_clay_text_cache = false;
+        unsafe { clay::Clay_ResetMeasureTextCache() };
+        
+    }
     result |= dbg_ui(ui, is_rendering);
 
     result
