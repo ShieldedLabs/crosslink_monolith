@@ -13,6 +13,8 @@ use crate::{
 
 pub use zebra_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
 
+pub const POS_BLOCK_REWARD_ZATS: u64 = 500_000_000; // TODO: directly contribute to "reward total" - currently dev fund 20% ignores this in its calculation
+
 /// The maximum chain reorganisation height.
 ///
 /// This threshold determines the maximum length of the best non-finalized chain.

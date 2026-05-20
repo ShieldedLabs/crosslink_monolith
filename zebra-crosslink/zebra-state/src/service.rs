@@ -2499,3 +2499,174 @@ pub fn init_test_services(
         chain_tip_change,
     )
 }
+
+
+/// Process a delegation bond from a staking action.
+///
+/// Updates the chain's delegation bond state based on the staking action kind:
+/// - CreateNewDelegationBond: creates new bond
+/// - BeginDelegationUnbonding: looks up bond from self.delegation_bonds, updates status,
+///   decreases staking_bonded pool, increases staking_unbonded pool
+/// - WithdrawDelegationBond: looks up bond from self.delegation_bonds and updates status
+///
+/// expects a non-empty bond_retargets
+pub fn update_chain_tip_with_delegation_bond(
+    chain_value_pools: &mut zebra_chain::value_balance::ValueBalance<zebra_chain::amount::NonNegative>,
+    delegation_bonds: &mut HashMap<finalized_state::disk_format::BondKey, (finalized_state::disk_format::DelegationBond, non_finalized_state::BondStatusInChain)>,
+    bond_retargets: &mut Vec<HashMap<finalized_state::disk_format::BondKey, [u8; 32]>>,
+    staking_action: &zcash_primitives::transaction::StakingAction,
+    _transaction_hash: &zebra_chain::transaction::Hash,
+    transaction_location: finalized_state::disk_format::TransactionLocation,
+) -> Result<(), ValidateContextError> {
+    use zcash_primitives::transaction::StakingActionKind;
+
+    let bond_key = staking_action.arg32_0;
+
+    match staking_action.kind {
+        StakingActionKind::CreateNewDelegationBond => {
+            // Extract bond data
+            // Note: amount validation should have been done during contextual validation
+            let amount = zebra_chain::amount::Amount::try_from(staking_action.amount_zats)
+                .expect("bond amount should have been validated");
+            let target_finalizer = staking_action.arg32_2;
+
+            let bond = finalized_state::disk_format::DelegationBond::new(
+                amount,
+                target_finalizer,
+                transaction_location,
+            );
+
+            // Insert as active bond
+            // Note: duplicate bond check should have been done during contextual validation
+            let previous = delegation_bonds.insert(bond_key, (bond, non_finalized_state::BondStatusInChain::Active));
+            assert!(
+                previous.is_none(),
+                "duplicate delegation bond should have been rejected during validation"
+            );
+        }
+        StakingActionKind::BeginDelegationUnbonding => {
+            // Get the bond from delegation_bonds
+            let (bond, _status) = delegation_bonds.get(&bond_key)
+                .copied()
+                .expect("bond must exist in chain (should have been validated)");
+
+            // Update status to Unbonding and set created_at to current transaction location
+            let updated_bond = finalized_state::disk_format::DelegationBond::new(
+                bond.amount,
+                bond.target_finalizer,
+                transaction_location,
+            );
+            delegation_bonds.insert(bond_key, (updated_bond, non_finalized_state::BondStatusInChain::Unbonding));
+
+            // Decrease staking_bonded pool by bond amount
+            let current_bonded = chain_value_pools.staking_bonded_amount();
+            let new_bonded = (current_bonded - bond.amount)
+                .map_err(|e| ValidateContextError::InvalidDelegationBond(
+                        format!("staking_bonded pool underflow when unbonding: {:?}", e)
+                ))?;
+            chain_value_pools.set_staking_bonded_amount(new_bonded);
+
+            // Increase staking_unbonded pool by bond amount
+            let current_unbonded = chain_value_pools.staking_unbonded_amount();
+            let new_unbonded = (current_unbonded + bond.amount)
+                .map_err(|e| ValidateContextError::InvalidDelegationBond(
+                        format!("staking_unbonded pool overflow when unbonding: {:?}", e)
+                ))?;
+            chain_value_pools.set_staking_unbonded_amount(new_unbonded);
+        }
+        StakingActionKind::WithdrawDelegationBond => {
+            // Get the bond from delegation_bonds
+            let (bond, _status) = delegation_bonds.get(&bond_key)
+                .copied()
+                .expect("bond must exist in chain (should have been validated)");
+
+            // Update status to Withdrawn and set created_at to current transaction location
+            let updated_bond = finalized_state::disk_format::DelegationBond::new(
+                bond.amount,
+                bond.target_finalizer,
+                transaction_location,
+            );
+            delegation_bonds.insert(bond_key, (updated_bond, non_finalized_state::BondStatusInChain::Withdrawn));
+        }
+        StakingActionKind::RetargetDelegationBond => {
+            // Get the old target first (immutable borrow)
+            let old_target = {
+                let (bond, _status) = delegation_bonds.get(&bond_key)
+                    .expect("bond must exist in chain (should have been validated)");
+                bond.target_finalizer
+            };
+
+            // Record the pre-block target for this bond (only if not already recorded in this block)
+            // This allows us to restore the original target on revert
+            let retargets_this_block = bond_retargets.last_mut()
+                .expect("bond_retargets should have been initialized for this block");
+            retargets_this_block.entry(bond_key).or_insert(old_target);
+
+            // Update only target_finalizer (not created_at or amount)
+            let new_target = staking_action.arg32_2;
+            let (bond, _status) = delegation_bonds.get_mut(&bond_key)
+                .expect("bond must exist in chain");
+            bond.target_finalizer = new_target;
+        }
+        // Other staking actions don't affect delegation bonds
+        _ => {}
+    }
+
+    Ok(())
+}
+
+
+/// caller must ensure delegation_bonds is non-empty
+pub fn update_bonds_with_pos_issuance(
+    bond_reward_total: u64,
+    delegation_bonds: &mut HashMap<finalized_state::disk_format::BondKey, (finalized_state::disk_format::DelegationBond, non_finalized_state::BondStatusInChain)>
+    ) -> Vec<([u8; 32], u64)>
+{
+    use zebra_chain::amount::Amount;
+
+    /*
+       Note(Sam): This is inspired from Andrews earlier code. We will use the fact the integer division only rounds
+       down to make sure we do not accidentally mint zats. We first identify the biggest bond, this bond will recieve the remainder.
+    */
+    let mut total_staked_zats = 0u64;
+    let max_staker = {
+        let mut iter = delegation_bonds.iter().filter(|(_, (_, status))| *status == non_finalized_state::BondStatusInChain::Active);
+        let first = iter.next().expect("is any checked already");
+        let mut max_staker = *first.0;
+        let mut biggest = first.1.0.amount.zatoshis() as u64;
+        total_staked_zats += first.1.0.amount.zatoshis() as u64;
+        for other in iter {
+            total_staked_zats += other.1.0.amount.zatoshis() as u64;
+            if other.1.0.amount.zatoshis() as u64 > biggest || (other.1.0.amount.zatoshis() as u64 == biggest && *other.0 < max_staker) {
+                max_staker = *other.0;
+                biggest = other.1.0.amount.zatoshis() as u64;
+            }
+        }
+        max_staker
+    };
+
+    let mut so_far_payed_reward = 0u64;
+
+    let mut reward_per_bond: Vec<([u8; 32], u64)> = Vec::new();
+    for (bond_key, (bond, bond_status)) in delegation_bonds.iter_mut() {
+        if *bond_status == non_finalized_state::BondStatusInChain::Active && *bond_key != max_staker {
+            let mul: u128 = (bond.amount.zatoshis() as u128) * (bond_reward_total as u128);
+            let reward = (mul / (total_staked_zats as u128)) as u64;
+            so_far_payed_reward += reward;
+
+            bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
+            reward_per_bond.push((*bond_key, reward,));
+        }
+    }
+
+    // Biggest bond position gets the remainder.
+    {
+        let (bond, _status) = delegation_bonds.get_mut(&max_staker).expect("checked earlier");
+        let reward = bond_reward_total - so_far_payed_reward;
+
+        bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
+        reward_per_bond.push((max_staker, reward,));
+    }
+
+    reward_per_bond
+}

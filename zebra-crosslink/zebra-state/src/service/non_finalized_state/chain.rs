@@ -1598,101 +1598,15 @@ impl Chain {
         _transaction_hash: &transaction::Hash,
         transaction_location: disk_format::TransactionLocation,
     ) -> Result<(), ValidateContextError> {
-        use zcash_primitives::transaction::StakingActionKind;
-
-        let bond_key = staking_action.arg32_0;
-
-        match staking_action.kind {
-            StakingActionKind::CreateNewDelegationBond => {
-                // Extract bond data
-                // Note: amount validation should have been done during contextual validation
-                let amount = Amount::try_from(staking_action.amount_zats)
-                    .expect("bond amount should have been validated");
-                let target_finalizer = staking_action.arg32_2;
-
-                let bond = disk_format::DelegationBond::new(
-                    amount,
-                    target_finalizer,
-                    transaction_location,
-                );
-
-                // Insert as active bond
-                // Note: duplicate bond check should have been done during contextual validation
-                let previous = self.delegation_bonds.insert(bond_key, (bond, BondStatusInChain::Active));
-                assert!(
-                    previous.is_none(),
-                    "duplicate delegation bond should have been rejected during validation"
-                );
-            }
-            StakingActionKind::BeginDelegationUnbonding => {
-                // Get the bond from self.delegation_bonds
-                let (bond, _status) = self.delegation_bonds.get(&bond_key)
-                    .copied()
-                    .expect("bond must exist in chain (should have been validated)");
-
-                // Update status to Unbonding and set created_at to current transaction location
-                let updated_bond = disk_format::DelegationBond::new(
-                    bond.amount,
-                    bond.target_finalizer,
-                    transaction_location,
-                );
-                self.delegation_bonds.insert(bond_key, (updated_bond, BondStatusInChain::Unbonding));
-
-                // Decrease staking_bonded pool by bond amount
-                let current_bonded = self.chain_value_pools.staking_bonded_amount();
-                let new_bonded = (current_bonded - bond.amount)
-                    .map_err(|e| ValidateContextError::InvalidDelegationBond(
-                        format!("staking_bonded pool underflow when unbonding: {:?}", e)
-                    ))?;
-                self.chain_value_pools.set_staking_bonded_amount(new_bonded);
-
-                // Increase staking_unbonded pool by bond amount
-                let current_unbonded = self.chain_value_pools.staking_unbonded_amount();
-                let new_unbonded = (current_unbonded + bond.amount)
-                    .map_err(|e| ValidateContextError::InvalidDelegationBond(
-                        format!("staking_unbonded pool overflow when unbonding: {:?}", e)
-                    ))?;
-                self.chain_value_pools.set_staking_unbonded_amount(new_unbonded);
-            }
-            StakingActionKind::WithdrawDelegationBond => {
-                // Get the bond from self.delegation_bonds
-                let (bond, _status) = self.delegation_bonds.get(&bond_key)
-                    .copied()
-                    .expect("bond must exist in chain (should have been validated)");
-
-                // Update status to Withdrawn and set created_at to current transaction location
-                let updated_bond = disk_format::DelegationBond::new(
-                    bond.amount,
-                    bond.target_finalizer,
-                    transaction_location,
-                );
-                self.delegation_bonds.insert(bond_key, (updated_bond, BondStatusInChain::Withdrawn));
-            }
-            StakingActionKind::RetargetDelegationBond => {
-                // Get the old target first (immutable borrow)
-                let old_target = {
-                    let (bond, _status) = self.delegation_bonds.get(&bond_key)
-                        .expect("bond must exist in chain (should have been validated)");
-                    bond.target_finalizer
-                };
-
-                // Record the pre-block target for this bond (only if not already recorded in this block)
-                // This allows us to restore the original target on revert
-                let retargets_this_block = self.bond_retargets.last_mut()
-                    .expect("bond_retargets should have been initialized for this block");
-                retargets_this_block.entry(bond_key).or_insert(old_target);
-
-                // Update only target_finalizer (not created_at or amount)
-                let new_target = staking_action.arg32_2;
-                let (bond, _status) = self.delegation_bonds.get_mut(&bond_key)
-                    .expect("bond must exist in chain");
-                bond.target_finalizer = new_target;
-            }
-            // Other staking actions don't affect delegation bonds
-            _ => {}
-        }
-
-        Ok(())
+        let ChainInner { chain_value_pools, delegation_bonds, bond_retargets, .. } = &mut self.inner;
+        crate::service::update_chain_tip_with_delegation_bond(
+            chain_value_pools,
+            delegation_bonds,
+            bond_retargets,
+            staking_action,
+            _transaction_hash,
+            transaction_location
+        )
     }
 
     /// Revert a delegation bond operation when a block is removed from the chain.
@@ -1905,51 +1819,8 @@ impl Chain {
             self.bond_rewards.push(Vec::new());
             // TODO handle this case, for prototyping this is whatever.
         } else {
-            /*
-            Note(Sam): This is inspired from Andrews earlier code. We will use the fact the integer division only rounds
-            down to make sure we do not accidentally mint zats. We first identify the biggest bond, this bond will recieve the remainder.
-            */
-            let mut total_staked_zats = 0u64;
-            let max_staker = {
-                let mut iter = self.inner.delegation_bonds.iter().filter(|(_, (_, status))| *status == BondStatusInChain::Active);
-                let first = iter.next().expect("is any checked already");
-                let mut max_staker = *first.0;
-                let mut biggest = first.1.0.amount.zatoshis() as u64;
-                total_staked_zats += first.1.0.amount.zatoshis() as u64;
-                for other in iter {
-                    total_staked_zats += other.1.0.amount.zatoshis() as u64;
-                    if other.1.0.amount.zatoshis() as u64 > biggest || (other.1.0.amount.zatoshis() as u64 == biggest && *other.0 < max_staker) {
-                        max_staker = *other.0;
-                        biggest = other.1.0.amount.zatoshis() as u64;
-                    }
-                }
-                max_staker
-            };
-
-            let bond_reward_total = 500_000_000; // TODO: directly contribute to "reward total" - currently dev fund 20% ignores this in its calculation
-            let mut so_far_payed_reward = 0u64;
-
-            let mut reward_store_for_revert: Vec<([u8; 32], u64)> = Vec::new();
-            for (bond_key, (bond, bond_status)) in self.inner.delegation_bonds.iter_mut() {
-                if *bond_status == BondStatusInChain::Active && *bond_key != max_staker {
-                    let mul: u128 = (bond.amount.zatoshis() as u128) * (bond_reward_total as u128);
-                    let reward = (mul / (total_staked_zats as u128)) as u64;
-                    so_far_payed_reward += reward;
-
-                    bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
-                    reward_store_for_revert.push((*bond_key, reward,));
-                }
-            }
-
-            // Biggest bond position gets the remainder.
-            {
-                let (bond, _status) = self.inner.delegation_bonds.get_mut(&max_staker).expect("checked earlier");
-                let reward = bond_reward_total - so_far_payed_reward;
-
-                bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
-                reward_store_for_revert.push((max_staker, reward,));
-            }
-
+            let bond_reward_total = crate::constants::POS_BLOCK_REWARD_ZATS;
+            let reward_store_for_revert = crate::service::update_bonds_with_pos_issuance(bond_reward_total, &mut self.inner.delegation_bonds);
             self.inner.chain_value_pools.set_staking_bonded_amount((self.inner.chain_value_pools.staking_bonded_amount() + Amount::new(bond_reward_total as i64)).unwrap());
             self.bond_rewards.push(reward_store_for_revert);
         }
