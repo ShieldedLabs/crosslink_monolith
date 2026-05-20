@@ -53,7 +53,7 @@ pub enum TFLServiceRequest {
     /// faucet
     Faucet(String),
     /// For crosslink testnet 1
-    TotalIssuanceFromKey(zcash_keys::keys::UnifiedFullViewingKey),
+    TotalIssuanceFromKey(zcash_keys::keys::UnifiedFullViewingKey, BlockHeight, BlockHeight),
     /// Finalizer recency status
     FinalizersRecencyStatus,
 }

@@ -2463,14 +2463,19 @@ fn handle_orchard_action(wallet: &mut ManualWallet, account_i: usize, keys: &Pre
     Some(s)
 }
 
-// TODO: prebuild array of addresses & check membership
-fn t_addr_belongs_to_account(account: &ManualAccount, t_addr: TransparentAddress) -> bool {
-    if let Some((p2pkh, p2sh, _ua)) = addrs_from_account(account, 0) {
+
+fn t_addr_belongs_to_ufvk_index(ufvk: &UnifiedFullViewingKey, index: u32, t_addr: TransparentAddress) -> bool {
+    if let Some((p2pkh, p2sh, _ua)) = addrs_from_ufvk(ufvk, 0) {
         t_addr == p2pkh || t_addr == p2sh
     } else {
         println!("Couldn't determine account t-addresses");
         false
     }
+}
+
+// TODO: prebuild array of addresses & check membership
+fn t_addr_belongs_to_account(account: &ManualAccount, t_addr: TransparentAddress) -> bool {
+    t_addr_belongs_to_ufvk_index(&account.ufvk, 0, t_addr)
 }
 
 fn read_full_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedKeys, block_h: BlockHeight, tx: &Transaction, insert_i: &mut usize, status: TxStatus) -> Option<()> {

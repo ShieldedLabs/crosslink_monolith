@@ -93,7 +93,7 @@ pub(crate) type SpendingTransactionId = ();
 
 /// The status of a delegation bond in the non-finalized chain.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum BondStatusInChain {
+pub enum BondStatusInChain {
     /// Bond is active and receiving rewards.
     Active,
     /// Bond has begun unbonding (first transaction completed).

@@ -578,7 +578,7 @@ pub trait Rpc {
 
     /// For crosslink testnet 1
     #[method(name = "get_total_issuance")]
-    async fn get_total_issuance(&self, ufvk: String) -> Result<u64>;
+    async fn get_total_issuance(&self, ufvk_str: String, first_height: u32, last_height: u32) -> Result<u64>;
 
     /// Returns all transaction ids in the memory pool, as a JSON array.
     ///
@@ -2481,7 +2481,7 @@ where
             .ok_or_misc_error("No blocks in state")
     }
 
-    async fn get_total_issuance(&self, ufvk_str: String) -> Result<u64> {
+    async fn get_total_issuance(&self, ufvk_str: String, first_height: u32, last_height: u32) -> Result<u64> {
         // TODO: @Prod @Testnet
         let network = &zcash_protocol::consensus::TEST_NETWORK;
         let ufvk = zcash_keys::keys::UnifiedFullViewingKey::decode(network, &ufvk_str)
@@ -2490,7 +2490,7 @@ where
         let res = self
             .tfl_service
             .clone()
-            .oneshot(TFLServiceRequest::TotalIssuanceFromKey(ufvk))
+            .oneshot(TFLServiceRequest::TotalIssuanceFromKey(ufvk, Height(first_height), Height(last_height)))
             .await;
         if let Ok(TFLServiceResponse::TotalIssuanceFromKey(res)) = res {
             res.map_error(server::error::LegacyCode::InvalidAddressOrKey)

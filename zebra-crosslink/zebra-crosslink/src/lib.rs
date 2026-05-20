@@ -1278,20 +1278,24 @@ async fn tfl_block_finality_from_height_hash(
 
 async fn total_issuance_from_key(
     internal_handle: TFLServiceHandle,
-    ufvk: zcash_keys::keys::UnifiedFullViewingKey
+    ufvk: zcash_keys::keys::UnifiedFullViewingKey,
+    first_height: ZebBlockHeight,
+    last_height: ZebBlockHeight,
 ) -> Result<u64, String> {
     let call = internal_handle.call.clone();
 
-    let res = (call.state)(StateRequest::Tip).await;
-    let tip_height = match res {
-        Ok(StateResponse::Tip(Some((tip_height, _)))) => tip_height,
-        Ok(StateResponse::Tip(None)) => return Err(format!("failed to get tip: {res:?}")),
-        _ => return Err(format!("unexpectedly failed to get tip: {res:?}")),
-    };
+    // let res = (call.state)(StateRequest::Tip).await;
+    // let tip_height = match res {
+    //     Ok(StateResponse::Tip(Some((tip_height, _)))) => tip_height,
+    //     Ok(StateResponse::Tip(None)) => return Err(format!("failed to get tip: {res:?}")),
+    //     _ => return Err(format!("unexpectedly failed to get tip: {res:?}")),
+    // };
 
     let mut scan_info = wallet::scanner::ScanInfo::default();
+    let mut delegation_bonds = HashMap::new();
 
-    for height in 1..=tip_height.0 {
+    for height in first_height.0..=last_height.0 { //tip_height.0 {
+        let tz = wallet::Timer::scope_("scan height", true);
         let res = (call.state)(StateRequest::Block(ZebBlockHeight(height).into())).await;
         let block = match res {
             Ok(StateResponse::Block(Some(block))) => block,
@@ -1303,13 +1307,37 @@ async fn total_issuance_from_key(
             return Err(format!("block at height {height} had 0 transactions"));
         }
 
+
+
         for (tx_i, tx) in block.transactions.iter().enumerate() {
             let coinbase_tx_bytes = match tx.zcash_serialize_to_vec() {
                 Ok(tx) => tx,
                 Err(err) => return Err(format!("failed to serialize coinbase tx at height {height}: {err:?}")),
             };
 
+
             let txid = tx.unmined_id().mined_id();
+
+            if let Some(staking_action) = tx.staking_action() {
+                let mut bond_retargets = vec![HashMap::new()];
+                zebra_state::update_chain_tip_with_delegation_bond(
+                    &mut zebra_chain::value_balance::ValueBalance::zero(),
+                    &mut delegation_bonds,
+                    &mut bond_retargets,
+                    &staking_action,
+                    &txid.0.into(),
+                    zebra_state::TransactionLocation {
+                        height: ZebBlockHeight(height),
+                        index: zebra_state::TransactionIndex::from_index(tx_i.try_into().unwrap()),
+                    }
+                );
+            }
+
+            if delegation_bonds.len() > 0 {
+                let reward_store_for_revert = zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds);
+                // TODO: apply
+            }
+
             match wallet::scanner::scan_tx(&mut scan_info, &coinbase_tx_bytes, tx_i, height, &ufvk, txid.0) {
                 Ok(false) => {},
                 Ok(true) => println!("scan info at {height}: {scan_info:?}"),
@@ -1318,6 +1346,18 @@ async fn total_issuance_from_key(
         }
     }
 
+    let mut bonds_value = 0;
+    for bond in &scan_info.bonds {
+        match delegation_bonds.get(&bond.0.0) {
+            Some(bond_info) => {
+                let val = u64::from(bond_info.0.amount);
+                println!("final value for bond {:?} = {}", bond, val);
+                bonds_value += val;
+            },
+            None => return Err(format!("couldn't find bond {:?}", bond)),
+        }
+    }
+    scan_info.bonds_value = bonds_value;
 
     Ok(scan_info.total_value())
 }
@@ -1412,9 +1452,9 @@ async fn tfl_service_incoming_request(
         }
 
         // workshop - mining & staking via PoW
-        TFLServiceRequest::TotalIssuanceFromKey(ufvk_str) => {
+        TFLServiceRequest::TotalIssuanceFromKey(ufvk_str, first_height, last_height) => {
             Ok(TFLServiceResponse::TotalIssuanceFromKey({
-                total_issuance_from_key(internal_handle.clone(), ufvk_str).await
+                total_issuance_from_key(internal_handle.clone(), ufvk_str, first_height, last_height).await
             }))
         }
 
