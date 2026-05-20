@@ -2016,6 +2016,23 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     // @Todo: prune attestees to only BFT PKs on a current or imminently upcoming roster
                     // @Todo: prune attesters to only BFT PKs on a current or imminently upcoming roster
 
+                    let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
+                    if peer_attestation.expiry + 60 <= now {
+                        tracing::warn!("Peer sent peer attestation that will expire too soon (<60s)");
+                        connection_keys_to_disconnect.push(connection_key);
+                        continue;
+                    }
+                    if peer_attestation.issued >= peer_attestation.expiry {
+                        tracing::warn!("Peer sent invalid peer attestation: Issued after expired");
+                        connection_keys_to_disconnect.push(connection_key);
+                        continue;
+                    }
+                    if peer_attestation.issued + 60 > peer_attestation.expiry {
+                        tracing::warn!("Peer sent invalid peer attestation: Expires less than 60 seconds after issued");
+                        connection_keys_to_disconnect.push(connection_key);
+                        continue;
+                    }
+
                     let keyed_hash_of_one_party_signed_attestation = {
                         // @Duplicate
                         {
@@ -2191,6 +2208,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
                 if attestation.expiry <= now {
                     tracing::warn!("Peer failed ID attestation: Attestation has already expired");
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                }
+                if attestation.issued >= attestation.expiry {
+                    tracing::warn!("Peer failed ID attestation: Issued after expired");
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                }
+                if attestation.issued + 60 > attestation.expiry {
+                    tracing::warn!("Peer failed ID attestation: Expires less than 60 seconds after issued");
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 }
