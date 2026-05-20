@@ -2656,6 +2656,7 @@ pub fn run_instances(i: usize) {
 pub mod bandwidth_test;
 pub mod p2p_test;
 pub mod native_sockets;
+pub mod nym_sockets;
 pub mod helpers;
 
 use helpers::*;
