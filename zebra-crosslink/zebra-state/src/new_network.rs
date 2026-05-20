@@ -1457,8 +1457,8 @@ pub fn sync(
 
                 // Hole punch
                 let (mut buf, mut o) = ([0u8; 1 + STP_ADDRESS_SERIALIZED_SIZE], 0);
-                o += PACKET_TYPE_WANT_HOLE_PUNCH .write_to(&mut buf[o..]);
-                o += ConnectionKey::from(address).write_to(&mut buf[o..]);
+                o += PACKET_TYPE_WANT_HOLE_PUNCH.write_to(&mut buf[o..]);
+                o += address.connection_key()   .write_to(&mut buf[o..]);
 
                 for (key, _conn) in connections_map.iter().filter(|(_, c)| c.is_connected()).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_RECENTS) {
                     if TRACE { tracing::info!("Requesting hole punch to recent address {:?} via random peer: {:?}...", address, _conn.address()); }
@@ -1490,8 +1490,8 @@ pub fn sync(
 
                 // Hole punch
                 let (mut buf, mut o) = ([0u8; 1 + STP_ADDRESS_SERIALIZED_SIZE], 0);
-                o += PACKET_TYPE_WANT_HOLE_PUNCH .write_to(&mut buf[o..]);
-                o += ConnectionKey::from(address).write_to(&mut buf[o..]);
+                o += PACKET_TYPE_WANT_HOLE_PUNCH.write_to(&mut buf[o..]);
+                o += address.connection_key()   .write_to(&mut buf[o..]);
 
                 for (key, _conn) in connections_map.iter().filter(|(k, c)| c.is_connected() && *k != sender_connection_key).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_ALLEGEDS) {
                     if TRACE { tracing::info!("Requesting hole punch to alleged address {:?} via random peer: {:?}...", address, _conn.address()); }

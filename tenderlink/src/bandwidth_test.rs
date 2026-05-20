@@ -502,7 +502,7 @@ pub fn connect_to_endpoint(
 
             let my_ip = if endpoint.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
-                ConnectionKey::from(endpoint),
+                endpoint.into(),
                 ConnectionTrackingData {
                     creation_time_ns: monotonic_clock_ns(),
                     my_ip,
@@ -533,7 +533,7 @@ pub fn connect_to_endpoint(
 
             let my_ip = if endpoint.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
             connections_map.insert(
-                ConnectionKey::from(endpoint),
+                endpoint.into(),
                 ConnectionTrackingData {
                     creation_time_ns: monotonic_clock_ns(),
                     my_ip,

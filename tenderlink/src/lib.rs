@@ -89,6 +89,9 @@ use zcash_primitives::bft::{ HashKey, HashKeys, FatPointerToBftBlock, TMSig, Pub
 
 const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(1000);
 
+const PEER_GOSSIP_DURATION: std::time::Duration = std::time::Duration::from_millis(1500);
+
+
 // NOTE: Sam and Phillip discussed forward jumps; Noise trial decryption already protects connectsions against replay attacks.
 const NONCE_FORWARD_JUMP_TOLERANCE: u64 = 512;
 
@@ -1353,7 +1356,7 @@ impl BftAddressMap {
         self.by_addr.insert(addr.clone(), *key);
     }
     pub fn get_key(&self, addr: &STPAddress) -> Option<&PubKeyID> { self.by_addr.get(addr) }
-    pub fn get_addrs(&self, key: &PubKeyID) -> impl Iterator<Item = &STPAddress> { self.by_key.get(key).map(|v| v.keys()).unwrap_or_default() }
+    pub fn get_addrs(&self, key: &PubKeyID) -> impl Iterator<Item = (&STPAddress, &Option<PeerAttestation>)> { self.by_key.get(key).map(|v| v.iter()).unwrap_or_default() }
     pub fn contains_key(&self, key: &PubKeyID) -> bool { self.by_key.contains_key(key) }
     pub fn all_addrs(&self) -> impl Iterator<Item = (&STPAddress, &PubKeyID)> { self.by_addr.iter() }
 }
@@ -1443,6 +1446,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     const ONE_SECOND: tokio::time::Duration = tokio::time::Duration::from_secs(1);
     let mut net_stats_window_start = tokio::time::Instant::now();
     let mut net_stats = NetworkStats::default();
+
+    let mut next_peer_gossip = std::time::Instant::now();
 
     let mut send_buf1 = [0u8; 2048];
     let mut next_tick_time = tokio::time::Instant::now();
@@ -1557,10 +1562,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         let was_now = tokio::time::Instant::now();
         if was_now > next_tick_time {
-            loop {
+            {
                 // TICK CODE
                 peers.retain(|connection_key, peer| {
-                    if current_connections.iter().position(|(x, _)| ConnectionKey::from(x) == *connection_key).is_none() {
+                    if current_connections.iter().position(|(x, _)| x.connection_key() == *connection_key).is_none() {
                         println!("{:05}: Disconnected from peer {:?}.", my_port, connection_key);
                         false
                     } else {
@@ -1781,7 +1786,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 if PRINT_PEERS { println!("{ctx_str} {ANSI_GRY}PEERS{ANSI_RST}: {:?}", peers.iter().map(|(ck, p)| {
                     let mut bft_key = PubKeyID::NIL;
                     for (c, _) in &current_connections {
-                        if ConnectionKey::from(c) == *ck {
+                        if c.connection_key() == *ck {
                             if let Some(k) = bft_key_address_map.get_key(&c) {
                                 bft_key = *k;
                             }
@@ -1794,7 +1799,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 for (connection_key, peer) in &mut peers {
                     let mut peer_bft_key = PubKeyID::NIL;
                     for (c, _) in &current_connections {
-                        if ConnectionKey::from(c) == *connection_key {
+                        if c.connection_key() == *connection_key {
                             if let Some(k) = bft_key_address_map.get_key(&c) {
                                 peer_bft_key = *k;
                             }
@@ -1837,6 +1842,26 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     }
                 }
 
+                if std::time::Instant::now() >= next_peer_gossip {
+                    for (connection_key, peer) in &mut peers {
+                        let mut o = 0;
+                        let header = PacketHeader::new::<PACKET_TYPE_PEER_ATTESTATIONS>();
+                        o += write_header_and_maybe_status(header, true,
+                                                           &bft_state,
+                                                           &roster,
+                                                           &mut send_buf1[o..],
+                                                           peer.index_counter);
+                        peer.index_counter += 1;
+                        // let attestation_len = peer_attestation.write_to(&mut send_buf1[o..]);
+                        // assert!(attestation_len == PEER_ATTESTATION_SERIALIZED_SIZE);
+                        // o += attestation_len;
+                        print_packet_tag_send(header);
+                        send_stp_msg(&mut messages_to_send, &connection_key, &send_buf1[..o], &mut net_stats);
+                    }
+
+                    next_peer_gossip = std::time::Instant::now() + PEER_GOSSIP_DURATION;
+                }
+
                 if PRINT_NETWORK_STATS {
                     let elapsed = net_stats_window_start.elapsed();
                     let nonzero_elapsed_sec = elapsed.as_secs_f32().max(1.0);
@@ -1854,8 +1879,6 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                  kbps, pps, bpp);
                     }
                 }
-
-                break;
             }
 
             let now_now = tokio::time::Instant::now();
@@ -1920,17 +1943,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             send_stp_msg(&mut messages_to_send, &key, &send_buf1[..o], &mut net_stats);
         }
 
-        // Note(Sam): Disabled this due to confusion. I am not sure it is the right thing.
-        // // Drop peers not on the roster. Kinda temp.
-        // connections_map.retain(|key, value| {
-        //     let stp_address = value.address();
-        //     let Some(bft_key) = bft_key_address_map.get_key(&stp_address) else { return false; };
-        //
-        //     roster.iter().position(|x| x.pub_key == *bft_key).is_some()
-        // });
-
         // Remove peer entries for dropped connections
-        peers.retain(|key, _| current_connections.iter().position(|(x, _)| ConnectionKey::from(x) == *key).is_some());
+        peers.retain(|key, _| current_connections.iter().position(|(x, _)| x.connection_key() == *key).is_some());
 
         let mut connection_keys_to_disconnect = Vec::new();
 
