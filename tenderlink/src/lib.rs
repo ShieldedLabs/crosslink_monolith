@@ -97,7 +97,7 @@ fn is_timeout(e: std::io::ErrorKind) -> bool{
 }
 
 #[derive(Default)]
-struct NetworkStats {
+pub struct NetworkStats {
     bytes_sent: usize,
     packets_sent: usize,
 }
@@ -118,13 +118,13 @@ pub enum TMStep {
 }
 
 #[derive(Debug)]
-struct TMDecision {
+pub struct TMDecision {
     round_i: usize,
     value: BlockValue,
     //signatures: Vec<TMSig>, // ability to prove to others e.g. those catching up
 }
 
-struct TMVote {
+pub struct TMVote {
     approve: bool,
     todo_sign_bytes: [u8; 96],
 }
@@ -302,7 +302,7 @@ enum TMMsgData {
     Prevote(ValueId),
     Precommit(ValueId),
 }
-struct TMMsg {
+pub struct TMMsg {
     height: u64,
     round: u32,
     data: TMMsgData, // ALT: byteslice + step distinguisher
@@ -1101,7 +1101,7 @@ impl TMState {
 pub struct Peer {
     pub latest_status_request_height: Option<u64>,
     pub latest_status: Option<PacketStatus>,
-    pub index_counter: u64, // for some peer randomness
+    pub index_counter: u64,           // for some peer randomness
     pub bft_pk: PubKeyID,             // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
     pub stp_address: STPAddress,      // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
     pub stp_handshake_hash: [u8; 64], // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
@@ -1183,6 +1183,11 @@ impl SliceRead for STPAddress {
         })
     }
 }
+
+impl SliceWrite for TMSig    { fn write_to(&self, buf: &mut [u8]) -> usize { self.0.write_to(buf) } }
+impl SliceWrite for PubKeyID { fn write_to(&self, buf: &mut [u8]) -> usize { self.0.write_to(buf) } }
+impl SliceRead  for TMSig    { fn read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self(SliceRead::read_from(buf)?)) } }
+impl SliceRead  for PubKeyID { fn read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self(SliceRead::read_from(buf)?)) } }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FinalizerPeerAddress {
@@ -1337,18 +1342,18 @@ pub fn addr_string_to_stuff(addr: &str) -> (IdentityKeyPair, STPAddress) {
 
 #[derive(Debug, Default, Clone)]
 pub struct BftAddressMap {
-    pub by_key:  HashMap<PubKeyID, Vec<STPAddress>>,
+    pub by_key:  HashMap<PubKeyID, HashMap<STPAddress, Option<PeerAttestation>>>,
     pub by_addr: HashMap<STPAddress, PubKeyID>,
     pub last_packet_utcs: HashMap<PubKeyID, i64>,
 }
 impl BftAddressMap {
     pub fn new() -> Self { Self::default() }
-    pub fn insert(&mut self, key: &PubKeyID, addr: &STPAddress) {
-        self.by_key.entry(*key).or_default().push(addr.clone());
+    pub fn insert(&mut self, key: &PubKeyID, addr: &STPAddress, attestation: Option<PeerAttestation>) {
+        self.by_key.entry(*key).or_default().insert(addr.clone(), attestation);
         self.by_addr.insert(addr.clone(), *key);
     }
     pub fn get_key(&self, addr: &STPAddress) -> Option<&PubKeyID> { self.by_addr.get(addr) }
-    pub fn get_addrs(&self, key: &PubKeyID) -> &[STPAddress] { self.by_key.get(key).map_or(&[], |v| v) }
+    pub fn get_addrs(&self, key: &PubKeyID) -> impl Iterator<Item = &STPAddress> { self.by_key.get(key).map(|v| v.keys()).unwrap_or_default() }
     pub fn contains_key(&self, key: &PubKeyID) -> bool { self.by_key.contains_key(key) }
     pub fn all_addrs(&self) -> impl Iterator<Item = (&STPAddress, &PubKeyID)> { self.by_addr.iter() }
 }
@@ -1400,8 +1405,20 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
     let mut bft_key_address_map = BftAddressMap::new();
 
+    let mut my_address_attestations = Vec::new();
+
     for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
-        bft_key_address_map.insert(bft_pk, address);
+        bft_key_address_map.insert(bft_pk, address, None);
+
+        if address.magic1 != CRYPTO_MAGIC {
+            // @Dev
+            panic!("The magic in the config toml - {} ({}) is different from the crypto magic - {} ({})! Modify one or the other!",
+                    bandwidth_test::b64(&address.magic1.to_le_bytes()[..6]),
+                    bandwidth_test::crypto_string_from_connect_magic1(address.magic1).unwrap_or("<invalid>"),
+                    bandwidth_test::b64(&CRYPTO_MAGIC  .to_le_bytes()[..6]),
+                    bandwidth_test::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
+                    );
+        }
     }
 
     if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, bft_key_address_map.by_key); }
@@ -1798,7 +1815,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                 peer_bft_key,
                                                 &mut net_stats);
                     }
-                    else if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
+                    else if roster_i_from_pub_key(&roster[..active_roster_len(&roster)], peer_bft_key).is_some() && let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                     {
                         for round_i in (current_height_start_i..bft_state.rounds_data.len()).rev()
                         {
@@ -1918,7 +1935,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         let mut connection_keys_to_disconnect = Vec::new();
 
         // READ
-        while messages_received.len() > 0 {
+        'process_packets: while messages_received.len() > 0 {
             let (connection_key, mut peer, msg) = {
                 let (key, packet, _) = messages_received.remove(0);
                 let Some(peer) = peers.get_mut(&key)
@@ -1987,6 +2004,57 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 }
             }
 
+            else if packet_type == PACKET_TYPE_PEER_ATTESTATIONS {
+                let chunks = msg[read_o..].chunks(PEER_ATTESTATION_SERIALIZED_SIZE);
+                for chunk in chunks {
+                    let Some(peer_attestation) = PeerAttestation::read_from(&mut &chunk[..]) else {
+                        tracing::warn!("Peer sent invalid peer attestation: Failed to read peer attestation");
+                        connection_keys_to_disconnect.push(connection_key);
+                        continue 'process_packets;
+                    };
+
+                    // @Todo: prune attestees to only BFT PKs on a current or imminently upcoming roster
+                    // @Todo: prune attesters to only BFT PKs on a current or imminently upcoming roster
+
+                    let keyed_hash_of_one_party_signed_attestation = {
+                        // @Duplicate
+                        {
+                            let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink One Party Signed Peer Attestation").finalize().into());
+
+                            let mut hasher = hash_key_for_attestation.hasher();
+                            hasher.update(&peer_attestation.issued.to_le_bytes()[..]);
+                            hasher.update(&peer_attestation.expiry.to_le_bytes()[..]);
+                            hasher.update(&peer_attestation.stp_address.ip.octets()[..]);
+                            hasher.update(&peer_attestation.stp_address.port.to_le_bytes()[..]);
+                            hasher.update(&peer_attestation.stp_address.magic1.to_le_bytes()[..]);
+                            hasher.update(&peer_attestation.stp_address.key[..]);
+                            hasher.update(&peer_attestation.attestee_bft_pk.0[..]);
+                            hasher.update(&peer_attestation.attester_bft_pk.0[..]);
+                            let keyed_hash_of_one_party_signed_attestation = hasher.finalize();
+
+                            match peer_attestation.attester_sig.verify(peer_attestation.attester_bft_pk, &keyed_hash_of_one_party_signed_attestation.as_bytes()[..]) { Ok(()) => {}, Err((err, str)) => {
+                                tracing::warn!("Peer sent invalid peer attestation: Attester signature invalid");
+                                connection_keys_to_disconnect.push(connection_key);
+                                continue 'process_packets;
+                            } };
+
+                            keyed_hash_of_one_party_signed_attestation
+                        }
+                    };
+                    {
+                        let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink Two Party Signed Peer Attestation").finalize().into());
+                        let keyed_hash_of_two_party_signed_attestation = hash_key_for_attestation.hash(&peer_attestation.attester_sig.0[..]);
+                        match peer_attestation.attestee_sig.verify(peer_attestation.attestee_bft_pk, &keyed_hash_of_two_party_signed_attestation[..]) { Ok(()) => {}, Err((err, str)) => {
+                            tracing::warn!("Peer sent invalid peer attestation: Attestee signature invalid");
+                            connection_keys_to_disconnect.push(connection_key);
+                            continue 'process_packets;
+                        } };
+                    }
+
+                    bft_key_address_map.insert(&peer_attestation.attestee_bft_pk.clone(), &peer_attestation.stp_address.clone(), Some(peer_attestation));
+                }
+            }
+
             else if packet_type == PACKET_TYPE_ID_HELLO {
 
                 let Some(their_verification) = PacketIdVerification::read_from(&mut &msg[read_o..]) else {
@@ -2007,7 +2075,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     } };
                 }
 
-                bft_key_address_map.insert(&their_verification.pk, &peer.stp_address);
+                bft_key_address_map.insert(&their_verification.pk, &peer.stp_address, None);
                 peer.bft_pk = their_verification.pk;
 
                 let my_verification = { // almost @Duplicate
@@ -2028,20 +2096,20 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 let attestation = { // @Duplicate
                     let addr = peer.stp_address.clone();
+                    let issued: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
                     let expiry = {
                         let seconds_per_minute = 60;
                         let minutes_per_hour   = 60;
                         let hours_per_day      = 24;
                         let days_expiry        =  1;
 
-                        let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
-
-                        now + (seconds_per_minute * minutes_per_hour * hours_per_day * days_expiry)
+                        issued + (seconds_per_minute * minutes_per_hour * hours_per_day * days_expiry)
                     };
                     let sig = {
                         let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink One Party Signed Peer Attestation").finalize().into());
 
                         let mut hasher = hash_key_for_attestation.hasher();
+                        hasher.update(&issued.to_le_bytes()[..]);
                         hasher.update(&expiry.to_le_bytes()[..]);
                         hasher.update(&addr.ip.octets()[..]);
                         hasher.update(&addr.port.to_le_bytes()[..]);
@@ -2054,7 +2122,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         TMSig(my_root_private_key.sign(&keyed_hash_of_one_party_signed_attestation.as_bytes()[..]).to_bytes())
                     };
 
-                    PacketIdAttestation { addr, expiry, sig }
+                    PacketIdAttestation { issued, expiry, addr, sig }
                 };
 
                 let mut o = 0;
@@ -2068,7 +2136,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                    peer.index_counter);
                 peer.index_counter += 1;
                 o += my_verification.write_to(&mut send_buf1[o..]);
-                o += attestation .write_to(&mut send_buf1[o..]);
+                o += attestation    .write_to(&mut send_buf1[o..]);
 
                 print_packet_tag_send(header);
                 send_stp_msg(&mut messages_to_send, &connection_key, &send_buf1[..o], &mut net_stats);
@@ -2095,7 +2163,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     } };
                 }
 
-                bft_key_address_map.insert(&their_verification.pk, &peer.stp_address);
+                bft_key_address_map.insert(&their_verification.pk, &peer.stp_address, None);
                 peer.bft_pk = their_verification.pk;
 
                 let Some(attestation) = PacketIdAttestation::read_from(msg) else {
@@ -2126,15 +2194,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 }
-                let keyed_hash_of_one_party_signed_attestation;
-                {
+                let keyed_hash_of_one_party_signed_attestation = {
                     // @Duplicate
-                    let addr = attestation.addr;
+                    let addr = attestation.addr.clone();
+                    let issued = attestation.issued;
                     let expiry = attestation.expiry;
-                    let sig = {
+                    {
                         let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink One Party Signed Peer Attestation").finalize().into());
 
                         let mut hasher = hash_key_for_attestation.hasher();
+                        hasher.update(&issued.to_le_bytes()[..]);
                         hasher.update(&expiry.to_le_bytes()[..]);
                         hasher.update(&addr.ip.octets()[..]);
                         hasher.update(&addr.port.to_le_bytes()[..]);
@@ -2142,20 +2211,53 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         hasher.update(&addr.key[..]);
                         hasher.update(&my_root_public_bft_key.as_ref()[..]);
                         hasher.update(&peer.bft_pk.0[..]);
-                        keyed_hash_of_one_party_signed_attestation = hasher.finalize();
+                        let keyed_hash_of_one_party_signed_attestation = hasher.finalize();
 
                         match attestation.sig.verify(their_verification.pk, &keyed_hash_of_one_party_signed_attestation.as_bytes()[..]) { Ok(()) => {}, Err((err, str)) => {
                             tracing::warn!("Peer failed ID attestation: Attestation signature invalid");
                             connection_keys_to_disconnect.push(connection_key);
                             continue;
                         } };
-                    };
+
+                        keyed_hash_of_one_party_signed_attestation
+                    }
                 };
 
                 // Sign their signed attestation with my signature
-                // let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink Two Party Signed Peer Attestation").finalize().into());
-                // assert!(peer.attestation.len() == 64);
-                // let keyed_hash_of_attestation = hash_key_for_attestation.hash(&peer.attestation[..]);
+                let sig = {
+                    let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink Two Party Signed Peer Attestation").finalize().into());
+                    assert!(attestation.sig.0.len() == 64);
+                    let keyed_hash_of_two_party_signed_attestation = hash_key_for_attestation.hash(&attestation.sig.0[..]);
+                    TMSig(my_root_private_key.sign(&keyed_hash_of_two_party_signed_attestation[..]).to_bytes())
+                };
+
+                let peer_attestation = PeerAttestation {
+                    stp_address:        attestation.addr,
+                    issued:             attestation.issued,
+                    expiry:             attestation.expiry,
+                    attester_bft_pk:    peer.bft_pk,
+                    attestee_bft_pk:    PubKeyID(my_root_public_bft_key.as_ref().try_into().expect("VerificationKeyBytes should be 32 bytes")),
+                    attester_sig:       attestation.sig,
+                    attestee_sig:       sig,
+                };
+                my_address_attestations.push(peer_attestation.clone());
+
+                // @Todo: Decide if @Temporary?
+                {
+                    let mut o = 0;
+                    let header = PacketHeader::new::<PACKET_TYPE_PEER_ATTESTATIONS>();
+                    o += write_header_and_maybe_status(header, true,
+                                                       &bft_state,
+                                                       &roster,
+                                                       &mut send_buf1[o..],
+                                                       peer.index_counter);
+                    peer.index_counter += 1;
+                    let attestation_len = peer_attestation.write_to(&mut send_buf1[o..]);
+                    assert!(attestation_len == PEER_ATTESTATION_SERIALIZED_SIZE);
+                    o += attestation_len;
+                    print_packet_tag_send(header);
+                    send_stp_msg(&mut messages_to_send, &connection_key, &send_buf1[..o], &mut net_stats);
+                }
             }
 
             else {
@@ -2186,9 +2288,9 @@ const PACKET_TYPE_ID_HELLO:         u8 = 1;
 const PACKET_TYPE_ID_HELLO_ACK:     u8 = 2;
 const PACKET_TYPE_ID_HELLO_ACK_ACK: u8 = 3;
 
-const PACKET_TYPE_PEER_ATTESTATION: u8 = 4;
-const PACKET_TYPE_WANT_HOLE_PUNCH:  u8 = 5;
-const PACKET_TYPE_TRY_HOLE_PUNCH:   u8 = 6;
+const PACKET_TYPE_PEER_ATTESTATIONS: u8 = 4;
+const PACKET_TYPE_WANT_HOLE_PUNCH:   u8 = 5;
+const PACKET_TYPE_TRY_HOLE_PUNCH:    u8 = 6;
 
 // consensus
 const PACKET_TYPE_PROPOSAL_CHUNK:       u8 =  7;
@@ -2217,7 +2319,7 @@ const PACKET_TYPE_NAMES: [[&str; 2]; PACKET_TYPE_COUNT as usize] = {
     names[PACKET_TYPE_ID_HELLO_ACK         as usize] = ["ID_HELLO_ACK",             "STATUS+ID_HELLO_ACK"];
     names[PACKET_TYPE_ID_HELLO_ACK_ACK     as usize] = ["ID_HELLO_ACK_ACK",         "STATUS+ID_HELLO_ACK_ACK"];
 
-    names[PACKET_TYPE_PEER_ATTESTATION     as usize] = ["PEER_ATTESTATION",         "STATUS+PEER_ATTESTATION"];
+    names[PACKET_TYPE_PEER_ATTESTATIONS    as usize] = ["PEER_ATTESTATIONS",        "STATUS+PEER_ATTESTATIONS"];
     names[PACKET_TYPE_WANT_HOLE_PUNCH      as usize] = ["WANT_HOLE_PUNCH",          "STATUS+WANT_HOLE_PUNCH"];
     names[PACKET_TYPE_TRY_HOLE_PUNCH       as usize] = ["TRY_HOLE_PUNCH",           "STATUS+TRY_HOLE_PUNCH"];
 
@@ -2249,7 +2351,7 @@ impl BlockHash { const NIL: Self = Self([0; 32]); }
 const STATUS_PROPOSAL_RNGS_N: usize = 1;
 const STATUS_VOTE_RNGS_N: usize = 1; // ALT: split prevote/precommit numbers
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct PacketStatus {
+pub struct PacketStatus {
     height: u64,
     round:  u32, // as context for following request ranges
     need_proposal_chunk_rngs: [ProposalRng; STATUS_PROPOSAL_RNGS_N],
@@ -2296,7 +2398,7 @@ impl PacketStatus {
 const PACKET_HEADER_SIZE: usize = 8 + 8; // 16
 const PACKET_STATUS_SIZE: usize = 8 /*height*/ + 4 /*round*/ + STATUS_PROPOSAL_RNGS_N * 8 + 2 * STATUS_VOTE_RNGS_N * 4; // 28
 #[derive(Debug, Clone, Copy)]
-struct PacketHeader {
+pub struct PacketHeader {
     tag: u64,
 }
 impl PacketHeader {
@@ -2331,7 +2433,7 @@ impl PacketHeader {
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct PubKeySig { roster_i: u16, sig: TMSig, }
+pub struct PubKeySig { roster_i: u16, sig: TMSig, }
 impl PubKeySig { const NIL: Self = Self{ roster_i: u16::MAX, sig: TMSig::NIL }; }
 
 // ALT: common consensus packet header: { packet header, height, round, value_id }
@@ -2340,7 +2442,7 @@ impl PubKeySig { const NIL: Self = Self{ roster_i: u16::MAX, sig: TMSig::NIL }; 
 // NOTE: all votes for the same value_id (or nil)
 // #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct PacketVotes {
+pub struct PacketVotes {
     // header
     no_votes_n:  u8,
     yes_votes_n: u8,
@@ -2389,7 +2491,7 @@ impl PacketVotes {
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct PacketIdVerification {
+pub struct PacketIdVerification {
     pub pk:  PubKeyID,
     pub sig: TMSig,
 }
@@ -2404,22 +2506,24 @@ impl SliceWrite for PacketIdVerification {
 impl SliceRead for PacketIdVerification {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
         Some(Self {
-            pk: PubKeyID(SliceRead::read_from(buf)?),
-            sig:   TMSig(SliceRead::read_from(buf)?),
+            pk:  SliceRead::read_from(buf)?,
+            sig: SliceRead::read_from(buf)?,
         })
     }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct PacketIdAttestation {
+pub struct PacketIdAttestation {
+    pub issued: u64, // Unix timestamp
+    pub expiry: u64, // Unix timestamp
     pub addr:   STPAddress,
-    pub expiry: u64, // Unix timestamp for when this attestation expires
     pub sig:    TMSig,
 }
 impl SliceWrite for PacketIdAttestation {
     fn write_to(&self, buf: &mut [u8]) -> usize {
         let mut o = 0;
         o += self.addr  .write_to(&mut buf[o..]);
+        o += self.issued.write_to(&mut buf[o..]);
         o += self.expiry.write_to(&mut buf[o..]);
         o += self.sig.0 .write_to(&mut buf[o..]);
         o
@@ -2428,22 +2532,70 @@ impl SliceWrite for PacketIdAttestation {
 impl SliceRead for PacketIdAttestation {
     fn read_from(buf: &mut &[u8]) -> Option<Self> {
         Some(Self {
-            addr:      SliceRead::read_from(buf)?,
-            expiry:    SliceRead::read_from(buf)?,
-            sig: TMSig(SliceRead::read_from(buf)?),
+            addr:   SliceRead::read_from(buf)?,
+            issued: SliceRead::read_from(buf)?,
+            expiry: SliceRead::read_from(buf)?,
+            sig:    SliceRead::read_from(buf)?,
         })
     }
 }
 
+#[derive(Debug, Default,       Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PeerAttestation {
+    pub stp_address:     STPAddress,
+    pub issued:          u64,
+    pub expiry:          u64,
+    pub attester_bft_pk: PubKeyID,
+    pub attestee_bft_pk: PubKeyID,
+    pub attester_sig:    TMSig,
+    pub attestee_sig:    TMSig,
+}
+impl SliceWrite for PeerAttestation {
+    fn write_to(&self, buf: &mut [u8]) -> usize {
+        let mut o = 0;
+        o += self.stp_address      .write_to(&mut buf[o..]);
+        o += self.issued           .write_to(&mut buf[o..]);
+        o += self.expiry           .write_to(&mut buf[o..]);
+        o += self.attester_bft_pk.0.write_to(&mut buf[o..]);
+        o += self.attestee_bft_pk.0.write_to(&mut buf[o..]);
+        o += self.attester_sig   .0.write_to(&mut buf[o..]);
+        o += self.attestee_sig   .0.write_to(&mut buf[o..]);
+        o
+    }
+}
+impl SliceRead for PeerAttestation {
+    fn read_from(buf: &mut &[u8]) -> Option<Self> {
+        Some(Self {
+            stp_address:     SliceRead::read_from(buf)?,
+            issued:          SliceRead::read_from(buf)?,
+            expiry:          SliceRead::read_from(buf)?,
+            attester_bft_pk: SliceRead::read_from(buf)?,
+            attestee_bft_pk: SliceRead::read_from(buf)?,
+            attester_sig:    SliceRead::read_from(buf)?,
+            attestee_sig:    SliceRead::read_from(buf)?,
+        })
+    }
+}
 
-const PROPOSAL_PACKET_EXTRA:    usize = (PACKET_HEADER_SIZE + PACKET_STATUS_SIZE + 56 + 64);
-const PROPOSAL_CHUNK_DATA_SIZE: usize = PATH_MTU - PROPOSAL_PACKET_EXTRA;
+pub const PEER_ATTESTATION_SERIALIZED_SIZE: usize = // @Volatile.
+    STP_ADDRESS_SERIALIZED_SIZE /* stp_address */ +
+    8 /* issued */ +
+    8 /* expiry */ +
+    32 /* attester_bft_pk */ +
+    32 /* attestee_bft_pk */ +
+    64 /* attester_sig */ +
+    64 /* attestee_sig */ +
+    0;
+
+
+pub const PROPOSAL_PACKET_EXTRA:    usize = (PACKET_HEADER_SIZE + PACKET_STATUS_SIZE + 56 + 64);
+pub const PROPOSAL_CHUNK_DATA_SIZE: usize = PATH_MTU - PROPOSAL_PACKET_EXTRA;
 
 // NOTE(azmr): this is:
 // - conservative in terms of max chunks, value_id, & arrival order
 // - assuming a fixed total proposal size
 #[derive(Debug)]
-struct PacketProposalChunkHeader {
+pub struct PacketProposalChunkHeader {
     // header
     chunk_i:       u32,
     proposal_size: u32,
@@ -2726,7 +2878,7 @@ mod tests {
 
     #[test]
     fn check_gen_rngs() {
-        struct Test {
+        pub struct Test {
             arr: &'static[u8],
             rngs: &'static[[usize; 2]],
         }
