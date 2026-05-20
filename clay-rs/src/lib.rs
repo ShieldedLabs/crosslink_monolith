@@ -466,7 +466,8 @@ impl Clay {
     /// **Use only if you know what you are doing or your getting errors from clay**
     pub fn max_measure_text_cache_word_count(&self, count: u32) {
         unsafe {
-            Clay_SetMaxElementCount(count as _);
+            // Clay_SetMaxElementCount(count as _);
+            Clay_SetMaxMeasureTextCacheWordCount(count as _);
         }
     }
 
