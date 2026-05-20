@@ -31,6 +31,30 @@
       "sourceLanguages": ["rust"]
     },
     {
+      "name": "Debug zebrad (viz_gui) without args",
+      "type": "lldb",
+      "request": "launch",
+
+      "cargo": {
+        "args": [
+          "run",
+          "--manifest-path",
+          "${workspaceFolder}/zebra-crosslink/Cargo.toml",
+          "--features",
+          "viz_gui",
+          "--bin",
+          "zebrad"
+        ]
+      },
+
+      "env": {
+        "RUSTFLAGS": "-Awarnings"
+      },
+
+      "cwd": "${workspaceFolder}/zebra-crosslink",
+      "sourceLanguages": ["rust"]
+    },
+    {
       "name": "Debug viz_gui with fake data",
       "type": "lldb",
       "request": "launch",

@@ -4225,17 +4225,18 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             ui.dummy_2 = dummy_2;
         }
     }
-
-    if false { // @Todo: this causes a Clay crash right now, so disable it until that's fixed.
-    // if viz.inspecting_block_hash != Hash32::from_u64(0) {
+    
+    if viz.inspecting_block_hash != Hash32::from_u64(0) {
         let ctx_menu_pos = (viz.inspecting_block_screen_x, viz.inspecting_block_screen_y);
-        let id = id("Block Inspector Contents");
-        if ui.hovered(id) {
+        let inspect_id = id("Block Inspector Contents");
+        let scroll_id = id("Block Inspector Scroll");
+        let (scroll_id, clip, scroll_ref, content_h, viewport_h, max) = ui.scroll_container(data, scroll_id, 0.0);
+        if ui.hovered(inspect_id) {
             ui.capture = true;
         }
         let border_colour = { let mut col = PANE_COL.hsva(); col.2 = 0x18; col.rgba() };
         if let _ = elem().decl(Decl {
-            id,
+            id: inspect_id,
             colour: border_colour,
             child_gap, padding, radius,
             width:  fit!(),
@@ -4244,20 +4245,27 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             ..Decl
         }) {
             if let _ = elem().decl(Decl {
+                id: scroll_id,
+                clip,
                 colour: PANE_COL,
                 child_gap, padding, radius,
                 width:  fit!(ui.scale(192.0), ui.draw().window_width as f32 * 0.5),
-                height: fit!(ui.scale(128.0)),
+                height: Sizing::Fixed(ui.scale(128.0)),
                 direction: TopToBottom,
                 ..Decl
             }) {
                 let text_h = ui.scale(10.0);
                 // Block Inspector Contents
                 ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { font: Mono, wrap: Wrap::Chars, h: text_h, align: AlignX::Left, ..TextDecl });
-
                 let text = {
                     if let Some(text) = viz.inspect_block_json_text.as_ref() {
-                        text.to_string()
+                        // NOTE(Giovanni): Temporarely fixing Clay's crash when rendering very long texts by
+                        // capping text length to 2000 characters...
+                        if text.len() > 2000 {
+                            format!("{}...\n[truncated, {} bytes total]", &text[..2000], text.len())
+                        } else {
+                            text.to_string()
+                        }
                     } else {
                         frame_strf!(data, "Loading info for block {}...", viz.inspecting_block_hash).to_string()
                     }
