@@ -1406,12 +1406,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut messages_to_send = Vec::new();
 
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
-    let mut bft_key_address_map = BftAddressMap::new();
+    let mut bft_address_map = BftAddressMap::new();
 
     let mut my_address_attestations = Vec::new();
 
     for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
-        bft_key_address_map.insert(bft_pk, address, None);
+        bft_address_map.insert(bft_pk, address, None);
 
         if address.magic1 != CRYPTO_MAGIC {
             // @Dev
@@ -1424,7 +1424,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         }
     }
 
-    if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, bft_key_address_map.by_key); }
+    if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, bft_address_map.by_key); }
 
     // TODO: only convert private to public in 1 location
     let mut bft_state = TMState::init(
@@ -1458,7 +1458,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             let mut peers = peers.iter().map(|(ck, p)| {
                 let mut bft_key = PubKeyID::NIL;
                 for (c, _) in &current_connections {
-                    if let Some(k) = bft_key_address_map.get_key(c) {
+                    if let Some(k) = bft_address_map.get_key(c) {
                         bft_key = *k;
                         break;
                     }
@@ -1574,13 +1574,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 });
 
                 // Try to reconnect to known but disconnected peers
-                for (address, _bft_key) in bft_key_address_map.all_addrs() {
+                for (address, _bft_key) in bft_address_map.all_addrs() {
                     if current_connections.iter().position(|(x, _)| x == address).is_none() {
                         current_connections.push((address.clone(), [0u8; 64]));
                     }
                 }
 
-                bft_state.bft_access_closure.0(&bft_state, &bft_key_address_map).await;
+                bft_state.bft_access_closure.0(&bft_state, &bft_address_map).await;
 
                 // BFT CONSENSUS
                 // account for the state updates we've accumulated
@@ -1787,7 +1787,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let mut bft_key = PubKeyID::NIL;
                     for (c, _) in &current_connections {
                         if c.connection_key() == *ck {
-                            if let Some(k) = bft_key_address_map.get_key(&c) {
+                            if let Some(k) = bft_address_map.get_key(&c) {
                                 bft_key = *k;
                             }
                             break;
@@ -1800,7 +1800,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let mut peer_bft_key = PubKeyID::NIL;
                     for (c, _) in &current_connections {
                         if c.connection_key() == *connection_key {
-                            if let Some(k) = bft_key_address_map.get_key(&c) {
+                            if let Some(k) = bft_address_map.get_key(&c) {
                                 peer_bft_key = *k;
                             }
                             break;
@@ -1843,6 +1843,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 }
 
                 if std::time::Instant::now() >= next_peer_gossip {
+                    let mut peer_attestations: Vec<&PeerAttestation> = bft_address_map.by_key.values().flat_map(|a| a.values()).filter_map(|o| o.as_ref()).collect();
+                    peer_attestations.shuffle(&mut rand::thread_rng());
+                    peer_attestations.truncate(1191 / PEER_ATTESTATION_SERIALIZED_SIZE);
                     for (connection_key, peer) in &mut peers {
                         let mut o = 0;
                         let header = PacketHeader::new::<PACKET_TYPE_PEER_ATTESTATIONS>();
@@ -1852,9 +1855,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                            &mut send_buf1[o..],
                                                            peer.index_counter);
                         peer.index_counter += 1;
-                        // let attestation_len = peer_attestation.write_to(&mut send_buf1[o..]);
-                        // assert!(attestation_len == PEER_ATTESTATION_SERIALIZED_SIZE);
-                        // o += attestation_len;
+
+                        for peer_attestation in &peer_attestations {
+                            let attestation_len = peer_attestation.write_to(&mut send_buf1[o..]);
+                            assert!(attestation_len == PEER_ATTESTATION_SERIALIZED_SIZE);
+                            o += attestation_len;
+                        }
                         print_packet_tag_send(header);
                         send_stp_msg(&mut messages_to_send, &connection_key, &send_buf1[..o], &mut net_stats);
                     }
@@ -2082,7 +2088,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         } };
                     }
 
-                    bft_key_address_map.insert(&peer_attestation.attestee_bft_pk.clone(), &peer_attestation.stp_address.clone(), Some(peer_attestation));
+                    bft_address_map.insert(&peer_attestation.attestee_bft_pk.clone(), &peer_attestation.stp_address.clone(), Some(peer_attestation));
                 }
             }
 
@@ -2106,7 +2112,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     } };
                 }
 
-                bft_key_address_map.insert(&their_verification.pk, &peer.stp_address, None);
+                bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
                 peer.bft_pk = their_verification.pk;
 
                 let my_verification = { // almost @Duplicate
@@ -2194,7 +2200,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     } };
                 }
 
-                bft_key_address_map.insert(&their_verification.pk, &peer.stp_address, None);
+                bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
                 peer.bft_pk = their_verification.pk;
 
                 let Some(attestation) = PacketIdAttestation::read_from(msg) else {
@@ -2304,8 +2310,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             else {
             }
 
-            if let Some(pk) = bft_key_address_map.get_key(&peer.stp_address) {
-                bft_key_address_map.last_packet_utcs.insert(*pk, chrono::Utc::now().timestamp());
+            if let Some(pk) = bft_address_map.get_key(&peer.stp_address) {
+                bft_address_map.last_packet_utcs.insert(*pk, chrono::Utc::now().timestamp());
             }
         }
 
