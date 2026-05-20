@@ -1842,6 +1842,39 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     }
                 }
 
+                // Prune attestations that expire in <60s
+                let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
+                for map in bft_address_map.by_key.values_mut() {
+                    map.retain(|stp_address, maybe_peer_attestation| {
+                        let Some(peer_attestation) = maybe_peer_attestation else {
+                            return true; // keep forever if None. // @Todo: @Incomplete?
+                        };
+
+                        if peer_attestation.expiry + 120 <= now {
+                            return false; // prune
+                        }
+                        if peer_attestation.issued >= peer_attestation.expiry {
+                            return false; // prune
+                        }
+                        if peer_attestation.issued + 60 > peer_attestation.expiry {
+                            return false; // prune
+                        }
+
+                        return true; // keep
+                    });
+                }
+                bft_address_map.by_addr.retain(|stp_address, bft_pk| {
+                    let Some(map) = bft_address_map.by_key.get(bft_pk) else {
+                        return false; // prune
+                    };
+
+                    if !map.contains_key(stp_address) {
+                        return false; // prune
+                    }
+
+                    return true; // keep
+                });
+
                 if std::time::Instant::now() >= next_peer_gossip {
                     let mut peer_attestations: Vec<&PeerAttestation> = bft_address_map.by_key.values().flat_map(|a| a.values()).filter_map(|o| o.as_ref()).collect();
                     peer_attestations.shuffle(&mut rand::thread_rng());
