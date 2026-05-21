@@ -117,15 +117,19 @@ impl StartCmd {
     async fn start(&self) -> Result<(), Report> {
 
         let config = APPLICATION.config();
-        let mut wallet_snapshot_path = config.state.cache_dir.clone();
-        wallet_snapshot_path.push("wallet.snapshot");
-        *wallet::WALLET_SNAPSHOT_PATH.lock().unwrap() = Some(wallet_snapshot_path.clone());
-
+        let wallet_snapshot_path = if config.state.ephemeral {
+            None
+        } else {
+            let mut path = config.state.cache_dir.clone();
+            path.push("wallet.snapshot");
+            Some(path)
+        };
+        *wallet::WALLET_SNAPSHOT_PATH.lock().unwrap() = wallet_snapshot_path.clone();
         #[cfg(not(feature = "viz_gui"))]
         {
             if config.crosslink.disable_the_headless_wallet == false {
                 let wallet_state = Arc::new(std::sync::Mutex::new(wallet::WalletState::new()));
-                tokio::spawn(zebra_crosslink::wallet::wallet_main(wallet_state, Some(wallet_snapshot_path)));
+                tokio::spawn(zebra_crosslink::wallet::wallet_main(wallet_state, wallet_snapshot_path.clone()));
             }
         }
         *zebra_crosslink::wallet::GUI_ENABLE_MINE.lock().unwrap() = config.mining.internal_miner;
@@ -221,8 +225,6 @@ impl StartCmd {
                 // },
                 mining: zebra_rpc::config::mining::Config {
                     miner_address: Some(config.mining.miner_address.clone().unwrap_or_else(||{
-                        use zcash_address::ToAddress;
-
                         let t_addr = wallet::default_p2pkh_from_entropy(&config.network.network, &global_seed).expect("unable to initialize miner");
                         info!("Miner address unspecified. Mining to {}", wallet::string_from_t_addr(&config.network.network, t_addr));
                         t_addr.to_zcash_address(config.network.network.kind().into())
