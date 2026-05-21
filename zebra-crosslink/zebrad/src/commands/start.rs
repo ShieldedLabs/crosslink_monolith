@@ -117,12 +117,15 @@ impl StartCmd {
     async fn start(&self) -> Result<(), Report> {
 
         let config = APPLICATION.config();
+        let mut wallet_snapshot_path = config.state.cache_dir.clone();
+        wallet_snapshot_path.push("wallet.snapshot");
+        *wallet::WALLET_SNAPSHOT_PATH.lock().unwrap() = Some(wallet_snapshot_path.clone());
 
         #[cfg(not(feature = "viz_gui"))]
         {
             if config.crosslink.disable_the_headless_wallet == false {
                 let wallet_state = Arc::new(std::sync::Mutex::new(wallet::WalletState::new()));
-                tokio::spawn(zebra_crosslink::wallet::wallet_main(wallet_state));
+                tokio::spawn(zebra_crosslink::wallet::wallet_main(wallet_state, Some(wallet_snapshot_path)));
             }
         }
         *zebra_crosslink::wallet::GUI_ENABLE_MINE.lock().unwrap() = config.mining.internal_miner;
