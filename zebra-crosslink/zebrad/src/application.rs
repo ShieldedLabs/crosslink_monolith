@@ -613,7 +613,7 @@ pub fn boot(app_cell: &'static AppCell<ZebradApp>) -> ! {
                     .build()
                     .unwrap();
 
-                rt.block_on(zebra_crosslink::wallet::wallet_main(wallet_state2));
+                rt.block_on(zebra_crosslink::wallet::wallet_main(wallet_state2, None));
             });
 
             let tokio_root_thread_handle = std::thread::spawn(move || {
