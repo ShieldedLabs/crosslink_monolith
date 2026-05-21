@@ -2286,6 +2286,7 @@ fn tx_position(wallet: &ManualWallet, txid: &TxId) -> Option<usize> {
     }
 }
 
+// TODO: track both internal and external in here?
 struct PreparedKeys {
     pub orchard_fvk: Option<orchard::keys::FullViewingKey>,
     pub orchard_ivk: Option<orchard::keys::PreparedIncomingViewingKey>,
@@ -2293,7 +2294,7 @@ struct PreparedKeys {
     // TODO: transparent, sapling
 }
 impl PreparedKeys {
-    pub fn from_ufvk_all(ufvk: &UnifiedFullViewingKey) -> Self {
+    pub fn from_ufvk_all_scoped(ufvk: &UnifiedFullViewingKey, scope: orchard::keys::Scope) -> Self {
         let mut keys = PreparedKeys {
             orchard_fvk: None,
             orchard_ivk: None,
@@ -2303,11 +2304,19 @@ impl PreparedKeys {
         if let Some(fvk) = ufvk.orchard() {
             // TODO: other scopes?
             keys.orchard_fvk = Some(fvk.clone());
-            keys.orchard_ivk = Some(fvk.to_ivk(orchard::keys::Scope::External).prepare());
-            keys.orchard_ovk = Some(fvk.to_ovk(orchard::keys::Scope::External));
+            keys.orchard_ivk = Some(fvk.to_ivk(scope).prepare());
+            keys.orchard_ovk = Some(fvk.to_ovk(scope));
         };
 
         keys
+    }
+
+    pub fn from_ufvk_all(ufvk: &UnifiedFullViewingKey) -> Self {
+        Self::from_ufvk_all_scoped(ufvk, orchard::keys::Scope::External)
+    }
+
+    pub fn from_ufvk_all_internal(ufvk: &UnifiedFullViewingKey) -> Self {
+        Self::from_ufvk_all_scoped(ufvk, orchard::keys::Scope::Internal)
     }
 
     pub fn from_ufvk_ivks(ufvk: &UnifiedFullViewingKey) -> Self {

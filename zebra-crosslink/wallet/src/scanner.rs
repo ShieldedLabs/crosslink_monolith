@@ -7,7 +7,7 @@ pub struct ScanInfo {
     pub coinbases_value: u64,
     pub coinbase_max_height: u32,
 
-    pub bonds: Vec<(PubKeyID, u64)>,
+    pub bonds: Vec<(PubKeyID, u64, TxId)>,
     pub utxos: HashSet<(PubKeyID, u32)>, // NOTE: grow-only
     pub bonds_value: u64,
 
@@ -15,7 +15,7 @@ pub struct ScanInfo {
 }
 impl ScanInfo {
     pub fn total_value(&self) -> u64 {
-        self.coinbases_value //+ self.bonds_value
+        self.coinbases_value + self.bonds_value
     }
 }
 
@@ -38,6 +38,8 @@ pub fn scan_tx(info: &mut ScanInfo, tx_bytes: &[u8], tx_i: usize, height: u32, u
 
     let txid_lrz = tx.txid();
     assert!(txid_zeb == <[u8;32]>::from(txid_lrz), "txids from zebra/librustzcash disagree: {} vs {}", txid_lrz, TxId::from_bytes(txid_zeb));
+
+    // println!("scanning {txid_lrz} at height {height}");
 
     let mut contains_my_t_spend = false;
     let mut coinbase_ok = false;
@@ -84,13 +86,11 @@ pub fn scan_tx(info: &mut ScanInfo, tx_bytes: &[u8], tx_i: usize, height: u32, u
         return Err("no coinbase found".to_owned());
     }
 
-    if let Some(t_bundle) = tx.transparent_bundle() {
-    }
-
 
     let keys = PreparedKeys::from_ufvk_all(&ufvk);
-    let Some(orchard_ovk) = keys.orchard_ovk else {
-        return Err("could not create orchard ovk".to_owned());
+    let internal_keys = PreparedKeys::from_ufvk_all_internal(&ufvk);
+    let (Some(orchard_ovk), Some(orchard_internal_ovk)) = (keys.orchard_ovk, internal_keys.orchard_ovk) else {
+        return Err("could not create orchard ovks".to_owned());
     };
 
     if let Some(staking_action) = tx.staking_action() {
@@ -104,27 +104,30 @@ pub fn scan_tx(info: &mut ScanInfo, tx_bytes: &[u8], tx_i: usize, height: u32, u
 
             if is_my_staking_action {
             } else if let Some(bundle) = tx.orchard_bundle() {
-                for action in bundle.actions() {
+                'actions: for action in bundle.actions() {
                     let action: &orchard::Action<_> = action; // type-check
                     let domain = orchard::note_encryption::OrchardDomain::for_action(action);
 
-                    if let Some((_note, _addr, _send_memo)) = try_output_recovery_with_ovk(
-                        &domain,
-                        &orchard_ovk,
-                        action,
-                        action.cv_net(),
-                        &action.encrypted_note().out_ciphertext
-                    ) {
-                        println!("found staking action paid for by our orchard: {:?}", staking_action.unique_pubkey);
-                        is_my_staking_action = true;
-                        break;
+                    for ovk in [&orchard_ovk, &orchard_internal_ovk] {
+                        if let Some((_note, _addr, _send_memo)) = try_output_recovery_with_ovk(
+                            &domain,
+                            ovk,
+                            action,
+                            action.cv_net(),
+                            &action.encrypted_note().out_ciphertext
+                        ) {
+                            println!("found staking action paid for by our orchard: {:?}", staking_action.unique_pubkey);
+                            is_my_staking_action = true;
+                            break 'actions;
+                        }
                     }
                 }
             }
 
+
             if is_my_staking_action {
                 new_info = true;
-                info.bonds.push((PubKeyID(staking_action.unique_pubkey), staking_action.amount_zats));
+                info.bonds.push((PubKeyID(staking_action.unique_pubkey), staking_action.amount_zats, txid_lrz));
             }
         }
     }
