@@ -890,7 +890,8 @@ pub const MAX_REASSEMBLY_SLOTS: usize = 128; // @Todo: convert max slots into ma
 pub const MAX_JUMBOGRAM_LEN: usize = 1 << 23; // 8 MB, matches the 23-bit field
 pub const MAX_JUMBOGRAM_IDS: u32   = 1 << 18; // matches 18-bit field
 
-pub const ACK_BUFFER_TIME_NS: u64 = 250_000_000;
+//pub const ACK_BUFFER_TIME_NS: u64 = 250_000_000;
+pub const ACK_BUFFER_TIME_NS: u64 = 5_000_000;
 
 impl SliceRead  for PackletHeader           { fn       read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self(u16::read_from(buf)?)) } }
 impl SliceWrite for PackletHeader           { fn write_to(&self, buf: &mut  [u8]) -> usize        { self.0  .write_to(buf) } }
@@ -1432,8 +1433,9 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
 
                                     if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, state.ack_field.as_bytes(), &mut packet_memory_send[o..]).unwrap(); }
                                     else { o += state.ack_field.as_bytes().write_to(&mut packet_memory_send[o..]); }
-                                    if let Some(ns) = &existing_connection.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, existing_connection.other_ip, existing_connection.other_port, &packet_memory_send[..o], Dscp::Af21); }
-                                    else { udp_send_with_congestion_and_dscp(socket, existing_connection.other_ip, existing_connection.other_port, &packet_memory_send[..o], Dscp::Af21); }
+                                    if let Some(ns) = &existing_connection.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, existing_connection.other_ip, existing_connection.other_port, &packet_memory_send[..o], Dscp::Af21, false); }
+                                    else { udp_send_with_congestion_and_dscp(socket, existing_connection.other_ip, existing_connection.other_port, &packet_memory_send[..o], Dscp::Af21, false); }
+                                    eprintln!("[ack sent] to {}:{} {} bytes (recv path)", existing_connection.other_ip, existing_connection.other_port, o);
                                     state.ack_timer = u64::MAX;
                                 }
 
@@ -1574,8 +1576,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                 connections_map.retain(|connection_key, connection_tracking_data| {match &mut connection_tracking_data.connection_state {
                     ConnectionState::SendingClientHelloPlaintext { last_sent_time_ns, hello_packet_payload } => {
                         if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
-                            if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21); }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21); }
+                            if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
+                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
                             if *last_sent_time_ns == 0 { // cheeky optimization
                                 *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
                             } else {
@@ -1589,8 +1591,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                     }
                     ConnectionState::SendingClientHello { magic1, last_sent_time_ns, hello_packet_payload, handshake } => {
                         if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
-                            if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21); }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21); }
+                            if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
+                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
                             if *last_sent_time_ns == 0 { // cheeky optimization
                                 *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
                             } else {
@@ -1604,8 +1606,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                     }
                     ConnectionState::SendingServerHelloPlaintext { magic2: _, last_sent_time_ns, hello_packet_payload } => {
                         if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
-                            if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21); }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21); }
+                            if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
+                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
                             if *last_sent_time_ns == 0 { // cheeky optimization
                                 *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
                             } else {
@@ -1619,8 +1621,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                     }
                     ConnectionState::SendingServerHello { magic1, magic2: _, cipher, last_sent_time_ns, hello_packet_payload } => {
                         if *last_sent_time_ns + 2_500_000_000 < current_time_now_ns {
-                            if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21); }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21); }
+                            if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
+                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &hello_packet_payload, Dscp::Af21, false); }
                             if *last_sent_time_ns == 0 { // cheeky optimization
                                 *last_sent_time_ns = current_time_now_ns - 2_500_000_000 + 10_000_000;
                             } else {
@@ -1653,13 +1655,14 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                 
                                 if let Some(cipher) = &mut state.cipher { o += cipher.current.write_message(virtual_nonce, state.ack_field.as_bytes(), &mut packet_memory_send[o..]).unwrap(); }
                                 else { o += state.ack_field.as_bytes().write_to(&mut packet_memory_send[o..]); }
-                                if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21); }
-                                else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21); }
+                                if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, false); }
+                                else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_send[..o], Dscp::Af21, false); }
+                                eprintln!("[ack sent] to {}:{} {} bytes (send path)", connection_tracking_data.other_ip, connection_tracking_data.other_port, o);
                                 state.ack_timer = u64::MAX;
                             }
                         }
                         
-                        if state.RTT_sample_cursor != 0 && state.last_ack_received_time + 15_000_000_000/2 < current_time_now_ns {
+                        if false && state.RTT_sample_cursor != 0 && state.last_ack_received_time + 15_000_000_000/2 < current_time_now_ns {
                             // blackhole detected, go to safe TU
                             state.current_tu = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64;
                             state.RTT_sample_cursor = 0;
@@ -1677,6 +1680,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             state.tu_probe_failed_count = 0;
                             if OVERLY_VERBOSE { println!("Blackhole detected!"); }
                         }
+                        state.current_tu = ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64; // @nocheckin
                         
                         if state.congestion_event_time_ns == 0 { state.congestion_event_time_ns = current_time_now_ns; }
                         
@@ -1772,7 +1776,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                         
                         state.congestion_event_rate_upps = state.congestion_event_rate_upps.max(1_000_000);
                         
-                        let allowed_bandwidth_upps = cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery).max(1_000_000);
+                        let allowed_bandwidth_upps = cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery).max(1_000_000).min(10_000_000);
                         // pps * 10^-6 * rtt * 10^-4 = p * 10^10
                         // steady state + bulk ack sawtooth compensation
                         let allowed_packets_in_flight = ((allowed_bandwidth_upps * state.RTT_mean as u64 / 10_000) + (allowed_bandwidth_upps * (ACK_BUFFER_TIME_NS / 2) / 1_000_000_000)) / 1_000_000;
@@ -1816,8 +1820,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                 packet_len = payload_size;
                             }
 
-                            let send_time_ns = if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21) }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21) };
+                            let send_time_ns = if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false) }
+                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false) };
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
                             state.last_sent_tu_probe_time_ns = send_time_ns;
                             state.packet_since_last_print += 1;
@@ -1840,8 +1844,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                                 packet_len = payload_size;
                             }
 
-                            let send_time_ns = if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21) }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21) };
+                            let send_time_ns = if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false) }
+                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::Af21, false) };
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
                             state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
                             state.packets_in_flight += 1;
@@ -1869,8 +1873,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16) -> Ne
                             }
 
                             should_sleep = false;
-                            let send_time_ns = if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort) }
-                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort) };
+                            let send_time_ns = if let Some(ns) = &connection_tracking_data.nym_sock { nym_udp_send_with_congestion_and_dscp(ns, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) }
+                            else { udp_send_with_congestion_and_dscp(socket, connection_tracking_data.other_ip, connection_tracking_data.other_port, &packet_memory_encrypted[0..6+packet_len], Dscp::BestEffort, false) };
                             increment_sequence_number_and_account(send_time_ns, &mut state.send_sequence_number, &mut state.send_time_band, &mut state.send_time_band_head_index, &mut state.packets_waiting_ack_field);
                             state.last_sent_data_packet = current_time_now_ns; // We use the older time here so the pacer skips less packets.
                             state.packets_in_flight += 1;

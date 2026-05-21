@@ -190,10 +190,11 @@ pub fn nym_setup() -> NymHandle {
 
             use crate::native_sockets::ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE;
             let mut active: Vec<ActiveNymSock> = Vec::new();
+            let mut send_buf = vec![0u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
             let mut recv_buf = vec![0u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
 
             loop {
-                // Check for new connection requests
+                // Phase 1: Check for new connection requests
                 {
                     let mut queue = pending_clone.lock().unwrap();
                     for pending_sock in queue.drain(..) {
@@ -204,51 +205,29 @@ pub fn nym_setup() -> NymHandle {
                     }
                 }
 
-                let mut did_work = false;
-
-                // Service all active connections
+                // Phase 2: Drain all send rings
                 for sock in active.iter() {
-                    // Drain send ring -> send via UDP socket
-                    while let Some(len) = ring_try_pop(&sock.shared.send_ring, &mut recv_buf) {
+                    while let Some(len) = ring_try_pop(&sock.shared.send_ring, &mut send_buf) {
                         if len > SEND_HEADER_SIZE {
-                            let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&recv_buf[..16]).unwrap());
-                            let port = u16::from_be_bytes([recv_buf[16], recv_buf[17]]);
-                            // recv_buf[18] is dscp — reserved for future use
-                            let payload = &recv_buf[SEND_HEADER_SIZE..len];
+                            let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&send_buf[..16]).unwrap());
+                            let port = u16::from_be_bytes([send_buf[16], send_buf[17]]);
+                            let payload = &send_buf[SEND_HEADER_SIZE..len];
                             let dst: std::net::SocketAddr = if let Some(v4) = ip.to_ipv4_mapped() {
                                 (v4, port).into()
                             } else {
                                 (ip, port).into()
                             };
-                            let _ = sock.udp.send_to(payload, dst).await;
+                            match sock.udp.send_to(payload, dst).await {
+                                Ok(n) => eprintln!("[nym_thread send] {} bytes -> {}", n, dst),
+                                Err(e) => eprintln!("[nym_thread send] ERROR {} -> {}", e, dst),
+                            }
                         }
-                        did_work = true;
-                    }
-
-                    // Recv from UDP socket -> push into recv ring with header
-                    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-                    match sock.udp.poll_recv_from(&mut cx, &mut recv_buf) {
-                        std::task::Poll::Ready(Ok((len, src))) => {
-                            let (src_ip, src_port) = match src {
-                                std::net::SocketAddr::V4(v4) => (v4.ip().to_ipv6_mapped(), v4.port()),
-                                std::net::SocketAddr::V6(v6) => (*v6.ip(), v6.port()),
-                            };
-                            let mut header = [0u8; RECV_HEADER_SIZE];
-                            header[0..16].copy_from_slice(&src_ip.octets());
-                            header[16..18].copy_from_slice(&src_port.to_be_bytes());
-                            header[18] = 0; // flags: bit0=congested, bit1=ecn_enabled
-                            header[19] = 0; // dscp: BestEffort
-                            ring_try_push(&sock.shared.recv_ring, &header, &recv_buf[..len]);
-                            did_work = true;
-                        }
-                        _ => {}
                     }
                 }
 
-                // Remove dead connections (realtime thread dropped its NymSockHandle)
+                // Phase 3: Remove dead connections
                 active.retain(|sock| {
                     if Arc::strong_count(&sock.shared) == 1 {
-                        // We're the only holder — realtime thread is done with this socket
                         let tunnel = &sock.tunnel;
                         tokio::spawn({
                             let tunnel = tunnel.clone();
@@ -260,8 +239,48 @@ pub fn nym_setup() -> NymHandle {
                     }
                 });
 
-                if !did_work {
-                    tokio::task::yield_now().await;
+                // Phase 4: Wait for receives or tick timeout, then loop back to drain sends
+                let tick = tokio::time::sleep(std::time::Duration::from_millis(1));
+                tokio::pin!(tick);
+
+                'wait: loop {
+                    if active.is_empty() {
+                        tick.as_mut().await;
+                        break 'wait;
+                    }
+
+                    // Build a future that resolves when any socket has data
+                    // We poll each socket's recv in sequence; first one ready wins
+                    let mut got_recv = false;
+                    for sock in active.iter() {
+                        tokio::select! {
+                            _ = &mut tick => { break 'wait; }
+                            result = sock.udp.recv_from(&mut recv_buf) => {
+                                match result {
+                                    Ok((len, src)) => {
+                                        eprintln!("[nym_thread recv] {} bytes <- {}", len, src);
+                                        let (src_ip, src_port) = match src {
+                                            std::net::SocketAddr::V4(v4) => (v4.ip().to_ipv6_mapped(), v4.port()),
+                                            std::net::SocketAddr::V6(v6) => (*v6.ip(), v6.port()),
+                                        };
+                                        let mut header = [0u8; RECV_HEADER_SIZE];
+                                        header[0..16].copy_from_slice(&src_ip.octets());
+                                        header[16..18].copy_from_slice(&src_port.to_be_bytes());
+                                        header[18] = 0;
+                                        header[19] = 0;
+                                        ring_try_push(&sock.shared.recv_ring, &header, &recv_buf[..len]);
+                                        got_recv = true;
+                                    }
+                                    Err(e) => { eprintln!("[nym_thread recv] ERROR {}", e); }
+                                }
+                                break; // got data from one socket, loop back to check all again
+                            }
+                        }
+                    }
+                    if !got_recv {
+                        break 'wait; // tick fired
+                    }
+                    // Got a recv — loop 'wait to try more recvs before tick expires
                 }
             }
         });
@@ -356,8 +375,8 @@ pub fn new_nym_sock(nym_handle: &NymHandle) -> NymSockHandle {
     NymSockHandle { shared }
 }
 
-// Send ring format: [16B dst_ip6][2B dst_port BE][1B dscp][payload...]
-const SEND_HEADER_SIZE: usize = 19;
+// Send ring format: [16B dst_ip6][2B dst_port BE][1B flags: bit0=ecn_signal][1B dscp][payload...]
+const SEND_HEADER_SIZE: usize = 20;
 // Recv ring format: [16B src_ip6][2B src_port BE][1B flags: bit0=congested, bit1=ecn_enabled][1B dscp][payload...]
 const RECV_HEADER_SIZE: usize = 20;
 
@@ -368,11 +387,13 @@ pub fn nym_udp_send_with_congestion_and_dscp(
     dst_port: u16,
     payload: &[u8],
     dscp: Dscp,
+    ecn_signal: bool,
 ) -> u64 {
     let mut header = [0u8; SEND_HEADER_SIZE];
     header[0..16].copy_from_slice(&dst_ip6.octets());
     header[16..18].copy_from_slice(&dst_port.to_be_bytes());
-    header[18] = dscp as u8;
+    header[18] = if ecn_signal { 1 } else { 0 };
+    header[19] = dscp as u8;
     ring_try_push(&nym_sock.shared.send_ring, &header, payload);
     monotonic_clock_ns()
 }

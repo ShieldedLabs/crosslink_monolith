@@ -309,6 +309,7 @@ mod linux {
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
+        ecn_signal: bool,
     ) -> u64 {
         let fd = udp_socket.0;
         let known_good_ipv6_address = udp_socket.1;
@@ -364,7 +365,7 @@ mod linux {
         msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = cbuf.len();
 
-        let tclass_byte = ((dscp as u8) << 2) | 0b10;
+        let tclass_byte = ((dscp as u8) << 2) | if ecn_signal { 0b10 } else { 0b00 };
 
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg as *const _ as *mut _);
@@ -902,11 +903,11 @@ mod windows {
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
+        ecn_signal: bool,
     ) -> u64 {
         let sock = udp_socket.0;
 
-        // full TCLASS/TOS byte: DSCP in upper 6 bits, ECN=ECT(0) (0b10)
-        let tclass_byte: u8 = ((dscp as u8) << 2) | 0b10;
+        let tclass_byte: u8 = ((dscp as u8) << 2) | if ecn_signal { 0b10 } else { 0b00 };
         let tclass_i32 = tclass_byte as i32;
 
         // Best-effort per-send tagging via socket option before send.
@@ -1398,6 +1399,7 @@ mod macos {
         dst_port: u16,
         payload: &[u8],
         dscp: Dscp,
+        ecn_signal: bool,
     ) -> u64 {
         // Darwin constants (not always exposed by Rust libc)
         const SO_NET_SERVICE_TYPE: libc::c_int = 0x1116;
@@ -1454,8 +1456,7 @@ mod macos {
         msg.msg_control = cbuf.as_mut_ptr().cast::<libc::c_void>();
         msg.msg_controllen = cbuf.len() as u32;
 
-        // 4) DSCP + ECN (ECT(0) = 0b10).
-        let tclass_byte: u8 = ((dscp as u8) << 2) | 0b10;
+        let tclass_byte: u8 = ((dscp as u8) << 2) | if ecn_signal { 0b10 } else { 0b00 };
 
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg as *const _ as *mut _);
