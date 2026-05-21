@@ -143,6 +143,8 @@ pub mod config {
         /// operator specify the entire hardfork schedule manually instead of
         /// inheriting the built-in (mainnet) assumed past. Defaults to `false`.
         pub disable_shipped_hardforks: bool,
+        /// Reset the zaino database on startup.
+        pub reset_zaino_on_startup: bool,
     }
     impl Default for Config {
         fn default() -> Self {
@@ -154,6 +156,7 @@ pub mod config {
                 disable_zaino: false,
                 hardforks: Vec::new(),
                 disable_shipped_hardforks: false,
+                reset_zaino_on_startup: false,
             }
         }
     }
@@ -737,9 +740,17 @@ async fn handle_new_decided_bft_block(
 
     let call = tfl_handle.call.clone();
     let new_final_hash = ZebBlockHash(BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0);
+<<<<<<< HEAD
     let new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
     // `height` is now the 0-based canonical height, i.e. the chain index directly.
     let insert_i = new_block.height as usize;
+=======
+    let new_final_height = block_height_from_hash(&call, new_final_hash)
+        .await
+        .unwrap_or(ZebBlockHeight(new_block.finalization_candidate_height));
+    // assert_eq!(new_final_height.0, new_block.finalization_candidate_height);
+    let insert_i = new_block.height as usize - 1;
+>>>>>>> bc8f71f (Harden crosslink startup state recovery)
 
     let mut internal = tfl_handle.internal.lock().await;
 
@@ -1362,7 +1373,9 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
         if let Some(new_block) = i_bft_blocks.last() {
             new_final_hash.0 = BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0;
-            new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
+            new_final_height = block_height_from_hash(&call, new_final_hash)
+                .await
+                .unwrap_or(ZebBlockHeight(new_block.finalization_candidate_height));
 //println!("Loaded at pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, unsorted_roster);
         }
 
