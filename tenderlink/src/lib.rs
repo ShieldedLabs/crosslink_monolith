@@ -87,9 +87,9 @@ use snow::resolvers::CryptoResolver;
 use tokio::time::Instant;
 use zcash_primitives::bft::{ HashKey, HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
 
-const TICK_DURATION: std::time::Duration = std::time::Duration::from_millis(1000);
-
-const PEER_GOSSIP_DURATION: std::time::Duration = std::time::Duration::from_millis(1500);
+const TICK_DURATION:         std::time::Duration = std::time::Duration::from_millis(1000);
+const PEER_GOSSIP_DURATION:  std::time::Duration = std::time::Duration::from_millis(1500);
+const PEER_CONNECT_DURATION: std::time::Duration = std::time::Duration::from_millis(5000);
 
 
 // NOTE: Sam and Phillip discussed forward jumps; Noise trial decryption already protects connectsions against replay attacks.
@@ -1400,7 +1400,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     use crate::bandwidth_test::*;
     use crate::native_sockets::*;
 
-    let my_port = my_endpoint.map(|e| e.port).unwrap_or(23485); // @Todo! Get local port after sock creation! @@@
+    let my_port = my_endpoint.map(|e| e.port).unwrap_or(23485); // @Dev: .unwrap_or(0); // @Todo! Get local port after sock creation! @@@
     let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port);
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
     let mut messages_to_send = Vec::new();
@@ -1447,7 +1447,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut net_stats_window_start = tokio::time::Instant::now();
     let mut net_stats = NetworkStats::default();
 
-    let mut next_peer_gossip = std::time::Instant::now();
+    let mut next_peer_gossip  = std::time::Instant::now();
+    let mut next_peer_connect = std::time::Instant::now();
 
     let mut send_buf1 = [0u8; 2048];
     let mut next_tick_time = tokio::time::Instant::now();
@@ -1560,6 +1561,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             net_stats_window_start = tokio::time::Instant::now();
         }
 
+        // if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_GRY}PROTOCOL{ANSI_RST}: Connected to {} peers", current_connections.len()); }
+
         let was_now = tokio::time::Instant::now();
         if was_now > next_tick_time {
             {
@@ -1573,11 +1576,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     }
                 });
 
-                // Try to reconnect to known but disconnected peers
-                for (address, _bft_key) in bft_address_map.all_addrs() {
-                    if current_connections.iter().position(|(x, _)| x == address).is_none() {
-                        current_connections.push((address.clone(), [0u8; 64]));
-                    }
+                // Try to reconnect to "seeders"
+                for FinalizerPeerAddress { address, .. } in &finalizer_peer_addresses {
+                    current_connections.push((address.clone(), [0u8; 64]));
                 }
 
                 bft_state.bft_access_closure.0(&bft_state, &bft_address_map).await;
@@ -1604,12 +1605,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     {
                         let header = PacketHeader::new::<PACKET_TYPE_EMPTY>();
                         let mut o = 0;
-                        o += write_header_and_maybe_status(header, true,
-                                                           bft_state,
-                                                           roster,
-                                                           &mut send_buf1[o..],
-                                                           peer.index_counter);
-                        peer.index_counter += 1;
+                        o += write_header_and_maybe_status(header, true, bft_state, roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
                         send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
                     }
 
@@ -1634,12 +1630,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                                 let header = PacketHeader::new::<PACKET_TYPE_PROPOSAL_CHUNK>();
                                 // @Todo @Speed: We should build the header once and save it for all chunks. Peers only obey the latest status anyway.
-                                o += write_header_and_maybe_status(header, true,
-                                                                   bft_state,
-                                                                   roster,
-                                                                   &mut send_buf1[o..],
-                                                                   peer.index_counter);
-                                peer.index_counter += 1;
+                                o += write_header_and_maybe_status(header, true, bft_state, roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
                                 let signed_data_start = o; // past header+status
 
                                 o += chunk_hdr.write_to(&mut send_buf1[o..]);
@@ -1733,13 +1724,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                                     let mut o = 0;
                                     // @Todo @Speed: We should build the header once and save it for all votes. Peers only obey the latest status anyway.
-                                    o += write_header_and_maybe_status(header, true,
-                                                                       bft_state,
-                                                                       roster,
-                                                                       &mut send_buf1[o..],
-                                                                       peer.index_counter);
-                                    peer.index_counter += 1;
-
+                                    o += write_header_and_maybe_status(header, true, bft_state, roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
                                     o += packet.write_to(&mut send_buf1[o..]);
                                     send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
 
@@ -1764,13 +1749,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                             let mut o = 0;
                             // @Todo @Speed: We should build the header once and save it for all votes. Peers only obey the latest status anyway.
-                            o += write_header_and_maybe_status(header, true,
-                                                               bft_state,
-                                                               roster,
-                                                               &mut send_buf1[o..],
-                                                               peer.index_counter);
-                            peer.index_counter += 1;
-
+                            o += write_header_and_maybe_status(header, true, bft_state, roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
                             o += packet.write_to(&mut send_buf1[o..]);
                             // TODO: maybe status
                             print_packet_tag_send(header);
@@ -1863,6 +1842,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         return true; // keep
                     });
                 }
+                bft_address_map.by_key.retain(|bft_pk, map| map.len() > 0);
+
                 bft_address_map.by_addr.retain(|stp_address, bft_pk| {
                     let Some(map) = bft_address_map.by_key.get(bft_pk) else {
                         return false; // prune
@@ -1882,23 +1863,63 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     for (connection_key, peer) in &mut peers {
                         let mut o = 0;
                         let header = PacketHeader::new::<PACKET_TYPE_PEER_ATTESTATIONS>();
-                        o += write_header_and_maybe_status(header, true,
-                                                           &bft_state,
-                                                           &roster,
-                                                           &mut send_buf1[o..],
-                                                           peer.index_counter);
-                        peer.index_counter += 1;
+                        o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
 
                         for peer_attestation in &peer_attestations {
                             let attestation_len = peer_attestation.write_to(&mut send_buf1[o..]);
                             assert!(attestation_len == PEER_ATTESTATION_SERIALIZED_SIZE);
                             o += attestation_len;
                         }
+
                         print_packet_tag_send(header);
                         send_stp_msg(&mut messages_to_send, &connection_key, &send_buf1[..o], &mut net_stats);
                     }
 
                     next_peer_gossip = std::time::Instant::now() + PEER_GOSSIP_DURATION;
+                }
+
+                use rand::seq::IteratorRandom;
+                if std::time::Instant::now() >= next_peer_connect {
+                    let mut connection_attempts = 0;
+
+                    let rng = &mut rand::thread_rng();
+
+                    const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 2;
+                    const PEERS_TO_ASK_PUNCH:               usize = 5;
+
+                    let mut all_addresses: Vec<(&PubKeyID, &HashMap<STPAddress, Option<PeerAttestation>>)> = bft_address_map.by_key.iter().collect(); all_addresses.shuffle(rng);
+                    for (_, map) in &all_addresses {
+                        // Grab a random address associated with this BFT key. @Todo: prioritize by trustworthiness and expiry time.
+                        let Some((address, _)) = map.iter().choose(rng) else {
+                            continue;
+                        };
+                        // Don't connect to myself.
+                        if address.key == my_stp_keypair.public {
+                            continue;
+                        }
+                        // Don't connect to anyone to whom I am already connected.
+                        if current_connections.iter().any(|(addr, _)| address == addr) {
+                            continue;
+                        }
+
+                        // Coordinate hole punch through connected peers
+                        let mut o = 0;
+                        let header = PacketHeader::new::<PACKET_TYPE_WANT_HOLE_PUNCH>();
+                        o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[o..], 0);
+                        o += address.connection_key().write_to(&mut send_buf1[o..]);
+
+                        for (conn_address, _) in current_connections.iter().choose_multiple(rng, PEERS_TO_ASK_PUNCH) {
+                            if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_GRY}PROTOCOL{ANSI_RST}: Requesting hole punch to address {:?} via random peer: {:?}...", address, conn_address); }
+
+                            print_packet_tag_send(header);
+                            send_stp_msg(&mut messages_to_send, &conn_address.connection_key(), &send_buf1[..o], &mut net_stats);
+                        }
+
+                        // Initiate direct connection to start hole punch
+                        current_connections.push((address.clone(), [0u8; 64]));
+                    }
+
+                    next_peer_connect = std::time::Instant::now() + PEER_CONNECT_DURATION;
                 }
 
                 if PRINT_NETWORK_STATS {
@@ -1970,12 +1991,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
             // send hello to start verifying identity
             let header = PacketHeader::new::<PACKET_TYPE_ID_HELLO>();
-            o += write_header_and_maybe_status(header, true,
-                                               &bft_state,
-                                               &roster,
-                                               &mut send_buf1[o..],
-                                               peer.index_counter);
-            peer.index_counter += 1;
+            o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
             o += verification.write_to(&mut send_buf1[o..]);
 
             print_packet_tag_send(header);
@@ -2061,7 +2077,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let chunks = msg[read_o..].chunks(PEER_ATTESTATION_SERIALIZED_SIZE);
                 for chunk in chunks {
                     let Some(peer_attestation) = PeerAttestation::read_from(&mut &chunk[..]) else {
-                        tracing::warn!("Peer sent invalid peer attestation: Failed to read peer attestation");
+                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Failed to read peer attestation"); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue 'process_packets;
                     };
@@ -2071,17 +2087,17 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                     let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
                     if peer_attestation.expiry + 60 <= now {
-                        tracing::warn!("Peer sent peer attestation that will expire too soon (<60s)");
+                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent peer attestation that will expire too soon (<60s)"); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     }
                     if peer_attestation.issued >= peer_attestation.expiry {
-                        tracing::warn!("Peer sent invalid peer attestation: Issued after expired");
+                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Issued after expired"); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     }
                     if peer_attestation.issued + 60 > peer_attestation.expiry {
-                        tracing::warn!("Peer sent invalid peer attestation: Expires less than 60 seconds after issued");
+                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Expires less than 60 seconds after issued"); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     }
@@ -2103,7 +2119,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             let keyed_hash_of_one_party_signed_attestation = hasher.finalize();
 
                             match peer_attestation.attester_sig.verify(peer_attestation.attester_bft_pk, &keyed_hash_of_one_party_signed_attestation.as_bytes()[..]) { Ok(()) => {}, Err((err, str)) => {
-                                tracing::warn!("Peer sent invalid peer attestation: Attester signature invalid");
+                                if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Attester signature invalid"); }
                                 connection_keys_to_disconnect.push(connection_key);
                                 continue 'process_packets;
                             } };
@@ -2115,7 +2131,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink Two Party Signed Peer Attestation").finalize().into());
                         let keyed_hash_of_two_party_signed_attestation = hash_key_for_attestation.hash(&peer_attestation.attester_sig.0[..]);
                         match peer_attestation.attestee_sig.verify(peer_attestation.attestee_bft_pk, &keyed_hash_of_two_party_signed_attestation[..]) { Ok(()) => {}, Err((err, str)) => {
-                            tracing::warn!("Peer sent invalid peer attestation: Attestee signature invalid");
+                            if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Attestee signature invalid"); }
                             connection_keys_to_disconnect.push(connection_key);
                             continue 'process_packets;
                         } };
@@ -2128,7 +2144,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             else if packet_type == PACKET_TYPE_ID_HELLO {
 
                 let Some(their_verification) = PacketIdVerification::read_from(&mut &msg[read_o..]) else {
-                    tracing::warn!("Peer failed ID verification: Failed to read ID Hello packet");
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID verification: Failed to read ID Hello packet"); }
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 };
@@ -2139,7 +2155,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
 
                     match their_verification.sig.verify(their_verification.pk, &keyed_hash_of_stp_handshake_hash[..]) { Ok(()) => {}, Err((err, str)) => {
-                        tracing::warn!("Peer failed ID verification: Handshake hash signature invalid");
+                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID verification: Handshake hash signature invalid"); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     } };
@@ -2199,12 +2215,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 // send hello to start verifying identity
                 let header = PacketHeader::new::<PACKET_TYPE_ID_HELLO_ACK>();
-                o += write_header_and_maybe_status(header, true,
-                                                   &bft_state,
-                                                   &roster,
-                                                   &mut send_buf1[o..],
-                                                   peer.index_counter);
-                peer.index_counter += 1;
+                o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
                 o += my_verification.write_to(&mut send_buf1[o..]);
                 o += attestation    .write_to(&mut send_buf1[o..]);
 
@@ -2216,7 +2227,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let msg = &mut &msg[read_o..];
 
                 let Some(their_verification) = PacketIdVerification::read_from(msg) else {
-                    tracing::warn!("Peer failed ID verification: Failed to read ID Hello Ack packet: Failed to read verification");
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID verification: Failed to read ID Hello Ack packet: Failed to read verification"); }
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 };
@@ -2227,7 +2238,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
 
                     match their_verification.sig.verify(their_verification.pk, &keyed_hash_of_stp_handshake_hash[..]) { Ok(()) => {}, Err((err, str)) => {
-                        tracing::warn!("Peer failed ID verification: Handshake hash signature invalid");
+                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID verification: Handshake hash signature invalid"); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     } };
@@ -2237,12 +2248,14 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 peer.bft_pk = their_verification.pk;
 
                 let Some(attestation) = PacketIdAttestation::read_from(msg) else {
-                    tracing::warn!("Peer failed ID verification: Failed to read ID Hello Ack packet: Failed to read attestation");
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID verification: Failed to read ID Hello Ack packet: Failed to read attestation"); }
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 };
 
-                #[cfg(debug_assertions)] {
+                #[cfg(debug_assertions)]
+                if false
+                {
                     eprintln!("attestation:            {:?}",  attestation);
                     eprintln!("attestation.addr:       {:?}",  attestation.addr);
                     eprintln!("attestation.addr.magic: {:x?}", attestation.addr.magic1);
@@ -2254,23 +2267,23 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 // @Todo: list of multiple listen keypairs
                 if attestation.addr.magic1 != my_stp_keypair.magic1 ||
                    attestation.addr.key    != my_stp_keypair.public {
-                    tracing::warn!("Peer failed ID attestation: STP address is not my address");
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID attestation: STP address is not my address"); }
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 }
                 let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
                 if attestation.expiry <= now {
-                    tracing::warn!("Peer failed ID attestation: Attestation has already expired");
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID attestation: Attestation has already expired"); }
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 }
                 if attestation.issued >= attestation.expiry {
-                    tracing::warn!("Peer failed ID attestation: Issued after expired");
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID attestation: Issued after expired"); }
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 }
                 if attestation.issued + 60 > attestation.expiry {
-                    tracing::warn!("Peer failed ID attestation: Expires less than 60 seconds after issued");
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID attestation: Expires less than 60 seconds after issued"); }
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 }
@@ -2294,7 +2307,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         let keyed_hash_of_one_party_signed_attestation = hasher.finalize();
 
                         match attestation.sig.verify(their_verification.pk, &keyed_hash_of_one_party_signed_attestation.as_bytes()[..]) { Ok(()) => {}, Err((err, str)) => {
-                            tracing::warn!("Peer failed ID attestation: Attestation signature invalid");
+                            if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID attestation: Attestation signature invalid"); }
                             connection_keys_to_disconnect.push(connection_key);
                             continue;
                         } };
@@ -2321,22 +2334,58 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     attestee_sig:       sig,
                 };
                 my_address_attestations.push(peer_attestation.clone());
+                bft_address_map.insert(&peer_attestation.attestee_bft_pk, &peer_attestation.stp_address, Some(peer_attestation.clone()));
 
                 // @Todo: Decide if @Temporary?
+                // if false
                 {
                     let mut o = 0;
                     let header = PacketHeader::new::<PACKET_TYPE_PEER_ATTESTATIONS>();
-                    o += write_header_and_maybe_status(header, true,
-                                                       &bft_state,
-                                                       &roster,
-                                                       &mut send_buf1[o..],
-                                                       peer.index_counter);
-                    peer.index_counter += 1;
+                    o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
                     let attestation_len = peer_attestation.write_to(&mut send_buf1[o..]);
                     assert!(attestation_len == PEER_ATTESTATION_SERIALIZED_SIZE);
                     o += attestation_len;
                     print_packet_tag_send(header);
                     send_stp_msg(&mut messages_to_send, &connection_key, &send_buf1[..o], &mut net_stats);
+                }
+            }
+
+            else if packet_type == PACKET_TYPE_WANT_HOLE_PUNCH {
+                // @Todo: rate limit consumption
+
+                let msg = &mut &msg[read_o..];
+
+                let Some(relay_to_connection_key) = ConnectionKey::read_from(msg) else {
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Disconnecting from peer: Connection key read failed"); } // @Todo: better error message.
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue 'process_packets;
+                };
+
+                if current_connections.iter().any(|(addr, _)| addr.connection_key() == relay_to_connection_key) {
+                    let mut o = 0;
+                    let header = PacketHeader::new::<PACKET_TYPE_TRY_HOLE_PUNCH>();
+                    o += write_header_and_maybe_status(header, true, &bft_state, &roster, &mut send_buf1[o..], peer.index_counter); peer.index_counter += 1;
+                    o += peer.stp_address.write_to(&mut send_buf1[o..]);
+
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_GRY}PROTOCOL{ANSI_RST}: Relaying hole punch request from {:?} to {:?}...", peer.stp_address, relay_to_connection_key); }
+                    print_packet_tag_send(header);
+                    send_stp_msg(&mut messages_to_send, &relay_to_connection_key, &send_buf1[..o], &mut net_stats);
+                }
+
+            } else if packet_type == PACKET_TYPE_TRY_HOLE_PUNCH {
+                // @Todo: rate limit consumption
+
+                let msg = &mut &msg[read_o..];
+
+                let Some(address_to_punch_to) = STPAddress::read_from(msg) else {
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Disconnecting from peer: Address read failed"); } // @Todo: better error message.
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue 'process_packets;
+                };
+
+                if !current_connections.iter().any(|(addr, _)| *addr == address_to_punch_to) {
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_GRY}PROTOCOL{ANSI_RST}: Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, peer.stp_address); }
+                    current_connections.push((address_to_punch_to, [0u8; 64]));
                 }
             }
 
@@ -2350,6 +2399,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         current_connections.retain(|(address, _)| !connection_keys_to_disconnect.contains(&address.connection_key()));
 
+        // @Todo(Phillip): How long should this be?
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 

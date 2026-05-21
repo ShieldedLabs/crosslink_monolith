@@ -1431,8 +1431,8 @@ pub fn sync(
             const PEERS_TO_ASK_PUNCH_FOR_RECENTS:  usize = 5;
             const PEERS_TO_ASK_PUNCH_FOR_ALLEGEDS: usize = 2;
 
-            let mut recents: Vec<_> = recent_peer_addresses.iter().collect(); recents.shuffle(rng);
-            for (_, map) in recents {
+            let mut recents: Vec<(&u16, &HashMap<STPAddress, RecentPeerAddress>)> = recent_peer_addresses.iter().collect(); recents.shuffle(rng);
+            for (_, map) in &recents {
                 if connection_attempts >= MAX_PEERS_TO_CONNECT_PER_ATTEMPT {
                     break;
                 }
