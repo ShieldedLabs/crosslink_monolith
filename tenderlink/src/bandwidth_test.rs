@@ -1063,7 +1063,7 @@ pub fn service_connections(
                                         if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}: server chose magic2 {server_magic2:#x} which we did not offer."); }
                                         break 'conn;
                                     }
-                                    if VERBOSE { println!("Connected to new server {:?}", server_key); }
+                                    if VERBOSE { println!("Connected to new server {:?}", STPAddress { ip: other_ip_addr, port: other_port, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: server_key.to_vec() }); }
                                     existing_connection.connection_state = ConnectionState::Connected {
                                         cipher: None,
                                         magic1: CONNECT_MAGIC1_PLAIN_TEXT,
@@ -1095,7 +1095,7 @@ pub fn service_connections(
                                         if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}: server chose magic2 {server_magic2:#x} which we did not offer."); }
                                         break 'conn;
                                     }
-                                    if VERBOSE { println!("Connected to new server {:?}", handshake.get_remote_static().unwrap()); }
+                                    if VERBOSE { println!("Connected to new server {:?}", STPAddress { ip: other_ip_addr, port: other_port, magic1: *magic1, key: handshake.get_remote_static().unwrap().to_vec() }); }
 
                                     // Borrow Checker crazyness required here.
                                     let new_state = ConnectionState::Connected {
@@ -1125,7 +1125,6 @@ pub fn service_connections(
                             break 'conn;
                         }
                         ConnectionState::SendingServerHelloPlaintext { magic2, last_sent_time_ns, hello_packet_payload } => {
-                            if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
                             existing_connection.connection_state = ConnectionState::Connected {
                                 cipher: None,
                                 magic1: CONNECT_MAGIC1_PLAIN_TEXT,
@@ -1135,6 +1134,7 @@ pub fn service_connections(
                                 last_sent_keep_alive_time_ns: 0,
                                 recv_time_ns: timestamp_ns,
                             };
+                            if VERBOSE { println!("Connected to new client {:?}", existing_connection.address()); }
                             // FALLTHROUGH TO CONNECTED
                         }
                         ConnectionState::SendingServerHello { cipher, magic1, magic2, last_sent_time_ns, hello_packet_payload } => {
@@ -1148,7 +1148,6 @@ pub fn service_connections(
                                 break 'conn;
                             }
 
-                            if VERBOSE { println!("Connected to new client {:?}", existing_connection.other_transport_identity); }
                             existing_connection.connection_state = ConnectionState::Connected {
                                 cipher: Some(cipher.clone()),
                                 magic1: *magic1,
@@ -1158,6 +1157,7 @@ pub fn service_connections(
                                 last_sent_keep_alive_time_ns: 0,
                                 recv_time_ns: timestamp_ns,
                             };
+                            if VERBOSE { println!("Connected to new client {:?}", existing_connection.address()); }
                             // FALLTHROUGH TO CONNECTED
                         }
                         ConnectionState::Connected { .. } => (),
