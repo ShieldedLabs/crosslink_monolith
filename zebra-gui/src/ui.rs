@@ -3411,19 +3411,22 @@ pub fn ui_right_pane(ui: &mut Context,
 
                     ui.checkbox(id("Matches Height"), &mut filters.filter_height, "Must have voted at the latest height", width);
 
-                    if let _ = elem().decl(Decl {
-                        id: ui::id("Finalizer Status Container"),
-                        width: fit!(width),
-                        height: fit!(radius * 2.0),
-                        direction: TopToBottom,
-                        radius: ui.scale(4.0).dup4(),
-                        ..Decl
-                    }) {
+                    if let _ = elem() {
+                        let id = ui::id("Finalizer Status Container");
+                        decl(Decl {
+                            id,
+                            width: grow!(width),
+                            height: fit!(radius * 2.0),
+                            align: Center,
+                            direction: LeftToRight,
+                            radius: ui.scale(4.0).dup4(),
+                            ..Decl
+                        });
 
                         let secs_string = ui.textbox(
                             data,
-                            id("Seconds since connected Textbox"),
-                            "Seconds since connected...",
+                            ui::id("Seconds since connected Textbox"),
+                            "-",
                             TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
                         );
                         let secs_str = secs_string.trim();
@@ -3432,6 +3435,11 @@ pub fn ui_right_pane(ui: &mut Context,
                             //println!("{:?}", state.finalizer_seconds_since_connected);
                         } else if secs_str.len() == 0 {
                             filters.filter_seconds_since_connected = 0;
+                        }
+
+                        ui.text("Must have directly connected to us in the last N seconds", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl });
+                        if ui.hovered(id) {
+                            set_tooltip_text!(data, "Set to 0/empty to not require this to be \"online\"");
                         }
                     }
                 }
