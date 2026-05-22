@@ -1295,7 +1295,7 @@ fn finalizer_is_online_ex(f: &FinalizerRecencyStatus, bft_status: &wallet::TFLRe
         ok &= any_vote;
     }
 
-    if filters.filter_seconds_since_connected != 0{
+    if filters.filter_seconds_since_connected != 0 {
         if bft_status.now_utc < f.last_direct_connection_utc {
             println!("Saw direct connection in future: now: {}; seen: {}", bft_status.now_utc, f.last_direct_connection_utc);
             return false;
@@ -3411,8 +3411,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
                     ui.checkbox(id("Matches Height"), &mut filters.filter_height, "Must have voted at the latest height", width);
 
-                    // Let's reintroduce this when everyone is reporting liveness.
-                    if false && let _ = elem().decl(Decl {
+                    if let _ = elem().decl(Decl {
                         id: ui::id("Finalizer Status Container"),
                         width: fit!(width),
                         height: fit!(radius * 2.0),
@@ -3625,19 +3624,21 @@ pub fn ui_right_pane(ui: &mut Context,
                             let yes_votes_across_all_round_in_this_height = finalizer_status.no_yes_votes_in_my_height[0][1] + finalizer_status.no_yes_votes_in_my_height[1][1];
                             let highest_round_this_finalizer_voted        = finalizer_status.highest_round_vote;
                             // finalizer_status.last_seen_new_info_utc;     // "\n  Time Last Info Seen: {}"
-                            // finalizer_status.last_direct_connection_utc; // "\n  Time Last Connected: {}"
 
                             set_tooltip_text!(data,
                                               std::concat!("Finalizer {}:\n",
                                                            "  {:.2}% of stake\n",
                                                            "  No  Votes Across All Rounds In This Height: {}\n",
                                                            "  Yes Votes Across All Rounds In This Height: {}\n",
-                                                           "  Highest Round This Finalizer Voted (Untrusted): {}"),
+                                                           "  Highest Round This Finalizer Voted (Untrusted): {}\n",
+                                                           "  Time Last Connected: {}"),
                                               wallet::bft::PubKeyID(member.pub_key),
                                               pct,
                                               no_votes_across_all_round_in_this_height,
                                               yes_votes_across_all_round_in_this_height,
-                                              highest_round_this_finalizer_voted);
+                                              highest_round_this_finalizer_voted,
+                                              finalizer_status.last_direct_connection_utc,
+                            );
                             data.tooltip_wrap = Wrap::None;
                             data.tooltip_font = Mono;
                         } else {
@@ -4225,7 +4226,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             ui.dummy_2 = dummy_2;
         }
     }
-    
+
     if viz.inspecting_block_hash != Hash32::from_u64(0) {
         let ctx_menu_pos = (viz.inspecting_block_screen_x, viz.inspecting_block_screen_y);
         let inspect_id = id("Block Inspector Contents");
@@ -4528,11 +4529,10 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             }
         }
     }
-    if(viz.should_reset_clay_text_cache)
-    {
+
+    if viz.should_reset_clay_text_cache {
         viz.should_reset_clay_text_cache = false;
         unsafe { clay::Clay_ResetMeasureTextCache() };
-        
     }
     result |= dbg_ui(ui, is_rendering);
 
