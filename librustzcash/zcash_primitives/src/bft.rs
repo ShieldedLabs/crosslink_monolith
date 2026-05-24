@@ -671,7 +671,7 @@ pub struct FinalizerRecencyStatus {
     pub no_yes_votes_in_my_height: [[u64; 2]; 2], // prevote, precommit
     pub highest_round_vote: u32,
     pub last_seen_new_info_utc: i64,
-    pub last_direct_connection_utc: i64,
+    pub last_direct_connection_utc: Option<i64>,
     // TODO: locked, valid
 }
 

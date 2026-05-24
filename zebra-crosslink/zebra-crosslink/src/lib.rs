@@ -1140,9 +1140,10 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                             }
 
                             if member.pub_key == bft_state.my_pub_key {
-                                st.1.last_direct_connection_utc = now_utc;
-                            } else if let Some(utc) = bft_key_address_map.last_packet_utcs.get(&member.pub_key) {
-                                st.1.last_direct_connection_utc = st.1.last_direct_connection_utc.max(*utc);
+                                st.1.last_direct_connection_utc = Some(now_utc);
+                            } else {
+                                let utc = bft_key_address_map.last_packet_utcs.get(&member.pub_key);
+                                st.1.last_direct_connection_utc = st.1.last_direct_connection_utc.max(utc.copied());
                             }
                         }
                     }

@@ -1285,23 +1285,25 @@ fn get_finalizer_status(bft_status: &wallet::TFLRecencyStatus, pub_key: [u8;32])
 }
 
 fn finalizer_is_online_ex(f: &FinalizerRecencyStatus, bft_status: &wallet::TFLRecencyStatus, filters: &FinalizerFilters) -> bool {
-    let mut ok:bool = true;
+    let mut ok: bool = true;
     if filters.filter_height {
-        let mut any_vote = false;
-        any_vote |= f.no_yes_votes_in_my_height[0][0] > 0;
-        any_vote |= f.no_yes_votes_in_my_height[0][1] > 0;
-        any_vote |= f.no_yes_votes_in_my_height[1][0] > 0;
-        any_vote |= f.no_yes_votes_in_my_height[1][1] > 0;
-        ok &= any_vote;
+        ok &= f.no_yes_votes_in_my_height[0][0]
+            + f.no_yes_votes_in_my_height[0][1]
+            + f.no_yes_votes_in_my_height[1][0]
+            + f.no_yes_votes_in_my_height[1][1] > 0;
     }
 
     if filters.filter_seconds_since_connected != 0 {
-        if bft_status.now_utc < f.last_direct_connection_utc {
-            println!("Saw direct connection in future: now: {}; seen: {}", bft_status.now_utc, f.last_direct_connection_utc);
+        let Some(last_direct_connection_utc) = f.last_direct_connection_utc else {
+            return false;
+        };
+
+        if bft_status.now_utc < last_direct_connection_utc {
+            println!("Saw direct connection in future: now: {}; seen: {}", bft_status.now_utc, last_direct_connection_utc);
             return false;
         }
 
-        let secs_since_direct_connection = bft_status.now_utc - f.last_direct_connection_utc;
+        let secs_since_direct_connection = bft_status.now_utc - last_direct_connection_utc;
         ok &= secs_since_direct_connection <= filters.filter_seconds_since_connected as i64;
     }
     ok
@@ -3304,9 +3306,9 @@ pub fn ui_right_pane(ui: &mut Context,
         height: grow!(),
         ..Decl
     }) {
+
+
         let button_ex = |ui: &mut Context, label, act_on_press, enabled: bool| {
-
-
             let id = id(label);
             let (clicked, colour, text_colour) = ui.button_ex(act_on_press, BUTTON_GREY, id, enabled, winit::window::CursorIcon::Default);
             if let _ = elem().decl(Decl {
@@ -3339,7 +3341,7 @@ pub fn ui_right_pane(ui: &mut Context,
             clicked
         };
 
-        let clickable_icon = |ui: &mut Context, id, icon, enabled | {
+        let clickable_icon = |ui: &mut Context, id, icon, enabled| {
 
             let (clicked, colour, _) = ui.button_ex(false, (0xcc, 0xcc, 0xcc, 0xff) /* @todo colors */, id, enabled, winit::window::CursorIcon::Pointer);
             if let _ = elem().decl(Decl {
@@ -3409,7 +3411,7 @@ pub fn ui_right_pane(ui: &mut Context,
                     ..Decl
                 }) {
 
-                    ui.checkbox(id("Matches Height"), &mut filters.filter_height, "Must have voted at the latest height", width);
+                    ui.checkbox(id("Matches Height"), &mut filters.filter_height, "Voted at latest height", width);
 
                     if let _ = elem() {
                         let id = ui::id("Finalizer Status Container");
@@ -3417,29 +3419,39 @@ pub fn ui_right_pane(ui: &mut Context,
                             id,
                             width: grow!(width),
                             height: fit!(radius * 2.0),
+                            child_gap,
                             align: Center,
                             direction: LeftToRight,
                             radius: ui.scale(4.0).dup4(),
                             ..Decl
                         });
 
+                        ui.text("Connected less than:", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl });
+
+                        let textbox_id = ui::id("Seconds since connected Textbox");
                         let secs_string = ui.textbox(
                             data,
-                            ui::id("Seconds since connected Textbox"),
-                            "-",
+                            textbox_id,
+                            "∞",
                             TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
                         );
+                        let mut textbox_state = &mut data.textboxes.entry(textbox_id.id).or_default();
+                        textbox_state.text_buf.retain(|c| (*c >= '0' && *c <= '9') || *c == '∞');
+                        let len = textbox_state.text_buf.len();
+                        textbox_state.selection.0 = textbox_state.selection.0.min(len); // @Todo: this is very likely not the best thing to do here
+                        textbox_state.selection.1 = textbox_state.selection.1.min(len); // @Todo: this is very likely not the best thing to do here
                         let secs_str = secs_string.trim();
-                        if let Ok (value) = secs_str.parse::<u32>(){
+                        if let Ok(value) = secs_str.parse::<u32>(){
                             filters.filter_seconds_since_connected = value;
-                            //println!("{:?}", state.finalizer_seconds_since_connected);
-                        } else if secs_str.len() == 0 {
+                            // println!("{:?}", state.finalizer_seconds_since_connected);
+                        } else if secs_str.len() == 0 || secs_str == "∞" {
                             filters.filter_seconds_since_connected = 0;
                         }
 
-                        ui.text("Must have directly connected to us in the last N seconds", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl });
+                        ui.text("seconds ago", TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl });
+
                         if ui.hovered(id) {
-                            set_tooltip_text!(data, "Set to 0/empty to not require this to be \"online\"");
+                            set_tooltip_text!(data, "Set to 0/empty to ignore connection time");
                         }
                     }
                 }
@@ -3633,19 +3645,30 @@ pub fn ui_right_pane(ui: &mut Context,
                             let highest_round_this_finalizer_voted        = finalizer_status.highest_round_vote;
                             // finalizer_status.last_seen_new_info_utc;     // "\n  Time Last Info Seen: {}"
 
+                            let last_connected = if let Some(last_direct_connection_utc) = finalizer_status.last_direct_connection_utc {
+                                let seconds_ago = bft_status.now_utc - last_direct_connection_utc;
+                                format!("Last Connected: {} second{} ago ({})",
+                                        seconds_ago,
+                                        if seconds_ago == 1 { "" } else { "s" },
+                                        chrono::DateTime::<chrono::Utc>::from_timestamp(last_direct_connection_utc, 0).expect("recent Unix timestamp should be encodable as a UTC DateTime"),
+                                )
+                            } else {
+                                format!("Never connected to this finalizer during this session")
+                            };
+
                             set_tooltip_text!(data,
                                               std::concat!("Finalizer {}:\n",
                                                            "  {:.2}% of stake\n",
                                                            "  No  Votes Across All Rounds In This Height: {}\n",
                                                            "  Yes Votes Across All Rounds In This Height: {}\n",
                                                            "  Highest Round This Finalizer Voted (Untrusted): {}\n",
-                                                           "  Time Last Connected: {}"),
+                                                           "  {}"),
                                               wallet::bft::PubKeyID(member.pub_key),
                                               pct,
                                               no_votes_across_all_round_in_this_height,
                                               yes_votes_across_all_round_in_this_height,
                                               highest_round_this_finalizer_voted,
-                                              finalizer_status.last_direct_connection_utc,
+                                              last_connected,
                             );
                             data.tooltip_wrap = Wrap::None;
                             data.tooltip_font = Mono;

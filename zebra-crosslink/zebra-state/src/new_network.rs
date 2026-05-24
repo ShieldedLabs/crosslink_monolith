@@ -737,7 +737,7 @@ pub fn chain_intersect_prefix<'l>(a: &'l [ShadowBlock], b: &'l [ShadowBlock]) ->
 }
 
 
-const TRACE     :bool=0!=       1;
+const TRACE     :bool=0!=       0;
 
 
 // @Todo: always only wait on real stuff, never sleeping for fixed amounts like this
