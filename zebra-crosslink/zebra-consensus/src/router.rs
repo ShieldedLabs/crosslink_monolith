@@ -393,14 +393,36 @@ where
 pub fn init_checkpoint_list(config: Config, network: &Network) -> (CheckpointList, Height) {
     // TODO: Zebra parses the checkpoint list three times at startup.
     //       Instead, cache the checkpoint list for each `network`.
-    let list = network.checkpoint_list();
+    let hardcoded_list = network.checkpoint_list();
+    let extra_checkpoints: Vec<_> = config
+        .extra_checkpoints
+        .iter()
+        .map(|checkpoint| {
+            checkpoint
+                .height_and_hash()
+                .expect("configured checkpoint should parse")
+        })
+        .collect();
 
-    let max_checkpoint_height = if config.checkpoint_sync {
-        list.max_height()
+    let list = if config.checkpoint_sync {
+        hardcoded_list
+            .with_extra_checkpoints(extra_checkpoints.iter().copied())
+            .expect("configured checkpoints should be valid")
     } else {
-        list.min_height_in_range(network.mandatory_checkpoint_height()..)
-            .expect("hardcoded checkpoint list extends past canopy activation")
+        let max_mandatory_checkpoint_height = hardcoded_list
+            .min_height_in_range(network.mandatory_checkpoint_height()..)
+            .expect("hardcoded checkpoint list extends past canopy activation");
+
+        let required_checkpoints = hardcoded_list
+            .iter()
+            .filter(|(height, _hash)| **height <= max_mandatory_checkpoint_height)
+            .map(|(height, hash)| (*height, *hash))
+            .chain(extra_checkpoints.iter().copied());
+
+        CheckpointList::from_list(required_checkpoints)
+            .expect("configured checkpoints should be valid")
     };
+    let max_checkpoint_height = list.max_height();
 
     (list, max_checkpoint_height)
 }

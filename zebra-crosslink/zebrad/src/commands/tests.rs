@@ -1,5 +1,6 @@
 //! Tests for parsing zebrad commands
 
+use abscissa_core::config::Override;
 use clap::Parser;
 
 use crate::commands::ZebradCmd;
@@ -44,4 +45,24 @@ fn args_with_subcommand_pass_through() {
 
         assert_eq!(matches!(args.cmd(), ZebradCmd::Start(_)), should_be_start,);
     }
+}
+
+#[test]
+fn start_checkpoint_arg_parses() {
+    let hash = "00040fe8ec8471911baa1db1266ea15dd06b4a8a5c453883c000b031973dce08";
+    let args =
+        EntryPoint::try_parse_from(["zebrad", "start", "--checkpoint", &format!("0:{hash}")])
+            .expect("checkpoint arg should parse successfully");
+
+    let ZebradCmd::Start(cmd) = args.cmd() else {
+        panic!("expected start command");
+    };
+
+    let config = cmd
+        .override_config(crate::config::ZebradConfig::default())
+        .expect("checkpoint arg should override config successfully");
+
+    assert_eq!(config.consensus.extra_checkpoints.len(), 1);
+    assert_eq!(config.consensus.extra_checkpoints[0].height, 0);
+    assert_eq!(config.consensus.extra_checkpoints[0].hash, hash);
 }

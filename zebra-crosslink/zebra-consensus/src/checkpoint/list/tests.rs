@@ -196,6 +196,39 @@ fn checkpoint_list_duplicate_heights_fail() -> Result<(), BoxError> {
     Ok(())
 }
 
+#[test]
+fn checkpoint_list_extra_checkpoints_append() -> Result<(), BoxError> {
+    let _init_guard = zebra_test::init();
+
+    let checkpoint_data = [
+        (block::Height(0), block::Hash([1; 32])),
+        (block::Height(10), block::Hash([2; 32])),
+    ];
+    let list = CheckpointList::from_list(checkpoint_data)?;
+    let list = list.with_extra_checkpoints([(block::Height(20), block::Hash([3; 32]))])?;
+
+    assert_eq!(list.max_height(), block::Height(20));
+    assert_eq!(list.hash(block::Height(20)), Some(block::Hash([3; 32])));
+
+    Ok(())
+}
+
+#[test]
+fn checkpoint_list_extra_checkpoints_reject_duplicate_height() -> Result<(), BoxError> {
+    let _init_guard = zebra_test::init();
+
+    let checkpoint_data = [
+        (block::Height(0), block::Hash([1; 32])),
+        (block::Height(10), block::Hash([2; 32])),
+    ];
+    let list = CheckpointList::from_list(checkpoint_data)?;
+    let _ = list
+        .with_extra_checkpoints([(block::Height(10), block::Hash([3; 32]))])
+        .expect_err("duplicate extra checkpoint height should fail");
+
+    Ok(())
+}
+
 /// Make sure that a checkpoint list containing duplicate hashes
 /// (at different heights) fails
 #[test]

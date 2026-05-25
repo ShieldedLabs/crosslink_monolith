@@ -6,6 +6,8 @@ use color_eyre::eyre::Report;
 use once_cell::sync::Lazy;
 use tower::{layer::Layer, timeout::TimeoutLayer};
 
+use crate::config::CheckpointConfig;
+
 use zebra_chain::{
     block::Block,
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
@@ -141,14 +143,43 @@ static STATE_VERIFY_TRANSCRIPT_GENESIS: Lazy<
 async fn verify_checkpoint_test() -> Result<(), Report> {
     verify_checkpoint(Config {
         checkpoint_sync: true,
+        extra_checkpoints: Vec::new(),
     })
     .await?;
     verify_checkpoint(Config {
         checkpoint_sync: false,
+        extra_checkpoints: Vec::new(),
     })
     .await?;
 
     Ok(())
+}
+
+#[test]
+fn checkpoint_sync_false_still_enforces_extra_checkpoints() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let hardcoded_list = network.checkpoint_list();
+    let mandatory_checkpoint_height = hardcoded_list
+        .min_height_in_range(network.mandatory_checkpoint_height()..)
+        .expect("hardcoded checkpoint list extends past mandatory checkpoint height");
+    let extra_height = block::Height(mandatory_checkpoint_height.0 + 1);
+    let extra_hash = block::Hash([1; 32]);
+
+    let (list, max_checkpoint_height) = super::init_checkpoint_list(
+        Config {
+            checkpoint_sync: false,
+            extra_checkpoints: vec![CheckpointConfig {
+                height: extra_height.0,
+                hash: extra_hash.to_string(),
+            }],
+        },
+        &network,
+    );
+
+    assert_eq!(max_checkpoint_height, extra_height);
+    assert_eq!(list.hash(extra_height), Some(extra_hash));
 }
 
 /// Test that checkpoint verifies work.

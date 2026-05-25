@@ -81,6 +81,7 @@ use futures::FutureExt;
 use tokio::{pin, select, sync::oneshot, time::timeout};
 use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
+use zebra_consensus::config::CheckpointConfig;
 
 use zebra_chain::block::genesis::regtest_genesis_block;
 use zebra_consensus::{router::BackgroundTaskHandles, ParameterCheckpoint};
@@ -110,6 +111,10 @@ pub struct StartCmd {
     /// Filter strings which override the config file and defaults
     #[clap(help = "tracing filters which override the zebrad.toml config")]
     filters: Vec<String>,
+
+    /// Add an extra checkpoint as HEIGHT:HASH, requiring that hash at that block height
+    #[clap(long, value_name = "HEIGHT:HASH")]
+    checkpoint: Vec<CheckpointConfig>,
 }
 
 impl StartCmd {
@@ -954,6 +959,8 @@ impl config::Override<ZebradConfig> for StartCmd {
         if !self.filters.is_empty() {
             config.tracing.filter = Some(self.filters.join(","));
         }
+
+        config.consensus.extra_checkpoints.extend(self.checkpoint.clone());
 
         Ok(config)
     }

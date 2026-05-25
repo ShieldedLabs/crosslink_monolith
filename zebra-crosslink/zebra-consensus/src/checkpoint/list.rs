@@ -192,6 +192,20 @@ impl CheckpointList {
         Ok(checkpoints)
     }
 
+    /// Return a checkpoint list with `extra_checkpoints` appended.
+    pub fn with_extra_checkpoints(
+        &self,
+        extra_checkpoints: impl IntoIterator<Item = (block::Height, block::Hash)>,
+    ) -> Result<Self, BoxError> {
+        let checkpoint_list = self
+            .0
+            .iter()
+            .map(|(height, hash)| (*height, *hash))
+            .chain(extra_checkpoints);
+
+        Self::from_list(checkpoint_list)
+    }
+
     /// Return true if there is a checkpoint at `height`.
     ///
     /// See `BTreeMap::contains_key()` for details.
