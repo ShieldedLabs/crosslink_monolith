@@ -509,7 +509,7 @@ impl HSVA_RGBA for (u8, u8, u8, u8) {
 }
 
 impl Context {
-    pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, global_audio_volume: 0.4, ..Default::default() } }
+    pub fn new() -> Context { Context { scale: 1f32, zoom: 1f32, dpi_scale: 1f32, global_audio_volume: 0.4, left_pane_width: PANE_PERCENT_LEFT, right_pane_width: PANE_PERCENT_RIGHT, ..Default::default() } }
     pub fn draw(&self)  -> &DrawCtx  { unsafe { &*self.draw     } }
     pub fn draw_mut(&mut self) -> &mut DrawCtx { unsafe { &mut *(self.draw as *mut DrawCtx) } }
     pub fn input(&self) -> &InputCtx { unsafe { &*self.input    } }
@@ -3956,26 +3956,55 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         ..Decl
     }) {
 
-        let pane_pct_left  = Sizing::Percent(PANE_PERCENT_LEFT);
-        let pane_pct_right = Sizing::Percent(PANE_PERCENT_RIGHT);
+        let pane_pct_left  = Sizing::Percent(ui.left_pane_width);
+        let pane_pct_right = Sizing::Percent(ui.right_pane_width);
 
-        if let _elem = elem().decl(Decl {
-            id: id("Left Pane"),
-            direction: TopToBottom,
+        if let _ = elem().decl(Decl {
             width: pane_pct_left,
             height: grow!(),
+            direction: LeftToRight,
             clip: ClipX,
             ..Decl
         }) {
-
-            let id = _elem.decl.id;
-            if ui.hovered(id) {
-                ui.capture = true;
+            if let _elem = elem().decl(Decl {
+                id: id("Left Pane"),
+                direction: TopToBottom,
+                width: grow!(),
+                height: grow!(),
+                ..Decl
+            }) {
+                let id = _elem.decl.id;
+                if ui.hovered(id) { ui.capture = true; }
+                let mut pane_tab_l = ui.pane_tab_l;
+                ui_left_pane(ui, wallet_state.clone(), data, viz, child_gap, padding, radius, &mut pane_tab_l);
+                ui.pane_tab_l = pane_tab_l;
             }
-
-            let mut pane_tab_l = ui.pane_tab_l;
-            ui_left_pane(ui, wallet_state.clone(), data, viz, child_gap, padding, radius, &mut pane_tab_l);
-            ui.pane_tab_l = pane_tab_l;
+            let left_div_id = id("Left Pane Divider");
+            let div_w = ui.scale(8.0);
+            let div_hover = ui.hovered_raw(left_div_id);
+            if div_hover || ui.mouse_pressed_id == left_div_id {
+                ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::EwResize);
+            }
+            if div_hover && ui.input().mouse_pressed(MouseButton::Left) {
+                ui.mouse_pressed_id = left_div_id;
+            }
+            if ui.mouse_pressed_id == left_div_id && ui.input().mouse_held(MouseButton::Left) {
+                let mx = ui.input().mouse_pos().0 as f32;
+                ui.left_pane_width = (mx / window_w).clamp(0.10, 0.45);
+            }
+            let div_col = if div_hover || ui.mouse_pressed_id == left_div_id {
+                (0x60, 0x60, 0x60, 0xff)
+            } else {
+                (0x00, 0x00, 0x00, 0x00)
+            };
+            let _ = elem().decl(Decl {
+                id: left_div_id,
+                width: fixed!(div_w),
+                height: grow!(),
+                colour: div_col,
+                radius: (div_w / 2.0).dup4(),
+                ..Decl
+            });
         }
 
         if let _elem = elem().decl(Decl {
@@ -4237,24 +4266,55 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             }
         }
 
-        if let _elem = elem().decl(Decl {
-            id: id("Right Pane"),
-            direction: TopToBottom,
+        if let _ = elem().decl(Decl {
             width: pane_pct_right,
             height: grow!(),
+            direction: LeftToRight,
             clip: ClipX,
             ..Decl
         }) {
-            let id = _elem.decl.id;
-            if ui.hovered(id) {
-                ui.capture = true;
+            let right_div_id = id("Right Pane Divider");
+            let right_div_w = ui.scale(8.0);
+            let right_div_hover = ui.hovered_raw(right_div_id);
+            if right_div_hover || ui.mouse_pressed_id == right_div_id {
+                ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::EwResize);
             }
+            if right_div_hover && ui.input().mouse_pressed(MouseButton::Left) {
+                ui.mouse_pressed_id = right_div_id;
+            }
+            if ui.mouse_pressed_id == right_div_id && ui.input().mouse_held(MouseButton::Left) {
+                let mx = ui.input().mouse_pos().0 as f32;
+                ui.right_pane_width = ((window_w - mx) / window_w).clamp(0.10, 0.45);
+            }
+            let right_div_col = if right_div_hover || ui.mouse_pressed_id == right_div_id {
+                (0x60, 0x60, 0x60, 0xff)
+            } else {
+                (0x00, 0x00, 0x00, 0x00)
+            };
+            let _ = elem().decl(Decl {
+                id: right_div_id,
+                width: fixed!(right_div_w),
+                height: grow!(),
+                colour: right_div_col,
+                radius: (right_div_w / 2.0).dup4(),
+                ..Decl
+            });
 
-            let mut dummy_1 = ui.dummy_1;
-            let mut dummy_2 = ui.dummy_2;
-            ui_right_pane(ui, wallet_state.clone(), viz, data, child_gap, padding, radius, &mut dummy_1, &mut dummy_2);
-            ui.dummy_1 = dummy_1;
-            ui.dummy_2 = dummy_2;
+            if let _elem = elem().decl(Decl {
+                id: id("Right Pane"),
+                direction: TopToBottom,
+                width: grow!(),
+                height: grow!(),
+                ..Decl
+            }) {
+                let id = _elem.decl.id;
+                if ui.hovered(id) { ui.capture = true; }
+                let mut dummy_1 = ui.dummy_1;
+                let mut dummy_2 = ui.dummy_2;
+                ui_right_pane(ui, wallet_state.clone(), viz, data, child_gap, padding, radius, &mut dummy_1, &mut dummy_2);
+                ui.dummy_1 = dummy_1;
+                ui.dummy_2 = dummy_2;
+            }
         }
     }
 
@@ -4640,6 +4700,10 @@ pub struct Context {
     pub viz_op: InteractiveVizOp,
 
     pub pane_tab_l: Id,
+
+    pub left_pane_width: f32,
+    pub right_pane_width: f32,
+
     pub dummy_1: Id,
     pub dummy_2: Id,
 

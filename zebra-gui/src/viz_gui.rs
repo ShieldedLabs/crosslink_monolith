@@ -749,11 +749,11 @@ fn minimap_screen_rect(draw_ctx: &DrawCtx, ui: &ui::Context, lane: MinimapLane) 
     let strip = 46.0 * ds;
     let (x0, x1) = match lane {
         MinimapLane::Pow => {
-            let x0 = w * PANE_PERCENT_LEFT + gx;
+            let x0 = w * ui.left_pane_width + gx;
             (x0, x0 + strip)
         }
         MinimapLane::Pos => {
-            let x1 = w * (1.0 - PANE_PERCENT_RIGHT) - gx;
+            let x1 = w * (1.0 - ui.right_pane_width) - gx;
             (x1 - strip, x1)
         }
     };
