@@ -128,7 +128,7 @@ pub fn dbg_ui(ui: &mut Context, is_rendering: bool) -> bool {
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum Direction { #[default] LeftToRight, TopToBottom }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum Floating  { #[default] None, Parent, Root(f32, f32) }
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum ClipMode  { #[default] None, ClipX, ClipY, Clip, Scroll(f32) }
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default)]                pub enum ClipMode  { #[default] None, ClipX, ClipY, Clip, Scroll(f32), ScrollBoth(f32, f32) }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub struct Align   { x: AlignX, y: AlignY }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignX    { #[default] Left, Right, Center }
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Default, Hash, Ord, Eq)] pub enum AlignY    { #[default] Top, Bottom, Center }
@@ -346,17 +346,19 @@ pub const Clay_ElementDeclaration_ZERO: clay::Clay_ElementDeclaration = clay::Cl
         };
         decl.id = item.id.clay().id;
         let (clip_x, clip_y) = match item.clip {
-            ClipMode::None      => (false, false, ),
-            ClipMode::ClipX     => (true,  false, ),
-            ClipMode::ClipY     => (false, true,  ),
-            ClipMode::Clip      => (true,  true,  ),
-            ClipMode::Scroll(_) => (false, true,  ),
+            ClipMode::None         => (false, false, ),
+            ClipMode::ClipX        => (true,  false, ),
+            ClipMode::ClipY        => (false, true,  ),
+            ClipMode::Clip         => (true,  true,  ),
+            ClipMode::Scroll(_)    => (false, true,  ),
+            ClipMode::ScrollBoth(_, _) => (true,  true,  ),
         };
         decl.clip = clay::Clay_ClipElementConfig {
             horizontal: clip_x,
             vertical:   clip_y,
             childOffset: match item.clip {
                 ClipMode::Scroll(y) => clay::Clay_Vector2 { x: 0.0, y },
+                ClipMode::ScrollBoth(y, x) => clay::Clay_Vector2 { x, y },
                 _                   => clay::Clay_Vector2 { x: 0.0, y: 0.0 },
             }
         };
@@ -929,11 +931,37 @@ impl Context {
                 0.0
             }
         };
+
+        scroll_container_state.content_width = {
+            let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
+            if scroll_container_data.found {
+                scroll_container_data.contentDimensions.width
+            } else {
+                0.0
+            }
+        };
+
+        scroll_container_state.viewport_width = {
+            let scroll_container_data: clay::Clay_ScrollContainerData = unsafe { clay::Clay_GetScrollContainerData(id.clay().id) };
+            if scroll_container_data.found {
+                scroll_container_data.scrollContainerDimensions.width
+            } else {
+                0.0
+            }
+        };
+
         let max = scroll_container_state.content_height / self.scale - scroll_end_height;
+        let max_x = (scroll_container_state.content_width - scroll_container_state.viewport_width) / self.scale;
 
         if self.hovered(id) && !self.suppress_scroll_for_clay {
-            scroll_container_state.scroll -= self.input().zoom_delta     as f32 * 32.0;
-            scroll_container_state.scroll -= self.input().scroll_delta.1 as f32 * 32.0;
+            let shift = self.input().key_held(KeyCode::ShiftLeft) || self.input().key_held(KeyCode::ShiftRight);
+            if shift {
+                scroll_container_state.scroll_x -= self.input().scroll_delta.1 as f32 * 32.0 / self.scale;
+            } else {
+                scroll_container_state.scroll -= self.input().zoom_delta     as f32 * 32.0;
+                scroll_container_state.scroll -= self.input().scroll_delta.1 as f32 * 32.0;
+            }
+            scroll_container_state.scroll_x -= self.input().scroll_delta.0 as f32 * 32.0 / self.scale;
 
             if self.input().key_pressed(KeyCode::PageUp) {
                 scroll_container_state.scroll -= scroll_container_state.viewport_height / self.scale;
@@ -955,9 +983,21 @@ impl Context {
         if scroll_container_state.scroll < 0.0 {
             scroll_container_state.scroll = 0.0;
         }
+        if scroll_container_state.scroll_x > max_x {
+            scroll_container_state.scroll_x = max_x;
+        }
+        if scroll_container_state.scroll_x < 0.0 {
+            scroll_container_state.scroll_x = 0.0;
+        }
+
+        let clip = if max_x > 0.0 {
+            ClipMode::ScrollBoth(-scroll_container_state.scroll * self.scale, -scroll_container_state.scroll_x * self.scale)
+        } else {
+            Scroll(-scroll_container_state.scroll * self.scale)
+        };
 
         (id,
-         Scroll(-scroll_container_state.scroll * self.scale),
+         clip,
          &mut scroll_container_state.scroll,
          scroll_container_state.content_height,
          scroll_container_state.viewport_height,
@@ -1106,6 +1146,9 @@ pub struct ScrollContainerState {
     pub scroll: f32,
     pub content_height: f32,
     pub viewport_height: f32,
+    pub scroll_x: f32,
+    pub content_width: f32,
+    pub viewport_width: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -4319,46 +4362,149 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
     }
 
     if viz.inspecting_block_hash != Hash32::from_u64(0) {
-        let ctx_menu_pos = (viz.inspecting_block_screen_x, viz.inspecting_block_screen_y);
-        let inspect_id = id("Block Inspector Contents");
+        let inspect_outer_id = id("Block Inspector Outer");
         let scroll_id = id("Block Inspector Scroll");
+        let resize_id = id("Block Inspector Resize");
         let (scroll_id, clip, scroll_ref, content_h, viewport_h, max) = ui.scroll_container(data, scroll_id, 0.0);
-        if ui.hovered(inspect_id) {
+
+        if ui.hovered(inspect_outer_id) {
             ui.capture = true;
         }
-        let border_colour = { let mut col = PANE_COL.hsva(); col.2 = 0x18; col.rgba() };
+
+        let inspector_w = ui.scale(480.0).min(ui.draw().window_width as f32 * 0.45);
+        let inspector_h = ui.scale(420.0).min(ui.draw().window_height as f32 * 0.6);
+
+        let title_bar_h = ui.scale(40.0);
+        let title_pad = ui.scale(12.0);
+        let close_btn_r = ui.scale(14.0);
+
+        let resize_hover = ui.hovered_raw(resize_id);
+        if resize_hover || ui.mouse_pressed_id == resize_id {
+            ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::NwseResize);
+        }
+        if resize_hover && ui.input().mouse_pressed(MouseButton::Left) {
+            ui.mouse_pressed_id = resize_id;
+        }
+        if ui.mouse_pressed_id == resize_id && ui.input().mouse_held(MouseButton::Left) {
+            let mx = ui.input().mouse_pos().0 as f32;
+            let my = ui.input().mouse_pos().1 as f32;
+            let data_mx = data.scroll_containers.get(&resize_id.id);
+        }
+
+        let border_colour = { let mut col = PANE_COL.hsva(); col.2 = 0x22; col.rgba() };
         if let _ = elem().decl(Decl {
-            id: inspect_id,
+            id: inspect_outer_id,
             colour: border_colour,
-            child_gap, padding, radius,
-            width:  fit!(),
-            height: fit!(),
-            floating: Floating::Root(ctx_menu_pos.0 as f32, ctx_menu_pos.1 as f32),
+            radius: (ui.scale(8.0)).dup4(),
+            width:  fixed!(inspector_w),
+            height: fixed!(inspector_h),
+            floating: Floating::Root(
+                (viz.inspecting_block_screen_x + ui.scale(16.0)).min(ui.draw().window_width as f32 - inspector_w - ui.scale(8.0)),
+                (viz.inspecting_block_screen_y + ui.scale(16.0)).min(ui.draw().window_height as f32 - inspector_h - ui.scale(8.0))
+            ),
+            direction: TopToBottom,
             ..Decl
         }) {
+            let scroll_pad = ui.scale(14.0);
             if let _ = elem().decl(Decl {
                 id: scroll_id,
                 clip,
                 colour: PANE_COL,
-                child_gap, padding, radius,
-                width:  fit!(ui.scale(192.0), ui.draw().window_width as f32 * 0.5),
-                height: Sizing::Fixed(ui.scale(128.0)),
+                padding: (scroll_pad, scroll_pad, scroll_pad, scroll_pad),
+                child_gap: ui.scale(8.0),
+                radius: (ui.scale(8.0)).dup4(),
+                width:  percent!(1.0),
+                height: grow!(),
                 direction: TopToBottom,
                 ..Decl
             }) {
-                let text_h = ui.scale(10.0);
-                // Block Inspector Contents
-                ui.text(frame_strf!(data, "Block: {}", viz.inspecting_block_hash), TextDecl { font: Mono, wrap: Wrap::Chars, h: text_h, align: AlignX::Left, ..TextDecl });
+                let section_hdr = TextDecl { h: ui.scale(13.0), colour: WHITE.mul(0.45), align: AlignX::Left, ..TextDecl };
+                let body_text = TextDecl { font: Mono, h: ui.scale(13.0), colour: WHITE.mul(0.85), wrap: Wrap::None, align: AlignX::Left, ..TextDecl };
+
+                ui.text("HASH", section_hdr);
+                ui.text(frame_strf!(data, "{}", viz.inspecting_block_hash), TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+
+                let _ = elem().decl(Decl {
+                    width: percent!(1.0),
+                    height: fixed!(1.0),
+                    colour: WHITE.mul(0.08),
+                    ..Decl
+                });
+
                 let text = {
                     if let Some(text) = viz.inspect_block_json_text.as_ref() {
-
+                        ui.text("RAW DATA", section_hdr);
                         text.to_string()
                     } else {
                         frame_strf!(data, "Loading info for block {}...", viz.inspecting_block_hash).to_string()
                     }
                 };
-                ui.text(frame_strf!(data, "{}", text), TextDecl { font: Mono, wrap: Wrap::Chars, h: text_h, align: AlignX::Left, ..TextDecl });
+                ui.text(frame_strf!(data, "{}", text), body_text);
             }
+
+            let scroll_container_state = data.scroll_containers.entry(scroll_id.id).or_insert(Default::default());
+            let content_w = scroll_container_state.content_width;
+            let viewport_w = scroll_container_state.viewport_width;
+            let max_x = (content_w - viewport_w) / ui.scale;
+            let scroll_x_val = scroll_container_state.scroll_x;
+            let h_scrollbar_w = ui.scale(32.0);
+
+            if max_x > 0.0 {
+                let scroll_pct_x = (if max_x == 0.0 { 0.0 } else { scroll_x_val / max_x }).max(0.0).min(1.0);
+                let handle_pct_x = if content_w == 0.0 { 1.0 } else { viewport_w / content_w };
+                let scrollbar_region_w = viewport_w / ui.scale - scroll_pad * 2.0;
+                let handle_w = (handle_pct_x * scrollbar_region_w).max(ui.scale(24.0)).min(scrollbar_region_w);
+                let handle_offset = scroll_pct_x * (scrollbar_region_w - handle_w);
+
+                let h_scroll_handle_id = ui::id("Block Inspector H Scrollbar Handle");
+                let (h_activated, mut h_colour, _) = ui.button_ex(true, (0x60, 0x60, 0x60, 0), h_scroll_handle_id, true, winit::window::CursorIcon::Default);
+                h_colour.3 = h_colour.2;
+
+                if ui.mouse_pressed_id == h_scroll_handle_id {
+                    let delta_x = ui.input().mouse_delta().0 as f32;
+                    let delta_pct = delta_x / (scrollbar_region_w - handle_w);
+                    scroll_container_state.scroll_x += delta_pct * max_x;
+                    scroll_container_state.scroll_x = scroll_container_state.scroll_x.clamp(0.0, max_x);
+                }
+
+                let radius = ui.scale(6.0);
+                if let _ = elem().decl(Decl {
+                    width: percent!(1.0),
+                    height: fixed!(h_scrollbar_w),
+                    direction: LeftToRight,
+                    align: TopLeft,
+                    padding: (scroll_pad, scroll_pad, 0.0, scroll_pad),
+                    ..Decl
+                }) {
+                    if handle_w < scrollbar_region_w {
+                        let _ = elem().decl(Decl { width: fixed!(handle_offset), height: grow!(), ..Decl });
+                        let _ = elem().decl(Decl {
+                            id: h_scroll_handle_id,
+                            colour: h_colour,
+                            radius: radius.dup4(),
+                            width: fixed!(handle_w),
+                            height: fixed!(h_scrollbar_w - scroll_pad),
+                            ..Decl
+                        });
+                    }
+                }
+            }
+
+            let resize_s = ui.scale(12.0);
+            let resize_col = if resize_hover || ui.mouse_pressed_id == resize_id {
+                (0x60, 0x60, 0x60, 0xff)
+            } else {
+                (0x00, 0x00, 0x00, 0x00)
+            };
+            if let _ = elem().decl(Decl {
+                id: resize_id,
+                colour: resize_col,
+                radius: (ui.scale(8.0)).dup4(),
+                width: fixed!(resize_s),
+                height: fixed!(resize_s),
+                floating: Floating::Parent,
+                ..Decl
+            }) {}
         }
     }
 
@@ -4451,6 +4597,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 }
 
                 scroll_container_state.viewport_height = command.bounding_box.height.min(window_h);
+                scroll_container_state.viewport_width = command.bounding_box.width.min(window_w);
             }
 
             let x1 = (command.bounding_box.x)                               as isize;
