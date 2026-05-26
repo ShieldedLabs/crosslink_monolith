@@ -1799,25 +1799,27 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                                 peer_bft_key,
                                                 &mut net_stats);
                     }
-                    else if roster_i_from_pub_key(&roster[..active_roster_len(&roster)], peer_bft_key).is_some() && let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
-                    {
-                        for round_i in (current_height_start_i..bft_state.rounds_data.len()).rev()
+                    else if roster_i_from_pub_key(&roster[..active_roster_len(&roster)], peer_bft_key).is_some() {
+                        if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
                         {
-                            let round_data = &bft_state.rounds_data[round_i];
-                            send_round_data_to_peer(&bft_state,
-                                                    true,
-                                                    &round_data,
-                                                    &ctx_str,
-                                                    &roster,
-                                                    &mut messages_to_send,
-                                                    &mut send_buf1,
-                                                    peer,
-                                                    connection_key,
-                                                    peer_bft_key,
-                                                    &mut net_stats);
+                            for round_i in (current_height_start_i..bft_state.rounds_data.len()).rev()
+                            {
+                                let round_data = &bft_state.rounds_data[round_i];
+                                send_round_data_to_peer(&bft_state,
+                                                        true,
+                                                        &round_data,
+                                                        &ctx_str,
+                                                        &roster,
+                                                        &mut messages_to_send,
+                                                        &mut send_buf1,
+                                                        peer,
+                                                        connection_key,
+                                                        peer_bft_key,
+                                                        &mut net_stats);
+                            }
+                        } else {
+                            eprintln!("{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: round_data array was empty");
                         }
-                    } else {
-                        eprintln!("{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: round_data array was empty");
                     }
                 }
 
