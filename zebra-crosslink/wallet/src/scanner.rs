@@ -1,13 +1,21 @@
 use crate::*;
 use crate::bft::PubKeyID;
 
+#[derive(Clone, Debug)]
+pub struct ScanBond {
+    pub pk: PubKeyID,
+    pub initial_val: u64,
+    pub create_height: u32,
+    pub create_txid: TxId
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct ScanInfo {
     pub coinbases_c: usize,
     pub coinbases_value: u64,
     pub coinbase_max_height: u32,
 
-    pub bonds: Vec<(PubKeyID, u64, TxId)>,
+    pub bonds: Vec<ScanBond>,
     pub utxos: HashSet<(PubKeyID, u32)>, // NOTE: grow-only
     pub bonds_value: u64,
 
@@ -127,7 +135,12 @@ pub fn scan_tx(info: &mut ScanInfo, tx_bytes: &[u8], tx_i: usize, height: u32, u
 
             if is_my_staking_action {
                 new_info = true;
-                info.bonds.push((PubKeyID(staking_action.unique_pubkey), staking_action.amount_zats, txid_lrz));
+                info.bonds.push(ScanBond {
+                    pk: PubKeyID(staking_action.unique_pubkey),
+                    initial_val: staking_action.amount_zats,
+                    create_txid: txid_lrz,
+                    create_height: height,
+                });
             }
         }
     }

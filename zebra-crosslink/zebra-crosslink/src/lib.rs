@@ -1349,17 +1349,20 @@ async fn total_issuance_from_key(
 
     let mut bonds_value = 0;
     for bond in &scan_info.bonds {
-        match delegation_bonds.get(&bond.0.0) {
+        match delegation_bonds.get(&bond.pk.0) {
             Some(bond_info) => {
-                let val = u64::from(bond_info.0.amount);
-                println!("final value for bond {:?} = {}", bond, val);
-                bonds_value += val;
+                let initial_val: u64 = bond.initial_val;
+                let final_val = u64::from(bond_info.0.amount);
+                let issuance_gained = final_val - initial_val;
+                println!("bond {:?}: initial value = {}; final value = {}; gained {}", bond, initial_val, final_val, issuance_gained);
+                bonds_value += issuance_gained;
             },
             None => return Err(format!("couldn't find bond {:?}", bond)),
         }
     }
     scan_info.bonds_value = bonds_value;
 
+    println!("final scan info: {scan_info:?}");
     Ok(scan_info.total_value())
 }
 
