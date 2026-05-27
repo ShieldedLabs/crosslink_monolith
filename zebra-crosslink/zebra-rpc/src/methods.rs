@@ -59,7 +59,7 @@ use tracing::Instrument;
 use zcash_address::{unified::Encoding, TryFromAddress};
 use zcash_protocol::consensus::Parameters;
 use zcash_primitives::transaction::RosterMember;
-use zcash_primitives::bft::FatPointerToBftBlock;
+use zcash_primitives::bft::{ FatPointerToBftBlock, ScanInfo };
 
 use zebra_chain::{
     amount::{self, Amount, NegativeAllowed, NonNegative},
@@ -578,7 +578,7 @@ pub trait Rpc {
 
     /// For crosslink testnet 1
     #[method(name = "get_total_issuance")]
-    async fn get_total_issuance(&self, ufvk_str: String, first_height: u32, last_height: u32) -> Result<u64>;
+    async fn get_total_issuance(&self, ufvk_strs: Vec<String>, first_height: u32, last_height: u32) -> Result<Vec<ScanInfo>>;
 
     /// Returns all transaction ids in the memory pool, as a JSON array.
     ///
@@ -2481,16 +2481,20 @@ where
             .ok_or_misc_error("No blocks in state")
     }
 
-    async fn get_total_issuance(&self, ufvk_str: String, first_height: u32, last_height: u32) -> Result<u64> {
+    async fn get_total_issuance(&self, ufvk_strs: Vec<String>, first_height: u32, last_height: u32) -> Result<Vec<ScanInfo>> {
         // TODO: @Prod @Testnet
         let network = &zcash_protocol::consensus::TEST_NETWORK;
-        let ufvk = zcash_keys::keys::UnifiedFullViewingKey::decode(network, &ufvk_str)
-            .map_error(server::error::LegacyCode::InvalidAddressOrKey)?;
+        let mut ufvks = Vec::with_capacity(ufvk_strs.len());
+        for ufvk_str in &ufvk_strs {
+            let ufvk = zcash_keys::keys::UnifiedFullViewingKey::decode(network, ufvk_str)
+                .map_error(server::error::LegacyCode::InvalidAddressOrKey)?;
+            ufvks.push(ufvk);
+        }
 
         let res = self
             .tfl_service
             .clone()
-            .oneshot(TFLServiceRequest::TotalIssuanceFromKey(ufvk, Height(first_height), Height(last_height)))
+            .oneshot(TFLServiceRequest::TotalIssuanceFromKey(ufvks, Height(first_height), Height(last_height)))
             .await;
         if let Ok(TFLServiceResponse::TotalIssuanceFromKey(res)) = res {
             res.map_error(server::error::LegacyCode::InvalidAddressOrKey)

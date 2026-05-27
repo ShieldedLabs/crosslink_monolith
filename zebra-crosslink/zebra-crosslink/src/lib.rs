@@ -1279,10 +1279,10 @@ async fn tfl_block_finality_from_height_hash(
 
 async fn total_issuance_from_key(
     internal_handle: TFLServiceHandle,
-    ufvk: zcash_keys::keys::UnifiedFullViewingKey,
+    ufvks: Vec<zcash_keys::keys::UnifiedFullViewingKey>,
     first_height: ZebBlockHeight,
     last_height: ZebBlockHeight,
-) -> Result<u64, String> {
+) -> Result<Vec<ScanInfo>, String> {
     let call = internal_handle.call.clone();
 
     // let res = (call.state)(StateRequest::Tip).await;
@@ -1292,9 +1292,9 @@ async fn total_issuance_from_key(
     //     _ => return Err(format!("unexpectedly failed to get tip: {res:?}")),
     // };
 
-    let mut scan_info = wallet::scanner::ScanInfo::default();
+    let mut scan_infos = vec![ScanInfo::default(); ufvks.len()];
     let mut delegation_bonds = HashMap::new();
-    let mut utxos = HashSet::<(PubKeyID, u32)>::new(); // NOTE: grow-only
+    let mut utxos_per_ufvk = vec![HashSet::<(PubKeyID, u32)>::new(); ufvks.len()]; // NOTE: hashsets here are grow-only
 
     for height in first_height.0..=last_height.0 { //tip_height.0 {
         let tz = wallet::Timer::scope_("scan height", true);
@@ -1340,31 +1340,39 @@ async fn total_issuance_from_key(
                 // TODO: apply
             }
 
-            match wallet::scanner::scan_tx(&mut scan_info, &mut utxos, &coinbase_tx_bytes, tx_i, height, &ufvk, txid.0) {
-                Ok(false) => {},
-                Ok(true) => println!("scan info at {height}: {scan_info:?}"),
-                Err(err) => return Err(format!("failed to scan {txid:?} at height {height}: {err}")),
+            for (ufvk_i, ufvk) in ufvks.iter().enumerate() {
+                let utxos = &mut utxos_per_ufvk[ufvk_i];
+                let scan_info = &mut scan_infos[ufvk_i];
+                match wallet::scanner::scan_tx(scan_info, utxos, &coinbase_tx_bytes, tx_i, height, &ufvk, txid.0) {
+                    Ok(false) => {},
+                    Ok(true) => println!("scan info at {height}: {scan_info:?}"),
+                    Err(err) => return Err(format!("failed to scan {txid:?} at height {height}: {err}")),
+                }
             }
         }
     }
 
     let mut bonds_value = 0;
-    for bond in &scan_info.bonds {
-        match delegation_bonds.get(&bond.pk.0) {
-            Some(bond_info) => {
-                let initial_val: u64 = bond.initial_val;
-                let final_val = u64::from(bond_info.0.amount);
-                let issuance_gained = final_val - initial_val;
-                println!("bond {:?}: initial value = {}; final value = {}; gained {}", bond, initial_val, final_val, issuance_gained);
-                bonds_value += issuance_gained;
-            },
-            None => return Err(format!("couldn't find bond {:?}", bond)),
+    for scan_info in &mut scan_infos {
+        for bond in &scan_info.bonds {
+            match delegation_bonds.get(&bond.pk.0) {
+                Some(bond_info) => {
+                    let initial_val: u64 = bond.initial_val;
+                    let final_val = u64::from(bond_info.0.amount);
+                    let issuance_gained = final_val - initial_val;
+                    println!("bond {:?}: initial value = {}; final value = {}; gained {}", bond, initial_val, final_val, issuance_gained);
+                    bonds_value += issuance_gained;
+                },
+                None => return Err(format!("couldn't find bond {:?}", bond)),
+            }
         }
-    }
-    scan_info.bonds_value = bonds_value;
 
-    println!("final scan info: {scan_info:?}");
-    Ok(scan_info.total_value())
+        scan_info.bonds_value = bonds_value;
+        scan_info.total_value = scan_info.coinbases_value + scan_info.bonds_value;
+        println!("final scan info: {scan_info:?}");
+    }
+
+    Ok(scan_infos)
 }
 
 async fn tfl_service_incoming_request(
