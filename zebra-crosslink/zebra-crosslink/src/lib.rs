@@ -1294,6 +1294,7 @@ async fn total_issuance_from_key(
 
     let mut scan_info = wallet::scanner::ScanInfo::default();
     let mut delegation_bonds = HashMap::new();
+    let mut utxos = HashSet::<(PubKeyID, u32)>::new(); // NOTE: grow-only
 
     for height in first_height.0..=last_height.0 { //tip_height.0 {
         let tz = wallet::Timer::scope_("scan height", true);
@@ -1339,7 +1340,7 @@ async fn total_issuance_from_key(
                 // TODO: apply
             }
 
-            match wallet::scanner::scan_tx(&mut scan_info, &coinbase_tx_bytes, tx_i, height, &ufvk, txid.0) {
+            match wallet::scanner::scan_tx(&mut scan_info, &mut utxos, &coinbase_tx_bytes, tx_i, height, &ufvk, txid.0) {
                 Ok(false) => {},
                 Ok(true) => println!("scan info at {height}: {scan_info:?}"),
                 Err(err) => return Err(format!("failed to scan {txid:?} at height {height}: {err}")),
