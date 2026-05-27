@@ -2110,7 +2110,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
 }
 
 const CUBIC_BETA: f64 = 0.67;
-const CUBIC_K_RTT_MULTIPLIER: u64 = 11;
+const CUBIC_K_RTT_MULTIPLIER: u64 = 9;
 const CUBIC_MAX_RATE_UPPS_PER_SEC: f64 = 83_668_000_000.0; // 1000 Mbps/s linear cap
 const CUBIC_MIN_GROWTH_UPPSPS: f64 = 1_000_000.0; // 1 pps per second minimum linear growth
 
