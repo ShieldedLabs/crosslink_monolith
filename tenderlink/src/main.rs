@@ -34,7 +34,7 @@ fn main() {
             let other_port : u16 = args[4].parse().unwrap();
             println!("running beamer on port: {}", port);
             println!("connecting to {} port {}", other_addr, other_port);
-            do_the_test_program3(port, new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap(), Some(STPAddress { ip: other_addr, port: other_port, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: seeder_keypair.public, }), max_pps, (4_000_000, 512*1024, 64*1024*1024));
+            do_the_test_program3(port, new_keypair_from_connect_magic1(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s).unwrap(), Some(STPAddress { ip: other_addr, port: other_port, magic1: CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, key: seeder_keypair.public, }), max_pps, (500_000, 512*1024, 64*1024*1024));
             return;
         }
     }

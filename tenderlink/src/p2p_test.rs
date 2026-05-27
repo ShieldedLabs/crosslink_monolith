@@ -187,9 +187,9 @@ pub fn p2p(port: u16, crypto: u64, keypair: Option<IdentityKeyPair>, peer_addres
             println_redraw!(chat_buf, name, "{}: {}", name, line);
         }
 
-        let mut packets_received_this_tick = Vec::new();
+        let mut packets_received_this_tick : Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
 
-        service_connections(&mut connections_map, &mut packets_received_this_tick, &packets_to_send, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_keypairs);
+        //service_connections(&mut connections_map, &mut packets_received_this_tick, &packets_to_send, &mut packet_memory_encrypted, &mut packet_memory_recv, &mut packet_memory_send, socket, &my_keypairs);
 
         // Remove peers connecting through a disabled protocol. This is a @Dev feature for testing ipv4/ipv6 issues.
         connections_map.retain(|connection_key, _| (use_ipv4 || !connection_key.is_ipv4()) && (use_ipv6 || !connection_key.is_ipv6()));

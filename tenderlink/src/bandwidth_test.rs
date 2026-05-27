@@ -139,14 +139,14 @@ pub fn do_the_test_program3(port: u16, my_keypair: IdentityKeyPair, beam_to: Opt
         loop {
             let mut send_unreliable = Vec::new();
             if wanted_connections.len() > 0 {
-                for _ in 0..30000 {
+                for _ in 0..50000 {
                     send_unreliable.push((wanted_connections[0].0.to_connection_key(), Vec::from(b"Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...Test data...")));
                 }
                 // the sends will be truncated anyway
             }
             let ret = new_service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable, });
             wanted_connections = ret.current_connections;
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(std::time::Duration::from_millis(3000));
         }
     }
     else {
@@ -441,6 +441,10 @@ impl UnreliableSendBuffer {
         for m in &new_messages { new_bytes += m.len(); }
         self.message_queue.extend(new_messages);
         self.queue_bytes_filled += new_bytes;
+        self.cut_to_size();
+    }
+    
+    pub fn cut_to_size(&mut self) {
         while self.queue_bytes_filled > self.current_byte_capacity() as usize {
             let Some(m) = self.message_queue.pop_front() else { break; };
             self.queue_bytes_filled -= m.len();
@@ -595,6 +599,7 @@ pub struct ConnectionStateConnected {
     pub send_sequence_number: u64,
     pub jumbogram_index: u32,
     pub last_sent_data_packet: u64,
+    pub last_sent_could_have_sent_data_packet: u64,
     pub last_ack_received_time: u64,
     pub last_status_print_time: u64,
     pub packet_since_last_print: u64,
@@ -646,6 +651,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         send_sequence_number: 0,
         jumbogram_index: 0,
         last_sent_data_packet: 0,
+        last_sent_could_have_sent_data_packet: 0,
         last_ack_received_time: timestamp_ns,
         last_status_print_time: timestamp_ns,
         packet_since_last_print: 0,
@@ -1770,6 +1776,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             state.congestion_event_time_ns = 0;
                             state.congestion_event_rate_upps = 0;
                             state.last_sent_data_packet = 0;
+                            state.last_sent_could_have_sent_data_packet = 0;
                             if state.tu_probe_sequence_number != u64::MAX {
                                 // Orphaning an in-flight TU probe. It was never counted in packets_in_flight,
                                 // but a late ack or the tail-advance loop will try to decrement it.
@@ -1785,7 +1792,11 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         if state.congestion_event_time_ns == 0 {
                             state.congestion_event_time_ns = current_time_now_ns;
                         }
-                        
+
+                        if state.is_app_limited {
+                            state.congestion_event_time_ns = current_time_now_ns.saturating_sub(state.app_limit_time_offset);
+                        }
+
                         {
                             let old_k = CUBIC_K_RTT_MULTIPLIER * (state.RTT_mean as u64 * 100_000);
                             let current_t = current_time_now_ns.saturating_sub(state.congestion_event_time_ns);
@@ -1806,6 +1817,9 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             // First RTT received — backdate to R→P transition
                             if state.RTT_mean != u16::MAX && old_k == CUBIC_K_RTT_MULTIPLIER * (u16::MAX as u64 * 100_000) {
                                 state.congestion_event_time_ns = current_time_now_ns.saturating_sub(new_k);
+                                if state.is_app_limited {
+                                    state.app_limit_time_offset = new_k;
+                                }
                             }
                             else if old_k > 0 && new_k > 0 {
                                 let mut lo = if new_k >= old_k { current_t } else { 0u64 };
@@ -1921,13 +1935,15 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             state.packets_waiting_ack_tail += 1;
                         }
                         
-                        if state.is_app_limited {
-                            state.congestion_event_time_ns = current_time_now_ns.saturating_sub(state.app_limit_time_offset);
-                        }
-
                         state.congestion_event_rate_upps = state.congestion_event_rate_upps.max(1_000_000);
                         
-                        let (allowed_bandwidth_upps, cubic_mode) = cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery);
+                        let (allowed_bandwidth_upps, cubic_mode) = if state.is_app_limited {
+                            let rtt_ns = state.RTT_mean as u64 * 100_000;
+                            let a_t = state.app_limit_time_offset.max(rtt_ns * 2);
+                            (cubic_rate(a_t, state.congestion_event_rate_upps, time_to_bandwidth_recovery).0, 'A')
+                        } else {
+                            cubic_rate(current_time_now_ns - state.congestion_event_time_ns, state.congestion_event_rate_upps, time_to_bandwidth_recovery)
+                        };
                         let allowed_bandwidth_upps = allowed_bandwidth_upps.max(1_000_000);
                         // pps * 10^-6 * rtt * 10^-4 = p * 10^10
                         // BDP + sawtooth: pipe is full (BDP) plus ack batching excess (ack_pace_estimate is in 0.1ms units)
@@ -1939,8 +1955,8 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         // ns = (10^6 / upps) * 10^9 = 10^15 / upps
                         let time_between_sends_ns = 1_000_000_000_000_000 / allowed_bandwidth_upps.max(1);
                         // This is some Unity Game developer level crap approximation but it will have to do.
-                        let mut packet_send_allowance_now = (current_time_now_ns + 1 - state.last_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS))) / time_between_sends_ns;
-                        let send_allowance_time_remainder = (current_time_now_ns + 1 - state.last_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS)))
+                        let mut packet_send_allowance_now = (current_time_now_ns + 1 - state.last_sent_could_have_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS))) / time_between_sends_ns;
+                        let send_allowance_time_remainder = (current_time_now_ns + 1 - state.last_sent_could_have_sent_data_packet.max(state.last_ack_received_time.saturating_sub(ACK_BUFFER_TIME_NS)))
                                                                 - time_between_sends_ns*packet_send_allowance_now;
                         
                         if state.send_pacer_acc_ns > time_between_sends_ns {
@@ -2009,6 +2025,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         }
 
                         connection_tracking_data.unreliable_send_buffer.current_bytes_per_second = payload_size as u64 * allowed_bandwidth_upps / 1000_000;
+                        connection_tracking_data.unreliable_send_buffer.cut_to_size();
                         while ring_buffer_not_full && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer) {
                         
                             let virtual_nonce = state.send_sequence_number;
@@ -2040,13 +2057,22 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             println!("####### START APP LIMITED ######");
                             state.is_app_limited = true;
                             state.app_limit_time_offset = current_time_now_ns - state.congestion_event_time_ns;
+                            if cubic_mode == 'G' || cubic_mode == 'S' || cubic_mode == 'L' {
+                                state.congestion_event_rate_upps = (allowed_bandwidth_upps as f64 / RATE_PG) as u64;
+                                let t_pg = (TIME_PG * time_to_bandwidth_recovery as f64) as u64;
+                                state.app_limit_time_offset = t_pg;
+                                state.congestion_event_time_ns = current_time_now_ns.saturating_sub(t_pg);
+                            }
                         } else if has_data && state.is_app_limited {
                             println!("####### END APP LIMITED ######");
                             state.is_app_limited = false;
-                            state.last_sent_data_packet = current_time_now_ns;
+                            let rtt_ns = state.RTT_mean as u64 * 100_000;
+                            let exit_t = state.app_limit_time_offset.max(rtt_ns * 2);
+                            state.congestion_event_time_ns = current_time_now_ns.saturating_sub(exit_t);
                         }
                         
                         if could_have_sent {
+                            state.last_sent_could_have_sent_data_packet = current_time_now_ns;
                             if packet_send_allowance_now == 0 {
                                 state.send_pacer_acc_ns += send_allowance_time_remainder;
                             }
@@ -2084,13 +2110,13 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
 }
 
 const CUBIC_BETA: f64 = 0.67;
-const CUBIC_K_RTT_MULTIPLIER: u64 = 7;
+const CUBIC_K_RTT_MULTIPLIER: u64 = 11;
 const CUBIC_MAX_RATE_UPPS_PER_SEC: f64 = 83_668_000_000.0; // 1000 Mbps/s linear cap
 const CUBIC_MIN_GROWTH_UPPSPS: f64 = 1_000_000.0; // 1 pps per second minimum linear growth
 
 // -- Edit with Claude ------------------------------------------------------
 // Piecewise rate curve after recovery. All times are multiples of k (the
-// recovery time = CUBIC_K_RTT_MULTIPLIER × RTT).  Rate targets are
+// recovery time = CUBIC_K_RTT_MULTIPLIER * RTT).  Rate targets are
 // multiples of r (the pre-drop rate, "congestion upps").
 //
 //  Transition times (as factors on k, cumulative from congestion event):
@@ -2105,8 +2131,8 @@ const CUBIC_MIN_GROWTH_UPPSPS: f64 = 1_000_000.0; // 1 pps per second minimum li
 //
 //  Curve shapes:
 //    R: p^2 recovery from r*BETA up to r*RATE_RP
-//    P: linear from r to r*P→G_factor, entry derivative carried into G
-//    G: quadratic from P→G point, entry derivative matches P exit
+//    P: linear from r to r*P-G_factor, entry derivative carried into G
+//    G: quadratic from P-G point, entry derivative matches P exit
 //    S: p^10 explosive ramp (startup / bandwidth discovery)
 //    L: linear cap at CUBIC_MAX_RATE_UPPS_PER_SEC
 //
@@ -2116,11 +2142,11 @@ const CUBIC_MIN_GROWTH_UPPSPS: f64 = 1_000_000.0; // 1 pps per second minimum li
 // description block to match. The description is the source of truth
 // for the curve design.
 // -------------------------------------------------------------------------─
-const RATE_RP: f64 = 0.98;  // rate factor at R→P transition
-const RATE_PG: f64 = 1.05;  // rate factor at P→G transition
-const RATE_GS: f64 = 4.0;   // rate factor at G→S transition
-const TIME_PG: f64 = 5.0;   // time factor (in k) for P→G transition
-const TIME_GS: f64 = 15.0;  // time factor (in k) for G→S transition
+const RATE_RP: f64 = 0.98;  // rate factor at R-P transition
+const RATE_PG: f64 = 1.05;  // rate factor at P-G transition
+const RATE_GS: f64 = 4.0;   // rate factor at G-S transition
+const TIME_PG: f64 = 5.0;   // time factor (in k) for P-G transition
+const TIME_GS: f64 = 15.0;  // time factor (in k) for G-S transition
 
 /// Evaluate the CUBIC sending-rate function.
 /// t_ns:  nanoseconds since the last congestion event.
