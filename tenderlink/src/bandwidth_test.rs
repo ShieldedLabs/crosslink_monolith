@@ -173,7 +173,7 @@ pub fn crypto_string_from_connect_magic1(magic: u64) -> Option<&'static str> {
 }
 
 pub const MAGIC2_BLOCK_SIZE: usize = 1 + 32 * 8; // 257 bytes: 1 byte count + 32 × 8-byte magic2 values. Always send full block for constant-size.
-pub const MAGIC2_APP_CROSSLINK: u64 = 0xc85f36d10d278812;
+pub const MAGIC2_APP_CROSSLINK: u64 = 0x9b21ac6a28ae93c0;
 const SERVER_SUPPORTED_MAGIC2: &[u64] = &[MAGIC2_APP_CROSSLINK];
 
 pub fn build_magic2_client_block() -> [u8; MAGIC2_BLOCK_SIZE] {
@@ -2234,20 +2234,6 @@ pub fn get_handshake_hash(handshake: &snow::HandshakeState) -> [u8; 64] {
     handshake_hash[..handshake_hash_slice.len()].copy_from_slice(handshake_hash_slice);
 
     handshake_hash
-}
-
-// Returns true if a packet was received. You should use this information to decide how to schedule your connection servicing.
-pub fn service_connections(
-    connections_map: &mut HashMap::<ConnectionKey, ConnectionTrackingData>,
-    packets_received_this_call: &mut Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
-    packets_to_send: &Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
-    packet_memory_encrypted: &mut PacketMemory,
-    packet_memory_recv: &mut PacketMemory,
-    packet_memory_send: &mut PacketMemory,
-    socket: SockHandle,
-    my_keypairs: &Vec<IdentityKeyPair>,
-) -> bool {
-    false
 }
 
 use crate::helpers::*;

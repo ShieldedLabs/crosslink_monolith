@@ -1,3 +1,5 @@
+/*
+
 use crate::native_sockets::{Dscp, Ipv6Addr, monotonic_clock_ns};
 use nym_sdk::mixnet::MixnetClient;
 use nym_ip_packet_requests::IpPair;
@@ -169,17 +171,6 @@ struct ActiveNymSock {
 
 pub struct NymHandle {
     pub pending: Arc<std::sync::Mutex<Vec<PendingNymSock>>>,
-}
-
-pub fn nym_setup() -> NymHandle {
-    NymHandle {
-        pending: Arc::new(std::sync::Mutex::new(Vec::new())),
-    }
-}
-
-/*
-pub struct NymHandle {
-    pub pending: Arc<std::sync::Mutex<Vec<PendingNymSock>>>,
     pub _nym_thread: std::thread::JoinHandle<()>,
 }
 
@@ -302,7 +293,6 @@ pub fn nym_setup() -> NymHandle {
         _nym_thread: nym_thread,
     }
 }
-*/
 
 async fn setup_nym_sock(
     client: &mut MixnetClient,
@@ -451,3 +441,51 @@ panic!("disabled");
         (Some(*nym_sock.shared.allocated_ipv4.get()), Some(*nym_sock.shared.allocated_ipv6.get()))
     }
 }
+
+// */
+
+///*
+
+use crate::native_sockets::{Dscp, Ipv6Addr};
+use std::sync::Arc;
+
+#[derive(Clone, Debug)]
+pub struct NymSockHandle {
+    pub shared: Arc<()>,
+}
+
+pub struct NymHandle;
+
+pub fn nym_setup() -> NymHandle {
+    NymHandle
+}
+
+pub fn new_nym_sock(_nym_handle: &NymHandle) -> NymSockHandle {
+    NymSockHandle { shared: Arc::new(()) }
+}
+
+pub fn nym_udp_send_with_congestion_and_dscp(
+    _nym_sock: &NymSockHandle,
+    _dst_ip6: Ipv6Addr,
+    _dst_port: u16,
+    _payload: &[u8],
+    _dscp: Dscp,
+    _ecn_signal: bool,
+) -> u64 {
+    0
+}
+
+pub fn nym_udp_recv_with_congestion_and_dscp(
+    _nym_sock: &NymSockHandle,
+    _buf: &mut [u8],
+) -> std::io::Result<(usize, Ipv6Addr, u16, bool, bool, Dscp, u64)> {
+    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+}
+
+pub fn nym_udp_probe_source_addresses(
+    _nym_sock: &NymSockHandle,
+) -> (Option<Ipv6Addr>, Option<Ipv6Addr>) {
+    (None, None)
+}
+
+// */

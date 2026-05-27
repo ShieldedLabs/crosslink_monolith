@@ -371,7 +371,7 @@ c.network.initial_testnet_peers.insert("70.34.209.18:8233".to_owned());
             // state disk file, doesn't open database
             ("initial disk state version", disk_db_version),
             // build-time constant
-            ("features", env!("VERGEN_CARGO_FEATURES").to_string()),
+            ("features", option_env!("VERGEN_CARGO_FEATURES").unwrap_or("unknown").to_string()),
         ];
 
         // git env vars can be skipped if there is no `.git` during the
@@ -392,11 +392,11 @@ c.network.initial_testnet_peers.insert("70.34.209.18:8233".to_owned());
             .collect();
 
         let build_metadata: Vec<_> = [
-            ("target triple", env!("VERGEN_CARGO_TARGET_TRIPLE")),
-            ("rust compiler", env!("VERGEN_RUSTC_SEMVER")),
-            ("rust release date", env!("VERGEN_RUSTC_COMMIT_DATE")),
-            ("optimization level", env!("VERGEN_CARGO_OPT_LEVEL")),
-            ("debug checks", env!("VERGEN_CARGO_DEBUG")),
+            ("target triple", option_env!("VERGEN_CARGO_TARGET_TRIPLE").unwrap_or("unknown")),
+            ("rust compiler", option_env!("VERGEN_RUSTC_SEMVER").unwrap_or("unknown")),
+            ("rust release date", option_env!("VERGEN_RUSTC_COMMIT_DATE").unwrap_or("unknown")),
+            ("optimization level", option_env!("VERGEN_CARGO_OPT_LEVEL").unwrap_or("unknown")),
+            ("debug checks", option_env!("VERGEN_CARGO_DEBUG").unwrap_or("unknown")),
         ]
         .iter()
         .map(|(k, v)| (*k, v.to_string()))

@@ -260,8 +260,6 @@ zaino-common = { path = "../../zaino/zaino-common" }
 zaino-serve = { path = "../../zaino/zaino-serve" }
 
 [build-dependencies]
-vergen-git2 = { workspace = true, features = ["cargo", "rustc"] }
-
 # test feature lightwalletd-grpc-tests
 tonic-prost-build = { workspace = true, optional = true }
 
