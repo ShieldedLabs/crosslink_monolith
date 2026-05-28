@@ -127,7 +127,7 @@
     };
 
     # Invoke `check_path` for each configured nixfmt check path.
-    render-path = p: ''check_path '${p}' '';
+    render-path = p: "check_path '${p}'";
 
     nixfmt-check-script = builtins.concatStringsSep "\n" (map render-path nixfmt-check-paths);
   in
@@ -175,16 +175,12 @@
           }
           check_path() {
             local path="$1"
-            local files_list
             if [ -d "$path" ]
             then
-              files_list="$(mktemp)"
-              find "$path" -type f -name '*.nix' -print0 > "$files_list"
               while IFS= read -r -d "" f
               do
                 check_file "$f"
-              done < "$files_list"
-              rm -f "$files_list"
+              done < <(find "$path" -type f -name '*.nix' -print0)
             elif [ -f "$path" ]
             then
               check_file "$path"
