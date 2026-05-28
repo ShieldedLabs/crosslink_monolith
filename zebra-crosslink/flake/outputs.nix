@@ -177,7 +177,7 @@
         # Check formatting
         nixfmt-check = run-command "nixfmt" [ nixfmt ] ''
           set -efuo pipefail
-          files=()
+          declare -a files=()
           ${nixfmt-check-script}
           exitcode=0
           for f in "${files[@]}"
