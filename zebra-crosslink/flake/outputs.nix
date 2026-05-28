@@ -126,6 +126,7 @@
       '';
     };
 
+    # Append nix files found at `p` into the shell-local `files` array.
     render-path = p: ''
       if [ -d '${p}' ]
       then
