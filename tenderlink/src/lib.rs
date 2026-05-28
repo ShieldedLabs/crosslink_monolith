@@ -1547,13 +1547,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
             o
         }
-        fn send_stp_msg(messages_to_send: &mut Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
+        fn send_stp_msg(messages_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>,
                         connection_key: &ConnectionKey,
                         msg: &[u8],
                         stats: &mut NetworkStats) {
             stats.packets_sent += 1;
             stats.bytes_sent += msg.len();
-            messages_to_send.push((*connection_key, Vec::from(msg), None));
+            messages_to_send.push((*connection_key, Vec::from(msg)));
         }
 
         if net_stats_window_start.elapsed() >= 10*ONE_SECOND {
@@ -1592,7 +1592,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                            round_data: &RoundData,
                                            ctx_str: &str,
                                            roster: &[SortedRosterMember],
-                                           messages_to_send: &mut Vec<(ConnectionKey, Vec<u8>, Option<u32>)>,
+                                           messages_to_send: &mut Vec<(ConnectionKey, Vec<u8>)>,
                                            send_buf1: &mut [u8],
                                            peer: &mut Peer,
                                            connection_key: &ConnectionKey,
@@ -1953,9 +1953,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         use rand::seq::SliceRandom;
         messages_to_send.shuffle(&mut rand::thread_rng());
-        let resp = new_service_connections(&network_thread_handle, NetworkThreadPush { wanted_connections: current_connections.clone(), send_unreliable: Vec::new(), }); // messages_to_send @not_done
+        let resp = service_connections(&network_thread_handle, NetworkThreadPush { wanted_connections: current_connections.clone(), send_unreliable: messages_to_send, });
         current_connections = resp.current_connections;
-        let mut messages_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new(); // = resp.messages_received;
+        let mut messages_received = resp.received_unreliable_messages;
         messages_to_send = Vec::new();
 
         // Ensure a Peer entry exists for every active connection
@@ -2008,7 +2008,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         // READ
         'process_packets: while messages_received.len() > 0 {
             let (connection_key, mut peer, msg) = {
-                let (key, packet, _) = messages_received.remove(0);
+                let (key, packet) = messages_received.remove(0);
                 let Some(peer) = peers.get_mut(&key)
                 else {
                     continue;
