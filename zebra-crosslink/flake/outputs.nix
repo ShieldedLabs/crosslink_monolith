@@ -177,10 +177,12 @@
             local path="$1"
             if [ -d "$path" ]
             then
-              while IFS= read -r -d $'\0' f
-              do
-                check_file "$f"
-              done < <(find "$path" -type f -name '*.nix' -print0)
+              find "$path" -type f -name '*.nix' -exec bash -c '
+                for f do
+                  printf '"'"'+ nixfmt --check --strict %q\n'"'"' "$f"
+                  nixfmt --check --strict "$f" || exit 1
+                done
+              ' bash {} + || exitcode=1
             elif [ -f "$path" ]
             then
               check_file "$path"
