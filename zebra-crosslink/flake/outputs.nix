@@ -126,14 +126,15 @@
       '';
     };
 
-    # Run nixfmt against the nix files found at `p`.
+    # Invoke `check_file` for each nix file found at `p`.
     render-path = p: ''
       if [ -d '${p}' ]
       then
-        find '${p}' -type f -name '*.nix' -print | while IFS= read -r f
+        find '${p}' -type f -name '*.nix' -print > "$files_list"
+        while IFS= read -r f
         do
           check_file "$f"
-        done
+        done < "$files_list"
       elif [ -f '${p}' ]
       then
         check_file '${p}'
@@ -178,6 +179,8 @@
         # Check formatting
         nixfmt-check = run-command "nixfmt" [ nixfmt ] ''
           set -efuo pipefail
+          files_list="$(mktemp)"
+          trap 'rm -f "$files_list"' EXIT
           exitcode=0
           check_file() {
             local f="$1"
