@@ -184,7 +184,7 @@
           exitcode=0
           check_file() {
             local f="$1"
-            echo "+ nixfmt --check --strict $f"
+            printf '+ nixfmt --check --strict %q\n' "$f"
             nixfmt --check --strict "$f" || exitcode=1
           }
           ${nixfmt-check-script}
