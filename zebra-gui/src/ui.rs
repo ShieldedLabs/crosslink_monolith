@@ -1921,16 +1921,28 @@ pub fn ui_left_pane(ui: &mut Context,
                         }) {
                             let (
                                 balance,
-                                waiting_for_send
+                                waiting_for_send,
+                                queued_actions,
+                                max_queued_actions
                             ) = {
                                 let wallet_state = wallet_state.lock().unwrap();
                                 (
                                     wallet_state.user_balance(),
                                     wallet_state.waiting_for_send,
+                                    wallet_state.queued_actions_len(),
+                                    WalletState::MAX_QUEUED_ACTIONS,
                                 )
                             };
 
-                            let can = !waiting_for_send && data.send_address.len() != 0;
+                            let queue_full = queued_actions >= max_queued_actions;
+                            let can = data.send_address.len() != 0 && !queue_full;
+                            ui.text(
+                                frame_strf!(data, "Queue: {}/{}, send in progress: {}", queued_actions, max_queued_actions, waiting_for_send),
+                                TextDecl { font: Mono, h: ui.scale(16.0), colour: WHITE.mul(0.7), align: AlignX::Center, ..TextDecl }
+                            );
+                            if queue_full {
+                                ui.text("Queue full", TextDecl { font: Mono, h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
+                            }
                             let sends = [
                                 ("0.1", ONE_cTAZ/10),
                                 // ("0.2", 2*(ONE_cTAZ/10)),
@@ -2112,7 +2124,14 @@ pub fn ui_left_pane(ui: &mut Context,
                         ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                     }
 
-                    let waiting_for_stake_to_finalizer = wallet_state.lock().unwrap().waiting_for_stake_to_finalizer;
+                    let (waiting_for_stake_to_finalizer, queued_actions, max_queued_actions) = {
+                        let wallet_state = wallet_state.lock().unwrap();
+                        (
+                            wallet_state.waiting_for_stake_to_finalizer,
+                            wallet_state.queued_actions_len(),
+                            WalletState::MAX_QUEUED_ACTIONS,
+                        )
+                    };
 
                     {
                         // if (balance as u64) < ONE_cTAZ / 100 {
@@ -2159,7 +2178,15 @@ pub fn ui_left_pane(ui: &mut Context,
                         }
                         let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
 
-                        let can = is_staking_day && !waiting_for_stake_to_finalizer && hex_dest.is_some();
+                        let queue_full = queued_actions >= max_queued_actions;
+                        let can = is_staking_day && hex_dest.is_some() && !queue_full;
+                        ui.text(
+                            frame_strf!(data, "Queue: {}/{}, stake in progress: {}", queued_actions, max_queued_actions, waiting_for_stake_to_finalizer),
+                            TextDecl { font: Mono, h: ui.scale(16.0), colour: WHITE.mul(0.7), align: AlignX::Center, ..TextDecl }
+                        );
+                        if queue_full {
+                            ui.text("Queue full", TextDecl { font: Mono, h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
+                        }
 
                         let mut hover = false;
 
@@ -2854,9 +2881,9 @@ pub fn ui_left_pane(ui: &mut Context,
             let (mut txs, locals, local_n) = {
                 let state = wallet_state.lock().unwrap();
                 if *tab_id == tab_id_user_wallet {
-                    (state.user_txs.clone(), state.user_local_txs, state.user_local_txs_n)
+                    (state.user_txs.clone(), state.user_local_txs.clone(), state.user_local_txs_n)
                 } else {
-                    (state.miner_txs.clone(), state.miner_local_txs, state.miner_local_txs_n)
+                    (state.miner_txs.clone(), state.miner_local_txs.clone(), state.miner_local_txs_n)
                 }
             };
             for i in 0..local_n {
