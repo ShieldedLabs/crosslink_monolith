@@ -1283,6 +1283,8 @@ async fn total_issuance_from_key(
     first_height: ZebBlockHeight,
     last_height: ZebBlockHeight,
 ) -> Result<Vec<ScanInfo>, String> {
+    assert!(first_height <= last_height);
+    
     let call = internal_handle.call.clone();
 
     // let res = (call.state)(StateRequest::Tip).await;
