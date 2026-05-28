@@ -177,7 +177,7 @@
             local path="$1"
             if [ -d "$path" ]
             then
-              while IFS= read -r -d "" f
+              while IFS= read -r -d $'\0' f
               do
                 check_file "$f"
               done < <(find "$path" -type f -name '*.nix' -print0)
