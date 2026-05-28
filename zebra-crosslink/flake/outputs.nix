@@ -167,27 +167,17 @@
         # Check formatting
         nixfmt-check = run-command "nixfmt" [ nixfmt ] ''
           set -efuo pipefail
-          exitcode=0
-          check_file() {
-            local f="$1"
-            printf '+ nixfmt --check --strict %q\n' "$f"
-            nixfmt --check --strict "$f" || exitcode=1
-          }
           check_path() {
             local path="$1"
             if [ -d "$path" ]
             then
-              find "$path" -type f -name '*.nix' -exec bash -c '
-                for f do
-                  printf '"'"'+ nixfmt --check --strict %q\n'"'"' "$f"
-                  nixfmt --check --strict "$f" || exit 1
-                done
-              ' bash {} + || exitcode=1
+              find "$path" -type f -name '*.nix' -exec nixfmt --check --strict {} + || exitcode=1
             elif [ -f "$path" ]
             then
-              check_file "$path"
+              nixfmt --check --strict "$path" || exitcode=1
             fi
           }
+          exitcode=0
           ${nixfmt-check-script}
           [ "$exitcode" -eq 0 ] && touch "$out" # signal success to nix
           exit "$exitcode"
