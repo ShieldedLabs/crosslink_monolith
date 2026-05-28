@@ -130,8 +130,8 @@
     render-path = p: ''
       if [ -d '${p}' ]
       then
-        find '${p}' -type f -name '*.nix' -print > "$files_list"
-        while IFS= read -r f
+        find '${p}' -type f -name '*.nix' -print0 > "$files_list"
+        while IFS= read -r -d "" f
         do
           check_file "$f"
         done < "$files_list"
@@ -184,9 +184,8 @@
           exitcode=0
           check_file() {
             local f="$1"
-            cmd="nixfmt --check --strict \"$f\""
-            echo "+ $cmd"
-            eval "$cmd" || exitcode=1
+            echo "+ nixfmt --check --strict $f"
+            nixfmt --check --strict "$f" || exitcode=1
           }
           ${nixfmt-check-script}
           [ "$exitcode" -eq 0 ] && touch "$out" # signal success to nix
