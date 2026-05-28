@@ -1955,7 +1955,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         messages_to_send.shuffle(&mut rand::thread_rng());
         let resp = new_service_connections(&network_thread_handle, NetworkThreadPush { wanted_connections: current_connections.clone(), send_unreliable: Vec::new(), }); // messages_to_send @not_done
         current_connections = resp.current_connections;
-        let mut messages_received : Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();// = resp.messages_received;
+        let mut messages_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new(); // = resp.messages_received;
         messages_to_send = Vec::new();
 
         // Ensure a Peer entry exists for every active connection
