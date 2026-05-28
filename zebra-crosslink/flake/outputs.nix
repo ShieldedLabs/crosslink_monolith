@@ -126,20 +126,8 @@
       '';
     };
 
-    # Invoke `check_file` for each nix file found at `p`.
-    render-path = p: ''
-      if [ -d '${p}' ]
-      then
-        find '${p}' -type f -name '*.nix' -print0 > "$files_list"
-        while IFS= read -r -d "" f
-        do
-          check_file "$f"
-        done < "$files_list"
-      elif [ -f '${p}' ]
-      then
-        check_file '${p}'
-      fi
-    '';
+    # Invoke `check_path` for each configured nixfmt check path.
+    render-path = p: ''check_path '${p}' '';
 
     nixfmt-check-script = builtins.concatStringsSep "\n" (map render-path nixfmt-check-paths);
   in
@@ -179,13 +167,28 @@
         # Check formatting
         nixfmt-check = run-command "nixfmt" [ nixfmt ] ''
           set -efuo pipefail
-          files_list="$(mktemp)"
-          trap 'rm -f "$files_list"' EXIT
           exitcode=0
           check_file() {
             local f="$1"
             printf '+ nixfmt --check --strict %q\n' "$f"
             nixfmt --check --strict "$f" || exitcode=1
+          }
+          check_path() {
+            local path="$1"
+            local files_list
+            if [ -d "$path" ]
+            then
+              files_list="$(mktemp)"
+              find "$path" -type f -name '*.nix' -print0 > "$files_list"
+              while IFS= read -r -d "" f
+              do
+                check_file "$f"
+              done < "$files_list"
+              rm -f "$files_list"
+            elif [ -f "$path" ]
+            then
+              check_file "$path"
+            fi
           }
           ${nixfmt-check-script}
           [ "$exitcode" -eq 0 ] && touch "$out" # signal success to nix
