@@ -2158,6 +2158,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                     match their_verification.sig.verify(their_verification.pk, &keyed_hash_of_stp_handshake_hash[..]) { Ok(()) => {}, Err((err, str)) => {
                         if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID verification: Handshake hash signature invalid"); }
+                        // if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Handshake hash is: {:?}", peer.stp_handshake_hash); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     } };

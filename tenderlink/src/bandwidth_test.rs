@@ -866,7 +866,7 @@ pub fn connect_to_endpoint(
 }
 
 const        VERBOSE                :bool=0!=                (1);
-const OVERLY_VERBOSE                :bool=0!=                (1);
+const OVERLY_VERBOSE                :bool=0!=                (0);
 
 macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
 
@@ -1292,6 +1292,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                                             let hello_packet_payload = Vec::from(&packet_memory_send[0..6+handshake_size]);
         
                                                             debug_assert!(new_handshake.is_handshake_finished());
+                                                            existing_connection.handshake_hash = get_handshake_hash(&new_handshake);
                                                             let cipher = ConnectionCipherTriplet::new_from_old_init_only(new_handshake.into_stateless_transport_mode().expect("Cannot fail given assert above."));
         
                                                             existing_connection.connection_state = ConnectionState::SendingServerHello { cipher, magic1: *magic1, magic2: chosen_magic2, last_sent_time_ns: 0, hello_packet_payload };
@@ -1384,6 +1385,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                 if first_six_bytes >> 16 == 0xffff_ffff && buf_len >= 6 + 32 {
                                     if let Ok(payload_len) = handshake.read_message(&packet_memory_encrypted[6..buf_len], &mut packet_memory_recv[..]) {
                                         debug_assert!(handshake.is_handshake_finished());
+                                        existing_connection.handshake_hash = get_handshake_hash(handshake);
                                         if payload_len != 8 {
                                             if OVERLY_VERBOSE { println!("Dropping from {connection_key:?}: server hello payload was {payload_len} bytes, expected 8 (magic2)."); }
                                             break 'conn;
@@ -2054,7 +2056,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
 
                         let has_data = connection_tracking_data.unreliable_send_buffer.has_unsent_data();
                         if !has_data && !state.is_app_limited {
-                            println!("####### START APP LIMITED ######");
+                            if OVERLY_VERBOSE { println!("####### START APP LIMITED ######"); }
                             state.is_app_limited = true;
                             state.app_limit_time_offset = current_time_now_ns - state.congestion_event_time_ns;
                             if cubic_mode == 'G' || cubic_mode == 'S' || cubic_mode == 'L' {
@@ -2064,7 +2066,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                 state.congestion_event_time_ns = current_time_now_ns.saturating_sub(t_pg);
                             }
                         } else if has_data && state.is_app_limited {
-                            println!("####### END APP LIMITED ######");
+                            if OVERLY_VERBOSE { println!("####### END APP LIMITED ######"); }
                             state.is_app_limited = false;
                             let rtt_ns = state.RTT_mean as u64 * 100_000;
                             let exit_t = state.app_limit_time_offset.max(rtt_ns * 2);
@@ -2088,7 +2090,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             let mean = state.RTT_mean as f64 / 10.0;
                             let ack_pace = state.ack_pace_estimate as f64 / 10.0;
                             let n = (state.RTT_sample_cursor as usize).min(16);
-                            println!("{mode} RTT (ms): mean={mean:.1} ack_pace={ack_pace:.1} (n={n}) --- TU: {} B  failed probes: {} --- target: {} pps   in flight: {}/{} (max {})  pacing: {} us  lost/sent: {}/{}", state.current_tu, state.tu_probe_failed_count, allowed_bandwidth_upps as f64 / 1000000.0, state.packets_in_flight, allowed_packets_in_flight, state.max_in_flight_since_last_print, time_between_sends_ns / 1000, state.packet_lost_since_last_print, state.packet_since_last_print);
+                            if OVERLY_VERBOSE { println!("{mode} RTT (ms): mean={mean:.1} ack_pace={ack_pace:.1} (n={n}) --- TU: {} B  failed probes: {} --- target: {} pps   in flight: {}/{} (max {})  pacing: {} us  lost/sent: {}/{}", state.current_tu, state.tu_probe_failed_count, allowed_bandwidth_upps as f64 / 1000000.0, state.packets_in_flight, allowed_packets_in_flight, state.max_in_flight_since_last_print, time_between_sends_ns / 1000, state.packet_lost_since_last_print, state.packet_since_last_print); }
                             state.packet_since_last_print = 0;
                             state.packet_lost_since_last_print = 0;
                             state.max_in_flight_since_last_print = state.packets_in_flight;

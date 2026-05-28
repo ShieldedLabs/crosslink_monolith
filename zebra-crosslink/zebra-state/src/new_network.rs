@@ -35,7 +35,7 @@ pub fn push_block_event(event: BlockEvent) {
 
 // @Todo: MTU discovery // @Duplicate with Tenderlink.
 const UDP_mMTU:        usize = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
-const STP_HEADER_SIZE: usize = 6 + crypto_overhead_from_connect_magic1(CRYPTO_MAGIC).unwrap();
+const STP_HEADER_SIZE: usize = total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(CRYPTO_MAGIC).unwrap();
 const STP_PACKLET_HDR: usize = std::mem::size_of::<PackletHeader>();
 const STP_JUMBO_HDR:   usize = std::mem::size_of::<PackletOneJumboFragment>();
 const PATH_MTU: usize = UDP_mMTU
