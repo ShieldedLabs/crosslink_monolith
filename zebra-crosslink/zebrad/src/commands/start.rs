@@ -116,7 +116,7 @@ impl StartCmd {
     async fn start(&self) -> Result<(), Report> {
 
         let config = APPLICATION.config();
-        
+
         #[cfg(not(feature = "viz_gui"))]
         {
             if config.crosslink.disable_the_headless_wallet == false {
@@ -491,7 +491,7 @@ impl StartCmd {
         {
             // let tfl_service2 = tfl_service.clone();
 
-            let state_config_copy = Arc::clone(&config);
+            let config = Arc::clone(&config);
             let sync_state = state.clone();
             let sync_read_state = read_only_state_service.clone();
             let sync_block_verifier = block_verifier_router.clone();
@@ -510,7 +510,7 @@ impl StartCmd {
                             })
                     })
                 };
-                zebra_state::new_network::sync(commit_block, &state_config_copy.state, sync_read_state, sync_state, /* tfl_service2, */ tokio::runtime::Handle::current())
+                zebra_state::new_network::sync(commit_block, &config.state, sync_read_state, sync_state, /* tfl_service2, */ tokio::runtime::Handle::current())
             });
         }
 
@@ -710,7 +710,7 @@ impl StartCmd {
         pin!(old_databases_task_handle_fused);
 
         let mut zaino_enabled = true;
-        
+
         #[cfg(not(feature = "viz_gui"))]
         {
             if config.crosslink.disable_zaino {
@@ -725,7 +725,7 @@ impl StartCmd {
             let mut zaino_db_path = config.state.cache_dir.clone();
             zaino_db_path.push(PathBuf::from("zaino"));
             std::fs::remove_dir_all(&zaino_db_path);
-            
+
 
             let zaino_config = zainodlib::config::ZainodConfig {
                 backend: zaino_state::BackendType::Fetch,

@@ -123,12 +123,10 @@ pub mod config {
         pub public_address: Option<String>,
         /// temp seed for private/public key pair
         pub insecure_user_name: Option<String>,
+        /// Use the public IP instead of the generated seed
+        pub public_ip_is_seed: bool,
         /// List of public IP addresses for peers, in the same format as `public_address`.
         pub bft_peers: Vec<String>,
-        /// Do not manipulate config
-        pub do_not_manipulate_config: bool,
-        /// I am the unstaker.
-        pub i_am_the_unstaker: bool,
         /// Disable the headless wallet.
         pub disable_the_headless_wallet: bool,
         /// Disable zaino.
@@ -140,8 +138,7 @@ pub mod config {
                 public_address: None,
                 insecure_user_name: None,
                 bft_peers: Vec::new(),
-                do_not_manipulate_config: false,
-                i_am_the_unstaker: false,
+                public_ip_is_seed: false,
                 disable_the_headless_wallet: false,
                 disable_zaino: false,
             }
@@ -899,15 +896,11 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         .unwrap_or(format!("127.0.0.1:{}", rand::thread_rng().next_u32() % 45869 + 2000));
     info!("public IP: {}", public_ip_string);
 
-    let user_name = if config.do_not_manipulate_config {
+    let user_name = if config.public_ip_is_seed {
         public_ip_string.clone()
     } else {
         format!("adrheardhed{:?}", global_seed)
     };
-
-    if config.i_am_the_unstaker {
-        *wallet::AM_I_THE_UNSTAKER.lock().unwrap() = true;
-    }
 
     let (mut rng, my_private_key, my_public_key) =
         rng_private_public_key_from_address(&user_name.as_bytes());

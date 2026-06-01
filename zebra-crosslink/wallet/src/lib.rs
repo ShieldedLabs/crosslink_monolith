@@ -382,8 +382,6 @@ impl ProposedTx {
 
 const CHEAT_UNSTAKING: bool = false;
 
-pub static AM_I_THE_UNSTAKER: Mutex<bool> = Mutex::new(false);
-
 pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
 pub static TENDERLINK_PUBLIC_KEY: Mutex<bft::PubKeyID> = Mutex::new(bft::PubKeyID([0;32]));
@@ -4342,7 +4340,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             for proposed in &proposed_stake {
                 waiting_for_stake_to_finalizer |= push_if_proposed_tx(&mut user_local_txs, proposed, BlockHeight::PROPOSED);
             }
-            
+
             let waiting_for_faucet = push_if_proposed_tx(&mut miner_local_txs, &proposed_faucet, BlockHeight::PROPOSED);
             let waiting_for_shield = push_if_proposed_tx(&mut miner_local_txs, &proposed_miner_shield, BlockHeight::PROPOSED);
             // CHEATING USER-VIEW OF FAUCET BUILD
@@ -4463,7 +4461,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 let mut wallet_state = wallet_state.lock().unwrap();
 
                 if DUMP_ACTIONS { println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len()); }
-                
+
                 //FIX(Giovanni): If there is a transaction in progress, don't process any new actions until the current one is complete.
                 if proposed_stake.front().is_some_and(|tx| tx.is_in_progress())
                     || proposed_send.front().is_some_and(|tx| tx.is_in_progress())
@@ -4508,7 +4506,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 &WalletAction::StakeToFinalizer(amount, target_finalizer) => {
                     proposed_stake.push_back(ProposedTx::EMPTY);
-                    
+
                     let mut proposed_tx = proposed_stake.back_mut().unwrap();
                     let ok = user_wallet.stake_orchard_to_finalizer(network, &mut proposed_tx, &mut client, &user_usk, amount.into_u64(), &orchard_tree, target_finalizer).is_some();
                     if !ok { proposed_stake.pop_back(); }
@@ -4559,7 +4557,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     if !ok { proposed_stake.pop_back(); }
                     else {
                     }
-                    
+
                     just_init_new_tx |= ok;
                     if DUMP_ACTIONS { println!("Try retarget: {ok:?}"); }
                     ok
@@ -4574,7 +4572,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     if !ok { proposed_stake.pop_back(); }
                     else {
                     }
-                    
+
                     just_init_new_tx |= ok;
                     if DUMP_ACTIONS { println!("Try withdraw stake: {ok:?}"); }
                     ok

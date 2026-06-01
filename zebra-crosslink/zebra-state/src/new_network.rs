@@ -1332,7 +1332,6 @@ pub fn sync(
 
     // Main sync loop
     loop {
-        
         let loop_start = std::time::Instant::now();
 
         if loop_start > next_console_status_print {
@@ -1344,7 +1343,7 @@ pub fn sync(
                     }
                 }
             }
-            
+
             tracing::info!("tip height: {:?}, finalized height: {:?}, peers: {:?}", near_tip_chains.tip_height(), near_tip_chains.finalized_height, my_peers_to_print);
             next_console_status_print = loop_start + std::time::Duration::from_secs(2);
         }
@@ -1782,7 +1781,7 @@ pub fn sync(
 
             // TODO: weight peers by observed quality
             const MAX_PEERS_TO_INIT_DLS_FROM: usize = 8;
-            
+
             /*  Note(Sam): CRITICAL BUG THAT I AM ADDRESSING NOW. We cannot randomly select a fixed number of
                 peers. We must first filter the peers by who has something we can download. Otherwise we will
                 fail in the case where most of the peers are behind us.
@@ -1793,11 +1792,11 @@ pub fn sync(
             peer_random_keys.shuffle(&mut rand::thread_rng());
 
             let mut count_of_peers_we_started_download_from = 0;
-            'send_to_peers: for connection_key in peer_random_keys {                
+            'send_to_peers: for connection_key in peer_random_keys {
                 let Peer { origin, their_tree, their_queue, ref mut block_downloads, .. } = peers.get_mut(&connection_key).unwrap();
                 if count_of_peers_we_started_download_from >= MAX_PEERS_TO_INIT_DLS_FROM { break 'send_to_peers; }
                 let mut did_we_actually_start_a_download_bool_for_increment_at_the_end = false;
-                
+
 
                 if *their_tree == NearTipBranches::default() {
                     continue 'send_to_peers; // No messages yet.
@@ -2037,7 +2036,7 @@ pub fn sync(
                 };
 
                 queue_blocks_to_request();
-                
+
                 if did_we_actually_start_a_download_bool_for_increment_at_the_end {
                     count_of_peers_we_started_download_from += 1;
                 }
@@ -2290,7 +2289,7 @@ pub fn sync(
                 };
 
                 if TRACE { tracing::info!("Received request for height {} hash {} offset {} from peer {connection_key:?}", request.height_hash.height.0, request.height_hash.hash_or_0, request.offset); }
-                
+
                 let mut height_hash = request.height_hash;
                 if height_hash.hash_or_0 == block::Hash([0;32]) {
                     if let Some(hash) = get_bc_hash_at_height(&read_state, &rt, height_hash.height) {
