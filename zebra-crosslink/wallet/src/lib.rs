@@ -443,6 +443,17 @@ impl Drop for Timer<'_> {
 // fn block_policy_10() -> ConfirmationsPolicy { ConfirmationsPolicy::new(std::num::NonZeroU32::new(5).unwrap(), std::num::NonZeroU32::new(5).unwrap(), false).unwrap() }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum QueueAction {
+    Faucet,
+    Stake(u64),
+    Unstake,
+    Retarget,
+    Claim,
+    Send(u64),
+    TestStake,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum WalletAction {
     RequestFromFaucet,
     TestStakeAction,
@@ -988,6 +999,18 @@ impl WalletState {
     pub fn miner_balance(&self)         -> u64 { self.miner_unshielded_funds + self.miner_shielded_spendable_funds + self.miner_shielded_pending_funds }
     pub fn miner_pending_balance(&self) -> u64 { self.miner_shielded_pending_funds }
     pub fn queued_actions_len(&self) -> usize { self.queued_slots_used() }
+
+    pub fn get_queued_actions(&self) -> Vec<QueueAction> {
+        self.actions_in_flight.iter().map(|a| match a {
+            WalletAction::RequestFromFaucet => QueueAction::Faucet,
+            WalletAction::TestStakeAction => QueueAction::TestStake,
+            WalletAction::StakeToFinalizer(amt, _) => QueueAction::Stake((*amt).into_u64()),
+            WalletAction::UnstakeFromFinalizer(_) => QueueAction::Unstake,
+            WalletAction::RetargetBond(_, _) => QueueAction::Retarget,
+            WalletAction::ClaimBond(_) => QueueAction::Claim,
+            WalletAction::SendToAddress(_, amt) => QueueAction::Send((*amt).into_u64()),
+        }).collect()
+    }
 
     pub fn request_from_faucet(&mut self) {
         if self.queued_slots_used() >= Self::MAX_QUEUED_ACTIONS {
