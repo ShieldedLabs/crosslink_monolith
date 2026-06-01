@@ -1460,8 +1460,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             let mut peers = peers.iter().map(|(ck, p)| {
                 let mut bft_key = PubKeyID::NIL;
                 for (c, _) in &current_connections {
-                    if let Some(k) = bft_address_map.get_key(c) {
-                        bft_key = *k;
+                    if c.connection_key() == *ck {
+                        if let Some(k) = bft_address_map.get_key(c) {
+                            bft_key = *k;
+                        }
                         break;
                     }
                 }

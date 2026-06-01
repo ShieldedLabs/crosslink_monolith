@@ -1847,7 +1847,7 @@ fn draw_multiline_text(
     line_distance_factor: Option<f32>,
     col: color::Color,
 ) {
-    text::draw_multiline_text(text, pt.x, pt.y, font_size, line_distance_factor, col)
+    text::draw_multiline_text(text, pt.x, pt.y, font_size, line_distance_factor, col);
 }
 
 fn circles_closest_pts(a: Circle, b: Circle) -> (Vec2, Vec2) {
