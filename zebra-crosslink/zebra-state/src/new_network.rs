@@ -1017,16 +1017,12 @@ impl SliceWrite for PeerPowBlockRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PeerPowBlockDownload {
     height_hash: HeightAndHashOr0,
-    reassembly: ReassemblySlot, // needed for requests
-    offset: u32, // needed for responses
     last_modified: std::time::Instant,
 }
 impl Default for PeerPowBlockDownload {
     fn default() -> Self {
         Self {
             height_hash: HeightAndHashOr0::default(),
-            reassembly: ReassemblySlot::default(),
-            offset: 0,
             last_modified: std::time::Instant::now(),
         }
     }
@@ -1071,9 +1067,7 @@ impl BlockDownloads {
     fn fill_slot(&mut self, dl_i: usize, height_hash: HeightAndHashOr0) -> Option<usize> {
         if dl_i < self.slots.len() {
             self.slots[dl_i] = PeerPowBlockDownload {
-                height_hash: height_hash,
-                reassembly: ReassemblySlot::default(),
-                offset: 0,
+                height_hash,
                 last_modified: std::time::Instant::now(),
             };
             self.used_flags |= 1 << dl_i;
@@ -1247,26 +1241,13 @@ pub fn sync(
         }
     };
 
-    let socket = match setup_and_bind_udp_socket(actual_network_local_port) {
-        Some(s) => {
-            tracing::info!("NewNet: Bound to port {}", actual_network_local_port);
-            s
-        }
-        None => {
-            tracing::warn!("NewNet: Port {} unavailable, binding to ephemeral port", actual_network_local_port);
-            setup_and_bind_udp_socket(0).expect("Failed to bind UDP socket on any port")
-        }
-    };
     let my_keypairs = vec![network_keypair.clone()];
+    let network_thread_handle = new_network_thread(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024));
+    tracing::info!("NewNet: Bound to port {}", actual_network_local_port);
 
-    let mut packet_memory_encrypted = new_packet_memory();
-    let mut packet_memory_recv      = new_packet_memory();
-    let mut packet_memory_send      = new_packet_memory();
-
-    let mut packets_to_send:  Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
-    let mut packets_received: Vec<(ConnectionKey, Vec<u8>, Option<u32>)> = Vec::new();
-
-    let mut connections_map: HashMap<ConnectionKey, ConnectionTrackingData> = HashMap::new();
+    let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
+    let mut initiate_connections = Vec::<STPAddress>::new();
+    let mut packets_to_send: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
 
     // Parse and connect to initial peers
     let mut initial_peer_addresses: Vec<STPAddress> = Vec::new();
@@ -1282,10 +1263,7 @@ pub fn sync(
                         );
             }
             tracing::info!("NewNet: Connecting to peer: {:?}", address);
-            match connect_to(&mut connections_map, &my_keypairs, &address) {
-                Err(e) => tracing::warn!("NewNet: Initial peer connect: connect_to failed: {e}"),
-                Ok(()) => {},
-            }
+            initiate_connections.push(address.clone());
             initial_peer_addresses.push(address);
         } else {
             tracing::warn!("NewNet: Failed to parse peer address: {}", peer_str);
@@ -1337,11 +1315,10 @@ pub fn sync(
 
         if loop_start > next_console_status_print {
             let mut my_peers_to_print = Vec::new();
-            for (connection_key, connection) in &connections_map {
-                if connection.is_connected() {
-                    if let Some(peer) = peers.get(connection_key) {
-                        my_peers_to_print.push(format!("{}@{}/{}", stp_address_get_short_string(connection.address()), peer.their_tree.finalized_height, peer.their_tree.tip_height));
-                    }
+            for (address, _) in &current_connections {
+                let key = address.connection_key();
+                if let Some(peer) = peers.get(&key) {
+                    my_peers_to_print.push(format!("{}@{}/{}", stp_address_get_short_string(address.clone()), peer.their_tree.finalized_height, peer.their_tree.tip_height));
                 }
             }
             
@@ -1379,12 +1356,8 @@ pub fn sync(
 
         // Try to reconnect to trusted initial seed peers
         for address in &initial_peer_addresses {
-            if !connections_map.contains_key(&address.connection_key()) {
-                // tracing::info!("NewNet: Connecting to {:?}...", address);
-                match connect_to(&mut connections_map, &my_keypairs, address) {
-                    Err(e) => tracing::warn!("NewNet: Initial peer reconnect: connect_to failed: {e}"),
-                    Ok(()) => {},
-                }
+            if !current_connections.iter().any(|(addr, _)| addr.connection_key() == address.connection_key()) {
+                initiate_connections.push(address.clone());
             }
         }
 
@@ -1439,17 +1412,11 @@ pub fn sync(
                 let Some((address, _)) = map.iter().choose(rng) else {
                     continue;
                 };
-                if connections_map.contains_key(&address.connection_key()) {
+                if current_connections.iter().any(|(addr, _)| addr.connection_key() == address.connection_key()) {
                     continue;
                 }
 
-                match connect_to(&mut connections_map, &my_keypairs, address) {
-                    Err(e) => {
-                        tracing::warn!("NewNet: Recent-address reconnect: connect_to failed: {e}");
-                        continue;
-                    }
-                    Ok(()) => {},
-                }
+                initiate_connections.push(address.clone());
 
                 connection_attempts += 1;
 
@@ -1460,9 +1427,9 @@ pub fn sync(
                 o += PACKET_TYPE_WANT_HOLE_PUNCH.write_to(&mut buf[o..]);
                 o += address.connection_key()   .write_to(&mut buf[o..]);
 
-                for (key, _conn) in connections_map.iter().filter(|(_, c)| c.is_connected()).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_RECENTS) {
-                    if TRACE { tracing::info!("Requesting hole punch to recent address {:?} via random peer: {:?}...", address, _conn.address()); }
-                    packets_to_send.push((*key, Vec::from(&buf[..o]), None));
+                for (addr, _) in current_connections.iter().choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_RECENTS) {
+                    if TRACE { tracing::info!("Requesting hole punch to recent address {:?} via random peer: {:?}...", address, addr); }
+                    packets_to_send.push((addr.connection_key(), Vec::from(&buf[..o])));
                 }
             }
 
@@ -1474,17 +1441,11 @@ pub fn sync(
                 let Some((address, sender_connection_key)) = map.iter().choose(rng) else {
                     continue;
                 };
-                if connections_map.contains_key(&address.connection_key()) {
+                if current_connections.iter().any(|(addr, _)| addr.connection_key() == address.connection_key()) {
                     continue;
                 }
 
-                match connect_to(&mut connections_map, &my_keypairs, address) {
-                    Err(e) => {
-                        tracing::warn!("NewNet: Alleged-address reconnect: connect_to failed: {e}");
-                        continue;
-                    }
-                    Ok(()) => {},
-                }
+                initiate_connections.push(address.clone());
 
                 connection_attempts += 1;
 
@@ -1493,14 +1454,14 @@ pub fn sync(
                 o += PACKET_TYPE_WANT_HOLE_PUNCH.write_to(&mut buf[o..]);
                 o += address.connection_key()   .write_to(&mut buf[o..]);
 
-                for (key, _conn) in connections_map.iter().filter(|(k, c)| c.is_connected() && *k != sender_connection_key).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_ALLEGEDS) {
-                    if TRACE { tracing::info!("Requesting hole punch to alleged address {:?} via random peer: {:?}...", address, _conn.address()); }
-                    packets_to_send.push((*key, Vec::from(&buf[..o]), None));
+                for (addr, _) in current_connections.iter().filter(|(addr, _)| addr.connection_key() != *sender_connection_key).choose_multiple(rng, PEERS_TO_ASK_PUNCH_FOR_ALLEGEDS) {
+                    if TRACE { tracing::info!("Requesting hole punch to alleged address {:?} via random peer: {:?}...", address, addr); }
+                    packets_to_send.push((addr.connection_key(), Vec::from(&buf[..o])));
                 }
 
-                if get_connected(&connections_map, &sender_connection_key).is_some() {
+                if current_connections.iter().any(|(addr, _)| addr.connection_key() == *sender_connection_key) {
                     if TRACE { tracing::info!("Requesting hole punch to alleged address {:?} via the original sender: {:?}...", address, sender_connection_key); }
-                    packets_to_send.push((*sender_connection_key, Vec::from(&buf[..o]), None));
+                    packets_to_send.push((*sender_connection_key, Vec::from(&buf[..o])));
                 }
             }
 
@@ -1544,12 +1505,8 @@ pub fn sync(
             }
 
             let gossip_packet = Vec::from(&buf[..o]);
-            for (key, connection) in &connections_map {
-                if !connection.is_connected() {
-                    continue;
-                }
-
-                packets_to_send.push((*key, gossip_packet.clone(), None));
+            for (addr, _) in &current_connections {
+                packets_to_send.push((addr.connection_key(), gossip_packet.clone()));
             }
 
             next_peer_gossip = std::time::Instant::now() + peer_gossip_interval;
@@ -1560,14 +1517,14 @@ pub fn sync(
         blocks_to_send.sort_by_key(|(_, _, height, _)| *height);
 
         // TODO: rate limit production!
-        for (connection_key, hash, height, offset) in &blocks_to_send {
+        for (connection_key, hash, height, _offset) in &blocks_to_send {
             let hash = *hash;
-            let Some(connection) = get_connected(&connections_map, connection_key) else {
+            if !current_connections.iter().any(|(addr, _)| addr.connection_key() == *connection_key) {
                 if TRACE { tracing::info!("Can't send block that was queued for sending: Peer was disconnected: {connection_key:?}"); }
                 continue;
-            };
+            }
             let Some(peer) = peers.get_mut(connection_key) else {
-                if TRACE { tracing::info!("Can't send block that was queued for sending: Peer does not exist for address: {:?}", connection.address()); }
+                if TRACE { tracing::info!("Can't send block that was queued for sending: Peer does not exist for connection: {connection_key:?}"); }
                 continue;
             };
 
@@ -1592,17 +1549,9 @@ pub fn sync(
 
             let serialized_block = &serialized_blocks[&hash];
 
-            if TRACE { tracing::info!("Sending BLOCK (Height: {height}, Hash: {hash}, {offset}-{})", serialized_block.len()); }
+            if TRACE { tracing::info!("Sending BLOCK (Height: {height}, Hash: {hash}, {} bytes)", serialized_block.len()); }
 
-            if *offset >= serialized_block.len() {
-                // TODO: fix macro/fn for: kill!("out-of-range block offset request");
-                continue;
-            }
-
-            let rem_slice = &serialized_block[*offset..];
-
-            let mut pkt_buf = [0u8; JUMBO_FRAG_SIZE];
-            let mut hdr = PeerPowBlockResponseChunkHdr {
+            let hdr = PeerPowBlockResponseChunkHdr {
                 offset: 0,
                 size: serialized_block.len().try_into().unwrap(),
                 height_hash: HeightAndHashOr0 {
@@ -1611,23 +1560,15 @@ pub fn sync(
                 }
             };
 
-            let chunk_size = JUMBO_FRAG_SIZE - {
-                let mut o = 0;
-                o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut pkt_buf[o..]);
-                o += hdr.write_to(&mut pkt_buf[o..]);
-                o
-            };
+            // header + full block as one message (layer 2 fragmentation comes later)
+            let hdr_size = 1 + 4 + 4 + 4 + 32; // packet_type + offset + size + height + hash
+            let mut pkt = vec![0u8; hdr_size + serialized_block.len()];
+            let mut o = 0;
+            o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut pkt[o..]);
+            o += hdr.write_to(&mut pkt[o..]);
+            pkt[o..].copy_from_slice(serialized_block);
 
-            for (chunk_i, chunk) in rem_slice.chunks(chunk_size).enumerate() { // TODO: Andrew wants to understand specific sizing
-                hdr.offset = *offset as u32 + (chunk_i * chunk_size) as u32; // simple & correct: just rewrite full header; ALT fitted: just rewrite diff
-
-                let mut o = 0;
-                o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut pkt_buf[o..]);
-                o += hdr.write_to(&mut pkt_buf[o..]);
-                o += chunk.write_to(&mut pkt_buf[o..]);
-
-                packets_to_send.push((*connection_key, Vec::from(&pkt_buf[..o]), None));
-            }
+            packets_to_send.push((*connection_key, pkt));
         }
         blocks_to_send.clear();
 
@@ -1646,14 +1587,11 @@ pub fn sync(
             }
             o += near_tip_chains   .write_to(&mut buf[o..], None);
 
-            for (key, connection) in &connections_map {
-                if !connection.is_connected() {
-                    // if TRACE { tracing::info!("Trying to send a STATUS to {:?}, but was disconnected!", connection.address()); }
-                    continue;
-                }
+            for (address, _) in &current_connections {
+                let key = address.connection_key();
 
-                let Some(peer) = peers.get(key) else {
-                    if TRACE { tracing::info!("Trying to send a STATUS to {:?} but they haven't finished being created", connection.address()); }
+                let Some(peer) = peers.get(&key) else {
+                    if TRACE { tracing::info!("Trying to send a STATUS to {:?} but they haven't finished being created", address); }
                     continue;
                 };
 
@@ -1675,16 +1613,16 @@ pub fn sync(
                         // subtract again because in order to send them that block we need to get that block's parent.
                         let their_final_parent_parent_height = peer.their_tree.finalized_height.saturating_sub(2);
                         let Some(their_final_parent_parent_hash) = get_bc_hash_at_height(&read_state, &rt, block::Height(their_final_parent_parent_height)) else {
-                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we don't have blocks @ {}", connection.address(), their_final_parent_parent_height); }
+                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we don't have blocks @ {}", address, their_final_parent_parent_height); }
                             break 'try_send_historical true; // fallback to tip chains if we don't successfully send historical here
                         };
 
                         let Some(mut hashes_from_their_final_parent) = get_hashes_after_hash(&read_state, &rt, their_final_parent_parent_hash, None) else {
-                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we couldn't find hashes after block @ {}, {}", connection.address(), their_final_parent_parent_height, their_final_parent_parent_hash); }
+                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we couldn't find hashes after block @ {}, {}", address, their_final_parent_parent_height, their_final_parent_parent_hash); }
                             break 'try_send_historical true;
                         };
                         if hashes_from_their_final_parent.len() == 0 {
-                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we found 0 hashes after block @ {}, {}", connection.address(), their_final_parent_parent_height, their_final_parent_parent_hash); }
+                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we found 0 hashes after block @ {}, {}", address, their_final_parent_parent_height, their_final_parent_parent_hash); }
                             break 'try_send_historical true;
                         }
 
@@ -1731,14 +1669,14 @@ pub fn sync(
                         o += historical_chains .write_to(&mut buf[o..], Some(near_tip_chains.tip_height().expect("at least genesis block assumed included in near tip chains"))); // @TODO: this will break if we remove genesis...
 
 
-                        // if TRACE { tracing::info!("Send a historical STATUS to {:?} @ {}", connection.address(), their_final_parent_parent_height + 1); }
-                        packets_to_send.push((*key, Vec::from(&buf[..o]), None));
+                        // if TRACE { tracing::info!("Send a historical STATUS to {:?} @ {}", address, their_final_parent_parent_height + 1); }
+                        packets_to_send.push((key, Vec::from(&buf[..o])));
                         false
                     };
                 }
 
                 if send_tip_chains {
-                    packets_to_send.push((*key, Vec::from(&buf[..o]), None));
+                    packets_to_send.push((key, Vec::from(&buf[..o])));
                 }
             }
 
@@ -1746,7 +1684,7 @@ pub fn sync(
         }
 
         // Discard statuses of disconnected peers
-        peers.retain(|connection_key, _| get_connected(&connections_map, connection_key).is_some());
+        peers.retain(|connection_key, _| current_connections.iter().any(|(addr, _)| addr.connection_key() == *connection_key));
 
         if std::time::Instant::now() >= next_dl_init {
             let mut active_block_dls = 0;
@@ -1806,11 +1744,11 @@ pub fn sync(
                 let mut blocks_to_this_peer = their_queue.len();
                 // Skip now-disconnected peers
                 let connection_address = {
-                    let Some(connection) = get_connected(&connections_map, &connection_key) else {
+                    let Some((addr, _)) = current_connections.iter().find(|(addr, _)| addr.connection_key() == connection_key) else {
                         tracing::error!("NewNet: Peer is disconnected even after we filtered out disconnected peers. Impossible!: {connection_key:?}");
                         continue 'send_to_peers;
                     };
-                    connection.address()
+                    addr.clone()
                 };
 
                 macro_rules! warning {
@@ -1998,7 +1936,7 @@ pub fn sync(
                                             did_we_actually_start_a_download_bool_for_increment_at_the_end = true;
                                             active_block_dls += 1; // total in flight
                                             *dups += 1; // duplicates of this block
-                                            if TRACE { tracing::info!("Include request for near-tip   block @ {height}, {hash}, x{}, offset {}! New DL count for peer: {}", *dups, block_downloads.slots[dl_i].offset, block_downloads.used_flags.count_ones()); }
+                                            if TRACE { tracing::info!("Include request for near-tip   block @ {height}, {hash}, x{}! New DL count for peer: {}", *dups, block_downloads.used_flags.count_ones()); }
                                         } else {
                                             break; // not enough space for more downloads
                                         }
@@ -2071,25 +2009,17 @@ pub fn sync(
 
                         let dl = &peer.block_downloads.slots[dl_i];
 
-                        // determine the lowest offset before which we have every byte already
-                        let prefix = dl.reassembly.received.first().unwrap_or(&(0,0));
-                        let offset = if prefix.0 == 0 {
-                            prefix.1
-                        } else {
-                            0
-                        };
-
                         let mut buf = [0u8; JUMBO_FRAG_SIZE];
                         let mut o = 0;
                         o += PACKET_TYPE_BLOCK_REQ.write_to(&mut buf[o..]);
                         o += PeerPowBlockRequest {
                             height_hash: dl.height_hash,
-                            offset,
+                            offset: 0,
                         }.write_to(&mut buf[o..]);
 
-                        if TRACE { tracing::info!("Requesting height {} hash {} offset {offset} from peer {connection_key:?}", dl.height_hash.height.0, dl.height_hash.hash_or_0); }
+                        if TRACE { tracing::info!("Requesting height {} hash {} from peer {connection_key:?}", dl.height_hash.height.0, dl.height_hash.hash_or_0); }
 
-                        packets_to_send.push((*connection_key, Vec::from(&buf[..o]), None));
+                        packets_to_send.push((*connection_key, Vec::from(&buf[..o])));
                     }
                 }
             }
@@ -2104,49 +2034,28 @@ pub fn sync(
         // @@@ @Todo @@@: We need speculative queueing ASAP!
         // packets_to_send.shuffle(&mut rand::thread_rng());
 
-        let mut more_packets_likely_available = false;
         // Service STP connections (send/recv).
-        // @Todo: real scheduling. Right now I just want to receive everything!
-        for (_, buf, _) in &packets_to_send {
-            assert!(buf.len() > 0);
-            // if TRACE { tracing::info!("Sending message type: {} ({})", packet_name_from_type(buf[0]), buf[0]); }
-        }
-        for _ in 0..128 {
-            more_packets_likely_available = service_connections(&mut connections_map,
-                                                                &mut packets_received,
-                                                                &packets_to_send,
-                                                                // &packets_that_failed_to_send_due_to_congestion,
-                                                                &mut packet_memory_encrypted,
-                                                                &mut packet_memory_recv,
-                                                                &mut packet_memory_send,
-                                                                socket,
-                                                                &my_keypairs);
-
-            // for packet in &packets_that_failed_to_send_due_to_congestion {
-            // }
-
-            // @Todo: Just take a mut to the packets_to_send in service_connections and clear it inside?
-            packets_to_send.clear();
-
-            if !more_packets_likely_available || packets_received.len() > 0 {
-                break;
-            }
-        }
-
-        // // hypothetical: something "we may want" to "avoid pessimal drop behaviour"
-        // packets_received.shuffle();
+        let resp = service_connections(&network_thread_handle, NetworkThreadPush {
+            initiate_connections,
+            wanted_connections: current_connections.clone(),
+            send_unreliable: packets_to_send,
+        });
+        current_connections = resp.current_connections;
+        let mut packets_received = resp.received_unreliable_messages;
+        initiate_connections = Vec::new();
+        packets_to_send = Vec::new();
 
         // Process received packets
         'process_packets: while packets_received.len() > 0 {
-            let (connection_key, msg, jumbogram_id) = packets_received.remove(0);
+            let (connection_key, msg) = packets_received.remove(0);
 
             // Skip processing packets from now-disconnected peers
             let connection_address = {
-                let Some(connection) = get_connected(&connections_map, &connection_key) else {
+                let Some((addr, _)) = current_connections.iter().find(|(addr, _)| addr.connection_key() == connection_key) else {
                     tracing::info!("NewNet: Dropping message from disconnected peer: {connection_key:?}");
                     continue 'process_packets;
                 };
-                connection.address()
+                addr.clone()
             };
 
             let peer = peers.entry(connection_key).or_insert(Peer::default());
@@ -2165,9 +2074,8 @@ pub fn sync(
             }
             macro_rules! kill {
                 ($($arg:tt)*) => {{
-                    // let msg = format!("Killing peer {:?}: {}", connection_address, format!($($arg)*));
                     tracing::error!("{}", format!("NewNet: Killing peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
-                    connections_map.remove(&connection_key);
+                    current_connections.retain(|(addr, _)| addr.connection_key() != connection_key);
                     let kill_bucket = address_bucket(local_addresses_secret, &connection_address) & (MAX_RECENT_BUCKETS - 1);
                     if let Some(recents) = recent_peer_addresses.get_mut(&(kill_bucket as u16)) {
                         recents.remove(&connection_address);
@@ -2235,14 +2143,14 @@ pub fn sync(
                     continue 'process_packets;
                 };
 
-                if get_connected(&connections_map, &relay_to_connection_key).is_some() {
+                if current_connections.iter().any(|(addr, _)| addr.connection_key() == relay_to_connection_key) {
                     let (mut buf, mut o) = ([0u8; 1 + STP_ADDRESS_SERIALIZED_SIZE], 0);
 
                     o += PACKET_TYPE_TRY_HOLE_PUNCH.write_to(&mut buf[o..]);
                     o += connection_address        .write_to(&mut buf[o..]);
 
                     if TRACE { tracing::info!("Relaying hole punch request from {:?} to {:?}...", connection_address, relay_to_connection_key); }
-                    packets_to_send.push((relay_to_connection_key, Vec::from(&buf[..o]), None));
+                    packets_to_send.push((relay_to_connection_key, Vec::from(&buf[..o])));
                 }
 
             } else if packet_type == PACKET_TYPE_TRY_HOLE_PUNCH {
@@ -2252,9 +2160,9 @@ pub fn sync(
                     continue 'process_packets;
                 };
 
-                if !connections_map.contains_key(&address_to_punch_to.connection_key()) {
+                if !current_connections.iter().any(|(addr, _)| *addr == address_to_punch_to) {
                     if TRACE { tracing::info!("Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, connection_address); }
-                    let _ = connect_to(&mut connections_map, &my_keypairs, &address_to_punch_to);
+                    initiate_connections.push(address_to_punch_to);
                 }
 
             } else if packet_type == PACKET_TYPE_STATUS {
@@ -2363,26 +2271,16 @@ pub fn sync(
 
 
                 {
-                    let dl = &mut peer.block_downloads.slots[dl_i];
-                    if (dl.reassembly.total_len != 0 &&
-                        dl.reassembly.total_len != hdr.size) {
-                        kill!("peer tried to change size of block mid-send (from {} to {})", dl.reassembly.total_len, hdr.size);
-                        continue 'process_packets;
-                    }
                     if hdr.size as u64 > zebra_chain::block::MAX_BLOCK_BYTES {
                         kill!("peer tried to send a block larger than consensus allows: {}", hdr.size);
                         continue 'process_packets;
                     }
+                    let dl = &mut peer.block_downloads.slots[dl_i];
                     if dl.height_hash.height != hdr.height_hash.height {
                         kill!("the hash matches but the height doesn't");
                         continue 'process_packets;
                     }
-
                     dl.height_hash.hash_or_0 = hdr.height_hash.hash_or_0;
-
-                    if dl.reassembly.total_len <= 0 {
-                        dl.reassembly = ReassemblySlot::new(hdr.size);
-                    }
                 }
 
 
@@ -2392,9 +2290,6 @@ pub fn sync(
                     continue 'process_packets;
                 }
 
-                // if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not already queued..."); }
-
-                // TODO: we can accelerate with a height check, but this may change the semantics
                 for our_chain in &near_tip_chains.chains {
                     if our_chain.blocks.iter().any(|block| block.this_hash == alleged_hash) {
                         warning!("Block was already committed!: {alleged_hash}");
@@ -2403,33 +2298,11 @@ pub fn sync(
                     }
                 }
 
-                // if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not already in near_tip_chains..."); }
+                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: Received full block ({} bytes)", msg.len()); }
 
-                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: Inserting fragment at offset {} with length {}, total length {}", hdr.offset as usize, msg.len(), peer.block_downloads.slots[dl_i].reassembly.total_len); }
-
-                // try to construct a full block from the data available
-                match peer.block_downloads.slots[dl_i].reassembly.insert(hdr.offset as usize, &mut msg) {
-                    Ok((is_full, new_bytes_n)) => { // we have a full block; verify it etc
-                        if new_bytes_n > 0 {
-                            peer.block_downloads.slots[dl_i].last_modified = std::time::Instant::now();
-                        }
-
-                        if is_full {
-                            if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: All fragments downloaded! Processing..."); }
-                        } else { // we validly have a partial block; wait for more fragments
-                            if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, not done downloading all fragments. Continuing."); }
-                            continue 'process_packets;
-                        }
-                    }
-                    Err(()) => {
-                        kill!("overlapping/out-of-bounds fragment, killing connection");
-                        continue 'process_packets;
-                    }
-                }
-
-                // download completed; remove from peer's list
-                let block_data = peer.block_downloads.remove(dl_i).reassembly.buf;
-                let block_data = &block_data[..];
+                // Full block received as one message (no reassembly)
+                peer.block_downloads.remove(dl_i);
+                let block_data = msg;
 
 
                 // TODO: we should be able to early out once we have chunk 0 or a hdr-contained parent hash
@@ -2604,13 +2477,10 @@ pub fn sync(
             blocks_to_commit.clear();
         }
 
-        if !more_packets_likely_available {
-            // Sleep remainder of tick
-            let elapsed = loop_start.elapsed();
-            if elapsed < tick_duration {
-                // if TRACE { println!("Sleeping for {:?}", tick_duration - elapsed); }
-                std::thread::sleep(tick_duration - elapsed);
-            }
+        // Sleep remainder of tick
+        let elapsed = loop_start.elapsed();
+        if elapsed < tick_duration {
+            std::thread::sleep(tick_duration - elapsed);
         }
     }
 }
