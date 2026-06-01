@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::cell::RefCell;
 //use clay::*; // @Temporary
 use FontKind::Normal;
-use wallet::{ BlockHeight, TxParts, TxStatus, WalletState, WalletTxKind, WalletTxPart, WalletRosterMember, FinalizerFilters, FinalizerRecencyStatus, str_from_ctaz };
+use wallet::{ BlockHeight, TxParts, TxStatus, WalletState, WalletTxKind, WalletTxPart, WalletRosterMember, FinalizerFilters, FinalizerRecencyStatus, str_from_ctaz, QueueAction };
 
 use super::*;
 
@@ -442,6 +442,7 @@ pub enum Modal {
     Unstake,
     Retarget,
     User, // settings
+    Queue,
 }
 
 pub fn rgba_to_hsva(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8, u8) {
@@ -1921,16 +1922,28 @@ pub fn ui_left_pane(ui: &mut Context,
                         }) {
                             let (
                                 balance,
-                                waiting_for_send
+                                waiting_for_send,
+                                queued_actions,
+                                max_queued_actions
                             ) = {
                                 let wallet_state = wallet_state.lock().unwrap();
                                 (
                                     wallet_state.user_balance(),
                                     wallet_state.waiting_for_send,
+                                    wallet_state.queued_actions_len(),
+                                    WalletState::MAX_QUEUED_ACTIONS,
                                 )
                             };
 
-                            let can = !waiting_for_send && data.send_address.len() != 0;
+                            let queue_full = queued_actions >= max_queued_actions;
+                            let can = data.send_address.len() != 0 && !queue_full;
+                            ui.text(
+                                frame_strf!(data, "Queue: {}/{}, send in progress: {}", queued_actions, max_queued_actions, waiting_for_send),
+                                TextDecl { font: Mono, h: ui.scale(16.0), colour: WHITE.mul(0.7), align: AlignX::Center, ..TextDecl }
+                            );
+                            if queue_full {
+                                ui.text("Queue full", TextDecl { font: Mono, h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
+                            }
                             let sends = [
                                 ("0.1", ONE_cTAZ/10),
                                 // ("0.2", 2*(ONE_cTAZ/10)),
@@ -2112,7 +2125,14 @@ pub fn ui_left_pane(ui: &mut Context,
                         ui.text("Insufficient funds. Try the faucet!", TextDecl { h: ui.scale(20.0), colour, align: AlignX::Center, ..TextDecl });
                     }
 
-                    let waiting_for_stake_to_finalizer = wallet_state.lock().unwrap().waiting_for_stake_to_finalizer;
+                    let (waiting_for_stake_to_finalizer, queued_actions, max_queued_actions) = {
+                        let wallet_state = wallet_state.lock().unwrap();
+                        (
+                            wallet_state.waiting_for_stake_to_finalizer,
+                            wallet_state.queued_actions_len(),
+                            WalletState::MAX_QUEUED_ACTIONS,
+                        )
+                    };
 
                     {
                         // if (balance as u64) < ONE_cTAZ / 100 {
@@ -2159,7 +2179,15 @@ pub fn ui_left_pane(ui: &mut Context,
                         }
                         let hex_dest = addr_from_str_bytes(data.stake_address.as_bytes());
 
-                        let can = is_staking_day && !waiting_for_stake_to_finalizer && hex_dest.is_some();
+                        let queue_full = queued_actions >= max_queued_actions;
+                        let can = is_staking_day && hex_dest.is_some() && !queue_full;
+                        ui.text(
+                            frame_strf!(data, "Queue: {}/{}, stake in progress: {}", queued_actions, max_queued_actions, waiting_for_stake_to_finalizer),
+                            TextDecl { font: Mono, h: ui.scale(16.0), colour: WHITE.mul(0.7), align: AlignX::Center, ..TextDecl }
+                        );
+                        if queue_full {
+                            ui.text("Queue full", TextDecl { font: Mono, h: ui.scale(16.0), colour: (0xff, 0xaf, 0x0e, 0xff), align: AlignX::Center, ..TextDecl });
+                        }
 
                         let mut hover = false;
 
@@ -2736,6 +2764,131 @@ pub fn ui_left_pane(ui: &mut Context,
                     }
                     scroll_container_finish(ui, data, padding, id, clip, scroll, content_h, viewport_h, max);
                 }
+
+                Modal::Queue => {
+                    title_bar(ui, true, "Transaction Queue", id("Queue Title Bar"));
+
+                    let (queued_actions, max_queued_actions, queued_items) = {
+                        let state = wallet_state.lock().unwrap();
+                        (
+                            state.queued_actions_len(),
+                            WalletState::MAX_QUEUED_ACTIONS,
+                            state.get_queued_actions(),
+                        )
+                    };
+
+                    if let _ = elem().decl(Decl {
+                        child_gap, radius,
+                        id: id("Queue Container"),
+                        colour: MODAL_COL,
+                        width:  grow!(),
+                        height: grow!(),
+                        align: Center,
+                        direction: TopToBottom,
+                        ..Decl
+                    }) {
+                        let capacity_col = if queued_actions >= max_queued_actions {
+                            (0xff, 0xaf, 0x0e, 0xff)
+                        } else {
+                            WHITE.mul(0.5)
+                        };
+                        ui.text(
+                            frame_strf!(data, "Queue: {}/{}", queued_actions, max_queued_actions),
+                            TextDecl { h: ui.scale(16.0), colour: capacity_col, align: AlignX::Center, font: Mono, ..TextDecl }
+                        );
+
+                        if !queued_items.is_empty() {
+                            if let _ = elem().decl(Decl {
+                                width: percent!(1.0),
+                                height: fixed!(ui.scale(2.0)),
+                                colour: (0x33, 0x33, 0x38, 0xff),
+                                ..Decl
+                            }) {}
+
+                            let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Queue Scroll Container"), 48.0);
+                            if queued_items.is_empty() {
+                                clip = ClipMode::None;
+                                *scroll = 0.0;
+                            }
+                            let scroll = *scroll;
+                            ui.scroll_container_bgn(data, padding, 0.0, id, clip, scroll, content_h, viewport_h, max);
+                            {
+                                for (index, item) in queued_items.iter().enumerate() {
+                                    let (kind_label, amount_zats, status_label) = match item {
+                                        QueueAction::Faucet => ("Faucet", 0u64, "Queued"),
+                                        QueueAction::Stake(amt) => ("Stake", *amt, "Queued"),
+                                        QueueAction::Unstake => ("Unstake", 0u64, "Queued"),
+                                        QueueAction::Retarget => ("Retarget", 0u64, "Queued"),
+                                        QueueAction::Claim => ("Claim", 0u64, "Queued"),
+                                        QueueAction::Send(amt) => ("Send", *amt, "Queued"),
+                                        QueueAction::TestStake => ("TestStake", 0u64, "Queued"),
+                                    };
+
+                                    let amount_label = if amount_zats > 0 {
+                                        frame_strf!(data, "{} cTAZ", str_from_ctaz(amount_zats))
+                                    } else {
+                                        data.frame_str("")
+                                    };
+
+                                    let item_col = (0x2a, 0x2a, 0x30, 0xff);
+                                    if let _ = elem().decl(Decl {
+                                        colour: item_col,
+                                        radius: ui.scale(6.0).dup4(),
+                                        padding: (ui.scale(10.0), ui.scale(10.0), ui.scale(10.0), ui.scale(10.0)),
+                                        direction: LeftToRight,
+                                        child_gap: ui.scale(8.0),
+                                        width: percent!(1.0),
+                                        height: fit!(),
+                                        align: Center,
+                                        ..Decl
+                                    }) {
+                                        let icon = match item {
+                                            QueueAction::Send(_) => ICON_UP_SMALL,
+                                            QueueAction::Stake(_) => ICON_LINK_1,
+                                            QueueAction::Unstake => ICON_LINK_EXT_ALT,
+                                            QueueAction::Retarget => ICON_MOVE,
+                                            QueueAction::Claim => ICON_UNLINK,
+                                            QueueAction::Faucet => ICON_WATER,
+                                            QueueAction::TestStake => ICON_DOT,
+                                        };
+                                        ui.text(icon, TextDecl { font: Icons, colour: (0x88, 0x88, 0x88, 0xff), h: ui.scale(20.0), align: AlignX::Center, ..TextDecl });
+
+                                        if let _ = elem().decl(Decl {
+                                            direction: TopToBottom,
+                                            width: grow!(),
+                                            height: fit!(),
+                                            align: Left,
+                                            ..Decl
+                                        }) {
+                                            ui.text(kind_label, TextDecl { h: ui.scale(16.0), colour: WHITE, align: AlignX::Left, ..TextDecl });
+                                            if amount_label.len() > 0 {
+                                                ui.text(&amount_label, TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.6), align: AlignX::Left, font: Mono, ..TextDecl });
+                                            }
+                                        }
+
+                                        ui.text(status_label, TextDecl { h: ui.scale(14.0), colour: (0x88, 0x88, 0x88, 0xff), align: AlignX::Right, font: Mono, ..TextDecl });
+                                    }
+
+                                    if index < queued_items.len() - 1 {
+                                        if let _ = elem().decl(Decl { height: fixed!(ui.scale(4.0)), width: percent!(1.0), ..Decl }) {}
+                                    }
+                                }
+                            }
+                            ui.scroll_container_end(data, padding, id, clip, scroll, content_h, viewport_h, max);
+                        } else {
+                            if let _ = elem().decl(Decl {
+                                direction: TopToBottom,
+                                child_gap: ui.scale(8.0),
+                                width: percent!(1.0),
+                                height: grow!(),
+                                align: Center,
+                                ..Decl
+                            }) {
+                                ui.text("Queue is empty", TextDecl { h: ui.scale(18.0), colour: WHITE.mul(0.4), align: AlignX::Center, ..TextDecl });
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2840,11 +2993,11 @@ pub fn ui_left_pane(ui: &mut Context,
                 clicked
             };
 
-            // TODO: send should use ICON_PAPER_PLANE but it would be nice to support negative glyph advance first
             if button(ui, can, ICON_UP_BIG, "Send")       { ui.modal = Modal::Send;    }
             if button(ui, can, ICON_QRCODE, "Receive")    { ui.modal = Modal::Receive; }
             if button(ui, can, ICON_LINK_1, "Stake")      { ui.modal = Modal::Stake;   }
             if button(ui, can, ICON_UNLINK, "Edit Stake") { ui.modal = Modal::Unstake; }
+            if button(ui, can, ICON_TASKS,  "Queue")      { ui.modal = Modal::Queue;   }
             if button(ui, can, ICON_COG_1,  "User")       { ui.modal = Modal::User;    } // TODO: person icon
         }
 
@@ -2854,9 +3007,9 @@ pub fn ui_left_pane(ui: &mut Context,
             let (mut txs, locals, local_n) = {
                 let state = wallet_state.lock().unwrap();
                 if *tab_id == tab_id_user_wallet {
-                    (state.user_txs.clone(), state.user_local_txs, state.user_local_txs_n)
+                    (state.user_txs.clone(), state.user_local_txs.clone(), state.user_local_txs_n)
                 } else {
-                    (state.miner_txs.clone(), state.miner_local_txs, state.miner_local_txs_n)
+                    (state.miner_txs.clone(), state.miner_local_txs.clone(), state.miner_local_txs_n)
                 }
             };
             for i in 0..local_n {

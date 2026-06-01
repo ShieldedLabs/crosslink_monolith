@@ -1,34 +1,8 @@
 use crate::*;
-use crate::bft::PubKeyID;
-
-#[derive(Clone, Debug)]
-pub struct ScanBond {
-    pub pk: PubKeyID,
-    pub initial_val: u64,
-    pub create_height: u32,
-    pub create_txid: TxId
-}
-
-#[derive(Clone, Default, Debug)]
-pub struct ScanInfo {
-    pub coinbases_c: usize,
-    pub coinbases_value: u64,
-    pub coinbase_max_height: u32,
-
-    pub bonds: Vec<ScanBond>,
-    pub utxos: HashSet<(PubKeyID, u32)>, // NOTE: grow-only
-    pub bonds_value: u64,
-
-    pub max_height_seen: u32,
-}
-impl ScanInfo {
-    pub fn total_value(&self) -> u64 {
-        self.coinbases_value + self.bonds_value
-    }
-}
+use crate::bft::{ ScanInfo, ScanBond, PubKeyID };
 
 
-pub fn scan_tx(info: &mut ScanInfo, tx_bytes: &[u8], tx_i: usize, height: u32, ufvk: &UnifiedFullViewingKey, txid_zeb: [u8; 32]) -> Result<bool, String> {
+pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_bytes: &[u8], tx_i: usize, height: u32, ufvk: &UnifiedFullViewingKey, txid_zeb: [u8; 32]) -> Result<bool, String> {
     let tz = Timer::scope_("scan_tx", true);
     let mut new_info = false;
     info.max_height_seen = info.max_height_seen.max(height);
@@ -72,7 +46,7 @@ pub fn scan_tx(info: &mut ScanInfo, tx_bytes: &[u8], tx_i: usize, height: u32, u
         }
 
         for input in &t_bundle.vin {
-            if info.utxos.contains(&(PubKeyID(*input.prevout.txid().as_ref()), input.prevout.n())) {
+            if utxos.contains(&(PubKeyID(*input.prevout.txid().as_ref()), input.prevout.n())) {
                 contains_my_t_spend = true;
             }
         }
@@ -82,7 +56,7 @@ pub fn scan_tx(info: &mut ScanInfo, tx_bytes: &[u8], tx_i: usize, height: u32, u
             if let Some(t_addr) = txout.recipient_address() {
                 if t_addr_belongs_to_ufvk_index(ufvk, 0, t_addr) {
                     let outpoint = (PubKeyID(*txid_lrz.as_ref()), out_i.try_into().unwrap());
-                    if ! info.utxos.insert(outpoint) {
+                    if ! utxos.insert(outpoint) {
                         return Err(format!("multiple receipts of the same UTXO: {:?}", outpoint));
                     }
                 }
@@ -138,7 +112,7 @@ pub fn scan_tx(info: &mut ScanInfo, tx_bytes: &[u8], tx_i: usize, height: u32, u
                 info.bonds.push(ScanBond {
                     pk: PubKeyID(staking_action.unique_pubkey),
                     initial_val: staking_action.amount_zats,
-                    create_txid: txid_lrz,
+                    create_txid: PubKeyID(<[u8;32]>::from(txid_lrz)),
                     create_height: height,
                 });
             }

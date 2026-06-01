@@ -8,7 +8,7 @@ use zebra_chain::block::{Hash as BlockHash, Height as BlockHeight};
 
 use serde_with::serde_as;
 
-pub use zcash_primitives::bft::{FinalizerRecencyStatus, TFLRecencyStatus};
+pub use zcash_primitives::bft::{FinalizerRecencyStatus, TFLRecencyStatus, ScanInfo};
 
 /// The finality status of a block
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
@@ -53,7 +53,7 @@ pub enum TFLServiceRequest {
     /// faucet
     Faucet(String),
     /// For crosslink testnet 1
-    TotalIssuanceFromKey(zcash_keys::keys::UnifiedFullViewingKey, BlockHeight, BlockHeight),
+    TotalIssuanceFromKey(Vec<zcash_keys::keys::UnifiedFullViewingKey>, BlockHeight, BlockHeight),
     /// Finalizer recency status
     FinalizersRecencyStatus,
 }
@@ -84,7 +84,7 @@ pub enum TFLServiceResponse {
     /// Faucet
     Faucet(Result<u64, String>),
     /// Response to [`ReadRequest::TotalIssuanceFromKey`]
-    TotalIssuanceFromKey(Result<u64, String>),
+    TotalIssuanceFromKey(Result<Vec<ScanInfo>, String>),
     /// Finalizer recency status + reference UTC
     FinalizersRecencyStatus(TFLRecencyStatus),
 }

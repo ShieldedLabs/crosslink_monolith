@@ -216,60 +216,7 @@ impl Application for ZebradApp {
             .cloned()
             .unwrap_or_else(|| {
                 // NORMAL OPERATION CROSSLINK CONFIG OVERRIDES
-                let mut c = self.config.read().deref().clone();
-                if c.crosslink.do_not_manipulate_config == false {
-                    c.crosslink.bft_peers = vec![
-"70.34.201.146:12301".to_owned(),
-"70.34.209.22:12301".to_owned(),
-"70.34.195.191:12301".to_owned(),
-"70.34.209.18:12301".to_owned(),
-                    ];
-
-                    c.mempool.debug_enable_at_height = Some(0);
-
-                    // c.mining.miner_address = Some(
-                    //     ZcashAddress::try_from_encoded("tmRB9AEVsxNAQsqtJPqJUje9KCaAijpS77z")
-                    //         .unwrap(),
-                    // );
-                    c.mining.internal_miner = true;
-                    c.network.network = testnet::Parameters::build()
-                        //.with_network_name("CrosslinkTestnet")
-                        .with_network_magic(Magic([67, 108, 84, 48]))
-                        .with_slow_start_interval(Height(0))
-                        .with_genesis_hash("05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38")
-                        .with_funding_streams(vec![testnet::ConfiguredFundingStreams {
-                            height_range: Some(Height(1)..Height(99_999_999)),
-                            recipients: Some(vec![testnet::ConfiguredFundingStreamRecipient {
-                                receiver: FundingStreamReceiver::MajorGrants,
-                                numerator: 20,
-                                addresses: Some(vec!["t27tjLaUJZ53JKqWPkgd1XCTNWF636eLQRg".to_string()]),
-                            }]),
-                        }])
-                        .to_network();
-
-                    c.network.initial_testnet_peers.clear();
-c.network.initial_testnet_peers.insert("70.34.201.146:8233".to_owned());
-c.network.initial_testnet_peers.insert("70.34.209.22:8233".to_owned());
-c.network.initial_testnet_peers.insert("70.34.195.191:8233".to_owned());
-c.network.initial_testnet_peers.insert("70.34.209.18:8233".to_owned());
-
-
-
-                    c.rpc.listen_addr = Some("127.0.0.1:8232".parse().unwrap());
-                    c.rpc.enable_cookie_auth = false;
-                    c.state
-                        .cache_dir
-                        .push("zebra_crosslink_workshop_season_one_v3_ehtedht_cache_delete_me");
-
-                    c.state.network_initial_peers = vec![
-"[::ffff:70.34.201.146]:12001:1fgEw5Nx:_BA-d-zgMDO3lj5R-FgL3VwJQofnPVZarZSUzx9ZMhs".to_owned(),
-"[::ffff:70.34.209.22]:12001:1fgEw5Nx:2huJ7vzzieTrT_dFMaQwhS0fSGZFatCeBXNFCXTfJCs".to_owned(),
-"[::ffff:70.34.195.191]:12001:1fgEw5Nx:iezUrR8zwiqzt1__9Ex0OiqQ1O0gbipHuuKwCHwQggo".to_owned(),
-"[::ffff:70.34.209.18]:12001:1fgEw5Nx:9nM4V10MYltC-ShN4OaEQlvDiFHEJtsOYmOroLBanQM".to_owned(),
-                    ];
-
-                }
-                Arc::new(c)
+                self.config.read()
             })
     }
 

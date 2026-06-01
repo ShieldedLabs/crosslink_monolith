@@ -690,3 +690,25 @@ pub struct TFLRecencyStatus {
     // pub round_step_utc_rngs: Vec<[(u32, u32); 3]>,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ScanBond {
+    pub pk: PubKeyID, // typed for serialization
+    pub initial_val: u64,
+    pub create_height: u32,
+    pub create_txid: PubKeyID, // typed for serialization
+}
+
+#[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ScanInfo {
+    pub coinbases_c: usize,
+    pub coinbases_value: u64,
+    pub coinbase_max_height: u32,
+
+    pub bonds: Vec<ScanBond>,
+    pub bonds_value: u64,
+
+    pub max_height_seen: u32,
+    pub total_value: u64,
+}
+
+

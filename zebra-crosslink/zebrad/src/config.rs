@@ -166,8 +166,86 @@ impl ZebradConfig {
         );
 
         // Build the configuration
-        let config = builder.build()?;
+        let raw_config = builder.build()?;
+
+        println!("raw config: {raw_config:#?}");
         // Deserialize into our struct, which will use defaults for any missing fields
-        config.try_deserialize()
+        let mut config: Self = raw_config.clone().try_deserialize()?;
+
+        {
+            // set crosslink testnet defaults based on whether they were *specified*, which is slightly
+            // more precise than whether they are currently Some/None
+
+            use zebra_chain::{
+                block::Height,
+                parameters::{subsidy::FundingStreamReceiver, testnet, Magic},
+            };
+
+            match raw_config.get("network.network") {
+                Err(config::ConfigError::NotFound(_)) |
+                Ok("Testnet") =>
+                config.network.network = testnet::Parameters::build()
+                    // .with_network_name("Crosslink_Testnet_0")
+                    .with_network_magic(Magic([67, 108, 84, 48]))
+                    .with_slow_start_interval(Height(0))
+                    .with_genesis_hash("05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38")
+                    .with_funding_streams(vec![testnet::ConfiguredFundingStreams {
+                        height_range: Some(Height(1)..Height(99_999_999)),
+                        recipients: Some(vec![testnet::ConfiguredFundingStreamRecipient {
+                            receiver: FundingStreamReceiver::MajorGrants,
+                            numerator: 20,
+                            addresses: Some(vec!["t27tjLaUJZ53JKqWPkgd1XCTNWF636eLQRg".to_string()]),
+                        }]),
+                    }])
+                .to_network(),
+
+                _ => {}
+            }
+
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_array("crosslink.bft_peers") {
+                config.crosslink.bft_peers = vec![
+                    "70.34.201.146:12301".to_owned(),
+                    "70.34.209.22:12301".to_owned(),
+                    "70.34.195.191:12301".to_owned(),
+                    "70.34.209.18:12301".to_owned(),
+                ];
+            }
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_array("network.initial_testnet_peers") {
+                config.network.initial_testnet_peers.clear();
+                config.network.initial_testnet_peers.insert("70.34.201.146:8233".to_owned());
+                config.network.initial_testnet_peers.insert("70.34.209.22:8233".to_owned());
+                config.network.initial_testnet_peers.insert("70.34.195.191:8233".to_owned());
+                config.network.initial_testnet_peers.insert("70.34.209.18:8233".to_owned());
+            }
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_array("state.network_initial_peers") {
+                config.state.network_initial_peers = vec![
+                    "[::ffff:70.34.201.146]:12001:1fgEw5Nx:_BA-d-zgMDO3lj5R-FgL3VwJQofnPVZarZSUzx9ZMhs".to_owned(),
+                    "[::ffff:70.34.209.22]:12001:1fgEw5Nx:2huJ7vzzieTrT_dFMaQwhS0fSGZFatCeBXNFCXTfJCs".to_owned(),
+                    "[::ffff:70.34.195.191]:12001:1fgEw5Nx:iezUrR8zwiqzt1__9Ex0OiqQ1O0gbipHuuKwCHwQggo".to_owned(),
+                    "[::ffff:70.34.209.18]:12001:1fgEw5Nx:9nM4V10MYltC-ShN4OaEQlvDiFHEJtsOYmOroLBanQM".to_owned(),
+                ];
+            }
+
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_int("mempool.debug_enable_at_height") {
+                config.mempool.debug_enable_at_height = Some(0);
+            }
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_string("mining.internal_miner") {
+                config.mining.internal_miner = true;
+            }
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_string("rpc.listen_addr") {
+                config.rpc.listen_addr = Some("127.0.0.1:8232".parse().unwrap());
+            }
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_bool("rpc.enable_cookie_auth") {
+                config.rpc.enable_cookie_auth = false;
+            }
+
+            // unconditional append
+            config.state
+                .cache_dir
+                .push("zebra_crosslink_workshop_season_one_v3_ehtedht_cache_delete_me");
+        }
+
+        // if let zcash_protocol::consensus::Network::TestNetwork(_) = config.network.network
+        Ok(config)
     }
 }

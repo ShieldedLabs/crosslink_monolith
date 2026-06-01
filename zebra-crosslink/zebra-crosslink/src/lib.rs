@@ -123,12 +123,10 @@ pub mod config {
         pub public_address: Option<String>,
         /// temp seed for private/public key pair
         pub insecure_user_name: Option<String>,
+        /// Use the public IP instead of the generated seed
+        pub public_ip_is_seed: bool,
         /// List of public IP addresses for peers, in the same format as `public_address`.
         pub bft_peers: Vec<String>,
-        /// Do not manipulate config
-        pub do_not_manipulate_config: bool,
-        /// I am the unstaker.
-        pub i_am_the_unstaker: bool,
         /// Disable the headless wallet.
         pub disable_the_headless_wallet: bool,
         /// Disable zaino.
@@ -140,8 +138,7 @@ pub mod config {
                 public_address: None,
                 insecure_user_name: None,
                 bft_peers: Vec::new(),
-                do_not_manipulate_config: false,
-                i_am_the_unstaker: false,
+                public_ip_is_seed: false,
                 disable_the_headless_wallet: false,
                 disable_zaino: false,
             }
@@ -899,15 +896,11 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         .unwrap_or(format!("127.0.0.1:{}", rand::thread_rng().next_u32() % 45869 + 2000));
     info!("public IP: {}", public_ip_string);
 
-    let user_name = if config.do_not_manipulate_config {
+    let user_name = if config.public_ip_is_seed {
         public_ip_string.clone()
     } else {
         format!("adrheardhed{:?}", global_seed)
     };
-
-    if config.i_am_the_unstaker {
-        *wallet::AM_I_THE_UNSTAKER.lock().unwrap() = true;
-    }
 
     let (mut rng, my_private_key, my_public_key) =
         rng_private_public_key_from_address(&user_name.as_bytes());
@@ -1279,10 +1272,10 @@ async fn tfl_block_finality_from_height_hash(
 
 async fn total_issuance_from_key(
     internal_handle: TFLServiceHandle,
-    ufvk: zcash_keys::keys::UnifiedFullViewingKey,
+    ufvks: Vec<zcash_keys::keys::UnifiedFullViewingKey>,
     first_height: ZebBlockHeight,
     last_height: ZebBlockHeight,
-) -> Result<u64, String> {
+) -> Result<Vec<ScanInfo>, String> {
     let call = internal_handle.call.clone();
 
     // let res = (call.state)(StateRequest::Tip).await;
@@ -1292,8 +1285,9 @@ async fn total_issuance_from_key(
     //     _ => return Err(format!("unexpectedly failed to get tip: {res:?}")),
     // };
 
-    let mut scan_info = wallet::scanner::ScanInfo::default();
+    let mut scan_infos = vec![ScanInfo::default(); ufvks.len()];
     let mut delegation_bonds = HashMap::new();
+    let mut utxos_per_ufvk = vec![HashSet::<(PubKeyID, u32)>::new(); ufvks.len()]; // NOTE: hashsets here are grow-only
 
     for height in first_height.0..=last_height.0 { //tip_height.0 {
         let tz = wallet::Timer::scope_("scan height", true);
@@ -1339,31 +1333,39 @@ async fn total_issuance_from_key(
                 // TODO: apply
             }
 
-            match wallet::scanner::scan_tx(&mut scan_info, &coinbase_tx_bytes, tx_i, height, &ufvk, txid.0) {
-                Ok(false) => {},
-                Ok(true) => println!("scan info at {height}: {scan_info:?}"),
-                Err(err) => return Err(format!("failed to scan {txid:?} at height {height}: {err}")),
+            for (ufvk_i, ufvk) in ufvks.iter().enumerate() {
+                let utxos = &mut utxos_per_ufvk[ufvk_i];
+                let scan_info = &mut scan_infos[ufvk_i];
+                match wallet::scanner::scan_tx(scan_info, utxos, &coinbase_tx_bytes, tx_i, height, &ufvk, txid.0) {
+                    Ok(false) => {},
+                    Ok(true) => println!("scan info at {height}: {scan_info:?}"),
+                    Err(err) => return Err(format!("failed to scan {txid:?} at height {height}: {err}")),
+                }
             }
         }
     }
 
     let mut bonds_value = 0;
-    for bond in &scan_info.bonds {
-        match delegation_bonds.get(&bond.pk.0) {
-            Some(bond_info) => {
-                let initial_val: u64 = bond.initial_val;
-                let final_val = u64::from(bond_info.0.amount);
-                let issuance_gained = final_val - initial_val;
-                println!("bond {:?}: initial value = {}; final value = {}; gained {}", bond, initial_val, final_val, issuance_gained);
-                bonds_value += issuance_gained;
-            },
-            None => return Err(format!("couldn't find bond {:?}", bond)),
+    for scan_info in &mut scan_infos {
+        for bond in &scan_info.bonds {
+            match delegation_bonds.get(&bond.pk.0) {
+                Some(bond_info) => {
+                    let initial_val: u64 = bond.initial_val;
+                    let final_val = u64::from(bond_info.0.amount);
+                    let issuance_gained = final_val - initial_val;
+                    println!("bond {:?}: initial value = {}; final value = {}; gained {}", bond, initial_val, final_val, issuance_gained);
+                    bonds_value += issuance_gained;
+                },
+                None => return Err(format!("couldn't find bond {:?}", bond)),
+            }
         }
-    }
-    scan_info.bonds_value = bonds_value;
 
-    println!("final scan info: {scan_info:?}");
-    Ok(scan_info.total_value())
+        scan_info.bonds_value = bonds_value;
+        scan_info.total_value = scan_info.coinbases_value + scan_info.bonds_value;
+        println!("final scan info: {scan_info:?}");
+    }
+
+    Ok(scan_infos)
 }
 
 async fn tfl_service_incoming_request(
