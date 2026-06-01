@@ -20,9 +20,9 @@ pub fn ack_test() {
     let network_thread_handle1 = new_network_thread(vec![kp1.clone()], 58493, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024));
     let network_thread_handle2 = new_network_thread(vec![kp2.clone()], 23843, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024));
 
-    let mut wanted_connections = vec![ (STPAddress { ip: Ipv6Addr::LOCALHOST, port: 58493, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: kp1_pub, }, [0u8; 64]) ];
-    let ret = service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable: vec![], });
-    wanted_connections = ret.current_connections;
+    let initiate_connections = vec![ STPAddress { ip: Ipv6Addr::LOCALHOST, port: 58493, magic1: CONNECT_MAGIC1_PLAIN_TEXT, key: kp1_pub, } ];
+    let ret = service_connections(&network_thread_handle2, NetworkThreadPush { initiate_connections, send_unreliable: vec![], ..Default::default() });
+    let mut wanted_connections = ret.current_connections;
 
     // Build 50 messages with random sizes between 100 bytes and 4 MiB.
     // Layout: [id: u32 LE][len: u32 LE][blake3 hash: 32 bytes][random payload]
@@ -61,14 +61,14 @@ pub fn ack_test() {
             sent = true;
             println!("Sent {NUM_MESSAGES} messages, waiting 10s for receive...");
         } else if !sent {
-            let ret = service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable: vec![], });
+            let ret = service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, ..Default::default() });
             wanted_connections = ret.current_connections;
             std::thread::sleep(std::time::Duration::from_millis(100));
             continue;
         } else {
             break;
         }
-        let ret = service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable, });
+        let ret = service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable, ..Default::default() });
         wanted_connections = ret.current_connections;
     }
 
@@ -80,7 +80,7 @@ pub fn ack_test() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 
     while std::time::Instant::now() < deadline {
-        let ret = service_connections(&network_thread_handle1, NetworkThreadPush { wanted_connections: vec![], send_unreliable: vec![], });
+        let ret = service_connections(&network_thread_handle1, NetworkThreadPush::default());
         for (_conn_key, data) in &ret.received_unreliable_messages {
             if data.len() < HEADER_SIZE {
                 malformed += 1;
@@ -128,11 +128,10 @@ pub fn do_the_test_program3(port: u16, my_keypair: IdentityKeyPair, beam_to: Opt
     let network_thread_handle2 = new_network_thread(vec![my_keypair], port, max_pps, send_buffer_params);
     
     if let Some(other) = beam_to {
-        let mut wanted_connections = Vec::new();
-        wanted_connections.push((other, [0u8; 64]));
-        
-        let ret = service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable: vec![], });
-        wanted_connections = ret.current_connections;
+        let initiate_connections = vec![other];
+
+        let ret = service_connections(&network_thread_handle2, NetworkThreadPush { initiate_connections, ..Default::default() });
+        let mut wanted_connections = ret.current_connections;
     
         let mut i = 0;
     
@@ -144,7 +143,7 @@ pub fn do_the_test_program3(port: u16, my_keypair: IdentityKeyPair, beam_to: Opt
                 }
                 // the sends will be truncated anyway
             }
-            let ret = service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable, });
+            let ret = service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable, ..Default::default() });
             wanted_connections = ret.current_connections;
             std::thread::sleep(std::time::Duration::from_millis(3000));
         }
@@ -152,7 +151,7 @@ pub fn do_the_test_program3(port: u16, my_keypair: IdentityKeyPair, beam_to: Opt
     else {
         let mut wanted_connections = Vec::new();
         loop {
-            let ret = service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, send_unreliable: vec![], });
+            let ret = service_connections(&network_thread_handle2, NetworkThreadPush { wanted_connections, ..Default::default() });
             wanted_connections = ret.current_connections;
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -1023,6 +1022,7 @@ impl SliceWrite for PackletReliableStreamed {
 
 #[derive(Default)]
 pub struct NetworkThreadPush {
+    pub initiate_connections: Vec<STPAddress>,
     pub wanted_connections: Vec<(STPAddress, [u8; 64])>,
     pub send_unreliable: Vec<(ConnectionKey, Vec<u8>)>,
 }
@@ -1096,7 +1096,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                     }
                     true
                 });
-                for (w, _) in &req.wanted_connections {
+                for w in &req.initiate_connections {
                     if my_keypairs.iter().any(|kp| kp.public == w.key) {
                         continue;
                     }

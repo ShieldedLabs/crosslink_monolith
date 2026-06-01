@@ -1403,6 +1403,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let my_port = my_endpoint.map(|e| e.port).unwrap_or(23485); // @Dev: .unwrap_or(0); // @Todo! Get local port after sock creation! @@@
     let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024));
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
+    let mut initiate_connections = Vec::<STPAddress>::new();
     let mut messages_to_send = Vec::new();
 
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
@@ -1578,7 +1579,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 // Try to reconnect to "seeders"
                 for FinalizerPeerAddress { address, .. } in &finalizer_peer_addresses {
-                    current_connections.push((address.clone(), [0u8; 64]));
+                    initiate_connections.push(address.clone());
                 }
 
                 bft_state.bft_access_closure.0(&bft_state, &bft_address_map).await;
@@ -1918,7 +1919,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         }
 
                         // Initiate direct connection to start hole punch
-                        current_connections.push((address.clone(), [0u8; 64]));
+                        initiate_connections.push(address.clone());
                     }
 
                     next_peer_connect = std::time::Instant::now() + PEER_CONNECT_DURATION;
@@ -1953,8 +1954,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
         use rand::seq::SliceRandom;
         messages_to_send.shuffle(&mut rand::thread_rng());
-        let resp = service_connections(&network_thread_handle, NetworkThreadPush { wanted_connections: current_connections.clone(), send_unreliable: messages_to_send, });
+        let resp = service_connections(&network_thread_handle, NetworkThreadPush { initiate_connections, wanted_connections: current_connections.clone(), send_unreliable: messages_to_send, });
         current_connections = resp.current_connections;
+        initiate_connections = Vec::new();
         let mut messages_received = resp.received_unreliable_messages;
         messages_to_send = Vec::new();
 
@@ -2388,7 +2390,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                 if !current_connections.iter().any(|(addr, _)| *addr == address_to_punch_to) {
                     if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_GRY}PROTOCOL{ANSI_RST}: Attempting hole punch to {:?}, requested by {:?}...", address_to_punch_to, peer.stp_address); }
-                    current_connections.push((address_to_punch_to, [0u8; 64]));
+                    initiate_connections.push(address_to_punch_to);
                 }
             }
 
