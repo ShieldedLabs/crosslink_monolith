@@ -204,25 +204,28 @@ impl ZebradConfig {
 
             if let Err(config::ConfigError::NotFound(_)) = raw_config.get_array("crosslink.bft_peers") {
                 config.crosslink.bft_peers = vec![
-                    "70.34.201.146:12301".to_owned(),
-                    "70.34.209.22:12301".to_owned(),
-                    "70.34.195.191:12301".to_owned(),
-                    "70.34.209.18:12301".to_owned(),
+                    "108.61.103.59:12301".to_owned(),
+                    // "70.34.201.146:12301".to_owned(),
+                    // "70.34.209.22:12301".to_owned(),
+                    // "70.34.195.191:12301".to_owned(),
+                    // "70.34.209.18:12301".to_owned(),
                 ];
             }
             if let Err(config::ConfigError::NotFound(_)) = raw_config.get_array("network.initial_testnet_peers") {
                 config.network.initial_testnet_peers.clear();
-                config.network.initial_testnet_peers.insert("70.34.201.146:8233".to_owned());
-                config.network.initial_testnet_peers.insert("70.34.209.22:8233".to_owned());
-                config.network.initial_testnet_peers.insert("70.34.195.191:8233".to_owned());
-                config.network.initial_testnet_peers.insert("70.34.209.18:8233".to_owned());
+                config.network.initial_testnet_peers.insert("108.61.103.59:8233".to_owned());
+                // config.network.initial_testnet_peers.insert("70.34.201.146:8233".to_owned());
+                // config.network.initial_testnet_peers.insert("70.34.209.22:8233".to_owned());
+                // config.network.initial_testnet_peers.insert("70.34.195.191:8233".to_owned());
+                // config.network.initial_testnet_peers.insert("70.34.209.18:8233".to_owned());
             }
             if let Err(config::ConfigError::NotFound(_)) = raw_config.get_array("state.network_initial_peers") {
                 config.state.network_initial_peers = vec![
-                    "[::ffff:70.34.201.146]:12001:1fgEw5Nx:_BA-d-zgMDO3lj5R-FgL3VwJQofnPVZarZSUzx9ZMhs".to_owned(),
-                    "[::ffff:70.34.209.22]:12001:1fgEw5Nx:2huJ7vzzieTrT_dFMaQwhS0fSGZFatCeBXNFCXTfJCs".to_owned(),
-                    "[::ffff:70.34.195.191]:12001:1fgEw5Nx:iezUrR8zwiqzt1__9Ex0OiqQ1O0gbipHuuKwCHwQggo".to_owned(),
-                    "[::ffff:70.34.209.18]:12001:1fgEw5Nx:9nM4V10MYltC-ShN4OaEQlvDiFHEJtsOYmOroLBanQM".to_owned(),
+                    "[::ffff:108.61.103.59]:12001:1fgEw5Nx:PCf4WR-YrxlPU6oJrm8-ypcD3Yn0oxoFjNEYhx3vCWM".to_owned(),
+                    // "[::ffff:70.34.201.146]:12001:1fgEw5Nx:_BA-d-zgMDO3lj5R-FgL3VwJQofnPVZarZSUzx9ZMhs".to_owned(),
+                    // "[::ffff:70.34.209.22]:12001:1fgEw5Nx:2huJ7vzzieTrT_dFMaQwhS0fSGZFatCeBXNFCXTfJCs".to_owned(),
+                    // "[::ffff:70.34.195.191]:12001:1fgEw5Nx:iezUrR8zwiqzt1__9Ex0OiqQ1O0gbipHuuKwCHwQggo".to_owned(),
+                    // "[::ffff:70.34.209.18]:12001:1fgEw5Nx:9nM4V10MYltC-ShN4OaEQlvDiFHEJtsOYmOroLBanQM".to_owned(),
                 ];
             }
 
@@ -242,7 +245,8 @@ impl ZebradConfig {
             // unconditional append
             config.state
                 .cache_dir
-                .push("zebra_crosslink_workshop_season_one_v3_ehtedht_cache_delete_me");
+                // .push("zebra_crosslink_workshop_season_one_v3_ehtedht_cache_delete_me");
+                .push("zebra_crosslink_workshop_season_one_test");
         }
 
         // if let zcash_protocol::consensus::Network::TestNetwork(_) = config.network.network
