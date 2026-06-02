@@ -869,29 +869,6 @@ const OVERLY_VERBOSE                :bool=0!=                (0);
 
 macro_rules! pod { ($($item:item)*) => { $(#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)] $item)* }; }
 
-#[repr(u8)] pod! { pub enum PackletTag { #[default] Acknowledgements = 0, AnEntireDatagram = 1, OneJumboFragment = 2, ReliableStreamed = 3 } }
-#[repr(C)]  pod! { pub struct PackletHeader(u16); }
-#[repr(C)]  pod! { pub struct PackletOneJumboFragment { pub bits: u64 } } // id:18 | total_len:23 | byte_idx:23
-#[repr(C)]  pod! { pub struct PackletReliableStreamed { pub id: u32, pub seq: u32 } }
-
-impl PackletHeader {
-    pub fn new(tag: PackletTag, len: usize) -> Self { debug_assert!(len < (1 << 14)); Self((tag as u16) | ((len as u16) << 2)) }
-    pub fn tag(&self) -> PackletTag { match self.0 & 0x3 { 0 => PackletTag::Acknowledgements, 1 => PackletTag::AnEntireDatagram, 2 => PackletTag::OneJumboFragment, _ => PackletTag::ReliableStreamed } }
-    pub fn len(&self) -> usize { (self.0 >> 2) as usize }
-}
-
-impl PackletOneJumboFragment {
-    pub fn new(id: u32, total_len: usize, byte_idx: usize) -> Self {
-        debug_assert!(id        < (1 << 18));
-        debug_assert!(total_len < (1 << 23));
-        debug_assert!(byte_idx  < (1 << 23));
-        Self { bits: (id as u64) | ((total_len as u64) << 18) | ((byte_idx as u64) << 41) }
-    }
-    pub fn id(&self)        -> u32 { (self.bits & ((1 << 18) - 1)) as u32 }
-    pub fn total_len(&self) -> usize { ((self.bits >> 18) & ((1 << 23) - 1)) as usize }
-    pub fn byte_idx(&self)  -> usize { ((self.bits >> 41) & ((1 << 23) - 1)) as usize }
-}
-
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReassemblySlot {
     pub buf: Vec<u8>,
@@ -991,34 +968,6 @@ pub const MAX_JUMBOGRAM_LEN: usize = 1 << 23; // 8 MB, matches the 23-bit field
 pub const MAX_JUMBOGRAM_IDS: u32   = 1 << 18; // matches 18-bit field
 
 pub const ACK_BUFFER_TIME_NS: u64 = 50_000_000;
-
-impl SliceRead  for PackletHeader           { fn       read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self(u16::read_from(buf)?)) } }
-impl SliceWrite for PackletHeader           { fn write_to(&self, buf: &mut  [u8]) -> usize        { self.0  .write_to(buf) } }
-
-
-impl SliceRead  for PackletOneJumboFragment {
-    fn read_from(buf: &mut &[u8]) -> Option<Self> { Some(Self { bits: u64::read_from(buf)? }) }
-}
-impl SliceWrite for PackletOneJumboFragment {
-    fn write_to(&self, buf: &mut [u8]) -> usize { self.bits.write_to(buf) }
-}
-
-impl SliceRead  for PackletReliableStreamed {
-    fn read_from(buf: &mut &[u8]) -> Option<Self> {
-        Some(Self {
-            id:  u32::read_from(buf)?,
-            seq: u32::read_from(buf)?
-        })
-    }
-}
-impl SliceWrite for PackletReliableStreamed {
-    fn write_to(&self, buf: &mut [u8]) -> usize {
-        let mut o = 0;
-        o += self.id .write_to(&mut buf[o..]);
-        o += self.seq.write_to(&mut buf[o..]);
-        o
-    }
-}
 
 #[derive(Default)]
 pub struct NetworkThreadPush {

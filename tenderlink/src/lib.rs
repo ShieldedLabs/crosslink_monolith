@@ -64,7 +64,7 @@ const ANSI_RST: &'static str = "\x1b[0m";
 // @Todo: MTU discovery // @Duplicate with NewNet.
 const UDP_mMTU:        usize = 1400; // Note(Sam): This number informs cryptography. BAD! For season one we must now not change this number. Even if it means sending jumbos to compensate. :(
 const STP_HEADER_SIZE: usize = total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(CRYPTO_MAGIC).unwrap();
-const STP_PACKLET_HDR: usize = std::mem::size_of::<crate::bandwidth_test::PackletHeader>();
+const STP_PACKLET_HDR: usize = 2;
 const PATH_MTU: usize = UDP_mMTU
                       - STP_HEADER_SIZE
                       - STP_PACKLET_HDR;

@@ -36,8 +36,8 @@ pub fn push_block_event(event: BlockEvent) {
 // @Todo: MTU discovery // @Duplicate with Tenderlink.
 const UDP_mMTU:        usize = ASSUMED_SMALLEST_POSSIBLE_UDP_FRAME_WITH_GUARANTEED_DELIVERY;
 const STP_HEADER_SIZE: usize = total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(CRYPTO_MAGIC).unwrap();
-const STP_PACKLET_HDR: usize = std::mem::size_of::<PackletHeader>();
-const STP_JUMBO_HDR:   usize = std::mem::size_of::<PackletOneJumboFragment>();
+const STP_PACKLET_HDR: usize = 2;
+const STP_JUMBO_HDR:   usize = 8;
 const PATH_MTU: usize = UDP_mMTU
                       - STP_HEADER_SIZE
                       - STP_PACKLET_HDR;
@@ -1017,12 +1017,14 @@ impl SliceWrite for PeerPowBlockRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PeerPowBlockDownload {
     height_hash: HeightAndHashOr0,
+    reassembly: ReassemblySlot, // accumulates block fragments across (re)requests
     last_modified: std::time::Instant,
 }
 impl Default for PeerPowBlockDownload {
     fn default() -> Self {
         Self {
             height_hash: HeightAndHashOr0::default(),
+            reassembly: ReassemblySlot::new(),
             last_modified: std::time::Instant::now(),
         }
     }
@@ -1068,6 +1070,7 @@ impl BlockDownloads {
         if dl_i < self.slots.len() {
             self.slots[dl_i] = PeerPowBlockDownload {
                 height_hash,
+                reassembly: ReassemblySlot::new(),
                 last_modified: std::time::Instant::now(),
             };
             self.used_flags |= 1 << dl_i;
@@ -1516,7 +1519,7 @@ pub fn sync(
         blocks_to_send.sort_by_key(|(_, _, height, _)| *height);
 
         // TODO: rate limit production!
-        for (connection_key, hash, height, _offset) in &blocks_to_send {
+        for (connection_key, hash, height, offset) in &blocks_to_send {
             let hash = *hash;
             if !current_connections.iter().any(|(addr, _)| addr.connection_key() == *connection_key) {
                 if TRACE { tracing::info!("Can't send block that was queued for sending: Peer was disconnected: {connection_key:?}"); }
@@ -1548,26 +1551,50 @@ pub fn sync(
 
             let serialized_block = &serialized_blocks[&hash];
 
-            if TRACE { tracing::info!("Sending BLOCK (Height: {height}, Hash: {hash}, {} bytes)", serialized_block.len()); }
+            if *offset >= serialized_block.len() {
+                if TRACE { tracing::info!("Ignoring out-of-range block offset request: {offset} >= {}", serialized_block.len()); }
+                continue;
+            }
 
-            let hdr = PeerPowBlockResponseChunkHdr {
-                offset: 0,
-                size: serialized_block.len().try_into().unwrap(),
-                height_hash: HeightAndHashOr0 {
-                    height: block::Height(*height),
-                    hash_or_0: hash,
-                }
+            let total_size: u32 = serialized_block.len().try_into().unwrap();
+
+            if TRACE { tracing::info!("Sending BLOCK (Height: {height}, Hash: {hash}, {offset}-{})", serialized_block.len()); }
+
+            // Poor-man's fragmentation: split the block into single-packet chunks, each an
+            // independently deliverable & re-requestable message. STP delivery is unreliable,
+            // so the receiver reassembles and re-requests from its highest contiguous prefix.
+            let mut pkt_buf = [0u8; JUMBO_FRAG_SIZE];
+
+            // payload bytes available per packet after the chunk header
+            let chunk_size = JUMBO_FRAG_SIZE - {
+                let hdr = PeerPowBlockResponseChunkHdr {
+                    offset: 0,
+                    size: total_size,
+                    height_hash: HeightAndHashOr0 { height: block::Height(*height), hash_or_0: hash },
+                };
+                let mut o = 0;
+                o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut pkt_buf[o..]);
+                o += hdr.write_to(&mut pkt_buf[o..]);
+                o
             };
 
-            // header + full block as one message (layer 2 fragmentation comes later)
-            let hdr_size = 1 + 4 + 4 + 4 + 32; // packet_type + offset + size + height + hash
-            let mut pkt = vec![0u8; hdr_size + serialized_block.len()];
-            let mut o = 0;
-            o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut pkt[o..]);
-            o += hdr.write_to(&mut pkt[o..]);
-            pkt[o..].copy_from_slice(serialized_block);
+            for (chunk_i, chunk) in serialized_block[*offset..].chunks(chunk_size).enumerate() {
+                let hdr = PeerPowBlockResponseChunkHdr {
+                    offset: *offset as u32 + (chunk_i * chunk_size) as u32,
+                    size: total_size,
+                    height_hash: HeightAndHashOr0 {
+                        height: block::Height(*height),
+                        hash_or_0: hash,
+                    }
+                };
 
-            packets_to_send.push((*connection_key, pkt));
+                let mut o = 0;
+                o += PACKET_TYPE_BLOCK_CHUNK.write_to(&mut pkt_buf[o..]);
+                o += hdr.write_to(&mut pkt_buf[o..]);
+                o += chunk.write_to(&mut pkt_buf[o..]);
+
+                packets_to_send.push((*connection_key, Vec::from(&pkt_buf[..o])));
+            }
         }
         blocks_to_send.clear();
 
@@ -2008,15 +2035,21 @@ pub fn sync(
 
                         let dl = &peer.block_downloads.slots[dl_i];
 
+                        // resume from the highest contiguous prefix we've already reassembled
+                        let offset = match dl.reassembly.received.first() {
+                            Some(&(0, end)) => end,
+                            _ => 0,
+                        };
+
                         let mut buf = [0u8; JUMBO_FRAG_SIZE];
                         let mut o = 0;
                         o += PACKET_TYPE_BLOCK_REQ.write_to(&mut buf[o..]);
                         o += PeerPowBlockRequest {
                             height_hash: dl.height_hash,
-                            offset: 0,
+                            offset,
                         }.write_to(&mut buf[o..]);
 
-                        if TRACE { tracing::info!("Requesting height {} hash {} from peer {connection_key:?}", dl.height_hash.height.0, dl.height_hash.hash_or_0); }
+                        if TRACE { tracing::info!("Requesting height {} hash {} offset {offset} from peer {connection_key:?}", dl.height_hash.height.0, dl.height_hash.hash_or_0); }
 
                         packets_to_send.push((*connection_key, Vec::from(&buf[..o])));
                     }
@@ -2279,6 +2312,12 @@ pub fn sync(
                         kill!("the hash matches but the height doesn't");
                         continue 'process_packets;
                     }
+                    if let Some(existing) = dl.reassembly.total_len {
+                        if existing != hdr.size {
+                            kill!("peer tried to change size of block mid-send (from {} to {})", existing, hdr.size);
+                            continue 'process_packets;
+                        }
+                    }
                     dl.height_hash.hash_or_0 = hdr.height_hash.hash_or_0;
                 }
 
@@ -2297,11 +2336,33 @@ pub fn sync(
                     }
                 }
 
-                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: Received full block ({} bytes)", msg.len()); }
+                // reject fragments that extend past the declared size (bounds the reassembly buffer)
+                if hdr.offset as u64 + msg.len() as u64 > hdr.size as u64 {
+                    kill!("block fragment extends beyond declared size ({} + {} > {})", hdr.offset, msg.len(), hdr.size);
+                    continue 'process_packets;
+                }
 
-                // Full block received as one message (no reassembly)
-                peer.block_downloads.remove(dl_i);
-                let block_data = msg;
+                // Insert this fragment; the final fragment (reaching `size`) carries the fin marker.
+                let is_fin = hdr.offset as u64 + msg.len() as u64 == hdr.size as u64;
+                let (success, complete) = {
+                    let dl = &mut peer.block_downloads.slots[dl_i];
+                    dl.reassembly.insert(hdr.offset as usize, msg, is_fin)
+                };
+                if !success {
+                    kill!("overlapping/out-of-bounds block fragment");
+                    continue 'process_packets;
+                }
+                peer.block_downloads.slots[dl_i].last_modified = std::time::Instant::now();
+
+                if !complete {
+                    if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: fragment at offset {} ({} bytes); awaiting more", hdr.offset, msg.len()); }
+                    continue 'process_packets;
+                }
+
+                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: All fragments received ({} bytes)", hdr.size); }
+
+                let block_data_vec = peer.block_downloads.remove(dl_i).reassembly.buf;
+                let block_data = &block_data_vec[..];
 
 
                 // TODO: we should be able to early out once we have chunk 0 or a hdr-contained parent hash
