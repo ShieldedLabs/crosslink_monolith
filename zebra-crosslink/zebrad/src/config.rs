@@ -168,7 +168,7 @@ impl ZebradConfig {
         // Build the configuration
         let raw_config = builder.build()?;
 
-        println!("raw config: {raw_config:#?}");
+        // println!("raw config: {raw_config:#?}");
         // Deserialize into our struct, which will use defaults for any missing fields
         let mut config: Self = raw_config.clone().try_deserialize()?;
 
