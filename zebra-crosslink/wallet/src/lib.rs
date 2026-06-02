@@ -111,6 +111,9 @@ pub struct FaucetRequestClosure(pub Arc<dyn Fn(String) -> Result<u64, String> + 
 pub static FAUCET_REQUEST: Mutex<Option<FaucetRequestClosure>> = Mutex::new(None);
 pub static GUI_ENABLE_MINE: Mutex<bool> = Mutex::new(true);
 
+#[derive(Clone)]
+pub struct RecencyRequestClosure(pub Arc<dyn Fn() -> Option<String> + Sync + Send + 'static>);
+pub static RECENCY_REQUEST: Mutex<Option<RecencyRequestClosure>> = Mutex::new(None);
 
 // NOTE: this has slightly different semantics from the protocol version, hence the different type
 // TODO: some code becomes simpler with a u64, but I'm leaving this the same as default for now
@@ -385,6 +388,13 @@ const CHEAT_UNSTAKING: bool = false;
 pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
 pub static TENDERLINK_PUBLIC_KEY: Mutex<bft::PubKeyID> = Mutex::new(bft::PubKeyID([0;32]));
+
+pub fn get_tfl_recency_status_str() -> Option<String> {
+    use secp256k1::serde::Serialize;
+    let lock = RECENCY_REQUEST.lock().unwrap();
+    let closure = lock.as_ref()?;
+    closure.0()
+}
 
 async fn wait_for_zainod() {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));

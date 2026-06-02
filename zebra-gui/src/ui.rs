@@ -3650,6 +3650,12 @@ pub fn ui_right_pane(ui: &mut Context,
                             set_tooltip_text!(data, "Set to 0/empty to ignore connection time");
                         }
                     }
+
+                    if button_ex(ui, "Copy finalizer data as JSON", false, true) {
+                        if let Some(recency) = wallet::get_tfl_recency_status_str() {
+                            ui.input().send_to_clipboard(&recency);
+                        }
+                    }
                 }
             }
 

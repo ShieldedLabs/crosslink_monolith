@@ -885,6 +885,18 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         tokio::task::spawn_blocking(move || {
             rt.block_on(viz2::service_viz_requests(viz_tfl_handle, params))
         });
+
+        let rt = tokio::runtime::Handle::current();
+        let tfl_handle2 = internal_handle.clone();
+        *wallet::RECENCY_REQUEST.lock().unwrap() = Some(wallet::RecencyRequestClosure(Arc::new(move || {
+            rt.block_on(
+                async {
+                    let lock = tfl_handle2.internal.lock().await;
+                    let recency_status = &lock.recency_status;
+                    serde_json::to_string_pretty(recency_status).ok()
+                }
+            )
+        })));
     }
 
     if *TEST_MODE.lock().unwrap() {
