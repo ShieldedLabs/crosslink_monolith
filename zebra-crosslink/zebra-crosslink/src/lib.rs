@@ -1327,6 +1327,8 @@ async fn total_issuance_from_key(
 
             if let Some(staking_action) = tx.staking_action() {
                 let mut bond_retargets = vec![HashMap::new()];
+                // Note(Sam): It seems weird that the bonds never get deleted. I don't know what I was
+                // thinking when I did that. But it makes this code easy.
                 zebra_state::update_chain_tip_with_delegation_bond(
                     &mut zebra_chain::value_balance::ValueBalance::zero(),
                     &mut delegation_bonds,
