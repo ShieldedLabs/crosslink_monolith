@@ -1144,6 +1144,16 @@ pub struct Peer {
     // TODO: also handle PoS
     // TODO: cross-peer tracking
     block_downloads: BlockDownloads,
+
+    // Lite checkpointing (only meaningful while CheckpointState::Locked).
+    // Whether this peer's main chain has been confirmed to contain the configured
+    // checkpoint block: we requested the block at the checkpoint height and they
+    // returned the expected hash.
+    checkpoint_passed: bool,
+    // When we last sent (or evaluated) a checkpoint test for this peer. Used to
+    // re-test non-passing peers periodically in case their chain reorgs onto the
+    // checkpoint.
+    checkpoint_last_tested: Option<std::time::Instant>,
 }
 
 #[derive(Debug)]
@@ -1151,6 +1161,41 @@ pub enum BlockCommitError {
     Duplicate,
     Other(String),
 }
+
+/// Lite-checkpointing state machine, engaged when the operator configures
+/// `config.network_checkpoint_block_hash`. When no checkpoint is configured we
+/// stay in `Normal` and behave exactly as before.
+///
+/// ```text
+///   SEARCH ──(obtained block from a peer)──► LOCKED ──(committed on best chain)──► NORMAL
+///
+///   Startup entry point:
+///     - no checkpoint configured ............................ NORMAL
+///     - configured, already committed locally .............. NORMAL
+///     - configured, not yet committed locally .............. SEARCH
+/// ```
+///
+/// - `Search`: we have the target hash but not the block. Freeze normal sync (do
+///   not accept/commit any block), actively probe peers for the block *by hash*,
+///   and watch for it locally. As soon as we obtain it (and thus learn its
+///   height) → `Locked`. LOCKED is only ever reached from here.
+/// - `Locked`: only request blocks from peers that pass the height test (asked
+///   for the block at the checkpoint height, returned the expected hash). Non-passing
+///   peers are skipped and periodically re-tested.
+/// - `Normal`: no gating; behave as if no checkpoint was configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointState {
+    Normal,
+    Search { target: Hash },
+    Locked { target: Hash, height: u32 },
+}
+
+/// Sentinel "height unknown" value used for SEARCH-mode by-hash probe downloads.
+/// Peers serve blocks by hash regardless of the requested height, and no real
+/// block download ever uses this height, so it doubles as a tag we can clean up.
+const CHECKPOINT_SEARCH_HEIGHT: u32 = u32::MAX;
+/// How often to re-test a peer that has not (yet) passed the checkpoint test.
+const CHECKPOINT_RETEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn sync(
     commit_block: impl Fn(std::sync::Arc<Block>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Hash, BlockCommitError>> + Send>>,
@@ -1304,6 +1349,36 @@ pub fn sync(
     let mut next_peer_connect = std::time::Instant::now();
     let mut next_peer_request = std::time::Instant::now();
     let mut next_console_status_print = std::time::Instant::now();
+
+    // Lite checkpointing. See CheckpointState.
+    let checkpoint_target: Option<Hash> = match &config.network_checkpoint_block_hash {
+        None => None,
+        Some(s) => match s.parse::<Hash>() {
+            Ok(hash) => Some(hash),
+            Err(err) => {
+                tracing::error!("NewNet: Failed to parse network_checkpoint_block_hash {s:?}: {err:?}. Ignoring checkpoint.");
+                None
+            }
+        },
+    };
+    let mut checkpoint_state = match checkpoint_target {
+        None => CheckpointState::Normal,
+        Some(target) => {
+            // If the checkpoint is already committed on our best chain, there's nothing to do.
+            let already_committed_locally = get_hdr_at_hash(&read_state, &rt, target)
+                .map(|(_, height, _)| get_bc_hash_at_height(&read_state, &rt, height) == Some(target))
+                .unwrap_or(false);
+            if already_committed_locally {
+                tracing::info!("NewNet: Checkpoint {target} already committed locally; checkpointing satisfied (NORMAL).");
+                CheckpointState::Normal
+            } else {
+                tracing::info!("NewNet: Checkpoint {target} configured but not committed locally; entering SEARCH.");
+                CheckpointState::Search { target }
+            }
+        }
+    };
+    let checkpoint_check_interval = std::time::Duration::from_millis(1000);
+    let mut next_checkpoint_check = std::time::Instant::now() + checkpoint_check_interval;
 
     let stp_address_get_short_string = |address| {
         let addr = format!("{:?}", address);
@@ -1722,7 +1797,12 @@ pub fn sync(
                     if peer.block_downloads.slot_is_used(dl_i) {
                         let HeightAndHashOr0 { height: block::Height(height), hash_or_0 } = peer.block_downloads.slots[dl_i].height_hash;
 
-                        if height <= near_tip_chains.finalized_height {
+                        // Drop leftover SEARCH-mode by-hash probes once we've left SEARCH.
+                        if height == CHECKPOINT_SEARCH_HEIGHT
+                            && !matches!(checkpoint_state, CheckpointState::Search { .. }) {
+                            peer.block_downloads.remove(dl_i);
+
+                        } else if height <= near_tip_chains.finalized_height {
                             if TRACE { tracing::info!("Cancelling download request for block @ {}, {} - <= finalized @ {}", height, hash_or_0, near_tip_chains.finalized_height); }
                             peer.block_downloads.remove(dl_i);
 
@@ -1758,7 +1838,7 @@ pub fn sync(
 
             let mut count_of_peers_we_started_download_from = 0;
             'send_to_peers: for connection_key in peer_random_keys {
-                let Peer { origin, their_tree, their_queue, ref mut block_downloads, .. } = peers.get_mut(&connection_key).unwrap();
+                let Peer { origin, their_tree, their_queue, ref mut block_downloads, checkpoint_passed, checkpoint_last_tested, .. } = peers.get_mut(&connection_key).unwrap();
                 if count_of_peers_we_started_download_from >= MAX_PEERS_TO_INIT_DLS_FROM { break 'send_to_peers; }
                 let mut did_we_actually_start_a_download_bool_for_increment_at_the_end = false;
 
@@ -1776,6 +1856,41 @@ pub fn sync(
                     };
                     addr.clone()
                 };
+
+                // Lite checkpointing: gate / redirect what we request from this peer.
+                match checkpoint_state {
+                    CheckpointState::Search { target } => {
+                        // Freeze normal sync; only probe this peer for the checkpoint block by hash
+                        // (height unknown until we obtain it, hence the sentinel height).
+                        let probe = HeightAndHashOr0 {
+                            height: block::Height(CHECKPOINT_SEARCH_HEIGHT),
+                            hash_or_0: target,
+                        };
+                        if block_downloads.position(probe).is_none() {
+                            block_downloads.insert(probe);
+                        }
+                        continue 'send_to_peers;
+                    }
+                    CheckpointState::Locked { height: cp_height, .. } => {
+                        if !*checkpoint_passed {
+                            // Only sync from peers that pass the test; (re)issue the height test otherwise.
+                            let due = checkpoint_last_tested.as_ref().map_or(true, |t| t.elapsed() >= CHECKPOINT_RETEST_INTERVAL);
+                            if due {
+                                let probe = HeightAndHashOr0 {
+                                    height: block::Height(cp_height),
+                                    hash_or_0: block::Hash([0; 32]),
+                                };
+                                if block_downloads.position(probe).is_none() {
+                                    block_downloads.insert(probe);
+                                }
+                                *checkpoint_last_tested = Some(std::time::Instant::now());
+                            }
+                            continue 'send_to_peers;
+                        }
+                        // Passed peer: fall through to normal sync.
+                    }
+                    CheckpointState::Normal => {}
+                }
 
                 macro_rules! warning {
                     ($($arg:tt)*) => {{
@@ -2270,6 +2385,24 @@ pub fn sync(
                 // @Note: for valid blocks the height can be computed from block data, so this is an early-out optimization.
                 let alleged_height = hdr.height_hash.height.0;
 
+                // Lite checkpointing: a block arriving at the checkpoint height reveals whether
+                // this peer's main chain matches the checkpoint. (Evaluated from the chunk header,
+                // so a wrong-chain peer is rejected after a single chunk rather than a full block.)
+                if let CheckpointState::Locked { target, height: cp_height } = checkpoint_state {
+                    if alleged_height == cp_height {
+                        let their_hash = hdr.height_hash.hash_or_0;
+                        let passed = their_hash == target;
+                        peer.checkpoint_passed = passed;
+                        peer.checkpoint_last_tested = Some(std::time::Instant::now());
+                        if !passed {
+                            if TRACE { tracing::info!("NewNet: Peer failed checkpoint test: {their_hash} != target {target} @ height {cp_height}"); }
+                            peer.block_downloads.remove(dl_i);
+                            continue 'process_packets;
+                        }
+                        // Passed: this is the checkpoint block itself; let it commit normally.
+                    }
+                }
+
                 // @Note: Skip blocks that are older than the base of our NearTipChain view of the best chain.
                 // Depending on whether our NEAR_TIP_CHAIN_LEN is < or > Zebra's MAX_BLOCK_REORG_HEIGHT,
                 // presence in the best NearTipChain *may* or *may not* logically imply that this new block
@@ -2363,6 +2496,30 @@ pub fn sync(
 
                 let block_data_vec = peer.block_downloads.remove(dl_i).reassembly.buf;
                 let block_data = &block_data_vec[..];
+
+                // Lite checkpointing: handle SEARCH-mode by-hash probe responses (sentinel height).
+                // If it's the target we acquire it (learning its height) and lock on; otherwise it's
+                // a leftover probe and we simply drop it. The download slot was already removed above.
+                if alleged_height == CHECKPOINT_SEARCH_HEIGHT {
+                    if let CheckpointState::Search { target } = checkpoint_state {
+                        if alleged_hash == target {
+                            if let Some(b) = block_data.zcash_deserialize_into::<Block>().ok() {
+                                if b.hash() == target {
+                                    if let Some(h) = b.coinbase_height() {
+                                        tracing::info!("NewNet: Acquired checkpoint block {target} @ height {}; SEARCH -> LOCKED.", h.0);
+                                        checkpoint_state = CheckpointState::Locked { target, height: h.0 };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue 'process_packets;
+                }
+
+                // Lite checkpointing: while SEARCHing we do not accept/commit any block from any peer.
+                if matches!(checkpoint_state, CheckpointState::Search { .. }) {
+                    continue 'process_packets;
+                }
 
 
                 // TODO: we should be able to early out once we have chunk 0 or a hdr-contained parent hash
@@ -2535,6 +2692,19 @@ pub fn sync(
         if blocks_to_commit.len() > 0 && !any_blocks_in_the_queue_can_make_progress {
             // dbg_panic!("No blocks made progress in the queue this tick!? This should never hit! Currently we are only queueing blocks that can make progress!"); // @Temporary.
             blocks_to_commit.clear();
+        }
+
+        // Lite checkpointing: exit LOCKED once the checkpoint block is committed on our best
+        // chain locally (not merely sitting in the commit queue). SEARCH -> LOCKED happens
+        // inline when we acquire the block (see the BLOCK_CHUNK handler).
+        if std::time::Instant::now() >= next_checkpoint_check {
+            if let CheckpointState::Locked { target, height } = checkpoint_state {
+                if get_bc_hash_at_height(&read_state, &rt, Height(height)) == Some(target) {
+                    tracing::info!("NewNet: Checkpoint {target} committed locally @ height {height}; LOCKED -> NORMAL.");
+                    checkpoint_state = CheckpointState::Normal;
+                }
+            }
+            next_checkpoint_check = std::time::Instant::now() + checkpoint_check_interval;
         }
 
         // Sleep remainder of tick

@@ -120,6 +120,14 @@ pub struct Config {
     pub network_identity_seed_string: Option<String>,
     pub network_local_port: u16,
     pub network_initial_peers: Vec<String>,
+
+    /// Optional lite-checkpoint block hash (hex, display order).
+    ///
+    /// When set, the new-network sync engine refuses to build on any chain until
+    /// it has confirmed this block, and then only syncs from peers whose main
+    /// chain contains it, until the block is committed locally. See the
+    /// `CheckpointState` state machine in `new_network.rs`.
+    pub network_checkpoint_block_hash: Option<String>,
 }
 
 fn gen_temp_path(prefix: &str) -> PathBuf {
@@ -194,6 +202,7 @@ impl Default for Config {
             network_identity_seed_string: None,
             network_local_port: 0,
             network_initial_peers: Vec::new(),
+            network_checkpoint_block_hash: None,
         }
     }
 }
