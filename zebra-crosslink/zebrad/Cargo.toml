@@ -259,6 +259,9 @@ zaino-state = { path = "../../zaino/zaino-state" }
 zaino-common = { path = "../../zaino/zaino-common" }
 zaino-serve = { path = "../../zaino/zaino-serve" }
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
+
 [build-dependencies]
 # test feature lightwalletd-grpc-tests
 tonic-prost-build = { workspace = true, optional = true }
