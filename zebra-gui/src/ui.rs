@@ -4583,6 +4583,29 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                 ui.text("HASH", section_hdr);
                 ui.text(frame_strf!(data, "{}", viz.inspecting_block_hash), TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
 
+                // "Copy hash" button
+                {
+                    let copy_id = id("Block Inspector Copy Hash");
+                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, copy_id, true, winit::window::CursorIcon::Default);
+                    let radius = ui.scale(14.0);
+                    if let _ = elem().decl(Decl {
+                        id: copy_id,
+                        colour,
+                        padding,
+                        radius: radius.dup4(),
+                        align: Center,
+                        width:  fit!(),
+                        height: fit!(radius * 2.0),
+                        ..Decl
+                    }) {
+                        ui.text("Copy hash", TextDecl { h: ui.scale(13.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
+                    }
+                    if clicked {
+                        let hash_str = format!("{}", viz.inspecting_block_hash);
+                        ui.input().send_to_clipboard(&hash_str);
+                    }
+                }
+
                 let _ = elem().decl(Decl {
                     width: percent!(1.0),
                     height: fixed!(1.0),
