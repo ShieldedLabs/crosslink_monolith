@@ -360,7 +360,6 @@ struct ProposedTx {
     pub tx: WalletTx,
     pub prep: Option<BuildPrep>,
     pub tx_res: Option<TxBuildResult>,
-    pub last_send_attempt_h: BlockHeight,
     pub is_user_faucet: bool, // and NOT an RPC faucet
     // pub orchard_anchor_h: u32,
     // pub orchard_fvk: Option<orchard::keys::FullViewingKey>,
@@ -372,7 +371,6 @@ impl ProposedTx {
         tx: WalletTx::EMPTY,
         prep: None,
         tx_res: None,
-        last_send_attempt_h: BlockHeight::INVALID,
         is_user_faucet: false,
     };
 
@@ -948,10 +946,10 @@ pub struct WalletState {
     // pub debug_user_account: Option<ManualAccount>,
 
     pub user_local_txs_n: usize,
-    pub user_local_txs: Vec<WalletTx>,
+    pub user_local_txs: [WalletTx; 3],
     pub user_txs:      Vec<WalletTx>,
     pub miner_local_txs_n: usize,
-    pub miner_local_txs: Vec<WalletTx>,
+    pub miner_local_txs: [WalletTx; 3],
     pub miner_txs:     Vec<WalletTx>,
     pub roster:        Vec<WalletRosterMember>,
 
@@ -975,16 +973,6 @@ pub struct WalletState {
 }
 
 impl WalletState {
-    fn queued_slots_used(&self) -> usize {
-        self.actions_in_flight.len() + usize::from(
-            self.waiting_for_send
-                || self.waiting_for_stake_to_finalizer
-                || self.waiting_for_faucet
-        )
-    }
-
-    pub const MAX_QUEUED_ACTIONS: usize = 10;
-
     pub fn new() -> Self {
         WalletState {
             ..Default::default()
@@ -995,12 +983,8 @@ impl WalletState {
     pub fn user_pending_balance(&self)  -> u64 { self.user_shielded_pending_funds }
     pub fn miner_balance(&self)         -> u64 { self.miner_unshielded_funds + self.miner_shielded_spendable_funds + self.miner_shielded_pending_funds }
     pub fn miner_pending_balance(&self) -> u64 { self.miner_shielded_pending_funds }
-    pub fn queued_actions_len(&self) -> usize { self.queued_slots_used() }
 
     pub fn request_from_faucet(&mut self) {
-        if self.queued_slots_used() >= Self::MAX_QUEUED_ACTIONS {
-            return;
-        }
         self.waiting_for_faucet = true;
 
         if self.actions_in_flight.iter().filter(|a| match a { WalletAction::RequestFromFaucet => true, _ => false }).count() != 0 {
@@ -1011,17 +995,15 @@ impl WalletState {
     }
 
     pub fn stake_to_finalizer(&mut self, amount: u64, target_finalizer: [u8; 32]) {
-        if self.queued_slots_used() >= Self::MAX_QUEUED_ACTIONS {
+        if self.actions_in_flight.iter().filter(|a| match a { WalletAction::StakeToFinalizer(_,_) => true, _ => false }).count() != 0 {
             return;
         }
+
         self.waiting_for_stake_to_finalizer = true;
         self.actions_in_flight.push_back(WalletAction::StakeToFinalizer(Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_finalizer"), target_finalizer));
     }
 
     pub fn unstake_from_finalizer(&mut self, txid: [u8; 32]) {
-        if self.queued_slots_used() >= Self::MAX_QUEUED_ACTIONS {
-            return;
-        }
         let txid = TxId::from_bytes(txid);
         if self.actions_in_flight.iter().filter(|a| match a { WalletAction::UnstakeFromFinalizer(id) if id.eq(&txid) => true, _ => false }).count() != 0 {
             return;
@@ -1030,9 +1012,6 @@ impl WalletState {
     }
 
     pub fn retarget_bond(&mut self, txid: [u8; 32], new_target: [u8; 32]) {
-        if self.queued_slots_used() >= Self::MAX_QUEUED_ACTIONS {
-            return;
-        }
         let txid = TxId::from_bytes(txid);
         if self.actions_in_flight.iter().filter(|a| match a { WalletAction::RetargetBond(id, _to) if id.eq(&txid) => true, _ => false }).count() != 0 {
             return;
@@ -1041,9 +1020,6 @@ impl WalletState {
     }
 
     pub fn claim_bond(&mut self, txid: [u8; 32]) {
-        if self.queued_slots_used() >= Self::MAX_QUEUED_ACTIONS {
-            return;
-        }
         let txid = TxId::from_bytes(txid);
         if self.actions_in_flight.iter().filter(|a| match a { WalletAction::ClaimBond(id) if id.eq(&txid) => true, _ => false }).count() != 0 {
             return;
@@ -1052,13 +1028,17 @@ impl WalletState {
     }
 
     pub fn send_to_address(&mut self, address: String, amount: u64) {
-        if self.queued_slots_used() >= Self::MAX_QUEUED_ACTIONS {
-            return;
-        }
         let Ok(address) = UnifiedAddress::decode(&TEST_NETWORK /* @todo */, &address) else {
             println!("Invalid address for send: {}", address);
             return;
         };
+
+        if self.actions_in_flight.iter().filter(|a| match a {
+            WalletAction::SendToAddress(addr, amt) if amt.into_u64() == amount && addr.eq(&address) => true,
+            _ => false
+        }).count() != 0 {
+            return;
+        }
 
         self.waiting_for_send = true;
         self.actions_in_flight.push_back(WalletAction::SendToAddress(address, Zatoshis::from_u64(amount).expect("Invalid amount given to stake_to_finalizer")));
@@ -3437,9 +3417,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let mut proposed_faucet = ProposedTx::EMPTY;
     let mut proposed_miner_shield = ProposedTx::EMPTY;
-    // NOTE(Giovanni): Transaction queue for stake and send actions
-    let mut proposed_stake = VecDeque::<ProposedTx>::new();
-    let mut proposed_send = VecDeque::<ProposedTx>::new();
+    let mut proposed_stake = ProposedTx::EMPTY;
+    let mut proposed_send = ProposedTx::EMPTY;
 
     let mut wallet_state_push_time = Instant::now();
 
@@ -4308,41 +4287,36 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 user_withdrawable_funds += p.2;
             }
             user_wallet.care_about_bonds = stake_positions_bonded.iter().map(|p| p.0).chain(stake_positions_unbonded.iter().map(|p| p.0)).collect();
-            fn push_if_proposed_tx(arr: &mut Vec<WalletTx>, proposed: &ProposedTx, min_stage: BlockHeight) -> bool {
+
+            fn push_if_proposed_tx(arr: &mut[WalletTx], n: &mut usize, proposed: &ProposedTx, min_stage: BlockHeight) -> bool {
                 if proposed.is_in_progress() && proposed.tx.h >= min_stage && proposed.tx.h != BlockHeight::INVALID {
-                    arr.push(proposed.tx);
+                    // TODO: ordering by sequence number?
+                    arr[*n] = proposed.tx;
+                    *n += 1;
                     true
                 } else {
                     false
                 }
             }
-            let mut user_local_txs: Vec<WalletTx> = Vec::new();
-            let mut miner_local_txs: Vec<WalletTx> = Vec::new();
-            let mut waiting_for_send = false;
-            for proposed in &proposed_send {
-                waiting_for_send |= push_if_proposed_tx(&mut user_local_txs, proposed, BlockHeight::PROPOSED);
-            }
+            let mut user_local_txs = [WalletTx::EMPTY; 3];
+            let mut user_local_txs_n = 0;
+            let mut miner_local_txs = [WalletTx::EMPTY; 3];
+            let mut miner_local_txs_n = 0;
+            let waiting_for_send = push_if_proposed_tx(&mut user_local_txs, &mut user_local_txs_n, &proposed_send, BlockHeight::PROPOSED);
+            let waiting_for_stake_to_finalizer = push_if_proposed_tx(&mut user_local_txs, &mut user_local_txs_n, &proposed_stake, BlockHeight::PROPOSED);
+            let waiting_for_faucet = push_if_proposed_tx(&mut miner_local_txs, &mut miner_local_txs_n, &proposed_faucet, BlockHeight::PROPOSED);
+            let waiting_for_shield = push_if_proposed_tx(&mut miner_local_txs, &mut miner_local_txs_n, &proposed_miner_shield, BlockHeight::PROPOSED);
 
-            let mut waiting_for_stake_to_finalizer = false;
-            for proposed in &proposed_stake {
-                waiting_for_stake_to_finalizer |= push_if_proposed_tx(&mut user_local_txs, proposed, BlockHeight::PROPOSED);
-            }
-
-            let waiting_for_faucet = push_if_proposed_tx(&mut miner_local_txs, &proposed_faucet, BlockHeight::PROPOSED);
-            let waiting_for_shield = push_if_proposed_tx(&mut miner_local_txs, &proposed_miner_shield, BlockHeight::PROPOSED);
             // CHEATING USER-VIEW OF FAUCET BUILD
             if proposed_faucet.is_user_faucet {
                 let user_view_of_faucet_tx = ProposedTx {
                     tx: user_view_of_faucet_tx(&proposed_faucet.tx),
                     prep: None,
                     tx_res: None,
-                    last_send_attempt_h: BlockHeight::INVALID,
                     is_user_faucet: false,
                 };
-                push_if_proposed_tx(&mut user_local_txs, &user_view_of_faucet_tx, BlockHeight::PROPOSED);
+                push_if_proposed_tx(&mut user_local_txs, &mut user_local_txs_n, &user_view_of_faucet_tx, BlockHeight::PROPOSED);
             }
-            let user_local_txs_n = user_local_txs.len();
-            let miner_local_txs_n = miner_local_txs.len();
 
             let new_wallet_state_push_time = Instant::now();
             // println!("\n################ Wallet state period: {:#?}\n", new_wallet_state_push_time.duration_since(wallet_state_push_time));
@@ -4448,13 +4422,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                 let mut wallet_state = wallet_state.lock().unwrap();
 
                 if DUMP_ACTIONS { println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len()); }
-
-                //FIX(Giovanni): If there is a transaction in progress, don't process any new actions until the current one is complete.
-                if proposed_stake.front().is_some_and(|tx| tx.is_in_progress())
-                    || proposed_send.front().is_some_and(|tx| tx.is_in_progress())
-                {
-                    break;
-                }
                 let Some(action) = wallet_state.actions_in_flight.front() else {
                     // if we're not doing anything else, process a faucet RPC request
                     if ! proposed_faucet.is_in_progress() {
@@ -4488,16 +4455,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     proposed_faucet.is_user_faucet = true;
                     just_init_new_tx |= ok;
                     if DUMP_ACTIONS { println!("Try miner send: {ok:?}"); }
-                    ok
+                    true // ALT ok
                 }
 
                 &WalletAction::StakeToFinalizer(amount, target_finalizer) => {
-                    proposed_stake.push_back(ProposedTx::EMPTY);
-
-                    let mut proposed_tx = proposed_stake.back_mut().unwrap();
-                    let ok = user_wallet.stake_orchard_to_finalizer(network, &mut proposed_tx, &mut client, &user_usk, amount.into_u64(), &orchard_tree, target_finalizer).is_some();
-                    if !ok { proposed_stake.pop_back(); }
-
+                    let ok = user_wallet.stake_orchard_to_finalizer(network, &mut proposed_stake, &mut client, &user_usk, amount.into_u64(), &orchard_tree, target_finalizer).is_some();
                     println!("Try stake: {ok:?}");
                     just_init_new_tx |= ok;
                     ok
@@ -4505,61 +4467,32 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 WalletAction::SendToAddress(address, amount) => {
                     if let Some(orchard_address) = address.orchard() {
-                        proposed_send.push_back(ProposedTx::EMPTY);
-
-                        let mut proposed_tx = proposed_send.back_mut().unwrap();
                         let memo = MemoBytes::from_bytes("send from user wallet".as_bytes()).unwrap();
-                        let ok = user_wallet.send_orchard_to_orchard_zats(network, &mut proposed_tx, &mut client, &user_usk, amount.into_u64(), &orchard_tree, *orchard_address, memo).is_some();
-                        if !ok { proposed_send.pop_back(); }
-                        else {
-                        }
-
+                        let ok = user_wallet.send_orchard_to_orchard_zats(network, &mut proposed_send, &mut client, &user_usk, amount.into_u64(), &orchard_tree, *orchard_address, memo).is_some();
                         just_init_new_tx |= ok;
                         if DUMP_ACTIONS { println!("Try user send: {ok:?}"); }
-                        ok
+                        true // ALT ok
                     } else {
                         false
                     }
                 }
 
                 &WalletAction::UnstakeFromFinalizer(txid) => {
-                    proposed_stake.push_back(ProposedTx::EMPTY);
-
-                    let mut proposed_tx = proposed_stake.back_mut().unwrap();
-                    let ok = user_wallet.begin_unbonding_using_orchard(network, &mut proposed_tx, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).is_some();
-                    if !ok { proposed_stake.pop_back(); }
-                    else {
-                    }
-
+                    let ok = user_wallet.begin_unbonding_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).is_some();
                     just_init_new_tx |= ok;
                     if DUMP_ACTIONS { println!("Try unstake: {ok:?}"); }
                     ok
                 }
 
                 &WalletAction::RetargetBond(txid, new_target) => {
-                    proposed_stake.push_back(ProposedTx::EMPTY);
-
-                    let mut proposed_tx = proposed_stake.back_mut().unwrap();
-                    let ok = user_wallet.retarget_bond_using_orchard(network, &mut proposed_tx, &mut client, &user_usk, &orchard_tree, *txid.as_ref(), new_target).is_some();
-                    if !ok { proposed_stake.pop_back(); }
-                    else {
-                    }
-
+                    let ok = user_wallet.retarget_bond_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref(), new_target).is_some();
                     just_init_new_tx |= ok;
                     if DUMP_ACTIONS { println!("Try retarget: {ok:?}"); }
                     ok
                 }
 
                 &WalletAction::ClaimBond(txid) => {
-
-                    proposed_stake.push_back(ProposedTx::EMPTY);
-
-                    let mut proposed_tx = proposed_stake.back_mut().unwrap();
-                    let ok = user_wallet.claim_bond_using_orchard(network, &mut proposed_tx, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).await.is_some();
-                    if !ok { proposed_stake.pop_back(); }
-                    else {
-                    }
-
+                    let ok = user_wallet.claim_bond_using_orchard(network, &mut proposed_stake, &mut client, &user_usk, &orchard_tree, *txid.as_ref()).await.is_some();
                     just_init_new_tx |= ok;
                     if DUMP_ACTIONS { println!("Try withdraw stake: {ok:?}"); }
                     ok
@@ -4570,11 +4503,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             if !ok {
                 println!("** Failed to process action: {:?}", &action);
-                break;
             }
 
             wallet_state.lock().unwrap().actions_in_flight.pop_front();
-            break;  //FIX(Giovanni): Without this, the wallet will try to process the next action before the current one is complete.
         }
 
 
@@ -4617,12 +4548,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     // NOTE: do a full loop before returning here
                     BlockHeight::BUILT => {
-                        // NOTE(Giovanni): Avoid retry spam.
-                        if tx.last_send_attempt_h == wallet.chain_tip_h {
-                            return tx.tx;
-                        }
-                        tx.last_send_attempt_h = wallet.chain_tip_h;
-
                         let mut ok = false;
                         if let Some(tx_res) = &tx.tx_res {
                             ok = wallet.send_built_tx(network, client, &mut tx.tx, tx_res.transaction()).await;
@@ -4642,9 +4567,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         if ok {
                             *tx = ProposedTx::EMPTY; // Done. Don't retry
                         } else {
-                            // NOTE(Giovanni): Keep failed send at BUILT/OnBc so it stays at queue head and retries on later tip heights
-                            tx.tx.h = BlockHeight::BUILT;
-                            tx.tx.status = TxStatus::OnBc;
+                            *tx = ProposedTx::EMPTY; // TODO: fixed number of retries
                         }
 
                         result
@@ -4663,25 +4586,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
 
             continue_proposed_tx(&mut miner_wallet, network, &mut proposed_miner_shield, &mut client, "miner shield", DUMP_TX_SEND && false).await;
-            // NOTE(Giovanni): remove failed txs from the queue
-            while proposed_stake.front().is_some_and(|tx| !tx.is_in_progress()) {
-                proposed_stake.pop_front();
-            }
-            while proposed_send.front().is_some_and(|tx| !tx.is_in_progress()) {
-                proposed_send.pop_front();
-            }
-            // NOTE(Giovanni): continue the next tx in the queue
-            if let Some(tx) = proposed_stake.front_mut() {
-                continue_proposed_tx(&mut user_wallet, network, tx, &mut client, "stake", DUMP_TX_SEND).await;
-                if !tx.is_in_progress() {
-                    proposed_stake.pop_front();
-                }
-            } else if let Some(tx) = proposed_send.front_mut() {
-                continue_proposed_tx(&mut user_wallet, network, tx, &mut client, "send", DUMP_TX_SEND).await;
-                if !tx.is_in_progress() {
-                    proposed_send.pop_front();
-                }
-            }
+            continue_proposed_tx(&mut user_wallet,  network, &mut proposed_stake,        &mut client, "stake",        DUMP_TX_SEND).await;
+            continue_proposed_tx(&mut user_wallet,  network, &mut proposed_send,         &mut client, "send",         DUMP_TX_SEND).await;
         }
     }
 }
