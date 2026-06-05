@@ -22,16 +22,17 @@ impl Runnable for GenerateCmd {
     /// Start the application.
     #[allow(clippy::print_stdout)]
     fn run(&self) {
-        let default_config = ZebradConfig::default();
+        let default_config = ZebradConfig::crosslink_default();
         let mut output = r"# Default configuration for zebrad.
 #
 # This file can be used as a skeleton for custom configs.
 #
-# Unspecified fields use default values. Optional fields are Some(field) if the
-# field is present and None if it is absent.
+# It contains the fully-resolved Crosslink defaults, so running zebrad with this
+# file unmodified behaves exactly like running with no config file at all.
+# Optional fields are Some(field) if the field is present and None if it is absent.
 #
-# This file is generated as an example using zebrad's current defaults.
-# You should set only the config options you want to keep, and delete the rest.
+# You should set only the config options you want to change, and delete the rest;
+# any field you delete falls back to the same default shown here.
 # Only a subset of fields are present in the skeleton, since optional values
 # whose default is None are omitted.
 #

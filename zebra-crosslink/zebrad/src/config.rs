@@ -171,7 +171,44 @@ impl ZebradConfig {
         // println!("raw config: {raw_config:#?}");
         // Deserialize into our struct, which will use defaults for any missing fields
         let mut config: Self = raw_config.clone().try_deserialize()?;
+        config.apply_crosslink_defaults(&raw_config);
 
+        // Namespace the cache directory at load time. This is a transformation applied on
+        // top of whatever cache_dir is in effect (the default *or* a user-specified one),
+        // not a default value, so it is deliberately NOT serialized by `crosslink_default`
+        // / `generate` — load always appends it, which keeps generate-then-load equivalent
+        // to running with no config file.
+        config.state
+            .cache_dir
+            // .push("zebra_crosslink_workshop_season_one_v3_ehtedht_cache_delete_me");
+            .push("zebra_crosslink_workshop_season_one_test");
+
+        // if let zcash_protocol::consensus::Network::TestNetwork(_) = config.network.network
+        Ok(config)
+    }
+
+    /// Returns the fully-resolved Crosslink default configuration: identical to what
+    /// [`ZebradConfig::load`] produces when there is no config file and no environment
+    /// overrides. `zebrad generate` emits this, so that generating a config and running
+    /// with it unmodified behaves exactly like running with no config file at all.
+    pub fn crosslink_default() -> Self {
+        let empty = config::Config::builder()
+            .build()
+            .expect("an empty config source always builds");
+        let mut config = Self::default();
+        config.apply_crosslink_defaults(&empty);
+        // NB: the cache_dir namespace segment is intentionally not applied here — `load`
+        // appends it unconditionally, so baking it in would double-append on reload (and
+        // freeze the internal namespace into the generated file).
+        config
+    }
+
+    /// Applies Crosslink testnet defaults to every field that was not explicitly present
+    /// in `raw_config`. Fields already specified (in the file or environment) are left
+    /// untouched, making this idempotent: re-applying it to an already-resolved config
+    /// (such as a generated one) leaves it unchanged.
+    fn apply_crosslink_defaults(&mut self, raw_config: &config::Config) {
+        let config = self;
         {
             // set crosslink testnet defaults based on whether they were *specified*, which is slightly
             // more precise than whether they are currently Some/None
@@ -241,15 +278,6 @@ impl ZebradConfig {
             if let Err(config::ConfigError::NotFound(_)) = raw_config.get_bool("rpc.enable_cookie_auth") {
                 config.rpc.enable_cookie_auth = false;
             }
-
-            // unconditional append
-            config.state
-                .cache_dir
-                // .push("zebra_crosslink_workshop_season_one_v3_ehtedht_cache_delete_me");
-                .push("zebra_crosslink_workshop_season_one_test");
         }
-
-        // if let zcash_protocol::consensus::Network::TestNetwork(_) = config.network.network
-        Ok(config)
     }
 }
