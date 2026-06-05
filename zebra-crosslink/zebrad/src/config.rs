@@ -216,8 +216,7 @@ impl ZebradConfig {
         // to running with no config file.
         config.state
             .cache_dir
-            // .push("zebra_crosslink_workshop_season_one_v3_ehtedht_cache_delete_me");
-            .push("zebra_crosslink_workshop_season_one_test");
+            .push("zebra_crosslink_workshop_season_one_v3_ehtedht_cache_delete_me");
 
         // if let zcash_protocol::consensus::Network::TestNetwork(_) = config.network.network
         Ok(config)
@@ -232,22 +231,20 @@ impl ZebradConfig {
         Self {
             crosslink: zebra_crosslink::config::Config {
                 bft_peers: vec![
-                    "108.61.103.59:12301".to_owned(),
-                    // "70.34.201.146:12301".to_owned(),
-                    // "70.34.209.22:12301".to_owned(),
-                    // "70.34.195.191:12301".to_owned(),
-                    // "70.34.209.18:12301".to_owned(),
+                    "70.34.201.146:12301".to_owned(), // @terminator
+                    "70.34.209.22:12301".to_owned(),  // @terminator
+                    "70.34.195.191:12301".to_owned(), // @terminator
+                    "70.34.209.18:12301".to_owned(),  // @terminator
                 ],
                 ..Default::default()
             },
 
             state: zebra_state::config::Config {
                 network_initial_peers: vec![
-                    "[::ffff:108.61.103.59]:12001:1fgEw5Nx:PCf4WR-YrxlPU6oJrm8-ypcD3Yn0oxoFjNEYhx3vCWM".to_owned(),
-                    // "[::ffff:70.34.201.146]:12001:1fgEw5Nx:_BA-d-zgMDO3lj5R-FgL3VwJQofnPVZarZSUzx9ZMhs".to_owned(),
-                    // "[::ffff:70.34.209.22]:12001:1fgEw5Nx:2huJ7vzzieTrT_dFMaQwhS0fSGZFatCeBXNFCXTfJCs".to_owned(),
-                    // "[::ffff:70.34.195.191]:12001:1fgEw5Nx:iezUrR8zwiqzt1__9Ex0OiqQ1O0gbipHuuKwCHwQggo".to_owned(),
-                    // "[::ffff:70.34.209.18]:12001:1fgEw5Nx:9nM4V10MYltC-ShN4OaEQlvDiFHEJtsOYmOroLBanQM".to_owned(),
+                    "[::ffff:70.34.201.146]:12001:1fgEw5Nx:_BA-d-zgMDO3lj5R-FgL3VwJQofnPVZarZSUzx9ZMhs".to_owned(), // @terminator
+                    "[::ffff:70.34.209.22]:12001:1fgEw5Nx:2huJ7vzzieTrT_dFMaQwhS0fSGZFatCeBXNFCXTfJCs".to_owned(),  // @terminator
+                    "[::ffff:70.34.195.191]:12001:1fgEw5Nx:iezUrR8zwiqzt1__9Ex0OiqQ1O0gbipHuuKwCHwQggo".to_owned(), // @terminator
+                    "[::ffff:70.34.209.18]:12001:1fgEw5Nx:9nM4V10MYltC-ShN4OaEQlvDiFHEJtsOYmOroLBanQM".to_owned(),  // @terminator
                 ],
                 ..Default::default()
             },
@@ -255,7 +252,10 @@ impl ZebradConfig {
             network: zebra_network::config::Config {
                 initial_testnet_peers: {
                     let mut peers = indexmap::IndexSet::new();
-                    peers.insert("108.61.103.59:8233".to_owned());
+                    peers.insert("70.34.201.146:8233".to_owned()); // @terminator
+                    peers.insert("70.34.209.22:8233".to_owned());  // @terminator
+                    peers.insert("70.34.195.191:8233".to_owned()); // @terminator
+                    peers.insert("70.34.209.18:8233".to_owned());  // @terminator
                     peers
                 },
 
