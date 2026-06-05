@@ -121,10 +121,8 @@ pub mod config {
         /// Public address for this node, e.g. "/ip4/127.0.0.1/udp/24834/quic-v1" if testing
         /// internally, or the public IP address if using externally.
         pub public_address: Option<String>,
-        /// temp seed for private/public key pair
-        pub insecure_user_name: Option<String>,
         /// Use the public IP instead of the generated seed
-        pub public_ip_is_seed: bool,
+        pub explicit_bft_key_seed: Option<String>,
         /// List of public IP addresses for peers, in the same format as `public_address`.
         pub bft_peers: Vec<String>,
         /// Disable the headless wallet.
@@ -136,9 +134,8 @@ pub mod config {
         fn default() -> Self {
             Self {
                 public_address: None,
-                insecure_user_name: None,
                 bft_peers: Vec::new(),
-                public_ip_is_seed: false,
+                explicit_bft_key_seed: None,
                 disable_the_headless_wallet: false,
                 disable_zaino: false,
             }
@@ -908,14 +905,14 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         .unwrap_or(format!("127.0.0.1:{}", rand::thread_rng().next_u32() % 45869 + 2000));
     info!("public IP: {}", public_ip_string);
 
-    let user_name = if config.public_ip_is_seed {
-        public_ip_string.clone()
+    let bft_key_seed = if let Some(explicit_bft_key_seed) = config.explicit_bft_key_seed {
+        explicit_bft_key_seed.clone()
     } else {
         format!("adrheardhed{:?}", global_seed)
     };
 
-    let (mut rng, my_private_key, my_public_key) =
-        rng_private_public_key_from_address(&user_name.as_bytes());
+    let (_, my_private_key, my_public_key) =
+        rng_private_public_key_from_address(&bft_key_seed.as_bytes());
     internal_handle.internal.lock().await.my_public_key = my_public_key;
 
     {

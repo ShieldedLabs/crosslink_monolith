@@ -151,15 +151,15 @@ pub fn spawn_new_tfl_service(
                 .public_address
                 .clone()
                 .unwrap_or(String::from_str("/ip4/127.0.0.1/udp/45869/quic-v1").unwrap());
-            let user_name = config
-                .insecure_user_name
+            let bft_key_seed = config
+                .explicit_bft_key_seed
                 .clone()
                 .unwrap_or(public_ip_string);
             // .unwrap_or(String::from_str("tester").unwrap());
-            info!("user_name: {}", user_name);
-            let (_, _, public_key) = rng_private_public_key_from_address(&user_name.as_bytes());
+            info!("bft_key_seed: {}", bft_key_seed);
+            let (_, _, public_key) = rng_private_public_key_from_address(&bft_key_seed.as_bytes());
             array.push(RosterMember { pub_key:public_key.0, voting_power: 1, txids: Vec::new() });
-            map.insert(public_key, user_name);
+            map.insert(public_key, bft_key_seed);
         }
 
         (array, map)
