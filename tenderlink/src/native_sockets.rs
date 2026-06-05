@@ -1370,6 +1370,9 @@ mod macos {
                 return None;
             }
 
+            // Best-effort: on a dual-stack AF_INET6 socket, macOS rejects the
+            // IPv4-level IP_DONTFRAG with EINVAL (the IPV6_DONTFRAG above already
+            // covers fragmentation control). Don't treat this as fatal.
             let ip_dontfrag: libc::c_int = 1;
             if libc::setsockopt(
                 fd,
@@ -1379,8 +1382,7 @@ mod macos {
                 std::mem::size_of_val(&ip_dontfrag) as libc::socklen_t,
             ) != 0
             {
-                eprintln!("Failed to set IP_DONTFRAG: {}", std::io::Error::last_os_error());
-                return None;
+                eprintln!("Failed to set IP_DONTFRAG (non-fatal): {}", std::io::Error::last_os_error());
             }
         }
 
