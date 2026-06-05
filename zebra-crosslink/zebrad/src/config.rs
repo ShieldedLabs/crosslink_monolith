@@ -171,7 +171,43 @@ impl ZebradConfig {
         // println!("raw config: {raw_config:#?}");
         // Deserialize into our struct, which will use defaults for any missing fields
         let mut config: Self = raw_config.clone().try_deserialize()?;
-        config.apply_crosslink_defaults(&raw_config);
+
+        // set crosslink testnet defaults based on whether they were *specified*, which is slightly
+        // more precise than whether they are currently Some/None
+        {
+            let defaults = Self::crosslink_default();
+
+            match raw_config.get("network.network") {
+                Err(config::ConfigError::NotFound(_)) |
+                    Ok("Testnet") =>
+                    config.network.network = defaults.network.network,
+
+                _ => {}
+            }
+
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_array("crosslink.bft_peers") {
+                config.crosslink.bft_peers = defaults.crosslink.bft_peers;
+            }
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_array("network.initial_testnet_peers") {
+                config.network.initial_testnet_peers = defaults.network.initial_testnet_peers;
+            }
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_array("state.network_initial_peers") {
+                config.state.network_initial_peers = defaults.state.network_initial_peers ;
+            }
+
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_int("mempool.debug_enable_at_height") {
+                config.mempool.debug_enable_at_height = defaults.mempool.debug_enable_at_height;
+            }
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_string("mining.internal_miner") {
+                config.mining.internal_miner = defaults.mining.internal_miner;
+            }
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_string("rpc.listen_addr") {
+                config.rpc.listen_addr = defaults.rpc.listen_addr;
+            }
+            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_bool("rpc.enable_cookie_auth") {
+                config.rpc.enable_cookie_auth = defaults.rpc.enable_cookie_auth;
+            }
+        }
 
         // Namespace the cache directory at load time. This is a transformation applied on
         // top of whatever cache_dir is in effect (the default *or* a user-specified one),
@@ -187,41 +223,43 @@ impl ZebradConfig {
         Ok(config)
     }
 
-    /// Returns the fully-resolved Crosslink default configuration: identical to what
-    /// [`ZebradConfig::load`] produces when there is no config file and no environment
-    /// overrides. `zebrad generate` emits this, so that generating a config and running
-    /// with it unmodified behaves exactly like running with no config file at all.
     pub fn crosslink_default() -> Self {
-        let empty = config::Config::builder()
-            .build()
-            .expect("an empty config source always builds");
-        let mut config = Self::default();
-        config.apply_crosslink_defaults(&empty);
-        // NB: the cache_dir namespace segment is intentionally not applied here — `load`
-        // appends it unconditionally, so baking it in would double-append on reload (and
-        // freeze the internal namespace into the generated file).
-        config
-    }
+        use zebra_chain::{
+            block::Height,
+            parameters::{subsidy::FundingStreamReceiver, testnet, Magic},
+        };
 
-    /// Applies Crosslink testnet defaults to every field that was not explicitly present
-    /// in `raw_config`. Fields already specified (in the file or environment) are left
-    /// untouched, making this idempotent: re-applying it to an already-resolved config
-    /// (such as a generated one) leaves it unchanged.
-    fn apply_crosslink_defaults(&mut self, raw_config: &config::Config) {
-        let config = self;
-        {
-            // set crosslink testnet defaults based on whether they were *specified*, which is slightly
-            // more precise than whether they are currently Some/None
+        Self {
+            crosslink: zebra_crosslink::config::Config {
+                bft_peers: vec![
+                    "108.61.103.59:12301".to_owned(),
+                    // "70.34.201.146:12301".to_owned(),
+                    // "70.34.209.22:12301".to_owned(),
+                    // "70.34.195.191:12301".to_owned(),
+                    // "70.34.209.18:12301".to_owned(),
+                ],
+                ..Default::default()
+            },
 
-            use zebra_chain::{
-                block::Height,
-                parameters::{subsidy::FundingStreamReceiver, testnet, Magic},
-            };
+            state: zebra_state::config::Config {
+                network_initial_peers: vec![
+                    "[::ffff:108.61.103.59]:12001:1fgEw5Nx:PCf4WR-YrxlPU6oJrm8-ypcD3Yn0oxoFjNEYhx3vCWM".to_owned(),
+                    // "[::ffff:70.34.201.146]:12001:1fgEw5Nx:_BA-d-zgMDO3lj5R-FgL3VwJQofnPVZarZSUzx9ZMhs".to_owned(),
+                    // "[::ffff:70.34.209.22]:12001:1fgEw5Nx:2huJ7vzzieTrT_dFMaQwhS0fSGZFatCeBXNFCXTfJCs".to_owned(),
+                    // "[::ffff:70.34.195.191]:12001:1fgEw5Nx:iezUrR8zwiqzt1__9Ex0OiqQ1O0gbipHuuKwCHwQggo".to_owned(),
+                    // "[::ffff:70.34.209.18]:12001:1fgEw5Nx:9nM4V10MYltC-ShN4OaEQlvDiFHEJtsOYmOroLBanQM".to_owned(),
+                ],
+                ..Default::default()
+            },
 
-            match raw_config.get("network.network") {
-                Err(config::ConfigError::NotFound(_)) |
-                Ok("Testnet") =>
-                config.network.network = testnet::Parameters::build()
+            network: zebra_network::config::Config {
+                initial_testnet_peers: {
+                    let mut peers = indexmap::IndexSet::new();
+                    peers.insert("108.61.103.59:8233".to_owned());
+                    peers
+                },
+
+                network: testnet::Parameters::build()
                     // .with_network_name("Crosslink_Testnet_0")
                     .with_network_magic(Magic([67, 108, 84, 48]))
                     .with_slow_start_interval(Height(0))
@@ -236,48 +274,26 @@ impl ZebradConfig {
                     }])
                 .to_network(),
 
-                _ => {}
-            }
+                ..Default::default()
+            },
 
-            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_array("crosslink.bft_peers") {
-                config.crosslink.bft_peers = vec![
-                    "108.61.103.59:12301".to_owned(),
-                    // "70.34.201.146:12301".to_owned(),
-                    // "70.34.209.22:12301".to_owned(),
-                    // "70.34.195.191:12301".to_owned(),
-                    // "70.34.209.18:12301".to_owned(),
-                ];
-            }
-            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_array("network.initial_testnet_peers") {
-                config.network.initial_testnet_peers.clear();
-                config.network.initial_testnet_peers.insert("108.61.103.59:8233".to_owned());
-                // config.network.initial_testnet_peers.insert("70.34.201.146:8233".to_owned());
-                // config.network.initial_testnet_peers.insert("70.34.209.22:8233".to_owned());
-                // config.network.initial_testnet_peers.insert("70.34.195.191:8233".to_owned());
-                // config.network.initial_testnet_peers.insert("70.34.209.18:8233".to_owned());
-            }
-            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_array("state.network_initial_peers") {
-                config.state.network_initial_peers = vec![
-                    "[::ffff:108.61.103.59]:12001:1fgEw5Nx:PCf4WR-YrxlPU6oJrm8-ypcD3Yn0oxoFjNEYhx3vCWM".to_owned(),
-                    // "[::ffff:70.34.201.146]:12001:1fgEw5Nx:_BA-d-zgMDO3lj5R-FgL3VwJQofnPVZarZSUzx9ZMhs".to_owned(),
-                    // "[::ffff:70.34.209.22]:12001:1fgEw5Nx:2huJ7vzzieTrT_dFMaQwhS0fSGZFatCeBXNFCXTfJCs".to_owned(),
-                    // "[::ffff:70.34.195.191]:12001:1fgEw5Nx:iezUrR8zwiqzt1__9Ex0OiqQ1O0gbipHuuKwCHwQggo".to_owned(),
-                    // "[::ffff:70.34.209.18]:12001:1fgEw5Nx:9nM4V10MYltC-ShN4OaEQlvDiFHEJtsOYmOroLBanQM".to_owned(),
-                ];
-            }
+            rpc: zebra_rpc::config::rpc::Config {
+                listen_addr: Some("127.0.0.1:8232".parse().unwrap()),
+                enable_cookie_auth: false,
+                ..Default::default()
+            },
 
-            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_int("mempool.debug_enable_at_height") {
-                config.mempool.debug_enable_at_height = Some(0);
-            }
-            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_string("mining.internal_miner") {
-                config.mining.internal_miner = true;
-            }
-            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_string("rpc.listen_addr") {
-                config.rpc.listen_addr = Some("127.0.0.1:8232".parse().unwrap());
-            }
-            if let Err(config::ConfigError::NotFound(_)) = raw_config.get_bool("rpc.enable_cookie_auth") {
-                config.rpc.enable_cookie_auth = false;
-            }
+            mempool: crate::components::mempool::Config {
+                debug_enable_at_height: Some(0),
+                ..Default::default()
+            },
+
+            mining: zebra_rpc::config::mining::Config {
+                internal_miner: true,
+                ..Default::default()
+            },
+
+            ..Default::default()
         }
     }
 }
