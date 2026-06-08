@@ -36,7 +36,7 @@ let
     in
     (crane.mkLib pkgs).overrideToolchain fromToolchainFile;
 
-  flakelib = {
+  flakelib = rec {
     nixpkgs = pkgs;
 
     # select-source :: {
@@ -54,7 +54,7 @@ let
         inherit (pkgs.lib.fileset) toSource unions;
         inherit (pkgs.lib.trivial) flip;
         inherit (pkgs) symlinkJoin;
-        inherit (flakelib) run-command;
+        inherit run-command;
 
         base-name = "${pname}-src-${name-suffix}";
 
