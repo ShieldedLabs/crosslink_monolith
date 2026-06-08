@@ -39,7 +39,7 @@ pub struct ResponseFromZebra {
     pub bc_blocks: Vec<BcBlock>,
     pub bft_blocks: Vec<BftBlock>,
     pub what_block_it_is: Hash32,
-    pub json_dump_of_the_block: String, // @Todo: @Remove and replace with structured data.
+    pub block_serialization: Vec<u8>, // @Todo: @Remove and replace with structured data.
     // @Todo: pub block_inspection: BlockInspection,
     pub start_bc_height: u64,
 
@@ -60,7 +60,7 @@ impl ResponseFromZebra {
             bc_blocks: Vec::new(),
             bft_blocks: Vec::new(),
             what_block_it_is: Hash32::from_u64(0),
-            json_dump_of_the_block: "Data not available.".to_owned(),
+            block_serialization: Vec::new(),
             // @Todo: block_inspection: BlockInspection::None,
             start_bc_height: 0,
             orchard_pool_balance: 0,
@@ -236,7 +236,7 @@ pub struct VizState {
     pub last_frame_hovered_hash: Hash32,
 
     pub inspecting_block_hash: Hash32,
-    pub inspect_block_json_text: Option<String>,
+    pub block_serialization: Option<Vec<u8>>,
 
     pub should_reset_clay_text_cache: bool,
 
@@ -466,7 +466,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         last_frame_hovered_hash: Hash32::from_u64(0),
 
         inspecting_block_hash: Hash32::from_u64(0),
-        inspect_block_json_text: None,
+        block_serialization: None,
         should_reset_clay_text_cache: false,
 
         inspecting_block_screen_x: 0.0,
@@ -587,7 +587,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
 
         if message.what_block_it_is == viz_state.inspecting_block_hash {
             viz_state.should_reset_clay_text_cache = true;
-            viz_state.inspect_block_json_text = Some(message.json_dump_of_the_block);
+            viz_state.block_serialization = Some(message.block_serialization);
         }
 
         let zoom = ZOOM_FACTOR.powf(viz_state.zoom);
@@ -1646,7 +1646,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         viz_state.inspecting_block_hash = hovered_block;
         viz_state.inspecting_block_screen_x = hovered_block_screen_x;
         viz_state.inspecting_block_screen_y = hovered_block_screen_y;
-        viz_state.inspect_block_json_text = None;
+        viz_state.block_serialization = None;
     }
 
     let ww = draw_ctx.window_width as f32;

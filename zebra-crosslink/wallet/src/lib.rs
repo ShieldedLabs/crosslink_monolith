@@ -45,6 +45,7 @@ use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_note_encryption::{try_compact_note_decryption, try_note_decryption, try_output_recovery_with_ovk, ShieldedOutput};
 pub use zcash_primitives::bft;
+pub use zcash_primitives::block::BlockHeader;
 pub use bft::{FinalizerRecencyStatus, TFLRecencyStatus};
 use zcash_primitives::transaction::builder::{self, BuildConfig, Builder as TxBuilder, BuildResult as TxBuildResult};
 use zcash_primitives::transaction::components::TxOut;
