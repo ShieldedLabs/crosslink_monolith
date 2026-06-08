@@ -598,14 +598,14 @@ impl StateService {
     /// in RFC0005.
     ///
     /// [1]: https://zebra.zfnd.org/dev/rfcs/0005-state-updates.html#committing-non-finalized-blocks
-    #[instrument(level = "debug", skip(self, semantically_verrified))]
+    #[instrument(level = "debug", skip(self, semantically_verified))]
     fn queue_and_commit_to_non_finalized_state(
         &mut self,
-        semantically_verrified: SemanticallyVerifiedBlock,
+        semantically_verified: SemanticallyVerifiedBlock,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
-        tracing::debug!(block = %semantically_verrified.block, "queueing block for contextual verification");
-        let block_height = semantically_verrified.block.coinbase_height().unwrap_or(zebra_chain::block::Height(0));
-        let parent_hash = semantically_verrified.block.header.previous_block_hash;
+        tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
+        let block_height = semantically_verified.block.coinbase_height().unwrap_or(zebra_chain::block::Height(0));
+        let parent_hash = semantically_verified.block.header.previous_block_hash;
         let parent_block_header = self.read_service.non_finalized_state_receiver.with_watch_data(
             |non_finalized_state| {
                 let mut ret = None;
@@ -620,20 +620,20 @@ impl StateService {
         let parent_block_header = if parent_block_header.is_some() { parent_block_header } else { self.read_service.db.block_header(crate::HashOrHeight::Hash(parent_hash)) };
         let parent_block_fat_pointer = parent_block_header.map(|h| h.fat_pointer_to_bft_block.clone());
 
-        let this_header_fat_pointer = semantically_verrified.block.header.fat_pointer_to_bft_block.clone();
-        let semantically_verrified_height = semantically_verrified.height;
+        let this_header_fat_pointer = semantically_verified.block.header.fat_pointer_to_bft_block.clone();
+        let semantically_verified_height = semantically_verified.height;
 
         // BAD? Bug? sent_hashes is never cleaned up on failure, so this can
         // permanently block re-commits. But removing it causes duplicate chains
         // in non_finalized_state which crashes in chain.rs Ord impl.
         if self
             .non_finalized_block_write_sent_hashes
-            .contains(&semantically_verrified.hash)
+            .contains(&semantically_verified.hash)
         {
             let (rsp_tx, rsp_rx) = oneshot::channel();
             let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
                 ValidateContextError::DuplicateCommitRequest {
-                    block_hash: semantically_verrified.hash,
+                    block_hash: semantically_verified.hash,
                 },
             )));
             return rsp_rx;
@@ -642,12 +642,12 @@ impl StateService {
         if self
             .read_service
             .db
-            .contains_height(semantically_verrified.height)
+            .contains_height(semantically_verified.height)
         {
             let (rsp_tx, rsp_rx) = oneshot::channel();
             let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
                 ValidateContextError::AlreadyFinalized {
-                    block_height: semantically_verrified.height,
+                    block_height: semantically_verified.height,
                 },
             )));
             return rsp_rx;
@@ -658,21 +658,21 @@ impl StateService {
         // it with the newer request.
         let rsp_rx = if let Some((_, old_rsp_tx)) = self
             .non_finalized_state_queued_blocks
-            .get_mut(&semantically_verrified.hash)
+            .get_mut(&semantically_verified.hash)
         {
             tracing::debug!("replacing older queued request with new request");
             let (mut rsp_tx, rsp_rx) = oneshot::channel();
             std::mem::swap(old_rsp_tx, &mut rsp_tx);
             let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
                 ValidateContextError::ReplacedByNewerRequest {
-                    block_hash: semantically_verrified.hash,
+                    block_hash: semantically_verified.hash,
                 },
             )));
             rsp_rx
         } else {
             let (rsp_tx, rsp_rx) = oneshot::channel();
             self.non_finalized_state_queued_blocks
-                .queue((semantically_verrified, rsp_tx));
+                .queue((semantically_verified, rsp_tx));
             rsp_rx
         };
 
@@ -696,7 +696,7 @@ impl StateService {
                 let (rsp_tx, rsp_rx) = oneshot::channel();
                 let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
                     ValidateContextError::CrosslinkNotReady {
-                        block_height: semantically_verrified_height,
+                        block_height: semantically_verified_height,
                     },
                 )));
                 return rsp_rx;
@@ -725,7 +725,7 @@ impl StateService {
                 let (rsp_tx, rsp_rx) = oneshot::channel();
                 let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
                     ValidateContextError::CrosslinkNotReady {
-                        block_height: semantically_verrified_height,
+                        block_height: semantically_verified_height,
                     },
                 )));
                 return rsp_rx;
