@@ -1,0 +1,39 @@
+name: Nix Verification
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  nix-verify:
+    name: Verify nix build and develop
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zebra-crosslink
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@v30
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'zebra-crosslink/flake.lock', 'flake.nix', 'zebra-crosslink/flake.nix', 'zebra-crosslink/flake/**/*.nix') }}  # yamllint disable-line rule:line-length
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-
+          purge-created: 0
+          purge-primary-key: never
+      - name: Verify nix build
+        run: nix build --print-build-logs
+      - name: Verify nix develop cargo build
+        run: nix develop --command cargo build
