@@ -33,6 +33,9 @@ jobs:
           purge-prefixes: nix-${{ runner.os }}-
           purge-created: 0
           purge-primary-key: never
+      - name: Verify root nix build
+        working-directory: ${{ github.workspace }}
+        run: nix build --print-build-logs
       - name: Verify nix build
         run: nix build --print-build-logs
       - name: Verify nix develop cargo build
