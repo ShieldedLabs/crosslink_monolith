@@ -210,6 +210,29 @@ pub async fn service_viz_requests(
 
                         // TODO: compute the finalized tip height!
                     };
+                    
+                    // NOTE(Giovanni): fallback to find the block in the BC and BFT chains.
+                    if response.what_block_it_is == Hash32::from_u64(0)
+                    && request.want_to_inspect_block != Hash32::from_u64(0)
+                    {
+                        let want = request.want_to_inspect_block;
+                        drop(internal);
+                        let hash = ZebBlockHash(want.as_bytes());
+                        if let Some(bc) = crate::block_from_hash(&call, hash).await {
+                            response.what_block_it_is = want;
+                            response.block_serialization = bc.zcash_serialize_to_vec().unwrap_or_default();
+                        } else {
+                            let internal = tfl_handle.internal.lock().await;
+                            for b in internal.bft_blocks.iter() {
+                                let this_hash = Hash32::from_bytes(b.blake3_hash().0);
+                                if want == this_hash {
+                                    response.what_block_it_is = want;
+                                    response.block_serialization = b.zcash_serialize_to_vec().unwrap_or_default();
+                                    break;
+                                }
+                            }
+                        }
+                    }
 
                     let _ = response_queue.try_send(response);
                 } else {
