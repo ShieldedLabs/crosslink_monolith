@@ -4371,7 +4371,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         let inspect_outer_id = id("Block Inspector Outer");
         let scroll_id = id("Block Inspector Scroll");
         let resize_id = id("Block Inspector Resize");
-        let (scroll_id, clip, scroll_ref, content_h, viewport_h, max) = ui.scroll_container(data, scroll_id, 0.0);
+        let (scroll_id, clip, scroll, content_h, viewport_h, max) = ui.scroll_container(data, scroll_id, 0.0);
+        let scroll = *scroll;
 
         if ui.hovered(inspect_outer_id) {
             ui.capture = true;
@@ -4380,21 +4381,12 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
         let inspector_w = ui.scale(480.0).min(ui.draw().window_width as f32 * 0.45);
         let inspector_h = ui.scale(420.0).min(ui.draw().window_height as f32 * 0.6);
 
-        let title_bar_h = ui.scale(40.0);
-        let title_pad = ui.scale(12.0);
-        let close_btn_r = ui.scale(14.0);
-
         let resize_hover = ui.hovered_raw(resize_id);
         if resize_hover || ui.mouse_pressed_id == resize_id {
             ui.cursor = winit::window::Cursor::Icon(winit::window::CursorIcon::NwseResize);
         }
         if resize_hover && ui.input().mouse_pressed(MouseButton::Left) {
             ui.mouse_pressed_id = resize_id;
-        }
-        if ui.mouse_pressed_id == resize_id && ui.input().mouse_held(MouseButton::Left) {
-            let mx = ui.input().mouse_pos().0 as f32;
-            let my = ui.input().mouse_pos().1 as f32;
-            let data_mx = data.scroll_containers.get(&resize_id.id);
         }
 
         let border_colour = { let mut col = PANE_COL.hsva(); col.2 = 0x22; col.rgba() };
@@ -4412,141 +4404,242 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             ..Decl
         }) {
             let scroll_pad = ui.scale(14.0);
+            let scrollbar_pad = ui.scale(6.0);
+            let scrollbar_edge_pad = ui.scale(6.0);
+            let scrollbar_radius = ui.scale(3.0);
+            let scrollbar_thin = scrollbar_pad + scrollbar_radius * 2.0 + scrollbar_edge_pad;
+
             if let _ = elem().decl(Decl {
-                id: scroll_id,
-                clip,
-                colour: PANE_COL,
-                padding: (scroll_pad, scroll_pad, scroll_pad, scroll_pad),
-                child_gap: ui.scale(8.0),
-                radius: (ui.scale(8.0)).dup4(),
-                width:  percent!(1.0),
+                width: percent!(1.0),
                 height: grow!(),
                 direction: TopToBottom,
+                align: TopLeft,
+                padding: (scrollbar_edge_pad, 0.0, scrollbar_edge_pad, 0.0),
                 ..Decl
             }) {
-                let section_hdr = TextDecl { h: ui.scale(13.0), colour: WHITE.mul(0.45), align: AlignX::Left, ..TextDecl };
-                let body_text = TextDecl { font: Mono, h: ui.scale(13.0), colour: WHITE.mul(0.85), wrap: Wrap::None, align: AlignX::Left, ..TextDecl };
-
-                ui.text("HASH", section_hdr);
-                ui.text(frame_strf!(data, "{}", viz.inspecting_block_hash), TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
-
-                // "Copy hash" button
-                {
-                    let copy_id = id("Block Inspector Copy Hash");
-                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, copy_id, true, winit::window::CursorIcon::Default);
-                    let radius = ui.scale(14.0);
-                    if let _ = elem().decl(Decl {
-                        id: copy_id,
-                        colour,
-                        padding,
-                        radius: radius.dup4(),
-                        align: Center,
-                        width:  fit!(),
-                        height: fit!(radius * 2.0),
-                        ..Decl
-                    }) {
-                        ui.text("Copy hash", TextDecl { h: ui.scale(13.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
-                    }
-                    if clicked {
-                        let hash_str = format!("{}", viz.inspecting_block_hash);
-                        ui.input().send_to_clipboard(&hash_str);
-                    }
-                }
-
-                let _ = elem().decl(Decl {
-                    width: percent!(1.0),
-                    height: fixed!(1.0),
-                    colour: WHITE.mul(0.08),
-                    ..Decl
-                });
-
-                let text = if let Some(bytes) = viz.block_serialization.as_ref() {
-                    ui.text("RAW DATA", section_hdr);
-                
-                    if viz.inspecting_block_is_bft() {
-                        match wallet::bft::BftBlock::zcash_deserialize(&bytes[..]) {
-                            Ok(bft) => frame_strf!(data, "{:#?}", bft).to_string(),
-                            Err(e) => format!("Failed to parse BFT block: {e}"),
-                        }
-                    } else {
-                        match wallet::BlockHeader::read_data(&bytes[..]) {
-                            Ok(header) => frame_strf!(data, "{:#?}", header).to_string(),
-                            Err(e) => format!("Failed to parse PoW block header: {e}"),
-                        }
-                    }
-                } else {
-                    String::from("Loading info for block ...")
+                let (content_w, viewport_w, scroll_x_val) = {
+                    let s = data.scroll_containers.entry(scroll_id.id).or_insert(Default::default());
+                    (s.content_width, s.viewport_width, s.scroll_x)
                 };
-                // "Copy data" button
-                {
-                    let copy_id = id("Block Inspector Copy Data");
-                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, copy_id, true, winit::window::CursorIcon::Default);
-                    let radius = ui.scale(14.0);
-                    if let _ = elem().decl(Decl {
-                        id: copy_id,
-                        colour,
-                        padding,
-                        radius: radius.dup4(),
-                        align: Center,
-                        width:  fit!(),
-                        height: fit!(radius * 2.0),
-                        ..Decl
-                    }) {
-                        ui.text("Copy data", TextDecl { h: ui.scale(13.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
-                    }
-                    if clicked {
-                        let data_str = format!("{}", text);
-                        ui.input().send_to_clipboard(&data_str);
-                    }
-                }
-                ui.text(frame_strf!(data, "{}", text), body_text);
-            }
+                let max_x = (content_w - viewport_w) / ui.scale;
 
-            let scroll_container_state = data.scroll_containers.entry(scroll_id.id).or_insert(Default::default());
-            let content_w = scroll_container_state.content_width;
-            let viewport_w = scroll_container_state.viewport_width;
-            let max_x = (content_w - viewport_w) / ui.scale;
-            let scroll_x_val = scroll_container_state.scroll_x;
-            let h_scrollbar_w = ui.scale(32.0);
+                let fallback_pane_h = inspector_h - scrollbar_edge_pad - scrollbar_thin;
+                let fallback_pane_w = inspector_w - scrollbar_edge_pad - scrollbar_thin;
+                let effective_viewport_h = if viewport_h > 0.0 { viewport_h } else { (fallback_pane_h - scroll_pad * 2.0).max(0.0) };
+                let effective_viewport_w = if viewport_w > 0.0 { viewport_w } else { (fallback_pane_w - scroll_pad * 2.0).max(0.0) };
+                let scrollbar_region_h = (effective_viewport_h + 2.0 * scroll_pad - 2.0 * scrollbar_pad).max(scrollbar_radius * 3.0);
+                let scrollbar_region_w = (effective_viewport_w + 2.0 * scroll_pad - 2.0 * scrollbar_pad).max(scrollbar_radius * 3.0);
+                let handle_height = {
+                    let handle_pct = if content_h == 0.0 { 1.0 } else { effective_viewport_h / content_h };
+                    (handle_pct * scrollbar_region_h).max(scrollbar_radius * 3.0).min(scrollbar_region_h)
+                };
+                let scroll_pct = (if max == 0.0 { 0.0 } else { scroll / max }).clamp(0.0, 1.0);
+                let handle_offset_y = scroll_pct * (scrollbar_region_h - handle_height);
+                let v_scroll_active = max > 0.0 && handle_height < scrollbar_region_h;
 
-            if max_x > 0.0 {
-                let scroll_pct_x = (if max_x == 0.0 { 0.0 } else { scroll_x_val / max_x }).max(0.0).min(1.0);
-                let handle_pct_x = if content_w == 0.0 { 1.0 } else { viewport_w / content_w };
-                let scrollbar_region_w = viewport_w / ui.scale - scroll_pad * 2.0;
-                let handle_w = (handle_pct_x * scrollbar_region_w).max(ui.scale(24.0)).min(scrollbar_region_w);
-                let handle_offset = scroll_pct_x * (scrollbar_region_w - handle_w);
-
-                let h_scroll_handle_id = ui::id("Block Inspector H Scrollbar Handle");
-                let (h_activated, mut h_colour, _) = ui.button_ex(true, (0x60, 0x60, 0x60, 0), h_scroll_handle_id, true, winit::window::CursorIcon::Default);
-                h_colour.3 = h_colour.2;
-
-                if ui.mouse_pressed_id == h_scroll_handle_id {
-                    let delta_x = ui.input().mouse_delta().0 as f32;
-                    let delta_pct = delta_x / (scrollbar_region_w - handle_w);
-                    scroll_container_state.scroll_x += delta_pct * max_x;
-                    scroll_container_state.scroll_x = scroll_container_state.scroll_x.clamp(0.0, max_x);
-                }
-
-                let radius = ui.scale(6.0);
                 if let _ = elem().decl(Decl {
                     width: percent!(1.0),
-                    height: fixed!(h_scrollbar_w),
+                    height: grow!(),
                     direction: LeftToRight,
                     align: TopLeft,
-                    padding: (scroll_pad, scroll_pad, 0.0, scroll_pad),
                     ..Decl
                 }) {
-                    if handle_w < scrollbar_region_w {
-                        let _ = elem().decl(Decl { width: fixed!(handle_offset), height: grow!(), ..Decl });
-                        let _ = elem().decl(Decl {
-                            id: h_scroll_handle_id,
-                            colour: h_colour,
-                            radius: radius.dup4(),
-                            width: fixed!(handle_w),
-                            height: fixed!(h_scrollbar_w - scroll_pad),
+                    if let _ = elem().decl(Decl {
+                        width: grow!(),
+                        height: percent!(1.0),
+                        colour: PANE_COL,
+                        radius: (ui.scale(8.0)).dup4(),
+                        direction: TopToBottom,
+                        align: TopLeft,
+                        ..Decl
+                    }) {
+                        if let _ = elem().decl(Decl {
+                            id: scroll_id,
+                            clip,
+                            padding: (scroll_pad, scroll_pad, scroll_pad, scroll_pad),
+                            child_gap: ui.scale(8.0),
+                            width: percent!(1.0),
+                            height: grow!(),
+                            direction: TopToBottom,
                             ..Decl
-                        });
+                        }) {
+                            let section_hdr = TextDecl { h: ui.scale(13.0), colour: WHITE.mul(0.45), align: AlignX::Left, ..TextDecl };
+                            let body_text = TextDecl { font: Mono, h: ui.scale(13.0), colour: WHITE.mul(0.85), wrap: Wrap::None, align: AlignX::Left, ..TextDecl };
+
+                            ui.text("HASH", section_hdr);
+                            ui.text(frame_strf!(data, "{}", viz.inspecting_block_hash), TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+
+                            let text = if let Some(bytes) = viz.block_serialization.as_ref() {
+                                if viz.inspecting_block_is_bft() {
+                                    match wallet::bft::BftBlock::zcash_deserialize(&bytes[..]) {
+                                        Ok(bft) => frame_strf!(data, "{:#?}", bft).to_string(),
+                                        Err(e) => format!("Failed to parse BFT block: {e}"),
+                                    }
+                                } else {
+                                    match wallet::BlockHeader::read_data(&bytes[..]) {
+                                        Ok(header) => frame_strf!(data, "{:#?}", header).to_string(),
+                                        Err(e) => format!("Failed to parse PoW block header: {e}"),
+                                    }
+                                }
+                            } else {
+                                String::from("Loading info for block ...")
+                            };
+
+                            if let _ = elem().decl(Decl {
+                                direction: LeftToRight,
+                                child_gap: ui.scale(8.0),
+                                width: fit!(),
+                                height: fit!(),
+                                align: TopLeft,
+                                ..Decl
+                            }) {
+                                {
+                                    let copy_id = id("Block Inspector Copy Hash");
+                                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, copy_id, true, winit::window::CursorIcon::Default);
+                                    let radius = ui.scale(14.0);
+                                    if let _ = elem().decl(Decl {
+                                        id: copy_id,
+                                        colour,
+                                        padding,
+                                        radius: radius.dup4(),
+                                        align: Center,
+                                        width:  fit!(),
+                                        height: fit!(radius * 2.0),
+                                        ..Decl
+                                    }) {
+                                        ui.text("Copy hash", TextDecl { h: ui.scale(13.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
+                                    }
+                                    if clicked {
+                                        let hash_str = format!("{}", viz.inspecting_block_hash);
+                                        ui.input().send_to_clipboard(&hash_str);
+                                    }
+                                }
+                                {
+                                    let copy_id = id("Block Inspector Copy Data");
+                                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, copy_id, true, winit::window::CursorIcon::Default);
+                                    let radius = ui.scale(14.0);
+                                    if let _ = elem().decl(Decl {
+                                        id: copy_id,
+                                        colour,
+                                        padding,
+                                        radius: radius.dup4(),
+                                        align: Center,
+                                        width:  fit!(),
+                                        height: fit!(radius * 2.0),
+                                        ..Decl
+                                    }) {
+                                        ui.text("Copy data", TextDecl { h: ui.scale(13.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
+                                    }
+                                    if clicked {
+                                        let data_str = format!("{}", text);
+                                        ui.input().send_to_clipboard(&data_str);
+                                    }
+                                }
+                            }
+
+                            let _ = elem().decl(Decl {
+                                width: percent!(1.0),
+                                height: fixed!(1.0),
+                                colour: WHITE.mul(0.08),
+                                ..Decl
+                            });
+
+                            ui.text("RAW DATA", section_hdr);
+                            ui.text(frame_strf!(data, "{}", text), body_text);
+                        }
                     }
+
+                    ui.nav_skip = true;
+                    if let _ = elem().decl(Decl {
+                        width: fixed!(scrollbar_thin),
+                        height: percent!(1.0),
+                        padding: (scrollbar_pad, scrollbar_edge_pad, scrollbar_pad, scrollbar_pad),
+                        direction: TopToBottom,
+                        align: Top,
+                        ..Decl
+                    }) {
+                        if v_scroll_active {
+                            let v_scroll_handle_id = ui::id("Block Inspector V Scrollbar Handle");
+                            let (_, mut v_colour, _) = ui.button_ex(true, (0x60, 0x60, 0x60, 0), v_scroll_handle_id, true, winit::window::CursorIcon::Default);
+                            v_colour.3 = v_colour.2;
+
+                            if ui.mouse_pressed_id == v_scroll_handle_id {
+                                let delta_viewport_px = ui.input().mouse_delta().1 as f32;
+                                let delta_viewport_pct = delta_viewport_px / (scrollbar_region_h - handle_height);
+                                data.scroll_containers.entry(scroll_id.id).or_insert(Default::default()).scroll += delta_viewport_pct * max;
+                            }
+
+                            let _ = elem().decl(Decl { height: fixed!(handle_offset_y), ..Decl });
+                            let _ = elem().decl(Decl {
+                                id: v_scroll_handle_id,
+                                colour: v_colour,
+                                radius: scrollbar_radius.dup4(),
+                                width: fixed!(scrollbar_radius * 2.0),
+                                height: fixed!(handle_height),
+                                ..Decl
+                            });
+                        } else {
+                            let _ = elem().decl(Decl {
+                                colour: (0x60, 0x60, 0x60, 0x30),
+                                radius: scrollbar_radius.dup4(),
+                                width: fixed!(scrollbar_radius * 2.0),
+                                height: grow!(),
+                                ..Decl
+                            });
+                        }
+                    }
+                    ui.nav_skip = false;
+                }
+
+                if max_x > 0.0 {
+                    let scroll_pct_x = (scroll_x_val / max_x).clamp(0.0, 1.0);
+                    let handle_pct_x = if content_w == 0.0 { 1.0 } else { effective_viewport_w / content_w };
+                    let handle_w = (handle_pct_x * scrollbar_region_w).max(scrollbar_radius * 3.0).min(scrollbar_region_w);
+                    let handle_offset_x = scroll_pct_x * (scrollbar_region_w - handle_w);
+
+                    let h_scroll_handle_id = ui::id("Block Inspector H Scrollbar Handle");
+                    let (_, mut h_colour, _) = ui.button_ex(true, (0x60, 0x60, 0x60, 0), h_scroll_handle_id, true, winit::window::CursorIcon::Default);
+                    h_colour.3 = h_colour.2;
+
+                    if ui.mouse_pressed_id == h_scroll_handle_id {
+                        let delta_x = ui.input().mouse_delta().0 as f32;
+                        let delta_pct = delta_x / (scrollbar_region_w - handle_w);
+                        let scroll_container_state = data.scroll_containers.entry(scroll_id.id).or_insert(Default::default());
+                        scroll_container_state.scroll_x += delta_pct * max_x;
+                        scroll_container_state.scroll_x = scroll_container_state.scroll_x.clamp(0.0, max_x);
+                    }
+
+                    if let _ = elem().decl(Decl {
+                        width: percent!(1.0),
+                        direction: LeftToRight,
+                        align: TopLeft,
+                        padding: (0.0, 0.0, 0.0, scrollbar_edge_pad),
+                        ..Decl
+                    }) {
+                        if let _ = elem().decl(Decl {
+                            width: grow!(),
+                            height: fit!(),
+                            direction: LeftToRight,
+                            align: Left,
+                            padding: (scrollbar_pad, scrollbar_pad, scrollbar_pad, 0.0),
+                            ..Decl
+                        }) {
+                            if handle_w < scrollbar_region_w {
+                                let _ = elem().decl(Decl { width: fixed!(handle_offset_x), height: fixed!(scrollbar_radius * 2.0), ..Decl });
+                                let _ = elem().decl(Decl {
+                                    id: h_scroll_handle_id,
+                                    colour: h_colour,
+                                    radius: scrollbar_radius.dup4(),
+                                    width: fixed!(handle_w),
+                                    height: fixed!(scrollbar_radius * 2.0),
+                                    ..Decl
+                                });
+                            }
+                        }
+                        let _ = elem().decl(Decl { width: fixed!(scrollbar_thin), height: grow!(), ..Decl });
+                    }
+                } else {
+                    let _ = elem().decl(Decl { height: fixed!(scrollbar_edge_pad), ..Decl });
                 }
             }
 
