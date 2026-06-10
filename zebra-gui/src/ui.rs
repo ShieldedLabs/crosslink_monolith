@@ -4425,7 +4425,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
                 let fallback_pane_h = inspector_h - scrollbar_edge_pad - scrollbar_thin;
                 let fallback_pane_w = inspector_w - scrollbar_edge_pad - scrollbar_thin;
-                let effective_viewport_h = if viewport_h > 0.0 { viewport_h } else { (fallback_pane_h - scroll_pad * 2.0).max(0.0) };
+                let effective_viewport_h = (fallback_pane_h - scroll_pad * 2.0).max(0.0);
                 let effective_viewport_w = if viewport_w > 0.0 { viewport_w } else { (fallback_pane_w - scroll_pad * 2.0).max(0.0) };
                 let scrollbar_region_h = (effective_viewport_h + 2.0 * scroll_pad - 2.0 * scrollbar_pad).max(scrollbar_radius * 3.0);
                 let scrollbar_region_w = (effective_viewport_w + 2.0 * scroll_pad - 2.0 * scrollbar_pad).max(scrollbar_radius * 3.0);
