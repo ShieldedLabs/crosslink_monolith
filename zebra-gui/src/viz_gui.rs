@@ -297,6 +297,10 @@ impl VizState {
         true
     }
 
+    pub fn inspecting_block_is_bft(&self) -> bool {
+        self.on_screen_bfts.contains_key(&self.inspecting_block_hash)
+    }
+
     fn nearest_bft_height_to_camera_y(&self, camera_y: f32) -> u64 {
         let (fallback, _) = bft_minimap_height_span(self);
         let mut best: Option<(f32, u64)> = None;

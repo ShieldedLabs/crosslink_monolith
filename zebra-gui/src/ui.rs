@@ -4462,9 +4462,18 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
                 let text = if let Some(bytes) = viz.block_serialization.as_ref() {
                     ui.text("RAW DATA", section_hdr);
-                    
-                    let blockHeader = wallet::BlockHeader::read_data(&bytes[..]);
-                    frame_strf!(data, "{:#?}", blockHeader).to_string()
+                
+                    if viz.inspecting_block_is_bft() {
+                        match wallet::bft::BftBlock::zcash_deserialize(&bytes[..]) {
+                            Ok(bft) => frame_strf!(data, "{:#?}", bft).to_string(),
+                            Err(e) => format!("Failed to parse BFT block: {e}"),
+                        }
+                    } else {
+                        match wallet::BlockHeader::read_data(&bytes[..]) {
+                            Ok(header) => frame_strf!(data, "{:#?}", header).to_string(),
+                            Err(e) => format!("Failed to parse PoW block header: {e}"),
+                        }
+                    }
                 } else {
                     String::from("Loading info for block ...")
                 };
