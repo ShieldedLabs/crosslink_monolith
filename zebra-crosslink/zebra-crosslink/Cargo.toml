@@ -47,8 +47,8 @@ tempfile = "3.19.1"
 prost = "0.14.1"
 strum = "0.26.3"
 strum_macros = "0.26.4"
-zerocopy = "0.8.25"
-zerocopy-derive = "0.8.25"
+zerocopy = "=0.8.31"
+zerocopy-derive = "=0.8.31"
 blake3 = "1.8.2"
 byteorder = { workspace = true }
 ed25519-zebra = { workspace = true }
