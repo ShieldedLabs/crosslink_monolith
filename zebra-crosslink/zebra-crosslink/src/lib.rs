@@ -1379,6 +1379,112 @@ async fn total_issuance_from_key(
     Ok(scan_infos)
 }
 
+struct SlashTrackingBondChange {
+    change_height: ZebBlockHeight,
+    finalizer_pk_id: PubKeyID,
+}
+struct FinalizerSlashTracking {
+    snap_height: ZebBlockHeight,
+    analysis_heights_inclusive: (ZebBlockHeight, ZebBlockHeight),
+    slash_finalizers: HashSet<PubKeyID>,
+    bonds_staked_to_slash_finalizers_at_snap_height: HashMap<PubKeyID, SlashTrackingBondChange>, // from bond key
+}
+
+async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServiceHandle, tracking: &mut FinalizerSlashTracking, bonds_to_slash: &mut HashSet<PubKeyID>, max_height: ZebBlockHeight) -> Result<(), String> {
+    let call = internal_handle.call.clone();
+
+    let (analysis_lo_height, analysis_hi_height) = tracking.analysis_heights_inclusive;
+    assert!(analysis_lo_height <= analysis_hi_height);
+
+    let hi_height = analysis_hi_height.max(max_height);
+    if tracking.snap_height > hi_height {
+        return Ok(());
+    }
+
+    for height in tracking.snap_height.0 ..= hi_height.0 {
+        let height = ZebBlockHeight(height);
+        let res = (call.state)(StateRequest::Block(height.into())).await;
+
+        let block = match res {
+            Ok(StateResponse::Block(Some(block))) => block,
+            Ok(StateResponse::Block(None)) => return Err(format!("failed to get block at height {}", height.0)),
+            _ => return Err(format!("unexpectedly failed to get block at height {}: {res:?}", height.0)),
+        };
+
+        if block.transactions.len() == 0 {
+            return Err(format!("block at height {} had 0 transactions", height.0));
+        }
+
+
+        for (tx_i, tx) in block.transactions.iter().enumerate() {
+            use zcash_primitives::transaction;
+            // let txid = tx.unmined_id().mined_id();
+
+            let Some(staking_action) = tx.staking_action() else {
+                continue;
+            };
+
+            // NOTE: we have to do additional speculative work because we don't keep "from" info in the staking action
+            match staking_action.kind {
+                StakingActionKind::CreateNewDelegationBond => {
+                    let bond = transaction::StakingAction_CreateNewDelegationBond::try_from_union(&staking_action).unwrap();
+                    let finalizer_pk_id = PubKeyID(bond.target_finalizer);
+                    if tracking.slash_finalizers.contains(&finalizer_pk_id) {
+                        tracking.bonds_staked_to_slash_finalizers_at_snap_height.insert(
+                            PubKeyID(bond.unique_pubkey),
+                            SlashTrackingBondChange { change_height: height, finalizer_pk_id }
+                        );
+                    }
+                }
+                StakingActionKind::RetargetDelegationBond => {
+                    let bond = transaction::StakingAction_RetargetDelegationBond::try_from_union(&staking_action).unwrap();
+                    let finalizer_pk_id = PubKeyID(bond.target_finalizer);
+
+                    if tracking.slash_finalizers.contains(&finalizer_pk_id) {
+                        // TO finalizer
+                        tracking.bonds_staked_to_slash_finalizers_at_snap_height.insert(
+                            PubKeyID(bond.unique_pubkey),
+                            SlashTrackingBondChange { change_height: height, finalizer_pk_id }
+                        );
+                    } else {
+                        // FROM finalizer
+                        if let Some(details) = tracking.bonds_staked_to_slash_finalizers_at_snap_height.get(&PubKeyID(bond.unique_pubkey)) {
+                            tracking.bonds_staked_to_slash_finalizers_at_snap_height.remove(&PubKeyID(bond.unique_pubkey));
+                        }
+                    }
+                }
+                StakingActionKind::BeginDelegationUnbonding => {
+                    let bond = transaction::StakingAction_BeginDelegationUnbonding::try_from_union(&staking_action).unwrap();
+                    // FROM finalizer
+                    if let Some(details) = tracking.bonds_staked_to_slash_finalizers_at_snap_height.get(&PubKeyID(bond.unique_pubkey)) {
+                        tracking.bonds_staked_to_slash_finalizers_at_snap_height.remove(&PubKeyID(bond.unique_pubkey));
+                    }
+                }
+
+                StakingActionKind::Null => panic!("invalid staking action in block"),
+                StakingActionKind::WithdrawDelegationBond => {},
+
+                StakingActionKind::RegisterFinalizer |
+                    StakingActionKind::ConvertFinalizerRewardToDelegationBond |
+                    StakingActionKind::UpdateFinalizerKey =>
+                    todo!("unhandled"),
+            }
+        }
+
+        if analysis_lo_height <= height && height <= analysis_hi_height {
+            // Add all bonds currently allocated to a slashed finalizer to our "big list of bonds to slash".
+            // We no longer need to track them here as we are already committing to fully removing them from existence.
+            tracking.bonds_staked_to_slash_finalizers_at_snap_height.retain(|bond_key, v| {
+                bonds_to_slash.insert(*bond_key);
+                false
+            });
+        }
+    }
+
+    tracking.snap_height = max_height;
+    Ok(())
+}
+
 async fn tfl_service_incoming_request(
     internal_handle: TFLServiceHandle,
     request: TFLServiceRequest,
