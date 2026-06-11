@@ -26,11 +26,92 @@ impl RequestToZebra {
     }
 }
 
-// @Todo: enum BlockInspection {
-//     None,
-//     PoW(Arc<zebra_chain::Block>),
-//     PoS(Arc<zebra_chain::block::BftBlock>)
-// }
+#[derive(Clone, Debug, Default)]
+pub enum BlockInspection {
+    #[default]
+    None,
+    Pow(PowBlockInspection),
+    Bft(BftBlockInspection),
+}
+
+#[derive(Clone, Debug)]
+pub struct PowBlockInspection {
+    pub hash: Hash32,
+    pub height: Option<u64>,
+    pub parent_hash: Hash32,
+    pub time: i64,
+    pub fat_pointer: String,
+    pub transactions: Vec<TxInspection>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BftBlockInspection {
+    pub hash: Hash32,
+    pub version: u32,
+    pub height: u32,
+    pub previous_hash: Hash32,
+    pub finalization_candidate_height: u32,
+    pub pow_headers: Vec<BftPowHeaderInspection>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BftPowHeaderInspection {
+    pub height: u32,
+    pub hash: Hash32,
+}
+
+#[derive(Clone, Debug)]
+pub struct TxInspection {
+    pub hash: String,
+    pub is_coinbase: bool,
+    pub staking_action: Option<String>,
+}
+
+impl BlockInspection {
+    pub fn to_display_string(&self) -> String {
+        match self {
+            BlockInspection::None => String::new(),
+            BlockInspection::Pow(pow) => {
+                let mut s = String::from("PoW Block\n");
+                s.push_str(&format!("  Hash: {}\n", pow.hash));
+                if let Some(h) = pow.height {
+                    s.push_str(&format!("  Height: {h}\n"));
+                }
+                s.push_str(&format!("  Parent: {}\n", pow.parent_hash));
+                s.push_str(&format!("  Time: {}\n", pow.time));
+                s.push_str(&format!("  BFT pointer: {}\n", pow.fat_pointer));
+                s.push_str(&format!("  Transactions: {}\n", pow.transactions.len()));
+                for (i, tx) in pow.transactions.iter().enumerate() {
+                    s.push_str(&format!("  [{i}] {}", tx.hash));
+                    if tx.is_coinbase {
+                        s.push_str(" (coinbase)");
+                    }
+                    if let Some(sa) = &tx.staking_action {
+                        s.push_str(&format!(" {sa}"));
+                    }
+                    s.push('\n');
+                }
+                s
+            }
+            BlockInspection::Bft(bft) => {
+                let mut s = String::from("BFT Block\n");
+                s.push_str(&format!("  Hash: {}\n", bft.hash));
+                s.push_str(&format!("  Version: {}\n", bft.version));
+                s.push_str(&format!("  Height: {}\n", bft.height));
+                s.push_str(&format!("  Previous: {}\n", bft.previous_hash));
+                s.push_str(&format!(
+                    "  Finalization candidate height: {}\n",
+                    bft.finalization_candidate_height
+                ));
+                s.push_str("  PoW headers:\n");
+                for hdr in &bft.pow_headers {
+                    s.push_str(&format!("    [{}] - {}\n", hdr.height, hdr.hash));
+                }
+                s
+            }
+        }
+    }
+}
 
 pub struct ResponseFromZebra {
     pub bc_tip_height: u64,
@@ -39,8 +120,7 @@ pub struct ResponseFromZebra {
     pub bc_blocks: Vec<BcBlock>,
     pub bft_blocks: Vec<BftBlock>,
     pub what_block_it_is: Hash32,
-    pub block_serialization: Vec<u8>, // @Todo: @Remove and replace with structured data.
-    // @Todo: pub block_inspection: BlockInspection,
+    pub block_inspection: BlockInspection,
     pub start_bc_height: u64,
 
     pub orchard_pool_balance: i64,
@@ -60,8 +140,7 @@ impl ResponseFromZebra {
             bc_blocks: Vec::new(),
             bft_blocks: Vec::new(),
             what_block_it_is: Hash32::from_u64(0),
-            block_serialization: Vec::new(),
-            // @Todo: block_inspection: BlockInspection::None,
+            block_inspection: BlockInspection::None,
             start_bc_height: 0,
             orchard_pool_balance: 0,
             staking_bonded_pool_balance: 0,
@@ -236,7 +315,7 @@ pub struct VizState {
     pub last_frame_hovered_hash: Hash32,
 
     pub inspecting_block_hash: Hash32,
-    pub block_serialization: Option<Vec<u8>>,
+    pub block_inspection: Option<BlockInspection>,
 
     pub should_reset_clay_text_cache: bool,
 
@@ -470,7 +549,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         last_frame_hovered_hash: Hash32::from_u64(0),
 
         inspecting_block_hash: Hash32::from_u64(0),
-        block_serialization: None,
+        block_inspection: None,
         should_reset_clay_text_cache: false,
 
         inspecting_block_screen_x: 0.0,
@@ -591,7 +670,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
 
         if message.what_block_it_is == viz_state.inspecting_block_hash {
             viz_state.should_reset_clay_text_cache = true;
-            viz_state.block_serialization = Some(message.block_serialization);
+            viz_state.block_inspection = Some(message.block_inspection);
         }
 
         let zoom = ZOOM_FACTOR.powf(viz_state.zoom);
@@ -1650,7 +1729,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         viz_state.inspecting_block_hash = hovered_block;
         viz_state.inspecting_block_screen_x = hovered_block_screen_x;
         viz_state.inspecting_block_screen_y = hovered_block_screen_y;
-        viz_state.block_serialization = None;
+        viz_state.block_inspection = None;
     }
 
     let ww = draw_ctx.window_width as f32;

@@ -1,5 +1,8 @@
 
-use visualizer_zcash::Hash32;
+use visualizer_zcash::{
+    BftBlockInspection, BftPowHeaderInspection, BlockInspection, Hash32, PowBlockInspection,
+    TxInspection,
+};
 use zebra_chain::value_balance::ValueBalance;
 use std::cmp::{max, min};
 
@@ -170,11 +173,49 @@ pub async fn service_viz_requests(
                     response.start_bc_height = bc_ack_height as u64;
                     bc_ack_height = bc_ack_height.max(request.bc_ack_height as i32);
 
+                    let pow_inspection = |block: &Block| {
+                        use zebra_chain::{transaction::Transaction, transparent};
+                        BlockInspection::Pow(PowBlockInspection {
+                            hash: Hash32::from_bytes(block.hash().0),
+                            height: block.coinbase_height().map(|h| h.0 as u64),
+                            parent_hash: Hash32::from_bytes(block.header.previous_block_hash.0),
+                            time: block.header.time.timestamp(),
+                            fat_pointer: block.header.fat_pointer_to_bft_block.to_string(),
+                            transactions: block.transactions.iter().map(|tx| TxInspection {
+                                hash: format!("{}", tx.hash()),
+                                is_coinbase: matches!(tx.inputs().first(), Some(transparent::Input::Coinbase { .. })),
+                                staking_action: match tx.as_ref() {
+                                    Transaction::VCrosslink { staking_action: Some(sa), .. } => Some(format!("{sa}")),
+                                    _ => None,
+                                },
+                            }).collect(),
+                        })
+                    };
+
+                    let bft_inspection = |b: &wallet::bft::BftBlock| {
+                        BlockInspection::Bft(BftBlockInspection {
+                            hash: Hash32::from_bytes(b.blake3_hash().0),
+                            version: b.version,
+                            height: b.height,
+                            previous_hash: Hash32::from_bytes(b.previous_block_hash().0),
+                            finalization_candidate_height: b.finalization_candidate_height,
+                            pow_headers: b
+                                .headers
+                                .iter()
+                                .enumerate()
+                                .map(|(i, hdr)| BftPowHeaderInspection {
+                                    height: b.finalization_candidate_height + i as u32,
+                                    hash: Hash32::from_bytes(BlockHash::from_header_data(hdr).0),
+                                })
+                                .collect(),
+                        })
+                    };
+
                     for (i, bc) in seq_blocks.iter().enumerate() {
                         let this_hash = Hash32::from_bytes(bc.header.hash().0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;
-                            response.block_serialization = bc.zcash_serialize_to_vec().unwrap_or_default();
+                            response.block_inspection = pow_inspection(bc.as_ref());
                         }
                         response.bc_blocks.push(visualizer_zcash::BcBlock {
                             this_hash,
@@ -198,7 +239,7 @@ pub async fn service_viz_requests(
                         let this_hash = Hash32::from_bytes(b.blake3_hash().0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;
-                            response.block_serialization = b.zcash_serialize_to_vec().unwrap_or_default();
+                            response.block_inspection = bft_inspection(b);
                         }
                         response.bft_blocks.push(visualizer_zcash::BftBlock {
                             this_hash: this_hash,
@@ -220,14 +261,14 @@ pub async fn service_viz_requests(
                         let hash = ZebBlockHash(want.as_bytes());
                         if let Some(bc) = crate::block_from_hash(&call, hash).await {
                             response.what_block_it_is = want;
-                            response.block_serialization = bc.zcash_serialize_to_vec().unwrap_or_default();
+                            response.block_inspection = pow_inspection(bc.as_ref());
                         } else {
                             let internal = tfl_handle.internal.lock().await;
                             for b in internal.bft_blocks.iter() {
                                 let this_hash = Hash32::from_bytes(b.blake3_hash().0);
                                 if want == this_hash {
                                     response.what_block_it_is = want;
-                                    response.block_serialization = b.zcash_serialize_to_vec().unwrap_or_default();
+                                    response.block_inspection = bft_inspection(b);
                                     break;
                                 }
                             }

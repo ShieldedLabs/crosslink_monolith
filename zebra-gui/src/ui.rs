@@ -4469,18 +4469,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                             ui.text("HASH", section_hdr);
                             ui.text(frame_strf!(data, "{}", viz.inspecting_block_hash), TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
 
-                            let text = if let Some(bytes) = viz.block_serialization.as_ref() {
-                                if viz.inspecting_block_is_bft() {
-                                    match wallet::bft::BftBlock::zcash_deserialize(&bytes[..]) {
-                                        Ok(bft) => frame_strf!(data, "{:#?}", bft).to_string(),
-                                        Err(e) => format!("Failed to parse BFT block: {e}"),
-                                    }
-                                } else {
-                                    match wallet::BlockHeader::read_data(&bytes[..]) {
-                                        Ok(header) => frame_strf!(data, "{:#?}", header).to_string(),
-                                        Err(e) => format!("Failed to parse PoW block header: {e}"),
-                                    }
-                                }
+                            let text = if let Some(inspection) = viz.block_inspection.as_ref() {
+                                inspection.to_display_string()
                             } else {
                                 String::from("Loading info for block ...")
                             };
@@ -4544,7 +4534,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 ..Decl
                             });
 
-                            ui.text("RAW DATA", section_hdr);
+                            ui.text("BLOCK", section_hdr);
                             ui.text(frame_strf!(data, "{}", text), body_text);
                         }
                     }
