@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, hash::Hash, sync::Mutex};
 
+use chrono::{DateTime, Utc};
 use wallet::BlockHeight;
 // use twox_hash::XxHash3_64;
 use winit::event::MouseButton;
@@ -78,7 +79,7 @@ impl BlockInspection {
                     s.push_str(&format!("  Height: {h}\n"));
                 }
                 s.push_str(&format!("  Parent: {}\n", pow.parent_hash));
-                s.push_str(&format!("  Time: {}\n", pow.time));
+                s.push_str(&format!("  Time: {}\n", DateTime::<Utc>::from_timestamp_secs(pow.time).unwrap_or(DateTime::<Utc>::MAX_UTC).to_string()));
                 s.push_str(&format!("  BFT pointer: {}\n", pow.fat_pointer));
                 s.push_str(&format!("  Transactions: {}\n", pow.transactions.len()));
                 for (i, tx) in pow.transactions.iter().enumerate() {
@@ -1561,7 +1562,6 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         if very_zoom_out == false {
             let here_text_y = (origin_y + (y - 0.5)*screen_unit);
             if here_text_y <= draw_ctx.window_height as f32 && here_text_y + screen_unit >= 0.0 {
-                use chrono::{DateTime,Utc};
                 let w = if on_screen_bc.block.is_best_chain {
                     // hash
                     let text_line_buf;
