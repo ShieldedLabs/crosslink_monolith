@@ -218,6 +218,15 @@ impl ZebradConfig {
             .cache_dir
             .push("zebra_crosslink_workshop_season_one_v3_ehtedht_cache_delete_me");
 
+        // Merge user-led hardforks with the ones shipped in the executable, validate
+        // them, and store the canonical (sorted, deduplicated) list back. Building
+        // the schedule panics on conflicting/interleaving rules, so a bad config is
+        // rejected at load time.
+        config.crosslink.hardforks =
+            zebra_chain::parameters::HardForkSchedule::new(config.crosslink.hardforks.clone())
+                .rules()
+                .to_vec();
+
         // if let zcash_protocol::consensus::Network::TestNetwork(_) = config.network.network
         Ok(config)
     }

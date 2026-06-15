@@ -114,6 +114,13 @@ pub mod service;
 pub mod config {
     use serde::{Deserialize, Serialize};
 
+    // The canonical hardfork types live in `zebra-chain` so that zebra-state and
+    // zebra-consensus — which cannot depend on zebra-crosslink — can share them.
+    // Re-exported here for ergonomic access via `zebra_crosslink::config::*`.
+    pub use zebra_chain::parameters::hardfork::{
+        shipped_hardforks, HardForkConfig, HardForkSchedule, HashBytes,
+    };
+
     /// Configuration for the state service.
     #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
     #[serde(deny_unknown_fields, default)]
@@ -129,6 +136,11 @@ pub mod config {
         pub disable_the_headless_wallet: bool,
         /// Disable zaino.
         pub disable_zaino: bool,
+        /// User-led hardfork rules, as supplied in the config file. These are
+        /// merged with [`shipped_hardforks`] and validated by building a
+        /// [`HardForkSchedule`]; after loading, this holds the canonical, merged
+        /// list (see `ZebradConfig::load`).
+        pub hardforks: Vec<HardForkConfig>,
     }
     impl Default for Config {
         fn default() -> Self {
@@ -138,6 +150,7 @@ pub mod config {
                 explicit_bft_key_seed: None,
                 disable_the_headless_wallet: false,
                 disable_zaino: false,
+                hardforks: Vec::new(),
             }
         }
     }
