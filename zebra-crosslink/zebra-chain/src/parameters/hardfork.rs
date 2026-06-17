@@ -34,7 +34,7 @@ pub struct HardForkConfig {
     /// Finalizers terminated by this hardfork. Committed to by hash later, so
     /// this list is sorted into a canonical order when the schedule is built.
     #[serde(default)]
-    pub terminated_finalizers: Vec<HashBytes>,
+    pub terminated_finalizers: Vec<zcash_primitives::bft::PubKeyID>,
 }
 
 /// Hardfork rules shipped in the executable.

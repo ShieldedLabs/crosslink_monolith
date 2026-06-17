@@ -1191,6 +1191,28 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
     let mut last_diagnostic_print = Instant::now();
     let mut current_bc_tip: Option<(ZebBlockHeight, ZebBlockHash)> = None;
 
+    // TODO: handle multiple slash events
+    let mut slash_tracking = FinalizerSlashTracking {
+        snap_height: ZebBlockHeight(0),
+        analysis_heights_exclusive: (ZebBlockHeight(0), ZebBlockHeight(0)),
+        slash_finalizers: HashSet::new(),
+        bonds_staked_to_slash_finalizers_at_snap_height: HashMap::new(),
+    };
+    if let Some(slash_fork) = config.hardforks.last() {
+        // NOTE: this will change if the staking period changes
+        let end_height: u32 = slash_fork.pow_activation_height.try_into().expect("fits in u32");
+        assert!(end_height % zcash_primitives::transaction::STAKING_PERIOD != 0);
+        assert!(end_height != 0);
+        assert!(slash_fork.terminated_finalizers.len() != 0);
+        // ALT: determine bgn_height via PoS height (and deferred analysis)
+        let bgn_height: u32 = end_height.saturating_sub(2*zcash_primitives::transaction::STAKING_PERIOD).try_into().expect("fits in u32");
+        slash_tracking.analysis_heights_exclusive = (ZebBlockHeight(bgn_height), ZebBlockHeight(end_height));
+        for finalizer in &slash_fork.terminated_finalizers {
+            slash_tracking.slash_finalizers.insert(*finalizer);
+        }
+    }
+    let mut slashed_bonds = HashSet::<PubKeyID>::new();
+
     loop {
         // Calculate this prior to message handling so that handlers can use it:
         let new_bc_tip = if let Ok(StateResponse::Tip(val)) = (call.state)(StateRequest::Tip).await
@@ -1202,6 +1224,18 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
         tokio::time::sleep_until(run_instant).await;
         run_instant += MAIN_LOOP_SLEEP_INTERVAL;
+
+        if let Some((bc_tip, _)) = current_bc_tip {
+            let max_height = bc_tip.min((slash_tracking.snap_height + 5).unwrap());
+            match update_bonds_seen_for_finalizer_slash_tracking(internal_handle.clone(), &mut slash_tracking, &mut slashed_bonds, max_height).await {
+                Err(err) => println!("slashing error: {err:?}"),
+                Ok(()) => {
+                    if slash_tracking.snap_height >= max_height {
+                        println!("slashing bonds: {slashed_bonds:?}");
+                    }
+                }
+            }
+        }
 
         // from this point onwards we must race to completion in order to avoid stalling incoming requests
         // NOTE: split to avoid deadlock from non-recursive mutex - can we reasonably change type?
@@ -1392,29 +1426,31 @@ async fn total_issuance_from_key(
     Ok(scan_infos)
 }
 
-struct SlashTrackingBondChange {
-    change_height: ZebBlockHeight,
-    finalizer_pk_id: PubKeyID,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlashTrackingBondChange {
+    pub change_height: ZebBlockHeight,
+    pub finalizer_pk_id: PubKeyID,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct FinalizerSlashTracking {
-    snap_height: ZebBlockHeight,
-    analysis_heights_inclusive: (ZebBlockHeight, ZebBlockHeight),
-    slash_finalizers: HashSet<PubKeyID>,
-    bonds_staked_to_slash_finalizers_at_snap_height: HashMap<PubKeyID, SlashTrackingBondChange>, // from bond key
+    pub snap_height: ZebBlockHeight,
+    pub analysis_heights_exclusive: (ZebBlockHeight, ZebBlockHeight),
+    pub slash_finalizers: HashSet<PubKeyID>,
+    pub bonds_staked_to_slash_finalizers_at_snap_height: HashMap<PubKeyID, SlashTrackingBondChange>, // from bond key
 }
 
 async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServiceHandle, tracking: &mut FinalizerSlashTracking, bonds_to_slash: &mut HashSet<PubKeyID>, max_height: ZebBlockHeight) -> Result<(), String> {
     let call = internal_handle.call.clone();
 
-    let (analysis_lo_height, analysis_hi_height) = tracking.analysis_heights_inclusive;
-    assert!(analysis_lo_height <= analysis_hi_height);
+    let (analysis_bgn_height, analysis_end_height) = tracking.analysis_heights_exclusive;
+    assert!(analysis_bgn_height <= analysis_end_height);
 
-    let hi_height = analysis_hi_height.max(max_height);
-    if tracking.snap_height > hi_height {
+    let end_height = analysis_end_height.max((max_height+1).unwrap());
+    if tracking.snap_height >= end_height {
         return Ok(());
     }
 
-    for height in tracking.snap_height.0 ..= hi_height.0 {
+    for height in tracking.snap_height.0 .. end_height.0 {
         let height = ZebBlockHeight(height);
         let res = (call.state)(StateRequest::Block(height.into())).await;
 
@@ -1484,7 +1520,7 @@ async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServ
             }
         }
 
-        if analysis_lo_height <= height && height <= analysis_hi_height {
+        if analysis_bgn_height <= height && height < analysis_end_height {
             // Add all bonds currently allocated to a slashed finalizer to our "big list of bonds to slash".
             // We no longer need to track them here as we are already committing to fully removing them from existence.
             tracking.bonds_staked_to_slash_finalizers_at_snap_height.retain(|bond_key, v| {

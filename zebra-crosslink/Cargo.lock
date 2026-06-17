@@ -10255,7 +10255,6 @@ dependencies = [
  "zcash_primitives",
  "zcash_protocol",
  "zebra-chain",
- "zebra-consensus",
  "zebra-node-services",
  "zebra-state",
  "zebra-test",
