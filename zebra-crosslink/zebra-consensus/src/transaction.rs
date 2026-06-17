@@ -867,11 +867,12 @@ where
     /// Minimum number of blocks that must pass between staking actions on the same bond.
     pub const STAKING_ACTION_DELAY_BLOCKS: u32 = 75;
 
-    /// The period length for staking days. A new staking day starts every N blocks.
-    pub const STAKING_DAY_PERIOD: u32 = 150;
+    /// The number of blocks between the start of one staking day and the start of the next.
+    /// A new staking day starts every N blocks.
+    pub const STAKING_PERIOD: u32 = 150;
 
     /// The window size within each staking day period where staking actions are allowed.
-    /// Staking actions are only valid when `block_height % STAKING_DAY_PERIOD < STAKING_DAY_WINDOW`.
+    /// Staking actions are only valid when `block_height % STAKING_PERIOD < STAKING_DAY_WINDOW`.
     pub const STAKING_DAY_WINDOW: u32 = 70;
 
     /// Checks that staking actions in a transaction respect the required delay since the
@@ -938,7 +939,7 @@ where
 
     /// Checks that staking actions are only performed within the allowed staking window.
     ///
-    /// Staking actions are only valid when `block_height % STAKING_DAY_PERIOD < STAKING_DAY_WINDOW`.
+    /// Staking actions are only valid when `block_height % STAKING_PERIOD < STAKING_DAY_WINDOW`.
     /// For example, with PERIOD=100 and WINDOW=10, staking is allowed on blocks 0-9, 100-109, 200-209, etc.
     ///
     /// RetargetDelegationBond is exempt from this rule and can be submitted at any time.
@@ -969,12 +970,12 @@ where
         }
 
 
-        let position_in_period = block_height % Self::STAKING_DAY_PERIOD;
+        let position_in_period = block_height % Self::STAKING_PERIOD;
 
         if position_in_period >= Self::STAKING_DAY_WINDOW {
             return Err(TransactionError::StakingActionOutsideWindow {
                 block_height,
-                period: Self::STAKING_DAY_PERIOD,
+                period: Self::STAKING_PERIOD,
                 window: Self::STAKING_DAY_WINDOW,
             });
         }

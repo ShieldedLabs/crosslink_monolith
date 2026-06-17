@@ -79,7 +79,7 @@ use swash::{scale::ScaleContext, text, FontRef};
 
 
 pub const UI_COPY_STAKING_ACTION_DELAY_BLOCKS: u64 = 75;
-pub const UI_COPY_STAKING_DAY_PERIOD: u64 = 150;
+pub const UI_COPY_STAKING_PERIOD: u64 = 150;
 pub const UI_COPY_STAKING_DAY_WINDOW: u64 = 70;
 
 const RENDER_TILE_SHIFT: usize = 8;
@@ -1589,8 +1589,8 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
 
                                             {
                                                 let new_height = viz_state.bc_finalized_tip_height;
-                                                let new_pi= (new_height / UI_COPY_STAKING_DAY_PERIOD) * 2 + (new_height % UI_COPY_STAKING_DAY_PERIOD > UI_COPY_STAKING_DAY_WINDOW) as u64;
-                                                let old_pi= (last_frame_finalized_bc_height / UI_COPY_STAKING_DAY_PERIOD) * 2 + (last_frame_finalized_bc_height % UI_COPY_STAKING_DAY_PERIOD > UI_COPY_STAKING_DAY_WINDOW) as u64;
+                                                let new_pi= (new_height / UI_COPY_STAKING_PERIOD) * 2 + (new_height % UI_COPY_STAKING_PERIOD > UI_COPY_STAKING_DAY_WINDOW) as u64;
+                                                let old_pi= (last_frame_finalized_bc_height / UI_COPY_STAKING_PERIOD) * 2 + (last_frame_finalized_bc_height % UI_COPY_STAKING_PERIOD > UI_COPY_STAKING_DAY_WINDOW) as u64;
                                                 last_frame_finalized_bc_height = new_height;
 
                                                 let debug_do_anyway = ui.debug && input_ctx.key_pressed(KeyCode::F4);
