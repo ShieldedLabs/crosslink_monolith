@@ -110,6 +110,7 @@ use zcash_protocol::consensus::{NetworkType, Parameters, MAIN_NETWORK, TEST_NETW
 #[derive(Clone)]
 pub struct FaucetRequestClosure(pub Arc<dyn Fn(String) -> Result<u64, String> + Sync + Send + 'static>);
 pub static FAUCET_REQUEST: Mutex<Option<FaucetRequestClosure>> = Mutex::new(None);
+pub static USER_UFVK_STRING: Mutex<Option<String>> = Mutex::new(None);
 pub static GUI_ENABLE_MINE: Mutex<bool> = Mutex::new(true);
 
 #[derive(Clone)]
@@ -3301,6 +3302,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         state.user_recv_ua = user_ua_str.clone();
         state.user_seed_mnemonic = user_mnemonic.to_string();
         state.user_ufvk = user_account.ufvk.encode(network);
+        *USER_UFVK_STRING.lock().unwrap() = Some(state.user_ufvk.clone());
     }
 
 

@@ -1638,6 +1638,8 @@ async fn tfl_service_incoming_request(
         }
 
         TFLServiceRequest::StakingCmd(String) => Err(TFLServiceError::NotImplemented),
+
+        TFLServiceRequest::WalletUfvk => Ok(TFLServiceResponse::WalletUfvk(wallet::USER_UFVK_STRING.lock().unwrap().clone())),
     }
 }
 

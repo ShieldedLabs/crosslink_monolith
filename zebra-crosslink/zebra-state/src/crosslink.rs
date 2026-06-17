@@ -56,6 +56,8 @@ pub enum TFLServiceRequest {
     TotalIssuanceFromKey(Vec<zcash_keys::keys::UnifiedFullViewingKey>, BlockHeight, BlockHeight),
     /// Finalizer recency status
     FinalizersRecencyStatus,
+    /// Get UFVK for wallet
+    WalletUfvk,
 }
 
 /// Types of responses that can be returned by the TFLService.
@@ -87,6 +89,8 @@ pub enum TFLServiceResponse {
     TotalIssuanceFromKey(Result<Vec<ScanInfo>, String>),
     /// Finalizer recency status + reference UTC
     FinalizersRecencyStatus(TFLRecencyStatus),
+    /// Get UFVK for wallet
+    WalletUfvk(Option<String>),
 }
 
 /// Errors that can occur when interacting with the TFLService.

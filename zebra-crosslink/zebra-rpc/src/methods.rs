@@ -536,6 +536,10 @@ pub trait Rpc {
     #[method(name = "get_tfl_recency_status")]
     async fn get_tfl_recency_status(&self) -> Option<zebra_state::crosslink::TFLRecencyStatus>;
 
+    /// Get the UFVK for the attached wallet
+    #[method(name = "get_wallet_ufvk")]
+    async fn get_wallet_ufvk(&self) -> Option<String>;
+
     /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
     /// If the block is not in Zebra's state,
     /// returns [error code `-8`.](https://github.com/zcash/zcash/issues/5758)
@@ -2337,6 +2341,21 @@ where
                 None
             }
             _ => unreachable!("invalid enum: {res:?}"),
+        }
+    }
+
+    async fn get_wallet_ufvk(&self) -> Option<String> {
+        let res = self
+            .tfl_service
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(TFLServiceRequest::WalletUfvk)
+            .await;
+        match res {
+            Ok(TFLServiceResponse::WalletUfvk(ufvk_str)) => ufvk_str,
+            _ => None
         }
     }
 
