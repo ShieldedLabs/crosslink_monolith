@@ -24,6 +24,7 @@ use tower::{
 use tracing::Instrument;
 
 use zcash_protocol::value::ZatBalance;
+use zcash_primitives::transaction::{STAKING_PERIOD, STAKING_DAY_WINDOW};
 
 use zebra_chain::{
     amount::{Amount, NonNegative},
@@ -867,14 +868,6 @@ where
     /// Minimum number of blocks that must pass between staking actions on the same bond.
     pub const STAKING_ACTION_DELAY_BLOCKS: u32 = 75;
 
-    /// The number of blocks between the start of one staking day and the start of the next.
-    /// A new staking day starts every N blocks.
-    pub const STAKING_PERIOD: u32 = 150;
-
-    /// The window size within each staking day period where staking actions are allowed.
-    /// Staking actions are only valid when `block_height % STAKING_PERIOD < STAKING_DAY_WINDOW`.
-    pub const STAKING_DAY_WINDOW: u32 = 70;
-
     /// Checks that staking actions in a transaction respect the required delay since the
     /// last action on the same bond.
     ///
@@ -970,13 +963,13 @@ where
         }
 
 
-        let position_in_period = block_height % Self::STAKING_PERIOD;
+        let position_in_period = block_height % STAKING_PERIOD;
 
-        if position_in_period >= Self::STAKING_DAY_WINDOW {
+        if position_in_period >= STAKING_DAY_WINDOW {
             return Err(TransactionError::StakingActionOutsideWindow {
                 block_height,
-                period: Self::STAKING_PERIOD,
-                window: Self::STAKING_DAY_WINDOW,
+                period: STAKING_PERIOD,
+                window: STAKING_DAY_WINDOW,
             });
         }
 

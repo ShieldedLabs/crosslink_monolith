@@ -78,7 +78,6 @@ use rustybuzz::{shape, Face as RbFace, UnicodeBuffer};
 use swash::{scale::ScaleContext, text, FontRef};
 
 
-pub const UI_COPY_STAKING_ACTION_DELAY_BLOCKS: u64 = 75;
 pub const UI_COPY_STAKING_PERIOD: u64 = 150;
 pub const UI_COPY_STAKING_DAY_WINDOW: u64 = 70;
 
