@@ -28,13 +28,38 @@ pub struct HashBytes(#[serde(with = "hex")] pub [u8; 32]);
 #[serde(deny_unknown_fields)]
 pub struct HardForkConfig {
     /// The PoW block height at which this hardfork activates.
+    #[serde(deserialize_with = "deserialize_staking_aligned")]
     pub pow_activation_height: u64,
     /// The BFT certificate height at which this hardfork activates.
     pub bft_certificate_height: u64,
     /// Finalizers terminated by this hardfork. Committed to by hash later, so
     /// this list is sorted into a canonical order when the schedule is built.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_finalizers")]
     pub terminated_finalizers: Vec<zcash_primitives::bft::PubKeyID>,
+}
+
+fn deserialize_staking_aligned<'de, D>(d: D) -> Result<u64, D::Error> where D: serde::Deserializer<'de> {
+    let n = u64::deserialize(d)?; // @Todo: should be u32
+    let period = zcash_primitives::transaction::STAKING_PERIOD as u64; // @Todo: u32
+    if n == 0 {
+        return Err(serde::de::Error::custom(format!("`pow_activation_height` must be greater than zero and a multiple of the staking period ({period})")));
+    }
+    if n % period != 0 {
+        return Err(serde::de::Error::custom(format!("`pow_activation_height` must be a multiple of the staking period ({period}); got {n} (nearest valid: {} or {})",
+                                                    n / period * period, (n / period + 1) * period)));
+    }
+    Ok(n)
+}
+
+fn deserialize_unique_finalizers<'de, D>(d: D) -> Result<Vec<zcash_primitives::bft::PubKeyID>, D::Error> where D: serde::Deserializer<'de> {
+    let finalizers = Vec::<zcash_primitives::bft::PubKeyID>::deserialize(d)?;
+    let mut seen = std::collections::HashSet::with_capacity(finalizers.len());
+    for finalizer in &finalizers {
+        if !seen.insert(finalizer) {
+            return Err(serde::de::Error::custom(format!("`terminated_finalizers` contains duplicate finalizer \"{finalizer}\", which was already specified")));
+        }
+    }
+    Ok(finalizers)
 }
 
 /// Hardfork rules shipped in the executable.

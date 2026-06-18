@@ -375,7 +375,8 @@ impl<'de> serde::Deserialize<'de> for PubKeyID {
     where
         D: serde::Deserializer<'de>,
     {
-        let le_str = <&str>::deserialize(deserializer)?;
+        let le_str = std::borrow::Cow::<'de, str>::deserialize(deserializer)?;
+        let le_str: &str = le_str.as_ref();
         if le_str.len() != 64 {
             return Err(serde::de::Error::invalid_length(le_str.len(), &"32 bytes => 64 hex characters"));
         }

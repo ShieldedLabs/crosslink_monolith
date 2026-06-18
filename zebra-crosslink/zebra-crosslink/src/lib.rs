@@ -1201,7 +1201,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
     if let Some(slash_fork) = config.hardforks.last() {
         // NOTE: this will change if the staking period changes
         let end_height: u32 = slash_fork.pow_activation_height.try_into().expect("fits in u32");
-        assert!(end_height % zcash_primitives::transaction::STAKING_PERIOD != 0);
+        assert!(end_height % zcash_primitives::transaction::STAKING_PERIOD == 0);
         assert!(end_height != 0);
         assert!(slash_fork.terminated_finalizers.len() != 0);
         // ALT: determine bgn_height via PoS height (and deferred analysis)
