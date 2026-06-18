@@ -700,6 +700,7 @@ pub struct ScanBond {
 
 #[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScanInfo {
+    pub ufvk: std::string::String,
     pub coinbases_c: usize,
     pub coinbases_value: u64,
     pub coinbase_max_height: u32,

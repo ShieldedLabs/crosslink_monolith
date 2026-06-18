@@ -47,7 +47,7 @@ use zcash_primitives::block::{
     BlockHeaderData as BcBlockHeader,
     BlockHeader as BcBlockHeaderWrap,
 };
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, TEST_NETWORK};
 
 use chrono::DateTime;
 
@@ -1341,7 +1341,7 @@ async fn total_issuance_from_key(
     //     _ => return Err(format!("unexpectedly failed to get tip: {res:?}")),
     // };
 
-    let mut scan_infos = vec![ScanInfo::default(); ufvks.len()];
+    let mut scan_infos: Vec<ScanInfo> = ufvks.iter().map(|ufvk| ScanInfo { ufvk: ufvk.encode(&TEST_NETWORK), ..ScanInfo::default() }).collect();
     let mut delegation_bonds = HashMap::new();
     let mut utxos_per_ufvk = vec![HashSet::<(PubKeyID, u32)>::new(); ufvks.len()]; // NOTE: hashsets here are grow-only
 
