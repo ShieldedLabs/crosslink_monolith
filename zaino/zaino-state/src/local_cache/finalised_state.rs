@@ -600,20 +600,19 @@ impl FinalisedState {
         }
 
         // NOTE(Giovanni): Get all the referenced blocks from the database and store them in a HashSet
-        let txn = self.database.begin_ro_txn()?;
         let mut referenced = HashSet::new();
         {
+            let txn = self.database.begin_ro_txn()?;
             let mut cursor = txn.open_ro_cursor(self.heights_to_hashes)?;
             for (_, hash_bytes) in cursor.iter() {
                 referenced.insert(hash_bytes.to_vec());
             }
         }
-        drop(txn);
 
         // NOTE(Giovanni): Get all the orphan blocks from the database and store them in a Vec
         let mut orphan_keys = Vec::new();
-        let txn = self.database.begin_ro_txn()?;
         {
+            let txn = self.database.begin_ro_txn()?;
             let mut cursor = txn.open_ro_cursor(self.hashes_to_blocks)?;
             for (hash_key, _) in cursor.iter() {
                 if !referenced.contains(hash_key) {
@@ -621,7 +620,6 @@ impl FinalisedState {
                 }
             }
         }
-        drop(txn);
 
         // NOTE(Giovanni): Remove the orphan blocks from the database
         if !orphan_keys.is_empty() {
