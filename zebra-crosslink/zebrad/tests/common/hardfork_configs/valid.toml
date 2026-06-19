@@ -1,0 +1,7 @@
+[[crosslink.hardforks]]
+pow_activation_height = 300
+bft_certificate_height = 10
+terminated_finalizers = [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+]
