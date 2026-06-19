@@ -26,20 +26,15 @@ if "%project%"=="zebra-crosslink" (
     set "flags=%flags% -Fviz_gui"
 )
 
-echo Pushing working dir: "%root%/%project%"
-pushd "%root%/%project%"
+if "%PH_SUBCOMMAND%"=="" ( echo PH_SUBCOMMAND not set, do not call this directly! && exit /b 1 )
+
+set "extra=%3 %4 %5 %6 %7 %8 %9"
+
+echo Pushing working dir: "%root%%project%"
+pushd "%root%%project%"
 cargo sweep --time 3
-%root%/cargo_build_errorlimit_1 %flags%
+call "%root%cargo_errorlimit.bat" %PH_SUBCOMMAND% %flags% %extra%
+set "result=%errorlevel%"
 popd
 
-if %errorlevel% neq 0 exit /b %errorlevel%
-
-if "%project%"=="zebra-crosslink" (
-    del /Q /F "%root%\zebra-crosslink\ZZ_1"
-    rem copy /Y  "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe"                "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_1.exe"
-    rem copy /Y  "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe"                "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_2.exe"
-    rem start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_1.exe" "-c" "%root%\zebra-crosslink\testnet_1.toml"
-    rem start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad_testnet_2.exe" "-c" "%root%\zebra-crosslink\testnet_2.toml"
-    rem start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe" "-c" "%root%\zebra-crosslink\.AA_0.local.toml"
-    rem start "" "%root%\zebra-crosslink\target\%build_folder%\deps\zebrad.exe" "-c" "%root%\zebra-crosslink\.AA_1.local.toml"
-)
+exit /b %result%
