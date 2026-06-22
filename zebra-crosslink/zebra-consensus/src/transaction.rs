@@ -866,7 +866,10 @@ where
     }
 
     /// Minimum number of blocks that must pass between staking actions on the same bond.
-    pub const STAKING_ACTION_DELAY_BLOCKS: u32 = 75;
+    /// @Todo: We probably don't really need this or want this. We can just check:
+    ///        (last_action_height / STAKING_PERIOD) > (current_height / STAKING_PERIOD)
+    ///        which is probably more robust.
+    pub const STAKING_ACTION_DELAY: u32 = STAKING_DAY_WINDOW + 5;
 
     /// Checks that staking actions in a transaction respect the required delay since the
     /// last action on the same bond.
@@ -918,12 +921,12 @@ where
         let current_height = height.0;
 
         // Check if enough blocks have passed since the last action
-        if current_height < last_action_height + Self::STAKING_ACTION_DELAY_BLOCKS {
+        if current_height < last_action_height + Self::STAKING_ACTION_DELAY {
             return Err(TransactionError::StakingActionDelayNotMet {
                 bond_key,
                 last_action_height,
                 current_height,
-                required_delay: Self::STAKING_ACTION_DELAY_BLOCKS,
+                required_delay: Self::STAKING_ACTION_DELAY,
             });
         }
 

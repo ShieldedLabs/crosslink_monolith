@@ -8,8 +8,8 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use zcash_keys::address::Address;
 use zebra_chain::{
     block::{
-        Block, FatPointerToBftBlock, Hash as BlockHash, Header as BlockHeader,
-        Height as BlockHeight,
+        Block, BftBlock, BftBlockAndFatPointerToIt, FatPointerSignature, FatPointerToBftBlock, PROTOTYPE_PARAMETERS, PubKeyID,
+        Hash as BlockHash, Header as BlockHeader, Height as BlockHeight,
     },
     fmt::HexDebug,
     history_tree::HistoryTree,
@@ -19,7 +19,6 @@ use zebra_chain::{
     serialization::*,
     work::{self, difficulty::CompactDifficulty},
 };
-use zebra_crosslink::{FatPointerToBftBlock2, chain::*};
 use zebra_crosslink::test_format::*;
 use zebra_state::crosslink::*;
 use zebrad::application::CROSSLINK_TEST_CONFIG_OVERRIDE;
@@ -272,7 +271,7 @@ fn crosslink_expect_pos_height_after_push() {
     }
     tf.push_instr_expect_pow_chain_length(8, 0);
 
-    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     for i in 1..5 {
         let bft = next_pos(pos_h, fat_ptr, &pow_common[i..i+3], &[]);
         tf.push_instr_load_pos(&bft, 0);
@@ -303,7 +302,7 @@ fn crosslink_expect_pos_out_of_order() {
     }
     tf.push_instr_expect_pow_chain_length(6, 0);
 
-    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let pos = [
         next_pos(pos_h, fat_ptr, &pow_common[0..=2], &[]),
         next_pos(pos_h, fat_ptr, &pow_common[1..=3], &[]),
@@ -336,7 +335,7 @@ fn crosslink_expect_pos_push_same_block_twice_only_accepted_once() {
     }
     tf.push_instr_expect_pow_chain_length(4, 0);
 
-    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let pos = next_pos(pos_h, fat_ptr, &pow_common[0..=2], &[]);
 
     tf.push_instr_load_pos(&pos, 0);
@@ -358,9 +357,9 @@ fn crosslink_reject_pos_with_signature_on_different_data() {
     // modify block data so that the signatures are incorrect
     // NOTE: modifying the last as there is no `previous_block_hash` that this invalidates
     let mut bft_block_and_fat_ptr =
-        BftBlockAndFatPointerToIt::zcash_deserialize(REGTEST_POS_BLOCK_BYTES[0]).unwrap();
+        BftBlockAndFatPointerToItWrap::zcash_deserialize(REGTEST_POS_BLOCK_BYTES[0]).unwrap();
     // let mut last_pow_hdr =
-    bft_block_and_fat_ptr.block.headers.last_mut().unwrap().time += Duration::from_secs(1);
+    bft_block_and_fat_ptr.0.block.headers.last_mut().unwrap().time += 1;
     let new_bytes = bft_block_and_fat_ptr.zcash_serialize_to_vec().unwrap();
 
     assert!(
@@ -380,7 +379,7 @@ fn crosslink_test_basic_finality() {
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let mut gen =
@@ -458,11 +457,11 @@ fn reject_pos_block_with_lt_sigma_headers() {
     }
 
     let mut bft_block_and_fat_ptr =
-        BftBlockAndFatPointerToIt::zcash_deserialize(REGTEST_POS_BLOCK_BYTES[0]).unwrap();
+        BftBlockAndFatPointerToItWrap::zcash_deserialize(REGTEST_POS_BLOCK_BYTES[0]).unwrap();
     bft_block_and_fat_ptr
-        .block
+        .0.block
         .headers
-        .truncate(bft_block_and_fat_ptr.block.headers.len() - 1);
+        .truncate(bft_block_and_fat_ptr.0.block.headers.len() - 1);
     let new_bytes = bft_block_and_fat_ptr.zcash_serialize_to_vec().unwrap();
     assert!(
         &new_bytes != REGTEST_POS_BLOCK_BYTES[0],
@@ -478,7 +477,7 @@ fn crosslink_test_pow_to_pos_link() {
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let mut gen =
@@ -496,16 +495,16 @@ fn crosslink_test_pow_to_pos_link() {
     let bft = next_pos(pos_h, fat_ptr, &pow[1..4], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
-    let fat_pointer_to_bft_block = zebra_chain::block::FatPointerToBftBlock {
+    let fat_pointer_to_bft_block = FatPointerToBftBlock {
         vote_for_block_without_finalizer_public_key: bft
-            .fat_ptr
+            .0.fat_ptr
             .vote_for_block_without_finalizer_public_key,
             signatures: bft
-                .fat_ptr
+                .0.fat_ptr
                 .signatures
                 .iter()
-                .map(|sig| zebra_chain::block::FatPointerSignature {
-                    public_key: sig.public_key,
+                .map(|sig| FatPointerSignature {
+                    pub_key: sig.pub_key,
                     vote_signature: sig.vote_signature,
                 })
         .collect(),
@@ -541,7 +540,7 @@ fn crosslink_reject_pow_chain_fork_that_is_competing_against_a_shorter_finalized
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let mut gen =
@@ -591,7 +590,7 @@ fn crosslink_pow_switch_to_finalized_chain_fork_even_though_longer_chain_exists(
     set_test_name(function_name!());
     let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
 
-    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
     let mut gen =
@@ -841,10 +840,10 @@ fn crosslink_gen_pow_fork() {
 
 fn create_pos_and_ptr_to_finalize_pow(
     bft_height: u32,
-    parent_fat_ptr: FatPointerToBftBlock2,
+    parent_fat_ptr: FatPointerToBftBlock,
     pow_blocks: &[Arc<Block>],
-    sigs: &[zebra_crosslink::FatPointerSignature2],
-) -> BftBlockAndFatPointerToIt {
+    sigs: &[FatPointerSignature],
+) -> BftBlockAndFatPointerToItWrap {
     assert_eq!(
         pow_blocks.len(),
         PROTOTYPE_PARAMETERS.bc_confirmation_depth_sigma as usize
@@ -852,7 +851,9 @@ fn create_pos_and_ptr_to_finalize_pow(
 
     let mut hdrs = Vec::with_capacity(pow_blocks.len());
     for pow_block in pow_blocks {
-        hdrs.push(pow_block.header.as_ref().clone());
+        // BftBlock::try_from takes BcBlockHeader (zcash_primitives), not zebra's
+        // Header; convert via the same helper production code uses (lib.rs).
+        hdrs.push(zebra_crosslink::bc_hdr_to_lrz(pow_block.header.as_ref()));
     }
 
     let block = BftBlock::try_from(
@@ -865,23 +866,23 @@ fn create_pos_and_ptr_to_finalize_pow(
     .expect("valid PoS block");
 
     // TODO:
-    let _sig = zebra_crosslink::FatPointerSignature2 {
-        public_key: [0xabu8; 32],
+    let _sig = FatPointerSignature {
+        pub_key: PubKeyID([0xabu8; 32]),
         vote_signature: [0xbcu8; 64],
     };
 
-    BftBlockAndFatPointerToIt::from_parts(block, bft_height.into(), 1, sigs)
+    BftBlockAndFatPointerToItWrap(BftBlockAndFatPointerToIt::from_parts(block, bft_height.into(), 1, sigs))
 }
 
 fn next_pos(
     cur_bft_height: &mut u32,
-    cur_fat_ptr: &mut FatPointerToBftBlock2,
+    cur_fat_ptr: &mut FatPointerToBftBlock,
     pow_blocks: &[Arc<Block>],
-    sigs: &[zebra_crosslink::FatPointerSignature2],
-) ->BftBlockAndFatPointerToIt {
+    sigs: &[FatPointerSignature],
+) -> BftBlockAndFatPointerToItWrap {
     *cur_bft_height += 1;
     let bft = create_pos_and_ptr_to_finalize_pow(*cur_bft_height, cur_fat_ptr.clone(), pow_blocks, sigs);
-    *cur_fat_ptr = bft.fat_ptr.clone();
+    *cur_fat_ptr = bft.0.fat_ptr.clone();
     bft
 }
 
@@ -903,7 +904,7 @@ fn crosslink_gen_pow_and_no_signature_no_roster_pos() {
         tf.push_instr_load_pow(block, 0);
     }
 
-    let fat_ptr = &mut FatPointerToBftBlock2::null();
+    let fat_ptr = &mut FatPointerToBftBlock::null();
     let pos_h = &mut 0;
     let bft = next_pos(pos_h, fat_ptr, &pow_common[0..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
@@ -966,13 +967,13 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
         tf.push_instr_load_pow(block, 0);
     }
 
-    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock2::null());
+    let (pos_h, fat_ptr) = (&mut 0, &mut FatPointerToBftBlock::null());
     let bft = next_pos(pos_h, fat_ptr, &pow_common[0..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
     let (_, _prv_key, pub_key) =
         zebra_crosslink::rng_private_public_key_from_address("some_pub_key".as_bytes());
-    tf.push_instr_expect_roster_includes(pub_key.into(), 1234, 0);
+    tf.push_instr_expect_roster_includes(pub_key.0, 1234, 0);
 
     test_bytes(tf.write_to_bytes());
 }
