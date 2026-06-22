@@ -2690,6 +2690,8 @@ pub async fn viz_main(
                                     _ => Vec::new(),
                                 };
                             },
+                            hardfork: None,
+                            do_not_include_until_bc_height: 0,
                         };
 
                         ctx.bft_last_added = ctx.push_node(
@@ -2936,6 +2938,8 @@ pub async fn viz_main(
                             previous_block_fat_ptr: FatPointerToBftBlock::null(),
                             finalization_candidate_height: 0,
                             headers: Vec::new(),
+                            hardfork: None,
+                            do_not_include_until_bc_height: 0,
                         };
 
                         let id = NodeId::Hash(bft_block.blake3_hash().0);

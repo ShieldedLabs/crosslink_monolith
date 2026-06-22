@@ -16,6 +16,73 @@ use crate::block::{ BlockHeaderData as BcBlockHeader, BlockHeader as BcBlockHead
 //     ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
 // };
 
+/// A single user-led hardfork rule.
+///
+/// This is the canonical per-rule type, shared by node config (in `zebra-chain`,
+/// which re-exports it) and by [`BftBlock`], which embeds an optional entry from
+/// version 2 onward.
+///
+/// When carried in a [`BftBlock`] the byte layout produced by [`zcash_serialize`]
+/// is consensus-critical: it is committed to by the block hash and therefore by
+/// finalizer signatures (see [`BftBlock`] docs). Do not change the layout without
+/// bumping the [`BftBlock`] version.
+///
+/// [`zcash_serialize`]: HardForkConfig::zcash_serialize
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardForkConfig {
+    /// The PoW block height at which this hardfork activates.
+    pub pow_activation_height: u64,
+    /// The BFT certificate height at which this hardfork activates.
+    pub bft_certificate_height: u64,
+    /// Finalizers terminated by this hardfork. Committed to by hash later, so
+    /// this list is sorted into a canonical order when the schedule is built.
+    #[serde(default)]
+    pub terminated_finalizers: Vec<PubKeyID>,
+}
+
+impl HardForkConfig {
+    /// Upper bound on `terminated_finalizers` accepted by [`zcash_deserialize`],
+    /// to bound allocation from untrusted input.
+    ///
+    /// [`zcash_deserialize`]: HardForkConfig::zcash_deserialize
+    const MAX_TERMINATED_FINALIZERS: u32 = 4096;
+
+    #[allow(clippy::unwrap_in_result)]
+    pub fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+        writer.write_u64::<LittleEndian>(self.pow_activation_height)?;
+        writer.write_u64::<LittleEndian>(self.bft_certificate_height)?;
+        writer.write_u32::<LittleEndian>(self.terminated_finalizers.len().try_into().unwrap())?;
+        for finalizer in &self.terminated_finalizers {
+            writer.write_all(&finalizer.0)?;
+        }
+        Ok(())
+    }
+
+    pub fn zcash_deserialize<R: std::io::Read>(mut reader: R) -> Result<Self, std::io::Error> {
+        let pow_activation_height = reader.read_u64::<LittleEndian>()?;
+        let bft_certificate_height = reader.read_u64::<LittleEndian>()?;
+        let count = reader.read_u32::<LittleEndian>()?;
+        if count > Self::MAX_TERMINATED_FINALIZERS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "terminated_finalizers count exceeds maximum",
+            ));
+        }
+        let mut terminated_finalizers = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let mut bytes = [0u8; 32];
+            reader.read_exact(&mut bytes)?;
+            terminated_finalizers.push(PubKeyID(bytes));
+        }
+        Ok(HardForkConfig {
+            pow_activation_height,
+            bft_certificate_height,
+            terminated_finalizers,
+        })
+    }
+}
+
 /// The BFT block content for Crosslink
 ///
 /// # Constructing [BftBlock]s
@@ -45,6 +112,18 @@ use crate::block::{ BlockHeaderData as BcBlockHeader, BlockHeader as BcBlockHead
 ///
 /// **TODO:** Ensure deserialization delegates to [BftBlock::try_from].
 ///
+/// ## Versioning
+///
+/// The serialized form is consensus-critical (it is blake3-hashed, and that hash
+/// is the value finalizers sign — see [Blake3Hash] and [Vote]). New fields are
+/// therefore gated on [version]: `version >= 2` blocks serialize the [hardfork]
+/// and [do_not_include_until_bc_height] tail, while earlier versions serialize
+/// byte-for-byte as before, leaving their hashes and signatures unchanged.
+///
+/// [version]: BftBlock::version
+/// [hardfork]: BftBlock::hardfork
+/// [do_not_include_until_bc_height]: BftBlock::do_not_include_until_bc_height
+///
 /// ## Design Notes
 ///
 /// This *assumes* is is more natural to fetch the latest BC tip in Zebra, then to iterate to parent blocks, appending each to the [Vec]. This means the in-memory header order is *reversed from the specification* [^1]:
@@ -70,6 +149,18 @@ pub struct BftBlock {
     /// The PoW Headers
     // @Zooko: PoPoW?
     pub headers: Vec<BcBlockHeader>,
+    /// A single user-led hardfork rule activated by this block, if any.
+    ///
+    /// Serialized only in `version >= 2` blocks. For earlier versions this must
+    /// be `None`: it is not serialized and so not covered by the block hash or
+    /// finalizer signatures.
+    pub hardfork: Option<HardForkConfig>,
+    /// BC height before which this BFT block must not be included.
+    ///
+    /// Serialized only in `version >= 2` blocks. For earlier versions this must
+    /// be `0`: it is not serialized and so not covered by the block hash or
+    /// finalizer signatures.
+    pub do_not_include_until_bc_height: u64,
 }
 
 impl BftBlock {
@@ -84,6 +175,18 @@ impl BftBlock {
         for header in &self.headers {
             // header_data.zcash_serialize(&mut writer)?;
             BcBlockHeaderWrap::write_data(header, &mut writer)?;
+        }
+        // Version 2 tail. Earlier versions end here, so their serialization (and
+        // hence hash and signatures) is unchanged.
+        if self.version >= 2 {
+            match &self.hardfork {
+                Some(hardfork) => {
+                    writer.write_u8(1)?;
+                    hardfork.zcash_serialize(&mut writer)?;
+                }
+                None => writer.write_u8(0)?,
+            }
+            writer.write_u64::<LittleEndian>(self.do_not_include_until_bc_height)?;
         }
         Ok(())
     }
@@ -111,12 +214,32 @@ impl BftBlock {
             array.push(BcBlockHeaderWrap::read_data(&mut reader)?);
         }
 
+        // Version 2 tail; see zcash_serialize. Earlier versions default to NIL.
+        let (hardfork, do_not_include_until_bc_height) = if version >= 2 {
+            let hardfork = match reader.read_u8()? {
+                0 => None,
+                1 => Some(HardForkConfig::zcash_deserialize(&mut reader)?),
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "invalid hardfork presence flag",
+                    ))
+                }
+            };
+            let do_not_include_until_bc_height = reader.read_u64::<LittleEndian>()?;
+            (hardfork, do_not_include_until_bc_height)
+        } else {
+            (None, 0)
+        };
+
         Ok(BftBlock {
             version,
             height,
             previous_block_fat_ptr,
             finalization_candidate_height,
             headers: array,
+            hardfork,
+            do_not_include_until_bc_height,
         })
     }
 // }
@@ -155,6 +278,8 @@ impl BftBlock {
             previous_block_fat_ptr,
             finalization_candidate_height,
             headers,
+            hardfork: None,
+            do_not_include_until_bc_height: 0,
         })
     }
 

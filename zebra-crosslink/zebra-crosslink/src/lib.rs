@@ -118,7 +118,7 @@ pub mod config {
     // zebra-consensus — which cannot depend on zebra-crosslink — can share them.
     // Re-exported here for ergonomic access via `zebra_crosslink::config::*`.
     pub use zebra_chain::parameters::hardfork::{
-        shipped_hardforks, HardForkConfig, HardForkSchedule, HashBytes,
+        shipped_hardforks, HardForkConfig, HardForkSchedule,
     };
 
     /// Configuration for the state service.
@@ -615,6 +615,8 @@ async fn handle_new_decided_bft_block(
             },
             finalization_candidate_height: 0,
             headers: Vec::new(),
+            hardfork: None,
+            do_not_include_until_bc_height: 0,
         });
     }
 

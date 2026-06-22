@@ -10,32 +10,12 @@
 //! which is built once at config load and then shared (read-only) with everything
 //! that needs it — zebra-state, zebra-consensus and zebra-crosslink.
 
-use serde::{Deserialize, Serialize};
-
-/// A 32-byte hash, represented as a hex string in TOML.
-///
-/// Ordering is by the raw bytes, which lets lists of these be sorted into a
-/// canonical order before they are committed to by hash.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-pub struct HashBytes(#[serde(with = "hex")] pub [u8; 32]);
-
-/// A single user-led hardfork rule.
-///
-/// Over time, user-led hardforks become assumed by the software, so these are
-/// merged with the hardfork rules shipped in the executable (see
-/// [`shipped_hardforks`]).
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardForkConfig {
-    /// The PoW block height at which this hardfork activates.
-    pub pow_activation_height: u64,
-    /// The BFT certificate height at which this hardfork activates.
-    pub bft_certificate_height: u64,
-    /// Finalizers terminated by this hardfork. Committed to by hash later, so
-    /// this list is sorted into a canonical order when the schedule is built.
-    #[serde(default)]
-    pub terminated_finalizers: Vec<HashBytes>,
-}
+// The per-rule type is defined in `zcash_primitives::bft` so that `BftBlock` can
+// embed an entry (zebra-chain depends on zcash_primitives, not the reverse). Its
+// `terminated_finalizers` are `PubKeyID` finalizer identities, which already
+// round-trip in the Bitcoin-style byte order used everywhere else. The scheduling
+// and merge logic below stays here, where node config lives.
+pub use zcash_primitives::bft::HardForkConfig;
 
 /// Hardfork rules shipped in the executable.
 ///
