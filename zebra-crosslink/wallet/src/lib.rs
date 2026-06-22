@@ -1155,7 +1155,7 @@ pub fn p2pkh_from_ufvk(ufvk: &UnifiedFullViewingKey, index: u32) -> Option<Trans
     Some(p2pkh)
 }
 
-fn addrs_from_ufvk(ufvk: &UnifiedFullViewingKey, index: u32) -> Option<(TransparentAddress, TransparentAddress, UnifiedAddress)> {
+pub fn addrs_from_ufvk(ufvk: &UnifiedFullViewingKey, index: u32) -> Option<(TransparentAddress, TransparentAddress, UnifiedAddress)> {
     // NOTE: the wallet auto-increments the child index so this isn't recognized
     let (ua, di_) = ufvk.find_address(orchard::keys::DiversifierIndex::new(), UnifiedAddressRequest::ORCHARD).ok()?;
     let t_addr = p2pkh_from_ufvk(ufvk, index)?;
@@ -2297,7 +2297,7 @@ fn tx_position(wallet: &ManualWallet, txid: &TxId) -> Option<usize> {
 }
 
 // TODO: track both internal and external in here?
-struct PreparedKeys {
+pub struct PreparedKeys {
     pub orchard_fvk: Option<orchard::keys::FullViewingKey>,
     pub orchard_ivk: Option<orchard::keys::PreparedIncomingViewingKey>,
     pub orchard_ovk: Option<orchard::keys::OutgoingViewingKey>,
