@@ -12,13 +12,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A 32-byte hash, represented as a hex string in TOML.
-///
-/// Ordering is by the raw bytes, which lets lists of these be sorted into a
-/// canonical order before they are committed to by hash.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-pub struct HashBytes(#[serde(with = "hex")] pub [u8; 32]);
-
 /// A single user-led hardfork rule.
 ///
 /// Over time, user-led hardforks become assumed by the software, so these are

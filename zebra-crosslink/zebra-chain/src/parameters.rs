@@ -23,7 +23,7 @@ mod transaction;
 pub mod arbitrary;
 
 pub use genesis::*;
-pub use hardfork::{shipped_hardforks, HardForkConfig, HardForkSchedule, HashBytes};
+pub use hardfork::{shipped_hardforks, HardForkConfig, HardForkSchedule};
 pub use network::{magic::Magic, subsidy, testnet, Network, NetworkKind};
 pub use network_upgrade::*;
 pub use transaction::*;
