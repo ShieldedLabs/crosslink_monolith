@@ -47,7 +47,7 @@ use zcash_primitives::block::{
     BlockHeaderData as BcBlockHeader,
     BlockHeader as BcBlockHeaderWrap,
 };
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, TEST_NETWORK};
 
 use chrono::DateTime;
 
@@ -1193,6 +1193,28 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
     let mut last_diagnostic_print = Instant::now();
     let mut current_bc_tip: Option<(ZebBlockHeight, ZebBlockHash)> = None;
 
+    // TODO: handle multiple slash events
+    let mut slash_tracking = FinalizerSlashTracking {
+        snap_height: ZebBlockHeight(0),
+        analysis_heights_exclusive: (ZebBlockHeight(0), ZebBlockHeight(0)),
+        slash_finalizers: HashSet::new(),
+        bonds_staked_to_slash_finalizers_at_snap_height: HashMap::new(),
+    };
+    if let Some(slash_fork) = config.hardforks.last() {
+        // NOTE: this will change if the staking period changes
+        let end_height: u32 = slash_fork.pow_activation_height.try_into().expect("fits in u32");
+        assert!(end_height % zcash_primitives::transaction::STAKING_PERIOD == 0);
+        assert!(end_height != 0);
+        assert!(slash_fork.terminated_finalizers.len() != 0);
+        // ALT: determine bgn_height via PoS height (and deferred analysis)
+        let bgn_height: u32 = end_height.saturating_sub(2*zcash_primitives::transaction::STAKING_PERIOD).try_into().expect("fits in u32");
+        slash_tracking.analysis_heights_exclusive = (ZebBlockHeight(bgn_height), ZebBlockHeight(end_height));
+        for finalizer in &slash_fork.terminated_finalizers {
+            slash_tracking.slash_finalizers.insert(*finalizer);
+        }
+    }
+    let mut slashed_bonds = HashSet::<PubKeyID>::new();
+
     loop {
         // Calculate this prior to message handling so that handlers can use it:
         let new_bc_tip = if let Ok(StateResponse::Tip(val)) = (call.state)(StateRequest::Tip).await
@@ -1204,6 +1226,18 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
         tokio::time::sleep_until(run_instant).await;
         run_instant += MAIN_LOOP_SLEEP_INTERVAL;
+
+        if let (true, Some((bc_tip, _))) = (slash_tracking.analysis_heights_exclusive.1.0 > 0, current_bc_tip) {
+            let max_height = bc_tip.min((slash_tracking.snap_height + 5).unwrap());
+            match update_bonds_seen_for_finalizer_slash_tracking(internal_handle.clone(), &mut slash_tracking, &mut slashed_bonds, max_height).await {
+                Err(err) => println!("slashing error: {err:?}"),
+                Ok(()) => {
+                    if slash_tracking.snap_height >= max_height {
+                        println!("slashing bonds: {slashed_bonds:?}");
+                    }
+                }
+            }
+        }
 
         // from this point onwards we must race to completion in order to avoid stalling incoming requests
         // NOTE: split to avoid deadlock from non-recursive mutex - can we reasonably change type?
@@ -1302,19 +1336,30 @@ async fn total_issuance_from_key(
 ) -> Result<Vec<ScanInfo>, String> {
     let call = internal_handle.call.clone();
 
-    // let res = (call.state)(StateRequest::Tip).await;
-    // let tip_height = match res {
-    //     Ok(StateResponse::Tip(Some((tip_height, _)))) => tip_height,
-    //     Ok(StateResponse::Tip(None)) => return Err(format!("failed to get tip: {res:?}")),
-    //     _ => return Err(format!("unexpectedly failed to get tip: {res:?}")),
-    // };
-
-    let mut scan_infos = vec![ScanInfo::default(); ufvks.len()];
     let mut delegation_bonds = HashMap::new();
     let mut utxos_per_ufvk = vec![HashSet::<(PubKeyID, u32)>::new(); ufvks.len()]; // NOTE: hashsets here are grow-only
 
-    for height in first_height.0..=last_height.0 { //tip_height.0 {
-        let tz = wallet::Timer::scope_("scan height", true);
+    let mut scan_infos = Vec::<ScanInfo>::with_capacity(ufvks.len());
+    let mut scan_ctxs = Vec::<wallet::scanner::ScanCtx>::with_capacity(ufvks.len());
+    for ufvk in &ufvks {
+        scan_infos.push(ScanInfo { ufvk: ufvk.encode(&TEST_NETWORK), ..ScanInfo::default() });
+
+        let external_keys = wallet::PreparedKeys::from_ufvk_all(&ufvk);
+        let internal_keys = wallet::PreparedKeys::from_ufvk_all_internal(&ufvk);
+        let (Some(orchard_external_ovk), Some(orchard_internal_ovk)) = (external_keys.orchard_ovk, internal_keys.orchard_ovk) else {
+            return Err("could not create orchard ovks".to_owned());
+        };
+
+        let Some((t_addr, _p2sh, _ua)) = wallet::addrs_from_ufvk(ufvk, 0) else{
+            return Err("Could not get an address".to_owned());
+        };
+
+        scan_ctxs.push(wallet::scanner::ScanCtx { ufvk: ufvk.clone(), t_addr, orchard_external_ovk, orchard_internal_ovk });
+    }
+
+    for height in first_height.0..=last_height.0 {
+        // let tz = wallet::Timer::scope_("scan height", true);
+        println!("scanning height {height}");
         let res = (call.state)(StateRequest::Block(ZebBlockHeight(height).into())).await;
         let block = match res {
             Ok(StateResponse::Block(Some(block))) => block,
@@ -1356,13 +1401,12 @@ async fn total_issuance_from_key(
 
             if delegation_bonds.len() > 0 {
                 let reward_store_for_revert = zebra_state::update_bonds_with_pos_issuance(zebra_state::constants::POS_BLOCK_REWARD_ZATS, &mut delegation_bonds);
-                // TODO: apply
             }
 
-            for (ufvk_i, ufvk) in ufvks.iter().enumerate() {
+            for (ufvk_i, scan_ctx) in scan_ctxs.iter().enumerate() {
                 let utxos = &mut utxos_per_ufvk[ufvk_i];
                 let scan_info = &mut scan_infos[ufvk_i];
-                match wallet::scanner::scan_tx(scan_info, utxos, &coinbase_tx_bytes, tx_i, height, &ufvk, txid.0) {
+                match wallet::scanner::scan_tx(scan_info, utxos, &coinbase_tx_bytes, tx_i, height, scan_ctx, txid.0) {
                     Ok(false) => {},
                     Ok(true) => println!("scan info at {height}: {scan_info:?}"),
                     Err(err) => return Err(format!("failed to scan {txid:?} at height {height}: {err}")),
@@ -1371,8 +1415,8 @@ async fn total_issuance_from_key(
         }
     }
 
-    let mut bonds_value = 0;
     for scan_info in &mut scan_infos {
+        let mut bonds_value = 0;
         for bond in &scan_info.bonds {
             match delegation_bonds.get(&bond.pk.0) {
                 Some(bond_info) => {
@@ -1394,29 +1438,31 @@ async fn total_issuance_from_key(
     Ok(scan_infos)
 }
 
-struct SlashTrackingBondChange {
-    change_height: ZebBlockHeight,
-    finalizer_pk_id: PubKeyID,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlashTrackingBondChange {
+    pub change_height: ZebBlockHeight,
+    pub finalizer_pk_id: PubKeyID,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct FinalizerSlashTracking {
-    snap_height: ZebBlockHeight,
-    analysis_heights_inclusive: (ZebBlockHeight, ZebBlockHeight),
-    slash_finalizers: HashSet<PubKeyID>,
-    bonds_staked_to_slash_finalizers_at_snap_height: HashMap<PubKeyID, SlashTrackingBondChange>, // from bond key
+    pub snap_height: ZebBlockHeight,
+    pub analysis_heights_exclusive: (ZebBlockHeight, ZebBlockHeight),
+    pub slash_finalizers: HashSet<PubKeyID>,
+    pub bonds_staked_to_slash_finalizers_at_snap_height: HashMap<PubKeyID, SlashTrackingBondChange>, // from bond key
 }
 
 async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServiceHandle, tracking: &mut FinalizerSlashTracking, bonds_to_slash: &mut HashSet<PubKeyID>, max_height: ZebBlockHeight) -> Result<(), String> {
     let call = internal_handle.call.clone();
 
-    let (analysis_lo_height, analysis_hi_height) = tracking.analysis_heights_inclusive;
-    assert!(analysis_lo_height <= analysis_hi_height);
+    let (analysis_bgn_height, analysis_end_height) = tracking.analysis_heights_exclusive;
+    assert!(analysis_bgn_height <= analysis_end_height);
 
-    let hi_height = analysis_hi_height.max(max_height);
-    if tracking.snap_height > hi_height {
+    let end_height = analysis_end_height.max((max_height+1).unwrap());
+    if tracking.snap_height >= end_height {
         return Ok(());
     }
 
-    for height in tracking.snap_height.0 ..= hi_height.0 {
+    for height in tracking.snap_height.0 .. end_height.0 {
         let height = ZebBlockHeight(height);
         let res = (call.state)(StateRequest::Block(height.into())).await;
 
@@ -1486,7 +1532,7 @@ async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServ
             }
         }
 
-        if analysis_lo_height <= height && height <= analysis_hi_height {
+        if analysis_bgn_height <= height && height < analysis_end_height {
             // Add all bonds currently allocated to a slashed finalizer to our "big list of bonds to slash".
             // We no longer need to track them here as we are already committing to fully removing them from existence.
             tracking.bonds_staked_to_slash_finalizers_at_snap_height.retain(|bond_key, v| {
@@ -1604,6 +1650,8 @@ async fn tfl_service_incoming_request(
         }
 
         TFLServiceRequest::StakingCmd(String) => Err(TFLServiceError::NotImplemented),
+
+        TFLServiceRequest::WalletUfvk => Ok(TFLServiceResponse::WalletUfvk(wallet::USER_UFVK_STRING.lock().unwrap().clone())),
     }
 }
 

@@ -1,19 +1,23 @@
 use crate::*;
 use crate::bft::{ ScanInfo, ScanBond, PubKeyID };
 
+#[derive(Clone, Debug)]
+pub struct ScanCtx {
+    pub ufvk: zcash_keys::keys::UnifiedFullViewingKey,
+    pub t_addr: TransparentAddress,
+    pub orchard_external_ovk: orchard::keys::OutgoingViewingKey,
+    pub orchard_internal_ovk: orchard::keys::OutgoingViewingKey,
+}
 
-pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_bytes: &[u8], tx_i: usize, height: u32, ufvk: &UnifiedFullViewingKey, txid_zeb: [u8; 32]) -> Result<bool, String> {
+
+pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_bytes: &[u8], tx_i: usize, height: u32, ctx: &ScanCtx, txid_zeb: [u8; 32]) -> Result<bool, String> {
     let tz = Timer::scope_("scan_tx", true);
     let mut new_info = false;
     info.max_height_seen = info.max_height_seen.max(height);
 
-    let Some((t_addr, p2sh, ua)) = addrs_from_ufvk(ufvk, 0) else{
-        return Err("Could not get an address".to_owned());
-    };
-
     let network = &TEST_NETWORK;
     let block_h = LRZBlockHeight::from_u32(height);
-    let tx = match Transaction::read(tx_bytes, BranchId::for_height(network, block_h)){
+    let tx = match Transaction::read(tx_bytes, BranchId::for_height(network, block_h)) {
         Ok(tx) => tx,
         Err(err) => return Err(format!("{err:?}")),
     };
@@ -28,20 +32,23 @@ pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_byt
     if let Some(t_bundle) = tx.transparent_bundle() {
         let tz = Timer::scope_("scan_tx > t_bundle", true);
         if t_bundle.is_coinbase() {
+            let mut is_to_ufvk = false;
             for output in &t_bundle.vout {
                 coinbase_ok = true;
 
-                if let Some(matched_addr) = output.recipient_address(){
-                    if matched_addr == t_addr {
-                        // println!("Found a match in a coinbase transaction at height {height}! Value: {value:?}");
-
-                        new_info = true;
-                        info.coinbases_c += 1;
-                        info.coinbases_value += 500_000_000; // hardcoded for @testnet ClT0
-                        debug_assert!(info.coinbase_max_height < height, "expected linear iteration");
-                        info.coinbase_max_height = height;
-                    }
+                if let Some(matched_addr) = output.recipient_address() {
+                    // is_to_ufvk |= t_addr_belongs_to_ufvk_index(&ctx.ufvk, 0, matched_addr);
+                    is_to_ufvk |= matched_addr == ctx.t_addr;
                 }
+            }
+
+            if is_to_ufvk {
+                // println!("Found a match in a coinbase transaction at height {height}! Value: {value:?}");
+                new_info = true;
+                info.coinbases_c += 1;
+                info.coinbases_value += 500_000_000; // hardcoded for @testnet ClT0
+                debug_assert!(info.coinbase_max_height < height, "expected linear iteration");
+                info.coinbase_max_height = height;
             }
         }
 
@@ -54,7 +61,7 @@ pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_byt
         // track received UTXOs so we can later determine if we spent that UTXO on a staking action
         for (out_i, txout) in t_bundle.vout.iter().enumerate() {
             if let Some(t_addr) = txout.recipient_address() {
-                if t_addr_belongs_to_ufvk_index(ufvk, 0, t_addr) {
+                if t_addr_belongs_to_ufvk_index(&ctx.ufvk, 0, t_addr) {
                     let outpoint = (PubKeyID(*txid_lrz.as_ref()), out_i.try_into().unwrap());
                     if ! utxos.insert(outpoint) {
                         return Err(format!("multiple receipts of the same UTXO: {:?}", outpoint));
@@ -68,12 +75,6 @@ pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_byt
         return Err("no coinbase found".to_owned());
     }
 
-
-    let keys = PreparedKeys::from_ufvk_all(&ufvk);
-    let internal_keys = PreparedKeys::from_ufvk_all_internal(&ufvk);
-    let (Some(orchard_ovk), Some(orchard_internal_ovk)) = (keys.orchard_ovk, internal_keys.orchard_ovk) else {
-        return Err("could not create orchard ovks".to_owned());
-    };
 
     if let Some(staking_action) = tx.staking_action() {
         if staking_action.kind == StakingActionKind::CreateNewDelegationBond {
@@ -90,7 +91,7 @@ pub fn scan_tx(info: &mut ScanInfo, utxos: &mut HashSet<(PubKeyID, u32)>, tx_byt
                     let action: &orchard::Action<_> = action; // type-check
                     let domain = orchard::note_encryption::OrchardDomain::for_action(action);
 
-                    for ovk in [&orchard_ovk, &orchard_internal_ovk] {
+                    for ovk in [&ctx.orchard_external_ovk, &ctx.orchard_internal_ovk] {
                         if let Some((_note, _addr, _send_memo)) = try_output_recovery_with_ovk(
                             &domain,
                             ovk,

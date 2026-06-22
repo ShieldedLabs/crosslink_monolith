@@ -724,7 +724,7 @@ impl StartCmd {
             let zebra_port_base = config.network.listen_addr.port();
             let mut zaino_db_path = config.state.cache_dir.clone();
             zaino_db_path.push(PathBuf::from("zaino"));
-            std::fs::remove_dir_all(&zaino_db_path);
+            // std::fs::remove_dir_all(&zaino_db_path);
 
 
             let zaino_config = zainodlib::config::ZainodConfig {

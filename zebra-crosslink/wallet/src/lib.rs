@@ -110,6 +110,7 @@ use zcash_protocol::consensus::{NetworkType, Parameters, MAIN_NETWORK, TEST_NETW
 #[derive(Clone)]
 pub struct FaucetRequestClosure(pub Arc<dyn Fn(String) -> Result<u64, String> + Sync + Send + 'static>);
 pub static FAUCET_REQUEST: Mutex<Option<FaucetRequestClosure>> = Mutex::new(None);
+pub static USER_UFVK_STRING: Mutex<Option<String>> = Mutex::new(None);
 pub static GUI_ENABLE_MINE: Mutex<bool> = Mutex::new(true);
 
 #[derive(Clone)]
@@ -1154,7 +1155,7 @@ pub fn p2pkh_from_ufvk(ufvk: &UnifiedFullViewingKey, index: u32) -> Option<Trans
     Some(p2pkh)
 }
 
-fn addrs_from_ufvk(ufvk: &UnifiedFullViewingKey, index: u32) -> Option<(TransparentAddress, TransparentAddress, UnifiedAddress)> {
+pub fn addrs_from_ufvk(ufvk: &UnifiedFullViewingKey, index: u32) -> Option<(TransparentAddress, TransparentAddress, UnifiedAddress)> {
     // NOTE: the wallet auto-increments the child index so this isn't recognized
     let (ua, di_) = ufvk.find_address(orchard::keys::DiversifierIndex::new(), UnifiedAddressRequest::ORCHARD).ok()?;
     let t_addr = p2pkh_from_ufvk(ufvk, index)?;
@@ -2296,7 +2297,7 @@ fn tx_position(wallet: &ManualWallet, txid: &TxId) -> Option<usize> {
 }
 
 // TODO: track both internal and external in here?
-struct PreparedKeys {
+pub struct PreparedKeys {
     pub orchard_fvk: Option<orchard::keys::FullViewingKey>,
     pub orchard_ivk: Option<orchard::keys::PreparedIncomingViewingKey>,
     pub orchard_ovk: Option<orchard::keys::OutgoingViewingKey>,
@@ -3301,6 +3302,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         state.user_recv_ua = user_ua_str.clone();
         state.user_seed_mnemonic = user_mnemonic.to_string();
         state.user_ufvk = user_account.ufvk.encode(network);
+        *USER_UFVK_STRING.lock().unwrap() = Some(state.user_ufvk.clone());
     }
 
 

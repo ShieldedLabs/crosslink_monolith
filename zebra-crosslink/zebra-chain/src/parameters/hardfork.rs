@@ -13,8 +13,10 @@
 // The per-rule type is defined in `zcash_primitives::bft` so that `BftBlock` can
 // embed an entry (zebra-chain depends on zcash_primitives, not the reverse). Its
 // `terminated_finalizers` are `PubKeyID` finalizer identities, which already
-// round-trip in the Bitcoin-style byte order used everywhere else. The scheduling
-// and merge logic below stays here, where node config lives.
+// round-trip in the Bitcoin-style byte order used everywhere else. Config-load
+// validation (staking-aligned heights, unique finalizers) lives on the type in
+// `bft.rs` via serde `deserialize_with`. The scheduling and merge logic below
+// stays here, where node config lives.
 pub use zcash_primitives::bft::HardForkConfig;
 
 /// Hardfork rules shipped in the executable.

@@ -32,13 +32,38 @@ use crate::block::{ BlockHeaderData as BcBlockHeader, BlockHeader as BcBlockHead
 #[serde(deny_unknown_fields)]
 pub struct HardForkConfig {
     /// The PoW block height at which this hardfork activates.
+    #[serde(deserialize_with = "deserialize_staking_aligned")]
     pub pow_activation_height: u64,
     /// The BFT certificate height at which this hardfork activates.
     pub bft_certificate_height: u64,
     /// Finalizers terminated by this hardfork. Committed to by hash later, so
     /// this list is sorted into a canonical order when the schedule is built.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_finalizers")]
     pub terminated_finalizers: Vec<PubKeyID>,
+}
+
+fn deserialize_staking_aligned<'de, D>(d: D) -> Result<u64, D::Error> where D: serde::Deserializer<'de> {
+    let n = u64::deserialize(d)?; // @Todo: should be u32
+    let period = crate::transaction::STAKING_PERIOD as u64; // @Todo: u32
+    if n == 0 {
+        return Err(serde::de::Error::custom(format!("`pow_activation_height` must be greater than zero and a multiple of the staking period ({period})")));
+    }
+    if n % period != 0 {
+        return Err(serde::de::Error::custom(format!("`pow_activation_height` must be a multiple of the staking period ({period}); got {n} (nearest valid: {} or {})",
+                                                    n / period * period, (n / period + 1) * period)));
+    }
+    Ok(n)
+}
+
+fn deserialize_unique_finalizers<'de, D>(d: D) -> Result<Vec<PubKeyID>, D::Error> where D: serde::Deserializer<'de> {
+    let finalizers = Vec::<PubKeyID>::deserialize(d)?;
+    let mut seen = std::collections::HashSet::with_capacity(finalizers.len());
+    for finalizer in &finalizers {
+        if !seen.insert(finalizer) {
+            return Err(serde::de::Error::custom(format!("`terminated_finalizers` contains duplicate finalizer \"{finalizer}\", which was already specified")));
+        }
+    }
+    Ok(finalizers)
 }
 
 impl HardForkConfig {
@@ -500,7 +525,8 @@ impl<'de> serde::Deserialize<'de> for PubKeyID {
     where
         D: serde::Deserializer<'de>,
     {
-        let le_str = <&str>::deserialize(deserializer)?;
+        let le_str = std::borrow::Cow::<'de, str>::deserialize(deserializer)?;
+        let le_str: &str = le_str.as_ref();
         if le_str.len() != 64 {
             return Err(serde::de::Error::invalid_length(le_str.len(), &"32 bytes => 64 hex characters"));
         }
@@ -825,6 +851,7 @@ pub struct ScanBond {
 
 #[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScanInfo {
+    pub ufvk: std::string::String,
     pub coinbases_c: usize,
     pub coinbases_value: u64,
     pub coinbase_max_height: u32,

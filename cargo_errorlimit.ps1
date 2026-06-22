@@ -1,11 +1,16 @@
-# cargo_build_filter.ps1
-# Streams cargo build output in real-time, showing only the first error.
+# cargo_errorlimit.ps1
+# Streams cargo output in real-time, showing only the first error.
 # Kills the cargo process once a second error line appears (no wasted compile time).
+#
+# Usage: cargo_errorlimit.ps1 <subcommand> [cargo args...]   e.g. build / test
 
-$cargoArgs = "build"
-if ($args.Count -gt 0) {
-    $cargoArgs = "build " + ($args -join " ")
+if ($args.Count -lt 1) {
+    [Console]::Error.WriteLine("cargo_errorlimit.ps1: missing cargo subcommand (e.g. build or test)")
+    exit 1
 }
+
+# First arg is the cargo subcommand (build/test/...); the rest are cargo args.
+$cargoArgs = $args -join " "
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = "cargo"

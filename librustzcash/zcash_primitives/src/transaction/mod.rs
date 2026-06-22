@@ -1545,6 +1545,14 @@ impl StakingAction_WithdrawDelegationBond {
     }
 }
 
+/// The number of blocks between the start of one staking day and the start of the next.
+/// A new staking day starts every N blocks.
+pub const STAKING_PERIOD: u32 = 150;
+
+/// The window size within each staking day period where staking actions are allowed.
+/// Staking actions are only valid when `block_height % STAKING_PERIOD < STAKING_DAY_WINDOW`.
+pub const STAKING_DAY_WINDOW: u32 = 70;
+
 // TODO(code org): should this be under zcash_protocol?
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct StakingAction {

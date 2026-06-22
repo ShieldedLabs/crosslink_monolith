@@ -3,7 +3,7 @@
 use lmdb::{Cursor, Database, Environment, Transaction};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::{fs, sync::Arc};
+use std::{collections::HashSet, fs, sync::Arc};
 use tracing::{error, info, warn};
 
 use zebra_chain::{
@@ -12,7 +12,9 @@ use zebra_chain::{
 };
 use zebra_state::{HashOrHeight, ReadStateService};
 
-use zaino_fetch::jsonrpsee::connector::JsonRpSeeConnector;
+use zaino_fetch::jsonrpsee::connector::{JsonRpSeeConnector, RpcRequestError};
+use zaino_fetch::jsonrpsee::response::{GetBlockError, GetBlockResponse};
+
 use zaino_proto::proto::compact_formats::CompactBlock;
 
 use crate::{
@@ -378,67 +380,105 @@ impl FinalisedState {
     async fn sync_db_from_reorg(&self) -> Result<(), FinalisedStateError> {
         let network = self.config.network.to_zebra_network();
 
-        let mut reorg_height = self.get_db_height().unwrap_or(Height(0));
-        // let reorg_height_int = reorg_height.0.saturating_sub(100);
-        // reorg_height = Height(reorg_height_int);
-
-        let mut reorg_hash = self.get_hash(reorg_height.0).unwrap_or(Hash([0u8; 32]));
-
-        let mut check_hash = match self
-            .fetcher
-            .get_block(reorg_height.0.to_string(), Some(1))
-            .await?
-        {
-            zaino_fetch::jsonrpsee::response::GetBlockResponse::Object(block) => block.hash.0,
-            _ => {
-                return Err(FinalisedStateError::Custom(
-                    "Unexpected block response type".to_string(),
-                ))
+        let validator_height = self.fetcher.get_blockchain_info().await?.blocks.0;
+        let db_height = self.get_db_height().unwrap_or(Height(0)).0;
+        
+        // NOTE(Giovanni): Delete all blocks in the database that are not in the validator chain
+        for h in (validator_height + 1)..=db_height {
+            if self.get_hash(h).is_ok() {
+                self.delete_block(Height(h))?;
             }
-        };
+        }
 
-        // Find reorg height.
-        //
-        // Here this is the latest height at which the internal block hash matches the server block hash.
-        while reorg_hash != check_hash {
-            match reorg_height.previous() {
-                Ok(height) => reorg_height = height,
-                // Underflow error meaning reorg_height = start of chain.
-                // This means the whole finalised state is old or corrupt.
-                Err(_) => {
-                    {
+        let mut reorg_height = Height(db_height.min(validator_height));
+
+        // NOTE(Giovanni): Find reorg height
+        loop {
+            let db_hash = match self.get_hash(reorg_height.0) {
+                Ok(hash) => hash,
+                Err(_) => match reorg_height.previous() {
+                    Ok(height) => {
+                        reorg_height = height;
+                        continue;
+                    }
+                    Err(_) => {
                         let mut txn = self.database.begin_rw_txn()?;
                         txn.clear_db(self.heights_to_hashes)?;
                         txn.clear_db(self.hashes_to_blocks)?;
                         txn.commit()?;
+                        break;
                     }
+                },
+            };
+            // NOTE(Giovanni): Get the hash of the block from the validator
+            let mut validator_hash = None;
+            for attempt in 0..3 {
+                match self
+                    .fetcher
+                    .get_block(reorg_height.0.to_string(), Some(1))
+                    .await
+                {
+                    Ok(GetBlockResponse::Object(block)) => {
+                        validator_hash = Some(block.hash.0);
+                        break;
+                    }
+                    Ok(_) => {
+                        return Err(FinalisedStateError::Custom(
+                            "Unexpected block response type".to_string(),
+                        ));
+                    }
+                    Err(RpcRequestError::Method(
+                        GetBlockError::BlockNotFound | GetBlockError::MissingBlock(_),
+                    )) => {
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            // NOTE(Giovanni): Check if the hash of the block from the validator matches the hash in the database
+            if let Some(ch) = validator_hash {
+                if db_hash == ch {
+                    let payload_ok = self
+                        .get_block(HashOrHeight::Height(reorg_height))
+                        .ok()
+                        .is_some_and(|block| {
+                            block.hash.as_slice() == &ch.0
+                                && block.height == reorg_height.0 as u64
+                        });
+                    if payload_ok {
+                        break;
+                    }
+                    warn!(
+                        "finalised state payload mismatch at height {}, deleting block",
+                        reorg_height.0
+                    );
+                    self.delete_block(reorg_height)?;
+                }
+            } else {
+                warn!(
+                    "validator has no block at height {} after retries, walking back",
+                    reorg_height.0
+                );
+            }
+
+            // NOTE(Giovanni): Walk back the chain until we find a block that matches the hash from the validator
+            match reorg_height.previous() {
+                Ok(height) => reorg_height = height,
+                Err(_) => {
+                    let mut txn = self.database.begin_rw_txn()?;
+                    txn.clear_db(self.heights_to_hashes)?;
+                    txn.clear_db(self.hashes_to_blocks)?;
+                    txn.commit()?;
                     break;
                 }
-            };
-
-            reorg_hash = self.get_hash(reorg_height.0).unwrap_or(Hash([0u8; 32]));
-
-            check_hash = match self
-                .fetcher
-                .get_block(reorg_height.0.to_string(), Some(1))
-                .await?
-            {
-                zaino_fetch::jsonrpsee::response::GetBlockResponse::Object(block) => block.hash.0,
-                _ => {
-                    return Err(FinalisedStateError::Custom(
-                        "Unexpected block response type".to_string(),
-                    ))
-                }
-            };
+            }
         }
 
         // Refill from max(reorg_height[+1], sapling_activation_height) to current server (finalised state) height.
-        let mut sync_height = self
-            .fetcher
-            .get_blockchain_info()
-            .await?
-            .blocks
-            .0;
+        let mut sync_height = validator_height;
         for block_height in ((reorg_height.0 + 1).max(
             self.config
                 .network
@@ -529,6 +569,69 @@ impl FinalisedState {
             }
         }
 
+        // NOTE(Giovanni): Fill the gaps in the database
+        let final_height = self.fetcher.get_blockchain_info().await?.blocks.0;
+        let sapling = network.sapling_activation_height().0;
+        for block_height in sapling..=final_height {
+            if self.get_hash(block_height).is_ok() {
+                continue;
+            }
+            warn!("gap at height {block_height}, fetching from validator");
+            loop {
+                match fetch_block_from_node(
+                    self.state.as_ref(),
+                    Some(&network),
+                    &self.fetcher,
+                    HashOrHeight::Height(Height(block_height)),
+                )
+                .await
+                {
+                    Ok((hash, block)) => {
+                        self.insert_block((Height(block_height), hash, block))?;
+                        break;
+                    }
+                    Err(e) => {
+                        self.status.store(StatusType::RecoverableError);
+                        warn!("{e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        }
+
+        // NOTE(Giovanni): Get all the referenced blocks from the database and store them in a HashSet
+        let mut referenced = HashSet::new();
+        {
+            let txn = self.database.begin_ro_txn()?;
+            let mut cursor = txn.open_ro_cursor(self.heights_to_hashes)?;
+            for (_, hash_bytes) in cursor.iter() {
+                referenced.insert(hash_bytes.to_vec());
+            }
+        }
+
+        // NOTE(Giovanni): Get all the orphan blocks from the database and store them in a Vec
+        let mut orphan_keys = Vec::new();
+        {
+            let txn = self.database.begin_ro_txn()?;
+            let mut cursor = txn.open_ro_cursor(self.hashes_to_blocks)?;
+            for (hash_key, _) in cursor.iter() {
+                if !referenced.contains(hash_key) {
+                    orphan_keys.push(hash_key.to_vec());
+                }
+            }
+        }
+
+        // NOTE(Giovanni): Remove the orphan blocks from the database
+        if !orphan_keys.is_empty() {
+            let removed = orphan_keys.len();
+            let mut txn = self.database.begin_rw_txn()?;
+            for hash_key in &orphan_keys {
+                txn.del(self.hashes_to_blocks, hash_key, None)?;
+            }
+            txn.commit()?;
+            warn!("removed {removed} orphan block entries from finalised state");
+        }
+
         self.status.store(StatusType::Ready);
 
         Ok(())
@@ -537,6 +640,13 @@ impl FinalisedState {
     /// Inserts a block into the finalised state.
     fn insert_block(&self, block: (Height, Hash, CompactBlock)) -> Result<(), FinalisedStateError> {
         let (height, hash, compact_block) = block;
+        // NOTE(Giovanni): Check if the hash of the block matches the hash in the compact block
+        if compact_block.hash.as_slice() != &hash.0 {
+            return Err(FinalisedStateError::Custom(format!(
+                "compact block hash does not match at height {}",
+                height.0
+            )));
+        }
         // let height_key = serde_json::to_vec(&DbHeight(height))?;
         let height_key = DbHeight(height).to_be_bytes();
         let hash_key = serde_json::to_vec(&DbHash(hash))?;
