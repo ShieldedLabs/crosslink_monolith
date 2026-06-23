@@ -3,8 +3,6 @@ const DUMP_NEAR_TIP_CHAINS: bool = 1 == 0;
 use std::collections::{HashMap, HashSet};
 use static_assertions::const_assert;
 
-use crate::{Request, Response, ReadRequest, ReadResponse};
-use tower::ServiceExt;
 use zebra_chain::block::{self, Block, Hash, Height};
 use zebra_chain::serialization::{ZcashSerialize, ZcashDeserialize};
 
@@ -771,34 +769,17 @@ const MAX_BANDWIDTH_BLOCKS_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_RES / zebra_
 // use crate::crosslink::TFLServiceError;
 
 type ReadState = crate::service::ReadStateService;
-type State = tower::buffer::Buffer<tower::util::BoxService<Request, Response, crate::BoxError>, Request>;
 // type TFLService = tower::buffer::Buffer<tower::util::BoxService<TFLServiceRequest, TFLServiceResponse, TFLServiceError>, TFLServiceRequest>;
 
-// TODO: the handling for these calls is sync, so don't have the indirection through async
-
-pub fn get_tips(read_state: &ReadState, rt: &tokio::runtime::Handle) -> (Option<(Height, Hash)>, Option<(Height, Hash)>) {
-    let tip_maybe = rt.block_on(async {
-        let res = read_state.clone().oneshot(ReadRequest::Tip).await;
-        match res {
-            Ok(ReadResponse::Tip(tip_maybe)) => tip_maybe,
-            Err(err) => panic!("sync start err: {err:?}"),
-            _ => panic!("sync err: unhandled response: {res:?}"),
-        }
-    });
-    let finalized_tip_maybe = rt.block_on(async {
-        let res = read_state.clone().oneshot(ReadRequest::FinalizedTip).await;
-        match res {
-            Ok(ReadResponse::Tip(finalized_tip_maybe)) => finalized_tip_maybe,
-            Err(err) => panic!("sync start err: {err:?}"),
-            _ => panic!("sync err: unhandled response: {res:?}"),
-        }
-    });
+pub fn get_tips(read_state: &ReadState) -> (Option<(Height, Hash)>, Option<(Height, Hash)>) {
+    let tip_maybe = read_state.best_tip();
+    let finalized_tip_maybe = read_state.finalized_tip();
     (tip_maybe, finalized_tip_maybe)
 }
 
-pub fn get_tips_blocking(read_state: &ReadState, rt: &tokio::runtime::Handle) -> ((Height, Hash), (Height, Hash)) {
+pub fn get_tips_blocking(read_state: &ReadState) -> ((Height, Hash), (Height, Hash)) {
     loop {
-        let (Some(tip), Some(finalized_tip)) = get_tips(&read_state, &rt)
+        let (Some(tip), Some(finalized_tip)) = get_tips(&read_state)
         else {
             std::thread::yield_now();
             continue;
@@ -807,81 +788,28 @@ pub fn get_tips_blocking(read_state: &ReadState, rt: &tokio::runtime::Handle) ->
     }
 }
 
-pub fn get_genesis_hash(read_state: &ReadState, rt: &tokio::runtime::Handle) -> Hash {
-    rt.block_on(async {
-        let res = read_state.clone().oneshot(ReadRequest::BestChainBlockHash(Height(0))).await;
-        match res {
-            Ok(ReadResponse::BlockHash(Some(hash))) => hash,
-            Ok(ReadResponse::BlockHash(None)) => panic!("failed to get genesis block"),
-            Err(err) => panic!("sync start err: {err:?}"),
-            _ => panic!("sync err: unhandled response: {res:?}"),
-        }
-    })
+pub fn get_genesis_hash(read_state: &ReadState) -> Hash {
+    read_state.best_chain_block_hash(Height(0)).expect("failed to get genesis block")
 }
 
-pub fn get_bc_hash_at_height(read_state: &ReadState, rt: &tokio::runtime::Handle, height: Height) -> Option<Hash> {
-    rt.block_on(async {
-        let res = read_state.clone().oneshot(ReadRequest::BestChainBlockHash(height)).await;
-        match res {
-            Ok(ReadResponse::BlockHash(maybe_hash)) => maybe_hash,
-            Err(err) => {
-                tracing::error!("get_bc_hash_at_height({height:?}): Error: {err:?}");
-                None
-            },
-            _ => panic!("get_bc_hash_at_height({height:?}): Unhandled response: {res:?}"),
-        }
-    })
+pub fn get_bc_hash_at_height(read_state: &ReadState, height: Height) -> Option<Hash> {
+    read_state.best_chain_block_hash(height)
 }
 
-pub fn get_hdr_at_hash(read_state: &ReadState, rt: &tokio::runtime::Handle, hash: Hash) -> Option<(std::sync::Arc<block::Header>, Height, Hash)> {
-    rt.block_on(async {
-        let res = read_state.clone().oneshot(ReadRequest::BlockHeader(hash.into())).await;
-        match res {
-            Ok(ReadResponse::BlockHeader{ header, height, hash, .. }) => Some((header, height, hash)),
-            Err(err) => {
-                tracing::error!("get_hdr_at_hash({hash}): Error: {err:?}");
-                None
-            },
-            _ => panic!("get_hdr_at_hash({hash}): Unhandled response: {res:?}"),
-        }
-    })
+pub fn get_hdr_at_hash(read_state: &ReadState, hash: Hash) -> Option<(std::sync::Arc<block::Header>, Height, Hash)> {
+    let (header, height, hash, _next) = read_state.block_header(hash.into())?;
+    Some((header, height, hash))
 }
 
-pub fn get_hdrs_after_hash(read_state: &ReadState, rt: &tokio::runtime::Handle, pre_first_hash: Hash, last_hash: Option<Hash>) -> Option<Vec<block::CountedHeader>> {
-    rt.block_on(async {
-        let res = read_state.clone().oneshot(ReadRequest::FindBlockHeaders{
-            known_blocks: vec![pre_first_hash],
-            stop: last_hash,
-        }).await;
-        match res {
-            Ok(ReadResponse::BlockHeaders(hdrs)) => Some(hdrs),
-            Err(err) => {
-                tracing::error!("get_hdrs_after_hash({pre_first_hash}): Error: {err:?}");
-                None
-            },
-            _ => panic!("get_hdrs_after_hash({pre_first_hash}): Unhandled response: {res:?}"),
-        }
-    })
+pub fn get_hdrs_after_hash(read_state: &ReadState, pre_first_hash: Hash, last_hash: Option<Hash>) -> Vec<block::CountedHeader> {
+    read_state.find_block_headers(vec![pre_first_hash], last_hash)
 }
 
-pub fn get_hashes_after_hash(read_state: &ReadState, rt: &tokio::runtime::Handle, pre_first_hash: Hash, last_hash: Option<Hash>) -> Option<Vec<block::Hash>> {
-    rt.block_on(async {
-        let res = read_state.clone().oneshot(ReadRequest::FindBlockHashes{
-            known_blocks: vec![pre_first_hash],
-            stop: last_hash,
-        }).await;
-        match res {
-            Ok(ReadResponse::BlockHashes(hashes)) => Some(hashes),
-            Err(err) => {
-                tracing::error!("get_hashes_after_hash({pre_first_hash}): Error: {err:?}");
-                None
-            },
-            _ => panic!("get_hashes_after_hash({pre_first_hash}): Unhandled response: {res:?}"),
-        }
-    })
+pub fn get_hashes_after_hash(read_state: &ReadState, pre_first_hash: Hash, last_hash: Option<Hash>) -> Vec<block::Hash> {
+    read_state.find_block_hashes(vec![pre_first_hash], last_hash)
 }
 
-pub fn is_parent_in_chains(rt: &tokio::runtime::Handle, state: &State, near_tip_chains: &NearTipChains, parent_hash: Hash) -> bool {
+pub fn is_parent_in_chains(read_state: &ReadState, near_tip_chains: &NearTipChains, parent_hash: Hash) -> bool {
     for our_chain in &near_tip_chains.chains {
         if our_chain.blocks.iter().any(|block| block.this_hash == parent_hash) {
             return true;
@@ -889,25 +817,15 @@ pub fn is_parent_in_chains(rt: &tokio::runtime::Handle, state: &State, near_tip_
     }
 
     // @Dev @Debug, but we would like to be able to quickly do this in production as well...
-    let res = rt.block_on(async { state.clone().oneshot(Request::KnownBlock(parent_hash.try_into().unwrap())).await });
-    match res {
-        Ok(Response::KnownBlock(None)) => {
-            return false;
-        }
-        Ok(Response::KnownBlock(Some(block))) => {
+    match read_state.known_block(parent_hash) {
+        None => false,
+        Some(_block) => {
             // @Note: if we don't find the parent in near tip chains, but we ask Zebra and Zebra is aware of it, warn loudly.
             tracing::warn!("NewNet: Block hash {parent_hash} was NOT in near tip chains but contained by Zebra state!!");
             //dbg_panic!();
-            return true;
+            true
         }
-        Err(err) => {
-            println!("Error requesting {}: {:?}", parent_hash, err);
-            return false;
-        }
-        _ => unreachable!("wrong response for KnownBlock")
     }
-
-    return false;
 }
 
 use tenderlink::STP_ADDRESS_MEMORY_SIZE;
@@ -1201,7 +1119,6 @@ pub fn sync(
     commit_block: impl Fn(std::sync::Arc<Block>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Hash, BlockCommitError>> + Send>>,
     config: &crate::config::Config,
     read_state: ReadState,
-    state: State,
     // tfl_service: TFLService, // no TFLServiceHandle. Sadge!
     rt: tokio::runtime::Handle,
 ) {
@@ -1211,7 +1128,7 @@ pub fn sync(
     let mut near_tip_chains = NearTipChains::default();
     // @Todo: @Refactor into a fn we can call to flush and reset the NearTipChains state.
     'init_near_tip_chains: {
-        let ((tip_height, tip_hash), (finalized_tip_height, finalized_tip_hash)) = get_tips_blocking(&read_state, &rt);
+        let ((tip_height, tip_hash), (finalized_tip_height, finalized_tip_hash)) = get_tips_blocking(&read_state);
         tracing::info!("NewNet: Starting at height={} hash={:?} finalized_height={} finalized_hash={}", tip_height.0, tip_hash, finalized_tip_height.0, finalized_tip_hash);
 
         near_tip_chains.finalized_height = finalized_tip_height.0;
@@ -1234,15 +1151,13 @@ pub fn sync(
         // - Prevents NearTipChains serialization asserts on new nodes
         // - Allows early nodes to overlap with and push to new nodes
         // This can be undone once fartipchain sync is ready.
-        near_tip_chains.push_blocks(&[ShadowBlock { this_hash: get_genesis_hash(&read_state, &rt), ..ShadowBlock::default() }]);
+        near_tip_chains.push_blocks(&[ShadowBlock { this_hash: get_genesis_hash(&read_state), ..ShadowBlock::default() }]);
 
         let near_tip_start_height = Height(tip_height.0.saturating_sub(NEAR_TIP_CHAIN_LEN+1));
-        let Some(near_tip_start_hash) = get_bc_hash_at_height(&read_state, &rt, near_tip_start_height) else {
+        let Some(near_tip_start_hash) = get_bc_hash_at_height(&read_state, near_tip_start_height) else {
             break 'init_near_tip_chains;
         };
-        let Some(near_tip_hdrs) = get_hdrs_after_hash(&read_state, &rt, near_tip_start_hash, None) else {
-            break 'init_near_tip_chains;
-        };
+        let near_tip_hdrs = get_hdrs_after_hash(&read_state, near_tip_start_hash, None);
 
         let mut parent_hash = near_tip_start_hash;
         let mut shadow_blocks = Vec::with_capacity(near_tip_hdrs.len());
@@ -1365,8 +1280,8 @@ pub fn sync(
         None => CheckpointState::Normal,
         Some(target) => {
             // If the checkpoint is already committed on our best chain, there's nothing to do.
-            let already_committed_locally = get_hdr_at_hash(&read_state, &rt, target)
-                .map(|(_, height, _)| get_bc_hash_at_height(&read_state, &rt, height) == Some(target))
+            let already_committed_locally = get_hdr_at_hash(&read_state, target)
+                .map(|(_, height, _)| get_bc_hash_at_height(&read_state, height) == Some(target))
                 .unwrap_or(false);
             if already_committed_locally {
                 tracing::info!("NewNet: Checkpoint {target} already committed locally; checkpointing satisfied (NORMAL).");
@@ -1606,21 +1521,16 @@ pub fn sync(
             };
 
             if !serialized_blocks.contains_key(&hash) {
-                let res = rt.block_on(async {
-                    read_state.clone().oneshot(ReadRequest::BlockButAlsoAllChains(hash.into())).await
-                });
-                match res {
-                    Ok(ReadResponse::BlockButAlsoAllChains(Some(block))) => {
+                match read_state.block_from_any_chain(hash.into()) {
+                    Some(block) => {
                         let serialized = dbg_verify(block.zcash_serialize_to_vec().ok()).unwrap();
                         assert!(serialized.len() as u64 <= zebra_chain::block::MAX_BLOCK_BYTES, "Internal block is too big! {} B", serialized.len());
                         serialized_blocks.insert(hash, serialized);
                     }
-                    Ok(ReadResponse::BlockButAlsoAllChains(None)) => {
+                    None => {
                         tracing::warn!("NewNet: Couldn't get block for hash {hash}!");
                         continue;
                     }
-                    Err(err) => { panic!("ReadRequest::BlockButAlsoAllChains({hash}): Error: {err:?}");              }
-                    _        => { panic!("ReadRequest::BlockButAlsoAllChains({hash}): Unhandled response: {res:?}"); }
                 }
             }
 
@@ -1713,15 +1623,12 @@ pub fn sync(
                         // subtract once to get the finalized block at their height to confirm the attach point (because our chain_intersect_prefix() does not match parents),
                         // subtract again because in order to send them that block we need to get that block's parent.
                         let their_final_parent_parent_height = peer.their_tree.finalized_height.saturating_sub(2);
-                        let Some(their_final_parent_parent_hash) = get_bc_hash_at_height(&read_state, &rt, block::Height(their_final_parent_parent_height)) else {
+                        let Some(their_final_parent_parent_hash) = get_bc_hash_at_height(&read_state, block::Height(their_final_parent_parent_height)) else {
                             if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we don't have blocks @ {}", address, their_final_parent_parent_height); }
                             break 'try_send_historical true; // fallback to tip chains if we don't successfully send historical here
                         };
 
-                        let Some(mut hashes_from_their_final_parent) = get_hashes_after_hash(&read_state, &rt, their_final_parent_parent_hash, None) else {
-                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we couldn't find hashes after block @ {}, {}", address, their_final_parent_parent_height, their_final_parent_parent_hash); }
-                            break 'try_send_historical true;
-                        };
+                        let mut hashes_from_their_final_parent = get_hashes_after_hash(&read_state, their_final_parent_parent_hash, None);
                         if hashes_from_their_final_parent.len() == 0 {
                             if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we found 0 hashes after block @ {}, {}", address, their_final_parent_parent_height, their_final_parent_parent_hash); }
                             break 'try_send_historical true;
@@ -2348,7 +2255,7 @@ pub fn sync(
 
                 let mut height_hash = request.height_hash;
                 if height_hash.hash_or_0 == block::Hash([0;32]) {
-                    if let Some(hash) = get_bc_hash_at_height(&read_state, &rt, height_hash.height) {
+                    if let Some(hash) = get_bc_hash_at_height(&read_state, height_hash.height) {
                         height_hash.hash_or_0 = hash;
                     }
                 }
@@ -2535,7 +2442,7 @@ pub fn sync(
                     Hash(parent_hash)
                 };
 
-                let have_parent_in_chains           = is_parent_in_chains(&rt, &state, &near_tip_chains, parent_hash);
+                let have_parent_in_chains           = is_parent_in_chains(&read_state, &near_tip_chains, parent_hash);
                 let have_parent_in_blocks_to_commit = blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == parent_hash);
 
                 if !have_parent_in_chains && !have_parent_in_blocks_to_commit {
@@ -2595,7 +2502,7 @@ pub fn sync(
                     // Never evict the incoming block's parent — that would orphan the block we're about to push.
                     let evict_idx = (0..blocks_to_commit.len()).find(|&i| {
                         blocks_to_commit[i].0 != parent_hash
-                        && is_tail(i) && !is_parent_in_chains(&rt, &state, &near_tip_chains, blocks_to_commit[i].1.header.previous_block_hash)
+                        && is_tail(i) && !is_parent_in_chains(&read_state, &near_tip_chains, blocks_to_commit[i].1.header.previous_block_hash)
                     }).or_else(|| if have_parent_in_chains {
                         // All tails are committable; only evict if new block is also committable.
                         (0..blocks_to_commit.len()).filter(|&i| blocks_to_commit[i].0 != parent_hash && is_tail(i)).last()
@@ -2661,7 +2568,7 @@ pub fn sync(
 
             let parent_hash = block_arc.header.previous_block_hash;
 
-            if !is_parent_in_chains(&rt, &state, &near_tip_chains, parent_hash) {
+            if !is_parent_in_chains(&read_state, &near_tip_chains, parent_hash) {
                 return true; // keep
             }
 
@@ -2699,7 +2606,7 @@ pub fn sync(
         // inline when we acquire the block (see the BLOCK_CHUNK handler).
         if std::time::Instant::now() >= next_checkpoint_check {
             if let CheckpointState::Locked { target, height } = checkpoint_state {
-                if get_bc_hash_at_height(&read_state, &rt, Height(height)) == Some(target) {
+                if get_bc_hash_at_height(&read_state, Height(height)) == Some(target) {
                     tracing::info!("NewNet: Checkpoint {target} committed locally @ height {height}; LOCKED -> NORMAL.");
                     checkpoint_state = CheckpointState::Normal;
                 }

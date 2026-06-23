@@ -492,7 +492,6 @@ impl StartCmd {
             // let tfl_service2 = tfl_service.clone();
 
             let config = Arc::clone(&config);
-            let sync_state = state.clone();
             let sync_read_state = read_only_state_service.clone();
             let sync_block_verifier = block_verifier_router.clone();
             tokio::task::spawn_blocking(move || {
@@ -510,7 +509,7 @@ impl StartCmd {
                             })
                     })
                 };
-                zebra_state::new_network::sync(commit_block, &config.state, sync_read_state, sync_state, /* tfl_service2, */ tokio::runtime::Handle::current())
+                zebra_state::new_network::sync(commit_block, &config.state, sync_read_state, /* tfl_service2, */ tokio::runtime::Handle::current())
             });
         }
 

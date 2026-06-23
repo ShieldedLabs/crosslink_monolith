@@ -47,7 +47,7 @@ use crate::{
     constants::{
         MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS, MAX_LEGACY_CHAIN_BLOCKS,
     },
-    response::{BondInfoResponse, NonFinalizedBlocksListener},
+    response::{BondInfoResponse, KnownBlock, NonFinalizedBlocksListener},
     service::{
         block_iter::any_ancestor_blocks,
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
@@ -939,6 +939,95 @@ impl ReadStateService {
         read::best_tip(&self.latest_non_finalized_state(), &self.db)
     }
 
+    /// Return the tip of the finalized chain only.
+    pub fn finalized_tip(&self) -> Option<(block::Height, block::Hash)> {
+        self.db.tip()
+    }
+
+    /// Return whether `hash` is known to the non-finalized or finalized state.
+    pub fn known_block(&self, hash: block::Hash) -> Option<KnownBlock> {
+        read::find::non_finalized_state_contains_block_hash(&self.latest_non_finalized_state(), hash)
+            .or_else(|| read::find::finalized_state_contains_block_hash(&self.db, hash))
+    }
+
+    /// Return the block identified by `hash_or_height`, searching all non-finalized chains
+    /// before falling back to the finalized state.
+    pub fn block_from_any_chain(&self, hash_or_height: crate::HashOrHeight) -> Option<Arc<block::Block>> {
+        self.non_finalized_state_receiver.with_watch_data(|non_finalized_state| {
+            for chain in non_finalized_state.chain_iter() {
+                if let Some(contextual) = chain.block(hash_or_height) {
+                    return Some(contextual.block.clone());
+                }
+            }
+            self.db.block(hash_or_height)
+        })
+    }
+
+    /// Return the hash of the best chain block at `height`, if any.
+    pub fn best_chain_block_hash(&self, height: block::Height) -> Option<block::Hash> {
+        self.non_finalized_state_receiver.with_watch_data(|non_finalized_state| {
+            read::hash_by_height(non_finalized_state.best_chain(), &self.db, height)
+        })
+    }
+
+    /// Return hashes for best-chain blocks following `known_blocks`, up to `stop`.
+    pub fn find_block_hashes(
+        &self,
+        known_blocks: Vec<block::Hash>,
+        stop: Option<block::Hash>,
+    ) -> Vec<block::Hash> {
+        self.non_finalized_state_receiver
+            .with_watch_data(|non_finalized_state| {
+                read::find_chain_hashes(
+                    non_finalized_state.best_chain(),
+                    &self.db,
+                    known_blocks,
+                    stop,
+                    MAX_FIND_BLOCK_HASHES_RESULTS,
+                )
+            })
+    }
+
+    /// Return headers for best-chain blocks following `known_blocks`, up to `stop`.
+    pub fn find_block_headers(
+        &self,
+        known_blocks: Vec<block::Hash>,
+        stop: Option<block::Hash>,
+    ) -> Vec<CountedHeader> {
+        self.non_finalized_state_receiver
+            .with_watch_data(|non_finalized_state| {
+                read::find_chain_headers(
+                    non_finalized_state.best_chain(),
+                    &self.db,
+                    known_blocks,
+                    stop,
+                    MAX_FIND_BLOCK_HEADERS_RESULTS,
+                )
+            })
+            .into_iter()
+            .map(|header| CountedHeader { header })
+            .collect()
+    }
+
+    /// Return the header, height, hash, and next block hash for the best-chain block identified
+    /// by `hash_or_height`, if any.
+    pub fn block_header(
+        &self,
+        hash_or_height: crate::HashOrHeight,
+    ) -> Option<(Arc<block::Header>, block::Height, block::Hash, Option<block::Hash>)> {
+        let best_chain = self.latest_best_chain();
+        let height = hash_or_height
+            .height_or_else(|hash| read::find::height_by_hash(best_chain.clone(), &self.db, hash))?;
+        let hash = hash_or_height
+            .hash_or_else(|height| read::find::hash_by_height(best_chain.clone(), &self.db, height))?;
+        let next_block_hash = height
+            .next()
+            .ok()
+            .and_then(|next_height| read::find::hash_by_height(best_chain.clone(), &self.db, next_height));
+        let header = read::block_header(best_chain, &self.db, height.into())?;
+        Some((header, height, hash, next_block_hash))
+    }
+
     /// Gets a clone of the latest non-finalized state from the `non_finalized_state_receiver`
     fn latest_non_finalized_state(&self) -> NonFinalizedState {
         self.non_finalized_state_receiver.cloned_watch_data()
@@ -1223,11 +1312,7 @@ impl Service<Request> for StateService {
                 let read_service = self.read_service.clone();
 
                 async move {
-                    let response = read::non_finalized_state_contains_block_hash(
-                        &read_service.latest_non_finalized_state(),
-                        hash,
-                    )
-                    .or_else(|| read::finalized_state_contains_block_hash(&read_service.db, hash));
+                    let response = read_service.known_block(hash);
 
                     // The work is done in the future.
                     timer.finish(module_path!(), line!(), "Request::KnownBlock");
@@ -1392,11 +1477,7 @@ impl Service<ReadRequest> for ReadStateService {
 
                 tokio::task::spawn_blocking(move || {
                     span.in_scope(move || {
-                        let tip = state.non_finalized_state_receiver.with_watch_data(
-                            |non_finalized_state| {
-                                read::tip(non_finalized_state.best_chain(), &state.db)
-                            },
-                        );
+                        let tip = state.best_tip();
 
                         // The work is done in the future.
                         timer.finish(module_path!(), line!(), "ReadRequest::Tip");
@@ -1411,7 +1492,7 @@ impl Service<ReadRequest> for ReadStateService {
                 let state = self.clone();
 
                 tokio::task::spawn_blocking(move || {
-                    Ok(ReadResponse::Tip(state.db.tip()))
+                    Ok(ReadResponse::Tip(state.finalized_tip()))
                 })
                 .wait_for_panics()
             }
@@ -1549,17 +1630,7 @@ impl Service<ReadRequest> for ReadStateService {
 
                 tokio::task::spawn_blocking(move || {
                     span.in_scope(move || {
-                        let block = state.non_finalized_state_receiver.with_watch_data(
-                            |non_finalized_state| {
-                                for chain in non_finalized_state.chain_iter() {
-                                    if let Some(contextual) = chain.block(hash_or_height) {
-                                        return Some(contextual.block.clone());
-                                    }
-                                }
-
-                                state.db.block(hash_or_height)
-                            },
-                        );
+                        let block = state.block_from_any_chain(hash_or_height);
 
                         timer.finish(module_path!(), line!(), "ReadRequest::BlockButAlsoAllChains");
 
@@ -1600,25 +1671,8 @@ impl Service<ReadRequest> for ReadStateService {
 
                 tokio::task::spawn_blocking(move || {
                     span.in_scope(move || {
-                        let best_chain = state.latest_best_chain();
-
-                        let height = hash_or_height
-                            .height_or_else(|hash| {
-                                read::find::height_by_hash(best_chain.clone(), &state.db, hash)
-                            })
-                            .ok_or_else(|| BoxError::from("block hash or height not found"))?;
-
-                        let hash = hash_or_height
-                            .hash_or_else(|height| {
-                                read::find::hash_by_height(best_chain.clone(), &state.db, height)
-                            })
-                            .ok_or_else(|| BoxError::from("block hash or height not found"))?;
-
-                        let next_height = height.next()?;
-                        let next_block_hash =
-                            read::find::hash_by_height(best_chain.clone(), &state.db, next_height);
-
-                        let header = read::block_header(best_chain, &state.db, height.into())
+                        let (header, height, hash, next_block_hash) = state
+                            .block_header(hash_or_height)
                             .ok_or_else(|| BoxError::from("block hash or height not found"))?;
 
                         // The work is done in the future.
@@ -1785,17 +1839,7 @@ impl Service<ReadRequest> for ReadStateService {
 
                 tokio::task::spawn_blocking(move || {
                     span.in_scope(move || {
-                        let block_hashes = state.non_finalized_state_receiver.with_watch_data(
-                            |non_finalized_state| {
-                                read::find_chain_hashes(
-                                    non_finalized_state.best_chain(),
-                                    &state.db,
-                                    known_blocks,
-                                    stop,
-                                    MAX_FIND_BLOCK_HASHES_RESULTS,
-                                )
-                            },
-                        );
+                        let block_hashes = state.find_block_hashes(known_blocks, stop);
 
                         // The work is done in the future.
                         timer.finish(module_path!(), line!(), "ReadRequest::FindBlockHashes");
@@ -1812,22 +1856,7 @@ impl Service<ReadRequest> for ReadStateService {
 
                 tokio::task::spawn_blocking(move || {
                     span.in_scope(move || {
-                        let block_headers = state.non_finalized_state_receiver.with_watch_data(
-                            |non_finalized_state| {
-                                read::find_chain_headers(
-                                    non_finalized_state.best_chain(),
-                                    &state.db,
-                                    known_blocks,
-                                    stop,
-                                    MAX_FIND_BLOCK_HEADERS_RESULTS,
-                                )
-                            },
-                        );
-
-                        let block_headers = block_headers
-                            .into_iter()
-                            .map(|header| CountedHeader { header })
-                            .collect();
+                        let block_headers = state.find_block_headers(known_blocks, stop);
 
                         // The work is done in the future.
                         timer.finish(module_path!(), line!(), "ReadRequest::FindBlockHeaders");
@@ -2093,15 +2122,7 @@ impl Service<ReadRequest> for ReadStateService {
 
                 tokio::task::spawn_blocking(move || {
                     span.in_scope(move || {
-                        let hash = state.non_finalized_state_receiver.with_watch_data(
-                            |non_finalized_state| {
-                                read::hash_by_height(
-                                    non_finalized_state.best_chain(),
-                                    &state.db,
-                                    height,
-                                )
-                            },
-                        );
+                        let hash = state.best_chain_block_hash(height);
 
                         // The work is done in the future.
                         timer.finish(module_path!(), line!(), "ReadRequest::BestChainBlockHash");
