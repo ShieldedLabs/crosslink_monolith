@@ -771,42 +771,15 @@ const MAX_BANDWIDTH_BLOCKS_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_RES / zebra_
 type ReadState = crate::service::ReadStateService;
 // type TFLService = tower::buffer::Buffer<tower::util::BoxService<TFLServiceRequest, TFLServiceResponse, TFLServiceError>, TFLServiceRequest>;
 
-pub fn get_tips(read_state: &ReadState) -> (Option<(Height, Hash)>, Option<(Height, Hash)>) {
-    let tip_maybe = read_state.best_tip();
-    let finalized_tip_maybe = read_state.finalized_tip();
-    (tip_maybe, finalized_tip_maybe)
-}
-
 pub fn get_tips_blocking(read_state: &ReadState) -> ((Height, Hash), (Height, Hash)) {
     loop {
-        let (Some(tip), Some(finalized_tip)) = get_tips(&read_state)
+        let (Some(tip), Some(finalized_tip)) = (read_state.best_tip(), read_state.finalized_tip())
         else {
             std::thread::yield_now();
             continue;
         };
         break (tip, finalized_tip)
     }
-}
-
-pub fn get_genesis_hash(read_state: &ReadState) -> Hash {
-    read_state.best_chain_block_hash(Height(0)).expect("failed to get genesis block")
-}
-
-pub fn get_bc_hash_at_height(read_state: &ReadState, height: Height) -> Option<Hash> {
-    read_state.best_chain_block_hash(height)
-}
-
-pub fn get_hdr_at_hash(read_state: &ReadState, hash: Hash) -> Option<(std::sync::Arc<block::Header>, Height, Hash)> {
-    let (header, height, hash, _next) = read_state.block_header(hash.into())?;
-    Some((header, height, hash))
-}
-
-pub fn get_hdrs_after_hash(read_state: &ReadState, pre_first_hash: Hash, last_hash: Option<Hash>) -> Vec<block::CountedHeader> {
-    read_state.find_block_headers(vec![pre_first_hash], last_hash)
-}
-
-pub fn get_hashes_after_hash(read_state: &ReadState, pre_first_hash: Hash, last_hash: Option<Hash>) -> Vec<block::Hash> {
-    read_state.find_block_hashes(vec![pre_first_hash], last_hash)
 }
 
 pub fn is_parent_in_chains(read_state: &ReadState, near_tip_chains: &NearTipChains, parent_hash: Hash) -> bool {
@@ -1151,13 +1124,13 @@ pub fn sync(
         // - Prevents NearTipChains serialization asserts on new nodes
         // - Allows early nodes to overlap with and push to new nodes
         // This can be undone once fartipchain sync is ready.
-        near_tip_chains.push_blocks(&[ShadowBlock { this_hash: get_genesis_hash(&read_state), ..ShadowBlock::default() }]);
+        near_tip_chains.push_blocks(&[ShadowBlock { this_hash: read_state.best_chain_block_hash(Height(0)).expect("failed to get genesis block"), ..ShadowBlock::default() }]);
 
         let near_tip_start_height = Height(tip_height.0.saturating_sub(NEAR_TIP_CHAIN_LEN+1));
-        let Some(near_tip_start_hash) = get_bc_hash_at_height(&read_state, near_tip_start_height) else {
+        let Some(near_tip_start_hash) = read_state.best_chain_block_hash(near_tip_start_height) else {
             break 'init_near_tip_chains;
         };
-        let near_tip_hdrs = get_hdrs_after_hash(&read_state, near_tip_start_hash, None);
+        let near_tip_hdrs = read_state.find_block_headers(vec![near_tip_start_hash], None);
 
         let mut parent_hash = near_tip_start_hash;
         let mut shadow_blocks = Vec::with_capacity(near_tip_hdrs.len());
@@ -1280,8 +1253,8 @@ pub fn sync(
         None => CheckpointState::Normal,
         Some(target) => {
             // If the checkpoint is already committed on our best chain, there's nothing to do.
-            let already_committed_locally = get_hdr_at_hash(&read_state, target)
-                .map(|(_, height, _)| get_bc_hash_at_height(&read_state, height) == Some(target))
+            let already_committed_locally = read_state.block_header(target.into())
+                .map(|(_, height, _, _)| read_state.best_chain_block_hash(height) == Some(target))
                 .unwrap_or(false);
             if already_committed_locally {
                 tracing::info!("NewNet: Checkpoint {target} already committed locally; checkpointing satisfied (NORMAL).");
@@ -1623,12 +1596,12 @@ pub fn sync(
                         // subtract once to get the finalized block at their height to confirm the attach point (because our chain_intersect_prefix() does not match parents),
                         // subtract again because in order to send them that block we need to get that block's parent.
                         let their_final_parent_parent_height = peer.their_tree.finalized_height.saturating_sub(2);
-                        let Some(their_final_parent_parent_hash) = get_bc_hash_at_height(&read_state, block::Height(their_final_parent_parent_height)) else {
+                        let Some(their_final_parent_parent_hash) = read_state.best_chain_block_hash(block::Height(their_final_parent_parent_height)) else {
                             if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we don't have blocks @ {}", address, their_final_parent_parent_height); }
                             break 'try_send_historical true; // fallback to tip chains if we don't successfully send historical here
                         };
 
-                        let mut hashes_from_their_final_parent = get_hashes_after_hash(&read_state, their_final_parent_parent_hash, None);
+                        let mut hashes_from_their_final_parent = read_state.find_block_hashes(vec![their_final_parent_parent_hash], None);
                         if hashes_from_their_final_parent.len() == 0 {
                             if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we found 0 hashes after block @ {}, {}", address, their_final_parent_parent_height, their_final_parent_parent_hash); }
                             break 'try_send_historical true;
@@ -2255,7 +2228,7 @@ pub fn sync(
 
                 let mut height_hash = request.height_hash;
                 if height_hash.hash_or_0 == block::Hash([0;32]) {
-                    if let Some(hash) = get_bc_hash_at_height(&read_state, height_hash.height) {
+                    if let Some(hash) = read_state.best_chain_block_hash(height_hash.height) {
                         height_hash.hash_or_0 = hash;
                     }
                 }
@@ -2606,7 +2579,7 @@ pub fn sync(
         // inline when we acquire the block (see the BLOCK_CHUNK handler).
         if std::time::Instant::now() >= next_checkpoint_check {
             if let CheckpointState::Locked { target, height } = checkpoint_state {
-                if get_bc_hash_at_height(&read_state, Height(height)) == Some(target) {
+                if read_state.best_chain_block_hash(Height(height)) == Some(target) {
                     tracing::info!("NewNet: Checkpoint {target} committed locally @ height {height}; LOCKED -> NORMAL.");
                     checkpoint_state = CheckpointState::Normal;
                 }
