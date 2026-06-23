@@ -197,7 +197,13 @@ impl BftBlock {
     #[allow(clippy::unwrap_in_result)]
     pub fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
         writer.write_u32::<LittleEndian>(self.version)?;
-        writer.write_u32::<LittleEndian>(self.height)?;
+        // v1 (and earlier) serialized `height` is 1-based, while the canonical
+        // in-memory `height` is 0-based (the chain index). Re-add the +1 for
+        // version < 2 so the bytes — and therefore the block hash and finalizer
+        // signatures — are byte-for-byte identical to legacy v1 blocks. v2+
+        // serializes the corrected 0-based height directly.
+        let serialized_height = if self.version < 2 { self.height + 1 } else { self.height };
+        writer.write_u32::<LittleEndian>(serialized_height)?;
         self.previous_block_fat_ptr.zcash_serialize(&mut writer);
         writer.write_u32::<LittleEndian>(self.finalization_candidate_height)?;
         writer.write_u32::<LittleEndian>(self.headers.len().try_into().unwrap())?;
@@ -216,6 +222,9 @@ impl BftBlock {
                 None => writer.write_u8(0)?,
             }
             writer.write_u64::<LittleEndian>(self.do_not_include_until_bc_height)?;
+        } else {
+            assert!(self.hardfork.is_none());
+            assert!(self.do_not_include_until_bc_height == 0);
         }
         Ok(())
     }
@@ -224,7 +233,19 @@ impl BftBlock {
 // impl ZcashDeserialize for BftBlock {
     pub fn zcash_deserialize<R: std::io::Read>(mut reader: R) -> Result<Self, std::io::Error> { // SerializationError> {
         let version = reader.read_u32::<LittleEndian>()?;
-        let height = reader.read_u32::<LittleEndian>()?;
+        // See zcash_serialize: v1 stores a 1-based height; normalize it to the
+        // canonical 0-based in-memory height. v2+ already stores 0-based. The
+        // guard rejects a stored 0 (impossible for a real v1 block, where the
+        // serialized height is >= 1) rather than wrapping.
+        let raw_height = reader.read_u32::<LittleEndian>()?;
+        let height = if version < 2 {
+            raw_height.checked_sub(1).ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "v1 BFT block has a zero serialized height, which cannot be normalized",
+            ))?
+        } else {
+            raw_height
+        };
         let previous_block_fat_ptr = FatPointerToBftBlock::zcash_deserialize(&mut reader)?;
         let finalization_candidate_height = reader.read_u32::<LittleEndian>()?;
         let header_count = reader.read_u32::<LittleEndian>()?;

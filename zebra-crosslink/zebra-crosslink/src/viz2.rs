@@ -232,6 +232,12 @@ pub async fn service_viz_requests(
                                 .unwrap_or(0xdeadbeef),
                             utc: bc.header.time.timestamp(),
                             serialized_size: bc.zcash_serialized_size(),
+                            // Flag this block when it sits at a hardfork's PoW activation height.
+                            // Many forks may share that height; each is flagged independently.
+                            is_hardfork_activation: {
+                                let h = lo_height.0 as u64 + i as u64;
+                                tfl_handle.config.hardforks.iter().any(|hf| hf.pow_activation_height == h)
+                            },
                         });
                     }
                     for i in request.bft_ack_height as usize..internal.bft_blocks.len() {
@@ -247,6 +253,11 @@ pub async fn service_viz_requests(
                             this_height: i as u64,
                             points_at_bc_block: Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0),
                             proving_blocks: b.headers.iter().skip(1).map(|x| Hash32::from_bytes(BlockHash::from_header_data(x).0)).collect(),
+                            // Foreknowledge from the hardfork schedule (known at startup, not from
+                            // the next block): flag this block when a hardfork activates at the next
+                            // BFT height, so the GUI can warn before the hardfork block exists.
+                            next_block_is_hardfork: tfl_handle.config.hardforks.iter()
+                                .any(|hf| hf.bft_certificate_height == i as u64 + 1),
                         });
 
                         // TODO: compute the finalized tip height!

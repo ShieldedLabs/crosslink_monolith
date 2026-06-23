@@ -166,6 +166,10 @@ pub struct BcBlock {
     pub work: u64,
     pub utc: i64,
     pub serialized_size: usize,
+    /// This block is at a user-led hardfork's PoW activation height. Many forked
+    /// blocks may share that height, so each one carries the flag and gets the
+    /// hardfork-activation marker drawn below it.
+    pub is_hardfork_activation: bool,
 }
 impl Default for BcBlock {
     fn default() -> Self {
@@ -182,6 +186,7 @@ impl Default for BcBlock {
             work: 0,
             utc: 0,
             serialized_size: 0,
+            is_hardfork_activation: false,
         }
     }
 }
@@ -237,6 +242,10 @@ pub struct BftBlock {
     pub this_height: u64,
     pub points_at_bc_block: Hash32,
     pub proving_blocks: Vec<Hash32>,
+    /// The *next* BFT block (this block's successor) activates a user-led
+    /// hardfork. We mark this block so the GUI can signal that a hardfork is
+    /// imminent — i.e. that the block about to be built is special.
+    pub next_block_is_hardfork: bool,
 }
 impl Default for BftBlock {
     fn default() -> Self {
@@ -246,6 +255,7 @@ impl Default for BftBlock {
             this_height: 0,
             points_at_bc_block: Hash32::from_u64(0),
             proving_blocks: Vec::with_capacity(0),
+            next_block_is_hardfork: false,
         }
     }
 }
@@ -587,7 +597,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 
             *seq += 1;
             let this_hash = Hash32::from_u64(*seq);
-            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, is_implicated_by_bft, points_at_bft_block, work:1234, utc:0, serialized_size: 0 }, ..Default::default() };
+            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, is_implicated_by_bft, points_at_bft_block, work:1234, utc:0, serialized_size: 0, is_hardfork_activation: false }, ..Default::default() };
             viz_state.on_screen_bcs.insert(block.block.this_hash, block);
             this_hash
         };
@@ -599,7 +609,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
             viz_state.bft_tip_height = this_height;
 
             let this_hash = Hash32::from_u64(*seq);
-            let block = OnScreenBft { block: BftBlock { this_hash, parent_hash: bft_parent_hash, this_height, points_at_bc_block, proving_blocks: vec![points_at_bc_block] }, ..Default::default() };
+            let block = OnScreenBft { block: BftBlock { this_hash, parent_hash: bft_parent_hash, this_height, points_at_bc_block, proving_blocks: vec![points_at_bc_block], next_block_is_hardfork: false }, ..Default::default() };
             viz_state.on_screen_bfts.insert(block.block.this_hash, block);
 
             bft_parent_hash = this_hash;
@@ -715,6 +725,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                             work: 0,
                             utc: 0,
                             serialized_size: 0,
+                            is_hardfork_activation: false,
                         }, ..Default::default() };
                         viz_state.on_screen_bcs.insert(block.block.this_hash, block);
                     }
@@ -1557,6 +1568,15 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             if !finalized {
                 draw_ctx.circle_square(pt_x, pt_y, rad * 0.65, rad * on_screen_bc.roundness * 0.65, 0xFF080808);
             }
+
+            // Hardfork activation marker: a small orange badge just below this block,
+            // which sits at a user-led hardfork's PoW activation height. Several forked
+            // blocks may share that height; each one is marked independently.
+            if on_screen_bc.block.is_hardfork_activation {
+                let orange = (((on_screen_bc.alpha*255.0) as u32) << 24) | 0xFF8C00;
+                let marker_rad = 0.6 * screen_unit;
+                draw_ctx.circle_square(pt_x, pt_y + 1.2*screen_unit, marker_rad, marker_rad * on_screen_bc.roundness, orange);
+            }
         }
 
         if very_zoom_out == false {
@@ -1671,6 +1691,15 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         }
         else {
             draw_ctx.circle_square(origin_x + (x*screen_unit), origin_y + (y*screen_unit), screen_unit, screen_unit*on_screen_bft.roundness, color);
+        }
+
+        // Hardfork warning marker: a small orange badge a little above and to the
+        // right of this block, signalling that the *next* BFT block will activate
+        // a user-led hardfork.
+        if on_screen_bft.block.next_block_is_hardfork {
+            let orange = (((on_screen_bft.alpha*255.0) as u32) << 24) | 0xFF8C00;
+            let rad = 0.6 * screen_unit;
+            draw_ctx.circle_square(origin_x + (x + 1.2)*screen_unit, origin_y + (y - 1.2)*screen_unit, rad, rad*on_screen_bft.roundness, orange);
         }
 
         if very_zoom_out == false {

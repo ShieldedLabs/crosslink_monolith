@@ -561,7 +561,9 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
 
     match BftBlock::try_from(
         params,
-        internal.bft_blocks.len() as u32 + 1,
+        // 0-based canonical height = the chain index this block will occupy.
+        // Serialization re-adds the legacy +1 for v1 blocks (see BftBlock::zcash_serialize).
+        internal.bft_blocks.len() as u32,
         internal.fat_pointer_to_tip.clone(),
         0,
         headers,
@@ -605,7 +607,8 @@ async fn handle_new_decided_bft_block(
     let new_final_hash = ZebBlockHash(BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0);
     let new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
     // assert_eq!(new_final_height.0, new_block.finalization_candidate_height);
-    let insert_i = new_block.height as usize - 1;
+    // `height` is now the 0-based canonical height, i.e. the chain index directly.
+    let insert_i = new_block.height as usize;
 
     let mut internal = tfl_handle.internal.lock().await;
 
@@ -750,6 +753,98 @@ async fn validate_bft_block(
         );
         return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
     }
+
+    // The linkage check above guarantees the parent is the current tip, so this block
+    // will occupy the next index — which is its canonical 0-based height.
+    let bft_height = internal.bft_blocks.len() as u64;
+
+    // The self-reported height must match the position the block will occupy.
+    if new_block.height as u64 != bft_height {
+        warn!(
+            "BFT block height {} does not match its chain position {}",
+            new_block.height, bft_height,
+        );
+        return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
+    }
+
+    let parent = internal.bft_blocks.last();
+    let parent_version = parent.map_or(0, |p| p.version);
+    let parent_do_not_include = parent.map_or(0, |p| p.do_not_include_until_bc_height);
+
+    // Version must be monotonic non-decreasing along the chain. (All v1 blocks share
+    // version 1, so this holds trivially for existing history.)
+    if new_block.version < parent_version {
+        warn!(
+            "BFT block version {} is below its parent's version {}",
+            new_block.version, parent_version,
+        );
+        return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
+    }
+
+    // If this node is configured with a hardfork at this BFT height, the proposal must
+    // carry exactly that hardfork (byte-for-byte) and set its do_not_include_until_bc_height
+    // to the hardfork's PoW activation height.
+    //
+    // This runs before the generic do_not_include_until_bc_height monotonicity check
+    // below so that a regression *caused by the hardfork activation* is reported as its
+    // own distinct error rather than the generic one.
+    if let Some(scheduled) = tfl_handle
+        .config
+        .hardforks
+        .iter()
+        .find(|hf| hf.bft_certificate_height == bft_height)
+    {
+        let scheduled_bytes = {
+            let mut bytes = Vec::new();
+            scheduled.zcash_serialize(&mut bytes).expect("serializing to a Vec is infallible");
+            bytes
+        };
+        let proposal_matches = match &new_block.hardfork {
+            Some(hardfork) => {
+                let mut bytes = Vec::new();
+                hardfork.zcash_serialize(&mut bytes).expect("serializing to a Vec is infallible");
+                bytes == scheduled_bytes
+            }
+            None => false,
+        };
+        if !proposal_matches {
+            warn!(
+                "BFT block at height {} must carry the scheduled hardfork byte-for-byte, but does not",
+                bft_height,
+            );
+            return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
+        }
+
+        if new_block.do_not_include_until_bc_height != scheduled.pow_activation_height {
+            warn!(
+                "BFT hardfork block at height {} must set do_not_include_until_bc_height to the hardfork pow_activation_height {}, but it is {}",
+                bft_height, scheduled.pow_activation_height, new_block.do_not_include_until_bc_height,
+            );
+            return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
+        }
+
+        // Separate error: the hardfork's PoW activation height must not regress the
+        // monotonic do_not_include_until_bc_height relative to the parent.
+        if scheduled.pow_activation_height < parent_do_not_include {
+            warn!(
+                "Hardfork pow_activation_height {} at BFT height {} is below the parent's do_not_include_until_bc_height {}; the hardfork activation regresses do_not_include_until_bc_height",
+                scheduled.pow_activation_height, bft_height, parent_do_not_include,
+            );
+            return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
+        }
+    }
+
+    // do_not_include_until_bc_height must be monotonic non-decreasing. (v1 blocks use
+    // the implicit value 0, so this holds for existing history.) In the hardfork case
+    // the checks above already guarantee this passes.
+    if new_block.do_not_include_until_bc_height < parent_do_not_include {
+        warn!(
+            "BFT block do_not_include_until_bc_height {} is below its parent's {}",
+            new_block.do_not_include_until_bc_height, parent_do_not_include,
+        );
+        return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
+    }
+
     drop(internal);
 
     let new_final_hash = ZebBlockHash(BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0);
