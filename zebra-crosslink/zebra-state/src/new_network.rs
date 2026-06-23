@@ -2760,14 +2760,14 @@ mod tests {
 
         let mut buf = [0u8; PACKET_STATUS_MAX_SIZE];
 
-        let mut chains = NearTipChains { chains: Vec::new() };
+        let mut chains = NearTipChains { finalized_height: 0, chains: Vec::new() };
 
         // (a, b), (b, c,), (c, d), (d, e), ..., (c, i), (i, j), ...
         // a b c d e f g h
         //     \ i j k l m n
         chains.push_blocks(&blocks);
 
-        let mut chains2 = NearTipChains { chains: Vec::new() };
+        let mut chains2 = NearTipChains { finalized_height: 0, chains: Vec::new() };
         // (a, b), (b, c,), (c, d), (d, e), ..., (c, i), (i, j), ...
         // a b c d e f g h
         //     \ i j k l m n
