@@ -808,6 +808,40 @@ impl StateService {
                 for queued_child in queued_children {
                     let (SemanticallyVerifiedBlock { hash, .. }, _) = queued_child;
 
+                    // CROSSLINK: commit-time fat-pointer gate (mirrors the intake check, incl. the
+                    // 32265 bypass). A block is committed only once its fat pointer is resolvable
+                    // and does not regress relative to its parent's (see
+                    // `call_from_state_to_crosslink_to_ask_about_fat_pointers`). If the parent's
+                    // pointer cannot be resolved yet — the parent is not committed to state (e.g. a
+                    // child flushed earlier this pass), or the referenced BFT block has not entered
+                    // this node — the block is *deferred*, not rejected: it is re-queued and
+                    // re-evaluated on a later flush, since it may become valid once those load.
+                    let child_fat_pointer = queued_child.0.block.header.fat_pointer_to_bft_block.clone();
+                    let child_parent_hash = queued_child.0.block.header.previous_block_hash;
+                    let parent_header = self.read_service.non_finalized_state_receiver.with_watch_data(
+                        |non_finalized_state| {
+                            let mut ret = None;
+                            for chain in non_finalized_state.chain_iter() {
+                                if ret.is_none() {
+                                    ret = chain.block(crate::HashOrHeight::Hash(child_parent_hash)).map(|b| b.block.header.clone());
+                                }
+                            }
+                            ret
+                        },
+                    );
+                    let parent_header = if parent_header.is_some() { parent_header } else { self.read_service.db.block_header(crate::HashOrHeight::Hash(child_parent_hash)) };
+                    let parent_fat_pointer = parent_header.map(|h| h.fat_pointer_to_bft_block.clone());
+
+                    let crosslink_ok = queued_child.0.height == zebra_chain::block::Height(32265)
+                        || (parent_fat_pointer.is_some()
+                            && (self.closure_to_call_crosslink)(parent_fat_pointer.unwrap(), child_fat_pointer));
+
+                    if !crosslink_ok {
+                        // Defer: re-queue without flushing or recursing; re-evaluated on a later flush.
+                        self.non_finalized_state_queued_blocks.queue(queued_child);
+                        continue;
+                    }
+
                     self.non_finalized_block_write_sent_hashes
                         .add(&queued_child.0);
                     let send_result = non_finalized_block_write_sender.send(queued_child.into());
@@ -1116,6 +1150,15 @@ impl Service<Request> for StateService {
                 // This method doesn't block, access the database, or perform CPU-intensive tasks,
                 // so we can run it directly in the tokio executor's Future threads.
                 let rsp_rx = self.send_crosslink_finalized_to_non_finalized_state(finalized);
+
+                // CROSSLINK: a BFT decision just landed (the new block is already in
+                // `bft_blocks` by the time this request arrives), which may make the fat
+                // pointers of previously-deferred non-finalized blocks resolvable. Re-flush
+                // the queue so those are re-evaluated now rather than waiting for the next
+                // incoming block — which may never come on an idle chain.
+                if let Some((_, tip_hash)) = self.best_tip() {
+                    self.send_ready_non_finalized_queued(tip_hash);
+                }
 
                 // TODO:
                 //   - check for panics in the block write task here,

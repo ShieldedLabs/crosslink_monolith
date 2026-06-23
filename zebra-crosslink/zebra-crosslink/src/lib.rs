@@ -292,11 +292,18 @@ pub(crate) struct TFLServiceInternal {
 
 fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: FatPointerToBftBlock, child_fat_pointer: FatPointerToBftBlock) -> bool {
     let mut internal = internal_handle.internal.blocking_lock();
+    // A real (non-null) pointer ranks as `index + 1`, while a null pointer is `0`.
+    // The `+1` keeps null strictly below any real pointer, so null can no longer be
+    // confused with "points at bft_blocks[0]"; a regression from any real pointer back
+    // to null then fails the `>=` check below. `None` (pointer not resolvable yet because
+    // the referenced BFT block has not entered this node) returns false, meaning "do not
+    // accept yet" — the block is deferred, not rejected: it may become valid once the
+    // BFT blocks load.
     let parent_height = if parent_fat_pointer == FatPointerToBftBlock::null() {
         0
     } else {
         if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash() == parent_fat_pointer.points_at_block_hash()) {
-            h
+            h + 1
         } else {
             return false;
         }
@@ -305,7 +312,7 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
         0
     } else {
         if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash() == child_fat_pointer.points_at_block_hash()) {
-            h
+            h + 1
         } else {
             return false;
         }
@@ -1237,6 +1244,18 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             }
             roster
         };
+
+        // CROSSLINK: the BFT chain is now loaded, which may make previously-deferred
+        // non-finalized PoW blocks' fat pointers resolvable. Trigger a re-flush of the
+        // non-finalized queue by issuing a finalize for the loaded tip. The finalize itself
+        // is a no-op once that tip is already finalized, but the state request handler
+        // re-flushes the queue regardless — so deferred blocks are re-evaluated now rather
+        // than waiting for the first new BFT decision (which may never come on an idle chain).
+        // The internal lock is released above, so the handler's callback into the fat-pointer
+        // closure will not deadlock.
+        if new_final_hash != ZebBlockHash([0; 32]) {
+            let _ = (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(new_final_hash)).await;
+        }
 
         tokio::spawn(tenderlink::entry_point(
             my_private_key,
