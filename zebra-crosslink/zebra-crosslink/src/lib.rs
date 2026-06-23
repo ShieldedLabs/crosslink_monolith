@@ -141,6 +141,11 @@ pub mod config {
         /// [`HardForkSchedule`]; after loading, this holds the canonical, merged
         /// list (see `ZebradConfig::load`).
         pub hardforks: Vec<HardForkConfig>,
+        /// Ignore the hardfork rules shipped in the executable
+        /// ([`shipped_hardforks`]) and use only `hardforks`. Lets a testnet
+        /// operator specify the entire hardfork schedule manually instead of
+        /// inheriting the built-in (mainnet) assumed past. Defaults to `false`.
+        pub disable_shipped_hardforks: bool,
     }
     impl Default for Config {
         fn default() -> Self {
@@ -151,6 +156,7 @@ pub mod config {
                 disable_the_headless_wallet: false,
                 disable_zaino: false,
                 hardforks: Vec::new(),
+                disable_shipped_hardforks: false,
             }
         }
     }

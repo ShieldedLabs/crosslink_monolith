@@ -83,12 +83,27 @@ impl HardForkSchedule {
     /// cannot be combined into a single increasing chain:
     ///
     /// - Two *different* rules at the same `pow_activation_height`, or
+    /// - `bft_certificate_height` not strictly increasing in pow-sorted order
+    ///   (a duplicate, or an inversion relative to `pow_activation_height`), or
     /// - The two sources interleaving by height. They may only overlap as a
     ///   shared, exactly-matching block (the shipped rules are the assumed past,
     ///   which the user rules may restate exactly and then extend).
     pub fn new(user_hardforks: Vec<HardForkConfig>) -> Self {
+        Self::merge(user_hardforks, shipped_hardforks())
+    }
+
+    /// Like [`HardForkSchedule::new`], but ignores the rules shipped in the
+    /// executable: the schedule is built from `user_hardforks` alone. Lets a
+    /// testnet operator specify the entire schedule manually rather than
+    /// inheriting the built-in assumed past (see the `disable_shipped_hardforks`
+    /// config flag). The same ordering/duplicate validation still applies.
+    pub fn new_without_shipped(user_hardforks: Vec<HardForkConfig>) -> Self {
+        Self::merge(user_hardforks, Vec::new())
+    }
+
+    fn merge(user_hardforks: Vec<HardForkConfig>, shipped: Vec<HardForkConfig>) -> Self {
         let mut user_hardforks = user_hardforks;
-        let mut shipped = shipped_hardforks();
+        let mut shipped = shipped;
 
         // Canonicalize each rule's finalizer list so that equality (and thus
         // exact-duplicate detection) is independent of the order finalizers were
@@ -121,7 +136,10 @@ impl HardForkSchedule {
         // Sort by activation height. Exact duplicates are already merged above.
         tagged.sort_by_key(|t| t.rule.pow_activation_height);
 
-        // Two *different* rules at the same height are a conflicting overlap.
+        // Two *different* rules at the same pow height are a conflicting overlap.
+        // bft_certificate_height carries the same constraint as pow_activation_height:
+        // in this pow-sorted order it must strictly increase, so the two heights share
+        // one coherent order and bft_certificate_height contains no duplicates.
         for pair in tagged.windows(2) {
             assert!(
                 pair[0].rule.pow_activation_height != pair[1].rule.pow_activation_height,
@@ -129,6 +147,17 @@ impl HardForkSchedule {
                 pair[0].rule.pow_activation_height,
                 pair[0].rule,
                 pair[1].rule,
+            );
+            assert!(
+                pair[0].rule.bft_certificate_height < pair[1].rule.bft_certificate_height,
+                "incoherently ordered hardfork rules: the rule at pow_activation_height {} \
+                 has bft_certificate_height {}, but the next rule (pow_activation_height {}) \
+                 has bft_certificate_height {}; bft_certificate_height must strictly increase \
+                 with pow_activation_height (same order, no duplicates)",
+                pair[0].rule.pow_activation_height,
+                pair[0].rule.bft_certificate_height,
+                pair[1].rule.pow_activation_height,
+                pair[1].rule.bft_certificate_height,
             );
         }
 
@@ -155,5 +184,40 @@ impl HardForkSchedule {
             .rules
             .partition_point(|rule| rule.pow_activation_height <= pow_height);
         idx.checked_sub(1).map(|i| &self.rules[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zcash_primitives::bft::PubKeyID;
+
+    fn rule(pow: u64, bft: u64, finalizer: u8) -> HardForkConfig {
+        HardForkConfig {
+            pow_activation_height: pow,
+            bft_certificate_height: bft,
+            terminated_finalizers: vec![PubKeyID([finalizer; 32])],
+        }
+    }
+
+    #[test]
+    fn bft_heights_strictly_increasing_is_accepted() {
+        let schedule = HardForkSchedule::new(vec![rule(300, 20, 2), rule(150, 10, 1)]);
+        // Sorted by pow_activation_height; bft_certificate_height increases with it.
+        let bfts: Vec<u64> = schedule.rules().iter().map(|r| r.bft_certificate_height).collect();
+        assert_eq!(bfts, vec![10, 20]);
+    }
+
+    #[test]
+    #[should_panic(expected = "bft_certificate_height must strictly increase")]
+    fn duplicate_bft_height_is_rejected() {
+        HardForkSchedule::new(vec![rule(150, 10, 1), rule(300, 10, 2)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "bft_certificate_height must strictly increase")]
+    fn inverted_bft_height_is_rejected() {
+        // pow_activation_height increases but bft_certificate_height decreases.
+        HardForkSchedule::new(vec![rule(150, 20, 1), rule(300, 10, 2)]);
     }
 }

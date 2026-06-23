@@ -18,6 +18,7 @@ fn hardfork_invalid_configs_rejected() {
         ("misaligned-height.toml", "must be a multiple of the staking period"),
         ("zero-height.toml", "must be greater than zero"),
         ("duplicate-finalizers.toml", "duplicate finalizer"),
+        ("empty-finalizers.toml", "must list at least one finalizer"),
     ];
 
     for (file, expected_msg) in cases {

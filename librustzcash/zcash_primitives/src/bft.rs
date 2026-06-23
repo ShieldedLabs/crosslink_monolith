@@ -36,9 +36,10 @@ pub struct HardForkConfig {
     pub pow_activation_height: u64,
     /// The BFT certificate height at which this hardfork activates.
     pub bft_certificate_height: u64,
-    /// Finalizers terminated by this hardfork. Committed to by hash later, so
-    /// this list is sorted into a canonical order when the schedule is built.
-    #[serde(default, deserialize_with = "deserialize_unique_finalizers")]
+    /// Finalizers terminated by this hardfork; must list at least one. Committed
+    /// to by hash later, so this list is sorted into a canonical order when the
+    /// schedule is built.
+    #[serde(deserialize_with = "deserialize_unique_finalizers")]
     pub terminated_finalizers: Vec<PubKeyID>,
 }
 
@@ -57,6 +58,9 @@ fn deserialize_staking_aligned<'de, D>(d: D) -> Result<u64, D::Error> where D: s
 
 fn deserialize_unique_finalizers<'de, D>(d: D) -> Result<Vec<PubKeyID>, D::Error> where D: serde::Deserializer<'de> {
     let finalizers = Vec::<PubKeyID>::deserialize(d)?;
+    if finalizers.is_empty() {
+        return Err(serde::de::Error::custom("`terminated_finalizers` must list at least one finalizer"));
+    }
     let mut seen = std::collections::HashSet::with_capacity(finalizers.len());
     for finalizer in &finalizers {
         if !seen.insert(finalizer) {

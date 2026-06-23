@@ -221,11 +221,15 @@ impl ZebradConfig {
         // Merge user-led hardforks with the ones shipped in the executable, validate
         // them, and store the canonical (sorted, deduplicated) list back. Building
         // the schedule panics on conflicting/interleaving rules, so a bad config is
-        // rejected at load time.
-        config.crosslink.hardforks =
-            zebra_chain::parameters::HardForkSchedule::new(config.crosslink.hardforks.clone())
-                .rules()
-                .to_vec();
+        // rejected at load time. `disable_shipped_hardforks` skips the built-in rules
+        // so a testnet operator can specify the whole schedule manually.
+        let user_hardforks = config.crosslink.hardforks.clone();
+        let schedule = if config.crosslink.disable_shipped_hardforks {
+            zebra_chain::parameters::HardForkSchedule::new_without_shipped(user_hardforks)
+        } else {
+            zebra_chain::parameters::HardForkSchedule::new(user_hardforks)
+        };
+        config.crosslink.hardforks = schedule.rules().to_vec();
 
         // if let zcash_protocol::consensus::Network::TestNetwork(_) = config.network.network
         Ok(config)

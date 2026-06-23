@@ -29,7 +29,7 @@ const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
 
 #[cfg(debug_assertions)] #[track_caller] pub fn dbg_panic_internal(msg: std::fmt::Arguments<'_>) -> ! {
     dbg_break();
-    unsafe { std::env::set_var("RUST_BACKTRACE", "full"); }
+    #[allow(unsafe_code)] unsafe { std::env::set_var("RUST_BACKTRACE", "full"); }
     panic!("{msg}");
 }
 #[macro_export] macro_rules! dbg_panic {
