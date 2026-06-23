@@ -257,6 +257,11 @@ impl FinalizerBlacklist {
     pub(crate) fn terminated_ids(&self) -> impl Iterator<Item = &PubKeyID> + '_ {
         self.by_finalizer.keys()
     }
+
+    /// Whether `pk` is currently blacklisted (terminated).
+    fn is_terminated(&self, pk: &PubKeyID) -> bool {
+        self.by_finalizer.contains_key(pk)
+    }
 }
 
 #[allow(dead_code)]
@@ -292,11 +297,18 @@ pub(crate) struct TFLServiceInternal {
 
 fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: FatPointerToBftBlock, child_fat_pointer: FatPointerToBftBlock) -> bool {
     let mut internal = internal_handle.internal.blocking_lock();
+    // A real (non-null) pointer ranks as `index + 1`, while a null pointer is `0`.
+    // The `+1` keeps null strictly below any real pointer, so null can no longer be
+    // confused with "points at bft_blocks[0]"; a regression from any real pointer back
+    // to null then fails the `>=` check below. `None` (pointer not resolvable yet because
+    // the referenced BFT block has not entered this node) returns false, meaning "do not
+    // accept yet" — the block is deferred, not rejected: it may become valid once the
+    // BFT blocks load.
     let parent_height = if parent_fat_pointer == FatPointerToBftBlock::null() {
         0
     } else {
         if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash() == parent_fat_pointer.points_at_block_hash()) {
-            h
+            h + 1
         } else {
             return false;
         }
@@ -305,7 +317,7 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
         0
     } else {
         if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash() == child_fat_pointer.points_at_block_hash()) {
-            h
+            h + 1
         } else {
             return false;
         }
@@ -750,10 +762,14 @@ async fn handle_new_decided_bft_block(
         file.flush().unwrap();
     }
 
-    tenderlink_roster_from_internal(&internal.finalizers_at_current_height)
+    tenderlink_roster_from_internal(&internal.finalizers_at_current_height, &internal.finalizer_blacklist)
 }
 
-fn tenderlink_roster_from_internal(vals: &[RosterMember]) -> Vec<SortedRosterMember> {
+/// Build the tenderlink consensus roster from the internal roster, excluding any
+/// finalizer in `blacklist` (terminated by a user-led hardfork). The filtering is a
+/// pure membership test, mirroring how the viz excludes terminated finalizers. Pass
+/// `&FinalizerBlacklist::default()` to build the roster unfiltered.
+fn tenderlink_roster_from_internal(vals: &[RosterMember], blacklist: &FinalizerBlacklist) -> Vec<SortedRosterMember> {
     let mut ret: Vec<SortedRosterMember> = vals
         .iter()
         .map(|v| SortedRosterMember {
@@ -761,6 +777,7 @@ fn tenderlink_roster_from_internal(vals: &[RosterMember]) -> Vec<SortedRosterMem
             stake: v.voting_power,
             cumulative_stake: 0,
         })
+        .filter(|m| !blacklist.is_terminated(&m.pub_key))
         .collect();
 
     // Roster needs to be sorted for various reasons, including determining who is under max, and
@@ -1171,7 +1188,11 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() { break; }
 
                 let mut round_data = tenderlink::RoundData::EMPTY;
-                round_data.roster = tenderlink_roster_from_internal(&unsorted_roster);
+                // Historical round replay: do NOT filter terminated finalizers. These rounds
+                // were decided by a roster that included them, and the replayed vote signatures
+                // and precommit counts below are derived from this roster — filtering here would
+                // make them inconsistent and break ingest.
+                round_data.roster = tenderlink_roster_from_internal(&unsorted_roster, &FinalizerBlacklist::default());
                 round_data.msg_val_sigs = round_data.roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.pub_key == v.pub_key).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), TMSig(s))]).collect();
                 round_data.counts.precommits = fat_pointer.signatures.len() as u64;
                 round_data.counts.yes_precommits = fat_pointer.signatures.len() as u64;
@@ -1226,7 +1247,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         let roster = {
             let mut internal = internal_handle.internal.lock().await;
 
-            let roster = tenderlink_roster_from_internal(&unsorted_roster);
+            let roster = tenderlink_roster_from_internal(&unsorted_roster, &finalizer_blacklist);
             internal.finalizers_at_current_height = unsorted_roster;
             internal.bft_blocks = i_bft_blocks;
             internal.finalizer_blacklist = finalizer_blacklist;
@@ -1237,6 +1258,18 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             }
             roster
         };
+
+        // CROSSLINK: the BFT chain is now loaded, which may make previously-deferred
+        // non-finalized PoW blocks' fat pointers resolvable. Trigger a re-flush of the
+        // non-finalized queue by issuing a finalize for the loaded tip. The finalize itself
+        // is a no-op once that tip is already finalized, but the state request handler
+        // re-flushes the queue regardless — so deferred blocks are re-evaluated now rather
+        // than waiting for the first new BFT decision (which may never come on an idle chain).
+        // The internal lock is released above, so the handler's callback into the fat-pointer
+        // closure will not deadlock.
+        if new_final_hash != ZebBlockHash([0; 32]) {
+            let _ = (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(new_final_hash)).await;
+        }
 
         tokio::spawn(tenderlink::entry_point(
             my_private_key,
