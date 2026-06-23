@@ -131,6 +131,11 @@ pub struct ResponseFromZebra {
     pub peer_strings: Vec<String>,
 
     pub bft_recency: wallet::TFLRecencyStatus,
+
+    /// 32-byte ids of finalizers terminated by a user-led hardfork (the rolling
+    /// blacklist). The right-hand pane excludes these from the normal list and
+    /// shows them at the bottom with a cancel (X) icon.
+    pub blacklisted_finalizers: Vec<Hash32>,
 }
 impl ResponseFromZebra {
     pub fn _0() -> Self {
@@ -148,6 +153,7 @@ impl ResponseFromZebra {
             staking_unbonded_pool_balance: 0,
             peer_strings: Vec::new(),
             bft_recency: wallet::TFLRecencyStatus::default(),
+            blacklisted_finalizers: Vec::new(),
         }
     }
 }
@@ -313,6 +319,9 @@ pub struct VizState {
 
     // TODO: move to zaino
     pub bft_recency_status: wallet::TFLRecencyStatus,
+    /// 32-byte ids of terminated finalizers (the rolling blacklist), used by the
+    /// right-hand pane to move them to the bottom with a cancel (X) icon.
+    pub terminated_finalizer_ids: std::collections::HashSet<[u8; 32]>,
 
     pub time_since_last_animation: std::time::Instant,
 
@@ -569,6 +578,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         time_since_last_animation: Instant::now(),
 
         bft_recency_status: wallet::TFLRecencyStatus::default(),
+        terminated_finalizer_ids: std::collections::HashSet::new(),
 
         bft_ack_height: 0,
         bc_ack_height: 0,
@@ -659,6 +669,11 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
 
         anything_happened |= viz_state.bft_recency_status != message.bft_recency;
         viz_state.bft_recency_status = message.bft_recency;
+
+        let new_terminated: std::collections::HashSet<[u8; 32]> =
+            message.blacklisted_finalizers.iter().map(|h| h.as_bytes()).collect();
+        anything_happened |= viz_state.terminated_finalizer_ids != new_terminated;
+        viz_state.terminated_finalizer_ids = new_terminated;
 
         anything_happened |= viz_state.bft_tip_height != message.bft_tip_height;
         viz_state.bft_tip_height = message.bft_tip_height;

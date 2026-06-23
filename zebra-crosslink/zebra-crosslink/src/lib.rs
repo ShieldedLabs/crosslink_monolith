@@ -218,6 +218,47 @@ pub fn bc_hdr_to_lrz(header: &ZebBlockHeader) -> BcBlockHeader {
     // }
 }
 
+/// A rolling blacklist of finalizers terminated by user-led hardforks.
+///
+/// Conceptually a set of `(32-byte finalizer id, bc_block_height)` tuples, where the
+/// height is the activation height (`pow_activation_height`) of the hardfork that
+/// terminated the finalizer. Keys are unique: re-adding a finalizer keeps the
+/// **maximum** activation height (see [`add_terminated`]).
+///
+/// The list is "rolling": on each BFT decision the terminated finalizers from the
+/// decided block's hardfork are added, and entries whose activation height the
+/// finalized BC chain has already reached are pruned (see [`prune_reached`]).
+///
+/// [`add_terminated`]: FinalizerBlacklist::add_terminated
+/// [`prune_reached`]: FinalizerBlacklist::prune_reached
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FinalizerBlacklist {
+    by_finalizer: HashMap<PubKeyID, u64>,
+}
+
+impl FinalizerBlacklist {
+    /// Register every finalizer in `finalizers` as terminated at `activation_bc_height`,
+    /// merging any existing entry by keeping the greater of the two activation heights.
+    fn add_terminated(&mut self, finalizers: &[PubKeyID], activation_bc_height: u64) {
+        for &finalizer in finalizers {
+            let height = self.by_finalizer.entry(finalizer).or_insert(activation_bc_height);
+            *height = (*height).max(activation_bc_height);
+        }
+    }
+
+    /// Drop entries whose activation height the finalized BC chain has reached, i.e.
+    /// `activation_height <= finalized_bc_height`, keeping only those not yet reached.
+    fn prune_reached(&mut self, finalized_bc_height: u64) {
+        self.by_finalizer
+            .retain(|_, &mut activation| activation > finalized_bc_height);
+    }
+
+    /// The ids of all currently-blacklisted (terminated) finalizers.
+    pub(crate) fn terminated_ids(&self) -> impl Iterator<Item = &PubKeyID> + '_ {
+        self.by_finalizer.keys()
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct TFLServiceInternal {
@@ -245,6 +286,8 @@ pub(crate) struct TFLServiceInternal {
 
     current_bc_final: Option<(ZebBlockHeight, ZebBlockHash)>,
     path_to_pos_store_file: PathBuf,
+    /// Rolling blacklist of finalizers terminated by user-led hardforks. See [`FinalizerBlacklist`].
+    finalizer_blacklist: FinalizerBlacklist,
 }
 
 fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: FatPointerToBftBlock, child_fat_pointer: FatPointerToBftBlock) -> bool {
@@ -565,7 +608,6 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
         // Serialization re-adds the legacy +1 for v1 blocks (see BftBlock::zcash_serialize).
         internal.bft_blocks.len() as u32,
         internal.fat_pointer_to_tip.clone(),
-        0,
         headers,
     ) {
         Ok(v) => Some(v),
@@ -606,7 +648,6 @@ async fn handle_new_decided_bft_block(
     let call = tfl_handle.call.clone();
     let new_final_hash = ZebBlockHash(BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0);
     let new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
-    // assert_eq!(new_final_height.0, new_block.finalization_candidate_height);
     // `height` is now the 0-based canonical height, i.e. the chain index directly.
     let insert_i = new_block.height as usize;
 
@@ -622,7 +663,6 @@ async fn handle_new_decided_bft_block(
                 vote_for_block_without_finalizer_public_key: [0u8; 76 - 32],
                 signatures: Vec::new(),
             },
-            finalization_candidate_height: 0,
             headers: Vec::new(),
             hardfork: None,
             do_not_include_until_bc_height: 0,
@@ -646,6 +686,15 @@ async fn handle_new_decided_bft_block(
     internal.bft_blocks[insert_i] = new_block.clone();
     internal.fat_pointer_to_tip = fat_pointer.clone();
     internal.latest_final_block = Some((new_final_height, new_final_hash));
+
+    if let Some(hardfork) = &new_block.hardfork {
+        internal
+            .finalizer_blacklist
+            .add_terminated(&hardfork.terminated_finalizers, hardfork.pow_activation_height);
+    }
+    internal
+        .finalizer_blacklist
+        .prune_reached(new_final_height.0 as u64);
 
     drop(internal); // Note(Sam): IT IS VERY IMPORTANT THAT WE DROP THE LOCK BECAUSE ZEBRA_STATE MAY CALL US BACK
     let got_stakes = loop {
@@ -1150,12 +1199,37 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 //println!("Loaded at pow ({:?}, {:?}) with roster: {:?}", new_final_height, new_final_hash, unsorted_roster);
         }
 
+        // Reconstruct the rolling finalizer blacklist by replaying each loaded block in
+        // order, exactly as the live decision path does: prune entries whose activation
+        // height the block's finalized BC height has reached, then add that block's
+        // terminated finalizers. The finalized height isn't stored in the block, so it
+        // is derived from the finalization-candidate header (headers.first()).
+        let mut finalizer_blacklist = FinalizerBlacklist::default();
+        for block in &i_bft_blocks {
+            if let Some(candidate) = block.headers.first() {
+                let candidate_hash = ZebBlockHash(BlockHash::from_header_data(candidate).0);
+                if let Some(h) = block_height_from_hash(&call, candidate_hash).await {
+                    finalizer_blacklist.prune_reached(h.0 as u64);
+                } else {
+                    warn!(
+                        "Blacklist reconstruction: finalized PoW height unavailable for loaded BFT block {}; skipping its prune step",
+                        block.height,
+                    );
+                }
+            }
+            if let Some(hardfork) = &block.hardfork {
+                finalizer_blacklist
+                    .add_terminated(&hardfork.terminated_finalizers, hardfork.pow_activation_height);
+            }
+        }
+
         let roster = {
             let mut internal = internal_handle.internal.lock().await;
 
             let roster = tenderlink_roster_from_internal(&unsorted_roster);
             internal.finalizers_at_current_height = unsorted_roster;
             internal.bft_blocks = i_bft_blocks;
+            internal.finalizer_blacklist = finalizer_blacklist;
             internal.fat_pointer_to_tip = fat_pointer_to_tip;
             if new_final_hash != ZebBlockHash([0; 32]) {
                 internal.current_bc_final = Some((new_final_height, new_final_hash));

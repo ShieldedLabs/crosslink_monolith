@@ -173,8 +173,6 @@ pub struct BftBlock {
     pub height: u32,
     /// Hash of the previous BFT Block.
     pub previous_block_fat_ptr: FatPointerToBftBlock,
-    /// The height of the PoW block that is the finalization candidate.
-    pub finalization_candidate_height: u32,
     /// The PoW Headers
     // @Zooko: PoPoW?
     pub headers: Vec<BcBlockHeader>,
@@ -205,7 +203,10 @@ impl BftBlock {
         let serialized_height = if self.version < 2 { self.height + 1 } else { self.height };
         writer.write_u32::<LittleEndian>(serialized_height)?;
         self.previous_block_fat_ptr.zcash_serialize(&mut writer);
-        writer.write_u32::<LittleEndian>(self.finalization_candidate_height)?;
+        // The former `finalization_candidate_height` field was always 0 and has been
+        // removed. Keep its 4-byte slot, written as zero, so v1 block bytes — and thus
+        // hashes and finalizer signatures — are byte-for-byte identical to before.
+        writer.write_u32::<LittleEndian>(0)?;
         writer.write_u32::<LittleEndian>(self.headers.len().try_into().unwrap())?;
         for header in &self.headers {
             // header_data.zcash_serialize(&mut writer)?;
@@ -247,7 +248,9 @@ impl BftBlock {
             raw_height
         };
         let previous_block_fat_ptr = FatPointerToBftBlock::zcash_deserialize(&mut reader)?;
-        let finalization_candidate_height = reader.read_u32::<LittleEndian>()?;
+        // Consume and discard the former `finalization_candidate_height` slot (always 0);
+        // see zcash_serialize. The wire format is unchanged.
+        let _ = reader.read_u32::<LittleEndian>()?;
         let header_count = reader.read_u32::<LittleEndian>()?;
         if header_count > 2048 {
             // Fail on unreasonably large number.
@@ -286,7 +289,6 @@ impl BftBlock {
             version,
             height,
             previous_block_fat_ptr,
-            finalization_candidate_height,
             headers: array,
             hardfork,
             do_not_include_until_bc_height,
@@ -311,7 +313,6 @@ impl BftBlock {
         params: &ZcashCrosslinkParameters,
         height: u32,
         previous_block_fat_ptr: FatPointerToBftBlock,
-        finalization_candidate_height: u32,
         headers: Vec<BcBlockHeader>,
     ) -> Result<Self, InvalidBftBlock> {
         let expected = params.bc_confirmation_depth_sigma;
@@ -326,7 +327,6 @@ impl BftBlock {
             version: 1,
             height,
             previous_block_fat_ptr,
-            finalization_candidate_height,
             headers,
             hardfork: None,
             do_not_include_until_bc_height: 0,

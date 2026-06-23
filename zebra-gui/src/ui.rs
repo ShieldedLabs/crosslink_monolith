@@ -3312,6 +3312,7 @@ pub fn ui_right_pane(ui: &mut Context,
                  dummy_2: &mut Id) {
 
     let bft_status = &viz.bft_recency_status;
+    let terminated_finalizers = &viz.terminated_finalizer_ids;
     // ui.text(frame_strf!(data, "BFT recency: {bft_recency:#?}"), TextDecl { font: Mono, h: ui.scale(20.0), colour: WHITE, align: AlignX::Center, ..TextDecl });
 
     // @TODO: MAKE THESE NOT USE TABS, JUST USE HEADERS
@@ -3326,7 +3327,14 @@ pub fn ui_right_pane(ui: &mut Context,
 
     let mut filters_modified = true;
 
-    roster.sort_by_key(|member| std::cmp::Reverse(member.voting_power));
+    // Terminated (blacklisted) finalizers sink to the bottom; within each group,
+    // sort by voting power descending as before.
+    roster.sort_by_key(|member| {
+        (
+            terminated_finalizers.contains(&member.pub_key),
+            std::cmp::Reverse(member.voting_power),
+        )
+    });
     let roster = roster;
 
     if let _ = elem().decl(Decl {
@@ -3537,10 +3545,18 @@ pub fn ui_right_pane(ui: &mut Context,
             }
         }
 
+        // Terminated finalizers are excluded from the two summary bars above the list
+        // (they still appear in the list itself, at the bottom with a cancel icon).
+        let bar_roster: Vec<WalletRosterMember> = roster
+            .iter()
+            .filter(|member| !terminated_finalizers.contains(&member.pub_key))
+            .cloned()
+            .collect();
+
         let mut online_stake = 0u64;
 
         let mut total_stake = 0u64;
-        for member in &roster {
+        for member in &bar_roster {
             total_stake += member.voting_power;
 
             if finalizer_is_online(member.pub_key, &bft_status, &filters){
@@ -3568,7 +3584,7 @@ pub fn ui_right_pane(ui: &mut Context,
 
         finalizer_ratio_bar(ui, data, bft_status, &online_offline_roster_members, total_stake, height, seconds_since_connected, &FinalizerFilters::default(), ui::id("Right Pane Ratio Bar 1"), false);
 
-        finalizer_ratio_bar(ui, data, bft_status, &roster, total_stake, height, seconds_since_connected, &filters, ui::id("Right Pane Ratio Bar 2"), true);
+        finalizer_ratio_bar(ui, data, bft_status, &bar_roster, total_stake, height, seconds_since_connected, &filters, ui::id("Right Pane Ratio Bar 2"), true);
 
         let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
         if roster.len() == 0 {
@@ -3627,13 +3643,19 @@ pub fn ui_right_pane(ui: &mut Context,
                         align: Left,
                         ..Decl
                     }) {
-                        let is_online = if let Some(f) = finalizer_status {
+                        let is_terminated = terminated_finalizers.contains(&member.pub_key);
+                        let is_online = if is_terminated {
+                            false
+                        } else if let Some(f) = finalizer_status {
                             finalizer_is_online_ex(&f, &bft_status, &filters)
                         } else {
                             false
                         };
 
-                        let (text_colour, icon) = if is_online {
+                        let (text_colour, icon) = if is_terminated {
+                            // Terminated by a hardfork: show a cancel (X) icon instead of wifi.
+                            (WHITE.mul(0.5), ICON_CANCEL)
+                        } else if is_online {
                             (WHITE, ICON_WIFI)
                         } else {
                             (WHITE.mul(0.5), ICON_ATTENTION_1)

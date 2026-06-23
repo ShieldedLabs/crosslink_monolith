@@ -2669,7 +2669,6 @@ pub async fn viz_main(
                             version: 0,
                             height: 0,
                             previous_block_fat_ptr: FatPointerToBftBlock::null(),
-                            finalization_candidate_height: 0,
                             headers: loop {
                                 let bc: Option<u32> = target_bc_str.trim().parse().ok();
                                 if bc.is_none() {
@@ -2780,7 +2779,7 @@ pub async fn viz_main(
                         if let Some(bc_hdr) = bft_block.block.headers.first() {
                             if ctx.find_bc_node_by_hash(&BlockHash::from_header_data(&bc_hdr)).is_none() {
                                 clear_bft_bc_h = Some(
-                                    bft_block.block.finalization_candidate_height
+                                    0
                                         + bft_block.block.headers.len() as u32
                                         - 1,
                                 );
@@ -2936,7 +2935,6 @@ pub async fn viz_main(
                             version: 0,
                             height: 0,
                             previous_block_fat_ptr: FatPointerToBftBlock::null(),
-                            finalization_candidate_height: 0,
                             headers: Vec::new(),
                             hardfork: None,
                             do_not_include_until_bc_height: 0,
@@ -3030,7 +3028,7 @@ pub async fn viz_main(
                             );
                             if hdr_lo.is_none() && hdr_hi.is_none() {
                                 if let Some(bc_lo) = ctx.get_node(ctx.bc_lo) {
-                                    let max_hdr_h = bft_block.block.finalization_candidate_height
+                                    let max_hdr_h = 0
                                         + bft_block.block.headers.len() as u32
                                         - 1;
                                     if max_hdr_h < bc_lo.height {
@@ -3043,7 +3041,7 @@ pub async fn viz_main(
                                 }
 
                                 if let Some(bc_hi) = ctx.get_node(ctx.bc_hi) {
-                                    let min_hdr_h = bft_block.block.finalization_candidate_height;
+                                    let min_hdr_h = 0;
                                     if min_hdr_h > bc_hi.height {
                                         offscreen_new_pt = Some(vec2(
                                             node.pt.x,
@@ -3332,7 +3330,7 @@ pub async fn viz_main(
                                     None,
                                     &format!(
                                         "  {} - {}",
-                                        bft_block.block.finalization_candidate_height + i as u32,
+                                        0 + i as u32,
                                         BlockHash::from_header_data(pow_hdr)
                                     ),
                                 );

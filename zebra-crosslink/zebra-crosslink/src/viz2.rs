@@ -157,6 +157,30 @@ pub async fn service_viz_requests(
                     let mut internal = tfl_handle.internal.lock().await;
                     let mut response = visualizer_zcash::ResponseFromZebra::_0();
                     response.bft_recency = internal.recency_status.clone(); // TODO: do we want a better way of communicating singleton data
+                    {
+                        let mut blacklist : Vec<Hash32> = internal
+                            .finalizer_blacklist
+                            .terminated_ids()
+                            .map(|pk| Hash32::from_bytes(pk.0))
+                            .collect();
+                        // We need to add the upcoming hardfork because hardfork happens before the actual bft
+                        // block. The rolling blacklist only holds finalizers from *decided* hardfork blocks;
+                        // a hardfork configured at a BFT height we haven't decided yet (bft_certificate_height
+                        // >= the next block's index) won't be in it. Fold those in so the GUI shows the
+                        // termination as soon as it is scheduled, ahead of the decision.
+                        let upcoming_bft_height = internal.bft_blocks.len() as u64;
+                        for hf in tfl_handle.config.hardforks.iter() {
+                            if hf.bft_certificate_height >= upcoming_bft_height {
+                                for pk in &hf.terminated_finalizers {
+                                    let id = Hash32::from_bytes(pk.0);
+                                    if !blacklist.contains(&id) {
+                                        blacklist.push(id);
+                                    }
+                                }
+                            }
+                        }
+                        response.blacklisted_finalizers = blacklist;
+                    }
                     response.bc_tip_height = bc_tip_height;
                     response.bc_finalized_tip_height = if let Some(latest_finalized_block) = internal.latest_final_block {
                         latest_finalized_block.0.0 as u64
@@ -198,13 +222,14 @@ pub async fn service_viz_requests(
                             version: b.version,
                             height: b.height,
                             previous_hash: Hash32::from_bytes(b.previous_block_hash().0),
-                            finalization_candidate_height: b.finalization_candidate_height,
+                            // BftBlock no longer carries this (it was always 0); preserve prior behavior.
+                            finalization_candidate_height: 0,
                             pow_headers: b
                                 .headers
                                 .iter()
                                 .enumerate()
                                 .map(|(i, hdr)| BftPowHeaderInspection {
-                                    height: b.finalization_candidate_height + i as u32,
+                                    height: i as u32, // was b.finalization_candidate_height (always 0) + i
                                     hash: Hash32::from_bytes(BlockHash::from_header_data(hdr).0),
                                 })
                                 .collect(),
