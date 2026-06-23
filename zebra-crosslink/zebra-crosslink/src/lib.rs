@@ -239,7 +239,17 @@ pub(crate) struct FinalizerBlacklist {
 impl FinalizerBlacklist {
     /// Register every finalizer in `finalizers` as terminated at `activation_bc_height`,
     /// merging any existing entry by keeping the greater of the two activation heights.
-    fn add_terminated(&mut self, finalizers: &[PubKeyID], activation_bc_height: u64) {
+    ///
+    /// `finalized_bc_height` is the BC height already finalized at the point of this append.
+    /// If the activation height is at or below it, the append is a **no-op**: the activation
+    /// has already been finalized (the bonds are terminated at the source, and the key may
+    /// since have been restaked to), so an entry here would only wrongly suppress that key.
+    /// This makes a hardfork rule whose BFT decision lands much later than its BC activation
+    /// a no-op on the blacklist, which is correct — the rule has already taken effect.
+    fn add_terminated(&mut self, finalizers: &[PubKeyID], activation_bc_height: u64, finalized_bc_height: u64) {
+        if activation_bc_height <= finalized_bc_height {
+            return;
+        }
         for &finalizer in finalizers {
             let height = self.by_finalizer.entry(finalizer).or_insert(activation_bc_height);
             *height = (*height).max(activation_bc_height);
@@ -296,7 +306,15 @@ pub(crate) struct TFLServiceInternal {
 }
 
 fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: FatPointerToBftBlock, child_fat_pointer: FatPointerToBftBlock) -> bool {
-    let mut internal = internal_handle.internal.blocking_lock();
+    // This runs synchronously inside the state service, which is driven on an async runtime
+    // thread, so we must not block on the lock — `blocking_lock` panics in an async context.
+    // Use `try_lock`; if the lock is momentarily held, return false, which the callers treat
+    // as "do not accept yet" (defer). The commit gate re-queues the block and it is
+    // re-evaluated on a later flush, so a transient miss is harmless.
+    let internal = match internal_handle.internal.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
     // A real (non-null) pointer ranks as `index + 1`, while a null pointer is `0`.
     // The `+1` keeps null strictly below any real pointer, so null can no longer be
     // confused with "points at bft_blocks[0]"; a regression from any real pointer back
@@ -702,7 +720,7 @@ async fn handle_new_decided_bft_block(
     if let Some(hardfork) = &new_block.hardfork {
         internal
             .finalizer_blacklist
-            .add_terminated(&hardfork.terminated_finalizers, hardfork.pow_activation_height);
+            .add_terminated(&hardfork.terminated_finalizers, hardfork.pow_activation_height, new_final_height.0 as u64);
     }
     internal
         .finalizer_blacklist
@@ -1221,26 +1239,40 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         }
 
         // Reconstruct the rolling finalizer blacklist by replaying each loaded block in
-        // order, exactly as the live decision path does: prune entries whose activation
-        // height the block's finalized BC height has reached, then add that block's
-        // terminated finalizers. The finalized height isn't stored in the block, so it
-        // is derived from the finalization-candidate header (headers.first()).
+        // order, exactly as the live decision path does: for each block, resolve the BC
+        // height it finalizes, append its terminated finalizers (a no-op if that height is
+        // already at/above the hardfork's activation), then prune entries the finalized
+        // height has reached. The finalized height isn't stored in the block, so it is
+        // derived from the finalization-candidate header (headers.first()).
         let mut finalizer_blacklist = FinalizerBlacklist::default();
         for block in &i_bft_blocks {
-            if let Some(candidate) = block.headers.first() {
+            let finalized_bc_height: Option<u64> = if let Some(candidate) = block.headers.first() {
                 let candidate_hash = ZebBlockHash(BlockHash::from_header_data(candidate).0);
-                if let Some(h) = block_height_from_hash(&call, candidate_hash).await {
-                    finalizer_blacklist.prune_reached(h.0 as u64);
-                } else {
-                    warn!(
-                        "Blacklist reconstruction: finalized PoW height unavailable for loaded BFT block {}; skipping its prune step",
-                        block.height,
-                    );
+                match block_height_from_hash(&call, candidate_hash).await {
+                    Some(h) => Some(h.0 as u64),
+                    None => {
+                        warn!(
+                            "Blacklist reconstruction: finalized PoW height unavailable for loaded BFT block {}; treating as not-yet-finalized",
+                            block.height,
+                        );
+                        None
+                    }
                 }
-            }
+            } else {
+                None
+            };
+
             if let Some(hardfork) = &block.hardfork {
-                finalizer_blacklist
-                    .add_terminated(&hardfork.terminated_finalizers, hardfork.pow_activation_height);
+                // Unknown finalized height -> fall back to 0 (treat as not-yet-finalized, so
+                // the append still happens); this is the conservative choice.
+                finalizer_blacklist.add_terminated(
+                    &hardfork.terminated_finalizers,
+                    hardfork.pow_activation_height,
+                    finalized_bc_height.unwrap_or(0),
+                );
+            }
+            if let Some(h) = finalized_bc_height {
+                finalizer_blacklist.prune_reached(h);
             }
         }
 

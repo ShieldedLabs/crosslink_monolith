@@ -163,14 +163,14 @@ pub async fn service_viz_requests(
                             .terminated_ids()
                             .map(|pk| Hash32::from_bytes(pk.0))
                             .collect();
-                        // We need to add the upcoming hardfork because hardfork happens before the actual bft
-                        // block. The rolling blacklist only holds finalizers from *decided* hardfork blocks;
-                        // a hardfork configured at a BFT height we haven't decided yet (bft_certificate_height
-                        // >= the next block's index) won't be in it. Fold those in so the GUI shows the
-                        // termination as soon as it is scheduled, ahead of the decision.
+                        // Fold in the *imminent* hardfork: the rolling blacklist only holds finalizers
+                        // from already-decided hardfork blocks, so a configured hardfork shows nothing
+                        // until it is decided. Show it exactly one step early — only when its BFT block
+                        // is the very next one to be decided (bft_certificate_height == the next block's
+                        // index), not for the whole chain leading up to it.
                         let upcoming_bft_height = internal.bft_blocks.len() as u64;
                         for hf in tfl_handle.config.hardforks.iter() {
-                            if hf.bft_certificate_height >= upcoming_bft_height {
+                            if hf.bft_certificate_height == upcoming_bft_height {
                                 for pk in &hf.terminated_finalizers {
                                     let id = Hash32::from_bytes(pk.0);
                                     if !blacklist.contains(&id) {
