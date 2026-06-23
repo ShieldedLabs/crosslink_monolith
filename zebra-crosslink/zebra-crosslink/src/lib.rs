@@ -257,6 +257,11 @@ impl FinalizerBlacklist {
     pub(crate) fn terminated_ids(&self) -> impl Iterator<Item = &PubKeyID> + '_ {
         self.by_finalizer.keys()
     }
+
+    /// Whether `pk` is currently blacklisted (terminated).
+    fn is_terminated(&self, pk: &PubKeyID) -> bool {
+        self.by_finalizer.contains_key(pk)
+    }
 }
 
 #[allow(dead_code)]
@@ -757,10 +762,14 @@ async fn handle_new_decided_bft_block(
         file.flush().unwrap();
     }
 
-    tenderlink_roster_from_internal(&internal.finalizers_at_current_height)
+    tenderlink_roster_from_internal(&internal.finalizers_at_current_height, &internal.finalizer_blacklist)
 }
 
-fn tenderlink_roster_from_internal(vals: &[RosterMember]) -> Vec<SortedRosterMember> {
+/// Build the tenderlink consensus roster from the internal roster, excluding any
+/// finalizer in `blacklist` (terminated by a user-led hardfork). The filtering is a
+/// pure membership test, mirroring how the viz excludes terminated finalizers. Pass
+/// `&FinalizerBlacklist::default()` to build the roster unfiltered.
+fn tenderlink_roster_from_internal(vals: &[RosterMember], blacklist: &FinalizerBlacklist) -> Vec<SortedRosterMember> {
     let mut ret: Vec<SortedRosterMember> = vals
         .iter()
         .map(|v| SortedRosterMember {
@@ -768,6 +777,7 @@ fn tenderlink_roster_from_internal(vals: &[RosterMember]) -> Vec<SortedRosterMem
             stake: v.voting_power,
             cumulative_stake: 0,
         })
+        .filter(|m| !blacklist.is_terminated(&m.pub_key))
         .collect();
 
     // Roster needs to be sorted for various reasons, including determining who is under max, and
@@ -1178,7 +1188,11 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 if block.previous_block_fat_ptr.points_at_block_hash() != fat_pointer_to_tip.points_at_block_hash() { break; }
 
                 let mut round_data = tenderlink::RoundData::EMPTY;
-                round_data.roster = tenderlink_roster_from_internal(&unsorted_roster);
+                // Historical round replay: do NOT filter terminated finalizers. These rounds
+                // were decided by a roster that included them, and the replayed vote signatures
+                // and precommit counts below are derived from this roster — filtering here would
+                // make them inconsistent and break ingest.
+                round_data.roster = tenderlink_roster_from_internal(&unsorted_roster, &FinalizerBlacklist::default());
                 round_data.msg_val_sigs = round_data.roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.pub_key == v.pub_key).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), TMSig(s))]).collect();
                 round_data.counts.precommits = fat_pointer.signatures.len() as u64;
                 round_data.counts.yes_precommits = fat_pointer.signatures.len() as u64;
@@ -1233,7 +1247,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         let roster = {
             let mut internal = internal_handle.internal.lock().await;
 
-            let roster = tenderlink_roster_from_internal(&unsorted_roster);
+            let roster = tenderlink_roster_from_internal(&unsorted_roster, &finalizer_blacklist);
             internal.finalizers_at_current_height = unsorted_roster;
             internal.bft_blocks = i_bft_blocks;
             internal.finalizer_blacklist = finalizer_blacklist;
