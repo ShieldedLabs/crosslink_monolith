@@ -76,6 +76,7 @@ pub struct Zainod {
     logs_dir: TempDir,
     /// Config directory
     config_dir: TempDir,
+    _data_dir: Option<TempDir>,
 }
 
 impl LogsToDir for Zainod {
@@ -91,15 +92,16 @@ impl Process for Zainod {
 
     async fn launch(config: Self::Config) -> Result<Self, LaunchError> {
         let logs_dir = tempfile::tempdir().unwrap();
-        let data_dir = tempfile::tempdir().unwrap();
 
         let port = network::pick_unused_port(config.listen_port);
         let config_dir = tempfile::tempdir().unwrap();
 
-        let cache_dir = if let Some(cache) = config.chain_cache.clone() {
-            cache
+        let (cache_dir, data_dir) = if let Some(cache) = config.chain_cache.clone() {
+            (cache, None)
         } else {
-            data_dir.path().to_path_buf()
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_path_buf();
+            (path, Some(dir))
         };
 
         let config_file_path = config::write_zainod_config(
@@ -137,6 +139,7 @@ impl Process for Zainod {
             port,
             logs_dir,
             config_dir,
+            _data_dir: data_dir,
         })
     }
 

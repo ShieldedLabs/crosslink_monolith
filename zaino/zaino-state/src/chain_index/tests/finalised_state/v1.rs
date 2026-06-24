@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 use zaino_common::network::ActivationHeights;
-use zaino_common::{DatabaseConfig, Network, StorageConfig};
+use zaino_common::{DatabaseConfig, DatabaseSize, Network, StorageConfig};
 
 use crate::chain_index::finalised_state::capability::IndexedBlockExt;
 use crate::chain_index::finalised_state::db::DbBackend;
@@ -32,7 +32,7 @@ pub(crate) async fn spawn_v1_zaino_db(
         storage: StorageConfig {
             database: DatabaseConfig {
                 path: db_path,
-                ..Default::default()
+                size: DatabaseSize::Gb(1),
             },
             ..Default::default()
         },
@@ -142,7 +142,7 @@ async fn save_db_to_file_and_reload() {
         storage: StorageConfig {
             database: DatabaseConfig {
                 path: db_path,
-                ..Default::default()
+                size: DatabaseSize::Gb(1),
             },
             ..Default::default()
         },
@@ -200,6 +200,8 @@ async fn save_db_to_file_and_reload() {
     })
     .join()
     .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -223,7 +225,14 @@ async fn load_db_backend_from_file() {
         db_version: 1,
         network: Network::Regtest(ActivationHeights::default()),
     };
-    let finalized_state_backend = DbBackend::spawn_v1(&config).await.unwrap();
+    let finalized_state_backend = {
+        // LmdbError(Other(1224)) on Windows. Remove before opening.
+        let lock_path = db_path.join("regtest").join("v1").join("lock.mdb");
+        if lock_path.exists() {
+            let _ = std::fs::remove_file(&lock_path);
+        }
+        DbBackend::spawn_v1(&config).await.unwrap()
+    };
 
     let mut prev_hash = None;
     for height in 0..=100 {
@@ -243,7 +252,6 @@ async fn load_db_backend_from_file() {
         .await
         .unwrap()
         .is_none());
-    std::fs::remove_file(db_path.join("regtest").join("v1").join("lock.mdb")).unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]

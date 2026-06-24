@@ -25,7 +25,7 @@ tracing = { workspace = true }
 
 # Miscellaneous Workspace
 tokio = { workspace = true, features = ["full"] }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls-ring"] }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }

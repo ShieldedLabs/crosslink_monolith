@@ -256,13 +256,35 @@ impl<T: BlockchainSource> Migration<T> for Migration0_0_0To1_0_0 {
 
             info!("Wiping v0 database from disk.");
 
-            match tokio::fs::remove_dir_all(&db_path).await {
-                Ok(_) => tracing::info!("Deleted old database at {}", db_path.display()),
-                Err(e) => tracing::error!(
-                    "Failed to delete old database at {}: {}",
-                    db_path.display(),
-                    e
-                ),
+            let mut attempts = 0;
+            loop {
+                match std::fs::remove_dir_all(&db_path) {
+                    Ok(_) => {
+                        tracing::info!("Deleted old database at {}", db_path.display());
+                        break;
+                    }
+                    Err(e) if attempts < 5 => {
+                        attempts += 1;
+                        let delay = std::time::Duration::from_millis(100 * (1 << attempts));
+                        tracing::warn!(
+                            "Failed to delete old database at {} (attempt {}/5): {}. Retrying in {:?}...",
+                            db_path.display(),
+                            attempts,
+                            e,
+                            delay,
+                        );
+                        std::thread::sleep(delay);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to delete old database at {} after {} attempts: {}",
+                            db_path.display(),
+                            attempts,
+                            e
+                        );
+                        break;
+                    }
+                }
             }
         });
 

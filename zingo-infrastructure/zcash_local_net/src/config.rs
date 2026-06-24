@@ -259,7 +259,8 @@ validator_user = \"xxxxxx\"
 validator_password = \"xxxxxx\"
 
 [storage]
-database.path = \"{chain_cache}\""
+database.path = \"{chain_cache}\"
+database.size = {{ gb = 1 }}"
         )
         .as_bytes(),
     )?;
@@ -411,7 +412,8 @@ validator_user = \"xxxxxx\"
 validator_password = \"xxxxxx\"
 
 [storage]
-database.path = \"{zaino_test_path}\""
+database.path = \"{zaino_test_path}\"
+database.size = {{ gb = 1 }}"
             )
         );
     }

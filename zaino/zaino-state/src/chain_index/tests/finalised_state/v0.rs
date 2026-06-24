@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 use zaino_common::network::ActivationHeights;
-use zaino_common::{DatabaseConfig, Network, StorageConfig};
+use zaino_common::{DatabaseConfig, DatabaseSize, Network, StorageConfig};
 
 use crate::chain_index::finalised_state::reader::DbReader;
 use crate::chain_index::finalised_state::ZainoDB;
@@ -26,7 +26,7 @@ pub(crate) async fn spawn_v0_zaino_db(
         storage: StorageConfig {
             database: DatabaseConfig {
                 path: db_path,
-                ..Default::default()
+                size: DatabaseSize::Gb(1),
             },
             ..Default::default()
         },
@@ -135,7 +135,7 @@ async fn save_db_to_file_and_reload() {
         storage: StorageConfig {
             database: DatabaseConfig {
                 path: db_path,
-                ..Default::default()
+                size: DatabaseSize::Gb(1),
             },
             ..Default::default()
         },
@@ -195,6 +195,7 @@ async fn save_db_to_file_and_reload() {
     })
     .join()
     .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
 #[tokio::test(flavor = "multi_thread")]
