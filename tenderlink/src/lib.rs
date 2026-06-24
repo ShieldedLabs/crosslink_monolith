@@ -20,6 +20,9 @@ const PRINT_BFT_VOTE:       bool = 1 == 1;
 const PRINT_BFT_UPDATE:     bool = 1 == 1;
 const PRINT_BFT_STATE:      bool = 0 == 1;
 const PRINT_BFT_CONDITIONS: bool = 1 == 1;
+// Invalid-signature BFT FAULT prints. Off by default: with vote namespacing these are common and
+// expected (e.g. peers signing under a different hardfork namespace), so they're just noise.
+const PRINT_BFT_SIG_FAULT:  bool = 0 == 1;
 const PRINT_BFT_TIMEOUTS:   bool = 0 == 1;
 
 #[cfg(debug_assertions)] pub fn dbg_break() {
@@ -660,12 +663,14 @@ impl TMState {
         // namespace (nil -> unchanged). `height == self.height` is guaranteed above, so
         // `self.vote_namespace` is the correct namespace for `signed_data`.
         match sig.verify_with_namespace(from_pub_key, signed_data, &self.vote_namespace) { Ok(())=>{}, Err((err, str))=> {
-            eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST}: {} (..{}): for {} {}", str, signed_data.len(), value_id, err);
-            #[cfg(debug_assertions)]
-            {
-                println!("DEBUG LOOP OVER ALL ROSTER AND TRIAL VERIFY only success should be {} but that is not so... :(", roster_i);
-                for i in 0..roster.len() {
-                    println!("{}: success={} pub_key: {:?} stake: {} cumulative_stake: {}", i, sig.verify_with_namespace(roster[i].pub_key, signed_data, &self.vote_namespace).is_ok(), roster[i].pub_key, roster[i].stake, roster[i].cumulative_stake);
+            if PRINT_BFT_SIG_FAULT {
+                eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST}: {} (..{}): for {} {}", str, signed_data.len(), value_id, err);
+                #[cfg(debug_assertions)]
+                {
+                    println!("DEBUG LOOP OVER ALL ROSTER AND TRIAL VERIFY only success should be {} but that is not so... :(", roster_i);
+                    for i in 0..roster.len() {
+                        println!("{}: success={} pub_key: {:?} stake: {} cumulative_stake: {}", i, sig.verify_with_namespace(roster[i].pub_key, signed_data, &self.vote_namespace).is_ok(), roster[i].pub_key, roster[i].stake, roster[i].cumulative_stake);
+                    }
                 }
             }
             return TMStatus::Fail;
@@ -1690,7 +1695,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 match round_data.proposal_sigs[chunk_i].verify_with_namespace(proposer_pub_key, &send_buf1[signed_data_start..sig_o], &round_data.vote_namespace) {
                                     Ok(_) => {}
                                     Err((err, str)) => {
-                                        eprintln!("{ctx_str}: {ANSI_RED}BFT FAULT{ANSI_RST}: {str} [..{}): for proposal from {proposer_pub_key:?} {height}.{round}.{chunk_i}: {} {err}", sig_o-1, chunk_hdr.proposal_id);
+                                        if PRINT_BFT_SIG_FAULT {
+                                            eprintln!("{ctx_str}: {ANSI_RED}BFT FAULT{ANSI_RST}: {str} [..{}): for proposal from {proposer_pub_key:?} {height}.{round}.{chunk_i}: {} {err}", sig_o-1, chunk_hdr.proposal_id);
+                                        }
                                         continue;
                                     }
                                 }
@@ -1731,8 +1738,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 let sign_datas = make_vote_sign_datas(pub_key, is_precommit != 0, packet.height, packet.round, packet.value_id);
                                 let sign_data  = &sign_datas[(i >= packet.no_votes_n as usize) as usize];
                                 match sig.verify_with_namespace(pub_key, sign_data, vote_namespace) { Ok(_)=>{} Err((err, str)) => {
-                                    eprintln!("{ctx_str}: {ANSI_RED}BFT FAULT{ANSI_RST}: {str} [..{}): for {} from {roster_i}-{pub_key:?} {}.{}: {} {err}",
-                                        sign_data.len(), ["prevote", "precommit"][is_precommit], packet.height, packet.round, packet.value_id);
+                                    if PRINT_BFT_SIG_FAULT {
+                                        eprintln!("{ctx_str}: {ANSI_RED}BFT FAULT{ANSI_RST}: {str} [..{}): for {} from {roster_i}-{pub_key:?} {}.{}: {} {err}",
+                                            sign_data.len(), ["prevote", "precommit"][is_precommit], packet.height, packet.round, packet.value_id);
+                                    }
                                 }}
                             }
                         }
