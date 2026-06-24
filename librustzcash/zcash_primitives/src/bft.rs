@@ -575,6 +575,21 @@ impl TMSig {
         let vk = match VerificationKey::try_from(pub_key.0) { Ok(v)=>v,       Err(err)=>{ return Err((err, "invalid public key")) }};
         match vk.verify(&signature, signed_data)            { Ok(())=>Ok(()), Err(err)=>{ Err((err, "invalid signature")) }}
     }
+
+    /// Like [`TMSig::verify`], but for vote namespacing: the 32-byte `namespace`
+    /// (a cumulative hash of the hardforks in effect) is appended to `signed_data`
+    /// before verifying. A nil namespace (`[0; 32]`) appends nothing, so signatures
+    /// made without namespacing verify byte-for-byte as before — backwards compatible.
+    pub fn verify_with_namespace(&self, pub_key: PubKeyID, signed_data: &[u8], namespace: &[u8; 32]) -> Result<(), (ed25519_zebra::Error, &str)> {
+        if *namespace == [0u8; 32] {
+            self.verify(pub_key, signed_data)
+        } else {
+            let mut buf = Vec::with_capacity(signed_data.len() + 32);
+            buf.extend_from_slice(signed_data);
+            buf.extend_from_slice(namespace);
+            self.verify(pub_key, &buf)
+        }
+    }
 }
 impl std::fmt::Debug for TMSig { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { fmt_prefixed_byte_str(f, "Sig{", &self.0[..2])?; write!(f, "}}") } }
 

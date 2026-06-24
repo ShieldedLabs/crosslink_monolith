@@ -1083,6 +1083,24 @@ pub fn run_tfl_test(internal_handle: TFLServiceHandle) {
     tokio::task::spawn(test_format::instr_reader(internal_handle));
 }
 
+/// Vote-namespacing domain separator for a BFT height: a flat blake3 hash of the prefix of
+/// scheduled hardforks whose `bft_certificate_height <= bft_height` (inclusive of a hardfork at
+/// `bft_height` itself), concatenated in canonical schedule order. An empty prefix yields
+/// `[0; 32]` (nil), so the no-hardfork case is a backwards-compatible no-op in tenderlink's
+/// signing. The schedule is already sorted with strictly-increasing `bft_certificate_height`,
+/// so the filtered set is exactly the prefix.
+fn namespace_for_bft_height(hardforks: &[crate::config::HardForkConfig], bft_height: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    let mut any = false;
+    for hf in hardforks.iter().filter(|hf| hf.bft_certificate_height <= bft_height) {
+        let mut bytes = Vec::new();
+        hf.zcash_serialize(&mut bytes).expect("serializing to a Vec is infallible");
+        hasher.update(&bytes);
+        any = true;
+    }
+    if any { hasher.finalize().into() } else { [0u8; 32] }
+}
+
 async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [u8; 32], path_to_pos_store_file: PathBuf) -> Result<(), String> {
     let call = internal_handle.call.clone();
     let config = internal_handle.config.clone();
@@ -1233,6 +1251,9 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 round_data.proposal_id = tenderlink::ValueId(fat_pointer.points_at_block_hash().0);
                 round_data.height = ingest_data_for_tenderlink.len() as u64;
                 round_data.round = fat_pointer.get_vote_template().round as u32;
+                // Vote namespacing: this loaded height's domain separator (inclusive of any
+                // hardfork scheduled at it). Nil when no hardforks apply -> backwards compatible.
+                round_data.vote_namespace = namespace_for_bft_height(&config.hardforks, round_data.height);
 
                 ingest_data_for_tenderlink.push(round_data);
                 i_bft_blocks.push(block);
@@ -1316,6 +1337,11 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             let _ = (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(new_final_hash)).await;
         }
 
+        // Vote namespacing: the startup height is the number of ingested (decided) rounds; its
+        // domain separator is computed before the call since `ingest_data_for_tenderlink` is
+        // moved into it below.
+        let initial_vote_namespace = namespace_for_bft_height(&config.hardforks, ingest_data_for_tenderlink.len() as u64);
+
         tokio::spawn(tenderlink::entry_point(
             my_private_key,
             static_keypair_maybe,
@@ -1351,13 +1377,20 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     use bytes::Buf;
                     use zebra_chain::serialization::ZcashDeserialize;
 
-                    handle_new_decided_bft_block(
+                    let decided_block = BftBlock::zcash_deserialize(block.0.reader()).unwrap();
+                    let roster = handle_new_decided_bft_block(
                         &tfl_handle3,
-                        &BftBlock::zcash_deserialize(block.0.reader()).unwrap(),
+                        &decided_block,
                         &fat_pointer.into(),
                         tender_proposal_sigs,
                     )
-                    .await
+                    .await;
+                    // Vote namespacing: the next height is the decided block's height + 1; its
+                    // namespace is the cumulative hardfork hash inclusive of any hardfork scheduled
+                    // at that next height.
+                    let next_height = decided_block.height as u64 + 1;
+                    let namespace = namespace_for_bft_height(&tfl_handle3.config.hardforks, next_height);
+                    (roster, namespace)
                 })
             })),
             tenderlink::ClosureToUpdatePeers(Arc::new(move |all_peers| {
@@ -1439,6 +1472,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 })
             })),
             ingest_data_for_tenderlink,
+            initial_vote_namespace,
         ));
     }
 

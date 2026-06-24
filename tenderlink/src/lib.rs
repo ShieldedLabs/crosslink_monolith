@@ -154,7 +154,9 @@ impl std::fmt::Debug for ClosureToValidateProposedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToValidateProposedBlock(..)") }
 }
 #[derive(Clone)]
-pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock, Vec<TMSig>)-> core::pin::Pin<Box<dyn Future<Output = Vec<SortedRosterMember>> + Send>> + Send + Sync + 'static>);
+// Returns the roster for the next height together with that height's 32-byte vote-namespacing
+// domain separator (the cumulative hash of hardforks in effect; `[0; 32]` when there are none).
+pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock, Vec<TMSig>)-> core::pin::Pin<Box<dyn Future<Output = (Vec<SortedRosterMember>, [u8; 32])> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToPushDecidedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushDecidedBlock(..)") }
 }
@@ -242,6 +244,12 @@ pub struct RoundData {
     // TODO: by round or for whole state?
     pub active_timeout: Option<Timeout>,
     pub timeout_triggered: [bool; 2],
+
+    /// Vote-namespacing domain separator for this round's height: a cumulative hash of the
+    /// hardforks in effect (nil `[0; 32]` when there are none → no-op, backwards compatible).
+    /// Mixed into all signed payloads at this height. Set from the per-height value supplied
+    /// externally (copied from [`TMState::vote_namespace`] at creation, or from ingest data).
+    pub vote_namespace: [u8; 32],
 }
 impl RoundData {
     pub const EMPTY: RoundData = RoundData {
@@ -261,6 +269,7 @@ impl RoundData {
 
         active_timeout: None,
         timeout_triggered: [false;2],
+        vote_namespace: [0u8; 32],
     };
 
     fn has_full_proposal(&self) -> bool {
@@ -278,6 +287,7 @@ impl RoundData {
             roster:               Vec::from(&roster[0..roster_n]),
             active_timeout:       self.active_timeout.clone(),
             timeout_triggered:    self.timeout_triggered,
+            vote_namespace:       self.vote_namespace, // current height's namespace
             ..RoundData::EMPTY
         };
         self.proposal.0    = vec![0;          proposal_size as usize];
@@ -429,6 +439,11 @@ pub struct TMState {
     pub step: TMStep,
     /// basically the chain of agreed blocks
     pub height: u64,
+    /// Vote-namespacing domain separator for the current [`height`](Self::height): a cumulative
+    /// hash of the hardforks in effect (nil `[0; 32]` when none → backwards compatible). Supplied
+    /// externally per height (initial value at startup; updated from the decided-block closure's
+    /// return when the height advances), and copied into each [`RoundData`] as rounds are created.
+    pub vote_namespace: [u8; 32],
     /// most recent "possible decision value" - successful proposal + prevote
     /// when valid_value was updated
     pub valid_value_round: (Option<BlockValue>, i64), // TODO
@@ -464,6 +479,7 @@ impl TMState {
             round: 0,
             step: TMStep::Propose,
             height: 0,
+            vote_namespace: [0u8; 32],
             valid_value_round: (None, -1), // TODO: is this actually protocol-relevant or just a cache?
             locked_value_round: (None, -1),
 
@@ -510,7 +526,7 @@ impl TMState {
 
                     // NOTE: we *DON'T* want to write it immediately to our proper store because it
                     // will confuse check_and_incorporate_msg
-                    let sig = TMSig(self.my_signing_key.sign(&buf[..o]).to_bytes());
+                    let sig = TMSig(sign_with_namespace(&self.my_signing_key, &buf[..o], &self.vote_namespace));
                     if PRINT_SIGN { println!("{ctx_str} {ANSI_GRY}SIGN{ANSI_RST}: signed proposal with {:?}", sig) };
 
                     // NOTE: we're faulty if we give our pub key for this if it's not our proposal
@@ -528,7 +544,7 @@ impl TMState {
                 if PRINT_BFT_VOTE { println!("{ctx_str} {ANSI_GRY}BFT_VOTE{ANSI_RST}: {} on {}", ["prevoting", "precommitting"][is_precommit as usize], value_id); }
                 let packet_type = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit;
                 let signed_data = make_vote_sign_datas(roster[roster_i].pub_key, is_precommit != 0, height, round, value_id)[1];
-                let sig         = TMSig(self.my_signing_key.sign(&signed_data).to_bytes());
+                let sig         = TMSig(sign_with_namespace(&self.my_signing_key, &signed_data, &self.vote_namespace));
                 if PRINT_SIGN { println!("{ctx_str} {ANSI_GRY}SIGN{ANSI_RST}: signed {} with {:?}", ["prevote", "precommit"][is_precommit as usize], sig) };
 
                 self.check_and_incorporate_msg(
@@ -577,6 +593,7 @@ impl TMState {
             round,
             msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
             roster: roster.to_vec(),
+            vote_namespace: self.vote_namespace,
             ..RoundData::EMPTY
         });
         insert_i
@@ -639,14 +656,16 @@ impl TMState {
         // pkt_str += &format!(" from {} ({})", roster_i, from_pub_key);
         let ctx_str = format!("{ctx_str} [{} from {} {:?}]", pkt_str, roster_i, from_pub_key);
 
-        // check if data was signed by pub key
-        match sig.verify(from_pub_key, signed_data) { Ok(())=>{}, Err((err, str))=> {
+        // check if data was signed by pub key. Vote namespacing: mix in this height's
+        // namespace (nil -> unchanged). `height == self.height` is guaranteed above, so
+        // `self.vote_namespace` is the correct namespace for `signed_data`.
+        match sig.verify_with_namespace(from_pub_key, signed_data, &self.vote_namespace) { Ok(())=>{}, Err((err, str))=> {
             eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST}: {} (..{}): for {} {}", str, signed_data.len(), value_id, err);
             #[cfg(debug_assertions)]
             {
                 println!("DEBUG LOOP OVER ALL ROSTER AND TRIAL VERIFY only success should be {} but that is not so... :(", roster_i);
                 for i in 0..roster.len() {
-                    println!("{}: success={} pub_key: {:?} stake: {} cumulative_stake: {}", i, sig.verify(roster[i].pub_key, signed_data).is_ok(), roster[i].pub_key, roster[i].stake, roster[i].cumulative_stake);
+                    println!("{}: success={} pub_key: {:?} stake: {} cumulative_stake: {}", i, sig.verify_with_namespace(roster[i].pub_key, signed_data, &self.vote_namespace).is_ok(), roster[i].pub_key, roster[i].stake, roster[i].cumulative_stake);
                 }
             }
             return TMStatus::Fail;
@@ -1035,10 +1054,13 @@ impl TMState {
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
                 if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 49: value decided"); }
-                let new_roster = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster), self.rounds_data[i].proposal_sigs.clone()).await;
+                let (new_roster, new_vote_namespace) = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster), self.rounds_data[i].proposal_sigs.clone()).await;
                 if PRINT_ROSTER { println!("{ctx_str} {ANSI_GRY}ROSTER{ANSI_RST}: new roster: {:?}", new_roster); }
                 *roster = new_roster;
                 self.height += 1;
+                // Vote namespacing: adopt the namespace for the new height (supplied alongside the
+                // new roster by the decided-block closure).
+                self.vote_namespace = new_vote_namespace;
                 self.recent_commit_round_cache.push(self.rounds_data[i].clone());
                 self.rounds_data.retain(|r| r.height < self.height);
                 self.locked_value_round = (None, -1);
@@ -1198,6 +1220,21 @@ pub struct FinalizerPeerAddress {
     pub address: STPAddress,
 }
 
+/// Sign `data` for vote namespacing: the 32-byte `namespace` (a cumulative hash of the
+/// hardforks in effect at this height) is appended before signing. A nil namespace
+/// (`[0; 32]`) appends nothing, so the no-hardfork case signs byte-for-byte as before —
+/// backwards compatible. Mirrored by [`TMSig::verify_with_namespace`].
+fn sign_with_namespace(key: &SigningKey, data: &[u8], namespace: &[u8; 32]) -> [u8; 64] {
+    if *namespace == [0u8; 32] {
+        key.sign(data).to_bytes()
+    } else {
+        let mut buf = Vec::with_capacity(data.len() + 32);
+        buf.extend_from_slice(data);
+        buf.extend_from_slice(namespace);
+        key.sign(&buf).to_bytes()
+    }
+}
+
 fn make_vote_sign_datas(pub_key: PubKeyID, is_precommit: bool, height: u64, round: u32, value_id: ValueId) -> [[u8; 76]; 2] {
     let mut sign_data_no = [0; 76];
     sign_data_no[0..32].copy_from_slice(&pub_key.0[..]);
@@ -1289,7 +1326,8 @@ async fn instance(
                 decisions.lock().unwrap().push((block, fat_pointer));
                 let mut ret = roster2.clone();
                 ret.truncate(3 + decisions.lock().unwrap().len() % 2);
-                ret
+                // Sim/test has no hardforks → nil namespace (backwards-compatible no-op).
+                (ret, [0u8; 32])
             })
         })),
         ClosureToUpdatePeers(Arc::new(move |_all_peers| { Box::pin(async move {
@@ -1299,6 +1337,7 @@ async fn instance(
         })})),
 
         Vec::new(),
+        [0u8; 32], // initial_vote_namespace: no hardforks in the sim
     ).await
 }
 
@@ -1374,6 +1413,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          peer_cmd_closure: ClosureToUpdatePeers,
                          bft_access_closure: ClosureToAllowBftAccess,
                          ingest_startup_data: Vec<RoundData>,
+                         // Vote-namespacing domain separator for the startup height
+                         // (`ingest_startup_data.len()`); `[0; 32]` when no hardforks are in effect.
+                         initial_vote_namespace: [u8; 32],
                         ) -> std::io::Result<()> {
     hook_fail_on_panic();
 
@@ -1440,6 +1482,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     ); // TODO: double-check this is the right key
 
     bft_state.height = ingest_startup_data.len() as u64;
+    bft_state.vote_namespace = initial_vote_namespace;
     bft_state.recent_commit_round_cache = ingest_startup_data;
 
     bft_state.start_round(&roster, Instant::now(), 0).await;
@@ -1644,7 +1687,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 o += round_data.proposal_sigs[chunk_i].0.write_to(&mut send_buf1[o..]);
 
                                 #[cfg(debug_assertions)] // self-check signatures as sanity check
-                                match round_data.proposal_sigs[chunk_i].verify(proposer_pub_key, &send_buf1[signed_data_start..sig_o]) {
+                                match round_data.proposal_sigs[chunk_i].verify_with_namespace(proposer_pub_key, &send_buf1[signed_data_start..sig_o], &round_data.vote_namespace) {
                                     Ok(_) => {}
                                     Err((err, str)) => {
                                         eprintln!("{ctx_str}: {ANSI_RED}BFT FAULT{ANSI_RST}: {str} [..{}): for proposal from {proposer_pub_key:?} {height}.{round}.{chunk_i}: {} {err}", sig_o-1, chunk_hdr.proposal_id);
@@ -1676,7 +1719,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             votes: [ PubKeySig::NIL; 18 ],
                         };
 
-                        fn dbg_check_votes(ctx_str: &str, roster: &[SortedRosterMember], is_precommit: usize, packet: &PacketVotes) {
+                        fn dbg_check_votes(ctx_str: &str, roster: &[SortedRosterMember], is_precommit: usize, packet: &PacketVotes, vote_namespace: &[u8; 32]) {
                             #[cfg(debug_assertions)] // self-check signatures as sanity check
                             for i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
                                 let (roster_i, sig) = (packet.votes[i].roster_i as usize, &packet.votes[i].sig);
@@ -1687,7 +1730,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 let pub_key = member.pub_key;
                                 let sign_datas = make_vote_sign_datas(pub_key, is_precommit != 0, packet.height, packet.round, packet.value_id);
                                 let sign_data  = &sign_datas[(i >= packet.no_votes_n as usize) as usize];
-                                match sig.verify(pub_key, sign_data) { Ok(_)=>{} Err((err, str)) => {
+                                match sig.verify_with_namespace(pub_key, sign_data, vote_namespace) { Ok(_)=>{} Err((err, str)) => {
                                     eprintln!("{ctx_str}: {ANSI_RED}BFT FAULT{ANSI_RST}: {str} [..{}): for {} from {roster_i}-{pub_key:?} {}.{}: {} {err}",
                                         sign_data.len(), ["prevote", "precommit"][is_precommit], packet.height, packet.round, packet.value_id);
                                 }}
@@ -1723,7 +1766,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                     sent_c[is_precommit as usize] += (packet.no_votes_n + packet.yes_votes_n) as usize;
                                     // full evidence block; send it
                                     if PRINT_SENDS { println!("{ctx_str} {ANSI_GRY}SENDS{ANSI_RST}: sending full {} block: {:#?}", ["prevote", "precommit"][is_precommit as usize], packet); }
-                                    dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet);
+                                    dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet, &round_data.vote_namespace);
 
                                     let mut o = 0;
                                     // @Todo @Speed: We should build the header once and save it for all votes. Peers only obey the latest status anyway.
@@ -1748,7 +1791,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             }
 
                             if PRINT_SENDS { println!("{ctx_str} {ANSI_GRY}SENDS{ANSI_RST}: half-filled block post-gap-close: {:#?}", packet); }
-                            dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet);
+                            dbg_check_votes(ctx_str, &round_data.roster, is_precommit as usize, &packet, &round_data.vote_namespace);
 
                             let mut o = 0;
                             // @Todo @Speed: We should build the header once and save it for all votes. Peers only obey the latest status anyway.
