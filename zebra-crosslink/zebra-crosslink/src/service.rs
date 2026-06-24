@@ -183,6 +183,8 @@ pub fn spawn_new_tfl_service(
         path_to_pos_store_file: path_to_pos_store_file.clone(),
         recency_status: TFLRecencyStatus::default(),
         finalizer_blacklist: crate::FinalizerBlacklist::default(),
+        burned_bonds: std::collections::HashMap::new(),
+        burned_known_through: Some(BlockHeight(0)),
     }));
 
     let handle_mtx = Arc::new(std::sync::Mutex::new(None));
