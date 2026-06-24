@@ -272,6 +272,7 @@ impl Application for ZebradApp {
                      You can generate a valid config by running \"zebrad generate\", \
                      and diff it against yours to examine any format inconsistencies."
                 );
+                println!("Error: {e}");
                 // Convert config::ConfigError to FrameworkError using a generic IO error
                 let io_error = std::io::Error::new(
                     std::io::ErrorKind::InvalidData,

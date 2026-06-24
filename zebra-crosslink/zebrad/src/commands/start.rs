@@ -492,7 +492,6 @@ impl StartCmd {
             // let tfl_service2 = tfl_service.clone();
 
             let config = Arc::clone(&config);
-            let sync_state = state.clone();
             let sync_read_state = read_only_state_service.clone();
             let sync_block_verifier = block_verifier_router.clone();
             tokio::task::spawn_blocking(move || {
@@ -510,7 +509,7 @@ impl StartCmd {
                             })
                     })
                 };
-                zebra_state::new_network::sync(commit_block, &config.state, sync_read_state, sync_state, /* tfl_service2, */ tokio::runtime::Handle::current())
+                zebra_state::new_network::sync(commit_block, &config.state, sync_read_state, /* tfl_service2, */ tokio::runtime::Handle::current())
             });
         }
 
@@ -668,7 +667,38 @@ impl StartCmd {
         // And finally, spawn the internal Zcash miner, if it is enabled.
         //
         // TODO: add a config to enable the miner rather than a feature.
-        #[cfg(feature = "internal-miner")]
+
+        // @Note: We have a GUI toggle that disables mining *inside* the miner task.
+        //        This GUI toggle is initialized to the config `internal_miner` bool,
+        //        which will ensure mining is off even when the task is alive and well.
+        //        We want to allow the GUI to *re-enable* mining if the config had
+        //        initialized with mining off, so we *don't* gate this task behind config.
+
+        /* The logic here is hairy when expressed as Rust; the more readable JAI equivalent is this:
+
+            #if Features.Internal_Miner {
+                #if Features.Viz_Gui {
+                    spawn_miner(); // unconditionally
+                } else {
+                    if config.internal_miner {
+                        spawn_miner();
+                    } else {
+                        dummy();
+                    }
+                }
+            } else {
+                dummy();
+            }
+
+        */
+
+        #[cfg(all(feature = "internal-miner", feature = "viz_gui"))]
+        let miner_task_handle = {
+            info!("spawning Zcash miner");
+            components::miner::spawn_init(&config.network.network, &config.metrics, rpc_impl)
+        };
+
+        #[cfg(all(feature = "internal-miner", not(feature = "viz_gui")))]
         let miner_task_handle = if config.mining.is_internal_miner_enabled() {
             info!("spawning Zcash miner");
             components::miner::spawn_init(&config.network.network, &config.metrics, rpc_impl)
