@@ -664,7 +664,10 @@ async fn handle_new_decided_bft_block(
             panic!();
         }
         // TODO: check public keys on the fat pointer against the roster
-        if fat_pointer.validate_signatures() == false {
+        // Vote namespacing: the precommit signatures were made at this block's height with that
+        // height's namespace folded in, so verify with the same namespace.
+        let vote_namespace = namespace_for_bft_height(&tfl_handle.config.hardforks, new_block.height as u64);
+        if fat_pointer.validate_signatures(&vote_namespace) == false {
             error!("Signatures are not valid. Rejecting block.");
             panic!();
         }

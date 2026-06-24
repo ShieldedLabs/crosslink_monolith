@@ -750,14 +750,24 @@ impl FatPointerToBftBlock {
             .collect()
     }
 
-    pub fn validate_signatures(&self) -> bool {
+    pub fn validate_signatures(&self, vote_namespace: &[u8; 32]) -> bool {
         let mut batch = ed25519_zebra::batch::Verifier::new();
         for (vote, signature) in self.inflate() {
             let vk_bytes = ed25519_zebra::VerificationKeyBytes::from(vote.validator_address.0);
             let sig = ed25519_zebra::Signature::from_bytes(&signature);
             let msg = vote.to_bytes();
 
-            batch.queue((vk_bytes, sig, &msg));
+            // Vote namespacing: these precommit votes were signed over `msg || namespace`
+            // (a nil namespace appends nothing), so verify against the same bytes. Mirrors
+            // `sign_with_namespace` / `TMSig::verify_with_namespace`.
+            if *vote_namespace == [0u8; 32] {
+                batch.queue((vk_bytes, sig, &msg[..]));
+            } else {
+                let mut buf = Vec::with_capacity(msg.len() + 32);
+                buf.extend_from_slice(&msg[..]);
+                buf.extend_from_slice(vote_namespace);
+                batch.queue((vk_bytes, sig, buf.as_slice()));
+            }
         }
         batch.verify(rand::thread_rng()).is_ok()
     }
