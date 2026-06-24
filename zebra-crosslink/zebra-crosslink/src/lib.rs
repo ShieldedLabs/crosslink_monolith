@@ -175,7 +175,7 @@ use zebra_chain::block::{
     Block, CountedHeader, Hash as ZebBlockHash, Header as ZebBlockHeader, Height as ZebBlockHeight,
 };
 use zebra_node_services::mempool::{Request as MempoolRequest, Response as MempoolResponse};
-use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
+use zebra_state::{crosslink::*, BondKey, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
 
 /// Placeholder activation height for Crosslink functionality
 pub const TFL_ACTIVATION_HEIGHT: ZebBlockHeight = ZebBlockHeight(0);
@@ -1466,7 +1466,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             slash_tracking.slash_finalizers.insert(*finalizer);
         }
     }
-    let mut slashed_bonds = HashSet::<PubKeyID>::new();
+    let mut slashed_bonds = HashSet::<BondKeyID>::new();
 
     loop {
         // Calculate this prior to message handling so that handlers can use it:
@@ -1691,6 +1691,9 @@ async fn total_issuance_from_key(
     Ok(scan_infos)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct BondKeyID(pub BondKey);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SlashTrackingBondChange {
     pub change_height: ZebBlockHeight,
@@ -1701,10 +1704,10 @@ struct FinalizerSlashTracking {
     pub snap_height: ZebBlockHeight,
     pub analysis_heights_exclusive: (ZebBlockHeight, ZebBlockHeight),
     pub slash_finalizers: HashSet<PubKeyID>,
-    pub bonds_staked_to_slash_finalizers_at_snap_height: HashMap<PubKeyID, SlashTrackingBondChange>, // from bond key
+    pub bonds_staked_to_slash_finalizers_at_snap_height: HashMap<BondKeyID, SlashTrackingBondChange>, // from bond key
 }
 
-async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServiceHandle, tracking: &mut FinalizerSlashTracking, bonds_to_slash: &mut HashSet<PubKeyID>, max_height: ZebBlockHeight) -> Result<(), String> {
+async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServiceHandle, tracking: &mut FinalizerSlashTracking, bonds_to_slash: &mut HashSet<BondKeyID>, max_height: ZebBlockHeight) -> Result<(), String> {
     let call = internal_handle.call.clone();
 
     let (analysis_bgn_height, analysis_end_height) = tracking.analysis_heights_exclusive;
@@ -1745,7 +1748,7 @@ async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServ
                     let finalizer_pk_id = PubKeyID(bond.target_finalizer);
                     if tracking.slash_finalizers.contains(&finalizer_pk_id) {
                         tracking.bonds_staked_to_slash_finalizers_at_snap_height.insert(
-                            PubKeyID(bond.unique_pubkey),
+                            BondKeyID(bond.unique_pubkey),
                             SlashTrackingBondChange { change_height: height, finalizer_pk_id }
                         );
                     }
@@ -1757,21 +1760,21 @@ async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServ
                     if tracking.slash_finalizers.contains(&finalizer_pk_id) {
                         // TO finalizer
                         tracking.bonds_staked_to_slash_finalizers_at_snap_height.insert(
-                            PubKeyID(bond.unique_pubkey),
+                            BondKeyID(bond.unique_pubkey),
                             SlashTrackingBondChange { change_height: height, finalizer_pk_id }
                         );
                     } else {
                         // FROM finalizer
-                        if let Some(details) = tracking.bonds_staked_to_slash_finalizers_at_snap_height.get(&PubKeyID(bond.unique_pubkey)) {
-                            tracking.bonds_staked_to_slash_finalizers_at_snap_height.remove(&PubKeyID(bond.unique_pubkey));
+                        if let Some(details) = tracking.bonds_staked_to_slash_finalizers_at_snap_height.get(&BondKeyID(bond.unique_pubkey)) {
+                            tracking.bonds_staked_to_slash_finalizers_at_snap_height.remove(&BondKeyID(bond.unique_pubkey));
                         }
                     }
                 }
                 StakingActionKind::BeginDelegationUnbonding => {
                     let bond = transaction::StakingAction_BeginDelegationUnbonding::try_from_union(&staking_action).unwrap();
                     // FROM finalizer
-                    if let Some(details) = tracking.bonds_staked_to_slash_finalizers_at_snap_height.get(&PubKeyID(bond.unique_pubkey)) {
-                        tracking.bonds_staked_to_slash_finalizers_at_snap_height.remove(&PubKeyID(bond.unique_pubkey));
+                    if let Some(details) = tracking.bonds_staked_to_slash_finalizers_at_snap_height.get(&BondKeyID(bond.unique_pubkey)) {
+                        tracking.bonds_staked_to_slash_finalizers_at_snap_height.remove(&BondKeyID(bond.unique_pubkey));
                     }
                 }
 
