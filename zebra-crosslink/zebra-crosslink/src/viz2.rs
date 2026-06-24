@@ -158,28 +158,18 @@ pub async fn service_viz_requests(
                     let mut response = visualizer_zcash::ResponseFromZebra::_0();
                     response.bft_recency = internal.recency_status.clone(); // TODO: do we want a better way of communicating singleton data
                     {
-                        let mut blacklist : Vec<Hash32> = internal
-                            .finalizer_blacklist
-                            .terminated_ids()
-                            .map(|pk| Hash32::from_bytes(pk.0))
-                            .collect();
-                        // Fold in the *imminent* hardfork: the rolling blacklist only holds finalizers
-                        // from already-decided hardfork blocks, so a configured hardfork shows nothing
-                        // until it is decided. Show it exactly one step early — only when its BFT block
-                        // is the very next one to be decided (bft_certificate_height == the next block's
-                        // index), not for the whole chain leading up to it.
-                        let upcoming_bft_height = internal.bft_blocks.len() as u64;
-                        for hf in tfl_handle.config.hardforks.iter() {
-                            if hf.bft_certificate_height == upcoming_bft_height {
-                                for pk in &hf.terminated_finalizers {
-                                    let id = Hash32::from_bytes(pk.0);
-                                    if !blacklist.contains(&id) {
-                                        blacklist.push(id);
-                                    }
-                                }
-                            }
-                        }
-                        response.blacklisted_finalizers = blacklist;
+                        // Terminated finalizers, derived the same way tenderlink filters its roster:
+                        // a pure function of the hardfork schedule at the current working height (the
+                        // next block to decide) and the current finalized BC height. Identical source
+                        // means the viz display and the actual consensus roster always agree.
+                        let working_bft_height = internal.bft_blocks.len() as u64;
+                        let finalized_bc_height = internal.latest_final_block.map(|(h, _)| h.0 as u64).unwrap_or(0);
+                        response.blacklisted_finalizers = crate::terminated_finalizers_at(
+                            &tfl_handle.config.hardforks, working_bft_height, finalized_bc_height,
+                        )
+                        .iter()
+                        .map(|pk| Hash32::from_bytes(pk.0))
+                        .collect();
                     }
                     response.bc_tip_height = bc_tip_height;
                     response.bc_finalized_tip_height = if let Some(latest_finalized_block) = internal.latest_final_block {
