@@ -281,40 +281,78 @@ pub(crate) struct TFLServiceInternal {
 }
 
 fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: FatPointerToBftBlock, child_fat_pointer: FatPointerToBftBlock, pow_block_height: ZebBlockHeight) -> Option<bool> {
+    // Return value:
+    //   None        => DEFER  — re-queue and re-evaluate on a later flush. REVERSIBLE. This is
+    //                           the answer whenever we lack the information to be *certain* a
+    //                           block is invalid (lock contention, an unresolved BFT pointer,
+    //                           or an ordering relationship that depends on our current view).
+    //   Some(false) => REJECT — PERMANENT and IRREVERSIBLE: the block is dropped and every
+    //                           descendant queued behind it is orphaned. We may ONLY return this
+    //                           on facts that are immutable and view-independent, so that the
+    //                           decision can never turn out to have been a transient mistake.
+    //   Some(true)  => ACCEPT.
+    //
     // This runs synchronously inside the state service, which is driven on an async runtime
     // thread, so we must not block on the lock — `blocking_lock` panics in an async context.
-    // Use `try_lock`; None (defer) on contention. The commit gate re-queues the block and
-    // it is re-evaluated on a later flush, so a transient miss is harmless.
     let internal = match internal_handle.internal.try_lock() {
         Ok(guard) => guard,
-        Err(_) => return None,
+        Err(_) => return None, // lock contention is transient -> defer
     };
-    // A real (non-null) pointer ranks as `index + 1`, while a null pointer is `0`.
-    // The `+1` keeps null strictly below any real pointer. `None` (pointer not resolvable yet
-    // because the referenced BFT block has not entered this node) returns None (defer).
-    let parent_height = if parent_fat_pointer == FatPointerToBftBlock::null() {
-        0
-    } else {
-        if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash() == parent_fat_pointer.points_at_block_hash()) {
-            h + 1
-        } else {
-            return None;
-        }
-    };
-    let (child_height, child_do_not_include) = if child_fat_pointer == FatPointerToBftBlock::null() {
-        (0, 0u64)
-    } else {
-        if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash() == child_fat_pointer.points_at_block_hash()) {
-            (h + 1, internal.bft_blocks[h].do_not_include_until_bc_height)
-        } else {
-            return None;
-        }
-    };
-    // Hard-reject: the PoW block's height must be >= the BFT block's do_not_include_until_bc_height.
-    if (pow_block_height.0 as u64) < child_do_not_include {
+
+    let parent_is_null = parent_fat_pointer == FatPointerToBftBlock::null();
+    let child_is_null = child_fat_pointer == FatPointerToBftBlock::null();
+
+    // PERMANENT, decided purely from the (immutable) pointer values, without resolving either
+    // block: the child reverts to no BFT pointer while its parent had one. A null pointer can
+    // never be "as new or newer" than a real one, so this is a certain regression.
+    if child_is_null && !parent_is_null {
         return Some(false);
     }
-    Some(child_height >= parent_height)
+
+    // Resolve the child pointer against the in-memory BFT chain. A non-null pointer we cannot
+    // resolve yet (its BFT block has not entered this node) is NOT a failure — defer.
+    let child_index = if child_is_null {
+        None
+    } else {
+        match internal.bft_blocks.iter().position(|b| b.blake3_hash() == child_fat_pointer.points_at_block_hash()) {
+            Some(h) => Some(h),
+            None => return None, // unresolved child -> defer (reversible)
+        }
+    };
+
+    // PERMANENT, from immutable data: a resolved BFT block carries its own
+    // `do_not_include_until_bc_height`, and the PoW block carries its own height. Both are fixed,
+    // so a PoW block referencing a BFT block before that BFT block is allowed to be included can
+    // never become valid later -> safe to reject permanently.
+    if let Some(h) = child_index {
+        let do_not_include = internal.bft_blocks[h].do_not_include_until_bc_height;
+        if (pow_block_height.0 as u64) < do_not_include {
+            return Some(false);
+        }
+    }
+
+    // Resolve the parent pointer. Unresolved non-null parent -> defer.
+    let parent_index = if parent_is_null {
+        None
+    } else {
+        match internal.bft_blocks.iter().position(|b| b.blake3_hash() == parent_fat_pointer.points_at_block_hash()) {
+            Some(h) => Some(h),
+            None => return None, // unresolved parent -> defer (reversible)
+        }
+    };
+
+    // Ordering: the child must reference a BFT block at least as new as its parent's. A real
+    // pointer ranks as `index + 1`; null ranks as 0 (kept strictly below any real pointer).
+    //
+    // Once BOTH pointers resolve, this is a PERMANENT fact: the BFT chain is append-only
+    // (`handle_new_decided_bft_block` writes each block at the index equal to its own height,
+    // inserts strictly in order — asserted against the predecessor — and never overwrites a real
+    // block; finalized BFT blocks never revert). So a resolved pointer's index is fixed forever,
+    // and a genuine ordering violation can never become valid later -> safe to reject permanently.
+    // (Unresolved pointers already returned None above, so reaching here means both are known.)
+    let child_rank = child_index.map(|h| h + 1).unwrap_or(0);
+    let parent_rank = parent_index.map(|h| h + 1).unwrap_or(0);
+    Some(child_rank >= parent_rank)
 }
 
 // TODO: Result?
