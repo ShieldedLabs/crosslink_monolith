@@ -929,6 +929,9 @@ async fn validate_bft_block(
         return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
     }
 
+    // Captured before dropping the lock: an already-finalized hash we can safely use to kick
+    // the state's non-finalized queue below without risking a premature finalization.
+    let already_finalized_hash = internal.latest_final_block.map(|(_, hash)| hash);
     drop(internal);
 
     let new_final_hash = ZebBlockHash(BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0);
@@ -940,6 +943,16 @@ async fn validate_bft_block(
                 "Didn't have hash available for confirmation: {}",
                 new_final_hash
             );
+            // The PoW block we need is most likely sitting deferred in the state's non-finalized
+            // queue (held back by the crosslink commit gate — e.g. a transient try_lock miss, or
+            // waiting on a BFT block that has since arrived). Kick the queue so it is re-evaluated
+            // and committed, letting tenderlink's retried validation find it. We trigger the
+            // re-flush via a finalize of the *already-finalized* tip: that finalize is a guaranteed
+            // no-op (the tip is no longer in the non-finalized state, so nothing is prematurely
+            // finalized), but the request handler re-flushes the non-finalized queue regardless.
+            if let Some(hash) = already_finalized_hash {
+                let _ = (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(hash)).await;
+            }
             return (tenderlink::TMStatus::Indeterminate, tenderlink::TMStatusReason::NeedsBlock { hash: new_final_hash.0 });
         };
     return (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None);
