@@ -251,12 +251,12 @@ impl StartCmd {
                 max_checkpoint_height,
                 config.sync.checkpoint_verify_concurrency_limit
                     * (VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1),
-                Arc::new(move |fat_pointer_a, fat_pointer_b| {
+                Arc::new(move |fat_pointer_a, fat_pointer_b, height| {
                     if let Some(closure) = actual_closure.lock().unwrap().as_mut() {
-                        (closure)(fat_pointer_a, fat_pointer_b)
+                        (closure)(fat_pointer_a, fat_pointer_b, height)
                     } else {
                         tracing::error!("State -> Crosslink closure not yet initialized.");
-                        false
+                        None
                     }
                 }),
             )
