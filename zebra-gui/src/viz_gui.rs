@@ -52,6 +52,10 @@ pub struct BftBlockInspection {
     pub height: u32,
     pub previous_hash: Hash32,
     pub finalization_candidate_height: u32,
+    pub do_not_include_until_bc_height: u64,
+    pub hardfork_pow_activation_height: Option<u64>,
+    pub hardfork_bft_certificate_height: Option<u64>,
+    pub hardfork_terminated_finalizers: Vec<Hash32>,
     pub pow_headers: Vec<BftPowHeaderInspection>,
 }
 
@@ -100,10 +104,18 @@ impl BlockInspection {
                 s.push_str(&format!("  Version: {}\n", bft.version));
                 s.push_str(&format!("  Height: {}\n", bft.height));
                 s.push_str(&format!("  Previous: {}\n", bft.previous_hash));
-                s.push_str(&format!(
-                    "  Finalization candidate height: {}\n",
-                    bft.finalization_candidate_height
-                ));
+                if bft.do_not_include_until_bc_height > 0 {
+                    s.push_str(&format!("  Do not include until BC height: {}\n", bft.do_not_include_until_bc_height));
+                }
+                if let (Some(pow_h), Some(bft_h)) = (bft.hardfork_pow_activation_height, bft.hardfork_bft_certificate_height) {
+                    s.push_str("  Hardfork:\n");
+                    s.push_str(&format!("    PoW activation height: {pow_h}\n"));
+                    s.push_str(&format!("    BFT certificate height: {bft_h}\n"));
+                    s.push_str(&format!("    Terminated finalizers ({}):\n", bft.hardfork_terminated_finalizers.len()));
+                    for id in &bft.hardfork_terminated_finalizers {
+                        s.push_str(&format!("      {id}\n"));
+                    }
+                }
                 s.push_str("  PoW headers:\n");
                 for hdr in &bft.pow_headers {
                     s.push_str(&format!("    [{}] - {}\n", hdr.height, hdr.hash));

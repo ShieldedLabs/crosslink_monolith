@@ -212,14 +212,19 @@ pub async fn service_viz_requests(
                             version: b.version,
                             height: b.height,
                             previous_hash: Hash32::from_bytes(b.previous_block_hash().0),
-                            // BftBlock no longer carries this (it was always 0); preserve prior behavior.
                             finalization_candidate_height: 0,
+                            do_not_include_until_bc_height: b.do_not_include_until_bc_height,
+                            hardfork_pow_activation_height: b.hardfork.as_ref().map(|hf| hf.pow_activation_height),
+                            hardfork_bft_certificate_height: b.hardfork.as_ref().map(|hf| hf.bft_certificate_height),
+                            hardfork_terminated_finalizers: b.hardfork.as_ref().map(|hf|
+                                hf.terminated_finalizers.iter().map(|id| Hash32::from_bytes(id.0)).collect()
+                            ).unwrap_or_default(),
                             pow_headers: b
                                 .headers
                                 .iter()
                                 .enumerate()
                                 .map(|(i, hdr)| BftPowHeaderInspection {
-                                    height: i as u32, // was b.finalization_candidate_height (always 0) + i
+                                    height: i as u32,
                                     hash: Hash32::from_bytes(BlockHash::from_header_data(hdr).0),
                                 })
                                 .collect(),
