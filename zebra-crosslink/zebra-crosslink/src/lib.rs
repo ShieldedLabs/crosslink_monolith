@@ -1710,7 +1710,7 @@ async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServ
     let (analysis_bgn_height, analysis_end_height) = tracking.analysis_heights_exclusive;
     assert!(analysis_bgn_height <= analysis_end_height);
 
-    let end_height = analysis_end_height.max((max_height+1).unwrap());
+    let end_height = analysis_end_height.min((max_height+1).unwrap());
     if tracking.snap_height >= end_height {
         return Ok(());
     }
