@@ -280,42 +280,41 @@ pub(crate) struct TFLServiceInternal {
     burned_known_through: Option<ZebBlockHeight>,
 }
 
-fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: FatPointerToBftBlock, child_fat_pointer: FatPointerToBftBlock) -> bool {
+fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: FatPointerToBftBlock, child_fat_pointer: FatPointerToBftBlock, pow_block_height: ZebBlockHeight) -> Option<bool> {
     // This runs synchronously inside the state service, which is driven on an async runtime
     // thread, so we must not block on the lock — `blocking_lock` panics in an async context.
-    // Use `try_lock`; if the lock is momentarily held, return false, which the callers treat
-    // as "do not accept yet" (defer). The commit gate re-queues the block and it is
-    // re-evaluated on a later flush, so a transient miss is harmless.
+    // Use `try_lock`; None (defer) on contention. The commit gate re-queues the block and
+    // it is re-evaluated on a later flush, so a transient miss is harmless.
     let internal = match internal_handle.internal.try_lock() {
         Ok(guard) => guard,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     // A real (non-null) pointer ranks as `index + 1`, while a null pointer is `0`.
-    // The `+1` keeps null strictly below any real pointer, so null can no longer be
-    // confused with "points at bft_blocks[0]"; a regression from any real pointer back
-    // to null then fails the `>=` check below. `None` (pointer not resolvable yet because
-    // the referenced BFT block has not entered this node) returns false, meaning "do not
-    // accept yet" — the block is deferred, not rejected: it may become valid once the
-    // BFT blocks load.
+    // The `+1` keeps null strictly below any real pointer. `None` (pointer not resolvable yet
+    // because the referenced BFT block has not entered this node) returns None (defer).
     let parent_height = if parent_fat_pointer == FatPointerToBftBlock::null() {
         0
     } else {
         if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash() == parent_fat_pointer.points_at_block_hash()) {
             h + 1
         } else {
-            return false;
+            return None;
         }
     };
-    let child_height = if child_fat_pointer == FatPointerToBftBlock::null() {
-        0
+    let (child_height, child_do_not_include) = if child_fat_pointer == FatPointerToBftBlock::null() {
+        (0, 0u64)
     } else {
         if let Some(h) = internal.bft_blocks.iter().position(|b| b.blake3_hash() == child_fat_pointer.points_at_block_hash()) {
-            h + 1
+            (h + 1, internal.bft_blocks[h].do_not_include_until_bc_height)
         } else {
-            return false;
+            return None;
         }
     };
-    child_height >= parent_height
+    // Hard-reject: the PoW block's height must be >= the BFT block's do_not_include_until_bc_height.
+    if (pow_block_height.0 as u64) < child_do_not_include {
+        return Some(false);
+    }
+    Some(child_height >= parent_height)
 }
 
 // TODO: Result?
@@ -1929,11 +1928,21 @@ async fn tfl_service_incoming_request(
                 .collect()
         })),
 
-        TFLServiceRequest::FatPointerToBFTChainTip => {
+        TFLServiceRequest::FatPointerToBFTChainTip(proposed_pow_height) => {
             let internal = internal_handle.internal.lock().await;
-            Ok(TFLServiceResponse::FatPointerToBFTChainTip(
-                internal.fat_pointer_to_tip.clone(),
-            ))
+            // Walk back from the tip to find the highest BFT block whose
+            // do_not_include_until_bc_height <= proposed_pow_height.
+            let n = internal.bft_blocks.len();
+            let suitable_height = (0..n).rev()
+                .find(|&i| internal.bft_blocks[i].do_not_include_until_bc_height <= proposed_pow_height)
+                .map(|i| i + 1); // 1-based (see fat_pointer_to_block_at_height)
+            let fat_ptr = if let Some(h) = suitable_height {
+                fat_pointer_to_block_at_height(&internal.bft_blocks, &internal.fat_pointer_to_tip, h as u64)
+                    .unwrap_or_else(|| FatPointerToBftBlock::null())
+            } else {
+                FatPointerToBftBlock::null()
+            };
+            Ok(TFLServiceResponse::FatPointerToBFTChainTip(fat_ptr))
         }
 
         // wallet

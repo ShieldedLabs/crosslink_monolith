@@ -298,6 +298,10 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     CrosslinkNotReady { block_height: block::Height },
 
+    #[error("block height {block_height:?} references a BFT block that must not be included until BC height {do_not_include_until}")]
+    #[non_exhaustive]
+    CrosslinkFatPointerTooEarly { block_height: block::Height, do_not_include_until: u64 },
+
     #[error("block hash {block_hash} was replaced by a newer commit request")]
     #[non_exhaustive]
     ReplacedByNewerRequest { block_hash: block::Hash },

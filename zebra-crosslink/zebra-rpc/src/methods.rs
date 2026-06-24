@@ -1986,7 +1986,7 @@ where
             .ready()
             .await
             .unwrap()
-            .call(TFLServiceRequest::FatPointerToBFTChainTip)
+            .call(TFLServiceRequest::FatPointerToBFTChainTip(u64::MAX))
             .await;
         if let Ok(TFLServiceResponse::FatPointerToBFTChainTip(fat_pointer)) = ret {
             Some(fat_pointer)
@@ -3378,10 +3378,15 @@ where
             "selected transactions for the template from the mempool"
         );
 
-        let fat_pointer = self
-            .get_tfl_fat_pointer_to_bft_chain_tip()
-            .await
-            .expect("get fat pointer should never fail only return a null pointer");
+        let fat_pointer = {
+            let ret = self.tfl_service.clone().ready().await.unwrap()
+                .call(TFLServiceRequest::FatPointerToBFTChainTip(next_block_height.0 as u64))
+                .await;
+            match ret {
+                Ok(TFLServiceResponse::FatPointerToBFTChainTip(fp)) => fp,
+                _ => zcash_primitives::bft::FatPointerToBftBlock::null(),
+            }
+        };
 
         // - After this point, the template only depends on the previously fetched data.
 

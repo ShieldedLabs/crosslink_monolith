@@ -231,7 +231,7 @@ pub fn spawn_new_tfl_service(
     *handle_mtx.lock().unwrap() = Some(handle1.clone());
 
     let handle3 = handle1.clone();
-    *closure_from_state_to_here_mutex.lock().unwrap() = Some(Arc::new(move |fpa, fpb| crate::call_from_state_to_crosslink_to_ask_about_fat_pointers(&handle3, fpa, fpb)));
+    *closure_from_state_to_here_mutex.lock().unwrap() = Some(Arc::new(move |fpa, fpb, height| crate::call_from_state_to_crosslink_to_ask_about_fat_pointers(&handle3, fpa, fpb, height)));
 
     let handle2 = handle1.clone();
     (

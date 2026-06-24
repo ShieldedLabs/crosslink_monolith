@@ -46,8 +46,10 @@ pub enum TFLServiceRequest {
     TxFinalityStatus(zebra_chain::transaction::Hash),
     /// Get the finalizer roster
     Roster,
-    /// Get the fat pointer to the BFT chain tip
-    FatPointerToBFTChainTip,
+    /// Get the fat pointer to the BFT chain tip, suitable for a PoW block at the given height.
+    /// The handler walks back from the tip to find the most recent BFT block whose
+    /// `do_not_include_until_bc_height` is <= the proposed PoW block height.
+    FatPointerToBFTChainTip(u64),
     /// Send a staking command transaction
     StakingCmd(String),
     /// faucet

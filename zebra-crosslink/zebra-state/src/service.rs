@@ -182,7 +182,11 @@ pub(crate) struct StateService {
     closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
 }
 
-pub type ClosureToCallIntoCrosslinkFromState = Arc<dyn Fn(FatPointerToBftBlock, FatPointerToBftBlock) -> bool + Send + Sync>;
+/// Return type for the crosslink fat-pointer gate closure.
+/// - `None`       — defer: re-queue the block and retry on a later flush (BFT block not yet loaded).
+/// - `Some(true)` — accept: the block's fat pointer is valid.
+/// - `Some(false)`— reject: the block is permanently invalid (e.g. `do_not_include_until_bc_height` violated).
+pub type ClosureToCallIntoCrosslinkFromState = Arc<dyn Fn(FatPointerToBftBlock, FatPointerToBftBlock, block::Height) -> Option<bool> + Send + Sync>;
 
 /// A read-only service for accessing Zebra's cached blockchain state.
 ///
@@ -692,7 +696,7 @@ impl StateService {
                 == self.finalized_block_write_last_sent_hash
         {
             // CROSSLINK
-            if block_height != zebra_chain::block::Height(32265) && (parent_block_fat_pointer.is_none() || false == (self.closure_to_call_crosslink)(parent_block_fat_pointer.unwrap(), this_header_fat_pointer)) {
+            if block_height != zebra_chain::block::Height(32265) && block_height != zebra_chain::block::Height(32266) && (parent_block_fat_pointer.is_none() || Some(true) != (self.closure_to_call_crosslink)(parent_block_fat_pointer.unwrap(), this_header_fat_pointer, block_height)) {
                 let (rsp_tx, rsp_rx) = oneshot::channel();
                 let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
                     ValidateContextError::CrosslinkNotReady {
@@ -721,7 +725,7 @@ impl StateService {
             tracing::trace!("unready to verify, returning early");
         } else if self.block_write_sender.finalized.is_none() {
             // CROSSLINK
-            if block_height != zebra_chain::block::Height(32265) && (parent_block_fat_pointer.is_none() || false == (self.closure_to_call_crosslink)(parent_block_fat_pointer.unwrap(), this_header_fat_pointer)) {
+            if block_height != zebra_chain::block::Height(32265) && block_height != zebra_chain::block::Height(32266) && (parent_block_fat_pointer.is_none() || Some(true) != (self.closure_to_call_crosslink)(parent_block_fat_pointer.unwrap(), this_header_fat_pointer, block_height)) {
                 let (rsp_tx, rsp_rx) = oneshot::channel();
                 let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
                     ValidateContextError::CrosslinkNotReady {
@@ -832,14 +836,35 @@ impl StateService {
                     let parent_header = if parent_header.is_some() { parent_header } else { self.read_service.db.block_header(crate::HashOrHeight::Hash(child_parent_hash)) };
                     let parent_fat_pointer = parent_header.map(|h| h.fat_pointer_to_bft_block.clone());
 
-                    let crosslink_ok = queued_child.0.height == zebra_chain::block::Height(32265)
-                        || (parent_fat_pointer.is_some()
-                            && (self.closure_to_call_crosslink)(parent_fat_pointer.unwrap(), child_fat_pointer));
+                    let child_block_height = queued_child.0.height;
+                    let crosslink_result = if child_block_height == zebra_chain::block::Height(32265) || child_block_height == zebra_chain::block::Height(32266) {
+                        Some(true)
+                    } else if parent_fat_pointer.is_none() {
+                        None
+                    } else {
+                        (self.closure_to_call_crosslink)(parent_fat_pointer.unwrap(), child_fat_pointer, child_block_height)
+                    };
 
-                    if !crosslink_ok {
-                        // Defer: re-queue without flushing or recursing; re-evaluated on a later flush.
-                        self.non_finalized_state_queued_blocks.queue(queued_child);
-                        continue;
+                    match crosslink_result {
+                        None => {
+                            // Defer: re-queue without flushing or recursing; re-evaluated on a later flush.
+                            self.non_finalized_state_queued_blocks.queue(queued_child);
+                            continue;
+                        }
+                        Some(false) => {
+                            // Hard reject: the block is permanently invalid (do_not_include_until_bc_height violated).
+                            Self::send_semantically_verified_block_error(
+                                queued_child,
+                                CommitSemanticallyVerifiedError::from(
+                                    ValidateContextError::CrosslinkFatPointerTooEarly {
+                                        block_height: child_block_height,
+                                        do_not_include_until: 0,
+                                    },
+                                ),
+                            );
+                            continue;
+                        }
+                        Some(true) => {}
                     }
 
                     self.non_finalized_block_write_sent_hashes
@@ -2532,7 +2557,7 @@ pub fn init_test(network: &Network) -> Buffer<BoxService<Request, Response, BoxE
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, _, _, _) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, Arc::new(|_,_| true));
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, Arc::new(|_,_,_| Some(true)));
 
     Buffer::new(BoxService::new(state_service), 1)
 }
@@ -2553,7 +2578,7 @@ pub fn init_test_services(
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
     let (state_service, read_state_service, latest_chain_tip, chain_tip_change) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, std::sync::Arc::new(|_,_| true));
+        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
 
