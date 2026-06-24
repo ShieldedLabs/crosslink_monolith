@@ -1270,9 +1270,17 @@ impl Service<Request> for StateService {
                 // pointers of previously-deferred non-finalized blocks resolvable. Re-flush
                 // the queue so those are re-evaluated now rather than waiting for the next
                 // incoming block — which may never come on an idle chain.
-                if let Some((_, tip_hash)) = self.best_tip() {
-                    self.send_ready_non_finalized_queued(tip_hash);
-                }
+                //
+                // `block_in_place` is REQUIRED: this arm runs synchronously on a tokio runtime
+                // thread, and the fat-pointer gate reached from `send_ready_non_finalized_queued`
+                // acquires the crosslink lock with `blocking_lock()`, which panics on a runtime
+                // thread unless we are inside `block_in_place`. (The intake path at
+                // `CommitSemanticallyVerifiedBlock` is wrapped for the same reason.)
+                tokio::task::block_in_place(|| {
+                    if let Some((_, tip_hash)) = self.best_tip() {
+                        self.send_ready_non_finalized_queued(tip_hash);
+                    }
+                });
 
                 // TODO:
                 //   - check for panics in the block write task here,

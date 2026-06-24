@@ -284,20 +284,22 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     // Return value:
     //   None        => DEFER  — re-queue and re-evaluate on a later flush. REVERSIBLE. This is
     //                           the answer whenever we lack the information to be *certain* a
-    //                           block is invalid (lock contention, an unresolved BFT pointer,
-    //                           or an ordering relationship that depends on our current view).
+    //                           block is invalid — i.e. an unresolved BFT pointer (its block has
+    //                           not entered this node yet) that may resolve later.
     //   Some(false) => REJECT — PERMANENT and IRREVERSIBLE: the block is dropped and every
     //                           descendant queued behind it is orphaned. We may ONLY return this
     //                           on facts that are immutable and view-independent, so that the
     //                           decision can never turn out to have been a transient mistake.
     //   Some(true)  => ACCEPT.
     //
-    // This runs synchronously inside the state service, which is driven on an async runtime
-    // thread, so we must not block on the lock — `blocking_lock` panics in an async context.
-    let internal = match internal_handle.internal.try_lock() {
-        Ok(guard) => guard,
-        Err(_) => return None, // lock contention is transient -> defer
-    };
+    // This runs synchronously inside the state service. `blocking_lock` panics if called on a
+    // tokio runtime thread *unless* it is inside `tokio::task::block_in_place`, so EVERY caller
+    // of this function (via the state→crosslink closure) MUST be wrapped in `block_in_place`.
+    // See `queue_and_commit_to_non_finalized_state` (already wrapped) and the
+    // `CrosslinkFinalizeBlock` arm in zebra-state's `service.rs`. Acquiring the lock by blocking
+    // (rather than `try_lock`) means there is no spurious "lock busy" defer: the answer is always
+    // the real decision, never a transient miss.
+    let internal = internal_handle.internal.blocking_lock();
 
     let parent_is_null = parent_fat_pointer == FatPointerToBftBlock::null();
     let child_is_null = child_fat_pointer == FatPointerToBftBlock::null();
