@@ -1809,7 +1809,7 @@ async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServ
         }
     }
 
-    tracking.snap_height = max_height;
+    tracking.snap_height = end_height;
     Ok(())
 }
 
