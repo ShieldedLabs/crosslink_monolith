@@ -1747,6 +1747,7 @@ async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServ
                     let bond = transaction::StakingAction_CreateNewDelegationBond::try_from_union(&staking_action).unwrap();
                     let finalizer_pk_id = PubKeyID(bond.target_finalizer);
                     if tracking.slash_finalizers.contains(&finalizer_pk_id) {
+                        // TO finalizer
                         tracking.bonds_staked_to_slash_finalizers_at_snap_height.insert(
                             BondKeyID(bond.unique_pubkey),
                             SlashTrackingBondChange { change_height: height, finalizer_pk_id }
@@ -1765,16 +1766,26 @@ async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServ
                         );
                     } else {
                         // FROM finalizer
-                        if let Some(details) = tracking.bonds_staked_to_slash_finalizers_at_snap_height.get(&BondKeyID(bond.unique_pubkey)) {
-                            tracking.bonds_staked_to_slash_finalizers_at_snap_height.remove(&BondKeyID(bond.unique_pubkey));
+                        if let Some(details) = tracking.bonds_staked_to_slash_finalizers_at_snap_height.remove(&BondKeyID(bond.unique_pubkey)) {
+                            if analysis_bgn_height <= height && height < analysis_end_height {
+                                // @Todo: @Think: If we slash these bonds, it's more correct in the sense that it slashes bonds that were staked
+                                //                to the finalizer coming into the block at the analysis begin height. However, this is a slash
+                                //                consensus change that may be more expensive computationally and conceptually than ignoring them.
+                                bonds_to_slash.insert(BondKeyID(bond.unique_pubkey));
+                            }
                         }
                     }
                 }
                 StakingActionKind::BeginDelegationUnbonding => {
                     let bond = transaction::StakingAction_BeginDelegationUnbonding::try_from_union(&staking_action).unwrap();
                     // FROM finalizer
-                    if let Some(details) = tracking.bonds_staked_to_slash_finalizers_at_snap_height.get(&BondKeyID(bond.unique_pubkey)) {
-                        tracking.bonds_staked_to_slash_finalizers_at_snap_height.remove(&BondKeyID(bond.unique_pubkey));
+                    if let Some(details) = tracking.bonds_staked_to_slash_finalizers_at_snap_height.remove(&BondKeyID(bond.unique_pubkey)) {
+                        if analysis_bgn_height <= height && height < analysis_end_height {
+                            // @Todo: @Think: If we slash these bonds, it's more correct in the sense that it slashes bonds that were staked
+                            //                to the finalizer coming into the block at the analysis begin height. However, this is a slash
+                            //                consensus change that may be more expensive computationally and conceptually than ignoring them.
+                            bonds_to_slash.insert(BondKeyID(bond.unique_pubkey));
+                        }
                     }
                 }
 
