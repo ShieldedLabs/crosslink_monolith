@@ -36,6 +36,7 @@ pub mod chain;
 pub mod delegation;
 pub mod metrics;
 pub mod shielded;
+pub mod slashing;
 pub mod transparent;
 
 #[cfg(any(test, feature = "proptest-impl"))]

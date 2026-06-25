@@ -100,6 +100,8 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "delegation_bond_by_key",
     "bond_status_by_key",
     "aggregated_stakes_by_hash",
+    // Bond histories delegated to slashed finalizers. This will evolve in the future
+    "slashed_bond_intervals",
 ];
 
 /// The finalized part of the chain state, stored in the db.
