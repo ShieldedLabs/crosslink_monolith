@@ -2758,56 +2758,79 @@ pub fn burn_delegation_bonds(delegation_bonds: &mut HashMap<BondKey, (Delegation
 }
 
 
+/// Derive deterministic staking rewards for the active delegation bond set.
+///
+/// Integer division rounds down for each non-largest bond, and the largest bond
+/// gets the remainder so the full reward total is assigned without minting or
+/// dropping zats. Ties for largest bond are broken by the lowest bond key.
+pub(crate) fn bond_rewards_for_active_bonds<I>(
+    bond_reward_total: u64,
+    active_bonds: I,
+) -> Vec<(finalized_state::disk_format::BondKey, u64)>
+where
+    I: IntoIterator<Item = (finalized_state::disk_format::BondKey, u64)>,
+{
+    let active_bonds: Vec<_> = active_bonds.into_iter().collect();
+
+    if active_bonds.is_empty() {
+        return Vec::new();
+    }
+
+    let total_staked_zats: u64 = active_bonds
+        .iter()
+        .map(|(_bond_key, amount_zats)| *amount_zats)
+        .sum();
+
+    let max_staker = active_bonds
+        .iter()
+        .max_by_key(|(bond_key, amount_zats)| (*amount_zats, std::cmp::Reverse(*bond_key)))
+        .map(|(bond_key, _amount_zats)| *bond_key)
+        .expect("active_bonds is non-empty");
+
+    let mut paid_reward = 0u64;
+    let mut rewards = Vec::with_capacity(active_bonds.len());
+
+    for (bond_key, amount_zats) in active_bonds {
+        if bond_key == max_staker {
+            continue;
+        }
+
+        let reward = ((amount_zats as u128) * (bond_reward_total as u128)
+            / (total_staked_zats as u128)) as u64;
+        paid_reward += reward;
+        rewards.push((bond_key, reward));
+    }
+
+    rewards.push((max_staker, bond_reward_total - paid_reward));
+    rewards
+}
+
 /// caller must ensure delegation_bonds is non-empty
 pub fn update_bonds_with_pos_issuance(
     bond_reward_total: u64,
-    delegation_bonds: &mut HashMap<finalized_state::disk_format::BondKey, (finalized_state::disk_format::DelegationBond, non_finalized_state::BondStatusInChain)>
-    ) -> Vec<([u8; 32], u64)>
-{
+    delegation_bonds: &mut HashMap<
+        finalized_state::disk_format::BondKey,
+        (
+            finalized_state::disk_format::DelegationBond,
+            non_finalized_state::BondStatusInChain,
+        ),
+    >,
+) -> Vec<([u8; 32], u64)> {
     use zebra_chain::amount::Amount;
 
-    /*
-       Note(Sam): This is inspired from Andrews earlier code. We will use the fact the integer division only rounds
-       down to make sure we do not accidentally mint zats. We first identify the biggest bond, this bond will recieve the remainder.
-    */
-    let mut total_staked_zats = 0u64;
-    let max_staker = {
-        let mut iter = delegation_bonds.iter().filter(|(_, (_, status))| *status == non_finalized_state::BondStatusInChain::Active);
-        let first = iter.next().expect("is any checked already");
-        let mut max_staker = *first.0;
-        let mut biggest = first.1.0.amount.zatoshis() as u64;
-        total_staked_zats += first.1.0.amount.zatoshis() as u64;
-        for other in iter {
-            total_staked_zats += other.1.0.amount.zatoshis() as u64;
-            if other.1.0.amount.zatoshis() as u64 > biggest || (other.1.0.amount.zatoshis() as u64 == biggest && *other.0 < max_staker) {
-                max_staker = *other.0;
-                biggest = other.1.0.amount.zatoshis() as u64;
-            }
-        }
-        max_staker
-    };
+    let reward_per_bond = bond_rewards_for_active_bonds(
+        bond_reward_total,
+        delegation_bonds.iter().filter_map(|(bond_key, (bond, status))| {
+            (*status == non_finalized_state::BondStatusInChain::Active)
+                .then_some((*bond_key, bond.amount.zatoshis() as u64))
+        }),
+    );
 
-    let mut so_far_payed_reward = 0u64;
-
-    let mut reward_per_bond: Vec<([u8; 32], u64)> = Vec::new();
-    for (bond_key, (bond, bond_status)) in delegation_bonds.iter_mut() {
-        if *bond_status == non_finalized_state::BondStatusInChain::Active && *bond_key != max_staker {
-            let mul: u128 = (bond.amount.zatoshis() as u128) * (bond_reward_total as u128);
-            let reward = (mul / (total_staked_zats as u128)) as u64;
-            so_far_payed_reward += reward;
-
-            bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
-            reward_per_bond.push((*bond_key, reward,));
-        }
-    }
-
-    // Biggest bond position gets the remainder.
-    {
-        let (bond, _status) = delegation_bonds.get_mut(&max_staker).expect("checked earlier");
-        let reward = bond_reward_total - so_far_payed_reward;
-
-        bond.amount = (bond.amount + Amount::new(reward as i64)).unwrap();
-        reward_per_bond.push((max_staker, reward,));
+    for (bond_key, reward) in &reward_per_bond {
+        let (bond, _status) = delegation_bonds
+            .get_mut(bond_key)
+            .expect("active bond must exist if it received rewards");
+        bond.amount = (bond.amount + Amount::new(*reward as i64)).unwrap();
     }
 
     reward_per_bond
