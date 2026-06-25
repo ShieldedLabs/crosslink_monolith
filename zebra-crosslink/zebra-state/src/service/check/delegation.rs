@@ -177,6 +177,12 @@ fn validate_bond_for_unbonding(
                     bond_key
                 )));
             }
+            BondStatusInChain::Burned => {
+                return Err(ValidateContextError::InvalidDelegationBond(format!(
+                    "delegation bond is burned: {:?}",
+                    bond_key
+                )));
+            }
         }
     }
 
@@ -233,6 +239,12 @@ fn validate_bond_for_withdrawal(
                     bond_key
                 )));
             }
+            BondStatusInChain::Burned => {
+                return Err(ValidateContextError::InvalidDelegationBond(format!(
+                    "delegation bond is burned: {:?}",
+                    bond_key
+                )));
+            }
         }
     }
 
@@ -270,6 +282,12 @@ fn validate_bond_for_retarget(
             BondStatusInChain::Withdrawn => {
                 return Err(ValidateContextError::InvalidDelegationBond(format!(
                     "cannot retarget withdrawn delegation bond: {:?}",
+                    bond_key
+                )));
+            }
+            BondStatusInChain::Burned => {
+                return Err(ValidateContextError::InvalidDelegationBond(format!(
+                    "cannot retarget burned delegation bond: {:?}",
                     bond_key
                 )));
             }

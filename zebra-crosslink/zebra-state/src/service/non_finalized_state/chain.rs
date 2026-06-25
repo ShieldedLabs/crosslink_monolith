@@ -100,6 +100,8 @@ pub enum BondStatusInChain {
     Unbonding,
     /// Bond has been withdrawn (second transaction completed).
     Withdrawn,
+    /// Bond was burned by a social slashing fork
+    Burned,
 }
 
 /// The internal state of [`Chain`].
@@ -288,6 +290,7 @@ impl Chain {
                     disk_format::BondStatus::Active => BondStatusInChain::Active,
                     disk_format::BondStatus::Unbonding { .. } => BondStatusInChain::Unbonding,
                     disk_format::BondStatus::Withdrawn { .. } => BondStatusInChain::Withdrawn,
+                    disk_format::BondStatus::Burned => BondStatusInChain::Burned,
                 };
                 (key, (bond, chain_status))
             })

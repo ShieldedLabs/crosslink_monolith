@@ -88,6 +88,8 @@ pub enum BondStatus {
         /// The transaction location where withdrawal occurred
         withdrawn_at: TransactionLocation,
     },
+    /// Bond was burned by a social slashing fork
+    Burned,
 }
 
 impl BondStatus {
@@ -104,6 +106,11 @@ impl BondStatus {
     /// Returns true if this bond is withdrawn
     pub fn is_withdrawn(&self) -> bool {
         matches!(self, BondStatus::Withdrawn { .. })
+    }
+
+    /// Returns true if this bond is burned
+    pub fn is_burned(&self) -> bool {
+        matches!(self, BondStatus::Burned)
     }
 }
 
@@ -222,6 +229,10 @@ impl IntoDisk for BondStatus {
                 // Serialize transaction location (5 bytes)
                 bytes.extend_from_slice(withdrawn_at.as_bytes().as_ref());
             }
+            BondStatus::Burned => {
+                // Tag: 3
+                bytes.push(3);
+            }
         }
 
         bytes
@@ -304,6 +315,7 @@ impl FromDisk for BondStatus {
                 let withdrawn_at = TransactionLocation::from_bytes(&bytes[1..1 + TRANSACTION_LOCATION_DISK_BYTES]);
                 BondStatus::Withdrawn { withdrawn_at }
             }
+            3 => BondStatus::Burned,
             _ => panic!("Invalid BondStatus tag: {}", tag),
         }
     }

@@ -32,6 +32,7 @@ pub fn delegation_bond(
                         withdrawn_at: bond.created_at, // Using created_at as placeholder
                     }
                 }
+                BondStatusInChain::Burned => BondStatus::Burned,
             };
             return Some((*bond, finalized_status));
         }

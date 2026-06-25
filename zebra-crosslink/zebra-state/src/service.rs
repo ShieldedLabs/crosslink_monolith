@@ -2426,6 +2426,7 @@ impl Service<ReadRequest> for ReadStateService {
                                     BondStatusInChain::Active => 0,
                                     BondStatusInChain::Unbonding => 1,
                                     BondStatusInChain::Withdrawn => 2,
+                                    BondStatusInChain::Burned => 3,
                                 },
                                 last_action_height: bond.created_at.height.0,
                             }
