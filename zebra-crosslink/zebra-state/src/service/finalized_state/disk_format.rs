@@ -20,7 +20,7 @@ mod tests;
 
 pub use block::{TransactionIndex, TransactionLocation, MAX_ON_DISK_HEIGHT};
 pub use delegation::{AggregatedStakes, BondKey, BondStatus, DelegationBond};
-pub use slashing::SlashedBondKey;
+pub use slashing::{SlashIndexMeta, SlashedBondKey};
 pub use transparent::OutputLocation;
 
 #[cfg(any(test, feature = "proptest-impl"))]
