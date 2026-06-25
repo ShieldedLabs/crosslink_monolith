@@ -971,6 +971,11 @@ impl StateService {
 }
 
 impl ReadStateService {
+    /// A handle to the finalized on-disk database (shares the same RocksDB instance).
+    pub fn db(&self) -> ZebraDb {
+        self.db.clone()
+    }
+
     /// Creates a new read-only state service, using the provided finalized state and
     /// block write task handle.
     ///

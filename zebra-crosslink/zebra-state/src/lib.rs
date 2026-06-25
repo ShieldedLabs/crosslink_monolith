@@ -72,7 +72,7 @@ pub use service::{
 pub use service::finalized_state::{ReadDisk, TypedColumnFamily, WriteTypedBatch};
 
 pub use service::{
-    finalized_state::{disk_format::BondKey, DiskWriteBatch, FromDisk, IntoDisk, WriteDisk, ZebraDb},
+    finalized_state::{disk_format::BondKey, drive_slash_index, DiskWriteBatch, FromDisk, IntoDisk, WriteDisk, ZebraDb},
     update_bonds_with_pos_issuance,
     update_chain_tip_with_delegation_bond,
     ReadStateService,

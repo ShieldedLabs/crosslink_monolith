@@ -285,6 +285,37 @@ impl ZebraDb {
             self.advance_slash_index(slashed, &mut open, max_blocks);
         }
     }
+
+    /// One resumable step: prepare (reset if the slashed set changed), then advance one chunk.
+    pub fn advance_slash_index_step(&self, slashed: &BTreeSet<[u8; 32]>, max_blocks: u32) -> Height {
+        let mut open = self.prepare_slash_index(slashed);
+        self.advance_slash_index(slashed, &mut open, max_blocks)
+    }
+}
+
+/// Background driver: catch the index up to the finalized tip, then keep up as it advances.
+/// The heavy scan runs in chunks on a blocking thread and resumes across restarts via the watermark.
+pub async fn drive_slash_index(db: ZebraDb, slashed: BTreeSet<[u8; 32]>) {
+    if slashed.is_empty() {
+        return;
+    }
+    const CHUNK: u32 = 1000;
+    loop {
+        let db = db.clone();
+        let slashed = slashed.clone();
+        let caught_up = match tokio::task::spawn_blocking(move || {
+            let next = db.advance_slash_index_step(&slashed, CHUNK);
+            db.finalized_tip_height().map_or(true, |tip| next.0 > tip.0)
+        })
+        .await
+        {
+            Ok(caught_up) => caught_up,
+            Err(_) => return,
+        };
+        if caught_up {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
 }
 
 #[cfg(test)]

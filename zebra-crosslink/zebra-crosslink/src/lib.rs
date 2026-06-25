@@ -272,12 +272,6 @@ pub(crate) struct TFLServiceInternal {
 
     current_bc_final: Option<(ZebBlockHeight, ZebBlockHash)>,
     path_to_pos_store_file: PathBuf,
-    // burned bonds -> activation height at which each was burned
-    // @Todo: remove this and add a `Burned` state to `BondStateInChain` to work properly with non finalized state
-    burned_bonds: HashMap<BondKeyID, ZebBlockHeight>,
-    // burns known for all heights <= this; None once no scan is pending
-    // @Todo: move this to non finalized state? may need to have a per-nonfinalized-chain scanning coroutine state
-    burned_known_through: Option<ZebBlockHeight>,
 }
 
 fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLServiceHandle, parent_fat_pointer: FatPointerToBftBlock, child_fat_pointer: FatPointerToBftBlock, pow_block_height: ZebBlockHeight) -> Option<bool> {
@@ -1490,6 +1484,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
     let mut last_diagnostic_print = Instant::now();
     let mut current_bc_tip: Option<(ZebBlockHeight, ZebBlockHash)> = None;
 
+    /*
     // one tracker per terminating hardfork; a single shared cursor scans the chain once
     let mut slash_trackings = Vec::<FinalizerSlashTracking>::new();
     let mut slashed_bonds_per_tracking = Vec::<HashSet<BondKeyID>>::new();
@@ -1512,6 +1507,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         slashed_bonds_per_tracking.push(HashSet::new());
     }
     internal_handle.internal.lock().await.burned_known_through = burned_known_through_from_trackings(&slash_trackings, slash_snap_height);
+    */
 
     loop {
         // Calculate this prior to message handling so that handlers can use it:
@@ -1525,6 +1521,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         tokio::time::sleep_until(run_instant).await;
         run_instant += MAIN_LOOP_SLEEP_INTERVAL;
 
+        /*
         if !slash_trackings.is_empty() {
             if let Some((bc_tip, _)) = current_bc_tip {
                 let prev_snap = slash_snap_height;
@@ -1553,6 +1550,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 }
             }
         }
+        */
 
         // from this point onwards we must race to completion in order to avoid stalling incoming requests
         // NOTE: split to avoid deadlock from non-recursive mutex - can we reasonably change type?

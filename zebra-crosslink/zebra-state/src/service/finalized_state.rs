@@ -53,6 +53,7 @@ pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
 };
+pub use zebra_db::slashing::drive_slash_index;
 pub use zebra_db::ZebraDb;
 
 #[cfg(any(test, feature = "proptest-impl"))]
