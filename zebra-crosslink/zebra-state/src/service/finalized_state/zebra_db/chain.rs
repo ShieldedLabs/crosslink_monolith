@@ -12,7 +12,7 @@
 //! each time the database format (column, serialization, etc) changes.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     sync::Arc,
 };
 
@@ -32,7 +32,8 @@ use crate::{
     request::FinalizedBlock,
     service::finalized_state::{
         disk_db::DiskWriteBatch,
-        disk_format::{chain::HistoryTreeParts, BondKey, RawBytes},
+        disk_format::{chain::HistoryTreeParts, RawBytes},
+        zebra_db::delegation::checkpoint_replay_bond_rewards,
         zebra_db::ZebraDb,
         TypedColumnFamily,
     },
@@ -269,7 +270,10 @@ impl DiskWriteBatch {
         // Apply bond rewards to the staking_bonded pool tally FIRST,
         // before unbonding moves value between pools (to match non-finalized state order)
         let total_rewards: u64 = if finalized.bond_rewards.is_empty() {
-            checkpoint_replay_reward_total(db, finalized)
+            checkpoint_replay_bond_rewards(db, finalized)?
+                .into_iter()
+                .map(|(_bond_key, amount)| amount)
+                .sum()
         } else {
             finalized
                 .bond_rewards
@@ -322,36 +326,6 @@ impl DiskWriteBatch {
         );
 
         Ok(())
-    }
-}
-
-fn checkpoint_replay_reward_total(db: &ZebraDb, finalized: &FinalizedBlock) -> u64 {
-    let mut active_bonds: HashSet<_> = db
-        .all_bonds()
-        .filter_map(|(bond_key, _bond, status)| status.is_active().then_some(bond_key))
-        .collect();
-
-    for transaction in &finalized.block.transactions {
-        let Some(staking_action) = transaction.staking_action() else {
-            continue;
-        };
-
-        match staking_action.kind {
-            StakingActionKind::CreateNewDelegationBond => {
-                active_bonds.insert(staking_action.arg32_0);
-            }
-            StakingActionKind::BeginDelegationUnbonding
-            | StakingActionKind::WithdrawDelegationBond => {
-                active_bonds.remove(&staking_action.arg32_0);
-            }
-            _ => {}
-        }
-    }
-
-    if active_bonds.is_empty() {
-        0
-    } else {
-        500_000_000
     }
 }
 

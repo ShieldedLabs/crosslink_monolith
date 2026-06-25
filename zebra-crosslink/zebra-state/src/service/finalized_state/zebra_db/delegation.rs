@@ -5,12 +5,18 @@ use std::collections::{BTreeMap, HashMap};
 use zebra_chain::{amount::Amount, block, block::Height};
 
 use crate::{
+    constants::POS_BLOCK_REWARD_ZATS,
     request::FinalizedBlock,
-    service::finalized_state::{
-        disk_db::{DiskDb, DiskWriteBatch, WriteDisk},
-        disk_format::{AggregatedStakes, BondKey, BondStatus, DelegationBond, TransactionLocation},
-        zebra_db::ZebraDb,
-        TypedColumnFamily,
+    service::{
+        bond_rewards_for_active_bonds,
+        finalized_state::{
+            disk_db::{DiskDb, DiskWriteBatch, WriteDisk},
+            disk_format::{
+                AggregatedStakes, BondKey, BondStatus, DelegationBond, TransactionLocation,
+            },
+            zebra_db::ZebraDb,
+            TypedColumnFamily,
+        },
     },
     BoxError, FromDisk, IntoDisk,
 };
@@ -134,7 +140,74 @@ impl ZebraDb {
     }
 }
 
-fn checkpoint_replay_bond_rewards(
+fn checkpoint_replay_bond_changes(
+    db: &ZebraDb,
+    finalized: &FinalizedBlock,
+) -> Result<
+    (
+        HashMap<BondKey, DelegationBond>,
+        HashMap<BondKey, BondStatus>,
+    ),
+    BoxError,
+> {
+    use zcash_primitives::transaction::StakingActionKind;
+
+    let mut bonds_modified_in_block = HashMap::new();
+    let mut statuses_modified_in_block = HashMap::new();
+
+    for (transaction_index, transaction) in finalized.block.transactions.iter().enumerate() {
+        let Some(staking_action) = transaction.staking_action() else {
+            continue;
+        };
+
+        let bond_key = staking_action.arg32_0;
+        let transaction_location =
+            TransactionLocation::from_usize(finalized.height, transaction_index);
+
+        match staking_action.kind {
+            StakingActionKind::CreateNewDelegationBond => {
+                let amount = Amount::try_from(staking_action.amount_zats)?;
+                let target_finalizer = staking_action.arg32_2;
+                let bond = DelegationBond::new(amount, target_finalizer, transaction_location);
+
+                bonds_modified_in_block.insert(bond_key, bond);
+                statuses_modified_in_block.insert(bond_key, BondStatus::Active);
+            }
+            StakingActionKind::BeginDelegationUnbonding => {
+                statuses_modified_in_block.insert(
+                    bond_key,
+                    BondStatus::Unbonding {
+                        unbonded_at: transaction_location,
+                    },
+                );
+            }
+            StakingActionKind::WithdrawDelegationBond => {
+                statuses_modified_in_block.insert(
+                    bond_key,
+                    BondStatus::Withdrawn {
+                        withdrawn_at: transaction_location,
+                    },
+                );
+            }
+            StakingActionKind::RetargetDelegationBond => {
+                let new_target = staking_action.arg32_2;
+                let mut bond = bonds_modified_in_block
+                    .get(&bond_key)
+                    .copied()
+                    .or_else(|| db.delegation_bond(&bond_key))
+                    .ok_or_else(|| format!("bond {:?} not found for retarget", bond_key))?;
+
+                bond.target_finalizer = new_target;
+                bonds_modified_in_block.insert(bond_key, bond);
+            }
+            _ => {}
+        }
+    }
+
+    Ok((bonds_modified_in_block, statuses_modified_in_block))
+}
+
+fn checkpoint_replay_bond_rewards_from_changes(
     db: &ZebraDb,
     bonds_modified_in_block: &HashMap<BondKey, DelegationBond>,
     statuses_modified_in_block: &HashMap<BondKey, BondStatus>,
@@ -167,39 +240,26 @@ fn checkpoint_replay_bond_rewards(
         }
     }
 
-    if active_bonds.is_empty() {
-        return Vec::new();
-    }
+    bond_rewards_for_active_bonds(
+        POS_BLOCK_REWARD_ZATS,
+        active_bonds
+            .into_iter()
+            .map(|(bond_key, bond)| (bond_key, u64::from(bond.amount))),
+    )
+}
 
-    let total_staked_zats: u64 = active_bonds
-        .iter()
-        .map(|(_, bond)| u64::from(bond.amount))
-        .sum();
-    let Some(max_staker) = active_bonds
-        .iter()
-        .max_by_key(|(bond_key, bond)| (u64::from(bond.amount), std::cmp::Reverse(*bond_key)))
-        .map(|(bond_key, _)| *bond_key)
-    else {
-        return Vec::new();
-    };
+pub(crate) fn checkpoint_replay_bond_rewards(
+    db: &ZebraDb,
+    finalized: &FinalizedBlock,
+) -> Result<Vec<(BondKey, u64)>, BoxError> {
+    let (bonds_modified_in_block, statuses_modified_in_block) =
+        checkpoint_replay_bond_changes(db, finalized)?;
 
-    let bond_reward_total = 500_000_000u64;
-    let mut paid_reward = 0u64;
-    let mut rewards = Vec::with_capacity(active_bonds.len());
-
-    for (bond_key, bond) in active_bonds {
-        if bond_key == max_staker {
-            continue;
-        }
-
-        let reward = ((u64::from(bond.amount) as u128) * (bond_reward_total as u128)
-            / (total_staked_zats as u128)) as u64;
-        paid_reward += reward;
-        rewards.push((bond_key, reward));
-    }
-
-    rewards.push((max_staker, bond_reward_total - paid_reward));
-    rewards
+    Ok(checkpoint_replay_bond_rewards_from_changes(
+        db,
+        &bonds_modified_in_block,
+        &statuses_modified_in_block,
+    ))
 }
 
 impl DiskWriteBatch {
@@ -300,7 +360,7 @@ impl DiskWriteBatch {
         // finalized bond table plus this block's pending bond/status changes.
         let derived_bond_rewards;
         let bond_rewards = if finalized.bond_rewards.is_empty() {
-            derived_bond_rewards = checkpoint_replay_bond_rewards(
+            derived_bond_rewards = checkpoint_replay_bond_rewards_from_changes(
                 db,
                 &bonds_modified_in_block,
                 &statuses_modified_in_block,
