@@ -26,6 +26,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use zebra_chain::block::Height;
 
+use zcash_primitives::transaction::StakingActionKind;
+
 use crate::{
     service::finalized_state::{
         disk_db::{DiskWriteBatch, WriteDisk},
@@ -51,6 +53,75 @@ pub type SlashedBondIndexMetaCf<'cf> = TypedColumnFamily<'cf, (), SlashIndexMeta
 /// Carried across `advance` calls and reconstructable from the index on restart
 /// (see [`ZebraDb::load_open_slash_runs`]).
 pub type OpenSlashRuns = HashMap<BondKey, ([u8; 32], Height)>;
+
+/// Each staking action modifies or creates an interval.
+/// You can apply these modifications to a persistent database, or in-memory nonfinalized scanning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SlashRunChange {
+    Open(SlashedBondKey), // begin a run; persisted as a sentinel-ended (still-open) row
+    Close(SlashedBondKey, Height), // End a run that spanned >= 1 block, end height (exclusive)
+    Drop(SlashedBondKey), // run opened & closed within one block; not persisted
+}
+
+// Retarget/unbond: Close the run, or drop it if it never spanned a block.
+fn close_slash_run(
+    open: &mut OpenSlashRuns,
+    bond: BondKey,
+    height: Height,
+    out: &mut Vec<SlashRunChange>,
+) {
+    if let Some((finalizer, start)) = open.remove(&bond) {
+        let key = SlashedBondKey { finalizer, start, bond };
+        out.push(if start.0 < height.0 {
+            SlashRunChange::Close(key, height)
+        } else {
+            SlashRunChange::Drop(key)
+        });
+    }
+}
+
+// bond arrived at a finalizer; open a run, but only if that finalizer is slashed
+fn open_slash_run(
+    open: &mut OpenSlashRuns,
+    slashed: &BTreeSet<[u8; 32]>,
+    bond: BondKey,
+    target: [u8; 32],
+    height: Height,
+    out: &mut Vec<SlashRunChange>,
+) {
+    if slashed.contains(&target) {
+        open.insert(bond, (target, height));
+        out.push(SlashRunChange::Open(SlashedBondKey { finalizer: target, start: height, bond }));
+    }
+}
+
+// replay a staking action against the open-run set, returning the interval-row edits it implies
+// Create-/retarget-to-slashed: Open()
+// Unbond /retarget-away: Close()
+// A run that opens and closes in one block is dropped
+pub fn apply_staking_action_to_open_runs(
+    open: &mut OpenSlashRuns,
+    slashed: &BTreeSet<[u8; 32]>,
+    height: Height,
+    kind: StakingActionKind,
+    bond: BondKey,
+    target: [u8; 32],
+) -> Vec<SlashRunChange> {
+    use StakingActionKind::*;
+    let mut out = Vec::new();
+    match kind {
+        CreateNewDelegationBond => open_slash_run(open, slashed, bond, target, height, &mut out),
+        RetargetDelegationBond => {
+            close_slash_run(open, bond, height, &mut out);
+            open_slash_run(open, slashed, bond, target, height, &mut out);
+        }
+        BeginDelegationUnbonding => close_slash_run(open, bond, height, &mut out),
+        // WithdrawDelegationBond: the run already closed at unbonding.
+        // @Todo: Convert/Register/UpdateFinalizerKey
+        _ => {}
+    }
+    out
+}
 
 impl ZebraDb {
     pub(crate) fn slashed_bond_intervals_cf(&self) -> SlashedBondIntervalsCf<'_> {
@@ -180,8 +251,6 @@ impl ZebraDb {
         open: &mut OpenSlashRuns,
         max_blocks: u32,
     ) -> Height {
-        use zcash_primitives::transaction::StakingActionKind::*;
-
         let from = self.slash_index_next_height().0;
         let Some(tip) = self.finalized_tip_height() else {
             return Height(from);
@@ -211,50 +280,16 @@ impl ZebraDb {
                 let Some(action) = tx.staking_action() else {
                     continue;
                 };
-                let bond = action.arg32_0;
-
-                match action.kind {
-                    CreateNewDelegationBond => {
-                        if slashed.contains(&action.arg32_2) {
-                            open.insert(bond, (action.arg32_2, height));
-                            batch.zs_insert(
-                                &intervals,
-                                SlashedBondKey { finalizer: action.arg32_2, start: height, bond },
-                                MAX_ON_DISK_HEIGHT,
-                            );
+                for change in apply_staking_action_to_open_runs(
+                    open, slashed, height, action.kind, action.arg32_0, action.arg32_2,
+                ) {
+                    match change {
+                        SlashRunChange::Open(key) => {
+                            batch.zs_insert(&intervals, key, MAX_ON_DISK_HEIGHT)
                         }
+                        SlashRunChange::Close(key, end) => batch.zs_insert(&intervals, key, end),
+                        SlashRunChange::Drop(key) => batch.zs_delete(&intervals, key),
                     }
-                    RetargetDelegationBond => {
-                        if let Some((finalizer, start)) = open.remove(&bond) {
-                            let key = SlashedBondKey { finalizer, start, bond };
-                            if start.0 < height.0 {
-                                batch.zs_insert(&intervals, key, height);
-                            } else {
-                                batch.zs_delete(&intervals, key);
-                            }
-                        }
-                        if slashed.contains(&action.arg32_2) {
-                            open.insert(bond, (action.arg32_2, height));
-                            batch.zs_insert(
-                                &intervals,
-                                SlashedBondKey { finalizer: action.arg32_2, start: height, bond },
-                                MAX_ON_DISK_HEIGHT,
-                            );
-                        }
-                    }
-                    BeginDelegationUnbonding => {
-                        if let Some((finalizer, start)) = open.remove(&bond) {
-                            let key = SlashedBondKey { finalizer, start, bond };
-                            if start.0 < height.0 {
-                                batch.zs_insert(&intervals, key, height);
-                            } else {
-                                batch.zs_delete(&intervals, key);
-                            }
-                        }
-                    }
-                    // WithdrawDelegationBond: the run already closed at unbonding
-                    // @Todo: Convert/Register/UpdateFinalizerKey
-                    _ => {}
                 }
             }
         }
@@ -430,5 +465,120 @@ mod tests {
         assert!(open.is_empty());
         assert_eq!(db.slash_index_next_height(), Height(0));
         assert!(db.load_open_slash_runs().is_empty());
+    }
+
+    // --- pure reducer: membership logic shared between the disk db scan and the nonfinalized inmemory (F, A) tail ---
+
+    // create->slashed opens a run; retargeting away to an unslashed finalizer closes it with a real end and opens nothing new.
+    #[test]
+    fn reducer_open_then_retarget_away_closes() {
+        let t = [1u8; 32];
+        let other = [2u8; 32];
+        let slashed = set(&[t]);
+        let b = [7u8; 32];
+        let mut open = OpenSlashRuns::new();
+
+        let c = apply_staking_action_to_open_runs(
+            &mut open, &slashed, Height(100),
+            StakingActionKind::CreateNewDelegationBond, b, t,
+        );
+        assert_eq!(
+            c,
+            vec![SlashRunChange::Open(SlashedBondKey { finalizer: t, start: Height(100), bond: b })]
+        );
+        assert_eq!(open.get(&b), Some(&(t, Height(100))));
+
+        let c = apply_staking_action_to_open_runs(
+            &mut open, &slashed, Height(150),
+            StakingActionKind::RetargetDelegationBond, b, other,
+        );
+        assert_eq!(
+            c,
+            vec![SlashRunChange::Close(
+                SlashedBondKey { finalizer: t, start: Height(100), bond: b },
+                Height(150),
+            )]
+        );
+        assert!(open.is_empty());
+    }
+
+    /// a run that opens and closes in the same block is dropped, not persisted.
+    #[test]
+    fn reducer_same_block_churn_drops() {
+        let t = [1u8; 32];
+        let other = [2u8; 32];
+        let slashed = set(&[t]);
+        let b = [7u8; 32];
+        let mut open = OpenSlashRuns::new();
+
+        apply_staking_action_to_open_runs(
+            &mut open, &slashed, Height(100),
+            StakingActionKind::CreateNewDelegationBond, b, t,
+        );
+        let c = apply_staking_action_to_open_runs(
+            &mut open, &slashed, Height(100),
+            StakingActionKind::RetargetDelegationBond, b, other,
+        );
+        assert_eq!(
+            c,
+            vec![SlashRunChange::Drop(SlashedBondKey { finalizer: t, start: Height(100), bond: b })]
+        );
+        assert!(open.is_empty());
+    }
+
+    /// retargeting from one slashed finalizer to another closes the old run and opens a new one
+    #[test]
+    fn reducer_retarget_between_slashed() {
+        let t = [1u8; 32];
+        let u = [3u8; 32];
+        let slashed = set(&[t, u]);
+        let b = [7u8; 32];
+        let mut open = OpenSlashRuns::new();
+
+        apply_staking_action_to_open_runs(
+            &mut open, &slashed, Height(100),
+            StakingActionKind::CreateNewDelegationBond, b, t,
+        );
+        let c = apply_staking_action_to_open_runs(
+            &mut open, &slashed, Height(160),
+            StakingActionKind::RetargetDelegationBond, b, u,
+        );
+        assert_eq!(
+            c,
+            vec![
+                SlashRunChange::Close(
+                    SlashedBondKey { finalizer: t, start: Height(100), bond: b },
+                    Height(160),
+                ),
+                SlashRunChange::Open(SlashedBondKey { finalizer: u, start: Height(160), bond: b }),
+            ]
+        );
+        assert_eq!(open.get(&b), Some(&(u, Height(160))));
+    }
+
+    /// unbonding closes an open run
+    #[test]
+    fn reducer_unbond_closes() {
+        let t = [1u8; 32];
+        let slashed = set(&[t]);
+        let b = [7u8; 32];
+        let mut open = OpenSlashRuns::new();
+
+        apply_staking_action_to_open_runs(
+            &mut open, &slashed, Height(100),
+            StakingActionKind::CreateNewDelegationBond, b, t,
+        );
+        let c = apply_staking_action_to_open_runs(
+            &mut open, &slashed, Height(200),
+            StakingActionKind::BeginDelegationUnbonding, b, [0u8; 32],
+        );
+        assert_eq!(
+            c,
+            vec![SlashRunChange::Close(
+                SlashedBondKey { finalizer: t, start: Height(100), bond: b },
+                Height(200),
+            )]
+        );
+        assert!(open.is_empty());
     }
 }
