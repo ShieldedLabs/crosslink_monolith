@@ -57,6 +57,9 @@ pub struct NonFinalizedState {
     /// The configured Zcash network.
     pub network: Network,
 
+    /// drives slash burns; set at init
+    pub(crate) hardfork_schedule: std::sync::Arc<zebra_chain::parameters::hardfork::HardForkSchedule>,
+
     // Diagnostics
     //
     /// Configures the non-finalized state to count metrics.
@@ -97,6 +100,7 @@ impl Clone for NonFinalizedState {
         Self {
             chain_set: self.chain_set.clone(),
             network: self.network.clone(),
+            hardfork_schedule: self.hardfork_schedule.clone(),
             invalidated_blocks: self.invalidated_blocks.clone(),
             should_count_metrics: self.should_count_metrics,
             // Don't track progress in clones.
@@ -114,6 +118,7 @@ impl NonFinalizedState {
         NonFinalizedState {
             chain_set: Default::default(),
             network: network.clone(),
+            hardfork_schedule: Default::default(),
             invalidated_blocks: Default::default(),
             should_count_metrics: true,
             #[cfg(feature = "progress-bar")]
@@ -307,7 +312,15 @@ impl NonFinalizedState {
 
         // If the block is invalid, return the error,
         // and drop the cloned parent Arc, or newly created chain fork.
-        let modified_chain = self.validate_and_commit(parent_chain, prepared, finalized_state)?;
+        let mut modified_chain = self.validate_and_commit(parent_chain, prepared, finalized_state)?;
+
+        // at a hardfork's PoW activation height, burn every bond that delegated to a slashed finalizer anywhere in [A - W, A)
+        if let Some(rule) = self.hardfork_schedule.rule_active_at(height.0 as u64) {
+            if rule.pow_activation_height == height.0 as u64 {
+                let finalizers: Vec<[u8; 32]> = rule.terminated_finalizers.iter().map(|f| f.0).collect();
+                std::sync::Arc::make_mut(&mut modified_chain).apply_slash_burns(finalized_state, &finalizers, height);
+            }
+        }
 
         // If the block is valid:
         // - add the new chain fork or updated chain to the set of recent chains
