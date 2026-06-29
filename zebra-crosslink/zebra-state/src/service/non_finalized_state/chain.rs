@@ -435,6 +435,11 @@ impl Chain {
             self.bond_retargets.remove(0);
         }
 
+        // Discard bond burns for this block (the burn is now permanent on finalization)
+        if !self.bond_burns.is_empty() {
+            self.bond_burns.remove(0);
+        }
+
         // Extract full bond amounts for bonds that will be unbonded in this block
         // (needed for finalized state pool accounting)
         use zcash_primitives::transaction::StakingActionKind;
@@ -1884,6 +1889,15 @@ impl Chain {
 
         burned
     }
+
+    // burn at activation and record the pre-burn status so reorg can revert
+    pub(crate) fn apply_slash_burns(&mut self, db: &crate::service::finalized_state::ZebraDb, finalizers: &[[u8; 32]], activation: Height) {
+        let burn_set = self.slash_window_burns(db, finalizers, activation);
+        let reverts = crate::service::burn_delegation_bonds(&mut self.inner.delegation_bonds, &burn_set);
+        if let Some(last) = self.inner.bond_burns.last_mut() {
+            last.extend(reverts);
+        }
+    }
 }
 
 impl Deref for Chain {
@@ -1973,6 +1987,14 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                 let (bond, _status) = self.delegation_bonds.get_mut(&bond_key)
                     .expect("bond must exist if it was retargeted");
                 bond.target_finalizer = old_target;
+            }
+
+            // Revert slash burns - restore each bond's pre-burn status
+            let burns = self.bond_burns.pop().expect("burns must exist for tip block");
+            for (bond_key, prev_status) in burns {
+                if let Some((_bond, status)) = self.delegation_bonds.get_mut(&bond_key) {
+                    *status = prev_status;
+                }
             }
         }
 
