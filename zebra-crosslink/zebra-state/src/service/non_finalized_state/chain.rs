@@ -1717,6 +1717,7 @@ impl Chain {
 
         // Initialize empty retargets map for this block (will be populated if any retargets occur)
         self.bond_retargets.push(HashMap::new());
+        self.bond_burns.push(Vec::new());
 
         // for each transaction in block
         for (transaction_index, (transaction, transaction_hash)) in block
