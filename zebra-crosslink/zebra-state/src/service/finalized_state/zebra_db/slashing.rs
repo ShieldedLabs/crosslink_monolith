@@ -26,15 +26,13 @@ use std::collections::{BTreeSet, HashMap};
 
 use zebra_chain::block::Height;
 
-use zcash_primitives::transaction::StakingActionKind;
+pub use zcash_primitives::transaction::SLASH_ANALYSIS_WINDOW;
+pub use zcash_primitives::transaction::StakingActionKind;
 
 use crate::{
     service::finalized_state::{
         disk_db::{DiskWriteBatch, WriteDisk},
-        disk_format::{
-            slashing::{SlashIndexMeta, SlashedBondKey},
-            BondKey, MAX_ON_DISK_HEIGHT,
-        },
+        disk_format::{slashing::{SlashIndexMeta, SlashedBondKey}, BondKey, MAX_ON_DISK_HEIGHT},
         zebra_db::ZebraDb,
         TypedColumnFamily,
     },
@@ -136,12 +134,9 @@ impl ZebraDb {
 
     /// Bonds delegated to `finalizer` anywhere in `[activation - window_len, activation)`.
     /// Only complete once `activation <= slash_index_next_height()`.
-    pub fn bonds_burned_by(
-        &self,
-        finalizer: &[u8; 32],
-        activation: Height,
-        window_len: u32,
-    ) -> BTreeSet<BondKey> {
+    // @Todo @Refactor: batch process multiple finalizers?
+    pub fn bonds_burned_by(&self, finalizer: &[u8; 32], activation: Height) -> BTreeSet<BondKey> {
+        let window_len = SLASH_ANALYSIS_WINDOW; // Could be a parameter in future, etc etc
         let window_start = activation.0.saturating_sub(window_len);
 
         // All runs for `finalizer` that began before `activation`.
@@ -167,6 +162,16 @@ impl ZebraDb {
             }
         }
 
+        burned
+    }
+    /// Bonds delegated to any of `finalizers` anywhere in `[activation - window_len, activation)`.
+    /// Only complete once `activation <= slash_index_next_height()`.
+    // @Todo @Refactor: delete this wrapper and make bonds_burned_by batch process?
+    pub fn bonds_burned_by_any(&self, finalizers: &[[u8; 32]], activation: Height) -> BTreeSet<BondKey> {
+        let mut burned = BTreeSet::new();
+        for finalizer in finalizers {
+            burned.extend(self.bonds_burned_by(finalizer, activation));
+        }
         burned
     }
 
@@ -414,7 +419,7 @@ mod tests {
         put(&db, t, 500, b(7), Height(700)); // fled exactly at window start
         put(&db, t, 700, b(8), MAX_ON_DISK_HEIGHT); // joined exactly at window start
 
-        let burned = db.bonds_burned_by(&t, Height(1000), 300);
+        let burned = db.bonds_burned_by(&t, Height(1000));
 
         let expected: BTreeSet<BondKey> = [b(1), b(2), b(4), b(8)].into_iter().collect();
         assert_eq!(burned, expected);

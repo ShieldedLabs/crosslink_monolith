@@ -2719,6 +2719,21 @@ pub fn update_chain_tip_with_delegation_bond(
     Ok(())
 }
 
+use finalized_state::disk_format::{BondKey, DelegationBond};
+use non_finalized_state::BondStatusInChain;
+use std::collections::BTreeSet;
+
+pub fn burn_delegation_bonds(delegation_bonds: &mut HashMap<BondKey, (DelegationBond, BondStatusInChain)>, burn_set: &BTreeSet<BondKey>) -> Vec<(BondKey, BondStatusInChain)> {
+    let mut reverts = Vec::new();
+    for bond_key in burn_set {
+        if let Some((_, status)) = delegation_bonds.get_mut(bond_key) {
+            reverts.push((*bond_key, *status));
+            *status = non_finalized_state::BondStatusInChain::Burned;
+        }
+    }
+    reverts
+}
+
 
 /// caller must ensure delegation_bonds is non-empty
 pub fn update_bonds_with_pos_issuance(

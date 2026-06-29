@@ -1829,6 +1829,55 @@ impl Chain {
         }
         Ok(())
     }
+
+    // Only sensible once `finalized_height <= slash_index_next_height()`.
+    pub fn slash_window_burns(&self, db: &crate::service::finalized_state::ZebraDb, finalizers: &[[u8; 32]], activation: Height) -> BTreeSet<BondKey> {
+        pub use crate::service::finalized_state::slashing::{apply_staking_action_to_open_runs, OpenSlashRuns, SlashRunChange};
+        let window_len: u32 = crate::service::finalized_state::SLASH_ANALYSIS_WINDOW;
+        let window_start = activation.0.saturating_sub(window_len);
+
+        // Finalized portion: compute from index.
+        // Only ready once `finalized_height <= slash_index_next_height()`.
+        let mut burned = db.bonds_burned_by_any(finalizers, activation);
+
+        // Non-finalized portion: analyse the interval `(finalized_height, activation)`, both exclusive...
+        // Scan this chain's blocks in the same way as the finalized db has done.
+        // Only sensible once `finalized_height <= slash_index_next_height()`, since we are downstream of finalized db.
+        let slashed_finalizers: std::collections::BTreeSet<[u8; 32]> = finalizers.iter().copied().collect();
+
+        // start where finalized db left off, then detect cockroach bonds
+        let mut open_runs     = db.load_open_slash_runs();
+        let     starting_from = db.slash_index_next_height().0;
+        for h in  ((starting_from) .. (activation.0)) {
+            let height = Height(h);
+            let cvb = self.block(crate::HashOrHeight::Height(height)).expect("every height in [slash_index_next_height(), activation) must be a non-finalized block in this chain; slash burns must not be applied until the finalized slash index has advanced to this chain's root");
+            for tx in cvb.block.transactions.iter() {
+                let Some(action) = tx.staking_action() else {
+                    continue;
+                };
+
+                let changes = apply_staking_action_to_open_runs(&mut open_runs, &slashed_finalizers, height, action.kind, action.arg32_0, action.arg32_2);
+                for change in changes {
+                    let SlashRunChange::Close(key, end) = change else {
+                        continue;
+                    };
+
+                    if end.0 > window_start {
+                        burned.insert(key.bond);
+                    }
+                }
+            }
+        }
+
+        // Detect sitting duck bonds still open on a slashed finalizer at activation
+        for (bond, (_, start)) in open_runs.iter() {
+            if start.0 < activation.0 {
+                burned.insert(*bond);
+            }
+        }
+
+        burned
+    }
 }
 
 impl Deref for Chain {

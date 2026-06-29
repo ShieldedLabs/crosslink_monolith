@@ -1553,6 +1553,14 @@ pub const STAKING_PERIOD: u32 = 150;
 /// Staking actions are only valid when `block_height % STAKING_PERIOD < STAKING_DAY_WINDOW`.
 pub const STAKING_DAY_WINDOW: u32 = 70;
 
+// It takes 2 staking periods to withdraw funds-at-stake into shielded, so currently
+// there is not much point to slashing bonds older than that; any smart attacker will
+// likely have already withdrawn their stake. That's why the staking period exists: to
+// give the community time to notice malicious stake and burn it. If vGloriousFuture
+// prevents bond withdrawal until next finalization, a much longer window is warranted,
+// but it would require chasing BFT fat pointers. For now, this is the simple answer.
+pub const SLASH_ANALYSIS_WINDOW: u32 = 2 * STAKING_PERIOD;
+
 // TODO(code org): should this be under zcash_protocol?
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct StakingAction {

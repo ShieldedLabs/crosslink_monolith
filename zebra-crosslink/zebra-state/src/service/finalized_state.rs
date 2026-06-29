@@ -32,11 +32,14 @@ use crate::{
     BoxError, CheckpointVerifiedBlock, CloneError, Config,
 };
 
+pub use zcash_primitives::transaction::SLASH_ANALYSIS_WINDOW;
+
 pub mod column_family;
 
 mod disk_db;
 pub(crate) mod disk_format;
 mod zebra_db;
+pub use zebra_db::slashing;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
