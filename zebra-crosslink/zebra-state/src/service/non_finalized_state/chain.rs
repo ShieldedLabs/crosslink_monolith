@@ -151,6 +151,10 @@ pub struct ChainInner {
     /// Stores the target finalizer BEFORE the retarget, so we can restore it on revert.
     pub(crate) bond_retargets: Vec<HashMap<disk_format::BondKey, [u8; 32]>>,
 
+    /// Pre-burn (key, status) per bond burned at each block height, to restore on revert.
+    /// Indexed by block position in the chain (0 = first non-finalized block).
+    pub(crate) bond_burns: Vec<Vec<(disk_format::BondKey, BondStatusInChain)>>,
+
     // Note commitment trees
     //
     /// The Sprout note commitment tree for each anchor.
@@ -305,6 +309,7 @@ impl Chain {
             delegation_bonds,
             bond_rewards: Vec::new(),
             bond_retargets: Vec::new(),
+            bond_burns: Vec::new(),
             sprout_anchors: MultiSet::new(),
             sprout_anchors_by_height: Default::default(),
             sprout_trees_by_anchor: Default::default(),
