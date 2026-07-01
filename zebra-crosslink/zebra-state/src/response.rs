@@ -206,7 +206,7 @@ impl NonFinalizedBlocksListener {
         tokio::spawn(async move {
             // Start with an empty non-finalized state with the expectation that the caller doesn't yet have
             // any blocks from the non-finalized state.
-            let mut prev_non_finalized_state = NonFinalizedState::new(&network);
+            let mut prev_non_finalized_state = NonFinalizedState::new(&network, Default::default());
 
             loop {
                 // # Correctness

@@ -114,11 +114,12 @@ impl Clone for NonFinalizedState {
 
 impl NonFinalizedState {
     /// Returns a new non-finalized state for `network`.
-    pub fn new(network: &Network) -> NonFinalizedState {
+    // @Todo: move hardfork_schedule into Network?
+    pub fn new(network: &Network, hardfork_schedule: std::sync::Arc<zebra_chain::parameters::hardfork::HardForkSchedule>) -> NonFinalizedState {
         NonFinalizedState {
             chain_set: Default::default(),
             network: network.clone(),
-            hardfork_schedule: Default::default(),
+            hardfork_schedule,
             invalidated_blocks: Default::default(),
             should_count_metrics: true,
             #[cfg(feature = "progress-bar")]

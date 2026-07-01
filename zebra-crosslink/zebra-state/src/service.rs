@@ -334,10 +334,10 @@ impl StateService {
         let (chain_tip_sender, latest_chain_tip, chain_tip_change) =
             ChainTipSender::new(initial_tip, network);
 
-        let non_finalized_state = NonFinalizedState::new(network);
+        let non_finalized_state = NonFinalizedState::new(network, config.hardfork_schedule.clone());
 
         let (non_finalized_state_sender, non_finalized_state_receiver) =
-            watch::channel(NonFinalizedState::new(&finalized_state.network()));
+            watch::channel(NonFinalizedState::new(&finalized_state.network(), Default::default()));
 
         let finalized_state_for_writing = finalized_state.clone();
         let (block_write_sender, invalid_block_write_reset_receiver, block_write_task) =
@@ -2513,7 +2513,7 @@ pub fn init_read_only(
         true,
     );
     let (non_finalized_state_sender, non_finalized_state_receiver) =
-        tokio::sync::watch::channel(NonFinalizedState::new(network));
+        tokio::sync::watch::channel(NonFinalizedState::new(network, Default::default()));
 
     (
         ReadStateService::new(&finalized_state, None, non_finalized_state_receiver),

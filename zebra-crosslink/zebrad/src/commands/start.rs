@@ -265,6 +265,8 @@ impl StartCmd {
         info!("logging database metrics on startup");
         read_only_state_service.log_db_metrics();
 
+        state_config.hardfork_schedule = Arc::new(HardForkSchedule::new(config.crosslink.hardforks.clone()));
+
         // Drive the finalizer-slashing bond index: catch up the backlog at startup, then keep up live.
         {
             let slashed_finalizers: std::collections::BTreeSet<[u8; 32]> = config

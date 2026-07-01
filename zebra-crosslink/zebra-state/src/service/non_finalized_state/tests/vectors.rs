@@ -158,7 +158,7 @@ fn best_chain_wins_for_network(network: Network) -> Result<()> {
 
     let expected_hash = block2.hash();
 
-    let mut state = NonFinalizedState::new(&network);
+    let mut state = NonFinalizedState::new(&network, Default::default());
     let finalized_state = FinalizedState::new(
         &Config::ephemeral(),
         &network,
@@ -196,7 +196,7 @@ fn finalize_pops_from_best_chain_for_network(network: Network) -> Result<()> {
     let block2 = block1.make_fake_child().set_work(10);
     let child = block1.make_fake_child().set_work(1);
 
-    let mut state = NonFinalizedState::new(&network);
+    let mut state = NonFinalizedState::new(&network, Default::default());
     let finalized_state = FinalizedState::new(
         &Config::ephemeral(),
         &network,
@@ -242,7 +242,7 @@ fn invalidate_block_removes_block_and_descendants_from_chain_for_network(
     let block2 = block1.make_fake_child().set_work(10);
     let block3 = block2.make_fake_child().set_work(1);
 
-    let mut state = NonFinalizedState::new(&network);
+    let mut state = NonFinalizedState::new(&network, Default::default());
     let finalized_state = FinalizedState::new(
         &Config::ephemeral(),
         &network,
@@ -342,7 +342,7 @@ fn reconsider_block_inserts_block_and_descendants_into_chain_for_network(
     let block2 = block1.make_fake_child().set_work(10);
     let block3 = block2.make_fake_child().set_work(1);
 
-    let mut state = NonFinalizedState::new(&network);
+    let mut state = NonFinalizedState::new(&network, Default::default());
     let finalized_state = FinalizedState::new(
         &Config::ephemeral(),
         &network,
@@ -431,7 +431,7 @@ fn commit_block_extending_best_chain_doesnt_drop_worst_chains_for_network(
     let child1 = block1.make_fake_child().set_work(1);
     let child2 = block2.make_fake_child().set_work(1);
 
-    let mut state = NonFinalizedState::new(&network);
+    let mut state = NonFinalizedState::new(&network, Default::default());
     let finalized_state = FinalizedState::new(
         &Config::ephemeral(),
         &network,
@@ -476,7 +476,7 @@ fn shorter_chain_can_be_best_chain_for_network(network: Network) -> Result<()> {
 
     let short_chain_block = block1.make_fake_child().set_work(3);
 
-    let mut state = NonFinalizedState::new(&network);
+    let mut state = NonFinalizedState::new(&network, Default::default());
     let finalized_state = FinalizedState::new(
         &Config::ephemeral(),
         &network,
@@ -522,7 +522,7 @@ fn longer_chain_with_more_work_wins_for_network(network: Network) -> Result<()> 
 
     let short_chain_block = block1.make_fake_child().set_work(3);
 
-    let mut state = NonFinalizedState::new(&network);
+    let mut state = NonFinalizedState::new(&network, Default::default());
     let finalized_state = FinalizedState::new(
         &Config::ephemeral(),
         &network,

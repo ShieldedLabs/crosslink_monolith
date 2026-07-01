@@ -19,6 +19,9 @@ use crate::{
     service::finalized_state::restorable_db_versions,
     state_database_format_version_in_code, BoxError,
 };
+use zebra_chain::parameters::HardForkSchedule;
+
+use std::sync::Arc;
 
 /// Configuration for the state service.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -128,6 +131,9 @@ pub struct Config {
     /// chain contains it, until the block is committed locally. See the
     /// `CheckpointState` state machine in `new_network.rs`.
     pub network_checkpoint_block_hash: Option<String>,
+
+    #[serde(skip)]
+    pub hardfork_schedule: Arc<HardForkSchedule>,
 }
 
 fn gen_temp_path(prefix: &str) -> PathBuf {
@@ -203,6 +209,7 @@ impl Default for Config {
             network_local_port: 0,
             network_initial_peers: Vec::new(),
             network_checkpoint_block_hash: None,
+            hardfork_schedule: Default::default(),
         }
     }
 }

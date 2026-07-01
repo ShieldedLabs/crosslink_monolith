@@ -44,7 +44,7 @@ impl TrustedChainSync {
         db: ZebraDb,
         non_finalized_state_sender: tokio::sync::watch::Sender<NonFinalizedState>,
     ) -> Result<(LatestChainTip, ChainTipChange, JoinHandle<()>), BoxError> {
-        let non_finalized_state = NonFinalizedState::new(&db.network());
+        let non_finalized_state = NonFinalizedState::new(&db.network(), Default::default());
         let (chain_tip_sender, latest_chain_tip, chain_tip_change) =
             ChainTipSender::new(None, &db.network());
         let mut indexer_rpc_client =
