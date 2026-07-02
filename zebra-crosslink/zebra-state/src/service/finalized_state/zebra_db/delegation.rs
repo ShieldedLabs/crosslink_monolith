@@ -218,6 +218,12 @@ impl DiskWriteBatch {
             }
         }
 
+        // Persist slash burns applied to this block in the non-finalized state
+        let bond_status_by_key_cf = db.db.cf_handle(BOND_STATUS_BY_KEY).unwrap();
+        for bond_key in &finalized.bond_burns {
+            self.zs_insert(&bond_status_by_key_cf, *bond_key, BondStatus::Burned);
+        }
+
         Ok(())
     }
 

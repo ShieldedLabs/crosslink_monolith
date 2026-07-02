@@ -398,9 +398,9 @@ impl Chain {
     }
 
     /// Pops the lowest height block of the non-finalized portion of a chain,
-    /// and returns it with its associated treestate, bond rewards, and unbonding amounts for that block.
+    /// and returns it with its associated treestate, bond rewards, burned bonds, and unbonding amounts for that block.
     #[instrument(level = "debug", skip(self))]
-    pub(crate) fn pop_root(&mut self) -> (ContextuallyVerifiedBlock, Treestate, Vec<([u8; 32], u64)>, Vec<([u8; 32], u64)>) {
+    pub(crate) fn pop_root(&mut self) -> (ContextuallyVerifiedBlock, Treestate, Vec<([u8; 32], u64)>, Vec<[u8; 32]>, Vec<([u8; 32], u64)>) {
         // Obtain the lowest height.
         let block_height = self.non_finalized_root_height();
 
@@ -435,10 +435,12 @@ impl Chain {
             self.bond_retargets.remove(0);
         }
 
-        // Discard bond burns for this block (the burn is now permanent on finalization)
-        if !self.bond_burns.is_empty() {
-            self.bond_burns.remove(0);
-        }
+        // Extract burned bond keys BEFORE revert_chain_with discards them (the burn is now permanent on finalization)
+        let bond_burns: Vec<[u8; 32]> = if !self.bond_burns.is_empty() {
+            self.bond_burns.remove(0).into_iter().map(|(bond_key, _prev_status)| bond_key).collect()
+        } else {
+            Vec::new()
+        };
 
         // Extract full bond amounts for bonds that will be unbonded in this block
         // (needed for finalized state pool accounting)
@@ -458,7 +460,7 @@ impl Chain {
         // Update cumulative data members (this no longer discards bond_rewards since we extracted them above)
         self.revert_chain_with(&block, RevertPosition::Root);
 
-        (block, treestate, bond_rewards, unbonding_amounts)
+        (block, treestate, bond_rewards, bond_burns, unbonding_amounts)
     }
 
     /// Returns the block at the provided height and all of its descendant blocks.

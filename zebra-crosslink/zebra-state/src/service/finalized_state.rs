@@ -414,11 +414,12 @@ impl FinalizedState {
                 contextually_verified,
                 treestate,
                 bond_rewards,
+                bond_burns,
                 unbonding_amounts,
             } => (
                 contextually_verified.height,
                 contextually_verified.hash,
-                FinalizedBlock::from_contextually_verified(contextually_verified, treestate, bond_rewards, unbonding_amounts),
+                FinalizedBlock::from_contextually_verified(contextually_verified, treestate, bond_rewards, bond_burns, unbonding_amounts),
                 prev_note_commitment_trees,
             ),
         };
