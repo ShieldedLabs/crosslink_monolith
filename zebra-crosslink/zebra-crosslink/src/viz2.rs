@@ -214,11 +214,11 @@ pub async fn service_viz_requests(
                             previous_hash: Hash32::from_bytes(b.previous_block_hash().0),
                             finalization_candidate_height: 0,
                             do_not_include_until_bc_height: b.do_not_include_until_bc_height,
-                            hardfork_pow_activation_height: b.hardfork.as_ref().map(|hf| hf.pow_activation_height),
-                            hardfork_bft_certificate_height: b.hardfork.as_ref().map(|hf| hf.bft_certificate_height),
-                            hardfork_terminated_finalizers: b.hardfork.as_ref().map(|hf|
-                                hf.terminated_finalizers.iter().map(|id| Hash32::from_bytes(id.0)).collect()
-                            ).unwrap_or_default(),
+                            hardforks: b.hardforks.iter().map(|hf| visualizer_zcash::HardforkInspection {
+                                pow_activation_height: hf.pow_activation_height,
+                                bft_certificate_height: hf.bft_certificate_height,
+                                terminated_finalizers: hf.terminated_finalizers.iter().map(|id| Hash32::from_bytes(id.0)).collect(),
+                            }).collect(),
                             pow_headers: b
                                 .headers
                                 .iter()

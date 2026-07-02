@@ -83,8 +83,9 @@ impl HardForkSchedule {
     /// cannot be combined into a single increasing chain:
     ///
     /// - Two *different* rules at the same `pow_activation_height`, or
-    /// - `bft_certificate_height` not strictly increasing in pow-sorted order
-    ///   (a duplicate, or an inversion relative to `pow_activation_height`), or
+    /// - `bft_certificate_height` decreasing in pow-sorted order (an inversion
+    ///   relative to `pow_activation_height`; duplicates are allowed — several
+    ///   rules may share one BFT certificate height), or
     /// - The two sources interleaving by height. They may only overlap as a
     ///   shared, exactly-matching block (the shipped rules are the assumed past,
     ///   which the user rules may restate exactly and then extend).
@@ -137,9 +138,10 @@ impl HardForkSchedule {
         tagged.sort_by_key(|t| t.rule.pow_activation_height);
 
         // Two *different* rules at the same pow height are a conflicting overlap.
-        // bft_certificate_height carries the same constraint as pow_activation_height:
-        // in this pow-sorted order it must strictly increase, so the two heights share
-        // one coherent order and bft_certificate_height contains no duplicates.
+        // bft_certificate_height must be non-decreasing in this pow-sorted order, so
+        // the two heights share one coherent order. Unlike pow_activation_height,
+        // duplicates are allowed: several rules may be certified at the same BFT
+        // height (the BFT block then carries them all, in this canonical order).
         for pair in tagged.windows(2) {
             assert!(
                 pair[0].rule.pow_activation_height != pair[1].rule.pow_activation_height,
@@ -149,11 +151,11 @@ impl HardForkSchedule {
                 pair[1].rule,
             );
             assert!(
-                pair[0].rule.bft_certificate_height < pair[1].rule.bft_certificate_height,
+                pair[0].rule.bft_certificate_height <= pair[1].rule.bft_certificate_height,
                 "incoherently ordered hardfork rules: the rule at pow_activation_height {} \
                  has bft_certificate_height {}, but the next rule (pow_activation_height {}) \
-                 has bft_certificate_height {}; bft_certificate_height must strictly increase \
-                 with pow_activation_height (same order, no duplicates)",
+                 has bft_certificate_height {}; bft_certificate_height must be non-decreasing \
+                 with pow_activation_height",
                 pair[0].rule.pow_activation_height,
                 pair[0].rule.bft_certificate_height,
                 pair[1].rule.pow_activation_height,
@@ -209,13 +211,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "bft_certificate_height must strictly increase")]
-    fn duplicate_bft_height_is_rejected() {
-        HardForkSchedule::new(vec![rule(150, 10, 1), rule(300, 10, 2)]);
+    fn duplicate_bft_height_is_accepted() {
+        // Two rules certified at the same BFT height, distinct pow activations:
+        // both survive, in pow order.
+        let schedule = HardForkSchedule::new(vec![rule(300, 10, 2), rule(150, 10, 1)]);
+        let heights: Vec<(u64, u64)> = schedule
+            .rules()
+            .iter()
+            .map(|r| (r.pow_activation_height, r.bft_certificate_height))
+            .collect();
+        assert_eq!(heights, vec![(150, 10), (300, 10)]);
     }
 
     #[test]
-    #[should_panic(expected = "bft_certificate_height must strictly increase")]
+    #[should_panic(expected = "bft_certificate_height must be non-decreasing")]
     fn inverted_bft_height_is_rejected() {
         // pow_activation_height increases but bft_certificate_height decreases.
         HardForkSchedule::new(vec![rule(150, 20, 1), rule(300, 10, 2)]);

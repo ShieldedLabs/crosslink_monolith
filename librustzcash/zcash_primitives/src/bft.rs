@@ -145,12 +145,12 @@ impl HardForkConfig {
 ///
 /// The serialized form is consensus-critical (it is blake3-hashed, and that hash
 /// is the value finalizers sign — see [Blake3Hash] and [Vote]). New fields are
-/// therefore gated on [version]: `version >= 2` blocks serialize the [hardfork]
+/// therefore gated on [version]: `version >= 2` blocks serialize the [hardforks]
 /// and [do_not_include_until_bc_height] tail, while earlier versions serialize
 /// byte-for-byte as before, leaving their hashes and signatures unchanged.
 ///
 /// [version]: BftBlock::version
-/// [hardfork]: BftBlock::hardfork
+/// [hardforks]: BftBlock::hardforks
 /// [do_not_include_until_bc_height]: BftBlock::do_not_include_until_bc_height
 ///
 /// ## Design Notes
@@ -176,12 +176,14 @@ pub struct BftBlock {
     /// The PoW Headers
     // @Zooko: PoPoW?
     pub headers: Vec<BcBlockHeader>,
-    /// A single user-led hardfork rule activated by this block, if any.
+    /// The user-led hardfork rules activated by this block, in canonical schedule
+    /// order (ascending `pow_activation_height`). Usually empty; multiple rules may
+    /// share one BFT certificate height, so this is a list rather than an option.
     ///
     /// Serialized only in `version >= 2` blocks. For earlier versions this must
-    /// be `None`: it is not serialized and so not covered by the block hash or
+    /// be empty: it is not serialized and so not covered by the block hash or
     /// finalizer signatures.
-    pub hardfork: Option<HardForkConfig>,
+    pub hardforks: Vec<HardForkConfig>,
     /// BC height before which this BFT block must not be included.
     ///
     /// Serialized only in `version >= 2` blocks. For earlier versions this must
@@ -215,16 +217,13 @@ impl BftBlock {
         // Version 2 tail. Earlier versions end here, so their serialization (and
         // hence hash and signatures) is unchanged.
         if self.version >= 2 {
-            match &self.hardfork {
-                Some(hardfork) => {
-                    writer.write_u8(1)?;
-                    hardfork.zcash_serialize(&mut writer)?;
-                }
-                None => writer.write_u8(0)?,
+            writer.write_u8(u8::try_from(self.hardforks.len()).expect("at most 255 hardforks per BFT block"))?;
+            for hardfork in &self.hardforks {
+                hardfork.zcash_serialize(&mut writer)?;
             }
             writer.write_u64::<LittleEndian>(self.do_not_include_until_bc_height)?;
         } else {
-            assert!(self.hardfork.is_none());
+            assert!(self.hardforks.is_empty());
             assert!(self.do_not_include_until_bc_height == 0);
         }
         Ok(())
@@ -268,21 +267,16 @@ impl BftBlock {
         }
 
         // Version 2 tail; see zcash_serialize. Earlier versions default to NIL.
-        let (hardfork, do_not_include_until_bc_height) = if version >= 2 {
-            let hardfork = match reader.read_u8()? {
-                0 => None,
-                1 => Some(HardForkConfig::zcash_deserialize(&mut reader)?),
-                _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "invalid hardfork presence flag",
-                    ))
-                }
-            };
+        let (hardforks, do_not_include_until_bc_height) = if version >= 2 {
+            let hardfork_count = reader.read_u8()?;
+            let mut hardforks = Vec::with_capacity(hardfork_count as usize);
+            for _ in 0..hardfork_count {
+                hardforks.push(HardForkConfig::zcash_deserialize(&mut reader)?);
+            }
             let do_not_include_until_bc_height = reader.read_u64::<LittleEndian>()?;
-            (hardfork, do_not_include_until_bc_height)
+            (hardforks, do_not_include_until_bc_height)
         } else {
-            (None, 0)
+            (Vec::new(), 0)
         };
 
         Ok(BftBlock {
@@ -290,7 +284,7 @@ impl BftBlock {
             height,
             previous_block_fat_ptr,
             headers: array,
-            hardfork,
+            hardforks,
             do_not_include_until_bc_height,
         })
     }
@@ -328,7 +322,7 @@ impl BftBlock {
             height,
             previous_block_fat_ptr,
             headers,
-            hardfork: None,
+            hardforks: Vec::new(),
             do_not_include_until_bc_height: 0,
         })
     }

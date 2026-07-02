@@ -2689,7 +2689,7 @@ pub async fn viz_main(
                                     _ => Vec::new(),
                                 };
                             },
-                            hardfork: None,
+                            hardforks: Vec::new(),
                             do_not_include_until_bc_height: 0,
                         };
 
@@ -2936,7 +2936,7 @@ pub async fn viz_main(
                             height: 0,
                             previous_block_fat_ptr: FatPointerToBftBlock::null(),
                             headers: Vec::new(),
-                            hardfork: None,
+                            hardforks: Vec::new(),
                             do_not_include_until_bc_height: 0,
                         };
 

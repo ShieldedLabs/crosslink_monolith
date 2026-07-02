@@ -646,15 +646,17 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
     let fat_ptr = internal.fat_pointer_to_tip.clone();
     // Parent (current tip) do_not_include, carried forward so the value never regresses.
     let parent_do_not_include = internal.bft_blocks.last().map_or(0, |p| p.do_not_include_until_bc_height);
-    // The user-led hardfork scheduled at this BFT height, if any. validate_bft_block requires the
-    // proposal to carry exactly this hardfork (byte-for-byte) and set do_not_include to its
-    // activation height, so the proposer must emit it here.
-    let scheduled_hardfork = tfl_handle
+    // The user-led hardforks scheduled at this BFT height (several rules may share
+    // one certificate height). The config list is the canonical schedule, so this
+    // filter preserves canonical (ascending pow_activation_height) order — the same
+    // order validate_bft_block requires byte-for-byte.
+    let scheduled_hardforks: Vec<crate::config::HardForkConfig> = tfl_handle
         .config
         .hardforks
         .iter()
-        .find(|hf| hf.bft_certificate_height == bft_height)
-        .cloned();
+        .filter(|hf| hf.bft_certificate_height == bft_height)
+        .cloned()
+        .collect();
     drop(internal);
 
     match BftBlock::try_from(params, bft_height as u32, fat_ptr, headers) {
@@ -662,12 +664,14 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
             // Always propose v2 blocks: existing v1 blocks remain v1 (so their hashes/signatures
             // are untouched), and v2 >= any parent's version satisfies the monotonic-version check.
             block.version = 2;
-            // Emit the scheduled hardfork (if any) and propagate do_not_include monotonically:
-            // a hardfork block sets do_not_include = its pow_activation_height; otherwise carry the
-            // parent's forward so it never regresses (both as validate_bft_block requires).
-            if let Some(hf) = scheduled_hardfork {
-                block.do_not_include_until_bc_height = hf.pow_activation_height;
-                block.hardfork = Some(hf);
+            // Emit the scheduled hardforks (if any) and propagate do_not_include monotonically:
+            // a hardfork block sets do_not_include = the greatest activation height it carries
+            // (pointing at this block commits to every certificate in it, so the strictest one
+            // governs); otherwise carry the parent's forward so it never regresses (both as
+            // validate_bft_block requires).
+            if let Some(last) = scheduled_hardforks.last() {
+                block.do_not_include_until_bc_height = last.pow_activation_height;
+                block.hardforks = scheduled_hardforks;
             } else {
                 block.do_not_include_until_bc_height = parent_do_not_include;
             }
@@ -729,7 +733,7 @@ async fn handle_new_decided_bft_block(
                 signatures: Vec::new(),
             },
             headers: Vec::new(),
-            hardfork: None,
+            hardforks: Vec::new(),
             do_not_include_until_bc_height: 0,
         });
     }
@@ -896,54 +900,58 @@ async fn validate_bft_block(
         return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
     }
 
-    // If this node is configured with a hardfork at this BFT height, the proposal must
-    // carry exactly that hardfork (byte-for-byte) and set its do_not_include_until_bc_height
-    // to the hardfork's PoW activation height.
+    // The proposal must carry exactly the hardforks this node has scheduled at this BFT
+    // height — byte-for-byte, in canonical (ascending pow_activation_height) order, and
+    // none at all when none are scheduled — and set its do_not_include_until_bc_height
+    // to the greatest activation height among them (pointing at this block commits to
+    // every certificate in it, so the strictest one governs).
     //
     // This runs before the generic do_not_include_until_bc_height monotonicity check
     // below so that a regression *caused by the hardfork activation* is reported as its
     // own distinct error rather than the generic one.
-    if let Some(scheduled) = tfl_handle
+    let scheduled_hardforks: Vec<&crate::config::HardForkConfig> = tfl_handle
         .config
         .hardforks
         .iter()
-        .find(|hf| hf.bft_certificate_height == bft_height)
+        .filter(|hf| hf.bft_certificate_height == bft_height)
+        .collect();
     {
-        let scheduled_bytes = {
+        let serialize = |hf: &crate::config::HardForkConfig| {
             let mut bytes = Vec::new();
-            scheduled.zcash_serialize(&mut bytes).expect("serializing to a Vec is infallible");
+            hf.zcash_serialize(&mut bytes).expect("serializing to a Vec is infallible");
             bytes
         };
-        let proposal_matches = match &new_block.hardfork {
-            Some(hardfork) => {
-                let mut bytes = Vec::new();
-                hardfork.zcash_serialize(&mut bytes).expect("serializing to a Vec is infallible");
-                bytes == scheduled_bytes
-            }
-            None => false,
-        };
+        let proposal_matches = new_block.hardforks.len() == scheduled_hardforks.len()
+            && new_block
+                .hardforks
+                .iter()
+                .zip(scheduled_hardforks.iter())
+                .all(|(carried, scheduled)| serialize(carried) == serialize(scheduled));
         if !proposal_matches {
             warn!(
-                "BFT block at height {} must carry the scheduled hardfork byte-for-byte, but does not",
-                bft_height,
+                "BFT block at height {} must carry exactly the {} scheduled hardfork(s) byte-for-byte in schedule order, but does not",
+                bft_height, scheduled_hardforks.len(),
             );
             return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
         }
+    }
 
-        if new_block.do_not_include_until_bc_height != scheduled.pow_activation_height {
+    // Rules are pow-sorted, so the last scheduled rule has the greatest activation.
+    if let Some(last_scheduled) = scheduled_hardforks.last() {
+        if new_block.do_not_include_until_bc_height != last_scheduled.pow_activation_height {
             warn!(
-                "BFT hardfork block at height {} must set do_not_include_until_bc_height to the hardfork pow_activation_height {}, but it is {}",
-                bft_height, scheduled.pow_activation_height, new_block.do_not_include_until_bc_height,
+                "BFT hardfork block at height {} must set do_not_include_until_bc_height to the greatest carried pow_activation_height {}, but it is {}",
+                bft_height, last_scheduled.pow_activation_height, new_block.do_not_include_until_bc_height,
             );
             return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
         }
 
         // Separate error: the hardfork's PoW activation height must not regress the
         // monotonic do_not_include_until_bc_height relative to the parent.
-        if scheduled.pow_activation_height < parent_do_not_include {
+        if last_scheduled.pow_activation_height < parent_do_not_include {
             warn!(
                 "Hardfork pow_activation_height {} at BFT height {} is below the parent's do_not_include_until_bc_height {}; the hardfork activation regresses do_not_include_until_bc_height",
-                scheduled.pow_activation_height, bft_height, parent_do_not_include,
+                last_scheduled.pow_activation_height, bft_height, parent_do_not_include,
             );
             return (tenderlink::TMStatus::Fail, tenderlink::TMStatusReason::None);
         }
@@ -1118,8 +1126,8 @@ pub fn run_tfl_test(internal_handle: TFLServiceHandle) {
 /// scheduled hardforks whose `bft_certificate_height <= bft_height` (inclusive of a hardfork at
 /// `bft_height` itself), concatenated in canonical schedule order. An empty prefix yields
 /// `[0; 32]` (nil), so the no-hardfork case is a backwards-compatible no-op in tenderlink's
-/// signing. The schedule is already sorted with strictly-increasing `bft_certificate_height`,
-/// so the filtered set is exactly the prefix.
+/// signing. The schedule is sorted with non-decreasing `bft_certificate_height` (several rules
+/// may share one certificate height), so the filtered set is exactly the prefix.
 fn namespace_for_bft_height(hardforks: &[crate::config::HardForkConfig], bft_height: u64) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     let mut any = false;
