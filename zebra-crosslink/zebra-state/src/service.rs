@@ -36,7 +36,7 @@ use tower::buffer::Buffer;
 use zebra_chain::{
     block::{self, CountedHeader, HeightDiff},
     diagnostic::{task::WaitForPanics, CodeTimer},
-    parameters::{Network, NetworkUpgrade},
+    parameters::{HardForkSchedule, Network, NetworkUpgrade},
     subtree::NoteCommitmentSubtreeIndex,
 };
 
@@ -180,6 +180,9 @@ pub(crate) struct StateService {
 
     #[derivative(Debug = "ignore")]
     closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
+
+    /// the slash index blocks verification at hardfork activations; set at init
+    hardfork_schedule: Arc<HardForkSchedule>,
 }
 
 /// Return type for the crosslink fat-pointer gate closure.
@@ -378,6 +381,7 @@ impl StateService {
             read_service: read_service.clone(),
             max_finalized_queue_height: f64::NAN,
             closure_to_call_crosslink,
+            hardfork_schedule: config.hardfork_schedule.clone(),
         };
         timer.finish(module_path!(), line!(), "initializing state service");
 
@@ -865,6 +869,14 @@ impl StateService {
                             continue;
                         }
                         Some(true) => {}
+                    }
+
+                    // at a hardfork's PoW activation height, block any verification until the slash index reaches that height
+                    if let Some(rule) = self.hardfork_schedule.rule_active_at(child_block_height.0 as u64) {
+                        if rule.pow_activation_height == child_block_height.0 as u64 && self.read_service.db.slash_index_next_height().0 < child_block_height.0 {
+                            self.non_finalized_state_queued_blocks.queue(queued_child);
+                            continue;
+                        }
                     }
 
                     self.non_finalized_block_write_sent_hashes
