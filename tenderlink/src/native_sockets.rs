@@ -758,6 +758,7 @@ mod windows {
     #[inline]
     pub fn socket_setup() { // Windows
         unsafe {
+            #[link(name = "winmm")]
             unsafe extern "system" {
                 fn timeBeginPeriod(uPeriod: u32) -> u32;
                 fn timeEndPeriod(uPeriod: u32) -> u32;
