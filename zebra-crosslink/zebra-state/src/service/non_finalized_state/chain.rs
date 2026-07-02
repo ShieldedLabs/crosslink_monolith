@@ -1863,6 +1863,12 @@ impl Chain {
         // predicate, so double coverage is harmless; only under-coverage isn't.
         let     starting_from = db.slash_index_next_height().0;
         let mut open_runs     = db.load_open_slash_runs();
+        // The index covers the union of every rule's terminated finalizers, but this
+        // activation burns only for `finalizers`. Drop the other rules' runs, or their
+        // bonds get burned here — at the wrong activation height — via the replayed
+        // Close events and the sitting-duck sweep below, both of which consume
+        // `open_runs` without checking whose finalizer a run points at.
+        open_runs.retain(|_, (run_finalizer, _)| slashed_finalizers.contains(run_finalizer));
 
         let mut burned = BTreeSet::new();
         for h in  ((starting_from) .. (activation.0)) {
