@@ -83,6 +83,7 @@ use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
 
 use zebra_chain::block::genesis::regtest_genesis_block;
+use zebra_chain::parameters::{Network, HardForkSchedule};
 use zebra_consensus::{router::BackgroundTaskHandles, ParameterCheckpoint};
 use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
@@ -129,7 +130,7 @@ impl StartCmd {
         let is_regtest = config.network.network.is_regtest();
 
         let is_clt0 = 'is_clt0: { // Crosslink_Testnet_0
-            if let zebra_chain::parameters::Network::Testnet(params) = &config.network.network {
+            if let Network::Testnet(params) = &config.network.network {
                 if params.network_magic().0 == [b'C',b'l',b'T',b'0'] {
                     break 'is_clt0 true;
                 }
@@ -244,9 +245,12 @@ impl StartCmd {
         let actual_closure: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>> = Arc::new(std::sync::Mutex::new(None));
         let actual_closure2 = Arc::clone(&actual_closure);
 
+        let mut state_config = config.state.clone();
+        state_config.hardfork_schedule = Arc::new(HardForkSchedule::new(config.crosslink.hardforks.clone()));
+
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
             zebra_state::spawn_init(
-                config.state.clone(),
+                state_config,
                 &config.network.network,
                 max_checkpoint_height,
                 config.sync.checkpoint_verify_concurrency_limit
@@ -264,8 +268,6 @@ impl StartCmd {
 
         info!("logging database metrics on startup");
         read_only_state_service.log_db_metrics();
-
-        state_config.hardfork_schedule = Arc::new(HardForkSchedule::new(config.crosslink.hardforks.clone()));
 
         // Drive the finalizer-slashing bond index: catch up the backlog at startup, then keep up live.
         {
