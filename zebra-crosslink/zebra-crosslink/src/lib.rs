@@ -175,7 +175,7 @@ use zebra_chain::block::{
     Block, CountedHeader, Hash as ZebBlockHash, Header as ZebBlockHeader, Height as ZebBlockHeight,
 };
 use zebra_node_services::mempool::{Request as MempoolRequest, Response as MempoolResponse};
-use zebra_state::{crosslink::*, BondKey, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
+use zebra_state::{crosslink::*, Request as StateRequest, Response as StateResponse, ReadRequest as StateReadRequest, ReadResponse as StateReadResponse};
 
 /// Placeholder activation height for Crosslink functionality
 pub const TFL_ACTIVATION_HEIGHT: ZebBlockHeight = ZebBlockHeight(0);
@@ -1484,31 +1484,6 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
     let mut last_diagnostic_print = Instant::now();
     let mut current_bc_tip: Option<(ZebBlockHeight, ZebBlockHash)> = None;
 
-    /*
-    // one tracker per terminating hardfork; a single shared cursor scans the chain once
-    let mut slash_trackings = Vec::<FinalizerSlashTracking>::new();
-    let mut slashed_bonds_per_tracking = Vec::<HashSet<BondKeyID>>::new();
-    let mut slash_snap_height = ZebBlockHeight(0);
-    for slash_fork in &config.hardforks {
-        if slash_fork.terminated_finalizers.is_empty() {
-            continue;
-        }
-        // NOTE: this will change if the staking period changes
-        let end_height: u32 = slash_fork.pow_activation_height.try_into().expect("fits in u32");
-        assert!(end_height % zcash_primitives::transaction::STAKING_PERIOD == 0);
-        assert!(end_height != 0);
-        // ALT: determine bgn_height via PoS height (and deferred analysis)
-        let bgn_height: u32 = end_height.saturating_sub(2*zcash_primitives::transaction::STAKING_PERIOD).try_into().expect("fits in u32");
-        slash_trackings.push(FinalizerSlashTracking {
-            analysis_heights_exclusive: (ZebBlockHeight(bgn_height), ZebBlockHeight(end_height)),
-            slash_finalizers: slash_fork.terminated_finalizers.iter().copied().collect(),
-            bonds_staked_to_slash_finalizers_at_snap_height: HashMap::new(),
-        });
-        slashed_bonds_per_tracking.push(HashSet::new());
-    }
-    internal_handle.internal.lock().await.burned_known_through = burned_known_through_from_trackings(&slash_trackings, slash_snap_height);
-    */
-
     loop {
         // Calculate this prior to message handling so that handlers can use it:
         let new_bc_tip = if let Ok(StateResponse::Tip(val)) = (call.state)(StateRequest::Tip).await
@@ -1520,37 +1495,6 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
         tokio::time::sleep_until(run_instant).await;
         run_instant += MAIN_LOOP_SLEEP_INTERVAL;
-
-        /*
-        if !slash_trackings.is_empty() {
-            if let Some((bc_tip, _)) = current_bc_tip {
-                let prev_snap = slash_snap_height;
-                let max_height = bc_tip.min((slash_snap_height + 5).unwrap());
-                if let Err(err) = update_bonds_seen_for_finalizer_slash_tracking(internal_handle.clone(), &mut slash_trackings, &mut slashed_bonds_per_tracking, &mut slash_snap_height, max_height).await {
-                    println!("slashing error: {err:?}");
-                }
-                // the cursor advances even on a partial/errored pass, so a tracker is done once it crosses the activation
-                let newly_completed = slash_trackings.iter().any(|t| {
-                    let activation = t.analysis_heights_exclusive.1;
-                    prev_snap < activation && activation <= slash_snap_height
-                });
-                if newly_completed {
-                    // merge then advance the watermark under one lock so readers never see the watermark outrun the bonds
-                    let mut internal = internal_handle.internal.lock().await;
-                    for i in 0..slash_trackings.len() {
-                        let activation = slash_trackings[i].analysis_heights_exclusive.1;
-                        if prev_snap < activation && activation <= slash_snap_height {
-                            println!("slashing bonds at activation {}: {:?}", activation.0, slashed_bonds_per_tracking[i]);
-                            for bond in slashed_bonds_per_tracking[i].drain() {
-                                internal.burned_bonds.entry(bond).and_modify(|h| *h = (*h).min(activation)).or_insert(activation);
-                            }
-                        }
-                    }
-                    internal.burned_known_through = burned_known_through_from_trackings(&slash_trackings, slash_snap_height);
-                }
-            }
-        }
-        */
 
         // from this point onwards we must race to completion in order to avoid stalling incoming requests
         // NOTE: split to avoid deadlock from non-recursive mutex - can we reasonably change type?
@@ -1749,151 +1693,6 @@ async fn total_issuance_from_key(
     }
 
     Ok(scan_infos)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct BondKeyID(pub BondKey);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SlashTrackingBondChange {
-    pub change_height: ZebBlockHeight,
-    pub finalizer_pk_id: PubKeyID,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FinalizerSlashTracking {
-    pub analysis_heights_exclusive: (ZebBlockHeight, ZebBlockHeight),
-    pub slash_finalizers: HashSet<PubKeyID>,
-    pub bonds_staked_to_slash_finalizers_at_snap_height: HashMap<BondKeyID, SlashTrackingBondChange>, // from bond key
-}
-
-// burns are known below the earliest activation whose scan is unfinished; None once all are done
-fn burned_known_through_from_trackings(trackings: &[FinalizerSlashTracking], snap_height: ZebBlockHeight) -> Option<ZebBlockHeight> {
-    let mut min_incomplete: Option<ZebBlockHeight> = None;
-    for t in trackings {
-        let activation = t.analysis_heights_exclusive.1;
-        if snap_height < activation {
-            min_incomplete = Some(min_incomplete.map_or(activation, |m| m.min(activation)));
-        }
-    }
-    min_incomplete.map(|a| a.sat_sub(1))
-}
-
-async fn update_bonds_seen_for_finalizer_slash_tracking(internal_handle: TFLServiceHandle, trackings: &mut [FinalizerSlashTracking], bonds_to_slash: &mut [HashSet<BondKeyID>], snap_height: &mut ZebBlockHeight, max_height: ZebBlockHeight) -> Result<(), String> {
-    use zcash_primitives::transaction;
-    let call = internal_handle.call.clone();
-
-    // single shared pass; each tracker only consumes heights below its own activation
-    let scan_end = trackings.iter()
-        .map(|t| t.analysis_heights_exclusive.1)
-        .max()
-        .unwrap_or(*snap_height)
-        .min((max_height+1).unwrap());
-    if *snap_height >= scan_end {
-        return Ok(());
-    }
-
-    for height in snap_height.0 .. scan_end.0 {
-        let height = ZebBlockHeight(height);
-        // @Todo: use NonFinalizedState service here instead of finalized state service. scanning may have to be redone on reorgs?
-        let res = (call.state)(StateRequest::Block(height.into())).await;
-
-        let block = match res {
-            Ok(StateResponse::Block(Some(block))) => block,
-            Ok(StateResponse::Block(None)) => return Err(format!("failed to get block at height {}", height.0)),
-            _ => return Err(format!("unexpectedly failed to get block at height {}: {res:?}", height.0)),
-        };
-
-        if block.transactions.len() == 0 {
-            return Err(format!("block at height {} had 0 transactions", height.0));
-        }
-
-        for tx in block.transactions.iter() {
-            let Some(staking_action) = tx.staking_action() else {
-                continue;
-            };
-
-            for (tracking, bonds_to_slash) in trackings.iter_mut().zip(bonds_to_slash.iter_mut()) {
-                let (analysis_bgn_height, analysis_end_height) = tracking.analysis_heights_exclusive;
-                if height >= analysis_end_height {
-                    continue;
-                }
-
-                // NOTE: we have to do additional speculative work because we don't keep "from" info in the staking action
-                match staking_action.kind {
-                    StakingActionKind::CreateNewDelegationBond => {
-                        let bond = transaction::StakingAction_CreateNewDelegationBond::try_from_union(&staking_action).unwrap();
-                        let finalizer_pk_id = PubKeyID(bond.target_finalizer);
-                        if tracking.slash_finalizers.contains(&finalizer_pk_id) {
-                            // TO finalizer
-                            tracking.bonds_staked_to_slash_finalizers_at_snap_height.insert(
-                                BondKeyID(bond.unique_pubkey),
-                                SlashTrackingBondChange { change_height: height, finalizer_pk_id }
-                            );
-                        }
-                    }
-                    StakingActionKind::RetargetDelegationBond => {
-                        let bond = transaction::StakingAction_RetargetDelegationBond::try_from_union(&staking_action).unwrap();
-                        let finalizer_pk_id = PubKeyID(bond.target_finalizer);
-
-                        if tracking.slash_finalizers.contains(&finalizer_pk_id) {
-                            // TO finalizer
-                            tracking.bonds_staked_to_slash_finalizers_at_snap_height.insert(
-                                BondKeyID(bond.unique_pubkey),
-                                SlashTrackingBondChange { change_height: height, finalizer_pk_id }
-                            );
-                        } else {
-                            // FROM finalizer
-                            if let Some(details) = tracking.bonds_staked_to_slash_finalizers_at_snap_height.remove(&BondKeyID(bond.unique_pubkey)) {
-                                if analysis_bgn_height <= height && height < analysis_end_height {
-                                    // @Todo: @Think: If we slash these bonds, it's more correct in the sense that it slashes bonds that were staked
-                                    //                to the finalizer coming into the block at the analysis begin height. However, this is a slash
-                                    //                consensus change that may be more expensive computationally and conceptually than ignoring them.
-                                    bonds_to_slash.insert(BondKeyID(bond.unique_pubkey));
-                                }
-                            }
-                        }
-                    }
-                    StakingActionKind::BeginDelegationUnbonding => {
-                        let bond = transaction::StakingAction_BeginDelegationUnbonding::try_from_union(&staking_action).unwrap();
-                        // FROM finalizer
-                        if let Some(details) = tracking.bonds_staked_to_slash_finalizers_at_snap_height.remove(&BondKeyID(bond.unique_pubkey)) {
-                            if analysis_bgn_height <= height && height < analysis_end_height {
-                                // @Todo: @Think: If we slash these bonds, it's more correct in the sense that it slashes bonds that were staked
-                                //                to the finalizer coming into the block at the analysis begin height. However, this is a slash
-                                //                consensus change that may be more expensive computationally and conceptually than ignoring them.
-                                bonds_to_slash.insert(BondKeyID(bond.unique_pubkey));
-                            }
-                        }
-                    }
-
-                    StakingActionKind::Null => panic!("invalid staking action in block"),
-                    StakingActionKind::WithdrawDelegationBond => {},
-
-                    StakingActionKind::RegisterFinalizer |
-                        StakingActionKind::ConvertFinalizerRewardToDelegationBond |
-                        StakingActionKind::UpdateFinalizerKey =>
-                        todo!("unhandled"),
-                }
-            }
-        }
-
-        for (tracking, bonds_to_slash) in trackings.iter_mut().zip(bonds_to_slash.iter_mut()) {
-            let (analysis_bgn_height, analysis_end_height) = tracking.analysis_heights_exclusive;
-            if analysis_bgn_height <= height && height < analysis_end_height {
-                // Add all bonds currently allocated to a slashed finalizer to our "big list of bonds to slash".
-                // We no longer need to track them here as we are already committing to fully removing them from existence.
-                tracking.bonds_staked_to_slash_finalizers_at_snap_height.retain(|bond_key, v| {
-                    bonds_to_slash.insert(*bond_key);
-                    false
-                });
-            }
-        }
-
-        // advance per block so a mid-pass error doesn't reprocess applied blocks next tick
-        *snap_height = ZebBlockHeight(height.0 + 1);
-    }
-
-    Ok(())
 }
 
 async fn tfl_service_incoming_request(

@@ -871,11 +871,22 @@ impl StateService {
                         Some(true) => {}
                     }
 
-                    // at a hardfork's PoW activation height, block any verification until the slash index reaches that height
+                    // At a hardfork's PoW activation height, defer until the slash index
+                    // has incorporated every finalized block. This only bounds how much
+                    // slash_window_burns replays at commit time — it is a perf guard, not
+                    // a correctness requirement (the replay falls back to the finalized db
+                    // for heights the index hasn't reached). The predicate must NOT wait
+                    // for the index to reach the activation height itself: the index only
+                    // scans finalized blocks, and finality trails the PoW tip by sigma, so
+                    // that would deadlock the chain at every activation.
                     if let Some(rule) = self.hardfork_schedule.rule_active_at(child_block_height.0 as u64) {
-                        if rule.pow_activation_height == child_block_height.0 as u64 && self.read_service.db.slash_index_next_height().0 < child_block_height.0 {
-                            self.non_finalized_state_queued_blocks.queue(queued_child);
-                            continue;
+                        if rule.pow_activation_height == child_block_height.0 as u64 {
+                            let finalized_tip = self.read_service.db.finalized_tip_height();
+                            let index_next = self.read_service.db.slash_index_next_height();
+                            if finalized_tip.is_some_and(|tip| index_next.0 <= tip.0) {
+                                self.non_finalized_state_queued_blocks.queue(queued_child);
+                                continue;
+                            }
                         }
                     }
 

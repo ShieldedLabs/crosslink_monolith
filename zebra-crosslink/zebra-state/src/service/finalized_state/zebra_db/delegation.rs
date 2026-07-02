@@ -218,7 +218,12 @@ impl DiskWriteBatch {
             }
         }
 
-        // Persist slash burns applied to this block in the non-finalized state
+        // Persist slash burns applied to this block in the non-finalized state.
+        // Deliberately after the reward write above (decided 2026-07-02): a bond
+        // burned at activation height A still receives A's reward before its status
+        // flips to Burned. The value is permanently locked either way; keeping
+        // issuance uniform avoids a special case in the reward path. The
+        // non-finalized push orders it the same way (rewards in push, burns after).
         let bond_status_by_key_cf = db.db.cf_handle(BOND_STATUS_BY_KEY).unwrap();
         for bond_key in &finalized.bond_burns {
             self.zs_insert(&bond_status_by_key_cf, *bond_key, BondStatus::Burned);

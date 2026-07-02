@@ -313,15 +313,7 @@ impl NonFinalizedState {
 
         // If the block is invalid, return the error,
         // and drop the cloned parent Arc, or newly created chain fork.
-        let mut modified_chain = self.validate_and_commit(parent_chain, prepared, finalized_state)?;
-
-        // at a hardfork's PoW activation height, burn every bond that delegated to a slashed finalizer anywhere in [A - W, A)
-        if let Some(rule) = self.hardfork_schedule.rule_active_at(height.0 as u64) {
-            if rule.pow_activation_height == height.0 as u64 {
-                let finalizers: Vec<[u8; 32]> = rule.terminated_finalizers.iter().map(|f| f.0).collect();
-                std::sync::Arc::make_mut(&mut modified_chain).apply_slash_burns(finalized_state, &finalizers, height);
-            }
-        }
+        let modified_chain = self.validate_and_commit(parent_chain, prepared, finalized_state)?;
 
         // If the block is valid:
         // - add the new chain fork or updated chain to the set of recent chains
@@ -526,6 +518,8 @@ impl NonFinalizedState {
             });
         }
 
+        let height = prepared.height;
+
         // Reads from disk
         //
         // TODO: if these disk reads show up in profiles, run them in parallel, using std::thread::spawn()
@@ -573,7 +567,22 @@ impl NonFinalizedState {
             }
         })?;
 
-        Self::validate_and_update_parallel(new_chain, contextual, sprout_final_treestates)
+        let mut chain =
+            Self::validate_and_update_parallel(new_chain, contextual, sprout_final_treestates)?;
+
+        // At a hardfork's PoW activation height, burn every bond that delegated to a
+        // slashed finalizer anywhere in [A - W, A). This lives here — not in
+        // commit_block — so that a block starting a new chain (parent == finalized
+        // tip, via commit_new_chain) burns too; both commit paths funnel through
+        // this function after the push.
+        if let Some(rule) = self.hardfork_schedule.rule_active_at(height.0 as u64) {
+            if rule.pow_activation_height == height.0 as u64 {
+                let finalizers: Vec<[u8; 32]> = rule.terminated_finalizers.iter().map(|f| f.0).collect();
+                Arc::make_mut(&mut chain).apply_slash_burns(finalized_state, &finalizers, height);
+            }
+        }
+
+        Ok(chain)
     }
 
     /// Validate `contextual` and update `new_chain`, doing CPU-intensive work in parallel batches.

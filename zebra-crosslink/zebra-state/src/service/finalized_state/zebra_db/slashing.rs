@@ -115,7 +115,11 @@ pub fn apply_staking_action_to_open_runs(
         }
         BeginDelegationUnbonding => close_slash_run(open, bond, height, &mut out),
         // WithdrawDelegationBond: the run already closed at unbonding.
-        // @Todo: Convert/Register/UpdateFinalizerKey
+        // Register/Convert/UpdateFinalizerKey are deliberately ignored (decided
+        // 2026-07-02): the bond state machine doesn't implement them either, so
+        // they cannot create, retarget, or re-key a bond today. If they are ever
+        // implemented, they need arms here in the same change or the burn set
+        // under-counts.
         _ => {}
     }
     out
