@@ -871,11 +871,19 @@ impl StateService {
                         Some(true) => {}
                     }
 
-                    // at a hardfork's PoW activation height, block any verification until the slash index reaches that height
+                    // at a hardfork's PoW activation height the slash index blocks verification, but only
+                    // until it has incorporated every finalized block. The finalized part of [A-W, A) then
+                    // comes from the index and slash_window_burns replays the non-finalized tail (F, A) from
+                    // this chain; waiting for the index to reach A itself would stall the tip behind
+                    // finalization (and could deadlock if A-1 can't finalize without A).
                     if let Some(rule) = self.hardfork_schedule.rule_active_at(child_block_height.0 as u64) {
-                        if rule.pow_activation_height == child_block_height.0 as u64 && self.read_service.db.slash_index_next_height().0 < child_block_height.0 {
-                            self.non_finalized_state_queued_blocks.queue(queued_child);
-                            continue;
+                        if rule.pow_activation_height == child_block_height.0 as u64 {
+                            let index_next = self.read_service.db.slash_index_next_height().0;
+                            let index_ready = self.read_service.db.finalized_tip_height().map_or(true, |tip| index_next > tip.0);
+                            if !index_ready {
+                                self.non_finalized_state_queued_blocks.queue(queued_child);
+                                continue;
+                            }
                         }
                     }
 

@@ -1858,12 +1858,18 @@ impl Chain {
         // Only sensible once `finalized_height <= slash_index_next_height()`, since we are downstream of finalized db.
         let slashed_finalizers: std::collections::BTreeSet<[u8; 32]> = finalizers.iter().copied().collect();
 
-        // start where finalized db left off, then detect cockroach bonds
+        // Start where the finalized index left off and replay this chain's blocks. The readiness gate
+        // (send_ready_non_finalized_queued) defers activation until the index has incorporated every
+        // finalized block, so `starting_from` equals this chain's non-finalized root and the whole tail
+        // [starting_from, activation) is non-finalized blocks of this chain.
         let mut open_runs     = db.load_open_slash_runs();
         let     starting_from = db.slash_index_next_height().0;
-        for h in  ((starting_from) .. (activation.0)) {
+        debug_assert!(starting_from >= self.non_finalized_root_height().0, "slash index must reach this chain's root before burning (readiness gate violated)");
+        for h in starting_from..activation.0 {
             let height = Height(h);
-            let cvb = self.block(crate::HashOrHeight::Height(height)).expect("every height in [slash_index_next_height(), activation) must be a non-finalized block in this chain; slash burns must not be applied until the finalized slash index has advanced to this chain's root");
+            // A missing block means the index fell behind this chain's root, which the readiness gate must
+            // prevent; panicking rather than silently under-burning keeps nodes in consensus.
+            let cvb = self.block(crate::HashOrHeight::Height(height)).expect("slash-window tail height must be a non-finalized block in this chain (guaranteed by the readiness gate)");
             for tx in cvb.block.transactions.iter() {
                 let Some(action) = tx.staking_action() else {
                     continue;
