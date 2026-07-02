@@ -278,7 +278,7 @@ impl StartCmd {
                 .flat_map(|hf| hf.terminated_finalizers.iter().map(|f| f.0))
                 .collect();
             tokio::spawn(zebra_state::drive_slash_index(
-                read_only_state_service.db(),
+                read_only_state_service.db_clone(),
                 slashed_finalizers,
             ));
         }
