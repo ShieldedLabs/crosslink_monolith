@@ -1241,6 +1241,9 @@ pub fn sync(
     // Lite checkpointing. See CheckpointState.
     let checkpoint_target: Option<Hash> = match &config.network_checkpoint_block_hash {
         None => None,
+        // "" is the explicit opt-out: with a default checkpoint baked into the
+        // config, omitting the field no longer means "no checkpoint".
+        Some(s) if s.is_empty() => None,
         Some(s) => match s.parse::<Hash>() {
             Ok(hash) => Some(hash),
             Err(err) => {

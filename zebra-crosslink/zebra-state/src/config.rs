@@ -130,6 +130,9 @@ pub struct Config {
     /// it has confirmed this block, and then only syncs from peers whose main
     /// chain contains it, until the block is committed locally. See the
     /// `CheckpointState` state machine in `new_network.rs`.
+    ///
+    /// Defaults to the current network checkpoint (see `Default for Config`).
+    /// Set to a different hash to override, or to "" to disable checkpointing.
     pub network_checkpoint_block_hash: Option<String>,
 
     #[serde(skip)]
@@ -208,7 +211,9 @@ impl Default for Config {
             network_identity_seed_string: None,
             network_local_port: 0,
             network_initial_peers: Vec::new(),
-            network_checkpoint_block_hash: None,
+            network_checkpoint_block_hash: Some(
+                "02fc9aa7652b2a9a9f6196a446265fed6012227373ed34e0b17c7a3298db005e".to_string(),
+            ),
             hardfork_schedule: Default::default(),
         }
     }
