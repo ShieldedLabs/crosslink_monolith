@@ -3286,6 +3286,105 @@ fn save_wallet_snapshot_if_enabled(
     }
 }
 
+fn publish_loaded_wallet_snapshot(
+    wallet_state: &Arc<Mutex<WalletState>>,
+    miner_wallet: &ManualWallet,
+    user_wallet: &ManualWallet,
+    pow_cache: &PoWCache,
+) {
+    fn balances(wallet: &ManualWallet) -> (u64, u64, u64) {
+        let mut unshielded_funds = 0;
+        let mut shielded_pending_funds = 0;
+        let mut shielded_spendable_funds = 0;
+
+        for txo in &wallet.accounts[0].utxos {
+            unshielded_funds += txo.value.into_u64();
+        }
+
+        for note in &wallet.accounts[0].unspent_orchard_notes {
+            let val = note.note.value().inner();
+            if note.recv_h < wallet.chain_tip_h.sat_sub(5) {
+                shielded_spendable_funds += val;
+            } else {
+                shielded_pending_funds += val;
+            }
+        }
+
+        (unshielded_funds, shielded_pending_funds, shielded_spendable_funds)
+    }
+
+    let (miner_unshielded_funds, miner_shielded_pending_funds, miner_shielded_spendable_funds) = balances(miner_wallet);
+    let (user_unshielded_funds, user_shielded_pending_funds, user_shielded_spendable_funds) = balances(user_wallet);
+
+    let mut stake_positions_bonded = Vec::new();
+    let mut stake_positions_unbonded = Vec::new();
+    for tx in &user_wallet.txs {
+        if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
+        if let Some(staking_action) = &tx.staking_action {
+            if let Some(create_bond) = StakingAction_CreateNewDelegationBond::try_from_union(staking_action) {
+                stake_positions_bonded.push((create_bond.unique_pubkey, create_bond.target_finalizer, create_bond.amount_zats));
+            }
+            if let Some(retarget) = StakingAction_RetargetDelegationBond::try_from_union(staking_action) {
+                if let Some(existing_i) = stake_positions_bonded.iter().position(|p| p.0 == retarget.unique_pubkey) {
+                    stake_positions_bonded[existing_i].1 = retarget.target_finalizer;
+                }
+            }
+            if let Some(unbond) = StakingAction_BeginDelegationUnbonding::try_from_union(staking_action) {
+                if let Some(existing_i) = stake_positions_bonded.iter().position(|p| p.0 == unbond.unique_pubkey) {
+                    stake_positions_unbonded.push((unbond.unique_pubkey, stake_positions_bonded[existing_i].1, stake_positions_bonded[existing_i].2));
+                    stake_positions_bonded.remove(existing_i);
+                } else {
+                    stake_positions_unbonded.push((unbond.unique_pubkey, [0; 32], u64::MAX));
+                }
+            }
+            if let Some(unbond) = StakingAction_WithdrawDelegationBond::try_from_union(staking_action) {
+                if let Some(existing_i) = stake_positions_unbonded.iter().position(|p| p.0 == unbond.unique_pubkey) {
+                    stake_positions_unbonded.remove(existing_i);
+                }
+            }
+        }
+    }
+
+    let mut user_staked_funds = 0;
+    let mut user_withdrawable_funds = 0;
+    for p in &mut stake_positions_bonded {
+        if let Some(zats) = user_wallet.seen_bond_values.get(&p.0) {
+            p.2 = *zats;
+        }
+        user_staked_funds += p.2;
+    }
+    for p in &mut stake_positions_unbonded {
+        if let Some(zats) = user_wallet.seen_bond_values.get(&p.0) {
+            p.2 = *zats;
+        }
+        user_withdrawable_funds += p.2;
+    }
+
+    let mut lock = wallet_state.lock().unwrap();
+    lock.user_txs = user_wallet.txs.clone();
+    lock.miner_txs = miner_wallet.txs.clone();
+    lock.user_local_txs = [WalletTx::EMPTY; 3];
+    lock.user_local_txs_n = 0;
+    lock.miner_local_txs = [WalletTx::EMPTY; 3];
+    lock.miner_local_txs_n = 0;
+    lock.waiting_for_send = false;
+    lock.waiting_for_faucet = false;
+    lock.waiting_for_stake_to_finalizer = false;
+    lock.miner_unshielded_funds = miner_unshielded_funds;
+    lock.miner_shielded_pending_funds = miner_shielded_pending_funds;
+    lock.miner_shielded_spendable_funds = miner_shielded_spendable_funds;
+    lock.miner_seen_h = miner_wallet.chain_tip_h.0;
+    lock.user_unshielded_funds = user_unshielded_funds;
+    lock.user_shielded_pending_funds = user_shielded_pending_funds;
+    lock.user_shielded_spendable_funds = user_shielded_spendable_funds;
+    lock.stake_positions_bonded = stake_positions_bonded;
+    lock.stake_positions_unbonded = stake_positions_unbonded;
+    lock.wallets_sync_h = pow_cache.next_tip_h.saturating_sub(1);
+    lock.wallets_tip_h = user_wallet.chain_tip_h.0.into();
+    lock.staked_balance = user_staked_funds;
+    lock.withdrawable_balance = user_withdrawable_funds;
+}
+
 fn shard_tree_size(tree: &OrchardShardTree) -> u64 {
     tree.max_leaf_position(None)
         .expect("Infallible Memory Store")
@@ -3931,6 +4030,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>, snapshot_path: O
                 user_wallet = snapshot.user_wallet;
                 pow_cache = snapshot.pow_cache;
                 orchard_tree = snapshot.orchard_tree;
+                publish_loaded_wallet_snapshot(&wallet_state, &miner_wallet, &user_wallet, &pow_cache);
             }
             Ok(None) => println!("no matching wallet snapshot at {path:?}; starting wallet scan from genesis"),
             Err(err) => println!("WALLET SNAPSHOT ERROR: failed to load {path:?}: {err:?}; starting wallet scan from genesis"),
