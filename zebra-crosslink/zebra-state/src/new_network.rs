@@ -1696,14 +1696,25 @@ pub fn sync(
 
                         } else if hash_or_0 != block::Hash([0; 32]) {
                             requests_by_hash.entry(hash_or_0).and_modify(|c| *c += 1).or_insert(1);
+                            // A SEARCH by-hash probe (sentinel height) is bookkeeping, not real
+                            // block sync, so it must not consume the download budget.
+                            if height != CHECKPOINT_SEARCH_HEIGHT { active_block_dls += 1; }
 
                         } else {
                             requests_by_height.entry(height).and_modify(|c| *c += 1).or_insert(1);
+                            // A pending LOCKED checkpoint test is a by-height (hash-0) probe. Peers
+                            // below the checkpoint height never answer it, so it churns until timeout;
+                            // counting it would let such probes exhaust MAX_BANDWIDTH_BLOCKS_PER_RES
+                            // and starve real downloads from peers that DID pass. Don't count it.
+                            // (Once a peer passes, the slot's hash is filled in and it lands in the
+                            // branch above as a real download.) @Volatile: assumes real requests are
+                            // always by-hash; the historical by-height path is currently disabled.
+                            let is_locked_probe = matches!(checkpoint_state,
+                                CheckpointState::Locked { height: cp, .. } if cp == height);
+                            if !is_locked_probe { active_block_dls += 1; }
                         }
                     }
                 }
-
-                active_block_dls += peer.block_downloads.used_count();
             }
             let prev_active_block_dls = active_block_dls;
 
