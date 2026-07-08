@@ -1734,7 +1734,7 @@ pub fn sync(
             'send_to_peers: for connection_key in peer_random_keys {
                 let Peer { origin, their_tree, their_queue, ref mut block_downloads, checkpoint_passed, checkpoint_last_tested, .. } = peers.get_mut(&connection_key).unwrap();
                 if count_of_peers_we_started_download_from >= MAX_PEERS_TO_INIT_DLS_FROM { break 'send_to_peers; }
-                let mut did_we_actually_start_a_download_bool_for_increment_at_the_end = false;
+                let active_block_dls_before_this_peer = active_block_dls; // to detect if we start any dl for this peer
 
 
                 if *their_tree == NearTipBranches::default() {
@@ -1968,7 +1968,6 @@ pub fn sync(
                                     let dups = requests_by_hash.entry(hash).or_insert(0);
                                     if *dups < MAX_REQUEST_DUPLICATES_N {
                                         if let Some(dl_i) = block_downloads.insert(height_hash) {
-                                            did_we_actually_start_a_download_bool_for_increment_at_the_end = true;
                                             active_block_dls += 1; // total in flight
                                             *dups += 1; // duplicates of this block
                                             if TRACE { tracing::info!("Include request for near-tip   block @ {height}, {hash}, x{}! New DL count for peer: {}", *dups, block_downloads.used_flags.count_ones()); }
@@ -2011,7 +2010,9 @@ pub fn sync(
 
                 queue_blocks_to_request();
 
-                if did_we_actually_start_a_download_bool_for_increment_at_the_end {
+                // active_block_dls only advances inside queue_blocks_to_request, so a bump
+                // means this peer started at least one download.
+                if active_block_dls > active_block_dls_before_this_peer {
                     count_of_peers_we_started_download_from += 1;
                 }
             }
