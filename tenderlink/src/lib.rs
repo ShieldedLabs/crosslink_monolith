@@ -71,6 +71,7 @@ const STP_PACKLET_HDR: usize = 2;
 const PATH_MTU: usize = UDP_mMTU
                       - STP_HEADER_SIZE
                       - STP_PACKLET_HDR;
+const MAX_BFT_PROPOSAL_SIZE: usize = 8 * 1024 * 1024;
 
 // Tweak this!
 const MAX_BANDWIDTH_BYTES_PER_SECOND: usize = 1_000_000;
@@ -716,6 +717,17 @@ impl TMState {
             PACKET_TYPE_PROPOSAL_CHUNK => {
                 let Some(hdr) = PacketProposalChunkHeader::read_from(&mut &signed_data[..])
                 else { return TMStatus::Fail; };
+                let proposal_size = hdr.proposal_size as usize;
+                if proposal_size > MAX_BFT_PROPOSAL_SIZE {
+                    eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}.{}: proposal too large ({} bytes). Ignoring...",
+                        height, round, chunk_i, hdr.proposal_size);
+                    return TMStatus::Fail;
+                }
+                if chunk_i >= proposal_size.div_ceil(PROPOSAL_CHUNK_DATA_SIZE) {
+                    eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}.{}: proposal chunk out of range for {} bytes. Ignoring...",
+                        height, round, chunk_i, hdr.proposal_size);
+                    return TMStatus::Fail;
+                }
 
                 // "have they previously proposed a different value?"
                 if is_prev_seen_round && round_data.proposal_sigs_n > 0 {
@@ -1067,7 +1079,7 @@ impl TMState {
                 // new roster by the decided-block closure).
                 self.vote_namespace = new_vote_namespace;
                 self.recent_commit_round_cache.push(self.rounds_data[i].clone());
-                self.rounds_data.retain(|r| r.height < self.height);
+                self.rounds_data.retain(|r| r.height >= self.height);
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
                 self.start_round(roster, now, 0).await;
@@ -2096,7 +2108,19 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 };
                 let proposal_size = hdr.proposal_size as usize;
                 let chunk_i       = hdr.chunk_i       as usize;
-                let chunk_size = usize::min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_i * PROPOSAL_CHUNK_DATA_SIZE);
+                if proposal_size > MAX_BFT_PROPOSAL_SIZE {
+                    eprintln!("{:05}: couldn't read proposal chunk: proposal too large {}", my_port, proposal_size);
+                    continue;
+                }
+                let Some(chunk_o) = chunk_i.checked_mul(PROPOSAL_CHUNK_DATA_SIZE) else {
+                    eprintln!("{:05}: couldn't read proposal chunk: chunk index overflow {}", my_port, chunk_i);
+                    continue;
+                };
+                if chunk_o >= proposal_size {
+                    eprintln!("{:05}: couldn't read proposal chunk: chunk index out of range {}", my_port, chunk_i);
+                    continue;
+                }
+                let chunk_size = usize::min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_o);
                 let packet_size = chunk_size + PROPOSAL_PACKET_EXTRA;
 
                 // NOTE: assume for the moment that this is the valid height, we'll check in the subsequent call
