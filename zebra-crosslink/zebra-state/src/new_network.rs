@@ -2435,13 +2435,13 @@ pub fn sync(
                 let have_parent_in_chains           = is_parent_in_chains(&read_state, &near_tip_chains, parent_hash);
                 let have_parent_in_blocks_to_commit = blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == parent_hash);
 
-                if !have_parent_in_chains && !have_parent_in_blocks_to_commit {
-                    // TODO: we should keep these, but have them easily evictable, for OoO block downloads
-                    warning!("Block does not link anywhere known, neither to our chains nor to our blocks-to-commit queue! Not queueing; dropping: height {alleged_height} hash {alleged_hash}, parent {parent_hash}");
-                    continue 'process_packets;
-                }
-
-                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, valid hash and height and links somewhere known..."); }
+                // @Experimental: Accept non-committable tails by commenting out the skip. This should be vetted for DoS - could an adversary queue nonsense blocks?
+                // if !have_parent_in_chains && !have_parent_in_blocks_to_commit {
+                //     // TODO: we should keep these, but have them easily evictable, for OoO block downloads
+                //     warning!("Block does not link anywhere known, neither to our chains nor to our blocks-to-commit queue! Not queueing; dropping: height {alleged_height} hash {alleged_hash}, parent {parent_hash}");
+                //     continue 'process_packets;
+                // }
+                // if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, valid hash and height and links somewhere known..."); }
 
                 use zebra_chain::serialization::ZcashDeserializeInto;
                 let Some(block) = some_or_kill!(block_data.zcash_deserialize_into::<Block>().ok(), "Failed to deserialize block") else {
