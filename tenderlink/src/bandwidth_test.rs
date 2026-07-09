@@ -967,6 +967,7 @@ pub const MAX_REASSEMBLY_SLOTS: usize = 128; // @Todo: convert max slots into ma
 pub const MAX_JUMBOGRAM_LEN: usize = 1 << 23; // 8 MB, matches the 23-bit field
 pub const MAX_JUMBOGRAM_IDS: u32   = 1 << 18; // matches 18-bit field
 
+const ACK_TRACKING_PACKET_CAPACITY: u64 = 2048 * 64;
 pub const ACK_BUFFER_TIME_NS: u64 = 50_000_000;
 
 #[derive(Default)]
@@ -1832,10 +1833,11 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         
                         let time_to_considered_dropped = (state.RTT_mean as u64 * 100_000 * 2).max((2*(current_time_now_ns - state.last_ack_received_time)).min(1_000_000_000));
                         
-                        // TODO: Block sending until we have space.
-                        assert!(state.send_sequence_number - state.packets_waiting_ack_tail < 2048*64);
+                        if state.send_sequence_number.saturating_sub(state.packets_waiting_ack_tail) >= ACK_TRACKING_PACKET_CAPACITY && OVERLY_VERBOSE {
+                            println!("ACK tracking window full; blocking sends until old packets are acked or declared lost.");
+                        }
                         while state.packets_waiting_ack_tail < state.send_sequence_number {
-                            let bit_index = state.packets_waiting_ack_tail % (2048*64);
+                            let bit_index = state.packets_waiting_ack_tail % ACK_TRACKING_PACKET_CAPACITY;
                             if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                 let mut send_time = get_send_time_for_sequence_number(state.packets_waiting_ack_tail, &state.send_time_band, state.send_time_band_head_index);
                                 if send_time != 0 && (state.RTT_mean == 0 || (current_time_now_ns - send_time) < time_to_considered_dropped) {
@@ -1916,7 +1918,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         }
                         let could_have_sent = packet_send_allowance_now != 0;
                         
-                        let ring_buffer_not_full = state.send_sequence_number - state.packets_waiting_ack_tail < 2048*64 - 1;
+                        let ring_buffer_not_full = state.send_sequence_number.saturating_sub(state.packets_waiting_ack_tail) < ACK_TRACKING_PACKET_CAPACITY - 1;
 
                         state.current_tu = state.current_tu.min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                         if ring_buffer_not_full && state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.last_sent_tu_probe_time_ns + (state.tu_probe_failed_count.min(50)*state.tu_probe_failed_count.min(50)*250_000_000).max(time_between_sends_ns) < current_time_now_ns {
@@ -1949,6 +1951,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         
                         let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                         
+                        let ring_buffer_not_full = state.send_sequence_number.saturating_sub(state.packets_waiting_ack_tail) < ACK_TRACKING_PACKET_CAPACITY - 1;
                         if ring_buffer_not_full && state.last_sent_data_packet + 15_000_000_000/3 < current_time_now_ns {
                             let null_bytes = [0u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
                         
@@ -1977,7 +1980,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
 
                         connection_tracking_data.unreliable_send_buffer.current_bytes_per_second = payload_size as u64 * allowed_bandwidth_upps / 1000_000;
                         connection_tracking_data.unreliable_send_buffer.cut_to_size();
-                        while ring_buffer_not_full && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer) {
+                        while state.send_sequence_number.saturating_sub(state.packets_waiting_ack_tail) < ACK_TRACKING_PACKET_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer) {
                         
                             let virtual_nonce = state.send_sequence_number;
                             store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);
