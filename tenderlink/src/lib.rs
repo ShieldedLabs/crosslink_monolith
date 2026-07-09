@@ -1943,7 +1943,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let rng = &mut rand::thread_rng();
 
                     const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 2;
-                    const PEERS_TO_ASK_PUNCH:               usize = 5;
+                    const PEERS_TO_ASK_PUNCH:               usize = 2;
 
                     let mut all_addresses: Vec<(&PubKeyID, &HashMap<STPAddress, Option<PeerAttestation>>)> = bft_address_map.by_key.iter().collect(); all_addresses.shuffle(rng);
                     for (_, map) in &all_addresses {
@@ -1967,7 +1967,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         o += address.connection_key().write_to(&mut send_buf1[o..]);
 
                         for (conn_address, _) in current_connections.iter().choose_multiple(rng, PEERS_TO_ASK_PUNCH) {
-                            if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_GRY}PROTOCOL{ANSI_RST}: Requesting hole punch to address {:?} via random peer: {:?}...", address, conn_address); }
+                            // if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_GRY}PROTOCOL{ANSI_RST}: Requesting hole punch to address {:?} via random peer: {:?}...", address, conn_address); }
 
                             print_packet_tag_send(header);
                             send_stp_msg(&mut messages_to_send, &conn_address.connection_key(), &send_buf1[..o], &mut net_stats);

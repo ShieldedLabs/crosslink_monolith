@@ -2252,7 +2252,8 @@ pub fn sync(
                 if height_hash.hash_or_0 != block::Hash([0;32]) {
                     blocks_to_send.push((connection_key, height_hash.hash_or_0, height_hash.height.0, request.offset as usize));
                 } else {
-                    println!("Height requested that doesn't exist on BC: {:?}", height_hash.height);
+                    // @Todo: separate packet type for checkpoint feature height probe, or specify height in the config for the checkpoint
+                    // println!("Height requested that doesn't exist on BC: {:?}", height_hash.height);
                 }
             } else if packet_type == PACKET_TYPE_BLOCK_CHUNK {
                 let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height()) else {
