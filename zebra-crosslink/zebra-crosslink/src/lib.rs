@@ -166,6 +166,7 @@ pub mod test_format;
 #[cfg(feature = "viz_gui")]
 pub mod viz;
 
+#[cfg(feature = "viz_gui")]
 pub mod viz2;
 
 use crate::service::{TFLServiceCalls, TFLServiceHandle};
@@ -2115,4 +2116,3 @@ async fn _tfl_dump_block_sequence(
     .await;
     tfl_dump_blocks(&blocks[..], &infos[..]);
 }
-

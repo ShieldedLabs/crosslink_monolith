@@ -70,14 +70,14 @@ hex = { version = "0.4.3", features = ["serde"] }
 lazy_static = "1.5.0"
 
 tenderlink = { workspace = true }
-visualizer_zcash = { workspace = true }
+visualizer_zcash = { workspace = true, optional = true }
 
 [dev-dependencies]
 zebra-test = { path = "../zebra-test", version = "1.0.0-beta.45" }
 
 [features]
 default = []
-viz_gui = ["macroquad", "macroquad-profiler", "image", "miniquad"]
+viz_gui = ["macroquad", "macroquad-profiler", "image", "miniquad", "visualizer_zcash"]
 audio = []
 
 [build-dependencies]
