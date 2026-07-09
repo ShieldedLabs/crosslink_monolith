@@ -3,7 +3,7 @@
 use lmdb::{Cursor, Database, Environment, Transaction};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, sync::Arc};
+use std::{collections::HashSet, fs, sync::{Arc, atomic::{AtomicU64, Ordering}}};
 use tracing::{error, info, warn};
 
 use zebra_chain::{
@@ -119,6 +119,9 @@ pub struct FinalisedState {
     status: AtomicStatus,
     /// BlockCache config data.
     config: BlockCacheConfig,
+    /// Watermark: highest height durably committed to LMDB. Read by the
+    /// non-finalised state to know when a handed-off block is safe to drop.
+    finalised_height: Arc<AtomicU64>,
 }
 
 impl FinalisedState {
@@ -134,6 +137,7 @@ impl FinalisedState {
         fetcher: &JsonRpSeeConnector,
         state: Option<&ReadStateService>,
         block_receiver: tokio::sync::mpsc::Receiver<(Height, Hash, CompactBlock)>,
+        finalised_height: Arc<AtomicU64>,
         config: BlockCacheConfig,
     ) -> Result<Self, FinalisedStateError> {
         info!("Launching Finalised State..");
@@ -184,6 +188,7 @@ impl FinalisedState {
             write_task_handle: None,
             status: AtomicStatus::new(StatusType::Spawning),
             config,
+            finalised_height,
         };
 
         finalised_state.sync_db_from_reorg().await?;
@@ -210,6 +215,7 @@ impl FinalisedState {
             write_task_handle: None,
             status: self.status.clone(),
             config: self.config.clone(),
+            finalised_height: self.finalised_height.clone(),
         };
 
         let writer_handle = tokio::spawn(async move {
@@ -223,6 +229,7 @@ impl FinalisedState {
                                 "Block at height [{}] with hash [{}] successfully committed to finalised state.",
                                 height.0, hash
                             );
+                            finalised_state.finalised_height.fetch_max(height.0 as u64, Ordering::Release);
                             break;
                         }
                         Err(FinalisedStateError::LmdbError(lmdb::Error::KeyExist)) => {
@@ -239,6 +246,7 @@ impl FinalisedState {
                                             "Block at height {} already exists, skipping.",
                                             height.0
                                         );
+                                        finalised_state.finalised_height.fetch_max(height.0 as u64, Ordering::Release);
                                         break;
                                     }
                                 }
@@ -322,6 +330,7 @@ impl FinalisedState {
             write_task_handle: None,
             status: self.status.clone(),
             config: self.config.clone(),
+            finalised_height: self.finalised_height.clone(),
         };
 
         let reader_handle = tokio::spawn(async move {

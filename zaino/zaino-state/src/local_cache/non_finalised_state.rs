@@ -1,6 +1,7 @@
 //! Compact Block Cache non-finalised state implementation.
 
 use std::collections::HashSet;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use tracing::{error, info, warn};
 use zaino_fetch::jsonrpsee::connector::JsonRpSeeConnector;
@@ -38,6 +39,9 @@ pub struct NonFinalisedState {
     status: AtomicStatus,
     /// BlockCache config data.
     config: BlockCacheConfig,
+    /// Watermark published by the finalised state: highest height durably in
+    /// LMDB. A popped block is only dropped from the maps once it reaches this.
+    finalised_height: Arc<AtomicU64>,
 }
 
 impl NonFinalisedState {
@@ -46,6 +50,7 @@ impl NonFinalisedState {
         fetcher: &JsonRpSeeConnector,
         state: Option<&ReadStateService>,
         block_sender: tokio::sync::mpsc::Sender<(Height, Hash, CompactBlock)>,
+        finalised_height: Arc<AtomicU64>,
         config: BlockCacheConfig,
     ) -> Result<Self, NonFinalisedStateError> {
         info!("Launching Non-Finalised State..");
@@ -64,6 +69,7 @@ impl NonFinalisedState {
             block_sender,
             status: AtomicStatus::new(StatusType::Spawning),
             config,
+            finalised_height,
         };
 
         non_finalised_state.wait_on_server().await?;
@@ -121,6 +127,7 @@ impl NonFinalisedState {
             block_sender: self.block_sender.clone(),
             status: self.status.clone(),
             config: self.config.clone(),
+            finalised_height: self.finalised_height.clone(),
         };
 
         let sync_handle = tokio::spawn(async move {
@@ -315,7 +322,15 @@ impl NonFinalisedState {
                                 self.heights_to_hashes.remove(&pop_height, None);
                             }
                             zaino_common::DatabaseSize::Gb(_) => {
-                                if let Some(block) = self.hashes_to_blocks.get(&hash) {
+                                // Only drop from the maps once the finalised writer has durably
+                                // committed this height (Gb(_) reads have no validator fallback, so
+                                // removing early would open a read-gap). Until then, keep it readable
+                                // and keep handing it off. Removing here is also what lets the popped
+                                // min advance — otherwise it's re-sent forever and the maps leak.
+                                if self.finalised_height.load(Ordering::Acquire) >= pop_height.0 as u64 {
+                                    self.hashes_to_blocks.remove(&hash, None);
+                                    self.heights_to_hashes.remove(&pop_height, None);
+                                } else if let Some(block) = self.hashes_to_blocks.get(&hash) {
                                     if self
                                         .block_sender
                                         .send((pop_height, *hash, block.as_ref().clone()))
@@ -329,10 +344,6 @@ impl NonFinalisedState {
                                         ));
                                     }
                                 }
-                                // Don't remove from DashMaps yet — let the block remain
-                                // readable until the LMDB writer has committed it.
-                                // The DashMap capacity (10 000) is large enough to absorb
-                                // these lingering entries.
                             }
                         }
                     }
