@@ -1448,7 +1448,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     use crate::native_sockets::*;
 
     let my_port = my_endpoint.map(|e| e.port).unwrap_or(23485); // @Dev: .unwrap_or(0); // @Todo! Get local port after sock creation! @@@
-    let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024));
+    // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
+    let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
     let mut initiate_connections = Vec::<STPAddress>::new();
     let mut messages_to_send = Vec::new();

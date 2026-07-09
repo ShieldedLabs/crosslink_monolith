@@ -1178,7 +1178,8 @@ pub fn sync(
     };
 
     let my_keypairs = vec![network_keypair.clone()];
-    let network_thread_handle = new_network_thread(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024));
+    // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
+    let network_thread_handle = new_network_thread(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
     tracing::info!("NewNet: Bound to port {}", actual_network_local_port);
 
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
