@@ -753,13 +753,13 @@ const BLOCK_SEND_MS: u64 = 1000; // fastest interval at which to send blocks to 
 const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 2;
 const PEER_CONNECT_MS: u64 = 6000;
 const PEER_GOSSIP_MS:  u64 = 2500;
-const PEER_REQUEST_MS: u64 = 400;
-const PEER_RESPOND_MS: u64 = 400;
+const PEER_REQUEST_MS: u64 = 300;
+const PEER_RESPOND_MS: u64 = 300;
 
 
-const IDLE_MS: u64 = 400;
+const IDLE_MS: u64 = 300;
 
-const MAX_BANDWIDTH_BYTES_PER_MS: usize = 5_000; // 5 MB/s
+const MAX_BANDWIDTH_BYTES_PER_MS: usize = 7_000; // 7 MB/s
 const MAX_BANDWIDTH_BYTES_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_MS * PEER_RESPOND_MS as usize;
 const MAX_BANDWIDTH_BLOCKS_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_RES / zebra_chain::block::MAX_BLOCK_BYTES as usize;
 
