@@ -75,6 +75,7 @@ impl DelegationBond {
     any(test, feature = "proptest-impl"),
     derive(Arbitrary, serde::Serialize, serde::Deserialize)
 )]
+// TODO: visual state transition diagrams
 pub enum BondStatus {
     /// Bond is active and can be unbonded
     Active,

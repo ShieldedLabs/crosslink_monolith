@@ -1921,12 +1921,17 @@ pub fn sync(
                             // print_shadow_block_intersection(&their_branch, &our_chain.blocks, 1);
 
 
-                            // If the prefix was empty, there was no overlap.
-                            if prefix.is_empty() {
-                                continue;
-                            }
-
-                            let height_of_match = prefix.last().unwrap().this_height;
+                            let height_of_match = if !prefix.is_empty() {
+                                prefix.last().unwrap().this_height
+                            } else if their_branch_height_bgn > 0
+                                   && our_chain.blocks.iter().any(|b| b.this_hash == their_branch[0].parent_hash
+                                                                   && b.this_height + 1 == their_branch_height_bgn) {
+                                // no common height, but their branch extends our chain by parent link
+                                // (e.g. a fresh block mined right above our tip)
+                                their_branch_height_bgn - 1
+                            } else {
+                                continue; // no overlap
+                            };
 
                             assert!(height_of_match < our_chain_height_end);
                             assert!(height_of_match < their_branch_height_end);
@@ -2441,7 +2446,7 @@ pub fn sync(
                 //     warning!("Block does not link anywhere known, neither to our chains nor to our blocks-to-commit queue! Not queueing; dropping: height {alleged_height} hash {alleged_hash}, parent {parent_hash}");
                 //     continue 'process_packets;
                 // }
-                // if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, valid hash and height and links somewhere known..."); }
+                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, valid hash and height"); } // and links somewhere known..."); }
 
                 use zebra_chain::serialization::ZcashDeserializeInto;
                 let Some(block) = some_or_kill!(block_data.zcash_deserialize_into::<Block>().ok(), "Failed to deserialize block") else {
