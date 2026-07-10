@@ -6,7 +6,7 @@ It is **not** production-ready code, and it is **not** what would ultimately be 
 
 The implementation proposed for upstream integration will be developed to the standards expected of production software, with the appropriate architecture, testing, review, and documentation. 
 
-##Vulnerability Reporting
+## Vulnerability Reporting
 
 In the future, we would like to receive thorough reviews by bug-hunting teams, but currently we would kindly ask that you direct your vulnerability discovery efforts to: https://github.com/zcashfoundation/zebra
 
