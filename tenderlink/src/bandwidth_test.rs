@@ -894,8 +894,15 @@ impl ReassemblySlot {
     /// returns (success, is_complete)
     pub fn insert(&mut self, offset: usize, data: &[u8], is_fin: bool) -> (bool, bool) {
 
+        let Some(end_usize) = offset.checked_add(data.len()) else {
+            return (false, false);
+        };
+        if end_usize > MAX_JUMBOGRAM_LEN {
+            return (false, false);
+        }
+
         let start = offset as u32;
-        let end = (offset + data.len()) as u32;
+        let end = end_usize as u32;
 
         // If this is the final fragment, derive total_len from offset + data.len()
         if is_fin {
@@ -906,7 +913,7 @@ impl ReassemblySlot {
                     if last_end > end { return (false, false); }
                 }
                 self.total_len = Some(end);
-                self.buf.resize(end as usize, 0);
+                self.buf.resize(end_usize, 0);
             }
         }
 
@@ -925,8 +932,8 @@ impl ReassemblySlot {
         }
 
         // Grow buf if needed (total_len not yet known)
-        if end as usize > self.buf.len() {
-            self.buf.resize(end as usize, 0);
+        if end_usize > self.buf.len() {
+            self.buf.resize(end_usize, 0);
         }
 
         // Find all ranges that overlap or are adjacent to [start, end)
@@ -946,7 +953,7 @@ impl ReassemblySlot {
         }
 
         // Write new data (overlapping parts verified equal)
-        self.buf[offset..offset + data.len()].copy_from_slice(data);
+        self.buf[offset..end_usize].copy_from_slice(data);
 
         // Merge: union of [start, end) with all overlapping/adjacent ranges
         let merged_start = if first < last { self.received[first].0.min(start) } else { start };
@@ -1612,7 +1619,11 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                 if !success {
                                     existing_connection.unreliable_reassembly[slot_idx] = ReassemblySlot::new();
                                     (success, complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
-                                    assert!(success);
+                                    if !success {
+                                        if OVERLY_VERBOSE { println!("Error, oversized or invalid jumbogram fragment from {connection_key:?}. Disconnecting..."); }
+                                        connections_map.remove(&connection_key);
+                                        break 'conn;
+                                    }
                                 }
                                 if complete {
                                     let completed = std::mem::replace(&mut existing_connection.unreliable_reassembly[slot_idx], ReassemblySlot::new());
