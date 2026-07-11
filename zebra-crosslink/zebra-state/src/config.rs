@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::task::{spawn_blocking, JoinHandle};
 use tracing::Span;
 
-use zebra_chain::{common::default_cache_dir, parameters::Network};
+use zebra_chain::{block, common::default_cache_dir, parameters::Network};
 
 use crate::{
     constants::{DATABASE_FORMAT_VERSION_FILE_NAME, STATE_DATABASE_KIND},
@@ -124,19 +124,52 @@ pub struct Config {
     pub network_local_port: u16,
     pub network_initial_peers: Vec<String>,
 
-    /// Optional lite-checkpoint block hash (hex, display order).
-    ///
-    /// When set, the new-network sync engine refuses to build on any chain until
-    /// it has confirmed this block, and then only syncs from peers whose main
-    /// chain contains it, until the block is committed locally. See the
-    /// `CheckpointState` state machine in `new_network.rs`.
-    ///
-    /// Defaults to the current network checkpoint (see `Default for Config`).
-    /// Set to a different hash to override, or to "" to disable checkpointing.
-    pub network_checkpoint_block_hash: Option<String>,
+    /// Lite checkpoint: the synced chain must contain `hash` at `height`
+    /// see `new_network/checkpoint.rs`
+    /// see `Default for Config`
+    /// disable by specifying `height = 0` with `hash = ""` (exactly that pair)
+    #[serde(with = "network_checkpoint_toml")]
+    pub network_checkpoint: Option<NetworkCheckpoint>,
 
     #[serde(skip)]
     pub hardfork_schedule: Arc<HardForkSchedule>,
+}
+
+/// Lite checkpoint pin: `(height, hash)`. `None` means disabled.
+pub type NetworkCheckpoint = (u32, block::Hash);
+
+// the on-disk shape; `height = 0, hash = ""` (exactly that pair) means disabled.
+// `hash` is hex, display order. anything else invalid rejects the whole config.
+pub(crate) mod network_checkpoint_toml {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Toml {
+        height: u32,
+        hash: String,
+    }
+
+    pub fn serialize<S: Serializer>(v: &Option<super::NetworkCheckpoint>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            None => Toml { height: 0, hash: String::new() },
+            Some((height, hash)) => Toml { height: *height, hash: hash.to_string() },
+        }.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<super::NetworkCheckpoint>, D::Error> {
+        let t = Toml::deserialize(d)?;
+        match (t.height, t.hash.as_str()) {
+            (0, "") => Ok(None),
+            (0, _) => Err(D::Error::custom("network_checkpoint: height 0 means disabled and requires hash = \"\"")),
+            (_, "") => Err(D::Error::custom("network_checkpoint: empty hash means disabled and requires height = 0")),
+            (height, hash) => Ok(Some((
+                height,
+                hash.parse().map_err(|err| D::Error::custom(format!("network_checkpoint: bad hash {hash:?}: {err:?}")))?,
+            ))),
+        }
+    }
 }
 
 fn gen_temp_path(prefix: &str) -> PathBuf {
@@ -211,9 +244,10 @@ impl Default for Config {
             network_identity_seed_string: None,
             network_local_port: 0,
             network_initial_peers: Vec::new(),
-            network_checkpoint_block_hash: Some(
-                "02fc9aa7652b2a9a9f6196a446265fed6012227373ed34e0b17c7a3298db005e".to_string(),
-            ),
+            network_checkpoint: Some((
+                187572,
+                "02fc9aa7652b2a9a9f6196a446265fed6012227373ed34e0b17c7a3298db005e".parse().expect("valid checkpoint hash"),
+            )),
             hardfork_schedule: Default::default(),
         }
     }

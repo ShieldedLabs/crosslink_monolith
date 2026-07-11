@@ -292,8 +292,6 @@ impl IntoDisk for Transaction {
 
 impl FromDisk for Transaction {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        let bytes = bytes.as_ref();
-
         // TODO: skip cryptography verification during transaction deserialization from storage,
         //       or do it in a rayon thread (ideally in parallel with other transactions)
         bytes
