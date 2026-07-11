@@ -35,7 +35,7 @@ use zebra_rpc::{
         GetBlockTemplateRequestMode::Template,
         HexData,
     },
-    methods::{RpcImpl, RpcServer},
+    methods::{types::submit_block::SubmitBlockResponse, RpcImpl, RpcServer},
     proposal_block_from_template,
 };
 use zebra_state::WatchReceiver;
@@ -53,6 +53,26 @@ pub const BLOCK_TEMPLATE_REFRESH_LIMIT: Duration = Duration::from_secs(2);
 /// This should be slightly longer than `BLOCK_TEMPLATE_REFRESH_LIMIT` to allow for template
 /// generation.
 pub const BLOCK_MINING_WAIT_TIME: Duration = Duration::from_secs(3);
+
+/// Returns true if the template that produced a solution is still the current mining job.
+fn mining_template_is_current(
+    expected_header: &block::Header,
+    current_template: Option<&Arc<Block>>,
+) -> bool {
+    current_template
+        .map(|template| template.header.as_ref() == expected_header)
+        .unwrap_or(false)
+}
+
+/// Returns true if an internally mined block directly extends the current best tip.
+fn mined_block_extends_best_tip(
+    candidate: &Block,
+    best_tip_height: block::Height,
+    best_tip_hash: block::Hash,
+) -> bool {
+    candidate.coinbase_height().map(|height| height.0) == best_tip_height.0.checked_add(1)
+        && candidate.header.previous_block_hash == best_tip_hash
+}
 
 /// Initialize the miner based on its config, and spawn a task for it.
 ///
@@ -547,6 +567,7 @@ where
         };
 
         let height = template.coinbase_height().expect("template is valid");
+        let mining_template_header = Arc::clone(&template.header);
 
         // Set up the cancellation conditions for the miner.
         let mut cancel_receiver = template_receiver.clone();
@@ -605,28 +626,67 @@ where
             continue;
         };
 
+        // The blocking solver can find a solution at the same time as a template update. Recheck
+        // after it returns so an old job is never submitted after the tip or toggle changed.
+        let current_template = template_receiver.cloned_watch_data();
+        if !mining_template_is_current(mining_template_header.as_ref(), current_template.as_ref()) {
+            info!(
+                ?height,
+                ?solver_id,
+                "discarding solution from stale mining template"
+            );
+            continue;
+        }
+
         // Submit the newly mined blocks to the verifiers.
-        //
-        // TODO: if there is a new template (`cancel_fn().is_err()`), and
-        //       GetBlockTemplate.submit_old is false, return immediately, and skip submitting the
-        //       blocks.
         let mut any_success = false;
         for block in blocks {
+            // The first solution can advance the tip before another solution from the same solver
+            // batch is inspected. Check every candidate against the authoritative current tip.
+            let Ok(best_tip) = rpc.get_best_block_height_and_hash() else {
+                warn!(
+                    ?height,
+                    ?solver_id,
+                    "discarding internally mined block because the best tip is unavailable"
+                );
+                continue;
+            };
+
+            if !mined_block_extends_best_tip(&block, best_tip.height(), best_tip.hash()) {
+                info!(
+                    ?height,
+                    hash = ?block.hash(),
+                    ?solver_id,
+                    best_tip_height = ?best_tip.height(),
+                    "discarding internally mined block that does not extend the current best tip"
+                );
+                continue;
+            }
+
             let data = block
                 .zcash_serialize_to_vec()
                 .expect("serializing to Vec never fails");
 
             match rpc.submit_block(HexData(data), None).await {
-                Ok(success) => {
+                Ok(SubmitBlockResponse::Accepted) => {
                     info!(
                         ?height,
                         hash = ?block.hash(),
                         ?solver_id,
-                        ?success,
                         "successfully mined a new block",
                     );
                     any_success = true;
+                    // Additional solutions for this job are same-height siblings. Once one is
+                    // accepted, wait for the next template rather than submitting competitors.
+                    break;
                 }
+                Ok(response) => info!(
+                    ?height,
+                    hash = ?block.hash(),
+                    ?solver_id,
+                    ?response,
+                    "internally mined block was not accepted, trying again",
+                ),
                 Err(error) => info!(
                     ?height,
                     hash = ?block.hash(),
@@ -725,4 +785,62 @@ where
     Ok(solved_blocks
         .try_into()
         .expect("a 1:1 mapping of AtLeastOne produces at least one block"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zebra_chain::serialization::ZcashDeserializeInto;
+
+    #[test]
+    fn mining_template_freshness_gate_rejects_changed_or_disabled_jobs() {
+        let block_1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("block 1 should deserialize");
+        let block_2 = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("block 2 should deserialize");
+
+        assert!(mining_template_is_current(
+            block_1.header.as_ref(),
+            Some(&block_1),
+        ));
+        assert!(!mining_template_is_current(
+            block_1.header.as_ref(),
+            Some(&block_2),
+        ));
+        assert!(!mining_template_is_current(block_1.header.as_ref(), None));
+    }
+
+    #[test]
+    fn best_tip_gate_rejects_stale_and_second_sibling_blocks() {
+        let block_1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("block 1 should deserialize");
+        let parent_height = block::Height(0);
+        let parent_hash = block_1.header.previous_block_hash;
+
+        let mut sibling = (*block_1).clone();
+        let mut sibling_header = block::Header::clone(&sibling.header);
+        sibling_header.nonce[0] ^= 1;
+        sibling.header = Arc::new(sibling_header);
+
+        assert!(mined_block_extends_best_tip(
+            &block_1,
+            parent_height,
+            parent_hash,
+        ));
+        assert!(mined_block_extends_best_tip(
+            &sibling,
+            parent_height,
+            parent_hash,
+        ));
+
+        // Once the first sibling advances the tip, the second one must not be submitted.
+        assert!(!mined_block_extends_best_tip(
+            &sibling,
+            block::Height(1),
+            block_1.hash(),
+        ));
+    }
 }
