@@ -2270,17 +2270,25 @@ pub fn sync(
                 }
 
 
-                if blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == alleged_hash) {
-                    warning!("Block was already queued to commit!: {alleged_hash}");
-                    peer.block_downloads.remove(dl_i);
-                    continue 'process_packets;
-                }
+                // an unproven peer's checkpoint probe still needs to reassemble even if we
+                // already have the block, so the possession proof lands; dropped post-proof below
+                let is_unproven_checkpoint_probe = !checkpoint_committed_locally
+                    && !peer.has_checkpoint_block
+                    && checkpoint.is_some_and(|cp| cp.hash == alleged_hash);
 
-                for our_chain in &near_tip_chains.chains {
-                    if our_chain.blocks.iter().any(|block| block.this_hash == alleged_hash) {
-                        warning!("Block was already committed!: {alleged_hash}");
+                if !is_unproven_checkpoint_probe {
+                    if blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == alleged_hash) {
+                        warning!("Block was already queued to commit!: {alleged_hash}");
                         peer.block_downloads.remove(dl_i);
                         continue 'process_packets;
+                    }
+
+                    for our_chain in &near_tip_chains.chains {
+                        if our_chain.blocks.iter().any(|block| block.this_hash == alleged_hash) {
+                            warning!("Block was already committed!: {alleged_hash}");
+                            peer.block_downloads.remove(dl_i);
+                            continue 'process_packets;
+                        }
                     }
                 }
 
@@ -2379,6 +2387,11 @@ pub fn sync(
                     if hash == cp.hash {
                         // peer proved it holds the checkpoint block; passes the dl-init gate now
                         peer.has_checkpoint_block = true;
+                        // re-run the dup checks skipped for probes; don't queue the block twice
+                        if blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == hash)
+                            || near_tip_chains.chains.iter().any(|c| c.blocks.iter().any(|b| b.this_hash == hash)) {
+                            continue 'process_packets;
+                        }
                     }
                 }
 
