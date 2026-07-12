@@ -3271,6 +3271,10 @@ fn read_wallet_snapshot(
     Ok(Some(snapshot))
 }
 
+fn snapshot_tip_is_at_or_below_live_tip(snapshot_tip_h: u64, live_tip_h: u64) -> bool {
+    snapshot_tip_h <= live_tip_h
+}
+
 fn save_wallet_snapshot_if_enabled(
     path: Option<&Path>,
     global_seed: &[u8; 32],
@@ -4025,12 +4029,33 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>, snapshot_path: O
     if let Some(path) = snapshot_path.as_deref() {
         match read_wallet_snapshot(path, &global_seed, &genesis_hash, &miner_wallet, &user_wallet, CHECKPOINTS_N) {
             Ok(Some(snapshot)) => {
-                println!("loaded wallet snapshot from {path:?}");
-                miner_wallet = snapshot.miner_wallet;
-                user_wallet = snapshot.user_wallet;
-                pow_cache = snapshot.pow_cache;
-                orchard_tree = snapshot.orchard_tree;
-                publish_loaded_wallet_snapshot(&wallet_state, &miner_wallet, &user_wallet, &pow_cache);
+                let snapshot_tip_h = snapshot.pow_cache.next_tip_h.saturating_sub(1);
+                let load_snapshot = match client.get_lightd_info(Empty {}).await {
+                    Ok(info) => match u64::try_from(info.into_inner().block_height) {
+                        Ok(live_tip_h) if !snapshot_tip_is_at_or_below_live_tip(snapshot_tip_h, live_tip_h) => {
+                            println!("wallet snapshot at height {snapshot_tip_h} is ahead of Zaino tip {live_tip_h}; starting wallet scan from genesis");
+                            false
+                        }
+                        Ok(_) => true,
+                        Err(err) => {
+                            println!("wallet snapshot tip validation failed: {err:?}; retaining snapshot");
+                            true
+                        }
+                    },
+                    Err(err) => {
+                        println!("wallet snapshot tip validation failed: {err:?}; retaining snapshot");
+                        true
+                    }
+                };
+
+                if load_snapshot {
+                    println!("loaded wallet snapshot from {path:?}");
+                    miner_wallet = snapshot.miner_wallet;
+                    user_wallet = snapshot.user_wallet;
+                    pow_cache = snapshot.pow_cache;
+                    orchard_tree = snapshot.orchard_tree;
+                    publish_loaded_wallet_snapshot(&wallet_state, &miner_wallet, &user_wallet, &pow_cache);
+                }
             }
             Ok(None) => println!("no matching wallet snapshot at {path:?}; starting wallet scan from genesis"),
             Err(err) => println!("WALLET SNAPSHOT ERROR: failed to load {path:?}: {err:?}; starting wallet scan from genesis"),
@@ -5499,6 +5524,13 @@ mod wallet_snapshot_tests {
         tree.checkpoint(BlockHeight(0))
             .expect("empty tree checkpoint should succeed");
         tree
+    }
+
+    #[test]
+    fn wallet_snapshot_tip_must_not_exceed_live_tip() {
+        assert!(snapshot_tip_is_at_or_below_live_tip(42, 42));
+        assert!(snapshot_tip_is_at_or_below_live_tip(41, 42));
+        assert!(!snapshot_tip_is_at_or_below_live_tip(43, 42));
     }
 
     #[test]
