@@ -3416,6 +3416,48 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let mut auto_spend = (false,);
 
+    // ── Headless staking (opt-in, env-gated; everything below no-ops by default) ──
+    //
+    //   CROSSLINK_AUTO_SEND=1    forward mined funds miner→user wallet each cycle
+    //                            (runtime switch for the existing AUTO_SPEND path)
+    //   CROSSLINK_AUTO_STAKE=1   auto-stake spendable user funds to a finalizer
+    //                            during staking windows
+    //   CROSSLINK_STAKE_TARGET=  64-hex finalizer public key in the same (display)
+    //                            byte order the GUI stake box accepts; when unset,
+    //                            stakes to this node's own finalizer key
+    fn env_flag(name: &str) -> bool {
+        std::env::var(name).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+    }
+    // display-form hex → internal byte order, mirroring the GUI's addr_from_str_bytes
+    fn parse_display_hex32(s: &str) -> Option<[u8; 32]> {
+        let s = s.trim();
+        if s.len() != 64 { return None; }
+        let mut k = [0u8; 32];
+        for i in 0..32 {
+            k[31 - i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+        }
+        Some(k)
+    }
+    let headless_auto_send = env_flag("CROSSLINK_AUTO_SEND");
+    let mut headless_auto_stake = env_flag("CROSSLINK_AUTO_STAKE");
+    let headless_stake_target: Option<[u8; 32]> = match std::env::var("CROSSLINK_STAKE_TARGET") {
+        Ok(v) => match parse_display_hex32(&v) {
+            Some(k) => Some(k),
+            None => {
+                println!("headless staking: invalid CROSSLINK_STAKE_TARGET (want 64 hex chars, display byte order); auto-stake disabled");
+                headless_auto_stake = false;
+                None
+            }
+        },
+        Err(_) => None, // default: this node's own finalizer key, read at stake time
+    };
+    let mut headless_stake_last_check = Instant::now() - Duration::from_secs(1000);
+    let mut headless_stake_last_window: Option<u64> = None;
+    if headless_auto_send || headless_auto_stake {
+        println!("headless staking: auto_send={headless_auto_send} auto_stake={headless_auto_stake} target={}",
+            if headless_stake_target.is_some() { "explicit" } else { "own finalizer key" });
+    }
+
     let mut faucet_shield_cooldown_instant = Instant::now() - Duration::from_secs(1000);
 
     let mut proposed_faucet = ProposedTx::EMPTY;
@@ -4392,7 +4434,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
-        if AUTO_SPEND {
+        if AUTO_SPEND || headless_auto_send {
             if /*user_wallet.accounts[0].unspent_orchard_notes.len() == 0 &&*/ !proposed_faucet.is_in_progress() {
                 // the user needs money, try to send some (doesn't matter if we fail until we've mined some)
                 let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, FAUCET_VALUE, &orchard_tree, *user_ua.orchard().unwrap(),
@@ -4404,6 +4446,48 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
+
+        // ── Headless auto-stake: bond spendable user funds to a finalizer during
+        // staking windows. A window opens every 150 PoW blocks; act only in its
+        // first 60 blocks so the tx can confirm inside the window, and at most
+        // once per window. The first bond of any size implicitly registers the
+        // finalizer; after that only stake chunks >= 1 cTAZ to avoid dust bonds.
+        if headless_auto_stake
+            && !proposed_stake.is_in_progress()
+            && headless_stake_last_check.elapsed().as_secs() > 30
+        {
+            headless_stake_last_check = Instant::now();
+            let target = headless_stake_target
+                .unwrap_or_else(|| TENDERLINK_PUBLIC_KEY.lock().unwrap().0);
+            // all-zero = the BFT service hasn't published our own key yet; retry later
+            if target != [0u8; 32] {
+                let tip_h: u64 = user_wallet.chain_height().0 as u64;
+                let window = tip_h / 150;
+                let in_window = tip_h % 150 < 60;
+                if in_window && headless_stake_last_window != Some(window) {
+                    const ONE_CTAZ: u64 = 100_000_000;
+                    const STAKE_FEE_RESERVE: u64 = 20_000;
+                    let (spendable, waiting) = {
+                        let ws = wallet_state.lock().unwrap();
+                        (ws.user_shielded_spendable_funds, ws.waiting_for_stake_to_finalizer)
+                    };
+                    if !waiting {
+                        let budget = spendable.saturating_sub(STAKE_FEE_RESERVE);
+                        // largest power-of-10 chunk (in 0.01-cTAZ units) that fits the budget
+                        let mut amt = 0u64;
+                        let mut c = ONE_CTAZ / 100;
+                        while c <= budget { amt = c; c = c.saturating_mul(10); }
+                        let first_bond = user_wallet.care_about_bonds.is_empty();
+                        let min_amt = if first_bond { ONE_CTAZ / 100 } else { ONE_CTAZ };
+                        if amt >= min_amt {
+                            println!("headless staking: bonding {amt} zats (tip {tip_h}, window {window}, first_bond {first_bond})");
+                            wallet_state.lock().unwrap().stake_to_finalizer(amt, target);
+                            headless_stake_last_window = Some(window);
+                        }
+                    }
+                }
+            }
+        }
 
         // @todo(judah): I'm thinking the weird frame hitch we get in the UI is caused by this loop,
         // since it's probably waiting for the wallet_state mutex to unlock.
