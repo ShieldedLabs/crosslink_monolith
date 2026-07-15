@@ -392,7 +392,6 @@ pub static GLOBAL_SEED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 pub static TENDERLINK_PUBLIC_KEY: Mutex<bft::PubKeyID> = Mutex::new(bft::PubKeyID([0;32]));
 
 pub fn get_tfl_recency_status_str() -> Option<String> {
-    use secp256k1::serde::Serialize;
     let lock = RECENCY_REQUEST.lock().unwrap();
     let closure = lock.as_ref()?;
     closure.0()
