@@ -57,7 +57,7 @@ use zcash_primitives::transaction::fees::{
 use zcash_primitives::transaction::sighash::{signature_hash, SignableInput};
 use zcash_primitives::transaction::txid::TxIdDigester;
 use zcash_primitives::transaction::{Authorized, StakingAction_BeginDelegationUnbonding, StakingAction_CreateNewDelegationBond, StakingAction_RetargetDelegationBond, StakingAction_WithdrawDelegationBond, Transaction, TransactionData, TxVersion, Unauthorized};
-use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakeTxId};
+use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakingActionRequest, StakeTxId};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::consensus::{BlockHeight as LRZBlockHeight, BranchId};
 use zcash_protocol::memo::MemoBytes;
@@ -112,6 +112,8 @@ pub struct FaucetRequestClosure(pub Arc<dyn Fn(String) -> Result<u64, String> + 
 pub static FAUCET_REQUEST: Mutex<Option<FaucetRequestClosure>> = Mutex::new(None);
 pub static USER_UFVK_STRING: Mutex<Option<String>> = Mutex::new(None);
 pub static GUI_ENABLE_MINE: Mutex<bool> = Mutex::new(true);
+
+pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
 
 #[derive(Clone)]
 pub struct RecencyRequestClosure(pub Arc<dyn Fn() -> Option<String> + Sync + Send + 'static>);
@@ -3423,6 +3425,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut proposed_stake = ProposedTx::EMPTY;
     let mut proposed_send = ProposedTx::EMPTY;
 
+    let mut rpc_stake: Option<(ProposedTx, tokio::sync::oneshot::Sender<Result<String, String>>)> = None;
+
     let mut wallet_state_push_time = Instant::now();
 
     let mut just_init_new_tx = false;
@@ -4404,6 +4408,32 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
+        if rpc_stake.is_none() {
+            if let Some((request, sender)) = STAKING_STAGE.lock().unwrap().take() {
+                let mut tx = ProposedTx::EMPTY;
+                let res = match request {
+                    StakingActionRequest::CreateNewDelegationBond{ amount_zats, target_finalizer } =>
+                        user_wallet.stake_orchard_to_finalizer(network, &mut tx, &mut client, &user_usk, amount_zats, &orchard_tree, target_finalizer.0),
+                    StakingActionRequest::RetargetDelegationBond{ bond_key, target_finalizer } =>
+                        user_wallet.retarget_bond_using_orchard(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0, target_finalizer.0),
+                    StakingActionRequest::BeginDelegationUnbonding{ bond_key } =>
+                        user_wallet.begin_unbonding_using_orchard(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0),
+                    StakingActionRequest::WithdrawDelegationBond{ bond_key  } =>
+                        user_wallet.claim_bond_using_orchard(network, &mut tx, &mut client, &user_usk, &orchard_tree, bond_key.0).await,
+                };
+
+                match res {
+                    None => {
+                        sender.send(Err("failed to create staking transaction from notes".to_string()));
+                    }
+                    Some(()) => {
+                        println!("prepared notes for RPC-requested staking action");
+                        just_init_new_tx = true;
+                        rpc_stake = Some((tx, sender));
+                    }
+                }
+            }
+        }
 
         // @todo(judah): I'm thinking the weird frame hitch we get in the UI is caused by this loop,
         // since it's probably waiting for the wallet_state mutex to unlock.
@@ -4591,6 +4621,30 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             continue_proposed_tx(&mut miner_wallet, network, &mut proposed_miner_shield, &mut client, "miner shield", DUMP_TX_SEND && false).await;
             continue_proposed_tx(&mut user_wallet,  network, &mut proposed_stake,        &mut client, "stake",        DUMP_TX_SEND).await;
             continue_proposed_tx(&mut user_wallet,  network, &mut proposed_send,         &mut client, "send",         DUMP_TX_SEND).await;
+
+            if let Some((mut tx, sender)) = rpc_stake.take() {
+                let tx_progress = continue_proposed_tx(&mut user_wallet, network, &mut tx, &mut client, "rpc stake", DUMP_TX_SEND || true).await;
+                match tx_progress.h {
+                    BlockHeight::INVALID => {
+                        sender.send(Err(format!("failed to build staking action")));
+                        rpc_stake = None;
+                    }
+                    BlockHeight::SENT => {
+                        let res = if let Some(staking_action) = tx_progress.staking_action {
+                            format!("{{ \"txid\": {}, \"staking_action\": {} }}", tx_progress.txid, staking_action)
+                        } else {
+                            format!("{{ \"txid\": {} }}", tx_progress.txid)
+                        };
+                        sender.send(Ok(res));
+                        rpc_stake = None;
+                    }
+
+                    _ => {
+                        println!("RPC staking progress: {}, {:?}", tx_progress.h, tx.tx_res);
+                        rpc_stake = Some((tx, sender))
+                    }
+                }
+            }
         }
     }
 }
