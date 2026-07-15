@@ -413,7 +413,8 @@ mod linux {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EMSGSIZE) || err.raw_os_error() == Some(libc::EAGAIN)
                     || err.raw_os_error() == Some(libc::ENETUNREACH) || err.raw_os_error() == Some(libc::EHOSTUNREACH)
-                    || err.raw_os_error() == Some(libc::ENETDOWN) || err.raw_os_error() == Some(libc::ECONNREFUSED) {
+                    || err.raw_os_error() == Some(libc::ENETDOWN) || err.raw_os_error() == Some(libc::ECONNREFUSED)
+                    || err.raw_os_error() == Some(libc::EHOSTDOWN) /* @todo(judah): ensure we actually want to tolerate this error  */{
                     return timestamp_ns;
                 }
                 panic!("UDP Socket error: {}", err);
@@ -954,7 +955,7 @@ mod windows {
             let e = unsafe { WSAGetLastError() };
             if e == WSAEMSGSIZE || e == WSAEWOULDBLOCK || e == WSAENETUNREACH
                 || e == WSAEHOSTUNREACH || e == WSAECONNREFUSED || e == WSAECONNRESET
-                || e == WSAEINVAL {
+                || e == WSAEINVAL || e == WSAEHOSTDOWN /* @todo(judah): ensure we actually want to tolerate this error */ {
                 return timestamp_ns;
             }
             panic!("UDP Socket error: {}", std::io::Error::from_raw_os_error(e));
@@ -1485,7 +1486,8 @@ mod macos {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EMSGSIZE) || err.raw_os_error() == Some(libc::EAGAIN)
                     || err.raw_os_error() == Some(libc::ENETUNREACH) || err.raw_os_error() == Some(libc::EHOSTUNREACH)
-                    || err.raw_os_error() == Some(libc::ENETDOWN) || err.raw_os_error() == Some(libc::ECONNREFUSED) {
+                    || err.raw_os_error() == Some(libc::ENETDOWN) || err.raw_os_error() == Some(libc::ECONNREFUSED)
+                    || err.raw_os_error() == Some(libc::EHOSTDOWN) /* @todo(judah): ensure we actually want to tolerate this error */ {
                     return timestamp_ns;
                 }
                 panic!("UDP Socket error: {}", err);
