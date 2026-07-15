@@ -4408,7 +4408,8 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         }
 
         if rpc_stake.is_none() {
-            if let Some((request, sender)) = STAKING_STAGE.lock().unwrap().take() {
+            let staged_action = STAKING_STAGE.lock().unwrap().take();
+            if let Some((request, sender)) = staged_action {
                 let mut tx = ProposedTx::EMPTY;
                 let res = match request {
                     StakingActionRequest::CreateNewDelegationBond{ amount_zats, target_finalizer } =>
