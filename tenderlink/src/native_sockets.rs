@@ -1252,6 +1252,19 @@ pub use macos::*;
 mod macos {
     use super::*;
 
+    fn is_nonfatal_udp_send_error(error: Option<i32>) -> bool {
+        matches!(
+            error,
+            Some(libc::EMSGSIZE)
+                | Some(libc::EAGAIN)
+                | Some(libc::ENETUNREACH)
+                | Some(libc::EHOSTUNREACH)
+                | Some(libc::EHOSTDOWN)
+                | Some(libc::ENETDOWN)
+                | Some(libc::ECONNREFUSED)
+        )
+    }
+
     #[inline]
     pub fn socket_setup() {} // Mac
     #[inline]
@@ -1483,9 +1496,7 @@ mod macos {
             let n = libc::sendmsg(fd, &msg as *const _ as *mut _, 0);
             if n < 0 {
                 let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EMSGSIZE) || err.raw_os_error() == Some(libc::EAGAIN)
-                    || err.raw_os_error() == Some(libc::ENETUNREACH) || err.raw_os_error() == Some(libc::EHOSTUNREACH)
-                    || err.raw_os_error() == Some(libc::ENETDOWN) || err.raw_os_error() == Some(libc::ECONNREFUSED) {
+                if is_nonfatal_udp_send_error(err.raw_os_error()) {
                     return timestamp_ns;
                 }
                 panic!("UDP Socket error: {}", err);
@@ -1496,6 +1507,16 @@ mod macos {
             }
 
             timestamp_ns
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::is_nonfatal_udp_send_error;
+
+        #[test]
+        fn host_down_is_nonfatal_for_udp_sends() {
+            assert!(is_nonfatal_udp_send_error(Some(libc::EHOSTDOWN)));
         }
     }
 
