@@ -62,6 +62,7 @@ pub async fn service_viz_requests(
                 continue 'main_loop;
             };
             let bc_tip_height: u64 = tip_height_hash.0.0 as u64;
+            bc_ack_height = clamp_bc_ack_height(bc_ack_height, bc_tip_height);
 
             let bc_req_h = (bc_ack_height, -1);
 
@@ -185,7 +186,12 @@ pub async fn service_viz_requests(
                     response.staking_unbonded_pool_balance = staking_unbonded_pool_balance;
 
                     response.start_bc_height = bc_ack_height as u64;
-                    bc_ack_height = bc_ack_height.max(request.bc_ack_height as i32);
+                    let request_bc_ack_height =
+                        i32::try_from(request.bc_ack_height).unwrap_or(i32::MAX);
+                    bc_ack_height = clamp_bc_ack_height(
+                        bc_ack_height.max(request_bc_ack_height),
+                        bc_tip_height,
+                    );
 
                     let pow_inspection = |block: &Block| {
                         use zebra_chain::{transaction::Transaction, transparent};
@@ -315,6 +321,10 @@ pub async fn service_viz_requests(
     }
 }
 
+fn clamp_bc_ack_height(ack_height: i32, tip_height: u64) -> i32 {
+    ack_height.min(i32::try_from(tip_height).unwrap_or(i32::MAX))
+}
+
 fn abs_block_height(height: i32, tip: Option<(ZebBlockHeight, ZebBlockHash)>) -> ZebBlockHeight {
     if height >= 0 {
         ZebBlockHeight(height.try_into().unwrap())
@@ -333,4 +343,19 @@ fn abs_block_heights(
         abs_block_height(heights.0, tip),
         abs_block_height(heights.1, tip),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_bc_ack_height;
+
+    #[test]
+    fn clamps_acknowledgement_to_current_tip() {
+        assert_eq!(clamp_bc_ack_height(455_956, 228_029), 228_029);
+    }
+
+    #[test]
+    fn preserves_acknowledgement_at_or_below_tip() {
+        assert_eq!(clamp_bc_ack_height(228_029, 455_956), 228_029);
+    }
 }
