@@ -114,6 +114,50 @@ pub static USER_UFVK_STRING: Mutex<Option<String>> = Mutex::new(None);
 pub static GUI_ENABLE_MINE: Mutex<bool> = Mutex::new(true);
 
 pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
+// Read side, complementing `wallet_staking_action`: the headless wallet publishes a
+// clone of its live `WalletState` handle here at startup so an RPC can report staking
+// state (bonds, balances, sync height) without a round-trip through the wallet loop.
+// None until the wallet starts => the query fails closed with an explanatory error.
+pub static STAKING_STATUS_HANDLE: Mutex<Option<Arc<Mutex<WalletState>>>> = Mutex::new(None);
+
+/// Serialise the headless wallet's live staking view — bonds (key, target, amount),
+/// balances, and sync height — for the read-only `wallet_staking_status` RPC. This is
+/// the query complement to `wallet_staking_action`: it lets a headless operator see the
+/// result of the actions they submit. Fails closed when no wallet is running.
+pub fn wallet_staking_status_json() -> Result<String, String> {
+    let handle = STAKING_STATUS_HANDLE.lock().unwrap().clone();
+    let Some(handle) = handle else {
+        return Err("headless wallet is not running (is `disable_the_headless_wallet` set?)".to_string());
+    };
+    let s = handle.lock().unwrap();
+
+    fn hex32(b: &[u8; 32]) -> String {
+        let mut o = String::with_capacity(64);
+        for x in b { o.push_str(&format!("{:02x}", x)); }
+        o
+    }
+    fn bonds_json(v: &[([u8; 32], [u8; 32], u64)]) -> String {
+        let items: Vec<String> = v.iter().map(|(k, t, z)| format!(
+            "{{\"bond_key\":\"{}\",\"target_finalizer\":\"{}\",\"initial_zats\":{}}}",
+            hex32(k), hex32(t), z)).collect();
+        format!("[{}]", items.join(","))
+    }
+
+    let own_finalizer = hex32(&TENDERLINK_PUBLIC_KEY.lock().unwrap().0);
+
+    Ok(format!(
+        "{{\"wallet_is_init\":{},\"sync_height\":{},\"tip_height\":{},\
+\"user_address\":\"{}\",\"user_ufvk\":\"{}\",\"own_finalizer_pubkey\":\"{}\",\
+\"user_unshielded_zats\":{},\"user_shielded_spendable_zats\":{},\"user_shielded_pending_zats\":{},\
+\"staked_zats\":{},\"withdrawable_zats\":{},\
+\"bonded\":{},\"unbonded\":{}}}",
+        s.wallet_is_init, s.wallets_sync_h, s.wallets_tip_h,
+        s.user_recv_ua, s.user_ufvk, own_finalizer,
+        s.user_unshielded_funds, s.user_shielded_spendable_funds, s.user_shielded_pending_funds,
+        s.staked_balance, s.withdrawable_balance,
+        bonds_json(&s.stake_positions_bonded), bonds_json(&s.stake_positions_unbonded),
+    ))
+}
 
 #[derive(Clone)]
 pub struct RecencyRequestClosure(pub Arc<dyn Fn() -> Option<String> + Sync + Send + 'static>);
@@ -2882,6 +2926,9 @@ fn read_compact_tx(wallet: &mut ManualWallet, account_i: usize, keys: &PreparedK
 
 
 pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
+    // Publish the live state handle for the read-only `wallet_staking_status` RPC.
+    *STAKING_STATUS_HANDLE.lock().unwrap() = Some(wallet_state.clone());
+
     fn wallet_from_usk<P: Parameters + 'static>(params: P, name: &'static str, usk: &UnifiedSpendingKey) -> (ManualWallet, ManualAccount) {
         // TODO: skip this by changing API slightly
         let account_id = zip32::AccountId::try_from(0).unwrap();

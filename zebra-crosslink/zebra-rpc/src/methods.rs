@@ -544,6 +544,10 @@ pub trait Rpc {
     #[method(name = "wallet_staking_action")]
     async fn wallet_staking_action(&self, staking_action: StakingActionRequest) -> Result<String>;
 
+    /// read the wallet's staking status (bonds, balances, sync height) as a JSON object
+    #[method(name = "wallet_staking_status")]
+    async fn wallet_staking_status(&self) -> Result<String>;
+
     /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
     /// If the block is not in Zebra's state,
     /// returns [error code `-8`.](https://github.com/zcash/zcash/issues/5758)
@@ -2383,6 +2387,32 @@ where
             Err(err) => Err(ErrorObject::owned(
                     server::error::LegacyCode::Verify.into(),
                     format!("Faucet request for \"{staking_action:?}\" failed: {err}"),
+                    None::<()>,
+            )),
+            _ => unreachable!(""),
+        }
+    }
+
+    async fn wallet_staking_status(&self) -> Result<String> {
+        let res = self
+            .tfl_service
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(TFLServiceRequest::WalletStakingStatus)
+            .await;
+
+        match res {
+            Ok(TFLServiceResponse::WalletStakingStatus(Ok(res))) => Ok(res),
+            Ok(TFLServiceResponse::WalletStakingStatus(Err(err))) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::Verify.into(),
+                    format!("wallet_staking_status failed: {err}"),
+                    None::<()>,
+            )),
+            Err(err) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::Verify.into(),
+                    format!("wallet_staking_status failed: {err}"),
                     None::<()>,
             )),
             _ => unreachable!(""),

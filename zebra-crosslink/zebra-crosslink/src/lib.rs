@@ -1823,6 +1823,9 @@ async fn tfl_service_incoming_request(
             }
         })),
 
+        TFLServiceRequest::WalletStakingStatus =>
+            Ok(TFLServiceResponse::WalletStakingStatus(wallet::wallet_staking_status_json())),
+
         // workshop - mining & staking via PoW
         TFLServiceRequest::TotalIssuanceFromKey(ufvk_str, first_height, last_height) => {
             Ok(TFLServiceResponse::TotalIssuanceFromKey({

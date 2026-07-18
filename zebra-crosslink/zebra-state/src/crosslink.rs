@@ -63,6 +63,8 @@ pub enum TFLServiceRequest {
     WalletUfvk,
     /// Send staking action from wallet
     WalletStakingAction(StakingActionRequest),
+    /// Read the wallet's staking status (bonds, balances, sync height)
+    WalletStakingStatus,
 }
 
 /// Types of responses that can be returned by the TFLService.
@@ -98,6 +100,8 @@ pub enum TFLServiceResponse {
     WalletUfvk(Option<String>),
     /// Send staking action from wallet
     WalletStakingAction(Result<String, String>),
+    /// Wallet staking status as a JSON object string
+    WalletStakingStatus(Result<String, String>),
 }
 
 /// Errors that can occur when interacting with the TFLService.
