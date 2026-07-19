@@ -551,6 +551,9 @@ where
         // Set up the cancellation conditions for the miner.
         let mut cancel_receiver = template_receiver.clone();
         let old_header = zebra_chain::block::Header::clone(&template.header);
+        // Remember which parent we are solving against. Both `template` and `cancel_fn`
+        // are moved into `mine_a_block` below, so this has to be captured up front.
+        let solved_parent = old_header.previous_block_hash;
         let cancel_fn = move || match cancel_receiver.has_changed() {
             // Guard against get_block_template() providing an identical header. This could happen
             // if something irrelevant to the block data changes, the time was within 1 second, or
@@ -605,11 +608,43 @@ where
             continue;
         };
 
-        // Submit the newly mined blocks to the verifiers.
+        // Do not submit a solution that went stale while we were solving it.
         //
-        // TODO: if there is a new template (`cancel_fn().is_err()`), and
-        //       GetBlockTemplate.submit_old is false, return immediately, and skip submitting the
-        //       blocks.
+        // `mine_a_block` can return a valid solution for a template whose parent is no
+        // longer the tip: the solver only observes `cancel_fn` between equihash attempts,
+        // so a solution found just as a new block arrives still returns Ok. Submitting it
+        // builds on a stale parent and strands this node on a self-mined fork -- the
+        // mechanism behind the 2026-07-08 fork at height 202,689, which went undetected
+        // for 18h and 2,268 blocks, past the reorg window, and needed a full rollback.
+        //
+        // Only the PARENT matters. If the template changed for an unrelated reason (new
+        // timestamp, mempool churn) but the parent is unchanged, our block is still a
+        // legitimate competitor at this height, so it is submitted and the work is kept.
+        // That distinction is why this checks `previous_block_hash` rather than reusing
+        // `cancel_fn`'s whole-header comparison, which would discard good solutions.
+        //
+        // This is the guard the old TODO here asked for. It is a precondition for raising
+        // the solver count above 1 (see `configured_threads`): more concurrent solvers
+        // means more solutions completing after the tip has moved.
+        let current_parent = template_receiver
+            .cloned_watch_data()
+            .map(|b| b.header.previous_block_hash);
+        if current_parent.is_some_and(|parent| parent != solved_parent) {
+            info!(
+                ?height,
+                ?solver_id,
+                "discarding stale solution: tip moved while solving"
+            );
+
+            // Same backoff as the cancelled-solver path above.
+            if !is_shutting_down() {
+                sleep(BLOCK_TEMPLATE_REFRESH_LIMIT).await;
+            }
+
+            continue;
+        }
+
+        // Submit the newly mined blocks to the verifiers.
         let mut any_success = false;
         for block in blocks {
             let data = block
