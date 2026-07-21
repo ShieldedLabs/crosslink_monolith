@@ -2005,11 +2005,22 @@ async fn tfl_block_sequence(
             .await;
 
             if let Ok(StateResponse::BlockHashes(chunk_hashes)) = res {
-                if c == 0 && include_start_hash && !chunk_hashes.is_empty() {
-                    assert_eq!(
-                        chunk_hashes[0], start_hash,
-                        "first hash is not the one requested"
+                if c == 0 && include_start_hash && !chunk_hashes.is_empty() && chunk_hashes[0] != start_hash {
+                    // The best chain switched between resolving start_hash and this
+                    // walk: FindBlockHashes follows the CURRENT best chain, so a
+                    // same-height sibling switch (e.g. a stale internal-miner submit
+                    // displacing a just-committed block, see #39) makes the first
+                    // returned hash differ from the one requested. That is a normal
+                    // reorg race, not an internal error. Return what we have; the
+                    // callers' paranoid guards already retry against the new chain.
+                    // This was a fatal assert that took whole nodes down whenever
+                    // the race hit (multiple operator reports 2026-07-20/21,
+                    // "panicked at zebra-crosslink/src/lib.rs:1939/:1959").
+                    println!(
+                        "PARANOID != WRONG: first hash {} is not the requested {} (best chain switched mid-walk)",
+                        chunk_hashes[0], start_hash
                     );
+                    break;
                 }
 
                 chunk = chunk_hashes;
