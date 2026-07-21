@@ -2197,3 +2197,127 @@ async fn _tfl_dump_block_sequence(
     .await;
     tfl_dump_blocks(&blocks[..], &infos[..]);
 }
+
+#[cfg(test)]
+mod tfl_block_sequence_reorg_tests {
+    use super::*;
+    use crate::service::TFLServiceCalls;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zebra_chain::serialization::ZcashDeserializeInto;
+
+    /// Builds `TFLServiceCalls` whose state procedure answers with the given
+    /// sync closure. The other procedures are unused by `tfl_block_sequence`
+    /// and fail the call if ever hit.
+    fn state_only_calls(
+        state: impl Fn(StateRequest) -> StateResponse + Send + Sync + 'static,
+    ) -> TFLServiceCalls {
+        let state = Arc::new(state);
+        TFLServiceCalls {
+            state: Arc::new(move |req| {
+                let state = state.clone();
+                Box::pin(async move { Ok(state(req)) })
+            }),
+            read_state: Arc::new(|_| Box::pin(async { Err("read_state unused in test".into()) })),
+            mempool: Arc::new(|_| Box::pin(async { Err("mempool unused in test".into()) })),
+            force_feed_pos: Arc::new(|_, _| {
+                Box::pin(async { Err("force_feed_pos unused in test".to_string()) })
+            }),
+        }
+    }
+
+    fn test_blocks() -> (Arc<Block>, Arc<Block>) {
+        let block_1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("block 1 should deserialize");
+        let block_2 = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("block 2 should deserialize");
+        (block_1, block_2)
+    }
+
+    /// A best-chain switch between resolving the start hash and walking
+    /// `FindBlockHashes` makes element 0 a same-height sibling of the block we
+    /// started from. This used to be a fatal assert that aborted the node; it
+    /// must return empty vectors instead, so the viz2 caller's paranoid guards
+    /// reject the empty sequence and re-read the tip on the next loop tick.
+    #[tokio::test]
+    async fn sibling_first_hash_returns_empty_instead_of_panicking() {
+        let (block_1, block_2) = test_blocks();
+        let start_hash = block_1.hash();
+        // stands in for the sibling that displaced block_1 at the same height
+        let sibling_hash = block_2.hash();
+        let header = block_1.header.clone();
+
+        let calls = state_only_calls(move |req| match req {
+            StateRequest::BlockHeader(_) => StateResponse::BlockHeader {
+                header: header.clone(),
+                hash: start_hash,
+                height: ZebBlockHeight(1),
+                next_block_hash: None,
+            },
+            StateRequest::FindBlockHashes { .. } => {
+                StateResponse::BlockHashes(vec![sibling_hash])
+            }
+            other => panic!("unexpected state request in test: {other:?}"),
+        });
+
+        let (hashes, blocks) = tfl_block_sequence(
+            &calls,
+            start_hash,
+            Some((ZebBlockHeight(3), sibling_hash)),
+            true,
+            true,
+        )
+        .await;
+
+        assert!(hashes.is_empty(), "no sibling sequence may be consumed");
+        assert!(
+            blocks.is_empty(),
+            "no blocks may be fetched or published for a sibling walk"
+        );
+    }
+
+    /// The guard must not fire on a consistent walk: element 0 equal to the
+    /// requested start hash returns the sequence as before.
+    #[tokio::test]
+    async fn consistent_walk_still_returns_the_sequence() {
+        let (block_1, block_2) = test_blocks();
+        let start_hash = block_1.hash();
+        let next_hash = block_2.hash();
+        let header = block_1.header.clone();
+
+        let find_calls = AtomicUsize::new(0);
+        let calls = state_only_calls(move |req| match req {
+            StateRequest::BlockHeader(_) => StateResponse::BlockHeader {
+                header: header.clone(),
+                hash: start_hash,
+                height: ZebBlockHeight(1),
+                next_block_hash: None,
+            },
+            StateRequest::FindBlockHashes { .. } => {
+                if find_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    StateResponse::BlockHashes(vec![start_hash, next_hash])
+                } else {
+                    // end of chain
+                    StateResponse::BlockHashes(Vec::new())
+                }
+            }
+            other => panic!("unexpected state request in test: {other:?}"),
+        });
+
+        let (hashes, blocks) = tfl_block_sequence(
+            &calls,
+            start_hash,
+            Some((ZebBlockHeight(2), next_hash)),
+            true,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            hashes.iter().map(|h| h.1).collect::<Vec<_>>(),
+            vec![start_hash, next_hash],
+        );
+        assert!(blocks.is_empty(), "read_extra_info=false returns no blocks");
+    }
+}
