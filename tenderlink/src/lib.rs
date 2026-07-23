@@ -907,6 +907,8 @@ impl TMState {
     }
 
     async fn bft_update(&mut self, roster: &mut Vec<SortedRosterMember>) {
+        debug_assert!(self.rounds_data.iter().all(|r| r.height >= self.height));
+
         let now = Instant::now();
         let mut total_active_stake = 0;
         for i in 0..active_roster_len(roster) {
@@ -1067,10 +1069,11 @@ impl TMState {
                 // new roster by the decided-block closure).
                 self.vote_namespace = new_vote_namespace;
                 self.recent_commit_round_cache.push(self.rounds_data[i].clone());
-                self.rounds_data.retain(|r| r.height < self.height);
+                self.rounds_data.retain(|r| r.height >= self.height);
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
                 self.start_round(roster, now, 0).await;
+                break;
             }
 
             // line 55: round catchup
