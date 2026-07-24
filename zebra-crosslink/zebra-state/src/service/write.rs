@@ -383,6 +383,9 @@ impl WriteBlockWorkerTask {
                             }
                         }
 
+                        // The finalized tip changed, so this is stale and needs invalidation, or else it will write duplicate trees.
+                        prev_finalized_note_commitment_trees = None;
+
                         let aggregated_stakes = finalized_state.db.aggregated_stakes(&hash)
                             .unwrap_or_default();
 
