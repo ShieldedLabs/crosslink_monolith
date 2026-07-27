@@ -1840,6 +1840,19 @@ async fn tfl_service_incoming_request(
         TFLServiceRequest::StakingCmd(String) => Err(TFLServiceError::NotImplemented),
 
         TFLServiceRequest::WalletUfvk => Ok(TFLServiceResponse::WalletUfvk(wallet::USER_UFVK_STRING.lock().unwrap().clone())),
+
+        TFLServiceRequest::WalletSyncStatus => {
+            let s = *wallet::WALLET_SYNC_STATUS.lock().unwrap();
+            Ok(TFLServiceResponse::WalletSyncStatus(WalletSyncStatusSnapshot {
+                sync_height: s.sync_height,
+                tip_height: s.tip_height,
+                user_shielded_spendable_zats: s.user_shielded_spendable_zats,
+                user_shielded_pending_zats: s.user_shielded_pending_zats,
+                user_unshielded_zats: s.user_unshielded_zats,
+                staked_zats: s.staked_zats,
+                withdrawable_zats: s.withdrawable_zats,
+            }))
+        }
     }
 }
 

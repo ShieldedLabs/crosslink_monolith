@@ -88,7 +88,7 @@ use zebra_chain::{
 use zebra_consensus::{funding_stream_address, ParameterCheckpoint, RouterError};
 use zebra_network::{address_book_peers::AddressBookPeers, PeerSocketAddr};
 use zebra_node_services::mempool;
-use zebra_state::crosslink::{TFLBlockFinality, TFLServiceRequest, TFLServiceResponse};
+use zebra_state::crosslink::{TFLBlockFinality, TFLServiceRequest, TFLServiceResponse, WalletSyncStatusSnapshot};
 use zebra_state::{HashOrHeight, OutputLocation, ReadRequest, ReadResponse, TransactionLocation};
 
 use crate::{
@@ -539,6 +539,23 @@ pub trait Rpc {
     /// Get the UFVK for the attached wallet
     #[method(name = "get_wallet_ufvk")]
     async fn get_wallet_ufvk(&self) -> Option<String>;
+
+    /// Get the headless wallet's own note-scan progress and balances.
+    ///
+    /// `sync_height` is how far the wallet's own (in-memory, restart-resets-to-zero) note-scan
+    /// has reached -- distinct from the node's raw chain-sync height (see `getblockchaininfo`),
+    /// which can be fully caught up while this still lags behind, particularly right after a
+    /// restart. Balances (and anything derived from wallet-tracked notes, e.g.
+    /// `wallet_staking_action`) are only accurate once `sync_height` is close to `tip_height`.
+    ///
+    /// ## Example Usage
+    /// ```bash
+    /// curl -X POST -H "Content-Type: application/json" -d \
+    /// '{ "jsonrpc": "2.0", "method": "get_wallet_sync_status", "params": [], "id": 1 }' \
+    /// http://127.0.0.1:8232
+    /// ```
+    #[method(name = "get_wallet_sync_status")]
+    async fn get_wallet_sync_status(&self) -> Result<WalletSyncStatusSnapshot>;
 
     /// send a staking action from the given wallet
     #[method(name = "wallet_staking_action")]
@@ -2360,6 +2377,21 @@ where
         match res {
             Ok(TFLServiceResponse::WalletUfvk(ufvk_str)) => ufvk_str,
             _ => None
+        }
+    }
+
+    async fn get_wallet_sync_status(&self) -> Result<WalletSyncStatusSnapshot> {
+        let res = self
+            .tfl_service
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(TFLServiceRequest::WalletSyncStatus)
+            .await;
+        match res {
+            Ok(TFLServiceResponse::WalletSyncStatus(status)) => Ok(status),
+            _ => Ok(WalletSyncStatusSnapshot::default()),
         }
     }
 
