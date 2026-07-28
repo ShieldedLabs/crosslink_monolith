@@ -3,6 +3,15 @@ name = "tenderlink"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "tenderlink"
+path = "src/main.rs"
+required-features = ["simulation"]
+
+[features]
+default = []
+simulation = []
+
 [profile.dev]
 opt-level = 0            # no optimizations
 debug = 2   # full debug info (0 = none, 1 = line tables only, 2 = full)
@@ -35,6 +44,9 @@ zcash_primitives = { path = "../librustzcash/zcash_primitives" } # version = "2.
 #nym-ip-packet-requests = { git = "https://github.com/ShieldedLabs/nym.git", rev = "2023a668c5ba0127d2751aad7a124e33ec47d081" }
 #smolmix = { git = "https://github.com/ShieldedLabs/nym.git", rev = "2023a668c5ba0127d2751aad7a124e33ec47d081" }
 chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29.0", features = ["fs", "user"] }
 
 [dependencies.snow]
 git = "https://github.com/ShieldedLabs/snow.git"
