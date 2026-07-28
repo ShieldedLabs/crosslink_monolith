@@ -37,14 +37,12 @@ pub enum Response {
     /// successfully committed to the state.
     Committed(block::Hash),
 
-    /// Response to [`Request::InvalidateBlock`] indicating that a block was found and
-    /// invalidated in the state.
-    Invalidated(block::Hash),
-
-    /// Response to [`Request::ReconsiderBlock`] indicating that a previously invalidated
-    /// block was reconsidered and re-committed to the non-finalized state. Contains a list
-    /// of block hashes that were reconsidered in the state and successfully re-committed.
-    Reconsidered(Vec<block::Hash>),
+    /// Response to [`Request::CommitVerifiedBlockDirect`]: the committed hash, plus any blocks
+    /// this commit pushed past the reorg limit into the finalized state.
+    ///
+    /// The caller uses the second field to keep its own chain view current, which is why
+    /// new_network no longer needs an event channel back from the write task.
+    CommittedDirect(block::Hash, Vec<crate::new_network::ShadowBlock>),
 
     /// Response to [`Request::Depth`] with the depth of the specified block.
     Depth(Option<u32>),

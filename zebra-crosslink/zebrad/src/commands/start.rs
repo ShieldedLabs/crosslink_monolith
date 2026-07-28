@@ -244,6 +244,7 @@ impl StartCmd {
 
         let actual_closure: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>> = Arc::new(std::sync::Mutex::new(None));
         let actual_closure2 = Arc::clone(&actual_closure);
+        let actual_closure3 = Arc::clone(&actual_closure);
 
         let mut state_config = config.state.clone();
         // config.crosslink.hardforks is already canonical and merged (see ZebradConfig::load)
@@ -512,6 +513,7 @@ impl StartCmd {
 
             let config = Arc::clone(&config);
             let sync_read_state = read_only_state_service.clone();
+            let sync_state_for_commit = state.clone();
             let sync_block_verifier = block_verifier_router.clone();
             tokio::task::spawn_blocking(move || {
                 use zebra_state::new_network::BlockCommitError;
@@ -528,7 +530,49 @@ impl StartCmd {
                             })
                     })
                 };
-                zebra_state::new_network::sync(commit_block, &config.state, sync_read_state, /* tfl_service2, */ tokio::runtime::Handle::current())
+                // Synchronous verification entry points. Passed as plain fn pointers because
+                // zebra-state cannot depend on zebra-consensus (the dependency runs the other
+                // way), so new_network cannot call these directly.
+                let verify_fns = zebra_state::new_network::VerifyFns {
+                    check_header: zebra_consensus::sync_verify::block_check_header,
+                    check_body: zebra_consensus::sync_verify::block_check_body,
+                    check_cheap: zebra_consensus::sync_verify::block_check_cheap,
+                    verify_expensive: zebra_consensus::sync_verify::block_verify_expensive,
+                };
+                // The same state -> crosslink closure the state service holds, so new_network
+                // can run the fat-pointer gate itself rather than discovering it at commit time.
+                let crosslink_gate: zebra_state::ClosureToCallIntoCrosslinkFromState =
+                    Arc::new(move |fat_pointer_a, fat_pointer_b, height| {
+                        if let Some(closure) = actual_closure3.lock().unwrap().as_mut() {
+                            (closure)(fat_pointer_a, fat_pointer_b, height)
+                        } else {
+                            tracing::error!("NewNet -> Crosslink closure not yet initialized.");
+                            None
+                        }
+                    });
+                // Direct commit: new_network has already verified the block, so this skips the
+                // verifier router and the state's orphan queue and goes straight to the writer.
+                let mut direct_state = sync_state_for_commit.clone();
+                let commit_verified = move |semantically_verified: zebra_state::SemanticallyVerifiedBlock| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(zebra_chain::block::Hash, Vec<zebra_state::new_network::ShadowBlock>), BlockCommitError>> + Send>> {
+                    let mut state = direct_state.clone();
+                    Box::pin(async move {
+                        use tower::ServiceExt;
+                        let ready = state.ready().await.map_err(|e| BlockCommitError::Other(format!("{e:?}")))?;
+                        match ready.call(zebra_state::Request::CommitVerifiedBlockDirect(semantically_verified)).await {
+                            Ok(zebra_state::Response::CommittedDirect(hash, trad_finalized)) => Ok((hash, trad_finalized)),
+                            Ok(rsp) => Err(BlockCommitError::Other(format!("unexpected response: {rsp:?}"))),
+                            Err(e) => {
+                                let msg = format!("{e:?}");
+                                if msg.contains("DuplicateCommitRequest") || msg.contains("AlreadyFinalized") || msg.contains("already") {
+                                    Err(BlockCommitError::Duplicate)
+                                } else {
+                                    Err(BlockCommitError::Other(msg))
+                                }
+                            }
+                        }
+                    })
+                };
+                zebra_state::new_network::sync(commit_block, &config.state, sync_read_state, /* tfl_service2, */ tokio::runtime::Handle::current(), verify_fns, crosslink_gate, commit_verified)
             });
         }
 

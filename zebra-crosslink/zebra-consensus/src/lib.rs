@@ -42,6 +42,7 @@ mod script;
 pub mod config;
 pub mod error;
 pub mod router;
+pub mod sync_verify;
 pub mod transaction;
 
 #[cfg(any(test, feature = "proptest-impl"))]

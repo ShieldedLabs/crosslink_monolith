@@ -532,8 +532,15 @@ pub(crate) async fn handle_instr(
             // let mut file = std::fs::File::create(&path).expect("valid file");
             // file.write_all(instr.data_slice(bytes));
 
-            let (force_feed_ok, msg) = match (internal_handle.call.force_feed_pow)(Arc::new(block)).await {
-                Ok(()) => (true, "PoW force feed ok".to_string()),
+            // Route through new_network's ingest queue -- the same doorway submit_block uses --
+            // so the tests exercise the production admission path rather than a parallel one.
+            let (force_feed_ok, msg) = match zebra_state::new_network::submit_block_to_new_network(
+                Arc::new(block),
+                std::time::Duration::from_secs(30),
+            ).await {
+                Ok(zebra_state::new_network::IngestOutcome::Committed(_)) => (true, "PoW ingest ok".to_string()),
+                Ok(zebra_state::new_network::IngestOutcome::Known { .. }) => (true, "PoW already known".to_string()),
+                Ok(zebra_state::new_network::IngestOutcome::Failed { reason, .. }) => (false, reason),
                 Err(msg) => (false, msg),
             };
             test_check(flags, force_feed_ok, &msg);

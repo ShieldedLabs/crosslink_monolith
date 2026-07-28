@@ -925,62 +925,6 @@ impl StateService {
         self.read_service.best_tip()
     }
 
-    fn send_invalidate_block(
-        &self,
-        hash: block::Hash,
-    ) -> oneshot::Receiver<Result<block::Hash, BoxError>> {
-        let (rsp_tx, rsp_rx) = oneshot::channel();
-
-        let Some(sender) = &self.block_write_sender.non_finalized else {
-            let _ = rsp_tx.send(Err(
-                "cannot invalidate blocks while still committing checkpointed blocks".into(),
-            ));
-            return rsp_rx;
-        };
-
-        if let Err(tokio::sync::mpsc::error::SendError(error)) =
-            sender.send(NonFinalizedWriteMessage::Invalidate { hash, rsp_tx })
-        {
-            let NonFinalizedWriteMessage::Invalidate { rsp_tx, .. } = error else {
-                unreachable!("should return the same Invalidate message could not be sent");
-            };
-
-            let _ = rsp_tx.send(Err(
-                "failed to send invalidate block request to block write task".into(),
-            ));
-        }
-
-        rsp_rx
-    }
-
-    fn send_reconsider_block(
-        &self,
-        hash: block::Hash,
-    ) -> oneshot::Receiver<Result<Vec<block::Hash>, BoxError>> {
-        let (rsp_tx, rsp_rx) = oneshot::channel();
-
-        let Some(sender) = &self.block_write_sender.non_finalized else {
-            let _ = rsp_tx.send(Err(
-                "cannot reconsider blocks while still committing checkpointed blocks".into(),
-            ));
-            return rsp_rx;
-        };
-
-        if let Err(tokio::sync::mpsc::error::SendError(error)) =
-            sender.send(NonFinalizedWriteMessage::Reconsider { hash, rsp_tx })
-        {
-            let NonFinalizedWriteMessage::Reconsider { rsp_tx, .. } = error else {
-                unreachable!("should return the same Reconsider message could not be sent");
-            };
-
-            let _ = rsp_tx.send(Err(
-                "failed to send reconsider block request to block write task".into(),
-            ));
-        }
-
-        rsp_rx
-    }
-
     /// Assert some assumptions about the semantically verified `block` before it is queued.
     fn assert_block_can_be_validated(&self, block: &SemanticallyVerifiedBlock) {
         // required by `Request::CommitSemanticallyVerifiedBlock` call
@@ -1047,6 +991,44 @@ impl ReadStateService {
                 }
             }
             self.db.block(hash_or_height)
+        })
+    }
+
+    /// Return the header of the block identified by `hash_or_height`, searching all
+    /// non-finalized chains before falling back to the finalized state.
+    ///
+    /// Mirrors `block_from_any_chain`, but avoids deserializing the whole block. Needed for
+    /// the crosslink fat-pointer gate, which must resolve a *parent* that may be on a side
+    /// chain rather than the best chain.
+    pub fn any_chain_block_header(
+        &self,
+        hash_or_height: crate::HashOrHeight,
+    ) -> Option<Arc<block::Header>> {
+        self.non_finalized_state_receiver.with_watch_data(|non_finalized_state| {
+            for chain in non_finalized_state.chain_iter() {
+                if let Some(contextual) = chain.block(hash_or_height) {
+                    return Some(contextual.block.header.clone());
+                }
+            }
+            self.db.block_header(hash_or_height)
+        })
+    }
+
+    /// The network this state is for.
+    pub fn network(&self) -> &Network {
+        &self.network
+    }
+
+    /// Return the UTXO for `outpoint` if it exists in any non-finalized chain or in the
+    /// finalized state.
+    ///
+    /// This is a *load*, not the spend check: whether the spend is legal (unspent, correctly
+    /// ordered, mature coinbase) is decided later by
+    /// [`check::utxo::transparent_spend()`](crate::service::check::utxo::transparent_spend)
+    /// during contextual validation in the block write task.
+    pub fn any_chain_utxo(&self, outpoint: &zebra_chain::transparent::OutPoint) -> Option<zebra_chain::transparent::Utxo> {
+        self.non_finalized_state_receiver.with_watch_data(|non_finalized_state| {
+            read::any_utxo(non_finalized_state, &self.db, *outpoint)
         })
     }
 
@@ -1238,6 +1220,64 @@ impl Service<Request> for StateService {
                 .boxed()
             }
 
+            // new_network's path: the caller already did semantic verification, so skip the
+            // orphan queue, the sent-hash bookkeeping, and the crosslink gate (new_network runs
+            // that itself, before the expensive pass) and go straight to the write task.
+            Request::CommitVerifiedBlockDirect(semantically_verified) => {
+                let (rsp_tx, rsp_rx) = oneshot::channel();
+
+                // End the checkpoint phase if it has not ended. This drop is what makes the
+                // write task leave its finalized loop and start reading the non-finalized
+                // channel; it used to happen as a side effect of
+                // `queue_and_commit_to_non_finalized_state`, which this request bypasses.
+                if self.block_write_sender.finalized.is_some() {
+                    std::mem::drop(self.block_write_sender.finalized.take());
+                    self.non_finalized_block_write_sent_hashes = SentHashes::default();
+                    self.non_finalized_block_write_sent_hashes
+                        .can_fork_chain_at_hashes = true;
+                    self.clear_finalized_block_queue(
+                        "already finished committing checkpoint verified blocks: dropped duplicate block, \
+                         block is already committed to the state",
+                    );
+                }
+
+                let hash = semantically_verified.hash;
+
+                match &self.block_write_sender.non_finalized {
+                    Some(sender) => {
+                        if sender.send(crate::service::write::NonFinalizedWriteMessage::CommitReportingFinalized(semantically_verified, rsp_tx)).is_err() {
+                            let (tx, rx) = oneshot::channel();
+                            let _ = tx.send(Err(CommitSemanticallyVerifiedError::from(
+                                ValidateContextError::CommitTaskExited,
+                            )));
+                            return async move {
+                                rx.await
+                                    .map_err(|_| BoxError::from("commit task exited"))
+                                    .and_then(|res| res.map_err(BoxError::from))
+                                    .map(Response::Committed)
+                            }
+                            .boxed();
+                        }
+                    }
+                    None => {
+                        let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
+                            ValidateContextError::CommitTaskExited,
+                        )));
+                    }
+                }
+
+                timer.finish(module_path!(), line!(), "CommitVerifiedBlockDirect");
+
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_| BoxError::from("commit task dropped the response channel"))
+                        .and_then(|res| res.map_err(BoxError::from))
+                        .map(|trad_finalized| Response::CommittedDirect(hash, trad_finalized))
+                }
+                .boxed()
+            }
+
             // Uses finalized_state_queued_blocks and pending_utxos in the StateService.
             // Accesses shared writeable state in the StateService.
             Request::CommitCheckpointVerifiedBlock(finalized) => {
@@ -1423,48 +1463,6 @@ impl Service<Request> for StateService {
 
                     Ok(Response::KnownBlock(response))
                 }
-                .boxed()
-            }
-
-            Request::InvalidateBlock(block_hash) => {
-                let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| self.send_invalidate_block(block_hash))
-                });
-
-                let span = Span::current();
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_recv_error| {
-                            BoxError::from("invalidate block request was unexpectedly dropped")
-                        })
-                        // TODO: replace with Result::flatten once it stabilises
-                        // https://github.com/rust-lang/rust/issues/70142
-                        .and_then(convert::identity)
-                        .map(Response::Invalidated)
-                }
-                .instrument(span)
-                .boxed()
-            }
-
-            Request::ReconsiderBlock(block_hash) => {
-                let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| self.send_reconsider_block(block_hash))
-                });
-
-                let span = Span::current();
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_recv_error| {
-                            BoxError::from("reconsider block request was unexpectedly dropped")
-                        })
-                        // TODO: replace with Result::flatten once it stabilises
-                        // https://github.com/rust-lang/rust/issues/70142
-                        .and_then(convert::identity)
-                        .map(Response::Reconsidered)
-                }
-                .instrument(span)
                 .boxed()
             }
 

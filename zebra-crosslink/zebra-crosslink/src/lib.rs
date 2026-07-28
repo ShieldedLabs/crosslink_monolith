@@ -757,7 +757,11 @@ async fn handle_new_decided_bft_block(
     internal.fat_pointer_to_tip = fat_pointer.clone();
     internal.latest_final_block = Some((new_final_height, new_final_hash));
 
-    drop(internal); // Note(Sam): IT IS VERY IMPORTANT THAT WE DROP THE LOCK BECAUSE ZEBRA_STATE MAY CALL US BACK
+    // Note(Sam): IT IS VERY IMPORTANT THAT WE DROP THE LOCK BECAUSE ZEBRA_STATE MAY CALL US BACK.
+    // @Todo: once new_network syncs the BFT chain itself, this finalize becomes a message to
+    // new_network carrying the whole decision, and the reentrancy hazard goes with it -- the
+    // call graph stops being circular.
+    drop(internal);
     let got_stakes = loop {
         match (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(new_final_hash)).await {
             Ok(zebra_state::Response::CrosslinkFinalized(hash, aggregated_stakes)) => {
@@ -990,9 +994,10 @@ async fn validate_bft_block(
             // re-flush via a finalize of the *already-finalized* tip: that finalize is a guaranteed
             // no-op (the tip is no longer in the non-finalized state, so nothing is prematurely
             // finalized), but the request handler re-flushes the non-finalized queue regardless.
-            if let Some(hash) = already_finalized_hash {
-                let _ = (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(hash)).await;
-            }
+            // (Removed) This used to issue a no-op finalize of the already-finalized tip purely
+            // to make the state re-flush its deferred non-finalized queue. new_network owns that
+            // queue now and re-evaluates it every tick, so there is nothing to kick.
+            let _ = already_finalized_hash;
             return (tenderlink::TMStatus::Indeterminate, tenderlink::TMStatusReason::NeedsBlock { hash: new_final_hash.0 });
         };
     return (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None);
@@ -1346,9 +1351,8 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
         // than waiting for the first new BFT decision (which may never come on an idle chain).
         // The internal lock is released above, so the handler's callback into the fat-pointer
         // closure will not deadlock.
-        if new_final_hash != ZebBlockHash([0; 32]) {
-            let _ = (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(new_final_hash)).await;
-        }
+        // (Removed) This used to issue a no-op finalize of the loaded tip to re-flush the
+        // state's deferred queue at startup. new_network re-evaluates its own queue every tick.
 
         // Vote namespacing: the startup height is the number of ingested (decided) rounds; its
         // domain separator is computed before the call since `ingest_data_for_tenderlink` is

@@ -885,12 +885,14 @@ pub enum Request {
     /// Returns [`Response::KnownBlock(None)`](Response::KnownBlock) otherwise.
     KnownBlock(block::Hash),
 
-    /// Invalidates a block in the non-finalized state with the provided hash if one is present, removing it and
-    /// its child blocks, and rejecting it during contextual validation if it's resubmitted to the state.
-    InvalidateBlock(block::Hash),
-
-    /// Reconsiders a previously invalidated block in the non-finalized state with the provided hash if one is present.
-    ReconsiderBlock(block::Hash),
+    /// Commit a block that has *already* been semantically verified by the caller, bypassing
+    /// the verifier router, the orphan queue, and the sent-hash bookkeeping.
+    ///
+    /// This is new_network's path: it does its own synchronous verification, so the only work
+    /// left is contextual validation and the write itself. Also ends the checkpoint phase if it
+    /// has not ended yet -- that handoff used to be an emergent side effect of
+    /// `queue_and_commit_to_non_finalized_state`, which this request replaces.
+    CommitVerifiedBlockDirect(SemanticallyVerifiedBlock),
 
     /// Performs contextual validation of the given block, but does not commit it to the state.
     ///
@@ -931,8 +933,7 @@ impl Request {
             Request::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             Request::BestChainBlockHash(_) => "best_chain_block_hash",
             Request::KnownBlock(_) => "known_block",
-            Request::InvalidateBlock(_) => "invalidate_block",
-            Request::ReconsiderBlock(_) => "reconsider_block",
+            Request::CommitVerifiedBlockDirect(_) => "commit_verified_block_direct",
             Request::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
             Request::BondInfo(_) => "bond_info",
         }
@@ -1347,8 +1348,7 @@ impl TryFrom<Request> for ReadRequest {
 
             Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitCheckpointVerifiedBlock(_)
-            | Request::InvalidateBlock(_)
-            | Request::ReconsiderBlock(_)
+            | Request::CommitVerifiedBlockDirect(_)
             | Request::CrosslinkFinalizeBlock(_) => Err("ReadService does not write blocks"),
 
             Request::AwaitUtxo(_) => Err("ReadService does not track pending UTXOs. \

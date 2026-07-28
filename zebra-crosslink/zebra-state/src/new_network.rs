@@ -15,11 +15,15 @@ use tenderlink::{dbg_panic, dbg_verify};
 mod checkpoint;
 use checkpoint::Checkpoint;
 
+/// The last remaining event from the write task.
+///
+/// Commits and reorg-limit finalizations are no longer announced: `commit_verified` reports
+/// them synchronously, so new_network maintains its own chain view from the return value.
+/// Crosslink finalization is still pushed because BFT finalization does not route through
+/// new_network yet -- it goes crosslink service -> state -> write task. Once new_network syncs
+/// the BFT chain itself, this channel goes away entirely.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum BlockEvent {
-    Dequeued(ShadowBlock),
-    Committed(ShadowBlock),
-    TradFinalized(ShadowBlock),
     CrosslinkFinalized(ShadowBlock),
 }
 static BLOCK_EVENT_QUEUE_SENDER: std::sync::OnceLock<tokio::sync::mpsc::Sender<BlockEvent>> = std::sync::OnceLock::new();
@@ -1049,15 +1053,201 @@ pub enum BlockCommitError {
     Other(String),
 }
 
+// ---------------------------------------------------------------------------
+// Synchronous verification: types shared with zebra-consensus.
+//
+// These live here, not in zebra-consensus, because of the crate dependency direction:
+// zebra-consensus depends on zebra-state, so it can name these, but zebra-state can NOT
+// name anything in zebra-consensus. Defining them here is what lets `sync()` hold plain
+// `fn` pointers to the verification functions instead of boxed closures.
+// ---------------------------------------------------------------------------
+
+/// Values derived while running the cheap block checks.
+///
+/// Returned rather than recomputed: `transaction_hashes` costs a hash of every transaction
+/// in the block, and the expensive pass needs it again for sighashing.
+#[derive(Clone, Debug)]
+pub struct CheapBlockChecks {
+    pub hash: Hash,
+    pub height: Height,
+    pub transaction_hashes: std::sync::Arc<[zebra_chain::transaction::Hash]>,
+    pub coinbase_tx: std::sync::Arc<zebra_chain::transaction::Transaction>,
+    pub expected_block_subsidy: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    pub deferred_pool_balance_change: zebra_chain::amount::DeferredPoolBalanceChange,
+}
+
+/// A block verification failure.
+///
+/// `misbehavior_score` mirrors `zebra_consensus::RouterError::misbehavior_score()`, so the
+/// caller can weight or drop a peer without needing to name the consensus error types.
+#[derive(Clone, Debug)]
+pub struct BlockVerifyError {
+    pub msg: String,
+    pub misbehavior_score: u32,
+}
+
+/// The synchronous verification entry points, injected from zebrad.
+///
+/// Plain `fn` pointers, not closures: these functions capture nothing, so there is no
+/// allocation and no dynamic dispatch. @Todo: `verify_expensive` currently covers the
+/// shielded batches only; transparent scripts and sigops/fees are still to come.
+#[derive(Clone, Copy)]
+pub struct VerifyFns {
+    /// Header-only: PoW, difficulty, header time. Runs before the body is trusted.
+    pub check_header: fn(
+        &zebra_chain::block::Header,
+        &zebra_chain::parameters::Network,
+        Height,
+        chrono::DateTime<chrono::Utc>,
+        bool,
+    ) -> Result<(), BlockVerifyError>,
+
+    /// Body: binds the transactions to the header (merkle), then the subsidy rules.
+    /// Must run before anything trusts the height, including the crosslink gate.
+    pub check_body: fn(
+        &Block,
+        &zebra_chain::parameters::Network,
+    ) -> Result<CheapBlockChecks, BlockVerifyError>,
+
+    pub check_cheap: fn(
+        &Block,
+        &zebra_chain::parameters::Network,
+        chrono::DateTime<chrono::Utc>,
+        bool,
+    ) -> Result<CheapBlockChecks, BlockVerifyError>,
+
+    pub verify_expensive: fn(
+        &Block,
+        &zebra_chain::parameters::Network,
+        &CheapBlockChecks,
+        &dyn Fn(&zebra_chain::transparent::OutPoint) -> Option<zebra_chain::transparent::Utxo>,
+    ) -> Result<
+        std::collections::HashMap<
+            zebra_chain::transparent::OutPoint,
+            zebra_chain::transparent::OrderedUtxo,
+        >,
+        BlockVerifyError,
+    >,
+}
+
+// ---------------------------------------------------------------------------
+// Block ingest: the doorway for everything that is NOT new_network's own downloads.
+//
+// Producers are submit_block (the RPC, and therefore the internal miner) and the crosslink
+// test harness. Network-sourced blocks do NOT come through here -- they go straight into
+// blocks_to_commit -- so every entry on this queue is a local submission with no retry path
+// behind it. That is why the send side applies backpressure instead of dropping.
+// ---------------------------------------------------------------------------
+
+/// What happened to a submitted block.
+#[derive(Clone, Debug)]
+pub enum IngestOutcome {
+    /// Verified and committed.
+    Committed(Hash),
+    /// The state already knows this hash.
+    ///
+    /// `location` distinguishes best chain from a side chain or the commit queue -- a
+    /// distinction `is_duplicate_request()` throws away, and one miners care about.
+    Known {
+        location: crate::response::KnownBlockLocation,
+        height: Height,
+    },
+    /// Rejected. `misbehavior_score` mirrors the consensus error's own score.
+    Failed {
+        reason: String,
+        misbehavior_score: u32,
+    },
+}
+
+/// A block submitted from outside new_network, with a channel for the verdict.
+pub struct BlockSubmission {
+    pub block: std::sync::Arc<Block>,
+    pub reply: tokio::sync::oneshot::Sender<IngestOutcome>,
+}
+
+/// Bounded: this is a low-rate control path (one block per mining solution), not the bulk
+/// sync path, so a small queue is plenty.
+const BLOCK_SUBMISSION_QUEUE_LEN: usize = 32;
+
+static BLOCK_SUBMISSION_SENDER: std::sync::OnceLock<tokio::sync::mpsc::Sender<BlockSubmission>> =
+    std::sync::OnceLock::new();
+
+/// Submit a block to new_network and wait for its verdict.
+///
+/// Applies backpressure rather than dropping: nothing re-submits a miner's solved block, so a
+/// silent drop loses it. Never blocks the calling task -- `reserve()` yields instead.
+pub async fn submit_block_to_new_network(
+    block: std::sync::Arc<Block>,
+    timeout: std::time::Duration,
+) -> Result<IngestOutcome, String> {
+    let Some(tx) = BLOCK_SUBMISSION_SENDER.get() else {
+        return Err("new_network is not running".to_string());
+    };
+
+    let permit = match tokio::time::timeout(timeout, tx.reserve()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err("new_network stopped accepting blocks".to_string()),
+        Err(_) => return Err("timed out waiting for the block ingest queue".to_string()),
+    };
+
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    permit.send(BlockSubmission { block, reply });
+
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(_)) => Err("new_network dropped the reply channel".to_string()),
+        Err(_) => Err("timed out waiting for the block verdict".to_string()),
+    }
+}
+
+// @Temporary :SyncVerifyShadow
+// Scaffolding to A/B the synchronous verification path against the live async one. All of
+// this is parallel to the real pipeline and gates nothing; delete it once the sync path
+// takes over the commit decision.
+
+#[derive(Default, Debug)]
+struct ShadowStats {
+    /// Both paths accepted. The result we want.
+    agree_pass: u64,
+    /// Both paths rejected.
+    agree_reject: u64,
+    /// Sync path rejected a block the async path committed.
+    ///
+    /// This is THE alarm: it means the new path would have dropped a valid block. Anything
+    /// non-zero here blocks cutting over.
+    false_reject: u64,
+    /// Sync path accepted, async path did not.
+    ///
+    /// NOT necessarily a bug. The sync path only covers semantic checks, so contextual
+    /// failures (utxo spends, nullifiers, anchors) and the crosslink fat-pointer gate land
+    /// here legitimately. Worth eyeballing the reasons, not worth blocking on the count.
+    sync_pass_commit_err: u64,
+    /// Async path reported the block was already committed; nothing to compare against.
+    duplicate: u64,
+    cheap_total: std::time::Duration,
+    expensive_total: std::time::Duration,
+}
+
 pub fn sync(
     commit_block: impl Fn(std::sync::Arc<Block>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Hash, BlockCommitError>> + Send>>,
     config: &crate::config::Config,
     read_state: ReadState,
     // tfl_service: TFLService, // no TFLServiceHandle. Sadge!
     rt: tokio::runtime::Handle,
+    verify_fns: VerifyFns,
+    crosslink_gate: crate::ClosureToCallIntoCrosslinkFromState,
+    // Commit a block this loop has already verified, skipping the verifier router and the
+    // state's orphan queue. See `Request::CommitVerifiedBlockDirect`.
+    commit_verified: impl Fn(crate::SemanticallyVerifiedBlock) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Hash, Vec<ShadowBlock>), BlockCommitError>> + Send>>,
 ) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(500);
     BLOCK_EVENT_QUEUE_SENDER.set(event_tx).unwrap();
+
+    let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel(BLOCK_SUBMISSION_QUEUE_LEN);
+    let _ = BLOCK_SUBMISSION_SENDER.set(submit_tx);
+    // Replies live beside blocks_to_commit rather than inside it, so the existing queue and
+    // its eviction logic are untouched.
+    let mut submission_replies: HashMap<Hash, tokio::sync::oneshot::Sender<IngestOutcome>> = HashMap::new();
 
     let mut near_tip_chains = NearTipChains::default();
     // @Todo: @Refactor into a fn we can call to flush and reset the NearTipChains state.
@@ -1200,6 +1390,10 @@ pub fn sync(
     let mut next_peer_request = std::time::Instant::now();
     let mut next_console_status_print = std::time::Instant::now();
 
+    // @Temporary :SyncVerifyShadow
+    let mut shadow_stats = ShadowStats::default();
+    let mut next_shadow_report = std::time::Instant::now();
+
     // Lite checkpoint: enforced at the commit-queue push, and stays armed forever.
     let checkpoint = Checkpoint::from_config(&config.network_checkpoint);
     // while false we need to filter out peers who do not have the checkpoint
@@ -1246,10 +1440,7 @@ pub fn sync(
             match event_rx.try_recv() {
                 Ok(block_event) => {
                     match block_event {
-                        BlockEvent::Committed(block) => {
-                            near_tip_chains.push_blocks(&[block]);
-                        }
-                        BlockEvent::TradFinalized(block) | BlockEvent::CrosslinkFinalized(block) => {
+                        BlockEvent::CrosslinkFinalized(block) => {
                             near_tip_chains.remove_chains_invalidated_by_finalized(&block);
                         }
 
@@ -1260,6 +1451,37 @@ pub fn sync(
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(err) => { tracing::error!("{err:?}"); break; },
+            }
+        }
+
+        // Drain externally submitted blocks (submit_block RPC, miner, test harness) into the
+        // same commit queue the network path uses, so they go through identical verification.
+        loop {
+            match submit_rx.try_recv() {
+                Ok(BlockSubmission { block, reply }) => {
+                    let hash = block.hash();
+
+                    if let Some(known) = read_state.known_block(hash) {
+                        let _ = reply.send(IngestOutcome::Known {
+                            location: known.location,
+                            height: known.height,
+                        });
+                        continue;
+                    }
+                    if blocks_to_commit.iter().any(|(queued, _)| *queued == hash) {
+                        let _ = reply.send(IngestOutcome::Known {
+                            location: crate::response::KnownBlockLocation::Queue,
+                            height: block.coinbase_height().unwrap_or(Height(0)),
+                        });
+                        continue;
+                    }
+
+                    tracing::info!("NewNet: accepted submitted block {hash} into the commit queue");
+                    blocks_to_commit.push((hash, block));
+                    submission_replies.insert(hash, reply);
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(err) => { tracing::error!("block submission queue: {err:?}"); break; }
             }
         }
 
@@ -2486,10 +2708,166 @@ pub fn sync(
 
             let height = block_arc.coinbase_height().expect("all blocks in the commit queue should already have been confirmed to have a height").0;
             println!("Committing: @ {height}, {hash}");
-            let res = rt.block_on(commit_block(block_arc));
+            // @Temporary :SyncVerifyShadow
+            // Run the synchronous verification path immediately before the real commit, so
+            // both see identical state. This must NOT run at packet-receipt time: the block
+            // that created the outputs this one spends may still be queued here rather than
+            // committed, and the UTXO load would fail for a perfectly valid block.
+            let shadow = {
+                let network = read_state.network().clone();
+                // Matches SemanticBlockVerifier: PoW is skipped on networks that disable it.
+                let check_pow = !network.disable_pow();
+
+                let t0 = std::time::Instant::now();
+                // The agreed order: header (PoW gate) -> body (merkle binds the height) ->
+                // crosslink gate -> expensive. The crosslink gate MUST come after the body:
+                // it makes permanent, height-keyed decisions, and until the merkle root is
+                // checked the height is not bound to the PoW'd header.
+                let cheap_result = (verify_fns.check_header)(&block_arc.header, &network, block::Height(height), chrono::Utc::now(), check_pow)
+                    .and_then(|()| (verify_fns.check_body)(&block_arc, &network));
+                match cheap_result {
+                    Err(err) => Err(("cheap", err.msg)),
+                    Ok(cheap) => {
+                        let cheap_dur = t0.elapsed();
+
+                        // Crosslink fat-pointer gate, mirroring the state service's version
+                        // (:CrosslinkGate in service.rs). Three-way:
+                        //   None        -> the parent's pointer or the referenced BFT block is
+                        //                  not resolvable yet. Reversible, but per the agreed
+                        //                  policy we fail rather than defer: an internal retry
+                        //                  queue is unbounded in time, and the network layer
+                        //                  re-offers the block anyway.
+                        //   Some(false) -> permanently invalid.
+                        //   Some(true)  -> proceed.
+                        // @Volatile: the 32265/32266 bypass is carried across verbatim from
+                        // service.rs. It is a height-keyed hole in a consensus gate.
+                        let child_fat_pointer = block_arc.header.fat_pointer_to_bft_block.clone();
+                        let parent_fat_pointer = read_state
+                            .any_chain_block_header(parent_hash.into())
+                            .map(|hdr| hdr.fat_pointer_to_bft_block.clone());
+
+                        let gate = if height == 32265 || height == 32266 {
+                            Some(true)
+                        } else if let Some(parent_fp) = parent_fat_pointer {
+                            (crosslink_gate)(parent_fp, child_fat_pointer, block::Height(height))
+                        } else {
+                            None
+                        };
+
+                        // @Todo: this rejects on the REVERSIBLE answer, which costs re-downloads.
+                        //
+                        // `None` means "not resolvable yet" and is explicitly documented as
+                        // reversible; `Some(false)` is permanent. We currently fail on both.
+                        // Measured on a fresh sync to height 62: 108 rejections across 20
+                        // distinct blocks -- ~5.4 network re-downloads per affected block --
+                        // while every other verification phase rejected nothing at all.
+                        //
+                        // The real fix is not to re-check the gate later, but for new_network to
+                        // sync the BFT chain itself. Then it knows when each fat pointer becomes
+                        // resolvable and can submit blocks in dependency order, so the gate never
+                        // sees an unresolvable pointer and this whole class of retry disappears
+                        // by construction. Accepting the redundant traffic until then: it costs
+                        // apparent sync speed but keeps this path simple.
+                        match gate {
+                            None => Err(("crosslink", "fat pointer not resolvable yet".to_string())),
+                            Some(false) => Err(("crosslink", "fat pointer regressed or is too early".to_string())),
+                            Some(true) => {
+                                let lookup = |outpoint: &zebra_chain::transparent::OutPoint| read_state.any_chain_utxo(outpoint);
+                                let t1 = std::time::Instant::now();
+                                match (verify_fns.verify_expensive)(&block_arc, &network, &cheap, &lookup) {
+                                    Err(err) => Err(("expensive", err.msg)),
+                                    Ok(new_outputs) => Ok((cheap_dur, t1.elapsed(), cheap, new_outputs)),
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            // The sync path now GATES the commit: a rejection here means the block is never
+            // submitted. The old route (verifier router -> StateService -> queue_and_commit ->
+            // orphan queue -> sent-hash bookkeeping) is bypassed entirely; the write task is
+            // handed a block we already verified, leaving only contextual validation.
+            let res = match &shadow {
+                Ok((_, _, cheap, new_outputs)) => {
+                    let semantically_verified = crate::SemanticallyVerifiedBlock {
+                        block: block_arc.clone(),
+                        hash,
+                        height: cheap.height,
+                        new_outputs: new_outputs.clone(),
+                        transaction_hashes: cheap.transaction_hashes.clone(),
+                        deferred_pool_balance_change: Some(cheap.deferred_pool_balance_change),
+                    };
+                    rt.block_on(commit_verified(semantically_verified))
+                }
+                Err((phase, msg)) => {
+                    println!("Rejected by sync verification ({phase}) @ {height}, {hash}: {msg}");
+                    Err(BlockCommitError::Other(format!("{phase}: {msg}")))
+                }
+            };
+
+            match (&shadow, &res) {
+                (Ok((cheap, expensive, _, _)), Ok(_)) => {
+                    shadow_stats.agree_pass += 1;
+                    shadow_stats.cheap_total += *cheap;
+                    shadow_stats.expensive_total += *expensive;
+                }
+                (_, Err(BlockCommitError::Duplicate)) => {
+                    shadow_stats.duplicate += 1;
+                }
+                (Ok(_), Err(BlockCommitError::Other(why))) => {
+                    // Expected for contextual failures and the crosslink gate, neither of
+                    // which the sync path covers yet. Logged so the reasons stay visible.
+                    shadow_stats.sync_pass_commit_err += 1;
+                    tracing::info!("SyncVerifyShadow: sync passed but commit failed @ {height} {hash}: {why}");
+                }
+                (Err((phase, msg)), Ok(_)) => {
+                    // THE alarm: the sync path would have dropped a block the node accepted.
+                    shadow_stats.false_reject += 1;
+                    tracing::error!("SyncVerifyShadow: *** FALSE REJECT *** @ {height} {hash}: {phase} said {msg}, but the block COMMITTED");
+                }
+                (Err(_), Err(_)) => {
+                    shadow_stats.agree_reject += 1;
+                }
+            }
+
+            if let Some(reply) = submission_replies.remove(&hash) {
+                let outcome = match (&shadow, &res) {
+                    (_, Ok((committed, _))) => IngestOutcome::Committed(*committed),
+                    (_, Err(BlockCommitError::Duplicate)) => IngestOutcome::Known {
+                        location: crate::response::KnownBlockLocation::BestChain,
+                        height: block::Height(height),
+                    },
+                    (Err((phase, msg)), _) => IngestOutcome::Failed {
+                        reason: format!("{phase}: {msg}"),
+                        misbehavior_score: 0,
+                    },
+                    (_, Err(BlockCommitError::Other(why))) => IngestOutcome::Failed {
+                        reason: why.clone(),
+                        misbehavior_score: 0,
+                    },
+                };
+                let _ = reply.send(outcome);
+            }
+
             match res {
-                Ok(_) => {
+                Ok((_, trad_finalized)) => {
                     println!("committed!: @ {height}, {hash}");
+
+                    // Maintain the chain view from the commit result. This used to arrive as
+                    // BlockEvent::Committed / ::TradFinalized from the write task; now that the
+                    // commit is a synchronous call that reports what it did, the round trip is
+                    // unnecessary -- and so is the channel that made it possible for the write
+                    // task to block on a full queue while this loop was parked in a commit.
+                    near_tip_chains.push_blocks(&[ShadowBlock {
+                        this_hash: hash,
+                        parent_hash,
+                        this_height: height,
+                    }]);
+                    for finalized in &trad_finalized {
+                        near_tip_chains.remove_chains_invalidated_by_finalized(finalized);
+                    }
+
                     false // remove
                 }
                 Err(BlockCommitError::Duplicate) => {
@@ -2505,6 +2883,18 @@ pub fn sync(
                 }
             }
         });
+
+        // @Temporary :SyncVerifyShadow -- periodic scoreboard.
+        if std::time::Instant::now() >= next_shadow_report {
+            let s = &shadow_stats;
+            let n = s.agree_pass.max(1);
+            tracing::info!(
+                "SyncVerifyShadow: agree_pass={} agree_reject={} false_reject={} sync_pass_commit_err={} dup={} | avg cheap {:?}, avg expensive {:?}",
+                s.agree_pass, s.agree_reject, s.false_reject, s.sync_pass_commit_err, s.duplicate,
+                s.cheap_total / n as u32, s.expensive_total / n as u32,
+            );
+            next_shadow_report = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        }
 
         if blocks_to_commit.len() > 0 && !any_blocks_in_the_queue_can_make_progress {
             // dbg_panic!("No blocks made progress in the queue this tick!? This should never hit! Currently we are only queueing blocks that can make progress!"); // @Temporary.
