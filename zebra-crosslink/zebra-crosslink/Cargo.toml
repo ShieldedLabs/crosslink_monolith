@@ -72,6 +72,9 @@ lazy_static = "1.5.0"
 tenderlink = { workspace = true }
 visualizer_zcash = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["fs", "user"] }
+
 [dev-dependencies]
 zebra-test = { path = "../zebra-test", version = "1.0.0-beta.45" }
 

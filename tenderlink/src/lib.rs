@@ -4,6 +4,9 @@
 #![allow(clippy::never_loop)]
 
 #![allow(clippy::eq_op)]
+mod signer_wal;
+use signer_wal::*;
+
 const PRINT_PROTOCOL:       bool = 1 == 1;
 const PRINT_PROTOCOL_TAG:   bool = 0 == 1;
 const PRINT_ROSTER:         bool = 0 == 1;
@@ -102,6 +105,29 @@ fn is_timeout(e: std::io::ErrorKind) -> bool{
     e == std::io::ErrorKind::WouldBlock || e == std::io::ErrorKind::TimedOut
 }
 
+fn attestation_window_is_valid(issued: u64, expiry: u64, now: u64) -> bool {
+    let Some(lifetime) = expiry.checked_sub(issued) else {
+        return false;
+    };
+    let Some(minimum_expiry) = now.checked_add(60) else {
+        return false;
+    };
+    let Some(maximum_issued) = now.checked_add(MAX_ATTESTATION_CLOCK_SKEW_SECONDS) else {
+        return false;
+    };
+    let Some(maximum_expiry) = now
+        .checked_add(MAX_ATTESTATION_LIFETIME_SECONDS)
+        .and_then(|value| value.checked_add(MAX_ATTESTATION_CLOCK_SKEW_SECONDS))
+    else {
+        return false;
+    };
+    lifetime >= 60
+        && lifetime <= MAX_ATTESTATION_LIFETIME_SECONDS
+        && expiry >= minimum_expiry
+        && issued <= maximum_issued
+        && expiry <= maximum_expiry
+}
+
 #[derive(Default)]
 pub struct NetworkStats {
     bytes_sent: usize,
@@ -156,12 +182,24 @@ pub struct ClosureToValidateProposedBlock(pub Arc<dyn for<'a> Fn(&'a BlockValue)
 impl std::fmt::Debug for ClosureToValidateProposedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToValidateProposedBlock(..)") }
 }
-#[derive(Clone)]
-// Returns the roster for the next height together with that height's 32-byte vote-namespacing
-// domain separator (the cumulative hash of hardforks in effect; `[0; 32]` when there are none).
-pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock, Vec<TMSig>)-> core::pin::Pin<Box<dyn Future<Output = (Vec<SortedRosterMember>, [u8; 32])> + Send>> + Send + Sync + 'static>);
+#[derive(Clone, Debug)]
+pub struct DurableDecisionOutcome {
+    pub next_roster: Vec<SortedRosterMember>,
+    pub next_vote_namespace: [u8; 32],
+    /// Exact decided value hash reread from the durably synced committed store.
+    /// `None` keeps production signing disabled when no durable store exists.
+    pub durable_parent_commit: Option<[u8; 32]>,
+}
+
+// Returns the durably reread parent commit plus the roster and namespace for the next height.
+pub struct ClosureToPushDecidedBlock(pub Arc<dyn Fn(BlockValue, FatPointerToBftBlock, i64, Vec<TMSig>)-> core::pin::Pin<Box<dyn Future<Output = Result<DurableDecisionOutcome, String>> + Send>> + Send + Sync + 'static>);
 impl std::fmt::Debug for ClosureToPushDecidedBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToPushDecidedBlock(..)") }
+}
+#[derive(Clone)]
+pub struct ClosureToLoadCommittedRound(pub Arc<dyn Fn(u64)-> core::pin::Pin<Box<dyn Future<Output = Result<Option<RoundData>, String>> + Send>> + Send + Sync + 'static>);
+impl std::fmt::Debug for ClosureToLoadCommittedRound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToLoadCommittedRound(..)") }
 }
 #[derive(Clone)]
 pub struct ClosureToUpdatePeers(pub Arc<dyn Fn(Vec<PeerInfo>) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync + 'static>);
@@ -174,13 +212,40 @@ impl std::fmt::Debug for ClosureToAllowBftAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToAllowBftAccess(..)") }
 }
 
+#[derive(Clone, Debug)]
+pub enum SignerStartup {
+    #[cfg(any(test, feature = "simulation"))]
+    EphemeralSimulation {
+        chain_id: [u8; 32],
+        parent_commit: [u8; 32],
+        consensus_config_hash: [u8; 32],
+    },
+    ObserverOnly {
+        reason: String,
+        chain_id: [u8; 32],
+        parent_commit: [u8; 32],
+        consensus_config_hash: [u8; 32],
+    },
+    Durable {
+        wal_path: std::path::PathBuf,
+        anchor_path: std::path::PathBuf,
+        independent_anchor_authorized: bool,
+        non_genesis_bootstrap_receipt_hash: Option<[u8; 32]>,
+        chain_id: [u8; 32],
+        parent_commit: [u8; 32],
+        consensus_config_hash: [u8; 32],
+    },
+}
+
 fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMember]) -> FatPointerToBftBlock {
     let vote_for_block_without_finalizer_public_key: [u8; 76 - 32];
     {
         let mut sign_data = [0; 76 - 32];
         round_data.proposal_id.0.write_to(&mut sign_data[0..32]);
         round_data.height.write_to(&mut sign_data[32..]);
-        (round_data.round + 0x8000_0000).write_to(&mut sign_data[40..]);
+        canonical_vote_round(round_data.round, true)
+            .expect("decided round must be in the canonical 31-bit domain")
+            .write_to(&mut sign_data[40..]);
         vote_for_block_without_finalizer_public_key = sign_data;
     }
 
@@ -200,6 +265,85 @@ fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMembe
             })
             .collect(),
     }
+}
+
+/// Verify a reconstructed decided round against its exact active roster, signatures,
+/// namespace, canonical round domain, and weighted n-f quorum. This is the storage/network
+/// boundary verifier; it does not authorize signing or advance a signer epoch.
+pub fn verify_reconstructed_precommit_quorum(
+    round_data: &RoundData,
+    roster: &[SortedRosterMember],
+) -> Result<(), String> {
+    let active_len = active_roster_len(roster);
+    let Some(first_member) = roster.first().filter(|_| active_len > 0) else {
+        return Err("precommit roster is empty".into());
+    };
+    let certificate = canonical_precommit_certificate(round_data, roster)
+        .map_err(|error| error.to_string())?;
+    let epoch = SignerEpochBinding {
+        public_key: first_member.pub_key,
+        chain_id: [0u8; 32],
+        height: round_data.height,
+        parent_commit: [0u8; 32],
+        vote_namespace: round_data.vote_namespace,
+        consensus_config_hash: [0u8; 32],
+        roster_hash: canonical_roster_hash(roster).map_err(|error| error.to_string())?,
+        roster_index: 0,
+        active_roster_len: active_len
+            .try_into()
+            .map_err(|_| "active roster length does not fit u32")?,
+    };
+    verify_precommit_certificate(
+        &certificate,
+        round_data.round,
+        round_data.proposal_id,
+        &epoch,
+        roster,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Validate the exact consensus roster representation without binding it to a local signer.
+/// Raw public keys are identities: callers must not normalize byte-reversed twins.
+pub fn validate_consensus_roster(roster: &[SortedRosterMember]) -> Result<(), String> {
+    canonical_roster_hash(roster)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Return the canonical hash of the exact raw consensus roster.
+pub fn consensus_roster_hash(roster: &[SortedRosterMember]) -> Result<[u8; 32], String> {
+    canonical_roster_hash(roster).map_err(|error| error.to_string())
+}
+
+/// Return the exact roster fields bound into a durable signer epoch.
+pub fn signer_epoch_roster_binding(
+    roster: &[SortedRosterMember],
+    public_key: PubKeyID,
+) -> Result<([u8; 32], u32, u32), String> {
+    let active_len = active_roster_len(roster);
+    let roster_hash = canonical_roster_hash(roster).map_err(|error| error.to_string())?;
+    let roster_index = roster[..active_len]
+        .iter()
+        .position(|member| member.pub_key == public_key)
+        .ok_or_else(|| "signing key is absent from the active consensus roster".to_owned())?;
+    Ok((
+        roster_hash,
+        roster_index
+            .try_into()
+            .map_err(|_| "signer roster index does not fit u32")?,
+        active_len
+            .try_into()
+            .map_err(|_| "active roster length does not fit u32")?,
+    ))
+}
+
+/// Bind configured consensus rules to the exact Tenderlink hash-key suite.
+pub fn signer_consensus_config_binding(configured: [u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&configured);
+    hasher.update(&consensus_hash_keys_fingerprint(&HashKeys::default()));
+    hasher.finalize().into()
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -279,7 +423,10 @@ impl RoundData {
         self.proposal_sigs_n > 0 && self.proposal_sigs_n == self.proposal_sigs.len()
     }
 
-    fn flush_for_amnesiac_proposer(&mut self, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], proposal_size: u32) {
+    fn flush_for_amnesiac_proposer(&mut self, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], proposal_size: u32) -> bool {
+        let Some(proposal_chunks_n) = proposal_chunk_count(proposal_size) else {
+            return false;
+        };
         let roster_n = active_roster_len(roster);
         *self = RoundData {
             height:               self.height,
@@ -294,7 +441,8 @@ impl RoundData {
             ..RoundData::EMPTY
         };
         self.proposal.0    = vec![0;          proposal_size as usize];
-        self.proposal_sigs = vec![TMSig::NIL; self.proposal.chunks_n()];
+        self.proposal_sigs = vec![TMSig::NIL; proposal_chunks_n];
+        true
     }
     fn has_enough_info_to_determine_validity(&self) -> bool {
         self.proposal_is_faulty || self.has_full_proposal()
@@ -313,10 +461,273 @@ impl RoundData {
     }
 }
 
+fn rosters_match_exact(left: &[SortedRosterMember], right: &[SortedRosterMember]) -> bool {
+    left.len() == right.len() &&
+    left.iter().zip(right).all(|(left, right)| {
+        left.pub_key == right.pub_key &&
+        left.stake == right.stake &&
+        left.cumulative_stake == right.cumulative_stake
+    })
+}
+
+fn quorum_threshold(total_power: u64) -> u64 {
+    let max_faulty_power = total_power.saturating_sub(1) / 3;
+    total_power.saturating_sub(max_faulty_power)
+}
+
+fn verified_referenced_prevote_certificate(
+    rounds_data: &[RoundData],
+    current_round_i: usize,
+    current_namespace: &[u8; 32],
+    hash_keys: &HashKeys,
+) -> Option<(u32, u64, u64)> {
+    let current = rounds_data.get(current_round_i)?;
+    let valid_round: u32 = current.proposal_valid_round.try_into().ok()?;
+    if current.round > MAX_CONSENSUS_ROUND ||
+       valid_round > MAX_CONSENSUS_ROUND ||
+       valid_round >= current.round ||
+       current.proposal_is_faulty ||
+       !current.has_full_proposal() ||
+       current.proposal_id == ValueId::NIL ||
+       current.proposal_id != current.proposal.id_from_value(hash_keys) ||
+       current.vote_namespace != *current_namespace
+    {
+        return None;
+    }
+
+    let referenced_i = rounds_data
+        .binary_search_by_key(&(current.height, valid_round), |round| (round.height, round.round))
+        .ok()?;
+    let referenced = &rounds_data[referenced_i];
+    let current_active_len = active_roster_len(&current.roster);
+    let referenced_active_len = active_roster_len(&referenced.roster);
+    // The referenced proposal body is deliberately allowed to be compacted.
+    // The current proposer binds the complete current body to `proposal_id`,
+    // while the verified referenced prevotes bind the same id to `valid_round`.
+    if referenced.round > MAX_CONSENSUS_ROUND ||
+       referenced.proposal_id != current.proposal_id ||
+       referenced.vote_namespace != *current_namespace ||
+       current_active_len != referenced_active_len ||
+       !rosters_match_exact(
+           &referenced.roster[..referenced_active_len],
+           &current.roster[..current_active_len],
+       ) ||
+       referenced.msg_val_sigs.len() != referenced_active_len
+    {
+        return None;
+    }
+
+    let mut total_power = 0u64;
+    let mut yes_power = 0u64;
+    for (roster_i, member) in referenced.roster[..referenced_active_len].iter().enumerate() {
+        total_power = total_power.checked_add(member.stake)?;
+        if member.cumulative_stake != total_power {
+            return None;
+        }
+
+        let (value_id, sig) = referenced.msg_val_sigs[roster_i][0];
+        if value_id == ValueId::NIL {
+            if sig != TMSig::NIL {
+                let signed_data =
+                    make_vote_sign_datas(member.pub_key, false, referenced.height, valid_round, value_id)[0];
+                sig.verify_with_namespace(member.pub_key, &signed_data, current_namespace).ok()?;
+            }
+            continue;
+        }
+        if sig == TMSig::NIL {
+            return None;
+        }
+        let signed_data =
+            make_vote_sign_datas(member.pub_key, false, referenced.height, valid_round, value_id)[1];
+        sig.verify_with_namespace(member.pub_key, &signed_data, current_namespace).ok()?;
+        if value_id == referenced.proposal_id {
+            yes_power = yes_power.checked_add(member.stake)?;
+        }
+    }
+
+    if total_power == 0 {
+        return None;
+    }
+    let quorum = quorum_threshold(total_power);
+    (yes_power >= quorum).then_some((valid_round, yes_power, quorum))
+}
+
+fn round_indices_to_gossip(
+    rounds_data: &[RoundData],
+    height: u64,
+    current_round: u32,
+    historical_cursor: usize,
+) -> (Vec<usize>, usize) {
+    let Ok(current_i) = rounds_data
+        .binary_search_by_key(&(height, current_round), |round| (round.height, round.round))
+    else {
+        return (Vec::new(), 0);
+    };
+
+    let mut selected = vec![current_i];
+    let current = &rounds_data[current_i];
+    if let Ok(valid_round) = u32::try_from(current.proposal_valid_round) {
+        if valid_round < current_round {
+            if let Ok(valid_i) = rounds_data
+                .binary_search_by_key(&(height, valid_round), |round| (round.height, round.round))
+            {
+                selected.push(valid_i);
+            }
+        }
+    }
+
+    let historical: Vec<usize> = rounds_data
+        .iter()
+        .enumerate()
+        .filter_map(|(round_i, round)| {
+            (round.height == height &&
+             round_i != current_i &&
+             !selected.contains(&round_i))
+                .then_some(round_i)
+        })
+        .collect();
+
+    if historical.is_empty() {
+        return (selected, 0);
+    }
+
+    let cursor = historical_cursor % historical.len();
+    selected.push(historical[cursor]);
+    (selected, (cursor + 1) % historical.len())
+}
+
+fn commit_round_cache_entry_at_height(cache: &[RoundData], height: u64) -> Option<&RoundData> {
+    let base_height = cache.first()?.height;
+    let relative: usize = height.checked_sub(base_height)?.try_into().ok()?;
+    let round = cache.get(relative)?;
+    (round.height == height).then_some(round)
+}
+
+fn cached_commit_round_at_height(cache: &[RoundData], height: u64) -> Option<&RoundData> {
+    commit_round_cache_entry_at_height(cache, height)
+        .filter(|round| round.has_full_proposal())
+}
+
+fn commit_round_for_relay<'a>(
+    cache: &'a [RoundData],
+    loaded_historical_round: Option<&'a RoundData>,
+    height: u64,
+) -> Option<&'a RoundData> {
+    cached_commit_round_at_height(cache, height).or_else(|| {
+        loaded_historical_round.filter(|round| round.height == height)
+    })
+}
+
+fn defer_historical_round_retry(
+    retries: &mut std::collections::VecDeque<(u64, tokio::time::Instant)>,
+    height: u64,
+    retry_after: tokio::time::Instant,
+) {
+    retries.retain(|(retry_height, _)| *retry_height != height);
+    if retries.len() == MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY {
+        retries.pop_front();
+    }
+    retries.push_back((height, retry_after));
+}
+
+fn validate_commit_round_cache(
+    cache: &[RoundData],
+    expected_height: u64,
+) -> Result<(), String> {
+    let cache_height = u64::try_from(cache.len())
+        .map_err(|_| "commit-round cache length does not fit u64".to_string())?;
+    if cache.len() > MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY || cache_height > expected_height {
+        return Err(format!(
+            "commit-round cache length {cache_height} is invalid for BFT height {expected_height}"
+        ));
+    }
+    let base_height = expected_height - cache_height;
+    for (index, round) in cache.iter().enumerate() {
+        let expected_round_height = base_height
+            .checked_add(
+                u64::try_from(index)
+                    .map_err(|_| "commit-round cache index does not fit u64".to_string())?,
+            )
+            .ok_or("commit-round cache height overflows u64")?;
+        if round.height != expected_round_height {
+            return Err(format!(
+                "commit-round cache entry {index} carries height {} instead of {expected_round_height}",
+                round.height
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn compact_round_proposal_payload(round: &mut RoundData) {
+    // Replacing the vectors drops their backing allocations. `clear()` alone
+    // would retain the capacity and preserve the stall-era heap footprint.
+    round.proposal = BlockValue(Vec::new());
+    round.proposal_sigs = Vec::new();
+    round.proposal_sigs_n = 0;
+    round.proposal_checked_validity = (TMStatus::Indeterminate, TMStatusReason::None);
+}
+
+fn compact_recent_commit_payloads(cache: &mut [RoundData]) {
+    let compact_before = cache
+        .len()
+        .saturating_sub(MAX_RECENT_COMMIT_PAYLOADS_IN_MEMORY);
+    for round in &mut cache[..compact_before] {
+        compact_round_proposal_payload(round);
+    }
+}
+
+fn append_recent_commit_round(cache: &mut Vec<RoundData>, round: RoundData) {
+    cache.push(round);
+    let overflow = cache
+        .len()
+        .saturating_sub(MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY);
+    if overflow != 0 {
+        cache.drain(..overflow);
+    }
+    compact_recent_commit_payloads(cache);
+}
+
+/// Verify that reconstructed durable proposal context is the exact canonical
+/// chunk manifest signed by the deterministic proposer for this height/round.
+/// Callers must run this before admitting persisted signatures into gossip.
+pub fn verify_reconstructed_proposal_manifest(
+    hash_keys: &HashKeys,
+    round_data: &RoundData,
+) -> Result<(), String> {
+    validate_consensus_roster(&round_data.roster)?;
+    let active_len = active_roster_len(&round_data.roster);
+    let epoch = SignerEpochBinding {
+        public_key: PubKeyID::NIL,
+        chain_id: [0u8; 32],
+        height: round_data.height,
+        parent_commit: [0u8; 32],
+        vote_namespace: round_data.vote_namespace,
+        consensus_config_hash: [0u8; 32],
+        roster_hash: canonical_roster_hash(&round_data.roster)
+            .map_err(|error| error.to_string())?,
+        roster_index: u32::MAX,
+        active_roster_len: active_len
+            .try_into()
+            .map_err(|_| "active roster length does not fit u32".to_string())?,
+    };
+    verify_proposal_signature_manifest(
+        hash_keys,
+        &epoch,
+        &round_data.roster,
+        round_data.round,
+        round_data.proposal_valid_round,
+        &round_data.proposal,
+        round_data.proposal_id,
+        &round_data.proposal_sigs,
+    )
+    .map_err(|error| error.to_string())
+}
+
 enum TMMsgData {
     Proposal(BlockValue, i64),
     Prevote(ValueId),
-    Precommit(ValueId),
+    Precommit(ValueId, Option<LockValidTransition>),
 }
 pub struct TMMsg {
     height: u64,
@@ -427,8 +838,30 @@ impl Timeout {
 
 
 const ROSTER_MAX_N: usize = 100;
+const NORMAL_FUTURE_ROUND_WINDOW: u32 = 32;
+const RETAIN_PAST_ROUND_WINDOW: u32 = 64;
+pub const MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY: usize = 64;
+const MAX_RECENT_COMMIT_PAYLOADS_IN_MEMORY: usize = 1;
+const MAX_INFLIGHT_PROPOSAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PROPOSAL_CHUNKS_PER_ROUND_PER_TICK: usize = 2;
+const MAX_ROUTED_BFT_KEYS: usize = 256;
+const MAX_ENDPOINTS_PER_BFT_KEY: usize = 4;
+const MAX_DYNAMIC_ATTESTATIONS: usize = 256;
+const MAX_ATTESTATIONS_PER_PACKET: usize = 8;
+const MAX_ATTESTATIONS_PER_PEER_PER_MINUTE: usize = 32;
+const MAX_ATTESTATION_LIFETIME_SECONDS: u64 = 2 * 24 * 60 * 60;
+const MAX_ATTESTATION_CLOCK_SKEW_SECONDS: u64 = 5 * 60;
 fn active_roster_len(roster: &[SortedRosterMember]) -> usize { usize::min(ROSTER_MAX_N, roster.len()) }
 fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
+
+
+#[derive(Clone, Copy, Debug)]
+struct FutureRoundVote {
+    round: u32,
+    packet_type: u8,
+    value_id: ValueId,
+    sig: TMSig,
+}
 
 
 
@@ -436,7 +869,7 @@ fn total_roster_len(roster: &[SortedRosterMember])  -> usize { roster.len() }
 pub struct TMState {
     pub hash_keys: HashKeys,
     pub my_port: u16,
-    pub my_signing_key: SigningKey,
+    pub durable_signer: DurableSigner,
     pub my_pub_key: PubKeyID,
     pub round: u32,
     pub step: TMStep,
@@ -456,7 +889,19 @@ pub struct TMState {
 
     pub rounds_data: Vec<RoundData>,
 
-    pub recent_commit_round_cache: Vec<RoundData>, // for now will hold all completed heights
+    /// Compact, one-slot-per-validator evidence used to authorize a jump beyond
+    /// [`NORMAL_FUTURE_ROUND_WINDOW`]. A Byzantine minority can churn its own
+    /// slots but cannot allocate roster-sized `RoundData` or proposal buffers.
+    future_round_votes: Vec<Option<FutureRoundVote>>,
+    admitted_far_round: Option<u32>,
+
+    /// Bounded recent decided-round window. Historical state is never retained
+    /// for every height in the consensus process.
+    pub recent_commit_round_cache: Vec<RoundData>,
+
+    /// Latches an ambiguous decision-application boundary. No retry or height
+    /// advancement is permitted until restart reconciles the durable journals.
+    reconciliation_required: bool,
 
     propose_closure: ClosureToProposeNewBlock,
     validate_closure: ClosureToValidateProposedBlock,
@@ -467,7 +912,7 @@ pub struct TMState {
 }
 impl TMState {
     fn init(
-        my_signing_key: SigningKey, my_pub_key: PubKeyID, my_port: u16,
+        durable_signer: DurableSigner, my_pub_key: PubKeyID, my_port: u16,
         propose_closure: ClosureToProposeNewBlock,
         validate_closure: ClosureToValidateProposedBlock,
         push_block_closure: ClosureToPushDecidedBlock,
@@ -477,7 +922,7 @@ impl TMState {
         Self {
             hash_keys: HashKeys::default(),
             my_port,
-            my_signing_key,
+            durable_signer,
             my_pub_key,
             round: 0,
             step: TMStep::Propose,
@@ -487,7 +932,10 @@ impl TMState {
             locked_value_round: (None, -1),
 
             rounds_data: Vec::new(),
+            future_round_votes: Vec::new(),
+            admitted_far_round: None,
             recent_commit_round_cache: Vec::new(),
+            reconciliation_required: false,
 
             propose_closure,
             validate_closure,
@@ -518,7 +966,7 @@ impl TMState {
                     proposal_id: /*if proposal.0[1] % 5 == 0 { ValueId([6;32]) } else*/ { proposal.id_from_value(&self.hash_keys) },
                     valid_round,
                 };
-
+                let mut signable_parts = Vec::with_capacity(proposal.chunks_n());
                 for chunk_i in 0..proposal.chunks_n() { // NOTE: excluding packet_type // TODO: check this
                     hdr.chunk_i = chunk_i as u32;
                     let mut o = 0;
@@ -526,28 +974,58 @@ impl TMState {
 
                     let (chunk_o, chunk_size) = proposal.chunk_o_size(chunk_i);
                     o += proposal.0[chunk_o..chunk_o + chunk_size].write_to(&mut buf[o..]);
-
-                    // NOTE: we *DON'T* want to write it immediately to our proper store because it
-                    // will confuse check_and_incorporate_msg
-                    let sig = TMSig(sign_with_namespace(&self.my_signing_key, &buf[..o], &self.vote_namespace));
+                    signable_parts.push(buf[..o].to_vec());
+                }
+                let signatures = match self.durable_signer.sign_proposal(
+                    &self.hash_keys,
+                    roster,
+                    round,
+                    valid_round,
+                    hdr.proposal_id,
+                    &proposal.0,
+                    &signable_parts,
+                ) {
+                    Ok(signatures) => signatures,
+                    Err(error) => {
+                        eprintln!("{ctx_str} {ANSI_RED}SIGNING BLOCKED{ANSI_RST}: {error}");
+                        return self.step;
+                    }
+                };
+                for (chunk_i, (signed_data, sig)) in signable_parts.iter().zip(signatures).enumerate() {
                     if PRINT_SIGN { println!("{ctx_str} {ANSI_GRY}SIGN{ANSI_RST}: signed proposal with {:?}", sig) };
-
-                    // NOTE: we're faulty if we give our pub key for this if it's not our proposal
                     self.check_and_incorporate_msg(
-                        height, round, chunk_i, hdr.proposal_id, hdr.valid_round,
-                        roster, roster_i, PACKET_TYPE_PROPOSAL_CHUNK, &buf[..o], sig
+                        height, round, chunk_i, hdr.proposal_id, valid_round,
+                        roster, roster_i, PACKET_TYPE_PROPOSAL_CHUNK, signed_data, sig
                     );
                 }
 
                 TMStep::Propose
             }
 
-            TMMsgData::Prevote(value_id) | TMMsgData::Precommit(value_id) => {
-                let is_precommit: u8 = if let TMMsgData::Precommit(..) = msg { 1 } else { 0 };
+            vote_msg @ (TMMsgData::Prevote(..) | TMMsgData::Precommit(..)) => {
+                let (is_precommit, value_id, transition) = match vote_msg {
+                    TMMsgData::Prevote(value_id) => (0u8, value_id, None),
+                    TMMsgData::Precommit(value_id, transition) => (1u8, value_id, transition),
+                    TMMsgData::Proposal(..) => unreachable!(),
+                };
                 if PRINT_BFT_VOTE { println!("{ctx_str} {ANSI_GRY}BFT_VOTE{ANSI_RST}: {} on {}", ["prevoting", "precommitting"][is_precommit as usize], value_id); }
                 let packet_type = PACKET_TYPE_PREVOTE_SIGNATURES + is_precommit;
                 let signed_data = make_vote_sign_datas(roster[roster_i].pub_key, is_precommit != 0, height, round, value_id)[1];
-                let sig         = TMSig(sign_with_namespace(&self.my_signing_key, &signed_data, &self.vote_namespace));
+                let sig = match self.durable_signer.sign_vote(
+                    &self.hash_keys,
+                    roster,
+                    round,
+                    is_precommit != 0,
+                    value_id,
+                    &signed_data,
+                    transition,
+                ) {
+                    Ok(sig) => sig,
+                    Err(error) => {
+                        eprintln!("{ctx_str} {ANSI_RED}SIGNING BLOCKED{ANSI_RST}: {error}");
+                        return self.step;
+                    }
+                };
                 if PRINT_SIGN { println!("{ctx_str} {ANSI_GRY}SIGN{ANSI_RST}: signed {} with {:?}", ["prevote", "precommit"][is_precommit as usize], sig) };
 
                 self.check_and_incorporate_msg(
@@ -589,6 +1067,95 @@ impl TMState {
         (Some(roster_i), roster[roster_i].pub_key)
     }
 
+    fn prune_rounds_for_current_height(&mut self) {
+        let floor = self.round.saturating_sub(RETAIN_PAST_ROUND_WINDOW);
+        let ceiling = self.round.saturating_add(NORMAL_FUTURE_ROUND_WINDOW);
+        let mut protected = Vec::new();
+        for data in &self.rounds_data {
+            if data.height == self.height
+                && data.round >= floor
+                && data.round <= ceiling
+                && data.proposal_valid_round >= 0
+            {
+                if let Ok(referenced) = u32::try_from(data.proposal_valid_round) {
+                    protected.push(referenced);
+                }
+            }
+        }
+        for round in [self.locked_value_round.1, self.valid_value_round.1] {
+            if let Ok(round) = u32::try_from(round) {
+                protected.push(round);
+            }
+        }
+        self.rounds_data.retain(|data| {
+            data.height == self.height
+                && ((data.round >= floor && data.round <= ceiling)
+                    || protected.contains(&data.round))
+        });
+
+        // Old rounds retain ids, vote signatures, counts, rosters and timeout
+        // metadata, but not a gap-sized BftBlock body. Only the current,
+        // protocol-locked and protocol-valid rounds may keep proposal bytes.
+        let mut payload_protected = vec![self.round];
+        for round in [self.locked_value_round.1, self.valid_value_round.1] {
+            if let Ok(round) = u32::try_from(round) {
+                if !payload_protected.contains(&round) {
+                    payload_protected.push(round);
+                }
+            }
+        }
+        for data in &mut self.rounds_data {
+            if data.height == self.height
+                && data.round < self.round
+                && !payload_protected.contains(&data.round)
+            {
+                compact_round_proposal_payload(data);
+            }
+        }
+    }
+
+    fn clear_proposal_storage(data: &mut RoundData) {
+        compact_round_proposal_payload(data);
+        data.proposal_valid_round = -1;
+        data.proposal_is_faulty = false;
+    }
+
+    fn reserve_proposal_storage(&mut self, target_i: usize, requested: usize) -> bool {
+        let existing = self.rounds_data[target_i].proposal.0.len();
+        let projected = self
+            .rounds_data
+            .iter()
+            .try_fold(0usize, |total, data| {
+                total.checked_add(data.proposal.0.len())
+            })
+            .and_then(|total| total.checked_sub(existing))
+            .and_then(|total| total.checked_add(requested));
+        if projected.is_some_and(|bytes| bytes <= MAX_INFLIGHT_PROPOSAL_BYTES) {
+            return true;
+        }
+
+        // Current-round consensus traffic outranks speculative future proposals.
+        // Drop only their payload/signature buffers; compact vote evidence stays.
+        if self.rounds_data[target_i].round == self.round {
+            for (index, data) in self.rounds_data.iter_mut().enumerate() {
+                if index != target_i && data.height == self.height && data.round > self.round {
+                    Self::clear_proposal_storage(data);
+                }
+            }
+            let after_eviction = self
+                .rounds_data
+                .iter()
+                .try_fold(0usize, |total, data| {
+                    total.checked_add(data.proposal.0.len())
+                })
+                .and_then(|total| total.checked_sub(existing))
+                .and_then(|total| total.checked_add(requested));
+            return after_eviction
+                .is_some_and(|bytes| bytes <= MAX_INFLIGHT_PROPOSAL_BYTES);
+        }
+        false
+    }
+
     fn insert_round(&mut self, insert_i: usize, round: u32, roster: &[SortedRosterMember]) -> usize {
         let roster_n = active_roster_len(roster);
         self.rounds_data.insert(insert_i, RoundData {
@@ -604,14 +1171,34 @@ impl TMState {
 
     async fn start_round(&mut self, roster: &[SortedRosterMember], now: Instant, round: u32) {
         self.round = round;
+        self.prune_rounds_for_current_height();
+        if self.admitted_far_round.is_some_and(|admitted| admitted <= round) {
+            self.admitted_far_round = None;
+        }
+        for slot in &mut self.future_round_votes {
+            if slot.is_some_and(|evidence| evidence.round <= round) {
+                *slot = None;
+            }
+        }
         // self.active_proposal_value_round = (None, -1);
 
         let round_i = match self.rounds_data.binary_search_by_key(&(self.height, round), |el| (el.height, el.round)) {
             Ok(round_i)  => round_i,
             Err(round_i) => self.insert_round(round_i, round, roster)
         };
+        // Arm the propose timeout before invoking external proposal construction. A
+        // slow or temporarily unavailable state service must consume the round's
+        // bounded proposal budget, not postpone the timeout indefinitely.
+        self.rounds_data[round_i].active_timeout = Some(Timeout::new(
+            now,
+            self.height,
+            self.round,
+            TMStep::Propose,
+        ));
 
-        if Self::proposer_from_height_round(&self.hash_keys, roster, self.height, round).1 == self.my_pub_key {
+        if self.durable_signer.is_active() &&
+           Self::proposer_from_height_round(&self.hash_keys, roster, self.height, round).1 == self.my_pub_key
+        {
             let ctx_str = self.ctx_str(roster);
             let proposal = if let Some(valid_value) = self.valid_value_round.0.clone() {
                 Some(valid_value)
@@ -632,20 +1219,355 @@ impl TMState {
         } else {
             self.step = TMStep::Propose;
         }
-        self.rounds_data[round_i].active_timeout = Some(Timeout::new(now, self.height, self.round, TMStep::Propose));
+    }
+
+    async fn reconcile_pending_commit(
+        &mut self,
+        roster: &mut Vec<SortedRosterMember>,
+    ) -> Result<bool, String> {
+        let Some(recovery) = self
+            .durable_signer
+            .pending_commit_recovery(&self.hash_keys, roster)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        let digest = recovery.digest;
+        let recovered_round = recovery.round_data.clone();
+        let next_height = self
+            .height
+            .checked_add(1)
+            .ok_or("BFT height overflow during pending commit recovery")?;
+        if let Err(error) = validate_commit_round_cache(
+            &self.recent_commit_round_cache,
+            self.height,
+        )
+        .and_then(|()| {
+            (recovered_round.height == self.height)
+                .then_some(())
+                .ok_or_else(|| {
+                    format!(
+                        "recovered commit carries height {} while BFT expects {}",
+                        recovered_round.height, self.height
+                    )
+                })
+        }) {
+            let reason = format!("pending commit cache reconciliation failed: {error}");
+            self.durable_signer
+                .require_reconciliation(digest, reason.clone())
+                .map_err(|latch_error| {
+                    format!("{reason}; could not preserve reconciliation latch: {latch_error}")
+                })?;
+            self.reconciliation_required = true;
+            return Err(reason);
+        }
+        let push = self.push_block_closure.0.clone();
+        let outcome = match push(
+            recovery.proposal,
+            recovery.fat_pointer,
+            recovery.proposal_valid_round,
+            recovery.proposal_sigs,
+        )
+        .await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let reason = format!("pending commit application failed: {error}");
+                self.durable_signer
+                    .require_reconciliation(digest, reason.clone())
+                    .map_err(|latch_error| {
+                        format!("{reason}; could not preserve reconciliation latch: {latch_error}")
+                    })?;
+                self.reconciliation_required = true;
+                return Err(reason);
+            }
+        };
+        let durable_parent_commit = match outcome.durable_parent_commit {
+            Some(commit) => commit,
+            None => {
+                let reason =
+                    "pending commit recovery was not reread from the durable PoS store".to_string();
+                self.durable_signer
+                    .require_reconciliation(digest, reason.clone())
+                    .map_err(|latch_error| {
+                        format!("{reason}; could not preserve reconciliation latch: {latch_error}")
+                    })?;
+                self.reconciliation_required = true;
+                return Err(reason);
+            }
+        };
+        if let Err(error) = self.durable_signer.complete_commit(
+                digest,
+                durable_parent_commit,
+                outcome.next_vote_namespace,
+                &outcome.next_roster,
+            ) {
+            self.reconciliation_required = true;
+            return Err(format!("pending commit completion failed: {error}"));
+        }
+        append_recent_commit_round(&mut self.recent_commit_round_cache, recovered_round);
+        *roster = outcome.next_roster;
+        self.height = next_height;
+        self.vote_namespace = outcome.next_vote_namespace;
+        self.future_round_votes.clear();
+        self.admitted_far_round = None;
+        self.locked_value_round = (None, -1);
+        self.valid_value_round = (None, -1);
+        Ok(true)
+    }
+
+    fn restore_durable_signer_state(&mut self, roster: &[SortedRosterMember], now: Instant) -> Result<bool, SignerError> {
+        if !self.durable_signer.is_active() { return Ok(false); }
+        if let Some(transition) = self.durable_signer.durable_transition().cloned() {
+            verify_transition_certificate(
+                &transition,
+                self.durable_signer.epoch(),
+                &self.hash_keys,
+                roster,
+            )?;
+            self.locked_value_round = if transition.locked_round >= 0 {
+                (Some(BlockValue(transition.locked_value.clone())), transition.locked_round)
+            } else {
+                (None, -1)
+            };
+            self.valid_value_round = if transition.valid_round >= 0 {
+                (Some(BlockValue(transition.valid_value.clone())), transition.valid_round)
+            } else {
+                (None, -1)
+            };
+        }
+
+        let intents = self.durable_signer.replay_intents();
+        if intents.is_empty() { return Ok(false); }
+        let mut latest_round = 0u32;
+        for intent in intents {
+            let round = match &intent {
+                SignedIntent::Proposal { round, .. } | SignedIntent::Vote { round, .. } => *round,
+            };
+            latest_round = latest_round.max(round);
+            let round_i = match self.rounds_data.binary_search_by_key(&(self.height, round), |value| (value.height, value.round)) {
+                Ok(round_i) => round_i,
+                Err(round_i) => self.insert_round(round_i, round, roster),
+            };
+            match intent {
+                SignedIntent::Proposal { valid_round, proposal, .. } => {
+                    self.step = self.broadcast(roster, round_i, TMMsgData::Proposal(BlockValue(proposal), valid_round));
+                }
+                SignedIntent::Vote { kind, value_id, transition, .. } => {
+                    self.step = match kind {
+                        SlotKind::Prevote => self.broadcast(roster, round_i, TMMsgData::Prevote(value_id)),
+                        SlotKind::Precommit => self.broadcast(roster, round_i, TMMsgData::Precommit(value_id, transition)),
+                        SlotKind::Proposal => unreachable!(),
+                    };
+                }
+            }
+            if !self.durable_signer.is_active() {
+                return Err(SignerError::Conflict("exact WAL replay diverged and disabled signing".into()));
+            }
+        }
+        self.round = latest_round;
+        self.prune_rounds_for_current_height();
+        let current_i = self.rounds_data.binary_search_by_key(&(self.height, latest_round), |value| (value.height, value.round))
+            .map_err(|_| SignerError::Integrity("replayed current round is missing".into()))?;
+        self.rounds_data[current_i].active_timeout = Some(Timeout::new(now, self.height, latest_round, self.step));
+        Ok(true)
     }
 
     fn f_from_n(n: u64) -> u64 {
-        (n - 1) / 3
+        n.saturating_sub(1) / 3
     }
 
     fn check_and_incorporate_msg(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], roster_i: usize, packet_type: u8, signed_data: &[u8], sig: TMSig) -> TMStatus {
+        self.check_and_incorporate_msg_inner(
+            height,
+            round,
+            chunk_i,
+            value_id,
+            valid_round,
+            roster,
+            roster_i,
+            packet_type,
+            signed_data,
+            sig,
+            false,
+        )
+    }
+
+    /// Admit ordinary near-future votes directly. A vote farther ahead is kept
+    /// only in a compact per-validator slot until f+1 independently signed
+    /// evidence names the same round. Proposal chunks can never create that
+    /// certificate, so a lone Byzantine proposer cannot allocate 8 MiB at
+    /// arbitrarily many rounds.
+    fn check_and_incorporate_network_vote(
+        &mut self,
+        height: u64,
+        round: u32,
+        value_id: ValueId,
+        roster: &[SortedRosterMember],
+        roster_i: usize,
+        packet_type: u8,
+        signed_data: &[u8],
+        sig: TMSig,
+    ) -> TMStatus {
+        if height != self.height
+            || round > MAX_CONSENSUS_ROUND
+            || roster_i >= active_roster_len(roster)
+            || !matches!(
+                packet_type,
+                PACKET_TYPE_PREVOTE_SIGNATURES | PACKET_TYPE_PRECOMMIT_SIGNATURES
+            )
+        {
+            return TMStatus::Fail;
+        }
+        let normal_limit = self.round.saturating_add(NORMAL_FUTURE_ROUND_WINDOW);
+        if round <= normal_limit || self.admitted_far_round == Some(round) {
+            return self.check_and_incorporate_msg_inner(
+                height,
+                round,
+                0,
+                value_id,
+                -2,
+                roster,
+                roster_i,
+                packet_type,
+                signed_data,
+                sig,
+                self.admitted_far_round == Some(round),
+            );
+        }
+
+        let is_precommit = packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES;
+        let expected = make_vote_sign_datas(
+            roster[roster_i].pub_key,
+            is_precommit,
+            height,
+            round,
+            value_id,
+        )[(value_id != ValueId::NIL) as usize];
+        if signed_data != expected
+            || sig
+                .verify_with_namespace(
+                    roster[roster_i].pub_key,
+                    &expected,
+                    &self.vote_namespace,
+                )
+                .is_err()
+        {
+            return TMStatus::Fail;
+        }
+
+        self.future_round_votes
+            .resize(active_roster_len(roster), None);
+        self.future_round_votes[roster_i] = Some(FutureRoundVote {
+            round,
+            packet_type,
+            value_id,
+            sig,
+        });
+        let evidence_power = self
+            .future_round_votes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, evidence)| {
+                evidence
+                    .as_ref()
+                    .filter(|evidence| evidence.round == round)
+                    .map(|_| roster[index].stake)
+            })
+            .try_fold(0u64, |total, stake| total.checked_add(stake));
+        let Some(evidence_power) = evidence_power else {
+            return TMStatus::Fail;
+        };
+        let active_len = active_roster_len(roster);
+        let total_power = roster
+            .get(active_len.saturating_sub(1))
+            .map_or(0, |member| member.cumulative_stake);
+        if total_power == 0 || evidence_power < Self::f_from_n(total_power).saturating_add(1) {
+            return TMStatus::Pass;
+        }
+
+        if let Some(previous) = self.admitted_far_round {
+            if previous != round && previous > normal_limit {
+                self.rounds_data.retain(|data| {
+                    !(data.height == self.height && data.round == previous)
+                });
+            }
+        }
+        self.admitted_far_round = Some(round);
+        let certified_votes: Vec<(usize, FutureRoundVote)> = self
+            .future_round_votes
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let evidence = slot
+                    .as_ref()
+                    .copied()
+                    .filter(|evidence| evidence.round == round)?;
+                *slot = None;
+                Some((index, evidence))
+            })
+            .collect();
+        for (index, evidence) in certified_votes {
+            let is_precommit = evidence.packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES;
+            let signable = make_vote_sign_datas(
+                roster[index].pub_key,
+                is_precommit,
+                height,
+                round,
+                evidence.value_id,
+            )[(evidence.value_id != ValueId::NIL) as usize];
+            self.check_and_incorporate_msg_inner(
+                height,
+                round,
+                0,
+                evidence.value_id,
+                -2,
+                roster,
+                index,
+                evidence.packet_type,
+                &signable,
+                evidence.sig,
+                true,
+            );
+        }
+        TMStatus::Pass
+    }
+
+    fn check_and_incorporate_msg_inner(&mut self, height: u64, round: u32, chunk_i: usize, value_id: ValueId, valid_round: i64, roster: &[SortedRosterMember], roster_i: usize, packet_type: u8, signed_data: &[u8], sig: TMSig, allow_certified_far_round: bool) -> TMStatus {
         let ctx_str  = self.ctx_str(roster);
         let pkt_str = format!("{:20} {}.{}.{}", packet_name_from_tag(packet_type), height, round, chunk_i);
 
-        if height != self.height {
+        if height != self.height
+            || round > MAX_CONSENSUS_ROUND
+            || (!allow_certified_far_round
+                && round > self.round.saturating_add(NORMAL_FUTURE_ROUND_WINDOW))
+        {
             // eprintln!("{ctx_str} {ANSI_GRY}BFT{ANSI_RST}: received [{}] when we're at height {}", pkt_str, self.height);
             return TMStatus::Fail;
+        }
+
+        if packet_type == PACKET_TYPE_PROPOSAL_CHUNK {
+            let Some(hdr) = PacketProposalChunkHeader::read_from(&mut &signed_data[..]) else {
+                return TMStatus::Fail;
+            };
+            let canonical_valid_round = valid_round == -1
+                || (valid_round >= 0
+                    && valid_round <= i64::from(MAX_CONSENSUS_ROUND)
+                    && valid_round < i64::from(round));
+            let Some((_, chunk_size, _)) = proposal_chunk_layout(hdr.proposal_size, hdr.chunk_i)
+            else {
+                return TMStatus::Fail;
+            };
+            if hdr.height != height
+                || hdr.round != round
+                || hdr.chunk_i as usize != chunk_i
+                || hdr.proposal_id != value_id
+                || hdr.valid_round != valid_round
+                || !canonical_valid_round
+                || signed_data.len()
+                    != PacketProposalChunkHeader::SERIALIZED_SIZE + chunk_size
+            {
+                return TMStatus::Fail;
+            }
         }
 
         // check if in (active) roster
@@ -685,6 +1607,14 @@ impl TMState {
             Ok(round_i)  => (true,  round_i),
             Err(round_i) => (false, self.insert_round(round_i, round, roster)),
         };
+        if packet_type == PACKET_TYPE_PROPOSAL_CHUNK {
+            let Some(header) = PacketProposalChunkHeader::read_from(&mut &signed_data[..]) else {
+                return TMStatus::Fail;
+            };
+            if !self.reserve_proposal_storage(round_i, header.proposal_size as usize) {
+                return TMStatus::Fail;
+            }
+        }
         let round_data = &mut self.rounds_data[round_i];
 
         // TODO: Keep a dynamic array to solve the "Amnesiac Proposer's Dilemma".
@@ -723,7 +1653,9 @@ impl TMState {
                       (round_data.proposal.0.len() != hdr.proposal_size as usize ||
                        round_data.proposal_id != value_id ||
                        round_data.proposal_valid_round != valid_round) { // Amnesiac Proposer's Dilemma
-                        round_data.flush_for_amnesiac_proposer(value_id, valid_round, roster, hdr.proposal_size);
+                        if !round_data.flush_for_amnesiac_proposer(value_id, valid_round, roster, hdr.proposal_size) {
+                            return TMStatus::Fail;
+                        }
                         eprintln!("{ctx_str} {ANSI_YLW}AMNESIAC PROPOSER{ANSI_RST} at {}.{}.{}: Flushing proposal...", height, round, chunk_i);
                     } else {
                         if round_data.proposal.0.len() != hdr.proposal_size as usize {
@@ -745,8 +1677,11 @@ impl TMState {
                         }
                     }
                 } else {
-                    round_data.proposal.0    = vec![0;          hdr.proposal_size as usize];
-                    round_data.proposal_sigs = vec![TMSig::NIL; round_data.proposal.chunks_n()];
+                    let Some(proposal_chunks_n) = proposal_chunk_count(hdr.proposal_size) else {
+                        return TMStatus::Fail;
+                    };
+                    round_data.proposal.0    = vec![0; hdr.proposal_size as usize];
+                    round_data.proposal_sigs = vec![TMSig::NIL; proposal_chunks_n];
                 }
 
                 // Preliminary checks now finished (although not infallible from here) //////////////////////////
@@ -907,6 +1842,9 @@ impl TMState {
     }
 
     async fn bft_update(&mut self, roster: &mut Vec<SortedRosterMember>) {
+        if self.reconciliation_required {
+            return;
+        }
         debug_assert!(self.rounds_data.iter().all(|r| r.height >= self.height));
 
         let now = Instant::now();
@@ -916,15 +1854,10 @@ impl TMState {
         }
         let total_active_stake = total_active_stake;
         let f = Self::f_from_n(total_active_stake);
-        let big_threshold;
-        let small_threshold;
-        if f == 0 {
-            big_threshold = total_active_stake;
-            small_threshold = total_active_stake;
-        } else {
-            big_threshold = 2*f+1;
-            small_threshold = f+1;
-        }
+        // For arbitrary weighted totals, 2f+1 is safe only when total = 3f+1.
+        // Use n-f so any two quorums intersect in more than f voting power.
+        let big_threshold = quorum_threshold(total_active_stake);
+        let small_threshold = if total_active_stake == 0 { 0 } else { f.saturating_add(1) };
         let ctx_str = self.ctx_str(roster);
 
         // NOTE: binary search to {current height, round 0} to avoid looping through data for unneeded decided heights
@@ -937,6 +1870,20 @@ impl TMState {
 
             // TODO: don't spam "while" messages repeatedly
             let is_current_height_and_round = (self.height, self.round) == (self.rounds_data[i].height, self.rounds_data[i].round);
+            let referenced_prevote_certificate = if on_roster &&
+                is_current_height_and_round &&
+                has_enough_info_to_determine_validity &&
+                self.step == TMStep::Propose
+            {
+                verified_referenced_prevote_certificate(
+                    &self.rounds_data,
+                    i,
+                    &self.vote_namespace,
+                    &self.hash_keys,
+                )
+            } else {
+                None
+            };
             // println!("{:#?}", self);
             if PRINT_BFT_STATE { println!("{ctx_str} {ANSI_GRY}BFT_STATE{ANSI_RST}: {}={}.{}, {}/{}, {}",
                     ["!","="][is_current_height_and_round as usize],
@@ -978,19 +1925,27 @@ impl TMState {
             if (on_roster &&
                 is_current_height_and_round &&
                 has_enough_info_to_determine_validity &&
-                big_threshold <= counts.yes_prevotes &&
                 self.step == TMStep::Propose &&
-                0 <= self.rounds_data[i].proposal_valid_round && self.rounds_data[i].proposal_valid_round < self.round as i64) // we have received the proposal value
+                referenced_prevote_certificate.is_some())
             {
-                if self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass && (
-                    self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
-                    self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone()))
-                {
-                    if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 28-0: received 2f+1 prevotes"); }
-                    self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
-                } else {
-                    if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 28-1: received 2f+1 prevotes"); }
-                    self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
+                let proposal_status = self.rounds_data[i]
+                    .proposal_is_valid(self.validate_closure.clone())
+                    .await;
+                // Indeterminate means "do not cast a positive vote yet", not "skip the
+                // rest of this consensus tick". In particular, the propose timeout below
+                // must remain reachable so a missing PoW dependency cannot pin this node
+                // in Propose forever.
+                if proposal_status != TMStatus::Indeterminate {
+                    if proposal_status == TMStatus::Pass && (
+                        self.locked_value_round.1 <= self.rounds_data[i].proposal_valid_round ||
+                        self.locked_value_round.0 == Some(self.rounds_data[i].proposal.clone()))
+                    {
+                        if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 28-0: received 2f+1 prevotes"); }
+                        self.step = self.broadcast(roster, i, TMMsgData::Prevote(self.rounds_data[i].proposal_id));
+                    } else {
+                        if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 28-1: received 2f+1 prevotes"); }
+                        self.step = self.broadcast(roster, i, TMMsgData::Prevote(ValueId::NIL));
+                    }
                 }
             }
 
@@ -1019,12 +1974,49 @@ impl TMState {
                 (self.step == TMStep::Prevote || self.step == TMStep::Precommit)) // TODO: "for the first time"
             {
                 if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 36: seen 2f+1 valid prevotes"); }
+                let proposal = self.rounds_data[i].proposal.clone();
+                let proposal_id = self.rounds_data[i].proposal_id;
+                let certificate = match canonical_prevote_certificate(&self.rounds_data[i], roster) {
+                    Ok(certificate) => certificate,
+                    Err(error) => {
+                        self.durable_signer.fail_closed(format!("failed to encode lock certificate: {error}"));
+                        continue;
+                    }
+                };
+                let (locked_value, locked_round) = if self.step == TMStep::Prevote {
+                    (Some(proposal.clone()), self.round as i64)
+                } else {
+                    self.locked_value_round.clone()
+                };
+                let locked_value_id = locked_value.as_ref()
+                    .map(|value| value.id_from_value(&self.hash_keys))
+                    .unwrap_or(ValueId::NIL);
+                let transition = LockValidTransition {
+                    locked_round,
+                    locked_value_id,
+                    locked_value: locked_value.as_ref().map(|value| value.0.clone()).unwrap_or_default(),
+                    valid_round: self.round as i64,
+                    valid_value_id: proposal_id,
+                    valid_value: proposal.0.clone(),
+                    certificate,
+                };
+                if let Err(error) = verify_transition_certificate(
+                    &transition,
+                    self.durable_signer.epoch(),
+                    &self.hash_keys,
+                    roster,
+                ) {
+                    self.durable_signer.fail_closed(format!("lock certificate self-check failed: {error}"));
+                    continue;
+                }
+                self.valid_value_round = (Some(proposal.clone()), self.round as i64);
                 if self.step == TMStep::Prevote {
                     if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 36-0: seen 2f+1 valid prevotes"); }
-                    self.locked_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
-                    self.step = self.broadcast(roster, i, TMMsgData::Precommit(self.rounds_data[i].proposal_id));
+                    self.locked_value_round = (Some(proposal), self.round as i64);
+                    self.step = self.broadcast(roster, i, TMMsgData::Precommit(proposal_id, Some(transition)));
+                } else if let Err(error) = self.durable_signer.persist_transition(transition, &self.hash_keys, roster) {
+                    eprintln!("{ctx_str} {ANSI_RED}SIGNING BLOCKED{ANSI_RST}: {error}");
                 }
-                self.valid_value_round = (Some(self.rounds_data[i].proposal.clone()), self.round as i64);
             }
 
             // line 44: seen 2f+1 nil prevotes: precommit nil
@@ -1036,7 +2028,7 @@ impl TMState {
                 self.step == TMStep::Prevote)
             {
                 if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 44: seen 2f+1 nil prevotes"); }
-                self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
+                self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL, None));
             }
 
             // line 47: last orders on precommit period
@@ -1061,14 +2053,130 @@ impl TMState {
                 self.rounds_data[i].proposal_is_valid(self.validate_closure.clone()).await == TMStatus::Pass)
             {
                 if PRINT_BFT_CONDITIONS { println!("{ctx_str} {ANSI_GRY}BFT_CONDITIONS{ANSI_RST}: in condition 49: value decided"); }
-                let (new_roster, new_vote_namespace) = self.push_block_closure.0(self.rounds_data[i].proposal.clone(), round_data_to_fat_pointer(&self.rounds_data[i], roster), self.rounds_data[i].proposal_sigs.clone()).await;
-                if PRINT_ROSTER { println!("{ctx_str} {ANSI_GRY}ROSTER{ANSI_RST}: new roster: {:?}", new_roster); }
-                *roster = new_roster;
-                self.height += 1;
+                let commit_certificate = match canonical_precommit_certificate(&self.rounds_data[i], roster) {
+                    Ok(certificate) => certificate,
+                    Err(error) => {
+                        self.durable_signer.fail_closed(format!("could not encode decided precommit certificate: {error}"));
+                        continue;
+                    }
+                };
+                // Decision/QC verification is a network rule, not a local-signer rule.
+                // Off-roster and fail-closed observers must still be able to follow a valid
+                // decision, while local epoch membership remains mandatory on signing paths.
+                if let Err(error) = verify_reconstructed_precommit_quorum(
+                    &self.rounds_data[i],
+                    roster,
+                ) {
+                    self.durable_signer.fail_closed(format!("decided precommit certificate self-check failed: {error}"));
+                    continue;
+                }
+                let decided_proposal = self.rounds_data[i].proposal.clone();
+                let decided_fat_pointer = round_data_to_fat_pointer(&self.rounds_data[i], roster);
+                let decided_proposal_sigs = self.rounds_data[i].proposal_sigs.clone();
+                let decided_round = self.rounds_data[i].clone();
+                let next_height = match self.height.checked_add(1) {
+                    Some(next_height) => next_height,
+                    None => {
+                        eprintln!("{ctx_str} {ANSI_RED}DECISION APPLY BLOCKED{ANSI_RST}: BFT height overflow");
+                        self.reconciliation_required = true;
+                        return;
+                    }
+                };
+                if let Err(error) = validate_commit_round_cache(
+                    &self.recent_commit_round_cache,
+                    self.height,
+                )
+                .and_then(|()| {
+                    (decided_round.height == self.height)
+                        .then_some(())
+                        .ok_or_else(|| {
+                            format!(
+                                "decided round carries height {} while BFT expects {}",
+                                decided_round.height, self.height
+                            )
+                        })
+                }) {
+                    eprintln!("{ctx_str} {ANSI_RED}DECISION APPLY BLOCKED{ANSI_RST}: {error}");
+                    self.reconciliation_required = true;
+                    return;
+                }
+                let commit_intent_digest = match self.durable_signer.begin_or_resume_commit(
+                    &self.hash_keys,
+                    self.rounds_data[i].round,
+                    self.rounds_data[i].proposal_id,
+                    &decided_proposal,
+                    self.rounds_data[i].proposal_valid_round,
+                    &decided_proposal_sigs,
+                    &commit_certificate,
+                    roster,
+                ) {
+                    Ok(digest) => digest,
+                    Err(error) => {
+                        eprintln!("{ctx_str} {ANSI_RED}SIGNING BLOCKED{ANSI_RST}: could not persist or reconcile commit intent: {error}");
+                        self.reconciliation_required = true;
+                        return;
+                    }
+                };
+                let outcome = match self.push_block_closure.0(
+                    decided_proposal,
+                    decided_fat_pointer,
+                    self.rounds_data[i].proposal_valid_round,
+                    decided_proposal_sigs,
+                ).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if let Some(digest) = commit_intent_digest {
+                            let reason = format!("decided block application failed: {error}");
+                            if let Err(latch_error) = self
+                                .durable_signer
+                                .require_reconciliation(digest, reason)
+                            {
+                                eprintln!("{ctx_str} {ANSI_RED}SIGNING BLOCKED{ANSI_RST}: could not preserve reconciliation latch: {latch_error}");
+                            }
+                        }
+                        eprintln!("{ctx_str} {ANSI_RED}DECISION APPLY BLOCKED{ANSI_RST}: {error}");
+                        self.reconciliation_required = true;
+                        return;
+                    }
+                };
+                if PRINT_ROSTER { println!("{ctx_str} {ANSI_GRY}ROSTER{ANSI_RST}: new roster: {:?}", outcome.next_roster); }
+
+                if let Some(digest) = commit_intent_digest {
+                    match outcome.durable_parent_commit {
+                        Some(durable_parent_commit) => {
+                            if let Err(error) = self.durable_signer.complete_commit(
+                                digest,
+                                durable_parent_commit,
+                                outcome.next_vote_namespace,
+                                &outcome.next_roster,
+                            ) {
+                                eprintln!("{ctx_str} {ANSI_RED}SIGNING BLOCKED{ANSI_RST}: commit completion failed: {error}");
+                                self.reconciliation_required = true;
+                                return;
+                            }
+                        }
+                        None => {
+                            let reason = "decided block was not reread from a durable store";
+                            if let Err(error) = self
+                                .durable_signer
+                                .require_reconciliation(digest, reason)
+                            {
+                                eprintln!("{ctx_str} {ANSI_RED}SIGNING BLOCKED{ANSI_RST}: could not preserve reconciliation latch: {error}");
+                            }
+                            self.reconciliation_required = true;
+                            return;
+                        }
+                    }
+                }
+
+                append_recent_commit_round(&mut self.recent_commit_round_cache, decided_round);
+                *roster = outcome.next_roster;
+                self.height = next_height;
                 // Vote namespacing: adopt the namespace for the new height (supplied alongside the
                 // new roster by the decided-block closure).
-                self.vote_namespace = new_vote_namespace;
-                self.recent_commit_round_cache.push(self.rounds_data[i].clone());
+                self.vote_namespace = outcome.next_vote_namespace;
+                self.future_round_votes.clear();
+                self.admitted_far_round = None;
                 self.rounds_data.retain(|r| r.height >= self.height);
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
@@ -1102,7 +2210,7 @@ impl TMState {
                     },
                     TMStep::Prevote => if self.step == TMStep::Prevote {
                         if PRINT_BFT_TIMEOUTS { println!("{ctx_str} {ANSI_GRY}BFT_TIMEOUTS{ANSI_RST}: hit timeout prevote"); }
-                        self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL));
+                        self.step = self.broadcast(roster, i, TMMsgData::Precommit(ValueId::NIL, None));
                     },
                     TMStep::Precommit => {
                         if PRINT_BFT_TIMEOUTS { println!("{ctx_str} {ANSI_GRY}BFT_TIMEOUTS{ANSI_RST}: hit timeout precommit"); }
@@ -1136,8 +2244,16 @@ pub struct Peer {
     pub latest_status: Option<PacketStatus>,
     pub index_counter: u64,           // for some peer randomness
     pub bft_pk: PubKeyID,             // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
+    /// Set only after the connection's handshake hash is verified by this exact
+    /// raw consensus key. Status, telemetry, catch-up, and relay authorization
+    /// must never infer identity from a mutable address map.
+    pub authenticated_bft_pk: Option<PubKeyID>,
     pub stp_address: STPAddress,      // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
     pub stp_handshake_hash: [u8; 64], // for convenience // @Todo: @Remove! @@@!!! Don't replicate state like this; look it up from canonical unique sources.
+    pub historical_round_cursor: usize,
+    pub proposal_chunk_cursor: usize,
+    pub attestation_window_started: Option<Instant>,
+    pub attestations_in_window: usize,
 }
 impl Default for Peer {
     fn default() -> Self { Self {
@@ -1145,8 +2261,13 @@ impl Default for Peer {
         latest_status:                Default::default(),
         index_counter:                Default::default(),
         bft_pk:                       Default::default(),
+        authenticated_bft_pk:        None,
         stp_address:                  Default::default(),
         stp_handshake_hash:           [0u8; 64],
+        historical_round_cursor:      0,
+        proposal_chunk_cursor:        0,
+        attestation_window_started:   None,
+        attestations_in_window:       0,
     } }
 }
 impl Peer {
@@ -1243,18 +2364,59 @@ fn sign_with_namespace(key: &SigningKey, data: &[u8], namespace: &[u8; 32]) -> [
     }
 }
 
+fn canonical_vote_round(round: u32, is_precommit: bool) -> Option<u32> {
+    if round > MAX_CONSENSUS_ROUND {
+        return None;
+    }
+    if is_precommit {
+        round.checked_add(0x8000_0000)
+    } else {
+        Some(round)
+    }
+}
+
+fn proposal_chunk_count(proposal_size: u32) -> Option<usize> {
+    let proposal_size = proposal_size as usize;
+    if proposal_size == 0 || proposal_size > MAX_PROPOSAL_BYTES {
+        return None;
+    }
+    proposal_size
+        .checked_add(PROPOSAL_CHUNK_DATA_SIZE - 1)
+        .map(|size| size / PROPOSAL_CHUNK_DATA_SIZE)
+}
+
+fn proposal_chunk_layout(proposal_size: u32, chunk_i: u32) -> Option<(usize, usize, usize)> {
+    let chunks_n = proposal_chunk_count(proposal_size)?;
+    let chunk_i = chunk_i as usize;
+    if chunk_i >= chunks_n {
+        return None;
+    }
+    let chunk_o = chunk_i.checked_mul(PROPOSAL_CHUNK_DATA_SIZE)?;
+    let remaining = (proposal_size as usize).checked_sub(chunk_o)?;
+    Some((
+        chunk_o,
+        usize::min(PROPOSAL_CHUNK_DATA_SIZE, remaining),
+        chunks_n,
+    ))
+}
+
 fn make_vote_sign_datas(pub_key: PubKeyID, is_precommit: bool, height: u64, round: u32, value_id: ValueId) -> [[u8; 76]; 2] {
     let mut sign_data_no = [0; 76];
     sign_data_no[0..32].copy_from_slice(&pub_key.0[..]);
     height.write_to(&mut sign_data_no[64..]);
-    (round + 0x8000_0000 * (is_precommit as u32)).write_to(&mut sign_data_no[72..]);
+    canonical_vote_round(round, is_precommit)
+        .expect("vote round must be in the canonical 31-bit domain")
+        .write_to(&mut sign_data_no[72..]);
     let mut sign_data_yes = sign_data_no;
     value_id.0.write_to(&mut sign_data_yes[32..64]);
     [sign_data_no, sign_data_yes]
 }
 
-pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize; 2]> {
-    let mut rngs: Vec<[usize;2]> = Vec::with_capacity(n);
+fn visit_mostly_empty_rngs<F: Fn(usize) -> bool, V: FnMut([usize; 2])>(
+    n: usize,
+    f: &F,
+    mut visit: V,
+) {
     let mut filled_c = 0; // consecutive fills
     let mut rng = [0, 0];
     // TODO(perf): these can be split arbitrarily & merged if we wanted to go wide
@@ -1268,7 +2430,7 @@ pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize
         } else {
             filled_c += 1;
             if filled_c > 1 { // 2 in a row
-                rngs.push(rng);
+                visit(rng);
                 filled_c = 0;
                 rng[0] = i+1;
                 rng[1] = i+1;
@@ -1276,12 +2438,40 @@ pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize
         }
     }
     if rng[0] != rng[1] {
-        rngs.push(rng);
+        visit(rng);
     }
+}
 
+pub fn gen_mostly_empty_rngs<F: Fn(usize) -> bool>(n: usize, f: F) -> Vec<[usize; 2]> {
+    let mut rngs = Vec::new();
+    visit_mostly_empty_rngs(n, &f, |rng| rngs.push(rng));
     rngs
 }
 
+fn select_mostly_empty_rng<F: Fn(usize) -> bool>(
+    n: usize,
+    f: F,
+    selector: u64,
+) -> Option<[usize; 2]> {
+    let mut range_count = 0usize;
+    visit_mostly_empty_rngs(n, &f, |_| range_count += 1);
+    if range_count == 0 {
+        return None;
+    }
+
+    let wanted = (selector % range_count as u64) as usize;
+    let mut range_index = 0usize;
+    let mut selected = None;
+    visit_mostly_empty_rngs(n, &f, |rng| {
+        if range_index == wanted {
+            selected = Some(rng);
+        }
+        range_index += 1;
+    });
+    selected
+}
+
+#[cfg(any(test, feature = "simulation"))]
 async fn instance(
     my_root_private_key: SigningKey,
     my_stp_keypair: Option<IdentityKeyPair>,
@@ -1307,6 +2497,11 @@ async fn instance(
     let pub_key = PubKeyID(VerificationKeyBytes::from(&my_root_private_key.clone()).into());
 
     entry_point(my_root_private_key, my_stp_keypair, my_endpoint, roster, finalizer_peer_addresses, maybe_seed,
+        SignerStartup::EphemeralSimulation {
+            chain_id: [0u8; 32],
+            parent_commit: [0u8; 32],
+            consensus_config_hash: consensus_hash_keys_fingerprint(&HashKeys::default()),
+        },
         ClosureToProposeNewBlock(Arc::new(move || {
             let block_rng = Arc::clone(&block_rng);
             Box::pin(async move {
@@ -1327,16 +2522,24 @@ async fn instance(
                 // else { (TMStatus::Fail, TMStatusReason::None) }
             })
         })),
-        ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, _tender_proposal_sigs| {
+        ClosureToPushDecidedBlock(Arc::new(move |block, fat_pointer, _proposal_valid_round, _tender_proposal_sigs| {
             let decisions = Arc::clone(&decisions);
             let roster2 = roster2.clone();
             Box::pin(async move {
+                let durable_parent_commit = fat_pointer.points_at_block_hash().0;
                 decisions.lock().unwrap().push((block, fat_pointer));
                 let mut ret = roster2.clone();
                 ret.truncate(3 + decisions.lock().unwrap().len() % 2);
                 // Sim/test has no hardforks → nil namespace (backwards-compatible no-op).
-                (ret, [0u8; 32])
+                Ok(DurableDecisionOutcome {
+                    next_roster: ret,
+                    next_vote_namespace: [0u8; 32],
+                    durable_parent_commit: Some(durable_parent_commit),
+                })
             })
+        })),
+        ClosureToLoadCommittedRound(Arc::new(move |_height| {
+            Box::pin(async move { Ok(None) })
         })),
         ClosureToUpdatePeers(Arc::new(move |_all_peers| { Box::pin(async move {
         })})),
@@ -1398,9 +2601,36 @@ pub struct BftAddressMap {
 }
 impl BftAddressMap {
     pub fn new() -> Self { Self::default() }
-    pub fn insert(&mut self, key: &PubKeyID, addr: &STPAddress, attestation: Option<PeerAttestation>) {
-        self.by_key.entry(*key).or_default().insert(addr.clone(), attestation);
+    pub fn insert(&mut self, key: &PubKeyID, addr: &STPAddress, attestation: Option<PeerAttestation>) -> bool {
+        if self.by_addr.get(addr).is_some_and(|existing| existing != key) {
+            return false;
+        }
+        if !self.by_key.contains_key(key) && self.by_key.len() >= MAX_ROUTED_BFT_KEYS {
+            return false;
+        }
+        let dynamic_count = self
+            .by_key
+            .values()
+            .flat_map(|routes| routes.values())
+            .filter(|entry| entry.is_some())
+            .count();
+        let routes = self.by_key.entry(*key).or_default();
+        if !routes.contains_key(addr) && routes.len() >= MAX_ENDPOINTS_PER_BFT_KEY {
+            return false;
+        }
+        if attestation.is_some() {
+            // A configured route (`None`) is immutable and cannot be replaced by
+            // network gossip. Dynamic refreshes remain bounded and key-stable.
+            if routes.get(addr).is_some_and(Option::is_none) {
+                return false;
+            }
+            if !routes.contains_key(addr) && dynamic_count >= MAX_DYNAMIC_ATTESTATIONS {
+                return false;
+            }
+        }
+        routes.insert(addr.clone(), attestation);
         self.by_addr.insert(addr.clone(), *key);
+        true
     }
     pub fn get_key(&self, addr: &STPAddress) -> Option<&PubKeyID> { self.by_addr.get(addr) }
     pub fn get_addrs(&self, key: &PubKeyID) -> impl Iterator<Item = (&STPAddress, &Option<PeerAttestation>)> { self.by_key.get(key).map(|v| v.iter()).unwrap_or_default() }
@@ -1415,9 +2645,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          roster: Vec<SortedRosterMember>,
                          finalizer_peer_addresses: Vec<FinalizerPeerAddress>,
                          maybe_seed: Option<u128>,
+                         signer_startup: SignerStartup,
                          propose_closure: ClosureToProposeNewBlock,
                          validate_closure: ClosureToValidateProposedBlock,
                          push_block_closure: ClosureToPushDecidedBlock,
+                         load_committed_round_closure: ClosureToLoadCommittedRound,
                          peer_cmd_closure: ClosureToUpdatePeers,
                          bft_access_closure: ClosureToAllowBftAccess,
                          ingest_startup_data: Vec<RoundData>,
@@ -1445,14 +2677,107 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         println!("\"");
     }
 
+    let my_pub_key = PubKeyID(my_root_public_bft_key.into());
+    let active_len = active_roster_len(&roster);
+    let roster_index: u32 = roster_i_from_pub_key(&roster[..active_len], my_pub_key)
+        .map(|index| index.try_into().unwrap())
+        .unwrap_or(u32::MAX);
+    let roster_hash = canonical_roster_hash(&roster)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+    let startup_height = match ingest_startup_data.last() {
+        Some(round) => round.height.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "startup BFT height overflows u64",
+            )
+        })?,
+        None => 0,
+    };
+    validate_commit_round_cache(&ingest_startup_data, startup_height)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let (epoch, durable_signer) = match signer_startup {
+        #[cfg(any(test, feature = "simulation"))]
+        SignerStartup::EphemeralSimulation { chain_id, parent_commit, consensus_config_hash } => {
+            let epoch = SignerEpochBinding {
+                public_key: my_pub_key,
+                chain_id,
+                height: startup_height,
+                parent_commit,
+                vote_namespace: initial_vote_namespace,
+                consensus_config_hash: signer_consensus_config_binding(consensus_config_hash),
+                roster_hash,
+                roster_index,
+                active_roster_len: active_len.try_into().unwrap(),
+            };
+            let signer = DurableSigner::ephemeral_for_simulation(my_root_private_key, epoch.clone());
+            (epoch, signer)
+        }
+        SignerStartup::ObserverOnly {
+            reason,
+            chain_id,
+            parent_commit,
+            consensus_config_hash,
+        } => {
+            let epoch = SignerEpochBinding {
+                public_key: my_pub_key,
+                chain_id,
+                height: startup_height,
+                parent_commit,
+                vote_namespace: initial_vote_namespace,
+                consensus_config_hash: signer_consensus_config_binding(consensus_config_hash),
+                roster_hash,
+                roster_index,
+                active_roster_len: active_len.try_into().unwrap(),
+            };
+            let signer = DurableSigner::observer_only(
+                my_root_private_key,
+                epoch.clone(),
+                reason,
+            );
+            (epoch, signer)
+        }
+        SignerStartup::Durable {
+            wal_path,
+            anchor_path,
+            independent_anchor_authorized,
+            non_genesis_bootstrap_receipt_hash,
+            chain_id,
+            parent_commit,
+            consensus_config_hash,
+        } => {
+            let epoch = SignerEpochBinding {
+                public_key: my_pub_key,
+                chain_id,
+                height: startup_height,
+                parent_commit,
+                vote_namespace: initial_vote_namespace,
+                consensus_config_hash: signer_consensus_config_binding(consensus_config_hash),
+                roster_hash,
+                roster_index,
+                active_roster_len: active_len.try_into().unwrap(),
+            };
+            let signer = DurableSigner::open_or_observer(
+                my_root_private_key,
+                DurableSignerConfig {
+                    wal_path,
+                    anchor_path,
+                    independent_anchor_authorized,
+                    non_genesis_bootstrap_receipt_hash,
+                },
+                epoch.clone(),
+            );
+            (epoch, signer)
+        }
+    };
+
     let my_stp_keypair = my_stp_keypair.unwrap_or(new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap());
 
     use crate::bandwidth_test::*;
     use crate::native_sockets::*;
 
     let my_port = my_endpoint.map(|e| e.port).unwrap_or(23485); // @Dev: .unwrap_or(0); // @Todo! Get local port after sock creation! @@@
-    // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
-    let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
+    // Keep the one-second rate-adaptive queue, but make its per-connection memory ceiling explicit.
+    let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 512 * 1024, 8 * 1024 * 1024));
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
     let mut initiate_connections = Vec::<STPAddress>::new();
     let mut messages_to_send = Vec::new();
@@ -1460,10 +2785,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     let mut peers = HashMap::<ConnectionKey, Peer>::new();
     let mut bft_address_map = BftAddressMap::new();
 
-    let mut my_address_attestations = Vec::new();
-
     for FinalizerPeerAddress { bft_pk, address } in &finalizer_peer_addresses {
-        bft_address_map.insert(bft_pk, address, None);
+        if !bft_address_map.insert(bft_pk, address, None) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "configured BFT endpoint map exceeds bounds or contains an address/key collision",
+            ));
+        }
 
         if address.magic1 != CRYPTO_MAGIC {
             // @Dev
@@ -1478,10 +2806,9 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     if PRINT_PROTOCOL { println!("socket port={:05}, peers endpoints={:?}", my_port, bft_address_map.by_key); }
 
-    // TODO: only convert private to public in 1 location
     let mut bft_state = TMState::init(
-        my_root_private_key,
-        PubKeyID(my_root_public_bft_key.into()),
+        durable_signer,
+        my_pub_key,
         my_port,
         propose_closure,
         validate_closure,
@@ -1490,11 +2817,32 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         bft_access_closure,
     ); // TODO: double-check this is the right key
 
-    bft_state.height = ingest_startup_data.len() as u64;
+    bft_state.height = startup_height;
     bft_state.vote_namespace = initial_vote_namespace;
     bft_state.recent_commit_round_cache = ingest_startup_data;
+    compact_recent_commit_payloads(&mut bft_state.recent_commit_round_cache);
 
-    bft_state.start_round(&roster, Instant::now(), 0).await;
+    // A crash can leave the certified commit intent ahead of the PoS store.
+    // Recover from the exact proposal bytes and QC sealed in the signer WAL;
+    // do not wait for peers to gossip a historical round that they may no
+    // longer retain. The signer remains observer-only until the closure has
+    // durably applied/reread the value and `complete_commit` seals the successor.
+    bft_state
+        .reconcile_pending_commit(&mut roster)
+        .await
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+
+    let startup_now = Instant::now();
+    let restored = match bft_state.restore_durable_signer_state(&roster, startup_now) {
+        Ok(restored) => restored,
+        Err(error) => {
+            bft_state.durable_signer.fail_closed(error.to_string());
+            false
+        }
+    };
+    if !restored {
+        bft_state.start_round(&roster, startup_now, 0).await;
+    }
 
     const ONE_SECOND: tokio::time::Duration = tokio::time::Duration::from_secs(1);
     let mut net_stats_window_start = tokio::time::Instant::now();
@@ -1505,22 +2853,29 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let mut send_buf1 = [0u8; 2048];
     let mut next_tick_time = tokio::time::Instant::now();
+    const HISTORICAL_ROUND_RELAY_BURST_TICKS: usize = 8;
+    const HISTORICAL_ROUND_RETRY_DELAY: tokio::time::Duration =
+        tokio::time::Duration::from_secs(30);
+    struct LoadedHistoricalRound {
+        round: RoundData,
+        relay_ticks: usize,
+    }
+    let mut historical_round_load:
+        Option<(u64, tokio::task::JoinHandle<Result<Option<RoundData>, String>>)> = None;
+    let mut loaded_historical_round: Option<LoadedHistoricalRound> = None;
+    let mut last_historical_load_height: Option<u64> = None;
+    let mut historical_round_retries = std::collections::VecDeque::new();
     loop {
         let ctx_str = bft_state.ctx_str(&roster);
 
         {
-            let mut peers = peers.iter().map(|(ck, p)| {
-                let mut bft_key = PubKeyID::NIL;
-                for (c, _) in &current_connections {
-                    if c.connection_key() == *ck {
-                        if let Some(k) = bft_address_map.get_key(c) {
-                            bft_key = *k;
-                        }
-                        break;
-                    }
-                }
-                p.info(true, bft_key)
-            }).collect::<Vec<PeerInfo>>();
+            let peers = peers
+                .values()
+                .filter_map(|peer| {
+                    peer.authenticated_bft_pk
+                        .map(|key| peer.info(true, key))
+                })
+                .collect::<Vec<PeerInfo>>();
             bft_state.update_peers_cmd_closure.0(peers).await;
         }
 
@@ -1570,30 +2925,34 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                     let round_data = &bft_state.rounds_data[current_round_i];
 
-                    let proposal_chunk_rngs = gen_mostly_empty_rngs(round_data.proposal_sigs.len(), |i| round_data.proposal_sigs[i] == TMSig::NIL);
-                    if proposal_chunk_rngs.len() > 0 {
-                        let mut random_i = peer_random;
-                        for dst_rng in &mut status.need_proposal_chunk_rngs {
-                            let rng = proposal_chunk_rngs[random_i as usize % proposal_chunk_rngs.len()];
+                    for (selection_i, dst_rng) in status.need_proposal_chunk_rngs.iter_mut().enumerate() {
+                        let selector = peer_random.wrapping_add(
+                            (selection_i as u64).wrapping_mul(1610612741),
+                        );
+                        if let Some(rng) = select_mostly_empty_rng(
+                            round_data.proposal_sigs.len(),
+                            |i| round_data.proposal_sigs[i] == TMSig::NIL,
+                            selector,
+                        ) {
                             *dst_rng = [rng[0].try_into().unwrap(), rng[1].try_into().unwrap()];
-                            random_i = random_i.wrapping_add(1610612741); // large prime
-                            // TODO: "with removal"
                         }
                     }
-                    if PRINT_RNGS { println!("{ctx_str} {ANSI_GRY}RNGS{ANSI_RST}: request proposal  chunks {:?} from {:?}", status.need_proposal_chunk_rngs, proposal_chunk_rngs); }
+                    if PRINT_RNGS { println!("{ctx_str} {ANSI_GRY}RNGS{ANSI_RST}: request proposal chunks {:?}", status.need_proposal_chunk_rngs); }
 
                     for is_precommit in 0..2 {
-                        let vote_rngs = gen_mostly_empty_rngs(active_roster_len(roster), |i| round_data.msg_val_sigs[i][is_precommit].1 == TMSig::NIL);
-                        if vote_rngs.len() > 0 {
-                            let mut random_i = peer_random;
-                            for dst_rng in &mut status.need_vote_rngs[is_precommit] {
-                                let rng = vote_rngs[random_i as usize % vote_rngs.len()];
+                        for (selection_i, dst_rng) in status.need_vote_rngs[is_precommit].iter_mut().enumerate() {
+                            let selector = peer_random.wrapping_add(
+                                (selection_i as u64).wrapping_mul(1610612741),
+                            );
+                            if let Some(rng) = select_mostly_empty_rng(
+                                active_roster_len(roster),
+                                |i| round_data.msg_val_sigs[i][is_precommit].1 == TMSig::NIL,
+                                selector,
+                            ) {
                                 *dst_rng = [rng[0].try_into().unwrap(), rng[1].try_into().unwrap()];
-                                random_i = random_i.wrapping_add(1610612741); // large prime
-                                // TODO: "with removal"
                             }
                         }
-                        if PRINT_RNGS { println!("{ctx_str} {ANSI_GRY}RNGS{ANSI_RST}: request {:9} chunks {:?} from {:?}", ["prevote", "precommit"][is_precommit], status.need_vote_rngs[is_precommit], vote_rngs); }
+                        if PRINT_RNGS { println!("{ctx_str} {ANSI_GRY}RNGS{ANSI_RST}: request {:9} chunks {:?}", ["prevote", "precommit"][is_precommit], status.need_vote_rngs[is_precommit]); }
                     }
 
                 }
@@ -1642,6 +3001,64 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 // account for the state updates we've accumulated
                 bft_state.bft_update(&mut roster).await;
 
+                if historical_round_load
+                    .as_ref()
+                    .is_some_and(|(_, task)| task.is_finished())
+                {
+                    let (requested_height, task) = historical_round_load
+                        .take()
+                        .expect("finished historical-round task exists");
+                    match task.await {
+                        Ok(Ok(Some(round))) if round.height == requested_height => {
+                            loaded_historical_round = Some(LoadedHistoricalRound {
+                                round,
+                                relay_ticks: 0,
+                            });
+                        }
+                        Ok(Ok(Some(round))) => {
+                            eprintln!(
+                                "{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: historical loader returned height {} for request {requested_height}",
+                                round.height,
+                            );
+                            defer_historical_round_retry(
+                                &mut historical_round_retries,
+                                requested_height,
+                                tokio::time::Instant::now() + HISTORICAL_ROUND_RETRY_DELAY,
+                            );
+                        }
+                        Ok(Ok(None)) => {
+                            defer_historical_round_retry(
+                                &mut historical_round_retries,
+                                requested_height,
+                                tokio::time::Instant::now() + HISTORICAL_ROUND_RETRY_DELAY,
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            eprintln!(
+                                "{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: failed to load authenticated historical round {requested_height}: {error}",
+                            );
+                            defer_historical_round_retry(
+                                &mut historical_round_retries,
+                                requested_height,
+                                tokio::time::Instant::now() + HISTORICAL_ROUND_RETRY_DELAY,
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: historical round loader task failed for height {requested_height}: {error}",
+                            );
+                            defer_historical_round_retry(
+                                &mut historical_round_retries,
+                                requested_height,
+                                tokio::time::Instant::now() + HISTORICAL_ROUND_RETRY_DELAY,
+                            );
+                        }
+                    }
+                }
+                let retry_now = tokio::time::Instant::now();
+                historical_round_retries
+                    .retain(|(_, retry_after)| retry_now < *retry_after);
+
                 fn send_round_data_to_peer(bft_state: &TMState,
                                            should_send_prevotes: bool,
                                            round_data: &RoundData,
@@ -1676,7 +3093,15 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let mut sent_c: [usize; 2] = [0; 2];
 
                     if round_data.proposal_sigs_n > 0 {
-                        for chunk_i in 0..round_data.proposal_sigs.len() {
+                        let chunks_len = round_data.proposal_sigs.len();
+                        let start = peer.proposal_chunk_cursor % chunks_len;
+                        let mut scanned = 0usize;
+                        for offset in 0..chunks_len {
+                            if sent_chunk_cs >= MAX_PROPOSAL_CHUNKS_PER_ROUND_PER_TICK {
+                                break;
+                            }
+                            scanned = offset + 1;
+                            let chunk_i = (start + offset) % chunks_len;
                             // send all of the proposal chunks we've seen
                             if round_data.proposal_sigs[chunk_i] != TMSig::NIL {
                                 chunk_hdr.chunk_i = chunk_i as u32;
@@ -1712,6 +3137,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                 send_stp_msg(messages_to_send, connection_key, &send_buf1[..o], stats);
                             }
                         }
+                        peer.proposal_chunk_cursor = (start + scanned) % chunks_len;
                     }
 
                     let vote_start: u8 = if should_send_prevotes { 0 } else { 1 };
@@ -1834,35 +3260,112 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     (bft_key, p.latest_status.clone())
                 }).collect::<Vec<_>>()); }
 
+                if historical_round_load.is_none() && loaded_historical_round.is_none() {
+                    let mut requested_heights = peers
+                        .values()
+                        .filter_map(|peer| {
+                            let peer_bft_key = peer.authenticated_bft_pk?;
+                            let height = peer.latest_status_request_height?;
+                            (height < bft_state.height
+                                && cached_commit_round_at_height(
+                                    &bft_state.recent_commit_round_cache,
+                                    height,
+                                )
+                                .is_none()
+                                && roster_i_from_pub_key(
+                                    &roster[..active_roster_len(&roster)],
+                                    peer_bft_key,
+                                )
+                                .is_some()
+                                && !historical_round_retries
+                                    .iter()
+                                    .any(|(retry_height, _)| *retry_height == height))
+                            .then_some(height)
+                        })
+                        .collect::<Vec<_>>();
+                    requested_heights.sort_unstable();
+                    requested_heights.dedup();
+                    let selected_height = last_historical_load_height
+                        .and_then(|last_height| {
+                            requested_heights
+                                .iter()
+                                .copied()
+                                .find(|height| *height > last_height)
+                        })
+                        .or_else(|| requested_heights.first().copied());
+                    if let Some(height) = selected_height {
+                        last_historical_load_height = Some(height);
+                        let loader = load_committed_round_closure.clone();
+                        historical_round_load = Some((
+                            height,
+                            tokio::spawn(async move { (loader.0)(height).await }),
+                        ));
+                    }
+                }
+
+                let mut relayed_bft_keys = std::collections::HashSet::new();
+                let mut relayed_loaded_historical_round = false;
                 for (connection_key, peer) in &mut peers {
-                    let mut peer_bft_key = PubKeyID::NIL;
-                    for (c, _) in &current_connections {
-                        if c.connection_key() == *connection_key {
-                            if let Some(k) = bft_address_map.get_key(&c) {
-                                peer_bft_key = *k;
-                            }
-                            break;
-                        }
+                    let Some(peer_bft_key) = peer.authenticated_bft_pk else {
+                        continue;
+                    };
+                    // Multiple transport connections for one validator share one
+                    // relay allowance; otherwise a single key can multiply the
+                    // node's outbound work by reconnecting repeatedly.
+                    if !relayed_bft_keys.insert(peer_bft_key) {
+                        continue;
                     }
                     if let Some(height) = peer.latest_status_request_height && height < bft_state.height {
-                        peer.latest_status_request_height = None;
-                        send_round_data_to_peer(&bft_state,
-                                                false,
-                                                &bft_state.recent_commit_round_cache[height as usize],
-                                                &ctx_str,
-                                                &roster,
-                                                &mut messages_to_send,
-                                                &mut send_buf1,
-                                                peer,
-                                                connection_key,
-                                                peer_bft_key,
-                                                &mut net_stats);
+                        let cached_round = cached_commit_round_at_height(
+                            &bft_state.recent_commit_round_cache,
+                            height,
+                        );
+                        let loaded_round = loaded_historical_round
+                            .as_ref()
+                            .map(|loaded| &loaded.round);
+                        if let Some(committed_round) = commit_round_for_relay(
+                            &bft_state.recent_commit_round_cache,
+                            loaded_round,
+                            height,
+                        ) {
+                            let requester_is_authorized = roster_i_from_pub_key(
+                                &roster[..active_roster_len(&roster)],
+                                peer_bft_key,
+                            )
+                                .is_some()
+                                || roster_i_from_pub_key(
+                                    &committed_round.roster[..active_roster_len(&committed_round.roster)],
+                                    peer_bft_key,
+                                )
+                                .is_some();
+                            if requester_is_authorized {
+                                if cached_round.is_none() {
+                                    relayed_loaded_historical_round = true;
+                                }
+                                send_round_data_to_peer(&bft_state,
+                                                        false,
+                                                        committed_round,
+                                                        &ctx_str,
+                                                        &roster,
+                                                        &mut messages_to_send,
+                                                        &mut send_buf1,
+                                                        peer,
+                                                        connection_key,
+                                                        peer_bft_key,
+                                                        &mut net_stats);
+                            }
+                        }
                     }
                     else if roster_i_from_pub_key(&roster[..active_roster_len(&roster)], peer_bft_key).is_some() {
-                        if let Ok(current_height_start_i) = bft_state.rounds_data.binary_search_by_key(&(bft_state.height, 0), |el| (el.height, el.round))
-                        {
-                            for round_i in (current_height_start_i..bft_state.rounds_data.len()).rev()
-                            {
+                        let (round_indices, next_cursor) = round_indices_to_gossip(
+                            &bft_state.rounds_data,
+                            bft_state.height,
+                            bft_state.round,
+                            peer.historical_round_cursor,
+                        );
+                        peer.historical_round_cursor = next_cursor;
+                        if !round_indices.is_empty() {
+                            for round_i in round_indices {
                                 let round_data = &bft_state.rounds_data[round_i];
                                 send_round_data_to_peer(&bft_state,
                                                         true,
@@ -1881,6 +3384,18 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         }
                     }
                 }
+                let clear_loaded_historical_round = if let Some(loaded) = loaded_historical_round.as_mut() {
+                    if relayed_loaded_historical_round {
+                        loaded.relay_ticks = loaded.relay_ticks.saturating_add(1);
+                    }
+                    !relayed_loaded_historical_round
+                        || loaded.relay_ticks >= HISTORICAL_ROUND_RELAY_BURST_TICKS
+                } else {
+                    false
+                };
+                if clear_loaded_historical_round {
+                    loaded_historical_round = None;
+                }
 
                 // Prune attestations that expire in <60s
                 let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
@@ -1890,13 +3405,17 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                             return true; // keep forever if None. // @Todo: @Incomplete?
                         };
 
-                        if peer_attestation.expiry + 120 <= now {
+                        if peer_attestation.expiry <= now.saturating_sub(120) {
                             return false; // prune
                         }
                         if peer_attestation.issued >= peer_attestation.expiry {
                             return false; // prune
                         }
-                        if peer_attestation.issued + 60 > peer_attestation.expiry {
+                        if peer_attestation
+                            .expiry
+                            .checked_sub(peer_attestation.issued)
+                            .map_or(true, |lifetime| lifetime < 60)
+                        {
                             return false; // prune
                         }
 
@@ -2015,7 +3534,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         let resp = service_connections(&network_thread_handle, NetworkThreadPush { initiate_connections, wanted_connections: current_connections.clone(), send_unreliable: messages_to_send, });
         current_connections = resp.current_connections;
         initiate_connections = Vec::new();
-        let mut messages_received = resp.received_unreliable_messages;
+        let messages_received = resp.received_unreliable_messages;
         messages_to_send = Vec::new();
 
         // Ensure a Peer entry exists for every active connection
@@ -2043,7 +3562,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     assert!(peer.stp_handshake_hash.len() == 64);
                     let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
 
-                    TMSig(my_root_private_key.sign(&keyed_hash_of_stp_handshake_hash[..]).to_bytes())
+                    bft_state.durable_signer.sign_auxiliary_digest(&keyed_hash_of_stp_handshake_hash)
                 };
 
                 PacketIdVerification { pk, sig }
@@ -2066,14 +3585,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         let mut connection_keys_to_disconnect = Vec::new();
 
         // READ
-        'process_packets: while messages_received.len() > 0 {
-            let (connection_key, mut peer, msg) = {
-                let (key, packet) = messages_received.remove(0);
-                let Some(peer) = peers.get_mut(&key)
+        // Preserve network arrival order while consuming the batch in linear time.
+        // Vec::remove(0) shifted the remaining packet vector once per packet,
+        // making a large batch quadratic and delaying the next consensus tick.
+        'process_packets: for (connection_key, msg) in messages_received {
+            let (connection_key, peer, msg) = {
+                let Some(peer) = peers.get_mut(&connection_key)
                 else {
                     continue;
                 };
-                (key, peer, packet)
+                (connection_key, peer, msg)
             };
 
             let msg: &[u8] = &msg[..];
@@ -2088,8 +3609,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
 
             if let Some(status) = status {
-                peer.latest_status_request_height = Some(status.height);
-                peer.latest_status = Some(status);
+                if let Some(peer_key) = peer.authenticated_bft_pk
+                    && roster_i_from_pub_key(
+                        &roster[..active_roster_len(&roster)],
+                        peer_key,
+                    )
+                    .is_some()
+                {
+                    peer.latest_status_request_height = Some(status.height);
+                    peer.latest_status = Some(status);
+                }
             }
 
             const_assert!(PACKET_TYPE_PREVOTE_SIGNATURES + 1 == PACKET_TYPE_PRECOMMIT_SIGNATURES);
@@ -2098,9 +3627,13 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     eprintln!("{:05}: couldn't read proposal header", my_port);
                     continue;
                 };
-                let proposal_size = hdr.proposal_size as usize;
-                let chunk_i       = hdr.chunk_i       as usize;
-                let chunk_size = usize::min(PROPOSAL_CHUNK_DATA_SIZE, proposal_size - chunk_i * PROPOSAL_CHUNK_DATA_SIZE);
+                let Some((_, chunk_size, _)) = proposal_chunk_layout(hdr.proposal_size, hdr.chunk_i)
+                else {
+                    continue;
+                };
+                if hdr.round > MAX_CONSENSUS_ROUND {
+                    continue;
+                }
                 let packet_size = chunk_size + PROPOSAL_PACKET_EXTRA;
 
                 // NOTE: assume for the moment that this is the valid height, we'll check in the subsequent call
@@ -2118,16 +3651,34 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
             else if packet_type == PACKET_TYPE_PREVOTE_SIGNATURES || packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES {
                 if let Some(packet) = PacketVotes::read_from(&mut &msg[read_o..]) {
+                    if packet.round > MAX_CONSENSUS_ROUND {
+                        continue;
+                    }
                     let is_precommit = packet_type - PACKET_TYPE_PREVOTE_SIGNATURES;
                     let value_ids    = [ ValueId::NIL, packet.value_id ];
 
-                    for vote_i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
+                    let Some(votes_n) = packet.no_votes_n.checked_add(packet.yes_votes_n)
+                    else {
+                        continue;
+                    };
+                    if votes_n == 0 || votes_n as usize > packet.votes.len() {
+                        continue;
+                    }
+                    for vote_i in 0..votes_n as usize {
                         // Note(Sam): We can change the format of votes to be cool and branchless after the workshop.
                         if let Some(roster_member) = roster.get(packet.votes[vote_i].roster_i as usize) {
                             let sign_datas   = make_vote_sign_datas(roster_member.pub_key, is_precommit != 0, packet.height, packet.round, packet.value_id);
                             let no_yes_i = (vote_i >= packet.no_votes_n as usize) as usize;
-                            bft_state.check_and_incorporate_msg(packet.height, packet.round, 0, value_ids[no_yes_i], -2,
-                                &roster, packet.votes[vote_i].roster_i as usize, packet_type, &sign_datas[no_yes_i], TMSig(packet.votes[vote_i].sig.0));
+                            bft_state.check_and_incorporate_network_vote(
+                                packet.height,
+                                packet.round,
+                                value_ids[no_yes_i],
+                                &roster,
+                                packet.votes[vote_i].roster_i as usize,
+                                packet_type,
+                                &sign_datas[no_yes_i],
+                                TMSig(packet.votes[vote_i].sig.0),
+                            );
                         }
                     }
                 } else {
@@ -2136,7 +3687,55 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             }
 
             else if packet_type == PACKET_TYPE_PEER_ATTESTATIONS {
-                let chunks = msg[read_o..].chunks(PEER_ATTESTATION_SERIALIZED_SIZE);
+                let Some(sender_key) = peer.authenticated_bft_pk else {
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                };
+                let key_is_routed = |key: PubKeyID| {
+                    roster_i_from_pub_key(&roster[..active_roster_len(&roster)], key).is_some()
+                        || finalizer_peer_addresses
+                            .iter()
+                            .any(|configured| configured.bft_pk == key)
+                };
+                if !key_is_routed(sender_key) {
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                }
+                let payload = &msg[read_o..];
+                if payload.is_empty()
+                    || payload.len() % PEER_ATTESTATION_SERIALIZED_SIZE != 0
+                    || payload.len() / PEER_ATTESTATION_SERIALIZED_SIZE
+                        > MAX_ATTESTATIONS_PER_PACKET
+                {
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                }
+                let packet_attestations = payload.len() / PEER_ATTESTATION_SERIALIZED_SIZE;
+                let now_instant = Instant::now();
+                if peer.attestation_window_started.is_none()
+                    || peer
+                        .attestation_window_started
+                        .is_some_and(|started| {
+                            now_instant.duration_since(started)
+                                >= std::time::Duration::from_secs(60)
+                        })
+                {
+                    peer.attestation_window_started = Some(now_instant);
+                    peer.attestations_in_window = 0;
+                }
+                let Some(next_attestation_count) = peer
+                    .attestations_in_window
+                    .checked_add(packet_attestations)
+                else {
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                };
+                if next_attestation_count > MAX_ATTESTATIONS_PER_PEER_PER_MINUTE {
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                }
+                peer.attestations_in_window = next_attestation_count;
+                let chunks = payload.chunks_exact(PEER_ATTESTATION_SERIALIZED_SIZE);
                 for chunk in chunks {
                     let Some(peer_attestation) = PeerAttestation::read_from(&mut &chunk[..]) else {
                         if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Failed to read peer attestation"); }
@@ -2144,22 +3743,47 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         continue 'process_packets;
                     };
 
-                    // @Todo: prune attestees to only BFT PKs on a current or imminently upcoming roster
-                    // @Todo: prune attesters to only BFT PKs on a current or imminently upcoming roster
+                    if !key_is_routed(peer_attestation.attester_bft_pk)
+                        || !key_is_routed(peer_attestation.attestee_bft_pk)
+                    {
+                        connection_keys_to_disconnect.push(connection_key);
+                        continue 'process_packets;
+                    }
 
-                    let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
-                    if peer_attestation.expiry + 60 <= now {
+                    let Ok(now) = u64::try_from(chrono::Utc::now().timestamp()) else {
+                        continue 'process_packets;
+                    };
+                    let Some(lifetime) = peer_attestation
+                        .expiry
+                        .checked_sub(peer_attestation.issued)
+                    else {
+                        connection_keys_to_disconnect.push(connection_key);
+                        continue 'process_packets;
+                    };
+                    let Some(minimum_expiry) = now.checked_add(60) else {
+                        continue 'process_packets;
+                    };
+                    let Some(maximum_issued) = now.checked_add(MAX_ATTESTATION_CLOCK_SKEW_SECONDS)
+                    else {
+                        continue 'process_packets;
+                    };
+                    let Some(maximum_expiry) = now
+                        .checked_add(MAX_ATTESTATION_LIFETIME_SECONDS)
+                        .and_then(|value| value.checked_add(MAX_ATTESTATION_CLOCK_SKEW_SECONDS))
+                    else {
+                        continue 'process_packets;
+                    };
+                    if peer_attestation.expiry < minimum_expiry {
                         if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent peer attestation that will expire too soon (<60s)"); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     }
-                    if peer_attestation.issued >= peer_attestation.expiry {
-                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Issued after expired"); }
-                        connection_keys_to_disconnect.push(connection_key);
-                        continue;
-                    }
-                    if peer_attestation.issued + 60 > peer_attestation.expiry {
-                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Expires less than 60 seconds after issued"); }
+                    if lifetime < 60
+                        || lifetime > MAX_ATTESTATION_LIFETIME_SECONDS
+                        || peer_attestation.issued > maximum_issued
+                        || peer_attestation.expiry > maximum_expiry
+                    {
+                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation lifetime or timestamp"); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     }
@@ -2199,7 +3823,16 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         } };
                     }
 
-                    bft_address_map.insert(&peer_attestation.attestee_bft_pk.clone(), &peer_attestation.stp_address.clone(), Some(peer_attestation));
+                    let attestee_bft_pk = peer_attestation.attestee_bft_pk;
+                    let attested_address = peer_attestation.stp_address.clone();
+                    if !bft_address_map.insert(
+                        &attestee_bft_pk,
+                        &attested_address,
+                        Some(peer_attestation),
+                    ) {
+                        connection_keys_to_disconnect.push(connection_key);
+                        continue 'process_packets;
+                    }
                 }
             }
 
@@ -2224,8 +3857,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     } };
                 }
 
-                bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
+                if !bft_address_map.insert(&their_verification.pk, &peer.stp_address, None) {
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                }
                 peer.bft_pk = their_verification.pk;
+                peer.authenticated_bft_pk = Some(their_verification.pk);
 
                 let my_verification = { // almost @Duplicate
                     let pk_bytes = my_root_public_bft_key.as_ref();
@@ -2237,7 +3874,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         assert!(peer.stp_handshake_hash.len() == 64);
                         let keyed_hash_of_stp_handshake_hash = hash_key_for_stp_handshake_hash.hash(&peer.stp_handshake_hash[..]);
 
-                        TMSig(my_root_private_key.sign(&keyed_hash_of_stp_handshake_hash[..]).to_bytes())
+                        bft_state.durable_signer.sign_auxiliary_digest(&keyed_hash_of_stp_handshake_hash)
                     };
 
                     PacketIdVerification { pk, sig }
@@ -2246,13 +3883,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                 let attestation = { // @Duplicate
                     let addr = peer.stp_address.clone();
                     let issued: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
-                    let expiry = {
-                        let seconds_per_minute = 60;
-                        let minutes_per_hour   = 60;
-                        let hours_per_day      = 24;
-                        let days_expiry        =  1;
-
-                        issued + (seconds_per_minute * minutes_per_hour * hours_per_day * days_expiry)
+                    let Some(expiry) = issued.checked_add(24 * 60 * 60) else {
+                        continue;
                     };
                     let sig = {
                         let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink One Party Signed Peer Attestation").finalize().into());
@@ -2268,7 +3900,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         hasher.update(&my_root_public_bft_key.as_ref()[..]);
                         let keyed_hash_of_one_party_signed_attestation = hasher.finalize();
 
-                        TMSig(my_root_private_key.sign(&keyed_hash_of_one_party_signed_attestation.as_bytes()[..]).to_bytes())
+                        bft_state.durable_signer.sign_auxiliary_digest(keyed_hash_of_one_party_signed_attestation.as_bytes())
                     };
 
                     PacketIdAttestation { issued, expiry, addr, sig }
@@ -2307,8 +3939,12 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     } };
                 }
 
-                bft_address_map.insert(&their_verification.pk, &peer.stp_address, None);
+                if !bft_address_map.insert(&their_verification.pk, &peer.stp_address, None) {
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                }
                 peer.bft_pk = their_verification.pk;
+                peer.authenticated_bft_pk = Some(their_verification.pk);
 
                 let Some(attestation) = PacketIdAttestation::read_from(msg) else {
                     if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID verification: Failed to read ID Hello Ack packet: Failed to read attestation"); }
@@ -2334,19 +3970,11 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 }
-                let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
-                if attestation.expiry <= now {
-                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID attestation: Attestation has already expired"); }
-                    connection_keys_to_disconnect.push(connection_key);
+                let Ok(now) = u64::try_from(chrono::Utc::now().timestamp()) else {
                     continue;
-                }
-                if attestation.issued >= attestation.expiry {
-                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID attestation: Issued after expired"); }
-                    connection_keys_to_disconnect.push(connection_key);
-                    continue;
-                }
-                if attestation.issued + 60 > attestation.expiry {
-                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID attestation: Expires less than 60 seconds after issued"); }
+                };
+                if !attestation_window_is_valid(attestation.issued, attestation.expiry, now) {
+                    if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer failed ID attestation: invalid lifetime or timestamp"); }
                     connection_keys_to_disconnect.push(connection_key);
                     continue;
                 }
@@ -2384,7 +4012,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let hash_key_for_attestation = HashKey(blake3::Hasher::new_derive_key("Tenderlink Two Party Signed Peer Attestation").finalize().into());
                     assert!(attestation.sig.0.len() == 64);
                     let keyed_hash_of_two_party_signed_attestation = hash_key_for_attestation.hash(&attestation.sig.0[..]);
-                    TMSig(my_root_private_key.sign(&keyed_hash_of_two_party_signed_attestation[..]).to_bytes())
+                    bft_state.durable_signer.sign_auxiliary_digest(&keyed_hash_of_two_party_signed_attestation)
                 };
 
                 let peer_attestation = PeerAttestation {
@@ -2396,8 +4024,14 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     attester_sig:       attestation.sig,
                     attestee_sig:       sig,
                 };
-                my_address_attestations.push(peer_attestation.clone());
-                bft_address_map.insert(&peer_attestation.attestee_bft_pk, &peer_attestation.stp_address, Some(peer_attestation.clone()));
+                if !bft_address_map.insert(
+                    &peer_attestation.attestee_bft_pk,
+                    &peer_attestation.stp_address,
+                    Some(peer_attestation.clone()),
+                ) {
+                    connection_keys_to_disconnect.push(connection_key);
+                    continue;
+                }
 
                 // @Todo: Decide if @Temporary?
                 // if false
@@ -2455,8 +4089,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
             else {
             }
 
-            if let Some(pk) = bft_address_map.get_key(&peer.stp_address) {
-                bft_address_map.last_packet_utcs.insert(*pk, chrono::Utc::now().timestamp());
+            if let Some(pk) = peer.authenticated_bft_pk {
+                bft_address_map
+                    .last_packet_utcs
+                    .insert(pk, chrono::Utc::now().timestamp());
             }
         }
 
@@ -2660,7 +4296,15 @@ impl PacketVotes {
         o += self.height     .write_to(&mut buf[o..]);
         o += self.value_id.0 .write_to(&mut buf[o..]);
         // NOTE(azmr): slight saving of bytes-on-wire if unused? i.e. initial few times each
-        for i in 0..(self.no_votes_n + self.yes_votes_n) as usize {
+        let votes_n = self
+            .no_votes_n
+            .checked_add(self.yes_votes_n)
+            .expect("local vote packet count must not overflow");
+        assert!(
+            votes_n as usize <= self.votes.len(),
+            "local vote packet exceeds wire capacity"
+        );
+        for i in 0..votes_n as usize {
             o += &self.votes[i].roster_i.write_to(&mut buf[o..]);
             o += &self.votes[i].sig   .0.write_to(&mut buf[o..]);
         }
@@ -2676,9 +4320,19 @@ impl PacketVotes {
             value_id:    ValueId(SliceRead::read_from(buf)?),
             ..Default::default()
         };
-        for i in 0..(packet.no_votes_n + packet.yes_votes_n) as usize {
+        if packet.round > MAX_CONSENSUS_ROUND {
+            return None;
+        }
+        let votes_n = packet.no_votes_n.checked_add(packet.yes_votes_n)?;
+        if votes_n == 0 || votes_n as usize > packet.votes.len() {
+            return None;
+        }
+        for i in 0..votes_n as usize {
             packet.votes[i].roster_i = u16::read_from(buf)?;
             packet.votes[i].sig.0    = SliceRead::read_from(buf)?;
+        }
+        if !buf.is_empty() {
+            return None;
         }
         Some(packet)
     }
@@ -2928,6 +4582,7 @@ fn hook_fail_on_panic() {
     }))
 }
 
+#[cfg(any(test, feature = "simulation"))]
 pub fn run_instances(i: usize) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -3008,8 +4663,77 @@ pub mod helpers;
 use helpers::*;
 
 #[cfg(test)]
+mod condition28_tests;
+#[cfg(test)]
+mod gossip_tests;
+#[cfg(test)]
+mod signer_wal_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn full_round(height: u64, byte: u8) -> RoundData {
+        let proposal = BlockValue(vec![byte; 32]);
+        RoundData {
+            height,
+            proposal_id: proposal.id_from_value(&HashKeys::default()),
+            proposal,
+            proposal_sigs: vec![TMSig([byte; 64])],
+            proposal_sigs_n: 1,
+            proposal_checked_validity: (TMStatus::Pass, TMStatusReason::None),
+            ..RoundData::EMPTY
+        }
+    }
+
+    fn encoded_vote_packet(no_votes_n: u8, yes_votes_n: u8, round: u32, votes_n: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(46 + votes_n * 66);
+        bytes.push(no_votes_n);
+        bytes.push(yes_votes_n);
+        bytes.extend_from_slice(&round.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.resize(46 + votes_n * 66, 0);
+        bytes
+    }
+
+    #[test]
+    fn vote_round_step_encoding_has_one_canonical_domain() {
+        assert_eq!(canonical_vote_round(MAX_CONSENSUS_ROUND, false), Some(MAX_CONSENSUS_ROUND));
+        assert_eq!(canonical_vote_round(MAX_CONSENSUS_ROUND, true), Some(u32::MAX));
+        assert_eq!(canonical_vote_round(MAX_CONSENSUS_ROUND + 1, false), None);
+        assert_eq!(canonical_vote_round(MAX_CONSENSUS_ROUND + 1, true), None);
+    }
+
+    #[test]
+    fn proposal_chunk_layout_rejects_zero_huge_and_out_of_range_headers() {
+        assert_eq!(proposal_chunk_layout(0, 0), None);
+        assert_eq!(proposal_chunk_layout(u32::MAX, 0), None);
+        assert_eq!(proposal_chunk_layout(1, 1), None);
+        assert_eq!(proposal_chunk_layout(MAX_PROPOSAL_BYTES as u32, u32::MAX), None);
+        assert_eq!(proposal_chunk_layout(1, 0), Some((0, 1, 1)));
+        let last_chunk = proposal_chunk_count(MAX_PROPOSAL_BYTES as u32).unwrap() - 1;
+        assert!(proposal_chunk_layout(MAX_PROPOSAL_BYTES as u32, last_chunk as u32).is_some());
+    }
+
+    #[test]
+    fn vote_packet_decoder_rejects_count_overflow_capacity_and_trailing_bytes() {
+        let valid = encoded_vote_packet(9, 9, MAX_CONSENSUS_ROUND, 18);
+        assert!(PacketVotes::read_from(&mut &valid[..]).is_some());
+
+        for malformed in [
+            encoded_vote_packet(19, 0, 0, 0),
+            encoded_vote_packet(255, 255, 0, 0),
+            encoded_vote_packet(0, 0, 0, 0),
+            encoded_vote_packet(1, 0, MAX_CONSENSUS_ROUND + 1, 1),
+        ] {
+            assert!(PacketVotes::read_from(&mut &malformed[..]).is_none());
+        }
+
+        let mut trailing = encoded_vote_packet(1, 0, 0, 1);
+        trailing.push(0);
+        assert!(PacketVotes::read_from(&mut &trailing[..]).is_none());
+    }
 
     // #[ignore]
     // #[test]
@@ -3031,6 +4755,7 @@ mod tests {
     // }
 
     #[test]
+    #[ignore = "manual multi-node simulator binds fixed ports and runs indefinitely"]
     fn single_rt() {
         run_instances(usize::MAX);
     }
@@ -3090,6 +4815,204 @@ mod tests {
         for (test_i, test) in tests.iter().enumerate() {
             let rngs = gen_mostly_empty_rngs(test.arr.len(), |i| test.arr[i] == b'0');
             assert_eq!(test.rngs, &rngs, "index {}", test_i);
+            for selector in 0..rngs.len().saturating_mul(3) {
+                assert_eq!(
+                    select_mostly_empty_rng(
+                        test.arr.len(),
+                        |i| test.arr[i] == b'0',
+                        selector as u64,
+                    ),
+                    Some(rngs[selector % rngs.len()]),
+                    "selection index {selector} in test {test_i}",
+                );
+            }
         }
+        assert_eq!(select_mostly_empty_rng(8, |_| false, 0), None);
+    }
+
+    #[test]
+    fn recent_commit_cache_is_a_bounded_contiguous_suffix() {
+        let total = MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY + 7;
+        let mut cache = Vec::new();
+        for height in 0..total {
+            append_recent_commit_round(&mut cache, full_round(height as u64, height as u8));
+        }
+
+        assert_eq!(cache.len(), MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY);
+        assert_eq!(cache.first().unwrap().height, 7);
+        assert_eq!(cache.last().unwrap().height, (total - 1) as u64);
+        validate_commit_round_cache(&cache, total as u64).unwrap();
+        assert_eq!(cache.iter().filter(|round| round.has_full_proposal()).count(), 1);
+        assert!(cached_commit_round_at_height(&cache, 6).is_none());
+        assert_eq!(commit_round_cache_entry_at_height(&cache, 7).unwrap().height, 7);
+        assert!(cached_commit_round_at_height(&cache, 7).is_none());
+        assert_eq!(
+            cached_commit_round_at_height(&cache, (total - 1) as u64)
+                .unwrap()
+                .height,
+            (total - 1) as u64,
+        );
+    }
+
+    #[test]
+    fn historical_relay_source_covers_the_64_65_and_far_behind_boundaries() {
+        let mut first_64 = (0..MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY)
+            .map(|height| full_round(height as u64, height as u8))
+            .collect::<Vec<_>>();
+        compact_recent_commit_payloads(&mut first_64);
+        assert!(commit_round_for_relay(&first_64, None, 0).is_none());
+        let loaded_height_zero = full_round(0, 200);
+        assert_eq!(
+            commit_round_for_relay(&first_64, Some(&loaded_height_zero), 0)
+                .unwrap()
+                .height,
+            0
+        );
+        assert_eq!(
+            commit_round_for_relay(
+                &first_64,
+                None,
+                (MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY - 1) as u64,
+            )
+            .unwrap()
+            .height,
+            (MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY - 1) as u64,
+        );
+
+        let mut after_65 = (1..=MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY)
+            .map(|height| full_round(height as u64, height as u8))
+            .collect::<Vec<_>>();
+        compact_recent_commit_payloads(&mut after_65);
+        assert!(commit_round_for_relay(&after_65, None, 0).is_none());
+        assert_eq!(
+            commit_round_for_relay(&after_65, Some(&loaded_height_zero), 0)
+                .unwrap()
+                .height,
+            0
+        );
+
+        let mut far_cache = (100..100 + MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY)
+            .map(|height| full_round(height as u64, height as u8))
+            .collect::<Vec<_>>();
+        compact_recent_commit_payloads(&mut far_cache);
+        let loaded_far_behind = full_round(7, 201);
+        assert_eq!(
+            commit_round_for_relay(&far_cache, Some(&loaded_far_behind), 7)
+                .unwrap()
+                .height,
+            7
+        );
+        assert!(commit_round_for_relay(&far_cache, Some(&loaded_far_behind), 8).is_none());
+    }
+
+    #[test]
+    fn stale_round_payload_compaction_preserves_identity_and_vote_evidence() {
+        let proposal_id = ValueId([7; 32]);
+        let vote = (proposal_id, TMSig([9; 64]));
+        let mut rounds = vec![
+            RoundData {
+                height: 4,
+                round: 3,
+                proposal: BlockValue(vec![1; 4096]),
+                proposal_valid_round: 1,
+                proposal_sigs: vec![TMSig([2; 64]); 4],
+                proposal_sigs_n: 4,
+                proposal_id,
+                proposal_checked_validity: (TMStatus::Pass, TMStatusReason::None),
+                msg_val_sigs: vec![[vote, vote]],
+                counts: ConsensusCounts {
+                    anys: 1,
+                    prevotes: 1,
+                    nil_prevotes: 0,
+                    yes_prevotes: 1,
+                    precommits: 1,
+                    yes_precommits: 1,
+                },
+                ..RoundData::EMPTY
+            },
+            full_round(4, 8),
+        ];
+        rounds[1].round = 4;
+
+        compact_round_proposal_payload(&mut rounds[0]);
+
+        assert!(rounds[0].proposal.0.is_empty());
+        assert!(rounds[0].proposal_sigs.is_empty());
+        assert_eq!(rounds[0].proposal_sigs_n, 0);
+        assert_eq!(rounds[0].proposal_id, proposal_id);
+        assert_eq!(rounds[0].proposal_valid_round, 1);
+        assert_eq!(rounds[0].msg_val_sigs, vec![[vote, vote]]);
+        assert_eq!(rounds[0].counts.yes_precommits, 1);
+        assert!(rounds[1].has_full_proposal());
+    }
+
+    #[test]
+    fn referenced_prevote_qc_survives_referenced_payload_compaction() {
+        let keys = (1u8..=4)
+            .map(|byte| SigningKey::from([byte; 32]))
+            .collect::<Vec<_>>();
+        let mut cumulative_stake = 0u64;
+        let roster = keys
+            .iter()
+            .map(|key| {
+                cumulative_stake += 1;
+                SortedRosterMember {
+                    pub_key: PubKeyID(key.verification_key().into()),
+                    stake: 1,
+                    cumulative_stake,
+                }
+            })
+            .collect::<Vec<_>>();
+        let namespace = [0u8; 32];
+        let proposal = BlockValue(vec![42; 128]);
+        let proposal_id = proposal.id_from_value(&HashKeys::default());
+        let mut referenced_votes = vec![[(ValueId::NIL, TMSig::NIL); 2]; roster.len()];
+        for (index, key) in keys.iter().take(3).enumerate() {
+            let signable = make_vote_sign_datas(
+                roster[index].pub_key,
+                false,
+                9,
+                1,
+                proposal_id,
+            )[1];
+            referenced_votes[index][0] =
+                (proposal_id, TMSig(sign_with_namespace(key, &signable, &namespace)));
+        }
+        let mut referenced = RoundData {
+            height: 9,
+            round: 1,
+            proposal: proposal.clone(),
+            proposal_id,
+            proposal_sigs: vec![TMSig([1; 64])],
+            proposal_sigs_n: 1,
+            msg_val_sigs: referenced_votes,
+            roster: roster.clone(),
+            vote_namespace: namespace,
+            ..RoundData::EMPTY
+        };
+        compact_round_proposal_payload(&mut referenced);
+        let current = RoundData {
+            height: 9,
+            round: 3,
+            proposal,
+            proposal_valid_round: 1,
+            proposal_id,
+            proposal_sigs: vec![TMSig([2; 64])],
+            proposal_sigs_n: 1,
+            roster,
+            vote_namespace: namespace,
+            ..RoundData::EMPTY
+        };
+        let rounds = vec![referenced, current];
+
+        assert_eq!(
+            verified_referenced_prevote_certificate(
+                &rounds,
+                1,
+                &namespace,
+                &HashKeys::default(),
+            ),
+            Some((1, 3, 3)),
+        );
     }
 }

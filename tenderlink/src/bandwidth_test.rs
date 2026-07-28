@@ -504,6 +504,7 @@ fn fill_packet_payload_with_unreliable_fragments(payload: &mut [u8], unreliable_
 #[derive(Debug)]
 pub struct ConnectionTrackingData {
     pub creation_time_ns: u64,
+    pub initiated_locally: bool,
     pub my_ip: Ipv6Addr, // TODO: use an ipv6 type that supports Default!
     pub my_transport_identity_keypair: IdentityKeyPair,
     pub two_byte_send_prefix: u16,
@@ -803,6 +804,16 @@ pub fn connect_to_endpoint(
     send_buffer_params: (u32, u32, u32),
 ) {
     assert!(my_connect_keypair.magic1 == endpoint.magic1);
+    let connection_key = ConnectionKey::from(endpoint);
+    if !connections_map.contains_key(&connection_key)
+        && !connection_capacity_allows(
+            connections_map.len(),
+            connections_map.values().filter(|connection| !connection.initiated_locally).count(),
+            true,
+        )
+    {
+        return;
+    }
 
     if my_connect_keypair.magic1 == CONNECT_MAGIC1_PLAIN_TEXT {
         let magic2_block = build_magic2_client_block();
@@ -814,9 +825,10 @@ pub fn connect_to_endpoint(
 
         let my_ip = if endpoint.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
         connections_map.insert(
-            ConnectionKey::from(endpoint),
+            connection_key,
             ConnectionTrackingData {
                 creation_time_ns: monotonic_clock_ns(),
+                initiated_locally: true,
                 my_ip,
                 my_transport_identity_keypair: my_connect_keypair.clone(),
                 two_byte_send_prefix: load_u16(&my_connect_keypair.public[0..2]) << 1,
@@ -827,7 +839,7 @@ pub fn connect_to_endpoint(
                 jumbo_reassembly: Default::default(),
                 handshake_hash: [0u8; 64],
                 unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
-                unreliable_reassembly: ReassemblySlot::new_ring(1024),
+                unreliable_reassembly: ReassemblySlot::new_ring(MAX_UNRELIABLE_REASSEMBLY_SLOTS),
                 nym_sock,
             },
         );
@@ -848,9 +860,10 @@ pub fn connect_to_endpoint(
 
         let my_ip = if endpoint.is_ipv4() { Ipv6Addr::UNSPECIFIED } else { Ipv6Addr::UNSPECIFIED };
         connections_map.insert(
-            ConnectionKey::from(endpoint),
+            connection_key,
             ConnectionTrackingData {
                 creation_time_ns: monotonic_clock_ns(),
+                initiated_locally: true,
                 my_ip,
                 my_transport_identity_keypair: my_connect_keypair.clone(),
                 two_byte_send_prefix: load_u16(&my_connect_keypair.public[0..2]) << 1,
@@ -861,7 +874,7 @@ pub fn connect_to_endpoint(
                 jumbo_reassembly: Default::default(),
                 handshake_hash: [0u8; 64],
                 unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
-                unreliable_reassembly: ReassemblySlot::new_ring(1024),
+                unreliable_reassembly: ReassemblySlot::new_ring(MAX_UNRELIABLE_REASSEMBLY_SLOTS),
                 nym_sock,
             },
         );
@@ -897,9 +910,18 @@ impl ReassemblySlot {
 
     /// returns (success, is_complete)
     pub fn insert(&mut self, offset: usize, data: &[u8], is_fin: bool) -> (bool, bool) {
-
-        let start = offset as u32;
-        let end = (offset + data.len()) as u32;
+        let Some(end_usize) = offset.checked_add(data.len()) else {
+            return (false, false);
+        };
+        if end_usize > MAX_JUMBOGRAM_LEN {
+            return (false, false);
+        }
+        let Ok(start) = u32::try_from(offset) else {
+            return (false, false);
+        };
+        let Ok(end) = u32::try_from(end_usize) else {
+            return (false, false);
+        };
 
         // If this is the final fragment, derive total_len from offset + data.len()
         if is_fin {
@@ -970,6 +992,136 @@ pub struct JumboReassembly {
 pub const MAX_REASSEMBLY_SLOTS: usize = 128; // @Todo: convert max slots into max bytes instead -- which is what we really want anyway!
 pub const MAX_JUMBOGRAM_LEN: usize = 1 << 23; // 8 MB, matches the 23-bit field
 pub const MAX_JUMBOGRAM_IDS: u32   = 1 << 18; // matches 18-bit field
+pub const MAX_UNRELIABLE_REASSEMBLY_BYTES: usize = MAX_JUMBOGRAM_LEN;
+pub const MAX_UNRELIABLE_REASSEMBLY_SLOTS: usize = MAX_REASSEMBLY_SLOTS;
+pub const MAX_NETWORK_CONNECTIONS: usize = 80;
+pub const MAX_INBOUND_NETWORK_CONNECTIONS: usize = 16;
+pub const MAX_NETWORK_SEND_BUFFER_BYTES: u32 = 8 * 1024 * 1024;
+pub const MAX_RECEIVED_UNRELIABLE_BYTES: usize = 32 * 1024 * 1024;
+
+fn connection_capacity_allows(
+    total_connections: usize,
+    inbound_connections: usize,
+    initiated_locally: bool,
+) -> bool {
+    total_connections < MAX_NETWORK_CONNECTIONS
+        && (initiated_locally || inbound_connections < MAX_INBOUND_NETWORK_CONNECTIONS)
+}
+
+fn bounded_send_buffer_params(params: (u32, u32, u32)) -> (u32, u32, u32) {
+    let max_queue_size_bytes = params.2.min(MAX_NETWORK_SEND_BUFFER_BYTES);
+    let min_queue_size_bytes = params.1.min(max_queue_size_bytes);
+    (params.0, min_queue_size_bytes, max_queue_size_bytes)
+}
+
+fn received_unreliable_budget_allows(current_bytes: usize, message_bytes: usize) -> bool {
+    message_bytes <= MAX_RECEIVED_UNRELIABLE_BYTES.saturating_sub(current_bytes)
+}
+
+fn unreliable_reassembly_budget_allows(
+    slots: &[ReassemblySlot],
+    slot_idx: usize,
+    requested_end: usize,
+) -> bool {
+    if requested_end > MAX_JUMBOGRAM_LEN || slot_idx >= slots.len() {
+        return false;
+    }
+    let target_is_empty = slots[slot_idx].buf.is_empty() && slots[slot_idx].received.is_empty();
+    if target_is_empty
+        && slots
+            .iter()
+            .filter(|slot| !slot.buf.is_empty() || !slot.received.is_empty())
+            .count()
+            >= MAX_UNRELIABLE_REASSEMBLY_SLOTS
+    {
+        return false;
+    }
+    let Some(current_bytes) = slots
+        .iter()
+        .try_fold(0usize, |sum, slot| sum.checked_add(slot.buf.len()))
+    else {
+        return false;
+    };
+    let growth = requested_end.saturating_sub(slots[slot_idx].buf.len());
+    current_bytes
+        .checked_add(growth)
+        .is_some_and(|total| total <= MAX_UNRELIABLE_REASSEMBLY_BYTES)
+}
+
+#[cfg(test)]
+mod bounded_reassembly_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_large_offsets_without_allocating() {
+        let mut slot = ReassemblySlot::new();
+        assert_eq!(
+            slot.insert(MAX_JUMBOGRAM_LEN + 1, &[1], true),
+            (false, false)
+        );
+        assert_eq!(slot.insert(usize::MAX, &[1], true), (false, false));
+        assert!(slot.buf.is_empty());
+        assert!(slot.received.is_empty());
+    }
+
+    #[test]
+    fn enforces_active_slot_and_aggregate_byte_budgets() {
+        let mut active_slots = ReassemblySlot::new_ring(MAX_UNRELIABLE_REASSEMBLY_SLOTS + 1);
+        for slot in &mut active_slots[..MAX_UNRELIABLE_REASSEMBLY_SLOTS] {
+            slot.buf.push(0);
+        }
+        assert!(!unreliable_reassembly_budget_allows(
+            &active_slots,
+            MAX_UNRELIABLE_REASSEMBLY_SLOTS,
+            1,
+        ));
+
+        let mut byte_slots = ReassemblySlot::new_ring(2);
+        byte_slots[0].buf.resize(MAX_JUMBOGRAM_LEN, 0);
+        assert!(!unreliable_reassembly_budget_allows(&byte_slots, 1, 1));
+        assert!(unreliable_reassembly_budget_allows(
+            &byte_slots,
+            0,
+            MAX_JUMBOGRAM_LEN,
+        ));
+    }
+
+    #[test]
+    fn reserves_connection_capacity_and_caps_send_buffers() {
+        assert!(connection_capacity_allows(0, 0, false));
+        assert!(!connection_capacity_allows(
+            MAX_INBOUND_NETWORK_CONNECTIONS,
+            MAX_INBOUND_NETWORK_CONNECTIONS,
+            false,
+        ));
+        assert!(connection_capacity_allows(
+            MAX_INBOUND_NETWORK_CONNECTIONS,
+            MAX_INBOUND_NETWORK_CONNECTIONS,
+            true,
+        ));
+        assert!(!connection_capacity_allows(
+            MAX_NETWORK_CONNECTIONS,
+            0,
+            true,
+        ));
+
+        let bounded = bounded_send_buffer_params((
+            1_000_000,
+            MAX_NETWORK_SEND_BUFFER_BYTES * 2,
+            u32::MAX,
+        ));
+        assert_eq!(bounded.1, MAX_NETWORK_SEND_BUFFER_BYTES);
+        assert_eq!(bounded.2, MAX_NETWORK_SEND_BUFFER_BYTES);
+        assert!(received_unreliable_budget_allows(
+            MAX_RECEIVED_UNRELIABLE_BYTES - 1,
+            1,
+        ));
+        assert!(!received_unreliable_budget_allows(
+            MAX_RECEIVED_UNRELIABLE_BYTES,
+            1,
+        ));
+    }
+}
 
 pub const ACK_BUFFER_TIME_NS: u64 = 50_000_000;
 
@@ -1002,6 +1154,7 @@ pub struct NetworkThreadHandle {
 }
 
 pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_pps: Option<u64>, send_buffer_params: (u32, u32, u32)) -> NetworkThreadHandle {
+    let send_buffer_params = bounded_send_buffer_params(send_buffer_params);
 
     // STP setup
     socket_setup();
@@ -1027,6 +1180,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
         let mut packet_memory_send      = new_packet_memory(); // Outgoing Decrypted
 
         let mut received_unreliable_messages: Vec<(ConnectionKey, Vec<u8>)> = Vec::new();
+        let mut received_unreliable_bytes = 0usize;
 
         let mut connections_map = HashMap::<ConnectionKey, ConnectionTrackingData>::new();
         let mut server_nym_sockets: Vec<NymSockHandle> = Vec::new();
@@ -1096,6 +1250,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                     }
                 }).collect();
                 std::mem::swap(&mut resp.received_unreliable_messages, &mut received_unreliable_messages);
+                received_unreliable_bytes = 0;
 
                 #[allow(unsafe_code)]
                 unsafe {
@@ -1183,7 +1338,14 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                                 if OVERLY_VERBOSE { println!("Did NOT respond to connection {}: Failed condition \"&existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key\"", connection_key.key_15_bits); }
                                             }
                                         }
-                                        else {
+                                        else if connection_capacity_allows(
+                                            connections_map.len(),
+                                            connections_map
+                                                .values()
+                                                .filter(|connection| !connection.initiated_locally)
+                                                .count(),
+                                            false,
+                                        ) {
                                             let client_key = Vec::from(client_key);
                                             store_u48(&mut packet_memory_send[0..6], 0xffff_ffff_0000 | (load_u16(&my_kp.public[0..2]) << 1) as u64);
                                             packet_memory_send[6..6+32].copy_from_slice(&my_kp.public[..]);
@@ -1195,6 +1357,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                                 connection_key,
                                                 ConnectionTrackingData {
                                                     creation_time_ns: monotonic_clock_ns(),
+                                                    initiated_locally: false,
                                                     my_ip,
                                                     my_transport_identity_keypair: my_kp.clone(),
                                                     two_byte_send_prefix: load_u16(&my_kp.public[0..2]) << 1,
@@ -1205,7 +1368,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                                     jumbo_reassembly: Default::default(),
                                                     handshake_hash: [0u8; 64],
                                                     unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
-                                                    unreliable_reassembly: ReassemblySlot::new_ring(1024),
+                                                    unreliable_reassembly: ReassemblySlot::new_ring(MAX_UNRELIABLE_REASSEMBLY_SLOTS),
                                                     nym_sock: None,
                                                 },
                                             );
@@ -1260,7 +1423,14 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                                     if OVERLY_VERBOSE { println!("Did NOT respond to client hello from {}: @Todo explanation: Following expression was false: &existing_connection.my_transport_identity_keypair == my_kp && existing_connection.other_transport_identity == client_key", connection_key.key_15_bits); }
                                                 }
                                             }
-                                            else {
+                                            else if connection_capacity_allows(
+                                                connections_map.len(),
+                                                connections_map
+                                                    .values()
+                                                    .filter(|connection| !connection.initiated_locally)
+                                                    .count(),
+                                                false,
+                                            ) {
                                                 let client_key = Vec::from(client_key);
                                                 let mut chosen_magic2_bytes = [0u8; 8];
                                                 store_u64(&mut chosen_magic2_bytes, chosen_magic2);
@@ -1277,6 +1447,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                                     connection_key,
                                                     ConnectionTrackingData {
                                                         creation_time_ns: monotonic_clock_ns(),
+                                                        initiated_locally: false,
                                                         my_ip,
                                                         my_transport_identity_keypair: my_kp.clone(),
                                                         two_byte_send_prefix: load_u16(&my_kp.public[0..2]) << 1,
@@ -1287,7 +1458,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                                         jumbo_reassembly: Default::default(),
                                                         handshake_hash,
                                                         unreliable_send_buffer: UnreliableSendBuffer::new(send_buffer_params.0, send_buffer_params.1, send_buffer_params.2),
-                                                        unreliable_reassembly: ReassemblySlot::new_ring(1024),
+                                                        unreliable_reassembly: ReassemblySlot::new_ring(MAX_UNRELIABLE_REASSEMBLY_SLOTS),
                                                         nym_sock: None,
                                                     },
                                                 );
@@ -1605,8 +1776,12 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                 let frag_data = &remaining_payload[8..(8+frag_len as usize)];
                                 remaining_payload = &remaining_payload[(8+frag_len as usize)..];
 
-                                if frag_offset + frag_len > u32::MAX as u64 {
-                                    if OVERLY_VERBOSE { println!("Error, frag_offset + frag_len overflows u32 from {connection_key:?}. Disconnecting..."); }
+                                let Some(fragment_end) = frag_offset.checked_add(frag_len) else {
+                                    connections_map.remove(&connection_key);
+                                    break 'conn;
+                                };
+                                if is_reliable || fragment_end > MAX_JUMBOGRAM_LEN as u64 {
+                                    if OVERLY_VERBOSE { println!("Error, fragment exceeds the unreliable reassembly domain from {connection_key:?}. Disconnecting..."); }
                                     connections_map.remove(&connection_key);
                                     break 'conn;
                                 }
@@ -1614,15 +1789,33 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                 //if OVERLY_VERBOSE { println!("Fragment from {:?}: R:{} F:{} ID:{} L:{} O:{}", connection_key, is_reliable, is_fin, package_id, frag_len, frag_offset); }
                                 
                                 let slot_idx = package_id as usize % existing_connection.unreliable_reassembly.len();
+                                if !unreliable_reassembly_budget_allows(
+                                    &existing_connection.unreliable_reassembly,
+                                    slot_idx,
+                                    fragment_end as usize,
+                                ) {
+                                    connections_map.remove(&connection_key);
+                                    break 'conn;
+                                }
                                 let (mut success, mut complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
                                 if !success {
                                     existing_connection.unreliable_reassembly[slot_idx] = ReassemblySlot::new();
                                     (success, complete) = existing_connection.unreliable_reassembly[slot_idx].insert(frag_offset as usize, frag_data, is_fin);
-                                    assert!(success);
+                                    if !success {
+                                        connections_map.remove(&connection_key);
+                                        break 'conn;
+                                    }
                                 }
                                 if complete {
                                     let completed = std::mem::replace(&mut existing_connection.unreliable_reassembly[slot_idx], ReassemblySlot::new());
-                                    received_unreliable_messages.push((connection_key, completed.buf));
+                                    if received_unreliable_budget_allows(
+                                        received_unreliable_bytes,
+                                        completed.buf.len(),
+                                    ) {
+                                        received_unreliable_bytes = received_unreliable_bytes
+                                            .saturating_add(completed.buf.len());
+                                        received_unreliable_messages.push((connection_key, completed.buf));
+                                    }
                                 }
                             }
 

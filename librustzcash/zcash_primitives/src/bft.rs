@@ -473,6 +473,10 @@ impl BftBlockAndFatPointerToIt {
 
     /// Generate a bundle of the block hash and signatures affirming its validity
     pub fn from_parts(block: BftBlock, height: u64, round: u32, signatures: &[FatPointerSignature]) -> Self {
+        assert!(
+            round <= 0x7fff_ffff,
+            "BFT round must fit the canonical 31-bit vote domain"
+        );
         let hash = block.blake3_hash();
         Self {
             block,
@@ -685,18 +689,18 @@ impl FatPointerToBftBlock {
         buf
     }
 
-    #[allow(clippy::reversed_empty_ranges)]
     pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 76 - 32 + 2 {
             return None;
         }
         let vote_for_block_without_finalizer_public_key = bytes[0..76 - 32].try_into().unwrap();
-        let len = u16::from_le_bytes(bytes[76 - 32..2].try_into().unwrap()) as usize;
+        let len = u16::from_le_bytes(bytes[76 - 32..76 - 32 + 2].try_into().unwrap()) as usize;
 
-        if 76 - 32 + 2 + len * (32 + 64) > bytes.len() {
+        let expected_len = (76_usize - 32 + 2).checked_add(len.checked_mul(32 + 64)?)?;
+        if expected_len != bytes.len() {
             return None;
         }
-        let rem = &bytes[76 - 32 + 2..];
+        let rem = &bytes[76 - 32 + 2..expected_len];
         let signatures = rem
             .chunks_exact(32 + 64)
             .map(|chunk| FatPointerSignature::from_bytes(chunk.try_into().unwrap()))
@@ -709,6 +713,10 @@ impl FatPointerToBftBlock {
     }
 
     pub fn from_parts(bft_block_hash: Blake3Hash, height: u64, round: u32, signatures: &[FatPointerSignature]) -> Self {
+        assert!(
+            round <= 0x7fff_ffff,
+            "BFT round must fit the canonical 31-bit vote domain"
+        );
         let mut vote_for_block_without_finalizer_public_key = [0_u8; 76 - 32]; // 76-32 = 44
         vote_for_block_without_finalizer_public_key[..32].copy_from_slice(&bft_block_hash.0);
         vote_for_block_without_finalizer_public_key[32..40].copy_from_slice(&height.to_le_bytes());
@@ -829,6 +837,10 @@ A signed vote will be this same layout followed by the 64 byte ed25519 signature
 
 impl Vote {
     pub fn to_bytes(&self) -> [u8; 76] {
+        assert!(
+            self.round >= 0,
+            "BFT vote round must be non-negative and canonical"
+        );
         let mut buf = [0_u8; 76];
         buf[0..32].copy_from_slice(self.validator_address.0.as_ref());
         buf[32..64].copy_from_slice(&self.value.0);
@@ -906,5 +918,3 @@ pub struct ScanInfo {
     pub max_height_seen: u32,
     pub total_value: u64,
 }
-
-

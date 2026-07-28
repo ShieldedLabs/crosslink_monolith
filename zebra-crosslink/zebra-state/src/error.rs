@@ -298,6 +298,10 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     CrosslinkNotReady { block_height: block::Height },
 
+    #[error("block height {block_height:?} was rejected because the bounded non-finalized queue is full")]
+    #[non_exhaustive]
+    QueuedBlockMemoryLimit { block_height: block::Height },
+
     #[error("block height {block_height:?} references a BFT block that must not be included until BC height {do_not_include_until}")]
     #[non_exhaustive]
     CrosslinkFatPointerTooEarly { block_height: block::Height, do_not_include_until: u64 },
