@@ -380,17 +380,6 @@ impl StartCmd {
         // Create a channel to send mined blocks to the gossip task
         let submit_block_channel = SubmitBlockChannel::new();
 
-        // Note(Sam): We do not need the whole GBT thing. We just need block_verifier_router. Andrew should use this for new sync.
-        let gbt_for_force_feeding_pow = Arc::new(
-            zebra_rpc::methods::types::get_block_template::GetBlockTemplateHandler::new(
-                &config.network.network.clone(),
-                config.mining.clone(),
-                block_verifier_router.clone(),
-                sync_status.clone(),
-                Some(submit_block_channel.sender()),
-            ),
-        );
-
         let mempool2 = mempool.clone();
         info!("spawning tfl service task");
         let (tfl_handle, tfl_service_task_handle) = {
@@ -412,94 +401,6 @@ impl StartCmd {
                     let mempool = mempool2.clone();
                     Box::pin(async move { mempool.clone().ready().await?.call(req).await })
                 }),
-                Arc::new(move |block| {
-                    let gbt = Arc::clone(&gbt_for_force_feeding_pow);
-
-                    let height = block
-                        .coinbase_height()
-                        // .ok_or_error(0, "coinbase height not found")?;
-                        .unwrap();
-
-                    let parent_hash = block.header.previous_block_hash;
-                    let block_hash = block.hash();
-
-                    Box::pin(async move {
-                        let attempt_result = timeout(Duration::from_millis(500), async move {
-                            let mut block_verifier_router = gbt.block_verifier_router();
-
-                            let height = block
-                                .coinbase_height()
-                                // .ok_or_error(0, "coinbase height not found")?;
-                                .unwrap();
-                            let block_hash = block.hash();
-
-                            let block_verifier_router_response =
-                                block_verifier_router.ready().await;
-                            if let Err(err) = block_verifier_router_response {
-                                return Err(format!("{err:?}"));
-                            }
-                            let block_verifier_router_response =
-                                block_verifier_router_response.unwrap();
-
-                            // .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
-                            let block_verifier_router_response = block_verifier_router_response
-                                .call(zebra_consensus::Request::Commit(block))
-                                .await;
-
-                            match block_verifier_router_response {
-                                // Currently, this match arm returns `null` (Accepted) for blocks committed
-                                // to any chain, but Accepted is only for blocks in the best chain.
-                                //
-                                // TODO (#5487):
-                                // - Inconclusive: check if the block is on a side-chain
-                                // The difference is important to miners, because they want to mine on the best chain.
-                                Ok(hash) => {
-                                    tracing::info!(?hash, ?height, "submit block accepted");
-
-                                    // gbt.advertise_mined_block(hash, height)
-                                    //     // .map_error_with_prefix(0, "failed to send mined block")?;
-                                    //     .unwrap();
-
-                                    // return Ok(submit_block::Response::Accepted);
-                                    Ok(())
-                                }
-
-                                // Turns BoxError into Result<VerifyChainError, BoxError>,
-                                // by downcasting from Any to VerifyChainError.
-                                Err(box_error) => {
-                                    let error = box_error
-                                        .downcast::<zebra_consensus::RouterError>()
-                                        .map(|boxed_chain_error| *boxed_chain_error);
-
-                                    tracing::error!(
-                                        ?error,
-                                        ?block_hash,
-                                        ?height,
-                                        "submit block failed verification"
-                                    );
-
-                                    // error
-                                    Err(format!("submit block failed verification: {error:?}"))
-                                }
-                            }
-                        })
-                        .await;
-
-                        match attempt_result {
-                            Ok(success) => success,
-                            Err(err) => {
-                                tracing::error!(
-                                    ?height,
-                                    ?block_hash,
-                                    ?parent_hash,
-                                    "submit block timed out"
-                                );
-                                // return Err("submit block timed out".to_string());
-                                Err(format!("{err:?}"))
-                            }
-                        }
-                    })
-                }),
                 config.crosslink.clone(),
                 actual_closure2,
             )
@@ -517,19 +418,7 @@ impl StartCmd {
             let sync_block_verifier = block_verifier_router.clone();
             tokio::task::spawn_blocking(move || {
                 use zebra_state::new_network::BlockCommitError;
-                let commit_block = |block: std::sync::Arc<zebra_chain::block::Block>| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<zebra_chain::block::Hash, BlockCommitError>> + Send>> {
-                    let mut verifier = sync_block_verifier.clone();
-                    Box::pin(async move {
-                        use tower::ServiceExt;
-                        let ready = verifier.ready().await.map_err(|e| BlockCommitError::Other(format!("{e:?}")))?;
-                        ready.call(zebra_consensus::Request::Commit(block)).await
-                            .map_err(|e| {
-                                let is_dup = e.downcast_ref::<zebra_consensus::router::RouterError>()
-                                    .map_or(false, |re| re.is_duplicate_request());
-                                if is_dup { BlockCommitError::Duplicate } else { BlockCommitError::Other(format!("{e:?}")) }
-                            })
-                    })
-                };
+
                 // Synchronous verification entry points. Passed as plain fn pointers because
                 // zebra-state cannot depend on zebra-consensus (the dependency runs the other
                 // way), so new_network cannot call these directly.
@@ -572,7 +461,7 @@ impl StartCmd {
                         }
                     })
                 };
-                zebra_state::new_network::sync(commit_block, &config.state, sync_read_state, /* tfl_service2, */ tokio::runtime::Handle::current(), verify_fns, crosslink_gate, commit_verified)
+                zebra_state::new_network::sync(&config.state, sync_read_state, /* tfl_service2, */ tokio::runtime::Handle::current(), verify_fns, crosslink_gate, commit_verified)
             });
         }
 

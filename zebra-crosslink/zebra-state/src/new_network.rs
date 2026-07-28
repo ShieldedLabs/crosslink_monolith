@@ -1200,36 +1200,22 @@ pub async fn submit_block_to_new_network(
     }
 }
 
-// @Temporary :SyncVerifyShadow
-// Scaffolding to A/B the synchronous verification path against the live async one. All of
-// this is parallel to the real pipeline and gates nothing; delete it once the sync path
-// takes over the commit decision.
-
+/// Verification timing, for the periodic report.
+///
+/// This replaces the A/B counters that ran until the sync path took over the commit decision.
+/// Those compared two independent verdicts; now that a sync rejection means no commit is
+/// attempted, there is no second opinion to compare against and the agreement counts became
+/// self-fulfilling. What is still worth watching is how long verification takes.
 #[derive(Default, Debug)]
-struct ShadowStats {
-    /// Both paths accepted. The result we want.
-    agree_pass: u64,
-    /// Both paths rejected.
-    agree_reject: u64,
-    /// Sync path rejected a block the async path committed.
-    ///
-    /// This is THE alarm: it means the new path would have dropped a valid block. Anything
-    /// non-zero here blocks cutting over.
-    false_reject: u64,
-    /// Sync path accepted, async path did not.
-    ///
-    /// NOT necessarily a bug. The sync path only covers semantic checks, so contextual
-    /// failures (utxo spends, nullifiers, anchors) and the crosslink fat-pointer gate land
-    /// here legitimately. Worth eyeballing the reasons, not worth blocking on the count.
-    sync_pass_commit_err: u64,
-    /// Async path reported the block was already committed; nothing to compare against.
-    duplicate: u64,
+struct VerifyStats {
+    committed: u64,
+    rejected_crosslink: u64,
+    rejected_other: u64,
     cheap_total: std::time::Duration,
     expensive_total: std::time::Duration,
 }
 
 pub fn sync(
-    commit_block: impl Fn(std::sync::Arc<Block>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Hash, BlockCommitError>> + Send>>,
     config: &crate::config::Config,
     read_state: ReadState,
     // tfl_service: TFLService, // no TFLServiceHandle. Sadge!
@@ -1390,9 +1376,8 @@ pub fn sync(
     let mut next_peer_request = std::time::Instant::now();
     let mut next_console_status_print = std::time::Instant::now();
 
-    // @Temporary :SyncVerifyShadow
-    let mut shadow_stats = ShadowStats::default();
-    let mut next_shadow_report = std::time::Instant::now();
+    let mut verify_stats = VerifyStats::default();
+    let mut next_verify_report = std::time::Instant::now();
 
     // Lite checkpoint: enforced at the commit-queue push, and stays armed forever.
     let checkpoint = Checkpoint::from_config(&config.network_checkpoint);
@@ -2708,12 +2693,11 @@ pub fn sync(
 
             let height = block_arc.coinbase_height().expect("all blocks in the commit queue should already have been confirmed to have a height").0;
             println!("Committing: @ {height}, {hash}");
-            // @Temporary :SyncVerifyShadow
-            // Run the synchronous verification path immediately before the real commit, so
-            // both see identical state. This must NOT run at packet-receipt time: the block
-            // that created the outputs this one spends may still be queued here rather than
-            // committed, and the UTXO load would fail for a perfectly valid block.
-            let shadow = {
+            // Verify synchronously, immediately before committing. This must NOT run at
+            // packet-receipt time: the block that created the outputs this one spends may still
+            // be sitting in this queue rather than committed, and the UTXO load would fail for a
+            // perfectly valid block.
+            let verdict = {
                 let network = read_state.network().clone();
                 // Matches SemanticBlockVerifier: PoW is skipped on networks that disable it.
                 let check_pow = !network.disable_pow();
@@ -2788,7 +2772,7 @@ pub fn sync(
             // submitted. The old route (verifier router -> StateService -> queue_and_commit ->
             // orphan queue -> sent-hash bookkeeping) is bypassed entirely; the write task is
             // handed a block we already verified, leaving only contextual validation.
-            let res = match &shadow {
+            let res = match &verdict {
                 Ok((_, _, cheap, new_outputs)) => {
                     let semantically_verified = crate::SemanticallyVerifiedBlock {
                         block: block_arc.clone(),
@@ -2806,33 +2790,19 @@ pub fn sync(
                 }
             };
 
-            match (&shadow, &res) {
+            match (&verdict, &res) {
                 (Ok((cheap, expensive, _, _)), Ok(_)) => {
-                    shadow_stats.agree_pass += 1;
-                    shadow_stats.cheap_total += *cheap;
-                    shadow_stats.expensive_total += *expensive;
+                    verify_stats.committed += 1;
+                    verify_stats.cheap_total += *cheap;
+                    verify_stats.expensive_total += *expensive;
                 }
-                (_, Err(BlockCommitError::Duplicate)) => {
-                    shadow_stats.duplicate += 1;
-                }
-                (Ok(_), Err(BlockCommitError::Other(why))) => {
-                    // Expected for contextual failures and the crosslink gate, neither of
-                    // which the sync path covers yet. Logged so the reasons stay visible.
-                    shadow_stats.sync_pass_commit_err += 1;
-                    tracing::info!("SyncVerifyShadow: sync passed but commit failed @ {height} {hash}: {why}");
-                }
-                (Err((phase, msg)), Ok(_)) => {
-                    // THE alarm: the sync path would have dropped a block the node accepted.
-                    shadow_stats.false_reject += 1;
-                    tracing::error!("SyncVerifyShadow: *** FALSE REJECT *** @ {height} {hash}: {phase} said {msg}, but the block COMMITTED");
-                }
-                (Err(_), Err(_)) => {
-                    shadow_stats.agree_reject += 1;
-                }
+                (Err(("crosslink", _)), _) => verify_stats.rejected_crosslink += 1,
+                (Err(_), _) => verify_stats.rejected_other += 1,
+                (Ok(_), Err(_)) => verify_stats.rejected_other += 1,
             }
 
             if let Some(reply) = submission_replies.remove(&hash) {
-                let outcome = match (&shadow, &res) {
+                let outcome = match (&verdict, &res) {
                     (_, Ok((committed, _))) => IngestOutcome::Committed(*committed),
                     (_, Err(BlockCommitError::Duplicate)) => IngestOutcome::Known {
                         location: crate::response::KnownBlockLocation::BestChain,
@@ -2884,16 +2854,15 @@ pub fn sync(
             }
         });
 
-        // @Temporary :SyncVerifyShadow -- periodic scoreboard.
-        if std::time::Instant::now() >= next_shadow_report {
-            let s = &shadow_stats;
-            let n = s.agree_pass.max(1);
+        if std::time::Instant::now() >= next_verify_report {
+            let s = &verify_stats;
+            let n = s.committed.max(1) as u32;
             tracing::info!(
-                "SyncVerifyShadow: agree_pass={} agree_reject={} false_reject={} sync_pass_commit_err={} dup={} | avg cheap {:?}, avg expensive {:?}",
-                s.agree_pass, s.agree_reject, s.false_reject, s.sync_pass_commit_err, s.duplicate,
-                s.cheap_total / n as u32, s.expensive_total / n as u32,
+                "NewNet verify: committed={} rejected_crosslink={} rejected_other={} | avg cheap {:?}, avg expensive {:?}",
+                s.committed, s.rejected_crosslink, s.rejected_other,
+                s.cheap_total / n, s.expensive_total / n,
             );
-            next_shadow_report = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            next_verify_report = std::time::Instant::now() + std::time::Duration::from_secs(10);
         }
 
         if blocks_to_commit.len() > 0 && !any_blocks_in_the_queue_can_make_progress {

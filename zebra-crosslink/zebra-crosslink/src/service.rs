@@ -88,11 +88,6 @@ pub(crate) type MempoolServiceProcedure = Arc<
 
 /// A pinned-in-memory, heap-allocated, reference-counted, thread-safe, asynchronous function
 /// pointer that takes an `Arc<Block>` as input and returns `()` as its output.
-pub(crate) type ForceFeedPoWBlockProcedure = Arc<
-    dyn Fn(Arc<zebra_chain::block::Block>) -> Pin<Box<dyn Future<Output = Result<(),String>> + Send>>
-        + Send
-        + Sync,
->;
 
 /// A pinned-in-memory, heap-allocated, reference-counted, thread-safe, asynchronous function
 /// pointer that takes an `Arc<Block>` as input and returns `()` as its output.
@@ -109,7 +104,6 @@ pub struct TFLServiceCalls {
     pub(crate) state: StateServiceProcedure,
     pub(crate) read_state: ReadStateServiceProcedure,
     pub(crate) mempool: MempoolServiceProcedure,
-    pub(crate) force_feed_pow: ForceFeedPoWBlockProcedure,
     pub(crate) force_feed_pos: ForceFeedPoSBlockProcedure,
 }
 impl fmt::Debug for TFLServiceCalls {
@@ -131,7 +125,6 @@ pub fn spawn_new_tfl_service(
     state_service_call: StateServiceProcedure,
     read_state_service_call: ReadStateServiceProcedure,
     mempool_service_call: MempoolServiceProcedure,
-    force_feed_pow_call: ForceFeedPoWBlockProcedure,
     config: crate::config::Config,
     closure_from_state_to_here_mutex: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>>,
 ) -> (TFLServiceHandle, JoinHandle<Result<(), String>>) {
@@ -220,7 +213,6 @@ pub fn spawn_new_tfl_service(
             state: state_service_call,
             read_state: read_state_service_call,
             mempool: mempool_service_call,
-            force_feed_pow: force_feed_pow_call,
             force_feed_pos,
         },
         config,
