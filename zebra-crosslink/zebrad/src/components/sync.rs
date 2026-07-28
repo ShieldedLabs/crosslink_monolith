@@ -1112,6 +1112,19 @@ where
                     .try_send((advertiser_addr, error.misbehavior_score()));
             }
 
+            // Same scoring, for blocks rejected by new_network's ingest rather than the
+            // verifier router. The score is carried through IngestOutcome, so a peer that
+            // serves an invalid block is penalised exactly as before.
+            Err(BlockDownloadVerifyError::IngestRejected {
+                misbehavior_score,
+                advertiser_addr: Some(advertiser_addr),
+                ..
+            }) if misbehavior_score != 0 => {
+                let _ = self
+                    .misbehavior_sender
+                    .try_send((advertiser_addr, misbehavior_score));
+            }
+
             Err(_) => {}
         };
 
@@ -1183,6 +1196,22 @@ where
             // Structural matches: downcasts
             BlockDownloadVerifyError::Invalid { error, .. } if error.is_duplicate_request() => {
                 debug!(error = ?e, "block was already verified, possibly from a previous sync run, continuing");
+                false
+            }
+
+            // A block new_network already had is benign -- redundant gossip, or a block this
+            // node downloaded twice. Never a reason to restart the sync.
+            BlockDownloadVerifyError::IngestRejected { duplicate: true, .. } => {
+                debug!(error = ?e, "block was already known to the state, continuing");
+                false
+            }
+
+            // Out-of-order submissions are answered with a drop rather than being held: the
+            // syncer re-requests, so this is routine rather than a sync failure.
+            BlockDownloadVerifyError::IngestRejected { reason, .. }
+                if reason.contains("dropped from the commit queue") =>
+            {
+                debug!(error = ?e, "block left the commit queue before its parent arrived, continuing");
                 false
             }
 

@@ -1165,9 +1165,10 @@ pub struct BlockSubmission {
     pub reply: tokio::sync::oneshot::Sender<IngestOutcome>,
 }
 
-/// Bounded: this is a low-rate control path (one block per mining solution), not the bulk
-/// sync path, so a small queue is plenty.
-const BLOCK_SUBMISSION_QUEUE_LEN: usize = 32;
+/// Bounded, but sized for bulk: the legacy syncer submits here too, and it runs with a
+/// download concurrency of 50 and a lookahead. Backpressure still applies -- submitters wait
+/// for a slot rather than being dropped -- this just stops the common case blocking.
+const BLOCK_SUBMISSION_QUEUE_LEN: usize = 256;
 
 static BLOCK_SUBMISSION_SENDER: std::sync::OnceLock<tokio::sync::mpsc::Sender<BlockSubmission>> =
     std::sync::OnceLock::new();
@@ -2863,6 +2864,25 @@ pub fn sync(
                 s.cheap_total / n, s.expensive_total / n,
             );
             next_verify_report = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        }
+
+        // Answer any submission whose block left the queue without being committed, so the
+        // submitter never waits out its timeout. Bulk sync submits blocks out of order, so
+        // this is routine, not exceptional.
+        if !submission_replies.is_empty() {
+            let stranded: Vec<Hash> = submission_replies
+                .keys()
+                .filter(|hash| !blocks_to_commit.iter().any(|(queued, _)| queued == *hash))
+                .cloned()
+                .collect();
+            for hash in stranded {
+                if let Some(reply) = submission_replies.remove(&hash) {
+                    let _ = reply.send(IngestOutcome::Failed {
+                        reason: "dropped from the commit queue before it could be committed".to_string(),
+                        misbehavior_score: 0,
+                    });
+                }
+            }
         }
 
         if blocks_to_commit.len() > 0 && !any_blocks_in_the_queue_can_make_progress {

@@ -351,11 +351,28 @@ where
                     .map_err(|e| (e.into(), None))?;
             }
 
-            verifier
-                .oneshot(zebra_consensus::Request::Commit(block))
-                .await
-                .map(|hash| (hash, block_height))
-                .map_err(|e| (e, advertiser_addr))
+            // Gossiped blocks enter through new_network's ingest queue, the same doorway the
+            // syncer and submit_block use, so there is one admission point and one set of
+            // verification rules.
+            let _ = verifier;
+            zebra_state::new_network::submit_block_to_new_network(
+                block,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .map_err(|reason| -> BoxError { reason.into() })
+            .and_then(|outcome| match outcome {
+                zebra_state::new_network::IngestOutcome::Committed(hash) => Ok(hash),
+                // Several peers announcing the same block is normal, not misbehaviour.
+                zebra_state::new_network::IngestOutcome::Known { .. } => {
+                    Err("gossiped block was already known to the state".into())
+                }
+                zebra_state::new_network::IngestOutcome::Failed { reason, .. } => {
+                    Err(reason.into())
+                }
+            })
+            .map(|hash| (hash, block_height))
+            .map_err(|e| (e, advertiser_addr))
         }
         .map_ok(|(hash, height)| {
             info!(?height, "downloaded and verified gossiped block");
