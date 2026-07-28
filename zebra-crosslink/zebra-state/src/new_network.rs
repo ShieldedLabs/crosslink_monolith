@@ -1259,22 +1259,6 @@ pub async fn submit_block_to_new_network(
     }
 }
 
-/// Verification timing, for the periodic report.
-///
-/// This replaces the A/B counters that ran until the sync path took over the commit decision.
-/// Those compared two independent verdicts; now that a sync rejection means no commit is
-/// attempted, there is no second opinion to compare against and the agreement counts became
-/// self-fulfilling. What is still worth watching is how long verification takes.
-#[derive(Default, Debug)]
-struct VerifyStats {
-    committed: u64,
-    deferral_checks: u64,
-    rejected_permanent: u64,
-    rejected_other: u64,
-    cheap_total: std::time::Duration,
-    expensive_total: std::time::Duration,
-}
-
 pub fn sync(
     config: &crate::config::Config,
     read_state: ReadState,
@@ -1450,8 +1434,6 @@ pub fn sync(
     let mut next_peer_request = std::time::Instant::now();
     let mut next_console_status_print = std::time::Instant::now();
 
-    let mut verify_stats = VerifyStats::default();
-    let mut next_verify_report = std::time::Instant::now();
 
     // Lite checkpoint: enforced at the commit-queue push, and stays armed forever.
     let checkpoint = Checkpoint::from_config(&config.network_checkpoint);
@@ -1555,7 +1537,6 @@ pub fn sync(
                         continue;
                     }
 
-                    tracing::info!("NewNet: accepted submitted block {hash} into the commit queue");
                     blocks_to_commit.push((hash, block));
                     submission_replies.insert(hash, reply);
                 }
@@ -2775,7 +2756,6 @@ pub fn sync(
                 // Matches SemanticBlockVerifier: PoW is skipped on networks that disable it.
                 let check_pow = !network.disable_pow();
 
-                let t0 = std::time::Instant::now();
                 // The agreed order: header (PoW gate) -> body (merkle binds the height) ->
                 // crosslink gate -> expensive. The crosslink gate MUST come after the body:
                 // it makes permanent, height-keyed decisions, and until the merkle root is
@@ -2785,8 +2765,6 @@ pub fn sync(
                 match cheap_result {
                     Err(err) => Err(("cheap", err.msg, false)),
                     Ok(cheap) => {
-                        let cheap_dur = t0.elapsed();
-
                         // Crosslink fat-pointer gate, mirroring the state service's version
                         // (:CrosslinkGate in service.rs). Three-way:
                         //   None        -> the parent's pointer or the referenced BFT block is
@@ -2833,10 +2811,9 @@ pub fn sync(
                             Some(false) => Err(("crosslink", "fat pointer regressed or is too early".to_string(), false)),
                             Some(true) => {
                                 let lookup = |outpoint: &zebra_chain::transparent::OutPoint| read_state.any_chain_utxo(outpoint);
-                                let t1 = std::time::Instant::now();
                                 match (verify_fns.verify_expensive)(&block_arc, &network, &cheap, &lookup) {
                                     Err(err) => Err(("expensive", err.msg, false)),
-                                    Ok(new_outputs) => Ok((cheap_dur, t1.elapsed(), cheap, new_outputs)),
+                                    Ok(new_outputs) => Ok((cheap, new_outputs)),
                                 }
                             }
                         }
@@ -2849,7 +2826,7 @@ pub fn sync(
             // orphan queue -> sent-hash bookkeeping) is bypassed entirely; the write task is
             // handed a block we already verified, leaving only contextual validation.
             let res = match &verdict {
-                Ok((_, _, cheap, new_outputs)) => {
+                Ok((cheap, new_outputs)) => {
                     let semantically_verified = crate::SemanticallyVerifiedBlock {
                         block: block_arc.clone(),
                         hash,
@@ -2870,26 +2847,8 @@ pub fn sync(
                             }
                         })
                 }
-                Err((phase, msg, deferrable)) => {
-                    if !deferrable {
-                        println!("Rejected by sync verification ({phase}) @ {height}, {hash}: {msg}");
-                    }
-                    Err(BlockCommitError::Other(format!("{phase}: {msg}")))
-                }
+                Err((phase, msg, _)) => Err(BlockCommitError::Other(format!("{phase}: {msg}"))),
             };
-
-            match (&verdict, &res) {
-                (Ok((cheap, expensive, _, _)), Ok(_)) => {
-                    verify_stats.committed += 1;
-                    verify_stats.cheap_total += *cheap;
-                    verify_stats.expensive_total += *expensive;
-                }
-                // Deferrals are not rejections: the block is still held and will be retried.
-                (Err((_, _, true)), _) => verify_stats.deferral_checks += 1,
-                (Err(("crosslink", _, false)), _) => verify_stats.rejected_permanent += 1,
-                (Err(_), _) => verify_stats.rejected_other += 1,
-                (Ok(_), Err(_)) => verify_stats.rejected_other += 1,
-            }
 
             if let Some(reply) = submission_replies.remove(&hash) {
                 let outcome = match (&verdict, &res) {
@@ -2949,36 +2908,6 @@ pub fn sync(
                 }
             }
         });
-
-        if std::time::Instant::now() >= next_verify_report {
-            let s = &verify_stats;
-            let n = s.committed.max(1) as u32;
-            tracing::info!(
-                "NewNet verify: committed={} held={} deferral_checks={} rejected_permanent={} rejected_other={} | avg cheap {:?}, avg expensive {:?}",
-                s.committed, blocks_to_commit.len(), s.deferral_checks, s.rejected_permanent, s.rejected_other,
-                s.cheap_total / n, s.expensive_total / n,
-            );
-            next_verify_report = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        }
-
-        // Answer any submission whose block left the queue without being committed, so the
-        // submitter never waits out its timeout. Bulk sync submits blocks out of order, so
-        // this is routine, not exceptional.
-        if !submission_replies.is_empty() {
-            let stranded: Vec<Hash> = submission_replies
-                .keys()
-                .filter(|hash| !blocks_to_commit.iter().any(|(queued, _)| queued == *hash))
-                .cloned()
-                .collect();
-            for hash in stranded {
-                if let Some(reply) = submission_replies.remove(&hash) {
-                    let _ = reply.send(IngestOutcome::Failed {
-                        reason: "dropped from the commit queue before it could be committed".to_string(),
-                        misbehavior_score: 0,
-                    });
-                }
-            }
-        }
 
         // Blocks at or below the finalized height can never commit, so holding them is pure
         // waste. This replaces a blanket clear() that used to throw away the whole cache --
