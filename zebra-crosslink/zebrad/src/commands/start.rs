@@ -408,9 +408,9 @@ impl StartCmd {
         let tfl_service = BoxService::new(tfl_handle);
         let tfl_service = ServiceBuilder::new().buffer(1).service(tfl_service);
 
-        #[cfg(feature = "new-net")]
+        // new_network is the block pipeline, not an option: every block entering this node
+        // goes through it, so there is nothing to gate.
         {
-            // let tfl_service2 = tfl_service.clone();
 
             let config = Arc::clone(&config);
             let sync_read_state = read_only_state_service.clone();
@@ -581,27 +581,44 @@ impl StartCmd {
                 .state_contains(config.network.network.genesis_hash())
                 .await?
             {
-                let genesis_hash = if is_regtest {
-                    block_verifier_router
-                        .clone()
-                        .oneshot(zebra_consensus::Request::Commit(regtest_genesis_block()))
-                        .await
-                        .expect("should validate Regtest genesis block")
+                // Genesis goes straight to the finalized state, skipping the verifier router.
+                //
+                // Its requirements differ from every other block: it has no parent to link to
+                // and cannot be reorged, so it is committed to the finalized state directly
+                // rather than entering a non-finalized chain. And the checkpoint verifier's only
+                // real job for it is confirming the hash matches the checkpoint list -- which is
+                // asserted here at the call site, and is true by construction for Regtest. Note
+                // the checkpoint path deliberately does not bind transaction authorizing data to
+                // the commitment hash (see CheckpointVerifiedBlock's docs), so this is not merely
+                // a cheaper version of semantic verification -- it is a different rule.
+                let genesis_block = if is_regtest {
+                    regtest_genesis_block()
                 } else if is_clt0 {
                     use zebra_chain::serialization::ZcashDeserialize;
                     let genesis_bytes = include_bytes!("../../../ClT0-genesis.pow");
-                    let genesis_block = Arc::new(zebra_chain::block::Block::zcash_deserialize(&genesis_bytes[..]).expect("hardcoded genesis must be valid"));
-
-                    assert_eq!(genesis_block.hash(), config.network.network.genesis_hash(),
-                    "config genesis hash doesn't match hash of baked genesis; consider editing your config");
-
-                    block_verifier_router
-                        .clone()
-                        .oneshot(zebra_consensus::Request::Commit(genesis_block))
-                        .await
-                        .expect("should validate baked-in genesis block")
+                    Arc::new(zebra_chain::block::Block::zcash_deserialize(&genesis_bytes[..]).expect("hardcoded genesis must be valid"))
                 } else {
                     panic!("unhandled special-case genesis");
+                };
+
+                assert_eq!(genesis_block.hash(), config.network.network.genesis_hash(),
+                    "genesis hash does not match the configured network genesis; consider editing your config");
+
+                let genesis_hash = {
+                    let mut state = state.clone();
+                    let rsp = state
+                        .ready()
+                        .await
+                        .expect("state service should be ready")
+                        .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
+                            zebra_state::CheckpointVerifiedBlock::from(genesis_block),
+                        ))
+                        .await
+                        .expect("should commit genesis block");
+                    match rsp {
+                        zebra_state::Response::Committed(hash) => hash,
+                        rsp => panic!("unexpected response to genesis commit: {rsp:?}"),
+                    }
                 };
 
                 assert_eq!(

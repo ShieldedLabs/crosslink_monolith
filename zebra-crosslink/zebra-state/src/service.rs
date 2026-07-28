@@ -54,7 +54,6 @@ use crate::{
         finalized_state::{FinalizedState, ZebraDb},
         non_finalized_state::{Chain, NonFinalizedState},
         pending_utxos::PendingUtxos,
-        queued_blocks::QueuedBlocks,
         watch_receiver::WatchReceiver,
     },
     BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, Config, ReadRequest,
@@ -83,7 +82,7 @@ mod tests;
 pub use finalized_state::{OutputLocation, TransactionIndex, TransactionLocation};
 use write::NonFinalizedWriteMessage;
 
-use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, SentHashes};
+use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified};
 
 /// A read-write service for Zebra's cached blockchain state.
 ///
@@ -116,13 +115,11 @@ pub(crate) struct StateService {
     /// This height should be lower than the last few checkpoints,
     /// so the full verifier can verify UTXO spends from those blocks,
     /// even if they haven't been committed to the finalized state yet.
-    full_verifier_utxo_lookahead: block::Height,
 
     // Queued Blocks
     //
     /// Queued blocks for the [`NonFinalizedState`] that arrived out of order.
     /// These blocks are awaiting their parent blocks before they can do contextual verification.
-    non_finalized_state_queued_blocks: QueuedBlocks,
 
     /// Queued blocks for the [`FinalizedState`] that arrived out of order.
     /// These blocks are awaiting their parent blocks before they can do contextual verification.
@@ -146,7 +143,6 @@ pub(crate) struct StateService {
 
     /// A set of block hashes that have been sent to the block write task.
     /// Hashes of blocks below the finalized tip height are periodically pruned.
-    non_finalized_block_write_sent_hashes: SentHashes,
 
     /// If an invalid block is sent on `finalized_block_write_sender`
     /// or `non_finalized_block_write_sender`,
@@ -249,9 +245,6 @@ impl Drop for StateService {
         self.clear_finalized_block_queue(
             "dropping the state: dropped unused finalized state queue block",
         );
-        self.clear_non_finalized_block_queue(CommitSemanticallyVerifiedError::from(
-            ValidateContextError::DroppedUnusedBlock,
-        ));
 
         // Log database metrics before shutting down
         info!("dropping the state: logging database metrics");
@@ -362,19 +355,15 @@ impl StateService {
                 .expect("fits in HeightDiff");
         let full_verifier_utxo_lookahead =
             full_verifier_utxo_lookahead.unwrap_or(block::Height::MIN);
-        let non_finalized_state_queued_blocks = QueuedBlocks::default();
         let pending_utxos = PendingUtxos::default();
 
         let finalized_block_write_last_sent_hash = finalized_state.db.finalized_tip_hash();
 
         let state = Self {
             network: network.clone(),
-            full_verifier_utxo_lookahead,
-            non_finalized_state_queued_blocks,
             finalized_state_queued_blocks: HashMap::new(),
             block_write_sender,
             finalized_block_write_last_sent_hash,
-            non_finalized_block_write_sent_hashes: SentHashes::default(),
             invalid_block_write_reset_receiver,
             pending_utxos,
             last_prune: Instant::now(),
@@ -439,13 +428,6 @@ impl StateService {
 
         let queued_prev_hash = checkpoint_verified.block.header.previous_block_hash;
         let queued_height = checkpoint_verified.height;
-
-        // If we're close to the final checkpoint, make the block's UTXOs available for
-        // semantic block verification, even when it is in the channel.
-        if self.is_close_to_final_checkpoint(queued_height) {
-            self.non_finalized_block_write_sent_hashes
-                .add_finalized(&checkpoint_verified)
-        }
 
         let (rsp_tx, rsp_rx) = oneshot::channel();
         let queued = (checkpoint_verified, rsp_tx);
@@ -579,13 +561,6 @@ impl StateService {
         std::mem::drop(finalized);
     }
 
-    /// Drops all non-finalized state queue blocks, and sends an error on their result channels.
-    fn clear_non_finalized_block_queue(&mut self, error: CommitSemanticallyVerifiedError) {
-        for (_hash, queued) in self.non_finalized_state_queued_blocks.drain() {
-            Self::send_semantically_verified_block_error(queued, error.clone());
-        }
-    }
-
     /// Send an error on a `QueuedSemanticallyVerified` block's result channel, and drop the block
     fn send_semantically_verified_block_error(
         queued: QueuedSemanticallyVerified,
@@ -599,161 +574,49 @@ impl StateService {
         std::mem::drop(finalized);
     }
 
-    /// Queue a semantically verified block for contextual verification and check if any queued
-    /// blocks are ready to be verified and committed to the state.
+    /// Send an already-verified block straight to the block write task.
     ///
-    /// This function encodes the logic for [committing non-finalized blocks][1]
-    /// in RFC0005.
-    ///
-    /// [1]: https://zebra.zfnd.org/dev/rfcs/0005-state-updates.html#committing-non-finalized-blocks
-    #[instrument(level = "debug", skip(self, semantically_verified))]
-    fn queue_and_commit_to_non_finalized_state(
+    /// Ends the checkpoint phase if it has not ended: that drop is what makes the write task
+    /// leave its finalized loop and start reading the non-finalized channel. It used to happen
+    /// as a side effect of the block queueing this replaces.
+    fn commit_verified_to_write_task(
         &mut self,
         semantically_verified: SemanticallyVerifiedBlock,
-    ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
-        tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
-        let block_height = semantically_verified.block.coinbase_height().unwrap_or(zebra_chain::block::Height(0));
-        let parent_hash = semantically_verified.block.header.previous_block_hash;
-        let parent_block_header = self.read_service.non_finalized_state_receiver.with_watch_data(
-            |non_finalized_state| {
-                let mut ret = None;
-                for chain in non_finalized_state.chain_iter() {
-                    if ret.is_none() {
-                        ret = chain.block(crate::HashOrHeight::Hash(parent_hash)).map(|b| b.block.header.clone());
-                    }
-                }
-                ret
-            },
-        );
-        let parent_block_header = if parent_block_header.is_some() { parent_block_header } else { self.read_service.db.block_header(crate::HashOrHeight::Hash(parent_hash)) };
-        let parent_block_fat_pointer = parent_block_header.map(|h| h.fat_pointer_to_bft_block.clone());
+    ) -> (
+        oneshot::Receiver<Result<Vec<crate::new_network::ShadowBlock>, CommitSemanticallyVerifiedError>>,
+        block::Hash,
+    ) {
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let hash = semantically_verified.hash;
 
-        let this_header_fat_pointer = semantically_verified.block.header.fat_pointer_to_bft_block.clone();
-        let semantically_verified_height = semantically_verified.height;
-
-        // BAD? Bug? sent_hashes is never cleaned up on failure, so this can
-        // permanently block re-commits. But removing it causes duplicate chains
-        // in non_finalized_state which crashes in chain.rs Ord impl.
-        if self
-            .non_finalized_block_write_sent_hashes
-            .contains(&semantically_verified.hash)
-        {
-            let (rsp_tx, rsp_rx) = oneshot::channel();
-            let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
-                ValidateContextError::DuplicateCommitRequest {
-                    block_hash: semantically_verified.hash,
-                },
-            )));
-            return rsp_rx;
-        }
-
-        if self
-            .read_service
-            .db
-            .contains_height(semantically_verified.height)
-        {
-            let (rsp_tx, rsp_rx) = oneshot::channel();
-            let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
-                ValidateContextError::AlreadyFinalized {
-                    block_height: semantically_verified.height,
-                },
-            )));
-            return rsp_rx;
-        }
-
-        // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
-        // has been queued but not yet committed to the state fails the older request and replaces
-        // it with the newer request.
-        let rsp_rx = if let Some((_, old_rsp_tx)) = self
-            .non_finalized_state_queued_blocks
-            .get_mut(&semantically_verified.hash)
-        {
-            tracing::debug!("replacing older queued request with new request");
-            let (mut rsp_tx, rsp_rx) = oneshot::channel();
-            std::mem::swap(old_rsp_tx, &mut rsp_tx);
-            let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
-                ValidateContextError::ReplacedByNewerRequest {
-                    block_hash: semantically_verified.hash,
-                },
-            )));
-            rsp_rx
-        } else {
-            let (rsp_tx, rsp_rx) = oneshot::channel();
-            self.non_finalized_state_queued_blocks
-                .queue((semantically_verified, rsp_tx));
-            rsp_rx
-        };
-
-        // We've finished sending checkpoint verified blocks when:
-        // - we've sent the verified block for the last checkpoint, and
-        // - it has been successfully written to disk.
-        //
-        // We detect the last checkpoint by looking for non-finalized blocks
-        // that are a child of the last block we sent.
-        //
-        // TODO: configure the state with the last checkpoint hash instead?
-        if self.block_write_sender.finalized.is_some()
-            && self
-                .non_finalized_state_queued_blocks
-                .has_queued_children(self.finalized_block_write_last_sent_hash)
-            && self.read_service.db.finalized_tip_hash()
-                == self.finalized_block_write_last_sent_hash
-        {
-            // CROSSLINK
-            if block_height != zebra_chain::block::Height(32265) && block_height != zebra_chain::block::Height(32266) && (parent_block_fat_pointer.is_none() || Some(true) != (self.closure_to_call_crosslink)(parent_block_fat_pointer.unwrap(), this_header_fat_pointer, block_height)) {
-                let (rsp_tx, rsp_rx) = oneshot::channel();
-                let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
-                    ValidateContextError::CrosslinkNotReady {
-                        block_height: semantically_verified_height,
-                    },
-                )));
-                return rsp_rx;
-            }
-
-            // Tell the block write task to stop committing checkpoint verified blocks to the finalized state,
-            // and move on to committing semantically verified blocks to the non-finalized state.
+        if self.block_write_sender.finalized.is_some() {
             std::mem::drop(self.block_write_sender.finalized.take());
-            // Remove any checkpoint-verified block hashes from `non_finalized_block_write_sent_hashes`.
-            self.non_finalized_block_write_sent_hashes = SentHashes::default();
-            // Mark `SentHashes` as usable by the `can_fork_chain_at()` method.
-            self.non_finalized_block_write_sent_hashes
-                .can_fork_chain_at_hashes = true;
-            // Send blocks from non-finalized queue
-            self.send_ready_non_finalized_queued(self.finalized_block_write_last_sent_hash);
-            // We've finished committing checkpoint verified blocks to finalized state, so drop any repeated queued blocks.
             self.clear_finalized_block_queue(
                 "already finished committing checkpoint verified blocks: dropped duplicate block, \
                  block is already committed to the state",
             );
-        } else if !self.can_fork_chain_at(&parent_hash) {
-            tracing::trace!("unready to verify, returning early");
-        } else if self.block_write_sender.finalized.is_none() {
-            // CROSSLINK
-            if block_height != zebra_chain::block::Height(32265) && block_height != zebra_chain::block::Height(32266) && (parent_block_fat_pointer.is_none() || Some(true) != (self.closure_to_call_crosslink)(parent_block_fat_pointer.unwrap(), this_header_fat_pointer, block_height)) {
-                let (rsp_tx, rsp_rx) = oneshot::channel();
-                let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
-                    ValidateContextError::CrosslinkNotReady {
-                        block_height: semantically_verified_height,
-                    },
-                )));
-                return rsp_rx;
-            }
-
-            // Wait until block commit task is ready to write non-finalized blocks before dequeuing them
-            self.send_ready_non_finalized_queued(parent_hash);
-
-            let finalized_tip_height = self.read_service.db.finalized_tip_height().expect(
-                "Finalized state must have at least one block before committing non-finalized state",
-            );
-
-            self.non_finalized_state_queued_blocks
-                .prune_by_height(finalized_tip_height);
-
-            self.non_finalized_block_write_sent_hashes
-                .prune_by_height(finalized_tip_height);
         }
 
-        rsp_rx
+        match &self.block_write_sender.non_finalized {
+            Some(sender) => {
+                if sender
+                    .send(crate::service::write::NonFinalizedWriteMessage::CommitReportingFinalized(
+                        semantically_verified,
+                        rsp_tx,
+                    ))
+                    .is_err()
+                {
+                    // the receiver is gone; the caller's rsp_rx will report the closed channel
+                }
+            }
+            None => {
+                let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
+                    ValidateContextError::CommitTaskExited,
+                )));
+            }
+        }
+
+        (rsp_rx, hash)
     }
 
     fn send_crosslink_finalized_to_non_finalized_state(
@@ -780,144 +643,6 @@ impl StateService {
         }
 
         rsp_rx
-    }
-
-    /// Returns `true` if `hash` is a valid previous block hash for new non-finalized blocks.
-    fn can_fork_chain_at(&self, hash: &block::Hash) -> bool {
-        self.non_finalized_block_write_sent_hashes
-            .can_fork_chain_at(hash)
-            || &self.read_service.db.finalized_tip_hash() == hash
-    }
-
-    /// Returns `true` if `queued_height` is near the final checkpoint.
-    ///
-    /// The semantic block verifier needs access to UTXOs from checkpoint verified blocks
-    /// near the final checkpoint, so that it can verify blocks that spend those UTXOs.
-    ///
-    /// If it doesn't have the required UTXOs, some blocks will time out,
-    /// but succeed after a syncer restart.
-    fn is_close_to_final_checkpoint(&self, queued_height: block::Height) -> bool {
-        queued_height >= self.full_verifier_utxo_lookahead
-    }
-
-    /// Sends all queued blocks whose parents have recently arrived starting from `new_parent`
-    /// in breadth-first ordering to the block write task which will attempt to validate and commit them
-    #[tracing::instrument(level = "debug", skip(self, new_parent))]
-    fn send_ready_non_finalized_queued(&mut self, new_parent: block::Hash) {
-        use tokio::sync::mpsc::error::SendError;
-        if let Some(non_finalized_block_write_sender) = &self.block_write_sender.non_finalized {
-            let mut new_parents: Vec<block::Hash> = vec![new_parent];
-
-            while let Some(parent_hash) = new_parents.pop() {
-                let queued_children = self
-                    .non_finalized_state_queued_blocks
-                    .dequeue_children(parent_hash);
-
-                for queued_child in queued_children {
-                    let (SemanticallyVerifiedBlock { hash, .. }, _) = queued_child;
-
-                    // CROSSLINK: commit-time fat-pointer gate (mirrors the intake check, incl. the
-                    // 32265 bypass). A block is committed only once its fat pointer is resolvable
-                    // and does not regress relative to its parent's (see
-                    // `call_from_state_to_crosslink_to_ask_about_fat_pointers`). If the parent's
-                    // pointer cannot be resolved yet — the parent is not committed to state (e.g. a
-                    // child flushed earlier this pass), or the referenced BFT block has not entered
-                    // this node — the block is *deferred*, not rejected: it is re-queued and
-                    // re-evaluated on a later flush, since it may become valid once those load.
-                    let child_fat_pointer = queued_child.0.block.header.fat_pointer_to_bft_block.clone();
-                    let child_parent_hash = queued_child.0.block.header.previous_block_hash;
-                    let parent_header = self.read_service.non_finalized_state_receiver.with_watch_data(
-                        |non_finalized_state| {
-                            let mut ret = None;
-                            for chain in non_finalized_state.chain_iter() {
-                                if ret.is_none() {
-                                    ret = chain.block(crate::HashOrHeight::Hash(child_parent_hash)).map(|b| b.block.header.clone());
-                                }
-                            }
-                            ret
-                        },
-                    );
-                    let parent_header = if parent_header.is_some() { parent_header } else { self.read_service.db.block_header(crate::HashOrHeight::Hash(child_parent_hash)) };
-                    let parent_fat_pointer = parent_header.map(|h| h.fat_pointer_to_bft_block.clone());
-
-                    let child_block_height = queued_child.0.height;
-                    let crosslink_result = if child_block_height == zebra_chain::block::Height(32265) || child_block_height == zebra_chain::block::Height(32266) {
-                        Some(true)
-                    } else if parent_fat_pointer.is_none() {
-                        None
-                    } else {
-                        (self.closure_to_call_crosslink)(parent_fat_pointer.unwrap(), child_fat_pointer, child_block_height)
-                    };
-
-                    match crosslink_result {
-                        None => {
-                            // Defer: re-queue without flushing or recursing; re-evaluated on a later flush.
-                            self.non_finalized_state_queued_blocks.queue(queued_child);
-                            continue;
-                        }
-                        Some(false) => {
-                            // Hard reject: the block is permanently invalid (do_not_include_until_bc_height violated).
-                            Self::send_semantically_verified_block_error(
-                                queued_child,
-                                CommitSemanticallyVerifiedError::from(
-                                    ValidateContextError::CrosslinkFatPointerTooEarly {
-                                        block_height: child_block_height,
-                                        do_not_include_until: 0,
-                                    },
-                                ),
-                            );
-                            continue;
-                        }
-                        Some(true) => {}
-                    }
-
-                    // At a hardfork's PoW activation height, defer until the slash index
-                    // has incorporated every finalized block. This only bounds how much
-                    // slash_window_burns replays at commit time — it is a perf guard, not
-                    // a correctness requirement (the replay falls back to the finalized db
-                    // for heights the index hasn't reached). The predicate must NOT wait
-                    // for the index to reach the activation height itself: the index only
-                    // scans finalized blocks, and finality trails the PoW tip by sigma, so
-                    // that would deadlock the chain at every activation.
-                    if let Some(rule) = self.hardfork_schedule.rule_active_at(child_block_height.0 as u64) {
-                        if rule.pow_activation_height == child_block_height.0 as u64 {
-                            let finalized_tip = self.read_service.db.finalized_tip_height();
-                            let index_next = self.read_service.db.slash_index_next_height();
-                            if finalized_tip.is_some_and(|tip| index_next.0 <= tip.0) {
-                                self.non_finalized_state_queued_blocks.queue(queued_child);
-                                continue;
-                            }
-                        }
-                    }
-
-                    self.non_finalized_block_write_sent_hashes
-                        .add(&queued_child.0);
-                    let send_result = non_finalized_block_write_sender.send(queued_child.into());
-
-                    if let Err(SendError(NonFinalizedWriteMessage::Commit(queued))) = send_result {
-                        // If Zebra is shutting down, drop blocks and return an error.
-                        Self::send_semantically_verified_block_error(
-                            queued,
-                            CommitSemanticallyVerifiedError::from(
-                                ValidateContextError::CommitTaskExited,
-                            ),
-                        );
-
-                        self.clear_non_finalized_block_queue(
-                            CommitSemanticallyVerifiedError::from(
-                                ValidateContextError::CommitTaskExited,
-                            ),
-                        );
-
-                        return;
-                    };
-
-                    new_parents.push(hash);
-                }
-            }
-
-            self.non_finalized_block_write_sent_hashes.finish_batch();
-        };
     }
 
     /// Return the tip of the current best chain.
@@ -1168,103 +893,15 @@ impl Service<Request> for StateService {
         let span = Span::current();
 
         match req {
-            // Uses non_finalized_state_queued_blocks and pending_utxos in the StateService
-            // Accesses shared writeable state in the StateService, NonFinalizedState, and ZebraDb.
-            Request::CommitSemanticallyVerifiedBlock(semantically_verified) => {
-                self.assert_block_can_be_validated(&semantically_verified);
-
-                self.pending_utxos
-                    .check_against_ordered(&semantically_verified.new_outputs);
-
-                // # Performance
-                //
-                // Allow other async tasks to make progress while blocks are being verified
-                // and written to disk. But wait for the blocks to finish committing,
-                // so that `StateService` multi-block queries always observe a consistent state.
-                //
-                // Since each block is spawned into its own task,
-                // there shouldn't be any other code running in the same task,
-                // so we don't need to worry about blocking it:
-                // https://docs.rs/tokio/latest/tokio/task/fn.block_in_place.html
-
-                let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| {
-                        self.queue_and_commit_to_non_finalized_state(semantically_verified)
-                    })
-                });
-
-                // TODO:
-                //   - check for panics in the block write task here,
-                //     as well as in poll_ready()
-
-                // The work is all done, the future just waits on a channel for the result
-                timer.finish(module_path!(), line!(), "CommitSemanticallyVerifiedBlock");
-
-                // Await the channel response, mapping any receive error into a BoxError.
-                // Then flatten the nested Result by converting the inner CommitSemanticallyVerifiedError into a BoxError.
-                let span = Span::current();
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_recv_error| {
-                            BoxError::from(CommitSemanticallyVerifiedError::from(
-                                ValidateContextError::NotReadyToBeCommitted,
-                            ))
-                        })
-                        // TODO: replace with Result::flatten once it stabilises
-                        // https://github.com/rust-lang/rust/issues/70142
-                        .and_then(|res| res.map_err(BoxError::from))
-                        .map(Response::Committed)
-                }
-                .instrument(span)
-                .boxed()
-            }
-
-            // new_network's path: the caller already did semantic verification, so skip the
-            // orphan queue, the sent-hash bookkeeping, and the crosslink gate (new_network runs
-            // that itself, before the expensive pass) and go straight to the write task.
-            Request::CommitVerifiedBlockDirect(semantically_verified) => {
-                let (rsp_tx, rsp_rx) = oneshot::channel();
-
-                // End the checkpoint phase if it has not ended. This drop is what makes the
-                // write task leave its finalized loop and start reading the non-finalized
-                // channel; it used to happen as a side effect of
-                // `queue_and_commit_to_non_finalized_state`, which this request bypasses.
-                if self.block_write_sender.finalized.is_some() {
-                    std::mem::drop(self.block_write_sender.finalized.take());
-                    self.non_finalized_block_write_sent_hashes = SentHashes::default();
-                    self.non_finalized_block_write_sent_hashes
-                        .can_fork_chain_at_hashes = true;
-                    self.clear_finalized_block_queue(
-                        "already finished committing checkpoint verified blocks: dropped duplicate block, \
-                         block is already committed to the state",
-                    );
-                }
-
-                let hash = semantically_verified.hash;
-
-                match &self.block_write_sender.non_finalized {
-                    Some(sender) => {
-                        if sender.send(crate::service::write::NonFinalizedWriteMessage::CommitReportingFinalized(semantically_verified, rsp_tx)).is_err() {
-                            let (tx, rx) = oneshot::channel();
-                            let _ = tx.send(Err(CommitSemanticallyVerifiedError::from(
-                                ValidateContextError::CommitTaskExited,
-                            )));
-                            return async move {
-                                rx.await
-                                    .map_err(|_| BoxError::from("commit task exited"))
-                                    .and_then(|res| res.map_err(BoxError::from))
-                                    .map(Response::Committed)
-                            }
-                            .boxed();
-                        }
-                    }
-                    None => {
-                        let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
-                            ValidateContextError::CommitTaskExited,
-                        )));
-                    }
-                }
+            // Both commit requests now take the same path: the caller has already verified the
+            // block, so all that is left is contextual validation and the write. The semantic
+            // verifier is no longer reachable -- nothing produces `Request::Commit` -- but the
+            // legacy request name still works if that ever changes.
+            Request::CommitSemanticallyVerifiedBlock(semantically_verified)
+            | Request::CommitVerifiedBlockDirect(semantically_verified) => {
+                let rsp_rx = self.commit_verified_to_write_task(semantically_verified);
+                let hash = rsp_rx.1;
+                let rsp_rx = rsp_rx.0;
 
                 timer.finish(module_path!(), line!(), "CommitVerifiedBlockDirect");
 
@@ -1344,11 +981,9 @@ impl Service<Request> for StateService {
                 // acquires the crosslink lock with `blocking_lock()`, which panics on a runtime
                 // thread unless we are inside `block_in_place`. (The intake path at
                 // `CommitSemanticallyVerifiedBlock` is wrapped for the same reason.)
-                tokio::task::block_in_place(|| {
-                    if let Some((_, tip_hash)) = self.best_tip() {
-                        self.send_ready_non_finalized_queued(tip_hash);
-                    }
-                });
+                // (Removed) This used to re-flush the state's deferred non-finalized queue so
+                // blocks whose fat pointers had become resolvable were re-evaluated. new_network
+                // owns that queue now and re-evaluates it every tick.
 
                 // TODO:
                 //   - check for panics in the block write task here,
@@ -1382,27 +1017,11 @@ impl Service<Request> for StateService {
 
                 let response_fut = response_fut.instrument(span).boxed();
 
-                // Check the non-finalized block queue outside the returned future,
-                // so we can access mutable state fields.
-                if let Some(utxo) = self.non_finalized_state_queued_blocks.utxo(&outpoint) {
-                    self.pending_utxos.respond(&outpoint, utxo);
-
-                    // We're finished, the returned future gets the UTXO from the respond() channel.
-                    timer.finish(module_path!(), line!(), "AwaitUtxo/queued-non-finalized");
-
-                    return response_fut;
-                }
-
-                // Check the sent non-finalized blocks
-                if let Some(utxo) = self.non_finalized_block_write_sent_hashes.utxo(&outpoint) {
-                    self.pending_utxos.respond(&outpoint, utxo);
-
-                    // We're finished, the returned future gets the UTXO from the respond() channel.
-                    timer.finish(module_path!(), line!(), "AwaitUtxo/sent-non-finalized");
-
-                    return response_fut;
-                }
-
+                // The two in-flight UTXO tiers are gone with the block queue. They existed for
+                // Zebra's concurrent download lookahead: a block could spend an output created by
+                // a block verified but not yet committed. new_network submits only blocks whose
+                // parent is already committed, and commits them one at a time, so a spent output
+                // is always either created within the same block or already in the state.
                 // We ignore any UTXOs in FinalizedState.finalized_state_queued_blocks,
                 // because it is only used during checkpoint verification.
                 //
