@@ -60,15 +60,26 @@ fn gossip_missing_current_round_fails_closed() {
 }
 
 #[test]
-fn historical_cache_lookup_is_checked_base_relative_and_exact() {
+fn historical_cache_metadata_lookup_is_checked_base_relative_and_exact() {
     let cache = vec![round(40, 7, -1), round(41, 3, -1)];
-    assert_eq!(cached_commit_round_at_height(&cache, 40).unwrap().height, 40);
-    assert_eq!(cached_commit_round_at_height(&cache, 41).unwrap().height, 41);
-    assert!(cached_commit_round_at_height(&cache, 0).is_none());
-    assert!(cached_commit_round_at_height(&cache, 39).is_none());
-    assert!(cached_commit_round_at_height(&cache, 42).is_none());
-    assert!(cached_commit_round_at_height(&cache, u64::MAX).is_none());
+    assert_eq!(commit_round_cache_entry_at_height(&cache, 40).unwrap().height, 40);
+    assert_eq!(commit_round_cache_entry_at_height(&cache, 41).unwrap().height, 41);
+    assert!(commit_round_cache_entry_at_height(&cache, 0).is_none());
+    assert!(commit_round_cache_entry_at_height(&cache, 39).is_none());
+    assert!(commit_round_cache_entry_at_height(&cache, 42).is_none());
+    assert!(commit_round_cache_entry_at_height(&cache, u64::MAX).is_none());
 
     let gapped = vec![round(40, 7, -1), round(42, 3, -1)];
-    assert!(cached_commit_round_at_height(&gapped, 41).is_none());
+    assert!(commit_round_cache_entry_at_height(&gapped, 41).is_none());
+
+    let mut relayable = round(50, 2, -1);
+    relayable.proposal = BlockValue(vec![5; 32]);
+    relayable.proposal_id = relayable.proposal.id_from_value(&HashKeys::default());
+    relayable.proposal_sigs = vec![TMSig([5; 64])];
+    relayable.proposal_sigs_n = 1;
+    let mut cache = vec![relayable];
+    assert!(cached_commit_round_at_height(&cache, 50).is_some());
+    compact_round_proposal_payload(&mut cache[0]);
+    assert!(commit_round_cache_entry_at_height(&cache, 50).is_some());
+    assert!(cached_commit_round_at_height(&cache, 50).is_none());
 }

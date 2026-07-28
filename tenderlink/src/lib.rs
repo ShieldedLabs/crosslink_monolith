@@ -501,12 +501,11 @@ fn verified_referenced_prevote_certificate(
     let referenced = &rounds_data[referenced_i];
     let current_active_len = active_roster_len(&current.roster);
     let referenced_active_len = active_roster_len(&referenced.roster);
+    // The referenced proposal body is deliberately allowed to be compacted.
+    // The current proposer binds the complete current body to `proposal_id`,
+    // while the verified referenced prevotes bind the same id to `valid_round`.
     if referenced.round > MAX_CONSENSUS_ROUND ||
-       referenced.proposal_is_faulty ||
-       !referenced.has_full_proposal() ||
        referenced.proposal_id != current.proposal_id ||
-       referenced.proposal_id != referenced.proposal.id_from_value(hash_keys) ||
-       referenced.proposal != current.proposal ||
        referenced.vote_namespace != *current_namespace ||
        current_active_len != referenced_active_len ||
        !rosters_match_exact(
@@ -597,11 +596,16 @@ fn round_indices_to_gossip(
     (selected, (cursor + 1) % historical.len())
 }
 
-fn cached_commit_round_at_height(cache: &[RoundData], height: u64) -> Option<&RoundData> {
+fn commit_round_cache_entry_at_height(cache: &[RoundData], height: u64) -> Option<&RoundData> {
     let base_height = cache.first()?.height;
     let relative: usize = height.checked_sub(base_height)?.try_into().ok()?;
     let round = cache.get(relative)?;
     (round.height == height).then_some(round)
+}
+
+fn cached_commit_round_at_height(cache: &[RoundData], height: u64) -> Option<&RoundData> {
+    commit_round_cache_entry_at_height(cache, height)
+        .filter(|round| round.has_full_proposal())
 }
 
 fn commit_round_for_relay<'a>(
@@ -655,6 +659,24 @@ fn validate_commit_round_cache(
     Ok(())
 }
 
+fn compact_round_proposal_payload(round: &mut RoundData) {
+    // Replacing the vectors drops their backing allocations. `clear()` alone
+    // would retain the capacity and preserve the stall-era heap footprint.
+    round.proposal = BlockValue(Vec::new());
+    round.proposal_sigs = Vec::new();
+    round.proposal_sigs_n = 0;
+    round.proposal_checked_validity = (TMStatus::Indeterminate, TMStatusReason::None);
+}
+
+fn compact_recent_commit_payloads(cache: &mut [RoundData]) {
+    let compact_before = cache
+        .len()
+        .saturating_sub(MAX_RECENT_COMMIT_PAYLOADS_IN_MEMORY);
+    for round in &mut cache[..compact_before] {
+        compact_round_proposal_payload(round);
+    }
+}
+
 fn append_recent_commit_round(cache: &mut Vec<RoundData>, round: RoundData) {
     cache.push(round);
     let overflow = cache
@@ -663,6 +685,7 @@ fn append_recent_commit_round(cache: &mut Vec<RoundData>, round: RoundData) {
     if overflow != 0 {
         cache.drain(..overflow);
     }
+    compact_recent_commit_payloads(cache);
 }
 
 /// Verify that reconstructed durable proposal context is the exact canonical
@@ -818,6 +841,7 @@ const ROSTER_MAX_N: usize = 100;
 const NORMAL_FUTURE_ROUND_WINDOW: u32 = 32;
 const RETAIN_PAST_ROUND_WINDOW: u32 = 64;
 pub const MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY: usize = 64;
+const MAX_RECENT_COMMIT_PAYLOADS_IN_MEMORY: usize = 1;
 const MAX_INFLIGHT_PROPOSAL_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PROPOSAL_CHUNKS_PER_ROUND_PER_TICK: usize = 2;
 const MAX_ROUTED_BFT_KEYS: usize = 256;
@@ -1068,14 +1092,31 @@ impl TMState {
                 && ((data.round >= floor && data.round <= ceiling)
                     || protected.contains(&data.round))
         });
+
+        // Old rounds retain ids, vote signatures, counts, rosters and timeout
+        // metadata, but not a gap-sized BftBlock body. Only the current,
+        // protocol-locked and protocol-valid rounds may keep proposal bytes.
+        let mut payload_protected = vec![self.round];
+        for round in [self.locked_value_round.1, self.valid_value_round.1] {
+            if let Ok(round) = u32::try_from(round) {
+                if !payload_protected.contains(&round) {
+                    payload_protected.push(round);
+                }
+            }
+        }
+        for data in &mut self.rounds_data {
+            if data.height == self.height
+                && data.round < self.round
+                && !payload_protected.contains(&data.round)
+            {
+                compact_round_proposal_payload(data);
+            }
+        }
     }
 
     fn clear_proposal_storage(data: &mut RoundData) {
-        data.proposal.0.clear();
+        compact_round_proposal_payload(data);
         data.proposal_valid_round = -1;
-        data.proposal_sigs.clear();
-        data.proposal_sigs_n = 0;
-        data.proposal_checked_validity = (TMStatus::Indeterminate, TMStatusReason::None);
         data.proposal_is_faulty = false;
     }
 
@@ -1324,6 +1365,7 @@ impl TMState {
             }
         }
         self.round = latest_round;
+        self.prune_rounds_for_current_height();
         let current_i = self.rounds_data.binary_search_by_key(&(self.height, latest_round), |value| (value.height, value.round))
             .map_err(|_| SignerError::Integrity("replayed current round is missing".into()))?;
         self.rounds_data[current_i].active_timeout = Some(Timeout::new(now, self.height, latest_round, self.step));
@@ -2778,6 +2820,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     bft_state.height = startup_height;
     bft_state.vote_namespace = initial_vote_namespace;
     bft_state.recent_commit_round_cache = ingest_startup_data;
+    compact_recent_commit_payloads(&mut bft_state.recent_commit_round_cache);
 
     // A crash can leave the certified commit intent ahead of the PoS store.
     // Recover from the exact proposal bytes and QC sealed in the signer WAL;
@@ -4630,6 +4673,19 @@ mod signer_wal_tests;
 mod tests {
     use super::*;
 
+    fn full_round(height: u64, byte: u8) -> RoundData {
+        let proposal = BlockValue(vec![byte; 32]);
+        RoundData {
+            height,
+            proposal_id: proposal.id_from_value(&HashKeys::default()),
+            proposal,
+            proposal_sigs: vec![TMSig([byte; 64])],
+            proposal_sigs_n: 1,
+            proposal_checked_validity: (TMStatus::Pass, TMStatusReason::None),
+            ..RoundData::EMPTY
+        }
+    }
+
     fn encoded_vote_packet(no_votes_n: u8, yes_votes_n: u8, round: u32, votes_n: usize) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(46 + votes_n * 66);
         bytes.push(no_votes_n);
@@ -4779,21 +4835,17 @@ mod tests {
         let total = MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY + 7;
         let mut cache = Vec::new();
         for height in 0..total {
-            append_recent_commit_round(
-                &mut cache,
-                RoundData {
-                    height: height as u64,
-                    ..RoundData::EMPTY
-                },
-            );
+            append_recent_commit_round(&mut cache, full_round(height as u64, height as u8));
         }
 
         assert_eq!(cache.len(), MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY);
         assert_eq!(cache.first().unwrap().height, 7);
         assert_eq!(cache.last().unwrap().height, (total - 1) as u64);
         validate_commit_round_cache(&cache, total as u64).unwrap();
+        assert_eq!(cache.iter().filter(|round| round.has_full_proposal()).count(), 1);
         assert!(cached_commit_round_at_height(&cache, 6).is_none());
-        assert_eq!(cached_commit_round_at_height(&cache, 7).unwrap().height, 7);
+        assert_eq!(commit_round_cache_entry_at_height(&cache, 7).unwrap().height, 7);
+        assert!(cached_commit_round_at_height(&cache, 7).is_none());
         assert_eq!(
             cached_commit_round_at_height(&cache, (total - 1) as u64)
                 .unwrap()
@@ -4804,27 +4856,33 @@ mod tests {
 
     #[test]
     fn historical_relay_source_covers_the_64_65_and_far_behind_boundaries() {
-        let first_64 = (0..MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY)
-            .map(|height| RoundData {
-                height: height as u64,
-                ..RoundData::EMPTY
-            })
+        let mut first_64 = (0..MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY)
+            .map(|height| full_round(height as u64, height as u8))
             .collect::<Vec<_>>();
+        compact_recent_commit_payloads(&mut first_64);
+        assert!(commit_round_for_relay(&first_64, None, 0).is_none());
+        let loaded_height_zero = full_round(0, 200);
         assert_eq!(
-            commit_round_for_relay(&first_64, None, 0).unwrap().height,
+            commit_round_for_relay(&first_64, Some(&loaded_height_zero), 0)
+                .unwrap()
+                .height,
             0
         );
+        assert_eq!(
+            commit_round_for_relay(
+                &first_64,
+                None,
+                (MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY - 1) as u64,
+            )
+            .unwrap()
+            .height,
+            (MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY - 1) as u64,
+        );
 
-        let after_65 = (1..=MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY)
-            .map(|height| RoundData {
-                height: height as u64,
-                ..RoundData::EMPTY
-            })
+        let mut after_65 = (1..=MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY)
+            .map(|height| full_round(height as u64, height as u8))
             .collect::<Vec<_>>();
-        let loaded_height_zero = RoundData {
-            height: 0,
-            ..RoundData::EMPTY
-        };
+        compact_recent_commit_payloads(&mut after_65);
         assert!(commit_round_for_relay(&after_65, None, 0).is_none());
         assert_eq!(
             commit_round_for_relay(&after_65, Some(&loaded_height_zero), 0)
@@ -4833,16 +4891,11 @@ mod tests {
             0
         );
 
-        let far_cache = (100..100 + MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY)
-            .map(|height| RoundData {
-                height: height as u64,
-                ..RoundData::EMPTY
-            })
+        let mut far_cache = (100..100 + MAX_RECENT_COMMIT_ROUNDS_IN_MEMORY)
+            .map(|height| full_round(height as u64, height as u8))
             .collect::<Vec<_>>();
-        let loaded_far_behind = RoundData {
-            height: 7,
-            ..RoundData::EMPTY
-        };
+        compact_recent_commit_payloads(&mut far_cache);
+        let loaded_far_behind = full_round(7, 201);
         assert_eq!(
             commit_round_for_relay(&far_cache, Some(&loaded_far_behind), 7)
                 .unwrap()
@@ -4850,5 +4903,116 @@ mod tests {
             7
         );
         assert!(commit_round_for_relay(&far_cache, Some(&loaded_far_behind), 8).is_none());
+    }
+
+    #[test]
+    fn stale_round_payload_compaction_preserves_identity_and_vote_evidence() {
+        let proposal_id = ValueId([7; 32]);
+        let vote = (proposal_id, TMSig([9; 64]));
+        let mut rounds = vec![
+            RoundData {
+                height: 4,
+                round: 3,
+                proposal: BlockValue(vec![1; 4096]),
+                proposal_valid_round: 1,
+                proposal_sigs: vec![TMSig([2; 64]); 4],
+                proposal_sigs_n: 4,
+                proposal_id,
+                proposal_checked_validity: (TMStatus::Pass, TMStatusReason::None),
+                msg_val_sigs: vec![[vote, vote]],
+                counts: ConsensusCounts {
+                    anys: 1,
+                    prevotes: 1,
+                    nil_prevotes: 0,
+                    yes_prevotes: 1,
+                    precommits: 1,
+                    yes_precommits: 1,
+                },
+                ..RoundData::EMPTY
+            },
+            full_round(4, 8),
+        ];
+        rounds[1].round = 4;
+
+        compact_round_proposal_payload(&mut rounds[0]);
+
+        assert!(rounds[0].proposal.0.is_empty());
+        assert!(rounds[0].proposal_sigs.is_empty());
+        assert_eq!(rounds[0].proposal_sigs_n, 0);
+        assert_eq!(rounds[0].proposal_id, proposal_id);
+        assert_eq!(rounds[0].proposal_valid_round, 1);
+        assert_eq!(rounds[0].msg_val_sigs, vec![[vote, vote]]);
+        assert_eq!(rounds[0].counts.yes_precommits, 1);
+        assert!(rounds[1].has_full_proposal());
+    }
+
+    #[test]
+    fn referenced_prevote_qc_survives_referenced_payload_compaction() {
+        let keys = (1u8..=4)
+            .map(|byte| SigningKey::from([byte; 32]))
+            .collect::<Vec<_>>();
+        let mut cumulative_stake = 0u64;
+        let roster = keys
+            .iter()
+            .map(|key| {
+                cumulative_stake += 1;
+                SortedRosterMember {
+                    pub_key: PubKeyID(key.verification_key().into()),
+                    stake: 1,
+                    cumulative_stake,
+                }
+            })
+            .collect::<Vec<_>>();
+        let namespace = [0u8; 32];
+        let proposal = BlockValue(vec![42; 128]);
+        let proposal_id = proposal.id_from_value(&HashKeys::default());
+        let mut referenced_votes = vec![[(ValueId::NIL, TMSig::NIL); 2]; roster.len()];
+        for (index, key) in keys.iter().take(3).enumerate() {
+            let signable = make_vote_sign_datas(
+                roster[index].pub_key,
+                false,
+                9,
+                1,
+                proposal_id,
+            )[1];
+            referenced_votes[index][0] =
+                (proposal_id, TMSig(sign_with_namespace(key, &signable, &namespace)));
+        }
+        let mut referenced = RoundData {
+            height: 9,
+            round: 1,
+            proposal: proposal.clone(),
+            proposal_id,
+            proposal_sigs: vec![TMSig([1; 64])],
+            proposal_sigs_n: 1,
+            msg_val_sigs: referenced_votes,
+            roster: roster.clone(),
+            vote_namespace: namespace,
+            ..RoundData::EMPTY
+        };
+        compact_round_proposal_payload(&mut referenced);
+        let current = RoundData {
+            height: 9,
+            round: 3,
+            proposal,
+            proposal_valid_round: 1,
+            proposal_id,
+            proposal_sigs: vec![TMSig([2; 64])],
+            proposal_sigs_n: 1,
+            roster,
+            vote_namespace: namespace,
+            ..RoundData::EMPTY
+        };
+        let rounds = vec![referenced, current];
+
+        assert_eq!(
+            verified_referenced_prevote_certificate(
+                &rounds,
+                1,
+                &namespace,
+                &HashKeys::default(),
+            ),
+            Some((1, 3, 3)),
+        );
     }
 }
