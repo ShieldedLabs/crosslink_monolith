@@ -1500,13 +1500,30 @@ pub fn sync(
         loop {
             match finalize_rx.try_recv() {
                 Ok(CrosslinkFinalizeRequest { hash, reply }) => {
-                    let result = block_writer
-                        .handle_crosslink_finalize(hash)
-                        .map_err(|err| format!("{err:?}"));
-                    if let Ok((_, _)) = &result {
-                        near_tip_chains.finalized_height = near_tip_chains
-                            .finalized_height
-                            .max(read_state.finalized_tip().map_or(0, |(h, _)| h.0));
+                    // Only finalize blocks our near-tip replica can see (or that are already
+                    // de-facto finalized in the DB). Finalizing a block outside the replica's
+                    // chains would push finalized_height past the best-chain tip and violate
+                    // the finalized_height <= tip_height invariant. Replying with an error
+                    // stalls the BFT decision (the caller retries forever) while PoW proceeds.
+                    let shadow = near_tip_chains
+                        .chains
+                        .iter()
+                        .find_map(|chain| chain.blocks.iter().find(|b| b.this_hash == hash).copied());
+
+                    let result = if shadow.is_some() || block_writer.finalized_state.db.contains_hash(hash) {
+                        block_writer
+                            .handle_crosslink_finalize(hash)
+                            .map_err(|err| format!("{err:?}"))
+                    } else {
+                        Err(format!(
+                            "BFT finalized {hash}, which is neither in the near-tip chains nor de-facto finalized; stalling finalization"
+                        ))
+                    };
+
+                    if result.is_ok() {
+                        if let Some(shadow) = &shadow {
+                            near_tip_chains.remove_chains_invalidated_by_finalized(shadow);
+                        }
                     }
                     let _ = reply.send(result);
                 }
