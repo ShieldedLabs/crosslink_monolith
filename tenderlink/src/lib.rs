@@ -90,7 +90,7 @@ use snow::resolvers::CryptoResolver;
 use tokio::time::Instant;
 use zcash_primitives::bft::{ HashKey, HashKeys, FatPointerToBftBlock, TMSig, PubKeyID, FatPointerSignature, BftBlockAndFatPointerToIt, BftBlock };
 
-const TICK_DURATION:         std::time::Duration = std::time::Duration::from_millis(1000);
+const TICK_DURATION:         std::time::Duration = std::time::Duration::from_millis(500);
 const PEER_GOSSIP_DURATION:  std::time::Duration = std::time::Duration::from_millis(1500);
 const PEER_CONNECT_DURATION: std::time::Duration = std::time::Duration::from_millis(5000);
 

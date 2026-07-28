@@ -754,7 +754,7 @@ const TRACE     :bool=0!=       0;
 //        any kind of consistent or clean timing in order to function properly.
 
 const STATUS_MS: u64 = 8000;  // fastest interval at which to send status messages
-const BLOCK_SEND_MS: u64 = 1000; // fastest interval at which to send blocks to peers
+const BLOCK_SEND_MS: u64 = 500; // fastest interval at which to send blocks to peers
 
 
 const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 2;
@@ -764,7 +764,7 @@ const PEER_REQUEST_MS: u64 = 300;
 const PEER_RESPOND_MS: u64 = 300;
 
 
-const IDLE_MS: u64 = 300;
+const IDLE_MS: u64 = 100;
 
 const MAX_BANDWIDTH_BYTES_PER_MS: usize = 7_000; // 7 MB/s
 const MAX_BANDWIDTH_BYTES_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_MS * PEER_RESPOND_MS as usize;
@@ -856,7 +856,26 @@ pub enum PeerOrigin {
     Selected,               // chosen from our address map diversely; less likely to be Sybil. AKA: outbound connection.
 }
 
-const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 10; // DO NOT MAKE LARGE, subject to N^2!!!
+/// How many queued block hashes we advertise in a STATUS packet.
+///
+/// @Volatile: this is WIRE FORMAT. It sizes the status buffer and peers reject a status that
+/// claims more than this. Changing it is a protocol change, not a tuning knob -- which is why
+/// the local cache below is a separate limit.
+const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 10;
+
+/// How many blocks to hold locally while they wait for something.
+///
+/// Two things make a block wait, and neither means it is invalid:
+///   - its parent has not been committed yet (arrived out of order), or
+///   - the crosslink gate cannot resolve its BFT pointer yet.
+///
+/// Both resolve on their own as the chain advances. Without this cache we drop the block and
+/// re-download it, which on a fresh sync cost ~2 redundant downloads per commit. Holding it
+/// costs memory and nothing else.
+///
+/// Every block still gets a commit attempt in the tick it arrives -- the cache is only where
+/// it lands after that attempt defers.
+const MAX_DEFERRED_BLOCKS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeightAndHashOr0 {
@@ -1249,7 +1268,8 @@ pub async fn submit_block_to_new_network(
 #[derive(Default, Debug)]
 struct VerifyStats {
     committed: u64,
-    rejected_crosslink: u64,
+    deferral_checks: u64,
+    rejected_permanent: u64,
     rejected_other: u64,
     cheap_total: std::time::Duration,
     expensive_total: std::time::Duration,
@@ -1791,13 +1811,12 @@ pub fn sync(
         assert!(near_tip_chains.tip_height().is_some());
         if std::time::Instant::now() >= next_status {
 
-            assert!(blocks_to_commit.len() < MAX_BLOCKS_TO_QUEUE_TO_COMMIT);
             let queue_len = blocks_to_commit.len().min(MAX_BLOCKS_TO_QUEUE_TO_COMMIT) as u8;
 
             let (mut buf, mut o) = ([0u8; 1 + 1 + MAX_BLOCKS_TO_QUEUE_TO_COMMIT * 32 + PACKET_STATUS_MAX_SIZE], 0);
             o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
             o += queue_len         .write_to(&mut buf[o..]);
-            for (queued_hash, _) in &blocks_to_commit {
+            for (queued_hash, _) in blocks_to_commit.iter().take(queue_len as usize) {
                 o += queued_hash.0.write_to(&mut buf[o..]);
             }
             o += near_tip_chains   .write_to(&mut buf[o..], None);
@@ -1875,7 +1894,7 @@ pub fn sync(
                         let (mut buf, mut o) = ([0u8; 1 + 1 + MAX_BLOCKS_TO_QUEUE_TO_COMMIT * 32 + PACKET_STATUS_MAX_SIZE], 0);
                         o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
                         o += queue_len         .write_to(&mut buf[o..]);
-                        for (queued_hash, _) in &blocks_to_commit {
+                        for (queued_hash, _) in blocks_to_commit.iter().take(queue_len as usize) {
                             o += queued_hash.0 .write_to(&mut buf[o..]);
                         }
                         o += historical_chains .write_to(&mut buf[o..], Some(near_tip_chains.tip_height().expect("at least genesis block assumed included in near tip chains"))); // @TODO: this will break if we remove genesis...
@@ -2681,33 +2700,13 @@ pub fn sync(
                 // @Todo(Phil): Semantic verification.
 
                 // @Note: Evict a sidechain tail to make room. Prefer non-committable tails.
-                if blocks_to_commit.len() >= MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
-
-                    // @Lazy. N squared. Not cool.
-                    let is_tail = |i: usize| {
-                        let (h, _) = &blocks_to_commit[i];
-                        !blocks_to_commit.iter().any(|(_, b)| b.header.previous_block_hash == *h)
-                    };
-
-                    // Prefer a non-committable tail (parent not in chains).
-                    // Never evict the incoming block's parent — that would orphan the block we're about to push.
-                    let evict_idx = (0..blocks_to_commit.len()).find(|&i| {
-                        blocks_to_commit[i].0 != parent_hash
-                        && is_tail(i) && !is_parent_in_chains(&read_state, &near_tip_chains, blocks_to_commit[i].1.header.previous_block_hash)
-                    }).or_else(|| if have_parent_in_chains {
-                        // All tails are committable; only evict if new block is also committable.
-                        (0..blocks_to_commit.len()).filter(|&i| blocks_to_commit[i].0 != parent_hash && is_tail(i)).last()
-                    } else {
-                        None
-                    });
-
-                    if let Some(idx) = evict_idx {
-                        warning!("Evicting block from commit queue to make room");
-                        blocks_to_commit.swap_remove(idx);
-                    } else {
-                        warning!("Commit queue full of committable blocks; dropping non-committable block");
-                        continue 'process_packets;
-                    }
+                // Make room if the cache is full. Oldest first: the queue is roughly in arrival
+                // order, and a block that has waited longest is the most likely to be waiting on
+                // something that is not coming. Anything evicted gets re-downloaded if a peer
+                // still advertises it, so this is a cost, not a correctness issue.
+                if blocks_to_commit.len() >= MAX_DEFERRED_BLOCKS {
+                    let evicted = blocks_to_commit.remove(0);
+                    warning!("Block cache full ({MAX_DEFERRED_BLOCKS}); evicting oldest: {}", evicted.0);
                 }
 
                 println!("Queueing for commit: {}", hash);
@@ -2784,7 +2783,7 @@ pub fn sync(
                 let cheap_result = (verify_fns.check_header)(&block_arc.header, &network, block::Height(height), chrono::Utc::now(), check_pow)
                     .and_then(|()| (verify_fns.check_body)(&block_arc, &network));
                 match cheap_result {
-                    Err(err) => Err(("cheap", err.msg)),
+                    Err(err) => Err(("cheap", err.msg, false)),
                     Ok(cheap) => {
                         let cheap_dur = t0.elapsed();
 
@@ -2827,13 +2826,16 @@ pub fn sync(
                         // by construction. Accepting the redundant traffic until then: it costs
                         // apparent sync speed but keeps this path simple.
                         match gate {
-                            None => Err(("crosslink", "fat pointer not resolvable yet".to_string())),
-                            Some(false) => Err(("crosslink", "fat pointer regressed or is too early".to_string())),
+                            // Reversible: the BFT block has not arrived. Hold the block and
+                            // re-check next tick rather than dropping and re-downloading it.
+                            None => Err(("crosslink", "fat pointer not resolvable yet".to_string(), true)),
+                            // Permanent, per the gate's own documentation. Drop it.
+                            Some(false) => Err(("crosslink", "fat pointer regressed or is too early".to_string(), false)),
                             Some(true) => {
                                 let lookup = |outpoint: &zebra_chain::transparent::OutPoint| read_state.any_chain_utxo(outpoint);
                                 let t1 = std::time::Instant::now();
                                 match (verify_fns.verify_expensive)(&block_arc, &network, &cheap, &lookup) {
-                                    Err(err) => Err(("expensive", err.msg)),
+                                    Err(err) => Err(("expensive", err.msg, false)),
                                     Ok(new_outputs) => Ok((cheap_dur, t1.elapsed(), cheap, new_outputs)),
                                 }
                             }
@@ -2868,8 +2870,10 @@ pub fn sync(
                             }
                         })
                 }
-                Err((phase, msg)) => {
-                    println!("Rejected by sync verification ({phase}) @ {height}, {hash}: {msg}");
+                Err((phase, msg, deferrable)) => {
+                    if !deferrable {
+                        println!("Rejected by sync verification ({phase}) @ {height}, {hash}: {msg}");
+                    }
                     Err(BlockCommitError::Other(format!("{phase}: {msg}")))
                 }
             };
@@ -2880,7 +2884,9 @@ pub fn sync(
                     verify_stats.cheap_total += *cheap;
                     verify_stats.expensive_total += *expensive;
                 }
-                (Err(("crosslink", _)), _) => verify_stats.rejected_crosslink += 1,
+                // Deferrals are not rejections: the block is still held and will be retried.
+                (Err((_, _, true)), _) => verify_stats.deferral_checks += 1,
+                (Err(("crosslink", _, false)), _) => verify_stats.rejected_permanent += 1,
                 (Err(_), _) => verify_stats.rejected_other += 1,
                 (Ok(_), Err(_)) => verify_stats.rejected_other += 1,
             }
@@ -2892,7 +2898,7 @@ pub fn sync(
                         location: crate::response::KnownBlockLocation::BestChain,
                         height: block::Height(height),
                     },
-                    (Err((phase, msg)), _) => IngestOutcome::Failed {
+                    (Err((phase, msg, _)), _) => IngestOutcome::Failed {
                         reason: format!("{phase}: {msg}"),
                         misbehavior_score: 0,
                     },
@@ -2902,6 +2908,12 @@ pub fn sync(
                     },
                 };
                 let _ = reply.send(outcome);
+            }
+
+            // A deferrable verdict means "not yet", not "no": keep the block so the next tick
+            // can retry it, instead of dropping it and paying for another download.
+            if let Err((_, _, true)) = &verdict {
+                return true; // keep
             }
 
             match res {
@@ -2942,8 +2954,8 @@ pub fn sync(
             let s = &verify_stats;
             let n = s.committed.max(1) as u32;
             tracing::info!(
-                "NewNet verify: committed={} rejected_crosslink={} rejected_other={} | avg cheap {:?}, avg expensive {:?}",
-                s.committed, s.rejected_crosslink, s.rejected_other,
+                "NewNet verify: committed={} held={} deferral_checks={} rejected_permanent={} rejected_other={} | avg cheap {:?}, avg expensive {:?}",
+                s.committed, blocks_to_commit.len(), s.deferral_checks, s.rejected_permanent, s.rejected_other,
                 s.cheap_total / n, s.expensive_total / n,
             );
             next_verify_report = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2968,10 +2980,26 @@ pub fn sync(
             }
         }
 
-        if blocks_to_commit.len() > 0 && !any_blocks_in_the_queue_can_make_progress {
-            // dbg_panic!("No blocks made progress in the queue this tick!? This should never hit! Currently we are only queueing blocks that can make progress!"); // @Temporary.
-            blocks_to_commit.clear();
+        // Blocks at or below the finalized height can never commit, so holding them is pure
+        // waste. This replaces a blanket clear() that used to throw away the whole cache --
+        // including blocks that were merely waiting for their parent -- whenever no block
+        // happened to make progress in a tick.
+        let finalized_height = near_tip_chains.finalized_height;
+        blocks_to_commit.retain(|(hash, block)| {
+            let height = block.coinbase_height().map_or(0, |h| h.0);
+            if height <= finalized_height {
+                if TRACE { tracing::info!("Dropping cached block @ {height} {hash}: at or below finalized {finalized_height}"); }
+                return false;
+            }
+            true
+        });
+
+        // Bound the cache. Oldest first; see MAX_DEFERRED_BLOCKS.
+        while blocks_to_commit.len() > MAX_DEFERRED_BLOCKS {
+            let evicted = blocks_to_commit.remove(0);
+            if TRACE { tracing::info!("Block cache full; evicting oldest: {}", evicted.0); }
         }
+        let _ = any_blocks_in_the_queue_can_make_progress;
 
         // Sleep remainder of tick
         let elapsed = loop_start.elapsed();
