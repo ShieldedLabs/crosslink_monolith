@@ -250,7 +250,7 @@ impl StartCmd {
         // config.crosslink.hardforks is already canonical and merged (see ZebradConfig::load)
         state_config.hardfork_schedule = Arc::new(HardForkSchedule::from_canonical(config.crosslink.hardforks.clone()));
 
-        let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
+        let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change, block_writer) =
             zebra_state::spawn_init(
                 state_config,
                 &config.network.network,
@@ -414,7 +414,21 @@ impl StartCmd {
 
             let config = Arc::clone(&config);
             let sync_read_state = read_only_state_service.clone();
-            let sync_state_for_commit = state.clone();
+
+            // new_network owns the block writer, so it is the only thing that can commit
+            // genesis. It does so before waiting for a tip -- otherwise it would wait forever
+            // for a block only it can write.
+            let genesis_block_for_new_network: Arc<zebra_chain::block::Block> = if is_regtest {
+                regtest_genesis_block()
+            } else if is_clt0 {
+                use zebra_chain::serialization::ZcashDeserialize;
+                let genesis_bytes = include_bytes!("../../../ClT0-genesis.pow");
+                Arc::new(zebra_chain::block::Block::zcash_deserialize(&genesis_bytes[..]).expect("hardcoded genesis must be valid"))
+            } else {
+                panic!("unhandled special-case genesis");
+            };
+            assert_eq!(genesis_block_for_new_network.hash(), config.network.network.genesis_hash(),
+                "genesis hash does not match the configured network genesis; consider editing your config");
             let sync_block_verifier = block_verifier_router.clone();
             tokio::task::spawn_blocking(move || {
                 use zebra_state::new_network::BlockCommitError;
@@ -439,29 +453,7 @@ impl StartCmd {
                             None
                         }
                     });
-                // Direct commit: new_network has already verified the block, so this skips the
-                // verifier router and the state's orphan queue and goes straight to the writer.
-                let mut direct_state = sync_state_for_commit.clone();
-                let commit_verified = move |semantically_verified: zebra_state::SemanticallyVerifiedBlock| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(zebra_chain::block::Hash, Vec<zebra_state::new_network::ShadowBlock>), BlockCommitError>> + Send>> {
-                    let mut state = direct_state.clone();
-                    Box::pin(async move {
-                        use tower::ServiceExt;
-                        let ready = state.ready().await.map_err(|e| BlockCommitError::Other(format!("{e:?}")))?;
-                        match ready.call(zebra_state::Request::CommitVerifiedBlockDirect(semantically_verified)).await {
-                            Ok(zebra_state::Response::CommittedDirect(hash, trad_finalized)) => Ok((hash, trad_finalized)),
-                            Ok(rsp) => Err(BlockCommitError::Other(format!("unexpected response: {rsp:?}"))),
-                            Err(e) => {
-                                let msg = format!("{e:?}");
-                                if msg.contains("DuplicateCommitRequest") || msg.contains("AlreadyFinalized") || msg.contains("already") {
-                                    Err(BlockCommitError::Duplicate)
-                                } else {
-                                    Err(BlockCommitError::Other(msg))
-                                }
-                            }
-                        }
-                    })
-                };
-                zebra_state::new_network::sync(&config.state, sync_read_state, /* tfl_service2, */ tokio::runtime::Handle::current(), verify_fns, crosslink_gate, commit_verified)
+                zebra_state::new_network::sync(&config.state, sync_read_state, /* tfl_service2, */ tokio::runtime::Handle::current(), verify_fns, crosslink_gate, block_writer, genesis_block_for_new_network)
             });
         }
 
@@ -577,57 +569,8 @@ impl StartCmd {
 
         info!("spawning syncer task");
         let syncer_task_handle = if is_regtest || is_clt0 {
-            if !syncer
-                .state_contains(config.network.network.genesis_hash())
-                .await?
-            {
-                // Genesis goes straight to the finalized state, skipping the verifier router.
-                //
-                // Its requirements differ from every other block: it has no parent to link to
-                // and cannot be reorged, so it is committed to the finalized state directly
-                // rather than entering a non-finalized chain. And the checkpoint verifier's only
-                // real job for it is confirming the hash matches the checkpoint list -- which is
-                // asserted here at the call site, and is true by construction for Regtest. Note
-                // the checkpoint path deliberately does not bind transaction authorizing data to
-                // the commitment hash (see CheckpointVerifiedBlock's docs), so this is not merely
-                // a cheaper version of semantic verification -- it is a different rule.
-                let genesis_block = if is_regtest {
-                    regtest_genesis_block()
-                } else if is_clt0 {
-                    use zebra_chain::serialization::ZcashDeserialize;
-                    let genesis_bytes = include_bytes!("../../../ClT0-genesis.pow");
-                    Arc::new(zebra_chain::block::Block::zcash_deserialize(&genesis_bytes[..]).expect("hardcoded genesis must be valid"))
-                } else {
-                    panic!("unhandled special-case genesis");
-                };
-
-                assert_eq!(genesis_block.hash(), config.network.network.genesis_hash(),
-                    "genesis hash does not match the configured network genesis; consider editing your config");
-
-                let genesis_hash = {
-                    let mut state = state.clone();
-                    let rsp = state
-                        .ready()
-                        .await
-                        .expect("state service should be ready")
-                        .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
-                            zebra_state::CheckpointVerifiedBlock::from(genesis_block),
-                        ))
-                        .await
-                        .expect("should commit genesis block");
-                    match rsp {
-                        zebra_state::Response::Committed(hash) => hash,
-                        rsp => panic!("unexpected response to genesis commit: {rsp:?}"),
-                    }
-                };
-
-                assert_eq!(
-                    genesis_hash,
-                    config.network.network.genesis_hash(),
-                    "validated block hash should match network genesis hash"
-                )
-            }
-
+            // Genesis is committed by new_network at startup: it owns the block writer, so no
+            // one else can. See the genesis handling in `new_network::sync`.
             tokio::spawn(std::future::pending().in_current_span())
         } else {
             tokio::spawn(syncer.sync().in_current_span())

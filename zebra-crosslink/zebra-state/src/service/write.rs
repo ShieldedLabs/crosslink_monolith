@@ -120,12 +120,9 @@ fn update_latest_chain_channels(
 /// `pub(crate)` so `new_network` can drive it directly rather than through the message
 /// channel. The two `handle_*` methods below are the whole of what the run loop does per
 /// message, so calling them is equivalent to sending the corresponding message.
-pub(crate) struct WriteBlockWorkerTask {
-    finalized_block_write_receiver: UnboundedReceiver<QueuedCheckpointVerified>,
-    non_finalized_block_write_receiver: UnboundedReceiver<NonFinalizedWriteMessage>,
+pub struct WriteBlockWorkerTask {
     pub(crate) finalized_state: FinalizedState,
     pub(crate) non_finalized_state: NonFinalizedState,
-    invalid_block_reset_sender: UnboundedSender<block::Hash>,
     chain_tip_sender: ChainTipSender,
     non_finalized_state_sender: watch::Sender<NonFinalizedState>,
 
@@ -189,53 +186,26 @@ impl BlockWriteSender {
             network = %non_finalized_state.network
         )
     )]
-    pub fn spawn(
+    /// Build the block writer.
+    ///
+    /// No thread and no channels: the caller (new_network) owns this and calls the handlers
+    /// directly. That makes every mutation of the chain state happen on one thread, in a known
+    /// order, with the result available synchronously.
+    pub fn new(
         finalized_state: FinalizedState,
         non_finalized_state: NonFinalizedState,
         chain_tip_sender: ChainTipSender,
         non_finalized_state_sender: watch::Sender<NonFinalizedState>,
-    ) -> (
-        Self,
-        tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
-        Option<Arc<std::thread::JoinHandle<()>>>,
-    ) {
-        // Security: The number of blocks in these channels is limited by
-        //           the syncer and inbound lookahead limits.
-        let (non_finalized_block_write_sender, non_finalized_block_write_receiver) =
-            tokio::sync::mpsc::unbounded_channel();
-        let (finalized_block_write_sender, finalized_block_write_receiver) =
-            tokio::sync::mpsc::unbounded_channel();
-        let (invalid_block_reset_sender, invalid_block_write_reset_receiver) =
-            tokio::sync::mpsc::unbounded_channel();
-
-        let span = Span::current();
-        
-        let task = std::thread::spawn(move || {
-            span.in_scope(|| {
-                WriteBlockWorkerTask {
-                    finalized_block_write_receiver,
-                    non_finalized_block_write_receiver,
-                    finalized_state,
-                    non_finalized_state,
-                    invalid_block_reset_sender,
-                    chain_tip_sender,
-                    non_finalized_state_sender,
-                    last_zebra_mined_log_height: None,
-                    prev_finalized_note_commitment_trees: None,
-                    parent_error_map: IndexMap::new(),
-                }
-                .run()
-            })
-        });
-
-        (
-            Self {
-                non_finalized: Some(non_finalized_block_write_sender),
-                finalized: Some(finalized_block_write_sender),
-            },
-            invalid_block_write_reset_receiver,
-            Some(Arc::new(task)),
-        )
+    ) -> WriteBlockWorkerTask {
+        WriteBlockWorkerTask {
+            finalized_state,
+            non_finalized_state,
+            chain_tip_sender,
+            non_finalized_state_sender,
+            last_zebra_mined_log_height: None,
+            prev_finalized_note_commitment_trees: None,
+            parent_error_map: IndexMap::new(),
+        }
     }
 }
 
@@ -250,131 +220,57 @@ impl WriteBlockWorkerTask {
             network = %self.non_finalized_state.network
         )
     )]
-    pub fn run(mut self) {
-        // Scoped: the destructured borrow must end before the dispatch loop below, which needs
-        // `&mut self` whole in order to call the handler methods.
-        {
-        let Self {
-            finalized_block_write_receiver,
-            finalized_state,
-            invalid_block_reset_sender,
-            chain_tip_sender,
-            last_zebra_mined_log_height,
-            prev_finalized_note_commitment_trees,
-            ..
-        } = &mut self;
+    /// Commit the genesis block directly to the finalized state.
+    ///
+    /// Genesis is the one block with no parent and no possibility of reorg, so it goes to the
+    /// finalized state rather than entering a non-finalized chain. Its hash is checked against
+    /// the configured network genesis by the caller, which is the whole of what the checkpoint
+    /// verifier contributed at height 0.
+    /// Commit a checkpoint-verified block straight to the finalized state.
+    ///
+    /// Used by `zebrad copy-state`, which bulk-copies an already-validated chain between
+    /// databases and so needs the write path without any verification in front of it.
+    pub fn commit_checkpoint_verified(
+        &mut self,
+        checkpoint_verified: crate::CheckpointVerifiedBlock,
+    ) -> Result<block::Hash, BoxError> {
+        let (hash, trees) = self.finalized_state.commit_finalized_direct(
+            checkpoint_verified.into(),
+            self.prev_finalized_note_commitment_trees.take(),
+            "copy-state bulk write",
+        )?;
+        self.prev_finalized_note_commitment_trees = Some(trees);
+        Ok(hash)
+    }
 
-        // Write all the finalized blocks sent by the state,
-        // until the state closes the finalized block channel's sender.
-        while let Some(ordered_block) = finalized_block_write_receiver.blocking_recv() {
-            // TODO: split these checks into separate functions
+    pub fn commit_genesis(
+        &mut self,
+        genesis: std::sync::Arc<zebra_chain::block::Block>,
+    ) -> Result<block::Hash, BoxError> {
+        let checkpoint_verified = crate::CheckpointVerifiedBlock::from(genesis);
+        let tip_block = ChainTipBlock::from(checkpoint_verified.clone());
 
-            if invalid_block_reset_sender.is_closed() {
-                info!("StateService closed the block reset channel. Is Zebra shutting down?");
-                return;
-            }
+        let (hash, trees) = self.finalized_state.commit_finalized_direct(
+            checkpoint_verified.into(),
+            self.prev_finalized_note_commitment_trees.take(),
+            "commit genesis block",
+        )?;
+        self.prev_finalized_note_commitment_trees = Some(trees);
 
-            // Discard any children of invalid blocks in the channel
-            //
-            // `commit_finalized()` requires blocks in height order.
-            // So if there has been a block commit error,
-            // we need to drop all the descendants of that block,
-            // until we receive a block at the required next height.
-            let next_valid_height = finalized_state
-                .db
-                .finalized_tip_height()
-                .map(|height| (height + 1).expect("committed heights are valid"))
-                .unwrap_or(Height(0));
+        // @Volatile: publishing the tip is not optional. Everything downstream of
+        // `latest_chain_tip` -- the sync progress task, the mempool, Zaino -- reads this watch
+        // channel, not the database. Committing without publishing leaves them seeing an empty
+        // chain forever. The old finalized write loop did this immediately after committing.
+        log_if_mined_by_zebra(&tip_block, &mut self.last_zebra_mined_log_height);
+        self.chain_tip_sender.set_finalized_tip(tip_block);
 
-            if ordered_block.0.height != next_valid_height {
-                debug!(
-                    ?next_valid_height,
-                    invalid_height = ?ordered_block.0.height,
-                    invalid_hash = ?ordered_block.0.hash,
-                    "got a block that was the wrong height. \
-                     Assuming a parent block failed, and dropping this block",
-                );
-
-                // We don't want to send a reset here, because it could overwrite a valid sent hash
-                std::mem::drop(ordered_block);
-                continue;
-            }
-
-            // Try committing the block
-            match finalized_state
-                .commit_finalized(ordered_block, prev_finalized_note_commitment_trees.take())
-            {
-                Ok((finalized, note_commitment_trees)) => {
-                    let tip_block = ChainTipBlock::from(finalized);
-                    *prev_finalized_note_commitment_trees = Some(note_commitment_trees);
-
-                    log_if_mined_by_zebra(&tip_block, last_zebra_mined_log_height);
-
-                    chain_tip_sender.set_finalized_tip(tip_block);
-                }
-                Err(error) => {
-                    let finalized_tip = finalized_state.db.tip();
-
-                    // The last block in the queue failed, so we can't commit the next block.
-                    // Instead, we need to reset the state queue,
-                    // and discard any children of the invalid block in the channel.
-                    info!(
-                        ?error,
-                        last_valid_height = ?finalized_tip.map(|tip| tip.0),
-                        last_valid_hash = ?finalized_tip.map(|tip| tip.1),
-                        "committing a block to the finalized state failed, resetting state queue",
-                    );
-
-                    let send_result =
-                        invalid_block_reset_sender.send(finalized_state.db.finalized_tip_hash());
-
-                    if send_result.is_err() {
-                        info!(
-                            "StateService closed the block reset channel. Is Zebra shutting down?"
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Do this check even if the channel got closed before any finalized blocks were sent.
-        // This can happen if we're past the finalized tip.
-        if invalid_block_reset_sender.is_closed() {
-            info!("StateService closed the block reset channel. Is Zebra shutting down?");
-            return;
-        }
-        }
-
-        // The loop below is now only message dispatch: everything it used to do inline lives
-        // in `handle_commit` / `handle_crosslink_finalize`, so `new_network` can call the same
-        // work directly instead of sending a message.
-        while let Some(msg) = self.non_finalized_block_write_receiver.blocking_recv() {
-            match msg {
-                NonFinalizedWriteMessage::CrosslinkFinalized(hash, rsp_tx) => {
-                    let _ = rsp_tx.send(self.handle_crosslink_finalize(hash));
-                }
-                NonFinalizedWriteMessage::CommitReportingFinalized(queued_child, rsp_tx) => {
-                    let _ = rsp_tx.send(self.handle_commit(queued_child));
-                }
-                NonFinalizedWriteMessage::Commit((queued_child, rsp_tx)) => {
-                    let child_hash = queued_child.hash;
-                    let result = self.handle_commit(queued_child);
-                    let _ = rsp_tx.send(result.map(|_finalized| child_hash));
-                }
-            }
-        }
-
-        // We're finished receiving non-finalized blocks from the state, and
-        // done writing to the finalized state, so we can force it to shut down.
-        self.finalized_state.db.shutdown(true);
-        std::mem::drop(self.finalized_state);
+        Ok(hash)
     }
 
     /// Crosslink-finalize `hash` and everything it implicitly finalizes.
     ///
     /// Extracted verbatim from the run loop's `CrosslinkFinalized` arm.
-    pub(crate) fn handle_crosslink_finalize(
+    pub fn handle_crosslink_finalize(
         &mut self,
         hash: block::Hash,
     ) -> Result<(block::Hash, Vec<([u8; 32], u64)>), BoxError> {
@@ -439,7 +335,7 @@ impl WriteBlockWorkerTask {
     /// anything that fell past the reorg limit.
     ///
     /// Extracted verbatim from the run loop's `Commit` arm.
-    pub(crate) fn handle_commit(
+    pub fn handle_commit(
         &mut self,
         queued_child: SemanticallyVerifiedBlock,
     ) -> Result<Vec<crate::new_network::ShadowBlock>, CommitSemanticallyVerifiedError> {

@@ -1159,6 +1159,45 @@ pub enum IngestOutcome {
     },
 }
 
+/// A crosslink-finalization request, with a channel for the result.
+///
+/// BFT finalization used to reach the write task through the state service. new_network owns
+/// the writer now, so the request comes here instead. This is the narrow version of routing BFT
+/// through new_network -- it moves the finalize call, not the chain sync.
+pub struct CrosslinkFinalizeRequest {
+    pub hash: Hash,
+    pub reply: tokio::sync::oneshot::Sender<Result<(Hash, Vec<([u8; 32], u64)>), String>>,
+}
+
+static CROSSLINK_FINALIZE_SENDER: std::sync::OnceLock<
+    tokio::sync::mpsc::Sender<CrosslinkFinalizeRequest>,
+> = std::sync::OnceLock::new();
+
+/// Ask new_network to crosslink-finalize `hash`, and wait for the result.
+pub async fn crosslink_finalize_via_new_network(
+    hash: Hash,
+    timeout: std::time::Duration,
+) -> Result<(Hash, Vec<([u8; 32], u64)>), String> {
+    let Some(tx) = CROSSLINK_FINALIZE_SENDER.get() else {
+        return Err("new_network is not running".to_string());
+    };
+
+    let permit = match tokio::time::timeout(timeout, tx.reserve()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err("new_network stopped accepting finalizations".to_string()),
+        Err(_) => return Err("timed out waiting for the finalize queue".to_string()),
+    };
+
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    permit.send(CrosslinkFinalizeRequest { hash, reply });
+
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("new_network dropped the finalize reply channel".to_string()),
+        Err(_) => Err("timed out waiting for the finalize result".to_string()),
+    }
+}
+
 /// A block submitted from outside new_network, with a channel for the verdict.
 pub struct BlockSubmission {
     pub block: std::sync::Arc<Block>,
@@ -1223,15 +1262,29 @@ pub fn sync(
     rt: tokio::runtime::Handle,
     verify_fns: VerifyFns,
     crosslink_gate: crate::ClosureToCallIntoCrosslinkFromState,
-    // Commit a block this loop has already verified, skipping the verifier router and the
-    // state's orphan queue. See `Request::CommitVerifiedBlockDirect`.
-    commit_verified: impl Fn(crate::SemanticallyVerifiedBlock) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Hash, Vec<ShadowBlock>), BlockCommitError>> + Send>>,
+    // The block writer. This loop owns it, so every mutation of the chain state happens on
+    // this thread, in a known order, with the result available synchronously.
+    mut block_writer: crate::service::write::WriteBlockWorkerTask,
+    genesis: std::sync::Arc<Block>,
 ) {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(500);
     BLOCK_EVENT_QUEUE_SENDER.set(event_tx).unwrap();
 
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel(BLOCK_SUBMISSION_QUEUE_LEN);
     let _ = BLOCK_SUBMISSION_SENDER.set(submit_tx);
+
+    let (finalize_tx, mut finalize_rx) = tokio::sync::mpsc::channel(64);
+    let _ = CROSSLINK_FINALIZE_SENDER.set(finalize_tx);
+
+    // Commit genesis before anything waits on a tip. This loop owns the writer, so nothing else
+    // can do it -- and `get_tips_blocking` below spins until a finalized tip exists, which would
+    // never happen.
+    if read_state.finalized_tip().is_none() {
+        match block_writer.commit_genesis(genesis) {
+            Ok(hash) => tracing::info!("NewNet: committed genesis {hash}"),
+            Err(err) => panic!("could not commit genesis block: {err}"),
+        }
+    }
     // Replies live beside blocks_to_commit rather than inside it, so the existing queue and
     // its eviction logic are untouched.
     let mut submission_replies: HashMap<Hash, tokio::sync::oneshot::Sender<IngestOutcome>> = HashMap::new();
@@ -1437,6 +1490,26 @@ pub fn sync(
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(err) => { tracing::error!("{err:?}"); break; },
+            }
+        }
+
+        // Crosslink finalization: the BFT side asks, this loop performs it. It used to reach
+        // the write task through the state service, which can no longer reach the writer.
+        loop {
+            match finalize_rx.try_recv() {
+                Ok(CrosslinkFinalizeRequest { hash, reply }) => {
+                    let result = block_writer
+                        .handle_crosslink_finalize(hash)
+                        .map_err(|err| format!("{err:?}"));
+                    if let Ok((_, _)) = &result {
+                        near_tip_chains.finalized_height = near_tip_chains
+                            .finalized_height
+                            .max(read_state.finalized_tip().map_or(0, |(h, _)| h.0));
+                    }
+                    let _ = reply.send(result);
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(err) => { tracing::error!("crosslink finalize queue: {err:?}"); break; }
             }
         }
 
@@ -2783,7 +2856,17 @@ pub fn sync(
                         transaction_hashes: cheap.transaction_hashes.clone(),
                         deferred_pool_balance_change: Some(cheap.deferred_pool_balance_change),
                     };
-                    rt.block_on(commit_verified(semantically_verified))
+                    block_writer
+                        .handle_commit(semantically_verified)
+                        .map(|trad_finalized| (hash, trad_finalized))
+                        .map_err(|err| {
+                            let msg = format!("{err:?}");
+                            if msg.contains("Duplicate") || msg.contains("AlreadyFinalized") {
+                                BlockCommitError::Duplicate
+                            } else {
+                                BlockCommitError::Other(msg)
+                            }
+                        })
                 }
                 Err((phase, msg)) => {
                     println!("Rejected by sync verification ({phase}) @ {height}, {hash}: {msg}");

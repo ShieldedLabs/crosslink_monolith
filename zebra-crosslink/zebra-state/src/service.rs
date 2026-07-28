@@ -71,7 +71,7 @@ pub(crate) mod non_finalized_state;
 mod pending_utxos;
 mod queued_blocks;
 pub(crate) mod read;
-mod write;
+pub mod write;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub mod arbitrary;
@@ -125,10 +125,8 @@ pub(crate) struct StateService {
     /// These blocks are awaiting their parent blocks before they can do contextual verification.
     ///
     /// Indexed by their parent block hash.
-    finalized_state_queued_blocks: HashMap<block::Hash, QueuedCheckpointVerified>,
 
     /// Channels to send blocks to the block write task.
-    block_write_sender: write::BlockWriteSender,
 
     /// The [`block::Hash`] of the most recent block sent on
     /// `finalized_block_write_sender` or `non_finalized_block_write_sender`.
@@ -139,7 +137,6 @@ pub(crate) struct StateService {
     ///
     /// If `invalid_block_write_reset_receiver` gets a reset, this is:
     /// - the hash of the last valid committed block (the parent of the invalid block).
-    finalized_block_write_last_sent_hash: block::Hash,
 
     /// A set of block hashes that have been sent to the block write task.
     /// Hashes of blocks below the finalized tip height are periodically pruned.
@@ -149,7 +146,6 @@ pub(crate) struct StateService {
     /// this channel gets the [`block::Hash`] of the valid tip.
     //
     // TODO: add tests for finalized and non-finalized resets (#2654)
-    invalid_block_write_reset_receiver: tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
 
     // Pending UTXO Request Tracking
     //
@@ -172,7 +168,6 @@ pub(crate) struct StateService {
     ///
     /// Set to `f64::NAN` if `finalized_state_queued_blocks` is empty, because grafana shows NaNs
     /// as a break in the graph.
-    max_finalized_queue_height: f64,
 
     #[derivative(Debug = "ignore")]
     closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
@@ -234,17 +229,8 @@ impl Drop for StateService {
         // The state service owns the state, tasks, and channels,
         // so dropping it should shut down everything.
 
-        // Close the channels (non-blocking)
-        // This makes the block write thread exit the next time it checks the channels.
-        // We want to do this here so we get any errors or panics from the block write task before it shuts down.
-        self.invalid_block_write_reset_receiver.close();
-
-        std::mem::drop(self.block_write_sender.finalized.take());
-        std::mem::drop(self.block_write_sender.non_finalized.take());
-
-        self.clear_finalized_block_queue(
-            "dropping the state: dropped unused finalized state queue block",
-        );
+        // The block writer is owned by new_network now: there is no thread to signal and no
+        // channels to close here.
 
         // Log database metrics before shutting down
         info!("dropping the state: logging database metrics");
@@ -310,7 +296,13 @@ impl StateService {
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
         closure_to_call_crosslink: ClosureToCallIntoCrosslinkFromState,
-    ) -> (Self, ReadStateService, LatestChainTip, ChainTipChange) {
+    ) -> (
+        Self,
+        ReadStateService,
+        LatestChainTip,
+        ChainTipChange,
+        crate::service::write::WriteBlockWorkerTask,
+    ) {
         let timer = CodeTimer::start();
         let finalized_state = FinalizedState::new(
             &config,
@@ -335,20 +327,18 @@ impl StateService {
         let (non_finalized_state_sender, non_finalized_state_receiver) =
             watch::channel(NonFinalizedState::new(&finalized_state.network(), Default::default()));
 
-        let finalized_state_for_writing = finalized_state.clone();
-        let (block_write_sender, invalid_block_write_reset_receiver, block_write_task) =
-            write::BlockWriteSender::spawn(
-                finalized_state_for_writing,
-                non_finalized_state,
-                chain_tip_sender,
-                non_finalized_state_sender,
-            );
-
-        let read_service = ReadStateService::new(
-            &finalized_state,
-            block_write_task,
-            non_finalized_state_receiver,
+        // The writer is handed to the caller rather than spawned: new_network owns it and calls
+        // it directly, so every mutation of the chain state happens on one thread in a known
+        // order, with the result available synchronously.
+        let block_writer = write::BlockWriteSender::new(
+            finalized_state.clone(),
+            non_finalized_state,
+            chain_tip_sender,
+            non_finalized_state_sender,
         );
+
+        let read_service =
+            ReadStateService::new(&finalized_state, None, non_finalized_state_receiver);
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
             - HeightDiff::try_from(checkpoint_verify_concurrency_limit)
@@ -357,18 +347,11 @@ impl StateService {
             full_verifier_utxo_lookahead.unwrap_or(block::Height::MIN);
         let pending_utxos = PendingUtxos::default();
 
-        let finalized_block_write_last_sent_hash = finalized_state.db.finalized_tip_hash();
-
         let state = Self {
             network: network.clone(),
-            finalized_state_queued_blocks: HashMap::new(),
-            block_write_sender,
-            finalized_block_write_last_sent_hash,
-            invalid_block_write_reset_receiver,
             pending_utxos,
             last_prune: Instant::now(),
             read_service: read_service.clone(),
-            max_finalized_queue_height: f64::NAN,
             closure_to_call_crosslink,
             hardfork_schedule: config.hardfork_schedule.clone(),
         };
@@ -406,243 +389,12 @@ impl StateService {
         tracing::info!("cached state consensus branch is valid: no legacy chain found");
         timer.finish(module_path!(), line!(), "legacy chain check");
 
-        (state, read_service, latest_chain_tip, chain_tip_change)
+        (state, read_service, latest_chain_tip, chain_tip_change, block_writer)
     }
 
     /// Call read only state service to log rocksdb database metrics.
     pub fn log_db_metrics(&self) {
         self.read_service.db.print_db_metrics();
-    }
-
-    /// Queue a checkpoint verified block for verification and storage in the finalized state.
-    ///
-    /// Returns a channel receiver that provides the result of the block commit.
-    fn queue_and_commit_to_finalized_state(
-        &mut self,
-        checkpoint_verified: CheckpointVerifiedBlock,
-    ) -> oneshot::Receiver<Result<block::Hash, BoxError>> {
-        // # Correctness & Performance
-        //
-        // This method must not block, access the database, or perform CPU-intensive tasks,
-        // because it is called directly from the tokio executor's Future threads.
-
-        let queued_prev_hash = checkpoint_verified.block.header.previous_block_hash;
-        let queued_height = checkpoint_verified.height;
-
-        let (rsp_tx, rsp_rx) = oneshot::channel();
-        let queued = (checkpoint_verified, rsp_tx);
-
-        if self.block_write_sender.finalized.is_some() {
-            // We're still committing checkpoint verified blocks
-            if let Some(duplicate_queued) = self
-                .finalized_state_queued_blocks
-                .insert(queued_prev_hash, queued)
-            {
-                Self::send_checkpoint_verified_block_error(
-                    duplicate_queued,
-                    "dropping older checkpoint verified block: got newer duplicate block",
-                );
-            }
-
-            self.drain_finalized_queue_and_commit();
-        } else {
-            // We've finished committing checkpoint verified blocks to the finalized state,
-            // so drop any repeated queued blocks, and return an error.
-            //
-            // TODO: track the latest sent height, and drop any blocks under that height
-            //       every time we send some blocks (like QueuedSemanticallyVerifiedBlocks)
-            Self::send_checkpoint_verified_block_error(
-                queued,
-                "already finished committing checkpoint verified blocks: dropped duplicate block, \
-                 block is already committed to the state",
-            );
-
-            self.clear_finalized_block_queue(
-                "already finished committing checkpoint verified blocks: dropped duplicate block, \
-                 block is already committed to the state",
-            );
-        }
-
-        if self.finalized_state_queued_blocks.is_empty() {
-            self.max_finalized_queue_height = f64::NAN;
-        } else if self.max_finalized_queue_height.is_nan()
-            || self.max_finalized_queue_height < queued_height.0 as f64
-        {
-            // if there are still blocks in the queue, then either:
-            //   - the new block was lower than the old maximum, and there was a gap before it,
-            //     so the maximum is still the same (and we skip this code), or
-            //   - the new block is higher than the old maximum, and there is at least one gap
-            //     between the finalized tip and the new maximum
-            self.max_finalized_queue_height = queued_height.0 as f64;
-        }
-
-        metrics::gauge!("state.checkpoint.queued.max.height").set(self.max_finalized_queue_height);
-        metrics::gauge!("state.checkpoint.queued.block.count")
-            .set(self.finalized_state_queued_blocks.len() as f64);
-
-        rsp_rx
-    }
-
-    /// Finds finalized state queue blocks to be committed to the state in order,
-    /// removes them from the queue, and sends them to the block commit task.
-    ///
-    /// After queueing a finalized block, this method checks whether the newly
-    /// queued block (and any of its descendants) can be committed to the state.
-    ///
-    /// Returns an error if the block commit channel has been closed.
-    pub fn drain_finalized_queue_and_commit(&mut self) {
-        use tokio::sync::mpsc::error::{SendError, TryRecvError};
-
-        // # Correctness & Performance
-        //
-        // This method must not block, access the database, or perform CPU-intensive tasks,
-        // because it is called directly from the tokio executor's Future threads.
-
-        // If a block failed, we need to start again from a valid tip.
-        match self.invalid_block_write_reset_receiver.try_recv() {
-            Ok(reset_tip_hash) => self.finalized_block_write_last_sent_hash = reset_tip_hash,
-            Err(TryRecvError::Disconnected) => {
-                info!("Block commit task closed the block reset channel. Is Zebra shutting down?");
-                return;
-            }
-            // There are no errors, so we can just use the last block hash we sent
-            Err(TryRecvError::Empty) => {}
-        }
-
-        while let Some(queued_block) = self
-            .finalized_state_queued_blocks
-            .remove(&self.finalized_block_write_last_sent_hash)
-        {
-            let last_sent_finalized_block_height = queued_block.0.height;
-
-            self.finalized_block_write_last_sent_hash = queued_block.0.hash;
-
-            // If we've finished sending finalized blocks, ignore any repeated blocks.
-            // (Blocks can be repeated after a syncer reset.)
-            if let Some(finalized_block_write_sender) = &self.block_write_sender.finalized {
-                let send_result = finalized_block_write_sender.send(queued_block);
-
-                // If the receiver is closed, we can't send any more blocks.
-                if let Err(SendError(queued)) = send_result {
-                    // If Zebra is shutting down, drop blocks and return an error.
-                    Self::send_checkpoint_verified_block_error(
-                        queued,
-                        "block commit task exited. Is Zebra shutting down?",
-                    );
-
-                    self.clear_finalized_block_queue(
-                        "block commit task exited. Is Zebra shutting down?",
-                    );
-                } else {
-                    metrics::gauge!("state.checkpoint.sent.block.height")
-                        .set(last_sent_finalized_block_height.0 as f64);
-                };
-            }
-        }
-    }
-
-    /// Drops all finalized state queue blocks, and sends an error on their result channels.
-    fn clear_finalized_block_queue(&mut self, error: impl Into<BoxError> + Clone) {
-        for (_hash, queued) in self.finalized_state_queued_blocks.drain() {
-            Self::send_checkpoint_verified_block_error(queued, error.clone());
-        }
-    }
-
-    /// Send an error on a `QueuedCheckpointVerified` block's result channel, and drop the block
-    fn send_checkpoint_verified_block_error(
-        queued: QueuedCheckpointVerified,
-        error: impl Into<BoxError>,
-    ) {
-        let (finalized, rsp_tx) = queued;
-
-        // The block sender might have already given up on this block,
-        // so ignore any channel send errors.
-        let _ = rsp_tx.send(Err(error.into()));
-        std::mem::drop(finalized);
-    }
-
-    /// Send an error on a `QueuedSemanticallyVerified` block's result channel, and drop the block
-    fn send_semantically_verified_block_error(
-        queued: QueuedSemanticallyVerified,
-        error: CommitSemanticallyVerifiedError,
-    ) {
-        let (finalized, rsp_tx) = queued;
-
-        // The block sender might have already given up on this block,
-        // so ignore any channel send errors.
-        let _ = rsp_tx.send(Err(error));
-        std::mem::drop(finalized);
-    }
-
-    /// Send an already-verified block straight to the block write task.
-    ///
-    /// Ends the checkpoint phase if it has not ended: that drop is what makes the write task
-    /// leave its finalized loop and start reading the non-finalized channel. It used to happen
-    /// as a side effect of the block queueing this replaces.
-    fn commit_verified_to_write_task(
-        &mut self,
-        semantically_verified: SemanticallyVerifiedBlock,
-    ) -> (
-        oneshot::Receiver<Result<Vec<crate::new_network::ShadowBlock>, CommitSemanticallyVerifiedError>>,
-        block::Hash,
-    ) {
-        let (rsp_tx, rsp_rx) = oneshot::channel();
-        let hash = semantically_verified.hash;
-
-        if self.block_write_sender.finalized.is_some() {
-            std::mem::drop(self.block_write_sender.finalized.take());
-            self.clear_finalized_block_queue(
-                "already finished committing checkpoint verified blocks: dropped duplicate block, \
-                 block is already committed to the state",
-            );
-        }
-
-        match &self.block_write_sender.non_finalized {
-            Some(sender) => {
-                if sender
-                    .send(crate::service::write::NonFinalizedWriteMessage::CommitReportingFinalized(
-                        semantically_verified,
-                        rsp_tx,
-                    ))
-                    .is_err()
-                {
-                    // the receiver is gone; the caller's rsp_rx will report the closed channel
-                }
-            }
-            None => {
-                let _ = rsp_tx.send(Err(CommitSemanticallyVerifiedError::from(
-                    ValidateContextError::CommitTaskExited,
-                )));
-            }
-        }
-
-        (rsp_rx, hash)
-    }
-
-    fn send_crosslink_finalized_to_non_finalized_state(
-        &mut self,
-        hash: block::Hash,
-    ) -> oneshot::Receiver<Result<(block::Hash, Vec<([u8; 32], u64)>), BoxError>> {
-        let (rsp_tx, rsp_rx) = oneshot::channel();
-
-        if self.block_write_sender.finalized.is_none() {
-            if let Some(tx) = &self.block_write_sender.non_finalized {
-                if let Err(err) =
-                    tx.send(NonFinalizedWriteMessage::CrosslinkFinalized(hash, rsp_tx))
-                {
-                    tracing::warn!(
-                        ?err,
-                        "failed to send Crosslink-finalized hash to NonFinalizedState"
-                    );
-                };
-            } else {
-                let _ = rsp_tx.send(Err("not ready to crosslink-finalize blocks".into()));
-            }
-        } else {
-            let _ = rsp_tx.send(Err("not ready to crosslink-finalize blocks".into()));
-        }
-
-        rsp_rx
     }
 
     /// Return the tip of the current best chain.
@@ -893,122 +645,36 @@ impl Service<Request> for StateService {
         let span = Span::current();
 
         match req {
-            // Both commit requests now take the same path: the caller has already verified the
-            // block, so all that is left is contextual validation and the write. The semantic
-            // verifier is no longer reachable -- nothing produces `Request::Commit` -- but the
-            // legacy request name still works if that ever changes.
-            Request::CommitSemanticallyVerifiedBlock(semantically_verified)
-            | Request::CommitVerifiedBlockDirect(semantically_verified) => {
-                let rsp_rx = self.commit_verified_to_write_task(semantically_verified);
-                let hash = rsp_rx.1;
-                let rsp_rx = rsp_rx.0;
-
-                timer.finish(module_path!(), line!(), "CommitVerifiedBlockDirect");
-
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_| BoxError::from("commit task dropped the response channel"))
-                        .and_then(|res| res.map_err(BoxError::from))
-                        .map(|trad_finalized| Response::CommittedDirect(hash, trad_finalized))
+            // Blocks are no longer committed through the state service: new_network owns the
+            // writer and calls it directly. These arms exist only because the unreachable
+            // consensus verifiers still name them.
+            Request::CommitSemanticallyVerifiedBlock(_)
+            | Request::CommitCheckpointVerifiedBlock(_) => {
+                timer.finish(module_path!(), line!(), "Commit*Block (unreachable)");
+                async {
+                    Err(BoxError::from(
+                        "blocks are committed through new_network, not the state service",
+                    ))
                 }
                 .boxed()
             }
 
-            // Uses finalized_state_queued_blocks and pending_utxos in the StateService.
-            // Accesses shared writeable state in the StateService.
-            Request::CommitCheckpointVerifiedBlock(finalized) => {
-                // # Consensus
-                //
-                // A semantic block verification could have called AwaitUtxo
-                // before this checkpoint verified block arrived in the state.
-                // So we need to check for pending UTXO requests sent by running
-                // semantic block verifications.
-                //
-                // This check is redundant for most checkpoint verified blocks,
-                // because semantic verification can only succeed near the final
-                // checkpoint, when all the UTXOs are available for the verifying block.
-                //
-                // (Checkpoint block UTXOs are verified using block hash checkpoints
-                // and transaction merkle tree block header commitments.)
-                self.pending_utxos
-                    .check_against_ordered(&finalized.new_outputs);
-
-                // # Performance
-                //
-                // This method doesn't block, access the database, or perform CPU-intensive tasks,
-                // so we can run it directly in the tokio executor's Future threads.
-                let rsp_rx = self.queue_and_commit_to_finalized_state(finalized);
-
-                // TODO:
-                //   - check for panics in the block write task here,
-                //     as well as in poll_ready()
-
-                // The work is all done, the future just waits on a channel for the result
-                timer.finish(module_path!(), line!(), "CommitCheckpointVerifiedBlock");
-
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_recv_error| {
-                            BoxError::from("block was dropped from the queue of finalized blocks")
-                        })
-                        // TODO: replace with Result::flatten once it stabilises
-                        // https://github.com/rust-lang/rust/issues/70142
-                        .and_then(convert::identity)
-                        .map(Response::Committed)
-                }
-                .instrument(span)
-                .boxed()
-            }
-
+            // BFT finalization is routed to new_network, which owns the block writer.
             Request::CrosslinkFinalizeBlock(finalized) => {
-                info!("Trying to Crosslink-finalize {}", finalized);
-                // # Performance
-                //
-                // This method doesn't block, access the database, or perform CPU-intensive tasks,
-                // so we can run it directly in the tokio executor's Future threads.
-                let rsp_rx = self.send_crosslink_finalized_to_non_finalized_state(finalized);
-
-                // CROSSLINK: a BFT decision just landed (the new block is already in
-                // `bft_blocks` by the time this request arrives), which may make the fat
-                // pointers of previously-deferred non-finalized blocks resolvable. Re-flush
-                // the queue so those are re-evaluated now rather than waiting for the next
-                // incoming block — which may never come on an idle chain.
-                //
-                // `block_in_place` is REQUIRED: this arm runs synchronously on a tokio runtime
-                // thread, and the fat-pointer gate reached from `send_ready_non_finalized_queued`
-                // acquires the crosslink lock with `blocking_lock()`, which panics on a runtime
-                // thread unless we are inside `block_in_place`. (The intake path at
-                // `CommitSemanticallyVerifiedBlock` is wrapped for the same reason.)
-                // (Removed) This used to re-flush the state's deferred non-finalized queue so
-                // blocks whose fat pointers had become resolvable were re-evaluated. new_network
-                // owns that queue now and re-evaluates it every tick.
-
-                // TODO:
-                //   - check for panics in the block write task here,
-                //     as well as in poll_ready()
-
-                // The work is all done, the future just waits on a channel for the result
                 timer.finish(module_path!(), line!(), "CrosslinkFinalizeBlock");
 
                 async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_recv_error| {
-                            BoxError::from("block was dropped from the queue of finalized blocks")
-                        })
-                        // TODO: replace with Result::flatten once it stabilises
-                        // https://github.com/rust-lang/rust/issues/70142
-                        .and_then(convert::identity)
-                        .map(|(hash, aggregated_stakes)| Response::CrosslinkFinalized(hash, aggregated_stakes))
+                    crate::new_network::crosslink_finalize_via_new_network(
+                        finalized,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await
+                    .map(|(hash, stakes)| Response::CrosslinkFinalized(hash, stakes))
+                    .map_err(BoxError::from)
                 }
-                .instrument(span)
                 .boxed()
             }
 
-            // Uses pending_utxos and non_finalized_state_queued_blocks in the StateService.
-            // If the UTXO isn't in the queued blocks, runs concurrently using the ReadStateService.
             Request::AwaitUtxo(outpoint) => {
                 // Prepare the AwaitUtxo future from PendingUxtos.
                 let response_fut = self.pending_utxos.queue(outpoint);
@@ -2112,8 +1778,9 @@ pub fn init(
     ReadStateService,
     LatestChainTip,
     ChainTipChange,
+    crate::service::write::WriteBlockWorkerTask,
 ) {
-    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
+    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change, block_writer) =
         StateService::new(
             config,
             network,
@@ -2127,6 +1794,7 @@ pub fn init(
         read_only_state_service,
         latest_chain_tip,
         chain_tip_change,
+        block_writer,
     )
 }
 
@@ -2190,6 +1858,7 @@ pub fn spawn_init(
     ReadStateService,
     LatestChainTip,
     ChainTipChange,
+    crate::service::write::WriteBlockWorkerTask,
 )> {
     let network = network.clone();
     tokio::task::spawn_blocking(move || {

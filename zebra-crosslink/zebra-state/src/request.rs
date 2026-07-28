@@ -653,74 +653,7 @@ impl DerefMut for CheckpointVerifiedBlock {
 /// A query about or modification to the chain state, via the
 /// [`StateService`](crate::service::StateService).
 pub enum Request {
-    /// Performs contextual validation of the given semantically verified block,
-    /// committing it to the state if successful.
-    ///
-    /// This request can be made out-of-order; the state service will queue it
-    /// until its parent is ready.
-    ///
-    /// Returns [`Response::Committed`] with the hash of the block when it is
-    /// committed to the state, or an error if the block fails contextual
-    /// validation or has already been committed to the state.
-    ///
-    /// This request cannot be cancelled once submitted; dropping the response
-    /// future will have no effect on whether it is eventually processed. A
-    /// request to commit a block which has been queued internally but not yet
-    /// committed will fail the older request and replace it with the newer request.
-    ///
-    /// # Correctness
-    ///
-    /// Block commit requests should be wrapped in a timeout, so that
-    /// out-of-order and invalid requests do not hang indefinitely. See the [`crate`]
-    /// documentation for details.
-    CommitSemanticallyVerifiedBlock(SemanticallyVerifiedBlock),
 
-    /// Commit a checkpointed block to the state, skipping most but not all
-    /// contextual validation.
-    ///
-    /// This is exposed for use in checkpointing, which produces checkpoint vefified
-    /// blocks. This request can be made out-of-order; the state service will queue
-    /// it until its parent is ready.
-    ///
-    /// Returns [`Response::Committed`] with the hash of the newly committed
-    /// block, or an error.
-    ///
-    /// This request cannot be cancelled once submitted; dropping the response
-    /// future will have no effect on whether it is eventually processed.
-    /// Duplicate requests will replace the older duplicate, and return an error
-    /// in its response future.
-    ///
-    /// # Note
-    ///
-    /// [`SemanticallyVerifiedBlock`], [`ContextuallyVerifiedBlock`] and
-    /// [`CheckpointVerifiedBlock`] are an internal Zebra implementation detail.
-    /// There is no difference between these blocks on the Zcash network, or in Zebra's
-    /// network or syncer implementations.
-    ///
-    /// # Consensus
-    ///
-    /// Checkpointing is allowed under the Zcash "social consensus" rules.
-    /// Zebra checkpoints both settled network upgrades, and blocks past the rollback limit.
-    /// (By the time Zebra release is tagged, its final checkpoint is typically hours or days old.)
-    ///
-    /// > A network upgrade is settled on a given network when there is a social consensus
-    /// > that it has activated with a given activation block hash. A full validator that
-    /// > potentially risks Mainnet funds or displays Mainnet transaction information to a user
-    /// > MUST do so only for a block chain that includes the activation block of the most
-    /// > recent settled network upgrade, with the corresponding activation block hash.
-    /// > ...
-    /// > A full validator MAY impose a limit on the number of blocks it will “roll back”
-    /// > when switching from one best valid block chain to another that is not a descendent.
-    /// > For `zcashd` and `zebra` this limit is 100 blocks.
-    ///
-    /// <https://zips.z.cash/protocol/protocol.pdf#blockchain>
-    ///
-    /// # Correctness
-    ///
-    /// Block commit requests should be wrapped in a timeout, so that
-    /// out-of-order and invalid requests do not hang indefinitely. See the [`crate`]
-    /// documentation for details.
-    CommitCheckpointVerifiedBlock(CheckpointVerifiedBlock),
 
     /// Communicate the hash that Crosslink has finalized so that PoW can account for it.
     ///
@@ -885,14 +818,19 @@ pub enum Request {
     /// Returns [`Response::KnownBlock(None)`](Response::KnownBlock) otherwise.
     KnownBlock(block::Hash),
 
-    /// Commit a block that has *already* been semantically verified by the caller, bypassing
-    /// the verifier router, the orphan queue, and the sent-hash bookkeeping.
+
+    /// Commit a semantically verified block.
     ///
-    /// This is new_network's path: it does its own synchronous verification, so the only work
-    /// left is contextual validation and the write itself. Also ends the checkpoint phase if it
-    /// has not ended yet -- that handoff used to be an emergent side effect of
-    /// `queue_and_commit_to_non_finalized_state`, which this request replaces.
-    CommitVerifiedBlockDirect(SemanticallyVerifiedBlock),
+    /// Unreachable: blocks are committed by new_network, which owns the block writer and calls
+    /// it directly. Kept because the (also unreachable) `SemanticBlockVerifier` still names it.
+    /// Returns an error.
+    CommitSemanticallyVerifiedBlock(SemanticallyVerifiedBlock),
+
+    /// Commit a checkpoint verified block.
+    ///
+    /// Unreachable for the same reason. Genesis -- the only block that ever took this path on
+    /// these networks -- is committed by new_network at startup. Returns an error.
+    CommitCheckpointVerifiedBlock(CheckpointVerifiedBlock),
 
     /// Performs contextual validation of the given block, but does not commit it to the state.
     ///
@@ -912,8 +850,6 @@ pub enum Request {
 impl Request {
     fn variant_name(&self) -> &'static str {
         match self {
-            Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
-            Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::CrosslinkFinalizeBlock(_) => "crosslink_finalize_block",
 
             Request::AwaitUtxo(_) => "await_utxo",
@@ -933,7 +869,8 @@ impl Request {
             Request::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             Request::BestChainBlockHash(_) => "best_chain_block_hash",
             Request::KnownBlock(_) => "known_block",
-            Request::CommitVerifiedBlockDirect(_) => "commit_verified_block_direct",
+            Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
+            Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
             Request::BondInfo(_) => "bond_info",
         }
@@ -1348,7 +1285,6 @@ impl TryFrom<Request> for ReadRequest {
 
             Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitCheckpointVerifiedBlock(_)
-            | Request::CommitVerifiedBlockDirect(_)
             | Request::CrosslinkFinalizeBlock(_) => Err("ReadService does not write blocks"),
 
             Request::AwaitUtxo(_) => Err("ReadService does not track pending UTXOs. \

@@ -55,6 +55,7 @@ pub use request::Spend;
 pub use response::{
     GetBlockTemplateChainInfo, KnownBlock, KnownBlockLocation, MinedTx, ReadResponse, Response,
 };
+pub use service::write::WriteBlockWorkerTask;
 pub use service::{
     chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip, TipAction},
     check,
