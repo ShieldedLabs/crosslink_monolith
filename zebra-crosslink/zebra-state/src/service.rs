@@ -80,7 +80,6 @@ pub mod arbitrary;
 mod tests;
 
 pub use finalized_state::{OutputLocation, TransactionIndex, TransactionLocation};
-use write::NonFinalizedWriteMessage;
 
 use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified};
 
@@ -330,7 +329,7 @@ impl StateService {
         // The writer is handed to the caller rather than spawned: new_network owns it and calls
         // it directly, so every mutation of the chain state happens on one thread in a known
         // order, with the result available synchronously.
-        let block_writer = write::BlockWriteSender::new(
+        let block_writer = write::WriteBlockWorkerTask::new(
             finalized_state.clone(),
             non_finalized_state,
             chain_tip_sender,

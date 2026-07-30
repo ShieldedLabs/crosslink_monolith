@@ -135,42 +135,12 @@ pub struct WriteBlockWorkerTask {
     parent_error_map: IndexMap<block::Hash, CommitSemanticallyVerifiedError>,
 }
 
-/// The message type for the non-finalized block write task channel.
-pub enum NonFinalizedWriteMessage {
-    /// A newly downloaded and semantically verified block prepared for
-    /// contextual validation and insertion into the non-finalized state.
-    Commit(QueuedSemanticallyVerified),
-    CrosslinkFinalized(
-        block::Hash,
-        tokio::sync::oneshot::Sender<Result<(block::Hash, Vec<([u8; 32], u64)>), BoxError>>,
-    ),
-}
-
-impl From<QueuedSemanticallyVerified> for NonFinalizedWriteMessage {
-    fn from(block: QueuedSemanticallyVerified) -> Self {
-        NonFinalizedWriteMessage::Commit(block)
-    }
-}
-
-/// A worker with a task that reads, validates, and writes blocks to the
-/// `finalized_state` or `non_finalized_state` and channels for sending
-/// it blocks.
-#[derive(Clone, Debug)]
-pub(super) struct BlockWriteSender {
-    /// A channel to send blocks to the `block_write_task`,
-    /// so they can be written to the [`NonFinalizedState`].
-    pub non_finalized: Option<tokio::sync::mpsc::UnboundedSender<NonFinalizedWriteMessage>>,
-
-    /// A channel to send blocks to the `block_write_task`,
-    /// so they can be written to the [`FinalizedState`].
+impl WriteBlockWorkerTask {
+    /// Build the block writer.
     ///
-    /// This sender is dropped after the state has finished sending all the checkpointed blocks,
-    /// and the lowest semantically verified block arrives.
-    pub finalized: Option<tokio::sync::mpsc::UnboundedSender<QueuedCheckpointVerified>>,
-}
-
-impl BlockWriteSender {
-    /// Creates a new [`BlockWriteSender`] with the given receivers and states.
+    /// No thread and no channels: the caller (new_network) owns this and calls the handlers
+    /// directly. That makes every mutation of the chain state happen on one thread, in a known
+    /// order, with the result available synchronously.
     #[instrument(
         level = "debug",
         skip_all,
@@ -178,11 +148,6 @@ impl BlockWriteSender {
             network = %non_finalized_state.network
         )
     )]
-    /// Build the block writer.
-    ///
-    /// No thread and no channels: the caller (new_network) owns this and calls the handlers
-    /// directly. That makes every mutation of the chain state happen on one thread, in a known
-    /// order, with the result available synchronously.
     pub fn new(
         finalized_state: FinalizedState,
         non_finalized_state: NonFinalizedState,
@@ -199,9 +164,7 @@ impl BlockWriteSender {
             parent_error_map: IndexMap::new(),
         }
     }
-}
 
-impl WriteBlockWorkerTask {
     /// Reads blocks from the channels, writes them to the `finalized_state` or `non_finalized_state`,
     /// sends any errors on the `invalid_block_reset_sender`, then updates the `chain_tip_sender` and
     /// `non_finalized_state_sender`.
