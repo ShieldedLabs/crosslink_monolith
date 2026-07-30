@@ -6,7 +6,7 @@ use static_assertions::const_assert;
 use zebra_chain::block::{self, Block, Hash, Height};
 use zebra_chain::serialization::{ZcashSerialize, ZcashDeserialize};
 
-use tenderlink::bandwidth_test::*;
+use tenderlink::stp::*;
 use tenderlink::native_sockets::*;
 use tenderlink::parse_to_ipv6_bytes;
 use tenderlink::{SliceWrite, SliceRead};
@@ -1388,10 +1388,10 @@ pub fn sync(
             if address.magic1 != CRYPTO_MAGIC {
                 // @Dev
                 panic!("The magic in the config toml - {} ({}) is different from the crypto magic - {} ({})! Modify one or the other!",
-                        tenderlink::bandwidth_test::b64(&address.magic1.to_le_bytes()[..6]),
-                        tenderlink::bandwidth_test::crypto_string_from_connect_magic1(address.magic1).unwrap_or("<invalid>"),
-                        tenderlink::bandwidth_test::b64(&CRYPTO_MAGIC  .to_le_bytes()[..6]),
-                        tenderlink::bandwidth_test::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
+                        tenderlink::stp::b64(&address.magic1.to_le_bytes()[..6]),
+                        tenderlink::stp::crypto_string_from_connect_magic1(address.magic1).unwrap_or("<invalid>"),
+                        tenderlink::stp::b64(&CRYPTO_MAGIC  .to_le_bytes()[..6]),
+                        tenderlink::stp::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
                         );
             }
             tracing::info!("NewNet: Connecting to peer: {:?}", address);

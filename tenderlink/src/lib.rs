@@ -1167,17 +1167,17 @@ pub struct PeerInfo {
 }
 
 pub use crate::helpers::*;
-pub use crate::bandwidth_test::STPAddress;
-pub use crate::bandwidth_test::fmt_byte_str;
-pub use crate::bandwidth_test::ConnectionKey;
-pub use crate::bandwidth_test::IdentityKeyPair;
-pub use crate::bandwidth_test::fmt_byte_str_rev;
-pub use crate::bandwidth_test::fmt_prefixed_byte_str;
-pub use crate::bandwidth_test::fmt_prefixed_byte_str_rev;
-pub use crate::bandwidth_test::CONNECT_MAGIC1_PLAIN_TEXT;
-pub use crate::bandwidth_test::total_packet_payload_overhead_from_connect_magic1_inside_udp_payload;
-pub use crate::bandwidth_test::new_keypair_from_connect_magic1_with_seed;
-pub use crate::bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
+pub use crate::stp::STPAddress;
+pub use crate::stp::fmt_byte_str;
+pub use crate::stp::ConnectionKey;
+pub use crate::stp::IdentityKeyPair;
+pub use crate::stp::fmt_byte_str_rev;
+pub use crate::stp::fmt_prefixed_byte_str;
+pub use crate::stp::fmt_prefixed_byte_str_rev;
+pub use crate::stp::CONNECT_MAGIC1_PLAIN_TEXT;
+pub use crate::stp::total_packet_payload_overhead_from_connect_magic1_inside_udp_payload;
+pub use crate::stp::new_keypair_from_connect_magic1_with_seed;
+pub use crate::stp::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s;
 
 
 pub const MAX_P2P_DISCOVERY_PUBKEY_SIZE: usize = 32;
@@ -1447,7 +1447,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let my_stp_keypair = my_stp_keypair.unwrap_or(new_keypair_from_connect_magic1(CRYPTO_MAGIC).unwrap());
 
-    use crate::bandwidth_test::*;
+    use crate::stp::*;
     use crate::native_sockets::*;
 
     let my_port = my_endpoint.map(|e| e.port).unwrap_or(23485); // @Dev: .unwrap_or(0); // @Todo! Get local port after sock creation! @@@
@@ -1468,10 +1468,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
         if address.magic1 != CRYPTO_MAGIC {
             // @Dev
             panic!("The magic in the config toml - {} ({}) is different from the crypto magic - {} ({})! Modify one or the other!",
-                    bandwidth_test::b64(&address.magic1.to_le_bytes()[..6]),
-                    bandwidth_test::crypto_string_from_connect_magic1(address.magic1).unwrap_or("<invalid>"),
-                    bandwidth_test::b64(&CRYPTO_MAGIC  .to_le_bytes()[..6]),
-                    bandwidth_test::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
+                    stp::b64(&address.magic1.to_le_bytes()[..6]),
+                    stp::crypto_string_from_connect_magic1(address.magic1).unwrap_or("<invalid>"),
+                    stp::b64(&CRYPTO_MAGIC  .to_le_bytes()[..6]),
+                    stp::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
                     );
         }
     }
@@ -2999,7 +2999,7 @@ pub fn run_instances(i: usize) {
     rt.block_on(std::future::pending::<()>())
 }
 
-pub mod bandwidth_test;
+pub mod stp;
 pub mod p2p_test;
 pub mod native_sockets;
 pub mod nym_sockets;

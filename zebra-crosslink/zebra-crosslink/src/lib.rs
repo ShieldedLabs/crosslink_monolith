@@ -1192,7 +1192,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
     internal_handle.internal.lock().await.my_public_key = my_public_key;
 
     {
-        use tenderlink::bandwidth_test::IdentityKeyPair;
+        use tenderlink::stp::IdentityKeyPair;
         use tenderlink::{parse_to_ipv6_bytes, addr_string_to_stuff};
 
         use std::net::{Ipv6Addr, SocketAddr};
