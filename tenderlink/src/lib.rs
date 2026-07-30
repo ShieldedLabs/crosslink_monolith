@@ -2028,6 +2028,28 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                                  kbps, pps, bpp);
                     }
                 }
+
+                // Decide-watch: a round holding yes-precommit stake at the current height
+                // normally decides within a tick, so at this sampling cadence the line only
+                // ever appears when completion is wedged -- cert short of the threshold, or
+                // validity unresolved. Shows the exact numbers needed to tell which. Silent
+                // in healthy operation, so it can stay on permanently.
+                {
+                    let mut total_active_stake = 0;
+                    for i in 0..active_roster_len(&roster) { total_active_stake += roster[i].stake; }
+                    if total_active_stake > 0 {
+                        let f = TMState::f_from_n(total_active_stake);
+                        let big_threshold = if f == 0 { total_active_stake } else { 2*f + 1 };
+                        for rd in bft_state.rounds_data.iter().filter(|r| r.height == bft_state.height && r.counts.yes_precommits > 0) {
+                            println!("{ctx_str} {ANSI_YLW}DECIDE_WAIT{ANSI_RST} {}.{}: yc:{}/{} (yv:{} total:{} f:{}) proposal:{}/{} validity:{:?}",
+                                     rd.height, rd.round,
+                                     rd.counts.yes_precommits, big_threshold,
+                                     rd.counts.yes_prevotes, total_active_stake, f,
+                                     rd.proposal_sigs_n, rd.proposal_sigs.len(),
+                                     rd.proposal_checked_validity);
+                        }
+                    }
+                }
             }
 
             let now_now = tokio::time::Instant::now();
