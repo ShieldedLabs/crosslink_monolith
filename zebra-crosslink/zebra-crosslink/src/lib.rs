@@ -820,18 +820,31 @@ async fn handle_new_decided_bft_block(
     // so they are already out of the roster that will vote on a hardfork block scheduled there.
     let next_bft_height = internal.bft_blocks.len() as u64;
     let terminated = terminated_finalizers_at(&tfl_handle.config.hardforks, next_bft_height, new_final_height.0 as u64);
-    tenderlink_roster_from_internal(&internal.finalizers_at_current_height, &terminated)
+    tenderlink_roster_from_internal(&internal.finalizers_at_current_height, &terminated, internal.my_public_key)
+}
+
+fn reversed_pub_key(mut key: PubKeyID) -> PubKeyID {
+    key.0.reverse();
+    key
+}
+
+fn canonicalize_local_roster_key(key: PubKeyID, my_public_key: PubKeyID) -> PubKeyID {
+    if key == reversed_pub_key(my_public_key) {
+        my_public_key
+    } else {
+        key
+    }
 }
 
 /// Build the tenderlink consensus roster from the internal roster, excluding any finalizer in
 /// `terminated` (terminated by a user-led hardfork; see [`terminated_finalizers_at`]). The
 /// filtering is a pure membership test, mirroring how the viz excludes terminated finalizers.
 /// Pass an empty set to build the roster unfiltered.
-fn tenderlink_roster_from_internal(vals: &[RosterMember], terminated: &HashSet<PubKeyID>) -> Vec<SortedRosterMember> {
+fn tenderlink_roster_from_internal(vals: &[RosterMember], terminated: &HashSet<PubKeyID>, my_public_key: PubKeyID) -> Vec<SortedRosterMember> {
     let mut ret: Vec<SortedRosterMember> = vals
         .iter()
         .map(|v| SortedRosterMember {
-            pub_key: PubKeyID(v.pub_key.into()),
+            pub_key: canonicalize_local_roster_key(PubKeyID(v.pub_key.into()), my_public_key),
             stake: v.voting_power,
             cumulative_stake: 0,
         })
@@ -1227,25 +1240,6 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             .finalizers_at_current_height
             .clone();
 
-        use tenderlink::FinalizerPeerAddress;
-        // Note(Sam): We do not support human names in the start config for now.
-        let finalizer_peer_addresses: Vec<FinalizerPeerAddress> = unsorted_roster
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                let string = format!("{:?}", m);
-                let mut hasher = DefaultHasher::new();
-                hasher.write(string.as_bytes());
-                let seed = hasher.finish();
-                let string = format!("127.0.0.1:{}", seed % 4000);
-                let (a, b) =
-                    addr_string_to_stuff(&config.bft_peers.get(i).unwrap_or_else(|| &string));
-                FinalizerPeerAddress {
-                    bft_pk: PubKeyID(m.pub_key.into()),
-                    address: b,
-                }
-            })
-            .collect();
 
         if path_to_pos_store_file.to_str() != Some("") {
             let mut pos_file = OpenOptions::new().read(true).write(true).create(true).open(&path_to_pos_store_file).unwrap();
@@ -1293,7 +1287,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     block_height_from_hash(&call, candidate_hash).await.map(|h| h.0 as u64).unwrap_or(0)
                 } else { 0 };
                 let this_terminated = terminated_finalizers_at(&config.hardforks, this_bft_height, this_finalized_bc_height);
-                round_data.roster = tenderlink_roster_from_internal(&unsorted_roster, &this_terminated);
+                round_data.roster = tenderlink_roster_from_internal(&unsorted_roster, &this_terminated, my_public_key);
                 round_data.msg_val_sigs = round_data.roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.pub_key == v.pub_key).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), TMSig(s))]).collect();
                 round_data.msg_nil_sigs = vec![[TMSig::NIL; 2]; round_data.roster.len()];
                 round_data.counts.precommits = fat_pointer.signatures.len() as u64;
@@ -1316,6 +1310,36 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             pos_file.set_len(valid_byte_count).unwrap();
         }
 
+        use tenderlink::FinalizerPeerAddress;
+        // Build peer addresses after PoS-store replay so dynamically staked finalizers
+        // are mapped by key, not by stale startup roster index. The local signer key
+        // always advertises the configured public endpoint.
+        let configured_finalizer_addresses: std::collections::HashMap<PubKeyID, String> = config
+            .bft_peers
+            .iter()
+            .map(|peer| {
+                let (_, _, public_key) = rng_private_public_key_from_address(peer.as_bytes());
+                (public_key, peer.clone())
+            })
+            .collect();
+        let mut reversed_my_public_key = my_public_key;
+        reversed_my_public_key.0.reverse();
+
+        let finalizer_peer_addresses: Vec<FinalizerPeerAddress> = unsorted_roster
+            .iter()
+            .filter_map(|m| {
+                let raw_bft_pk = PubKeyID(m.pub_key.into());
+                let bft_pk = canonicalize_local_roster_key(raw_bft_pk, my_public_key);
+                let address_string = if raw_bft_pk == my_public_key || raw_bft_pk == reversed_my_public_key || bft_pk == my_public_key {
+                    Some(public_ip_string.clone())
+                } else {
+                    configured_finalizer_addresses.get(&bft_pk).cloned()
+                }?;
+                let (_, address) = addr_string_to_stuff(&address_string);
+                Some(FinalizerPeerAddress { bft_pk, address })
+            })
+            .collect();
+
         let mut new_final_hash = ZebBlockHash([0; 32]);
         let mut new_final_height = ZebBlockHeight(0);
 
@@ -1333,7 +1357,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             // schedule (no stored blacklist; see `terminated_finalizers_at`).
             let startup_bft_height = i_bft_blocks.len() as u64;
             let terminated = terminated_finalizers_at(&config.hardforks, startup_bft_height, new_final_height.0 as u64);
-            let roster = tenderlink_roster_from_internal(&unsorted_roster, &terminated);
+            let roster = tenderlink_roster_from_internal(&unsorted_roster, &terminated, my_public_key);
             internal.finalizers_at_current_height = unsorted_roster;
             internal.bft_blocks = i_bft_blocks;
             internal.fat_pointer_to_tip = fat_pointer_to_tip;
