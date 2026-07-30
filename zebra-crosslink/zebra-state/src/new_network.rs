@@ -2727,12 +2727,22 @@ pub fn sync(
                             .any_chain_block_header(parent_hash.into())
                             .map(|hdr| hdr.fat_pointer_to_bft_block.clone());
 
-                        let gate = if height == 32265 || height == 32266 {
-                            Some(true)
+                        // Signatures dominate the Display form and never matter for "why is this
+                        // stuck" -- hash + ovd + count is enough to identify the pointer.
+                        let fp_brief = |fp: &zcash_primitives::bft::FatPointerToBftBlock| {
+                            let v = &fp.vote_for_block_without_finalizer_public_key;
+                            format!("{{hash:{} ovd:{} sigs:{}}}", hex::encode(&v[0..32]), hex::encode(&v[32..]), fp.signatures.len())
+                        };
+
+                        let (gate, defer_msg) = if height == 32265 || height == 32266 {
+                            (Some(true), String::new())
                         } else if let Some(parent_fp) = parent_fat_pointer {
-                            (crosslink_gate)(parent_fp, child_fat_pointer, block::Height(height))
+                            let msg = format!("child fp {} / parent fp {} not resolvable yet", fp_brief(&child_fat_pointer), fp_brief(&parent_fp));
+                            ((crosslink_gate)(parent_fp, child_fat_pointer, block::Height(height)), msg)
                         } else {
-                            None
+                            // known_block() saw the parent but any_chain_block_header() did not;
+                            // the two views disagreeing is itself worth seeing in the log.
+                            (None, format!("parent header {parent_hash} not found (child fp {})", fp_brief(&child_fat_pointer)))
                         };
 
                         // @Todo: this rejects on the REVERSIBLE answer, which costs re-downloads.
@@ -2752,7 +2762,7 @@ pub fn sync(
                         match gate {
                             // Reversible: the BFT block has not arrived. Hold the block and
                             // re-check next tick rather than dropping and re-downloading it.
-                            None => Err(("crosslink", "fat pointer not resolvable yet".to_string(), true)),
+                            None => Err(("crosslink", defer_msg, true)),
                             // Permanent, per the gate's own documentation. Drop it.
                             Some(false) => Err(("crosslink", "fat pointer regressed or is too early".to_string(), false)),
                             Some(true) => {
@@ -2817,7 +2827,8 @@ pub fn sync(
 
             // A deferrable verdict means "not yet", not "no": keep the block so the next tick
             // can retry it, instead of dropping it and paying for another download.
-            if let Err((_, _, true)) = &verdict {
+            if let Err((phase, msg, true)) = &verdict {
+                println!("Deferring: @ {height}, {hash}: {phase}: {msg}");
                 return true; // keep
             }
 
