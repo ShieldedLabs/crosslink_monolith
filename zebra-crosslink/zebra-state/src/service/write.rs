@@ -140,14 +140,6 @@ pub enum NonFinalizedWriteMessage {
     /// A newly downloaded and semantically verified block prepared for
     /// contextual validation and insertion into the non-finalized state.
     Commit(QueuedSemanticallyVerified),
-    /// Like `Commit`, but the reply carries the blocks this commit pushed past the reorg
-    /// limit, so the caller can maintain its own chain view without a separate event channel.
-    CommitReportingFinalized(
-        SemanticallyVerifiedBlock,
-        tokio::sync::oneshot::Sender<
-            Result<Vec<crate::new_network::ShadowBlock>, CommitSemanticallyVerifiedError>,
-        >,
-    ),
     CrosslinkFinalized(
         block::Hash,
         tokio::sync::oneshot::Sender<Result<(block::Hash, Vec<([u8; 32], u64)>), BoxError>>,
@@ -274,10 +266,6 @@ impl WriteBlockWorkerTask {
         &mut self,
         hash: block::Hash,
     ) -> Result<(block::Hash, Vec<([u8; 32], u64)>), BoxError> {
-        use crate::new_network::push_block_event;
-        use crate::new_network::BlockEvent;
-        use crate::new_network::ShadowBlock;
-
         if let Some(newly_finalized_blocks) = self.non_finalized_state.crosslink_finalize(hash) {
             update_latest_chain_channels(
                 &self.non_finalized_state,
@@ -290,22 +278,12 @@ impl WriteBlockWorkerTask {
             for i in 0..newly_finalized_blocks.len() {
                 let finalizable_block = self.non_finalized_state.finalize();
 
-                let inner_block = finalizable_block.inner_block();
-                let this_hash = inner_block.hash();
-                let parent_hash = inner_block.header.previous_block_hash;
-                let this_height = inner_block.coinbase_height().expect("finalized block must have a coinbase height").0;
-
                 match self.finalized_state.commit_finalized_direct(
                     finalizable_block,
                     None,
                     "commit Crosslink-finalized block",
                 ) {
                     Ok((hash, _)) => {
-                        push_block_event(BlockEvent::CrosslinkFinalized(ShadowBlock {
-                            this_hash,
-                            parent_hash,
-                            this_height
-                        }));
                         info!("  {}: {}", i, hash);
                     }
                     Err(err) => {
@@ -338,9 +316,7 @@ impl WriteBlockWorkerTask {
     pub fn handle_commit(
         &mut self,
         queued_child: SemanticallyVerifiedBlock,
-    ) -> Result<Vec<crate::new_network::ShadowBlock>, CommitSemanticallyVerifiedError> {
-        use crate::new_network::ShadowBlock;
-
+    ) -> Result<(), CommitSemanticallyVerifiedError> {
         let child_hash = queued_child.hash;
         let parent_hash = queued_child.block.header.previous_block_hash;
 
@@ -372,7 +348,7 @@ impl WriteBlockWorkerTask {
                 self.parent_error_map.shift_remove_index(0);
             }
 
-            return result.map(|()| Vec::new());
+            return result;
         }
 
         // Committing blocks to the finalized state keeps the same chain, so we can update the
@@ -384,10 +360,6 @@ impl WriteBlockWorkerTask {
             &mut self.last_zebra_mined_log_height,
         );
 
-        // Blocks pushed past the reorg limit by this commit. Returned rather than announced:
-        // the caller is the only consumer, and it can update its own view synchronously.
-        let mut trad_finalized = Vec::new();
-
         while self
             .non_finalized_state
             .best_chain_len()
@@ -397,23 +369,11 @@ impl WriteBlockWorkerTask {
             tracing::trace!("finalizing block past the reorg limit");
             let contextually_verified_with_trees = self.non_finalized_state.finalize();
 
-            let inner_block = contextually_verified_with_trees.inner_block();
-            let this_height = inner_block.coinbase_height().expect("finalized block must have a coinbase height").0;
-            // the finalized root's own hashes, NOT the just-committed child's:
-            // a wrong hash here makes remove_chains_invalidated_by_finalized() nuke the best chain
-            let this_hash = inner_block.hash();
-            let finalized_parent_hash = inner_block.header.previous_block_hash;
-
             self.prev_finalized_note_commitment_trees = self.finalized_state
                         .commit_finalized_direct(contextually_verified_with_trees, self.prev_finalized_note_commitment_trees.take(), "commit contextually-verified request")
                         .expect(
                             "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                         ).1.into();
-            trad_finalized.push(ShadowBlock {
-                this_hash,
-                parent_hash: finalized_parent_hash,
-                this_height,
-            });
         }
 
         // Update the metrics if semantic and contextual validation passes
@@ -428,7 +388,7 @@ impl WriteBlockWorkerTask {
 
         tracing::trace!("finished processing queued block");
 
-        result.map(|()| trad_finalized)
+        result
     }
 }
 

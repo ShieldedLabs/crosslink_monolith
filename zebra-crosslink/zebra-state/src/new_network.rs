@@ -15,25 +15,6 @@ use tenderlink::{dbg_panic, dbg_verify};
 mod checkpoint;
 use checkpoint::Checkpoint;
 
-/// The last remaining event from the write task.
-///
-/// Commits and reorg-limit finalizations are no longer announced: `commit_verified` reports
-/// them synchronously, so new_network maintains its own chain view from the return value.
-/// Crosslink finalization is still pushed because BFT finalization does not route through
-/// new_network yet -- it goes crosslink service -> state -> write task. Once new_network syncs
-/// the BFT chain itself, this channel goes away entirely.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum BlockEvent {
-    CrosslinkFinalized(ShadowBlock),
-}
-static BLOCK_EVENT_QUEUE_SENDER: std::sync::OnceLock<tokio::sync::mpsc::Sender<BlockEvent>> = std::sync::OnceLock::new();
-
-pub fn push_block_event(event: BlockEvent) {
-    if let Some(tx) = BLOCK_EVENT_QUEUE_SENDER.get() {
-        tx.blocking_send(event).unwrap();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // NewNet packet types // @Todo: share common messages/code with Tenderlink
 // ---------------------------------------------------------------------------
@@ -280,16 +261,14 @@ impl NearTipChain {
     }
 }
 
-/// Similar parallel chain model to Zebra's NonFinalizedState.
+/// Parallel chain branches, as they go on the wire in a STATUS packet.
 ///
-/// Not exactly "non-finalized", as it may include finalized blocks
-/// (either on startup or after crosslink finalization).
+/// Transient: built on demand by `near_tip_chains_from_state()` out of the NonFinalizedState
+/// plus a tail of the finalized best chain, and dropped again the same tick. Nothing maintains
+/// it incrementally, so it cannot drift from what the node actually has.
 ///
-/// :ReplicatingZebraState
-/// There is a big @Todo here which is: don't replicate Zebra NonFinalizedState at all!
-/// However, by design, our replica currently does not exactly overlap NonFinalizedState.
-/// We ignore whether blocks are finalized or not when storing in the NearTipChains.
-///
+/// Not the same shape as NonFinalizedState: that one is rooted at the finalized tip, and this
+/// deliberately reaches past it so peers that are behind us have something to attach to.
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NearTipChains {
     pub finalized_height: u32,
@@ -372,30 +351,6 @@ impl NearTipChains {
 
         self.chains.sort_by_key(|ch| std::cmp::Reverse(ch.work));
     }
-
-    fn remove_chains_invalidated_by_finalized(&mut self, final_block: &ShadowBlock) {
-        self.finalized_height = self.finalized_height.max(final_block.this_height);
-        self.chains.retain_mut(|chain| {
-            debug_assert!(chain.blocks.len() > 0, "should have been removed if empty");
-            let final_block_slice = [*final_block];
-            let prefix = chain_intersect_prefix(&final_block_slice, &chain.blocks);
-
-            if prefix.len() > 0 && prefix[0].this_hash == final_block.this_hash {
-                // contains finalized block; all good
-                return true;
-            }
-
-            if chain.blocks[0].this_height > final_block.this_height {
-                // possibly long branch that clipped after finalized; too soon to tell
-                // TODO: work out if finalized is ancestor; it will eventually get phased out anyway
-                return true;
-            }
-
-            // finalization invalidates chain, remove it
-            false
-        });
-    }
-
 
     /// 0 print_bytes => no print, otherwise it's the number of bytes to print from the hashes
     fn roundtrip_to_branches(&self, max_size: usize, hash_bytes_n: usize) {
@@ -789,23 +744,75 @@ pub fn get_tips_blocking(read_state: &ReadState) -> ((Height, Hash), (Height, Ha
     }
 }
 
-pub fn is_parent_in_chains(read_state: &ReadState, near_tip_chains: &NearTipChains, parent_hash: Hash) -> bool {
-    for our_chain in &near_tip_chains.chains {
-        if our_chain.blocks.iter().any(|block| block.this_hash == parent_hash) {
-            return true;
-        }
-    }
+/// The heights we advertise: the last [`NEAR_TIP_CHAIN_LEN`] ending at `tip_h`.
+fn near_tip_start_height(tip_h: u32) -> u32 {
+    tip_h.saturating_sub(NEAR_TIP_CHAIN_LEN - 1)
+}
 
-    // @Dev @Debug, but we would like to be able to quickly do this in production as well...
-    match read_state.known_block(parent_hash) {
-        None => false,
-        Some(_block) => {
-            // @Note: if we don't find the parent in near tip chains, but we ask Zebra and Zebra is aware of it, warn loudly.
-            tracing::warn!("NewNet: Block hash {parent_hash} was NOT in near tip chains but contained by Zebra state!!");
-            //dbg_panic!();
-            true
-        }
+/// Materialize one run of blocks over `[bgn_h ..= tip_h]`.
+///
+/// `in_chain` answers for the non-finalized part. Anything it declines comes from the finalized
+/// state, which is the shared ancestry of every non-finalized chain.
+fn shadow_run(
+    db: &crate::service::finalized_state::ZebraDb,
+    bgn_h: u32,
+    tip_h: u32,
+    in_chain: impl Fn(u32) -> Option<Hash>,
+) -> Option<Vec<ShadowBlock>> {
+    let hash_at = |h: u32| in_chain(h).or_else(|| db.hash(Height(h)));
+
+    let mut parent_hash = if bgn_h == 0 { Hash([0; 32]) } else { hash_at(bgn_h - 1)? };
+
+    let mut blocks = Vec::with_capacity((tip_h + 1 - bgn_h) as usize);
+    for this_height in bgn_h..=tip_h {
+        let this_hash = hash_at(this_height)?;
+        blocks.push(ShadowBlock { parent_hash, this_hash, this_height });
+        parent_hash = this_hash;
     }
+    Some(blocks)
+}
+
+/// Build the near-tip chain tree from the state, rather than mirroring it.
+///
+/// The non-finalized state alone isn't enough. It is rooted at the finalized tip and is empty
+/// on a fresh node, but a peer that is behind us needs a finalized tail to find an attach
+/// point in. So every chain is extended backwards along the finalized best chain until the run
+/// starts at the same height for all of them.
+fn near_tip_chains_from_state(read_state: &ReadState) -> Option<NearTipChains> {
+    let db = read_state.db_clone();
+    let (finalized_height, _) = db.tip()?;
+
+    read_state.with_non_finalized_state(|nfs| {
+        let best_tip_h = match nfs.best_chain() {
+            Some(chain) => chain.non_finalized_tip_height().0,
+            None => finalized_height.0,
+        };
+        let bgn_h = near_tip_start_height(best_tip_h);
+
+        let mut out = NearTipChains { finalized_height: finalized_height.0, chains: Vec::new() };
+
+        // chain_iter() is best-first by real cumulative work, and we don't re-sort, so branch 0
+        // of the status packet is the chain we actually consider best.
+        for chain in nfs.chain_iter() {
+            let tip_h  = chain.non_finalized_tip_height().0;
+            let root_h = chain.non_finalized_root_height().0;
+            if tip_h < bgn_h {
+                continue; // aged out from under the window
+            }
+            let in_chain = |h| if h >= root_h { chain.hash_by_height(Height(h)) } else { None };
+            if let Some(blocks) = shadow_run(&db, bgn_h, tip_h, in_chain) {
+                out.push_chain_unchecked(blocks);
+            }
+        }
+
+        if out.chains.is_empty() {
+            // Nothing non-finalized: the finalized best chain is the only chain there is.
+            out.push_chain_unchecked(shadow_run(&db, bgn_h, best_tip_h, |_| None)?);
+        }
+
+        debug_assert!(out.finalized_height <= out.tip_height().unwrap_or(0));
+        Some(out)
+    })
 }
 
 use tenderlink::STP_ADDRESS_MEMORY_SIZE;
@@ -1271,9 +1278,6 @@ pub fn sync(
     mut block_writer: crate::service::write::WriteBlockWorkerTask,
     genesis: std::sync::Arc<Block>,
 ) {
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(500);
-    BLOCK_EVENT_QUEUE_SENDER.set(event_tx).unwrap();
-
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel(BLOCK_SUBMISSION_QUEUE_LEN);
     let _ = BLOCK_SUBMISSION_SENDER.set(submit_tx);
 
@@ -1293,57 +1297,10 @@ pub fn sync(
     // its eviction logic are untouched.
     let mut submission_replies: HashMap<Hash, tokio::sync::oneshot::Sender<IngestOutcome>> = HashMap::new();
 
-    let mut near_tip_chains = NearTipChains::default();
-    // @Todo: @Refactor into a fn we can call to flush and reset the NearTipChains state.
-    'init_near_tip_chains: {
+    {
         let ((tip_height, tip_hash), (finalized_tip_height, finalized_tip_hash)) = get_tips_blocking(&read_state);
         tracing::info!("NewNet: Starting at height={} hash={:?} finalized_height={} finalized_hash={}", tip_height.0, tip_hash, finalized_tip_height.0, finalized_tip_hash);
-
-        near_tip_chains.finalized_height = finalized_tip_height.0;
-
-        assert!(near_tip_chains.finalized_height <= tip_height.0);
-
-        // let res = rt.block_on(async { tfl_service.clone().oneshot(Request::Get).await });
-        // if let Some((height, hash)) = match res {
-        //     Ok(TFLServiceResponse::FinalBlockHeightHash(height_and_hash)) => height_and_hash,
-        //     Err(err) => {
-        //         tracing::error!("FinalBlockHeightHash(): Error: {err:?}");
-        //         None
-        //     }
-        //     _ => panic!("FinalBlockHeightHash(): Unhandled response: {res:?}"),
-        // } {
-        //     near_tip_chains.finalized_height_crosslink = height.0;
-        // }
-
-        // Push genesis into near_tip_chains for two reasons:
-        // - Prevents NearTipChains serialization asserts on new nodes
-        // - Allows early nodes to overlap with and push to new nodes
-        // This can be undone once fartipchain sync is ready.
-        near_tip_chains.push_blocks(&[ShadowBlock { this_hash: read_state.best_chain_block_hash(Height(0)).expect("failed to get genesis block"), ..ShadowBlock::default() }]);
-
-        let near_tip_start_height = Height(tip_height.0.saturating_sub(NEAR_TIP_CHAIN_LEN+1));
-        let Some(near_tip_start_hash) = read_state.best_chain_block_hash(near_tip_start_height) else {
-            break 'init_near_tip_chains;
-        };
-        let near_tip_hdrs = read_state.find_block_headers(vec![near_tip_start_hash], None);
-
-        let mut parent_hash = near_tip_start_hash;
-        let mut shadow_blocks = Vec::with_capacity(near_tip_hdrs.len());
-        for (i, hdr) in near_tip_hdrs.iter().enumerate() {
-            let this_height = near_tip_start_height.0 + 1 + i as u32;
-            // TODO: double-check height
-            let block = ShadowBlock {
-                parent_hash,
-                this_hash: hdr.header.hash(),
-                this_height,
-            };
-            parent_hash = block.this_hash;
-            shadow_blocks.push(block);
-        };
-
-        near_tip_chains.push_blocks(&shadow_blocks);
-
-        assert!(near_tip_chains.finalized_height <= near_tip_chains.tip_height().unwrap()); // :AssumeGenesisBlockIncludedInNearTipChains
+        assert!(finalized_tip_height <= tip_height);
     }
 
     // Keypair setup
@@ -1472,27 +1429,11 @@ pub fn sync(
                 }
             }
 
-            tracing::info!("tip height: {:?}, finalized height: {:?}, peers: {:?}", near_tip_chains.tip_height(), near_tip_chains.finalized_height, my_peers_to_print);
+            tracing::info!("tip height: {:?}, finalized height: {:?}, peers: {:?}",
+                           read_state.best_tip().map(|(h, _)| h.0),
+                           read_state.finalized_tip().map(|(h, _)| h.0),
+                           my_peers_to_print);
             next_console_status_print = loop_start + std::time::Duration::from_secs(2);
-        }
-
-        // Drain block events
-        loop {
-            match event_rx.try_recv() {
-                Ok(block_event) => {
-                    match block_event {
-                        BlockEvent::CrosslinkFinalized(block) => {
-                            near_tip_chains.remove_chains_invalidated_by_finalized(&block);
-                        }
-
-                        _ => {
-                            tracing::info!("NewNet: block_event: {:?}", block_event);
-                        }
-                    }
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(err) => { tracing::error!("{err:?}"); break; },
-            }
         }
 
         // Crosslink finalization: the BFT side asks, this loop performs it. It used to reach
@@ -1500,31 +1441,23 @@ pub fn sync(
         loop {
             match finalize_rx.try_recv() {
                 Ok(CrosslinkFinalizeRequest { hash, reply }) => {
-                    // Only finalize blocks our near-tip replica can see (or that are already
-                    // de-facto finalized in the DB). Finalizing a block outside the replica's
-                    // chains would push finalized_height past the best-chain tip and violate
-                    // the finalized_height <= tip_height invariant. Replying with an error
-                    // stalls the BFT decision (the caller retries forever) while PoW proceeds.
-                    let shadow = near_tip_chains
-                        .chains
-                        .iter()
-                        .find_map(|chain| chain.blocks.iter().find(|b| b.this_hash == hash).copied());
+                    // Only finalize blocks we actually hold. Finalizing anything else would push
+                    // finalized_height past the best-chain tip and violate the
+                    // finalized_height <= tip_height invariant. Replying with an error stalls the
+                    // BFT decision (the caller retries forever) while PoW proceeds.
+                    let held = block_writer.non_finalized_state.any_chain_contains(&hash)
+                            || block_writer.finalized_state.db.contains_hash(hash);
 
-                    let result = if shadow.is_some() || block_writer.finalized_state.db.contains_hash(hash) {
+                    let result = if held {
                         block_writer
                             .handle_crosslink_finalize(hash)
                             .map_err(|err| format!("{err:?}"))
                     } else {
                         Err(format!(
-                            "BFT finalized {hash}, which is neither in the near-tip chains nor de-facto finalized; stalling finalization"
+                            "BFT finalized {hash}, which we do not have; stalling finalization"
                         ))
                     };
 
-                    if result.is_ok() {
-                        if let Some(shadow) = &shadow {
-                            near_tip_chains.remove_chains_invalidated_by_finalized(shadow);
-                        }
-                    }
                     let _ = reply.send(result);
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -1564,7 +1497,9 @@ pub fn sync(
 
         #[cfg(debug_assertions)]
         if false { // @Dev @Debug: Roundtrip test.
-            near_tip_chains.roundtrip_to_branches(PACKET_STATUS_MAX_SIZE, if XXX_tick_loop_counter % 20 == 0 { 2 } else { 0 });
+            if let Some(chains) = near_tip_chains_from_state(&read_state) {
+                chains.roundtrip_to_branches(PACKET_STATUS_MAX_SIZE, if XXX_tick_loop_counter % 20 == 0 { 2 } else { 0 });
+            }
             XXX_tick_loop_counter += 1;
         }
 
@@ -1805,9 +1740,15 @@ pub fn sync(
         }
         blocks_to_send.clear();
 
-        // Invariant: near_tip_chains contains at least the genesis. Currently.
-        assert!(near_tip_chains.tip_height().is_some());
-        if std::time::Instant::now() >= next_status {
+        if std::time::Instant::now() >= next_status { 'send_status: {
+            next_status = std::time::Instant::now() + status_interval;
+
+            // Our chain tree, as of right now. Built here and dropped at the end of the block, so
+            // it cannot go stale and nothing has to keep it up to date.
+            let Some(near_tip_chains) = near_tip_chains_from_state(&read_state) else {
+                tracing::warn!("NewNet: no tip yet; skipping STATUS");
+                break 'send_status;
+            };
 
             let queue_len = blocks_to_commit.len().min(MAX_BLOCKS_TO_QUEUE_TO_COMMIT) as u8;
 
@@ -1895,7 +1836,7 @@ pub fn sync(
                         for (queued_hash, _) in blocks_to_commit.iter().take(queue_len as usize) {
                             o += queued_hash.0 .write_to(&mut buf[o..]);
                         }
-                        o += historical_chains .write_to(&mut buf[o..], Some(near_tip_chains.tip_height().expect("at least genesis block assumed included in near tip chains"))); // @TODO: this will break if we remove genesis...
+                        o += historical_chains .write_to(&mut buf[o..], Some(near_tip_chains.tip_height().expect("near_tip_chains_from_state() always produces at least one chain")));
 
 
                         // if TRACE { tracing::info!("Send a historical STATUS to {:?} @ {}", address, their_final_parent_parent_height + 1); }
@@ -1908,14 +1849,20 @@ pub fn sync(
                     packets_to_send.push((key, Vec::from(&buf[..o])));
                 }
             }
-
-            next_status = std::time::Instant::now() + status_interval;
-        }
+        }}
 
         // Discard statuses of disconnected peers
         peers.retain(|connection_key, _| current_connections.iter().any(|(addr, _)| addr.connection_key() == *connection_key));
 
-        if std::time::Instant::now() >= next_dl_init {
+        if std::time::Instant::now() >= next_dl_init { 'init_dls: {
+            next_dl_init = std::time::Instant::now() + dl_init_interval;
+
+            // Same deal as the STATUS block: built here, used here, dropped here.
+            let Some(near_tip_chains) = near_tip_chains_from_state(&read_state) else {
+                tracing::warn!("NewNet: no tip yet; skipping download init");
+                break 'init_dls;
+            };
+
             if !checkpoint_committed_locally {
                 if let Some(cp) = &checkpoint {
                     checkpoint_committed_locally = read_state.best_chain_block_hash(Height(cp.height)) == Some(cp.hash);
@@ -2011,14 +1958,6 @@ pub fn sync(
                         tracing::warn!("{}", format!("NewNet: Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
                     }};
                 }
-
-                let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height())
-                else {
-                    warning!("I don't have a tip height yet");
-                    continue 'send_to_peers;
-                };
-
-
 
                 // // rule to push:
                 // //     per each of our chains:
@@ -2242,8 +2181,7 @@ pub fn sync(
             }
 
             if TRACE { tracing::info!("Started {} new block dls (currently {active_block_dls}/{MAX_BANDWIDTH_BLOCKS_PER_RES})", active_block_dls - prev_active_block_dls); }
-            next_dl_init = std::time::Instant::now() + dl_init_interval;
-        }
+        }}
 
         if std::time::Instant::now() >= next_peer_request {
             for (connection_key, peer) in peers.iter_mut() {
@@ -2257,14 +2195,10 @@ pub fn sync(
                         // Prevent cycles of receiving a sub-chunk after completing, then re-requesting a block we now have
                         // TODO: there may be a neater way to achieve the same thing
                         let HeightAndHashOr0 { height: block::Height(height), hash_or_0 } = peer.block_downloads.slots[dl_i].height_hash;
-                        if hash_or_0 != block::Hash([0;32]) {
-                            for our_chain in &near_tip_chains.chains {
-                                if our_chain.blocks.iter().any(|block| block.this_hash == hash_or_0) {
-                                    tracing::warn!("Don't need to re-request: block @ {height}, {hash_or_0} was already committed!");
-                                    peer.block_downloads.remove(dl_i);
-                                    continue 'downloads;
-                                }
-                            }
+                        if hash_or_0 != block::Hash([0;32]) && read_state.known_block(hash_or_0).is_some() {
+                            tracing::warn!("Don't need to re-request: block @ {height}, {hash_or_0} was already committed!");
+                            peer.block_downloads.remove(dl_i);
+                            continue 'downloads;
                         }
 
                         let dl = &peer.block_downloads.slots[dl_i];
@@ -2490,11 +2424,6 @@ pub fn sync(
                     // println!("Height requested that doesn't exist on BC: {:?}", height_hash.height);
                 }
             } else if packet_type == PACKET_TYPE_BLOCK_CHUNK {
-                let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height()) else {
-                    warning!("I don't have a tip height yet");
-                    continue 'process_packets;
-                };
-
                 let Some(hdr) = some_or_kill!(PeerPowBlockResponseChunkHdr::read_from(&mut msg), "failed to read PoW chunk header") else {
                     continue 'process_packets;
                 };
@@ -2516,11 +2445,12 @@ pub fn sync(
                 // @Note: for valid blocks the height can be computed from block data, so this is an early-out optimization.
                 let alleged_height = hdr.height_hash.height.0;
 
-                // @Note: Skip blocks that are older than the base of our NearTipChain view of the best chain.
-                // Depending on whether our NEAR_TIP_CHAIN_LEN is < or > Zebra's MAX_BLOCK_REORG_HEIGHT,
-                // presence in the best NearTipChain *may* or *may not* logically imply that this new block
-                // is "not even worth" submitting to Zebra (rejected due to being too far back).
-                let min_height = near_tip_chains.chains[0].blocks[0].this_height; // @Todo: this assumes :AssumeGenesisBlockIncludedInNearTipChains
+                // @Note: Skip blocks older than the base of the window we advertise. Depending on
+                // whether NEAR_TIP_CHAIN_LEN is < or > Zebra's MAX_BLOCK_REORG_HEIGHT, being below
+                // it *may* or *may not* imply the block is "not even worth" submitting to Zebra
+                // (rejected due to being too far back).
+                let (best_tip_height, _) = read_state.best_tip().expect("genesis is committed before the sync loop starts");
+                let min_height = near_tip_start_height(best_tip_height.0);
 
                 // if TRACE { tracing::info!("Block @ {alleged_height}, offset {}...", hdr.offset); }
 
@@ -2530,7 +2460,8 @@ pub fn sync(
                     continue 'process_packets; // Deciding that it's "not even worth" sending to Zebra
                 }
 
-                if alleged_height <= near_tip_chains.finalized_height {
+                let finalized_height = read_state.finalized_tip().map_or(0, |(h, _)| h.0);
+                if alleged_height <= finalized_height {
                     warning!("Block at height {alleged_height} is already finalized");
                     peer.block_downloads.remove(dl_i);
                     continue 'process_packets; // Definitely already committed :)
@@ -2581,12 +2512,10 @@ pub fn sync(
                         continue 'process_packets;
                     }
 
-                    for our_chain in &near_tip_chains.chains {
-                        if our_chain.blocks.iter().any(|block| block.this_hash == alleged_hash) {
-                            warning!("Block was already committed!: {alleged_hash}");
-                            peer.block_downloads.remove(dl_i);
-                            continue 'process_packets;
-                        }
+                    if read_state.known_block(alleged_hash).is_some() {
+                        warning!("Block was already committed!: {alleged_hash}");
+                        peer.block_downloads.remove(dl_i);
+                        continue 'process_packets;
                     }
                 }
 
@@ -2631,7 +2560,7 @@ pub fn sync(
                     Hash(parent_hash)
                 };
 
-                let have_parent_in_chains           = is_parent_in_chains(&read_state, &near_tip_chains, parent_hash);
+                let have_parent_in_chains           = read_state.known_block(parent_hash).is_some();
                 let have_parent_in_blocks_to_commit = blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == parent_hash);
 
                 // @Experimental: Accept non-committable tails by commenting out the skip. This should be vetted for DoS - could an adversary queue nonsense blocks?
@@ -2687,7 +2616,7 @@ pub fn sync(
                         peer.has_checkpoint_block = true;
                         // re-run the dup checks skipped for probes; don't queue the block twice
                         if blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == hash)
-                            || near_tip_chains.chains.iter().any(|c| c.blocks.iter().any(|b| b.this_hash == hash)) {
+                            || read_state.known_block(hash).is_some() {
                             continue 'process_packets;
                         }
                     }
@@ -2756,7 +2685,7 @@ pub fn sync(
 
             let parent_hash = block_arc.header.previous_block_hash;
 
-            if !is_parent_in_chains(&read_state, &near_tip_chains, parent_hash) {
+            if read_state.known_block(parent_hash).is_none() {
                 return true; // keep
             }
 
@@ -2854,7 +2783,7 @@ pub fn sync(
                     };
                     block_writer
                         .handle_commit(semantically_verified)
-                        .map(|trad_finalized| (hash, trad_finalized))
+                        .map(|()| hash)
                         .map_err(|err| {
                             let msg = format!("{err:?}");
                             if msg.contains("Duplicate") || msg.contains("AlreadyFinalized") {
@@ -2869,7 +2798,7 @@ pub fn sync(
 
             if let Some(reply) = submission_replies.remove(&hash) {
                 let outcome = match (&verdict, &res) {
-                    (_, Ok((committed, _))) => IngestOutcome::Committed(*committed),
+                    (_, Ok(committed)) => IngestOutcome::Committed(*committed),
                     (_, Err(BlockCommitError::Duplicate)) => IngestOutcome::Known {
                         location: crate::response::KnownBlockLocation::BestChain,
                         height: block::Height(height),
@@ -2893,28 +2822,14 @@ pub fn sync(
             }
 
             match res {
-                Ok((_, trad_finalized)) => {
+                Ok(_) => {
+                    // handle_commit() already published the new chain state through the tip and
+                    // non-finalized-state channels, on this thread, before returning. Anything
+                    // that wants the chain view reads it back out of the state.
                     println!("committed!: @ {height}, {hash}");
-
-                    // Maintain the chain view from the commit result. This used to arrive as
-                    // BlockEvent::Committed / ::TradFinalized from the write task; now that the
-                    // commit is a synchronous call that reports what it did, the round trip is
-                    // unnecessary -- and so is the channel that made it possible for the write
-                    // task to block on a full queue while this loop was parked in a commit.
-                    near_tip_chains.push_blocks(&[ShadowBlock {
-                        this_hash: hash,
-                        parent_hash,
-                        this_height: height,
-                    }]);
-                    for finalized in &trad_finalized {
-                        near_tip_chains.remove_chains_invalidated_by_finalized(finalized);
-                    }
-
                     false // remove
                 }
                 Err(BlockCommitError::Duplicate) => {
-                    // @Todo: We would like to update the finalized height here, but
-                    //        we would also have to call near_tip_chains.remove_chains_invalidated_by_finalized() with that height.
                     println!("Already was committed: {}", hash);
                     false // remove
                 }
@@ -2930,7 +2845,7 @@ pub fn sync(
         // waste. This replaces a blanket clear() that used to throw away the whole cache --
         // including blocks that were merely waiting for their parent -- whenever no block
         // happened to make progress in a tick.
-        let finalized_height = near_tip_chains.finalized_height;
+        let finalized_height = read_state.finalized_tip().map_or(0, |(h, _)| h.0);
         blocks_to_commit.retain(|(hash, block)| {
             let height = block.coinbase_height().map_or(0, |h| h.0);
             if height <= finalized_height {

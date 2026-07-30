@@ -574,6 +574,18 @@ impl ReadStateService {
         Some((header, height, hash, next_block_hash))
     }
 
+    /// Run `f` against the latest non-finalized state.
+    ///
+    /// new_network builds its near-tip chain tree out of this instead of maintaining its own
+    /// copy of it.
+    pub(crate) fn with_non_finalized_state<U>(
+        &self,
+        f: impl FnOnce(&NonFinalizedState) -> U,
+    ) -> U {
+        self.non_finalized_state_receiver
+            .with_watch_data(|non_finalized_state| f(&non_finalized_state))
+    }
+
     /// Gets a clone of the latest non-finalized state from the `non_finalized_state_receiver`
     fn latest_non_finalized_state(&self) -> NonFinalizedState {
         self.non_finalized_state_receiver.cloned_watch_data()
@@ -1879,7 +1891,7 @@ pub fn spawn_init(
 pub fn init_test(network: &Network) -> Buffer<BoxService<Request, Response, BoxError>, Request> {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, _, _, _) =
+    let (state_service, _, _, _, _block_writer) =
         StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, Arc::new(|_,_,_| Some(true)));
 
     Buffer::new(BoxService::new(state_service), 1)
@@ -1900,7 +1912,7 @@ pub fn init_test_services(
 ) {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, read_state_service, latest_chain_tip, chain_tip_change) =
+    let (state_service, read_state_service, latest_chain_tip, chain_tip_change, _block_writer) =
         StateService::new(Config::ephemeral(), network, block::Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
