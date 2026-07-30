@@ -708,7 +708,7 @@ const TRACE     :bool=0!=       0;
 //        coprime millisecond intervals, so we can make sure our code is not relying on
 //        any kind of consistent or clean timing in order to function properly.
 
-const STATUS_MS: u64 = 8000;  // fastest interval at which to send status messages
+const STATUS_MS: u64 = 4000;  // fastest interval at which to send status messages
 const BLOCK_SEND_MS: u64 = 500; // fastest interval at which to send blocks to peers
 
 
