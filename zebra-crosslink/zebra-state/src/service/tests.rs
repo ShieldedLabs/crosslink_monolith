@@ -412,7 +412,8 @@ proptest! {
         let _init_guard = zebra_test::init();
 
         // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
-        let (mut state_service, _, _, _, _block_writer) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
+        // Commits go straight through the writer now; StateService no longer queues them.
+        let (state_service, _, _, _, mut block_writer) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
 
         prop_assert_eq!(state_service.read_service.db.finalized_value_pool(), ValueBalance::zero());
         prop_assert_eq!(
@@ -435,8 +436,7 @@ proptest! {
                 expected_finalized_value_pool += *block_value_pool;
             }
 
-            let result_receiver = state_service.queue_and_commit_to_finalized_state(block.clone());
-            let result = result_receiver.blocking_recv();
+            let result = block_writer.commit_checkpoint_verified(block.clone());
 
             prop_assert!(result.is_ok(), "unexpected failed finalized block commit: {:?}", result);
 
@@ -461,8 +461,7 @@ proptest! {
             let block_value_pool = &block.block.chain_value_pool_change(&transparent::utxos_from_ordered_utxos(utxos), None)?;
             expected_non_finalized_value_pool += *block_value_pool;
 
-            let result_receiver = state_service.queue_and_commit_to_non_finalized_state(block.clone());
-            let result = result_receiver.blocking_recv();
+            let result = block_writer.handle_commit(block.clone());
 
             prop_assert!(result.is_ok(), "unexpected failed non-finalized block commit: {:?}", result);
 
@@ -505,7 +504,12 @@ proptest! {
         let _init_guard = zebra_test::init();
 
         // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
-        let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change, _block_writer) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
+        // @Note: this test is still #[ignore]d, and the finalized half of it is now stale as well
+        // as whatever the activation-height problem is. queue_and_commit_to_finalized_state()
+        // published the chain tip; commit_checkpoint_verified() does not (only commit_genesis()
+        // does), so the latest_chain_tip / chain_tip_change assertions in the first loop will not
+        // hold as written. Ported to keep the crate's test target building, not revived.
+        let (_state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change, mut block_writer) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
 
         prop_assert_eq!(latest_chain_tip.best_tip_height(), None);
         prop_assert_eq!(chain_tip_change.last_tip_change(), None);
@@ -521,8 +525,7 @@ proptest! {
                 TipAction::grow_with(expected_block.clone().into())
             };
 
-            let result_receiver = state_service.queue_and_commit_to_finalized_state(block);
-            let result = result_receiver.blocking_recv();
+            let result = block_writer.commit_checkpoint_verified(block);
 
             prop_assert!(result.is_ok(), "unexpected failed finalized block commit: {:?}", result);
 
@@ -544,8 +547,7 @@ proptest! {
                 TipAction::grow_with(expected_block.clone().into())
             };
 
-            let result_receiver = state_service.queue_and_commit_to_non_finalized_state(block);
-            let result = result_receiver.blocking_recv();
+            let result = block_writer.handle_commit(block);
 
             prop_assert!(result.is_ok(), "unexpected failed non-finalized block commit: {:?}", result);
 
