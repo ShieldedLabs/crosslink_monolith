@@ -688,12 +688,30 @@ impl TMState {
             // Dead votes are re-delivered forever by catchup, hence the 1/s cap.
             if self.last_sig_fault_print.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(1)) {
                 self.last_sig_fault_print = Some(std::time::Instant::now());
-                let actual = (0..active_roster_len(roster)).find(|&i| sig.verify_with_namespace(roster[i].pub_key, signed_data, &self.vote_namespace).is_ok());
-                match actual {
-                    Some(i) => eprintln!("{ctx_str} {ANSI_RED}SIG FAULT{ANSI_RST}: claimed roster_i {} {:?} but verifies as roster_i {} {:?} (stake {}) -- roster order/membership divergence",
-                                         roster_i, from_pub_key, i, roster[i].pub_key, roster[i].stake),
-                    None    => eprintln!("{ctx_str} {ANSI_RED}SIG FAULT{ANSI_RST}: claimed roster_i {} {:?}, verifies as nobody on the roster (namespace divergence or garbage): {}",
-                                         roster_i, from_pub_key, err),
+                // The vote payload embeds the signer's pub key in bytes 0..32, so naming a
+                // shifted signer requires rebuilding the payload per candidate key -- swapping
+                // only the verification key can never match. Proposal chunk payloads don't
+                // embed the key, so for those the raw payload is reused as-is.
+                let is_vote      = packet_type == PACKET_TYPE_PREVOTE_SIGNATURES || packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES;
+                let is_precommit = packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES;
+                let variant      = (value_id != ValueId::NIL) as usize;
+                let actual = (0..active_roster_len(roster)).find(|&i| {
+                    if is_vote {
+                        let sd = make_vote_sign_datas(roster[i].pub_key, is_precommit, height, round, value_id);
+                        sig.verify_with_namespace(roster[i].pub_key, &sd[variant], &self.vote_namespace).is_ok()
+                    } else {
+                        sig.verify_with_namespace(roster[i].pub_key, signed_data, &self.vote_namespace).is_ok()
+                    }
+                });
+                let nil_ns_ok = self.vote_namespace != [0u8; 32] &&
+                    sig.verify_with_namespace(from_pub_key, signed_data, &[0u8; 32]).is_ok();
+                match (actual, nil_ns_ok) {
+                    (Some(i), _) => eprintln!("{ctx_str} {ANSI_RED}SIG FAULT{ANSI_RST}: claimed roster_i {} {:?} but verifies as roster_i {} {:?} (stake {}) -- roster order/membership divergence",
+                                              roster_i, from_pub_key, i, roster[i].pub_key, roster[i].stake),
+                    (None, true) => eprintln!("{ctx_str} {ANSI_RED}SIG FAULT{ANSI_RST}: claimed roster_i {} {:?} verifies under the NIL namespace -- sender did not apply this height's vote namespace",
+                                              roster_i, from_pub_key),
+                    (None, false) => eprintln!("{ctx_str} {ANSI_RED}SIG FAULT{ANSI_RST}: claimed roster_i {} {:?}, verifies as nobody on the roster (key absent from our roster, or garbage): {}",
+                                               roster_i, from_pub_key, err),
                 }
             }
             return TMStatus::Fail;
