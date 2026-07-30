@@ -1254,6 +1254,9 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
 
             let mut cursor = Cursor::new(pos_file_bytes);
             let mut valid_byte_count = 0;
+            // BC height finalized by the previous loaded block's cert; the roster voting on
+            // block N was formed at N-1's decision, so N's replayed roster must use this.
+            let mut prev_finalized_bc_height: u64 = 0;
             'big_loop: loop {
                 valid_byte_count = cursor.position();
                 let block = if let Ok(block) = BftBlock::zcash_deserialize(&mut cursor) { block } else { break; };
@@ -1284,16 +1287,27 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 let mut round_data = tenderlink::RoundData::EMPTY;
                 // Historical round replay: filter the roster exactly as the live path did at this
                 // height, so it matches the roster that actually voted on this decided block (the
-                // sigs/counts below are derived from it). Uses this block's own height and the BC
-                // height it finalized (derived from its finalization-candidate header). For pre-
-                // hardfork heights this is a no-op, so existing chains are unaffected.
+                // sigs/counts below are derived from it, and votes travel by roster index -- a
+                // divergent roster re-indexes every stored vote through seats that never voted).
+                // The live roster for block N was formed when N-1 was decided, from the BC height
+                // *that* decision finalized -- so use the previous iteration's candidate height,
+                // NOT this block's own. Using fin-by-N here jailed/unjailed finalizers one cert
+                // early at a hardfork activation boundary (e.g. the cert finalizing the activation
+                // block itself, where the predicate flips inside the one-block gap).
                 let this_bft_height = ingest_data_for_tenderlink.len() as u64;
-                let this_finalized_bc_height: u64 = if let Some(candidate) = block.headers.first() {
-                    let candidate_hash = ZebBlockHash(BlockHash::from_header_data(candidate).0);
-                    block_height_from_hash(&call, candidate_hash).await.map(|h| h.0 as u64).unwrap_or(0)
-                } else { 0 };
-                let this_terminated = terminated_finalizers_at(&config.hardforks, this_bft_height, this_finalized_bc_height);
+                let this_terminated = terminated_finalizers_at(&config.hardforks, this_bft_height, prev_finalized_bc_height);
                 round_data.roster = tenderlink_roster_from_internal(&unsorted_roster, &this_terminated);
+                // Advance the watermark to this block's candidate height for the next iteration.
+                // If the candidate can't be resolved (PoW DB behind the pos file, e.g. wiped and
+                // re-syncing), keep the last known height: monotone, and correct whenever the DB
+                // is intact -- unlike the old `unwrap_or(0)`, which activated the entire blacklist
+                // across the whole replay, nondeterministically by DB-availability race.
+                if let Some(candidate) = block.headers.first() {
+                    let candidate_hash = ZebBlockHash(BlockHash::from_header_data(candidate).0);
+                    if let Some(h) = block_height_from_hash(&call, candidate_hash).await {
+                        prev_finalized_bc_height = h.0 as u64;
+                    }
+                }
                 round_data.msg_val_sigs = round_data.roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.pub_key == v.pub_key).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), TMSig(s))]).collect();
                 round_data.msg_nil_sigs = vec![[TMSig::NIL; 2]; round_data.roster.len()];
                 round_data.counts.precommits = fat_pointer.signatures.len() as u64;
