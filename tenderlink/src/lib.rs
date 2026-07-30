@@ -1528,6 +1528,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let mut next_peer_gossip  = std::time::Instant::now();
     let mut next_peer_connect = std::time::Instant::now();
+    let mut decide_wait_roster_printed: (u64, u32) = (u64::MAX, 0);
 
     let mut send_buf1 = [0u8; 2048];
     let mut next_tick_time = tokio::time::Instant::now();
@@ -2041,12 +2042,30 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         let f = TMState::f_from_n(total_active_stake);
                         let big_threshold = if f == 0 { total_active_stake } else { 2*f + 1 };
                         for rd in bft_state.rounds_data.iter().filter(|r| r.height == bft_state.height && r.counts.yes_precommits > 0) {
-                            println!("{ctx_str} {ANSI_YLW}DECIDE_WAIT{ANSI_RST} {}.{}: yc:{}/{} (yv:{} total:{} f:{}) proposal:{}/{} validity:{:?}",
+                            // Per-member vote fill, one char per active roster index:
+                            // C yes-precommit (counts toward yc), n nil-precommit, p prevote only, . silent.
+                            let n = active_roster_len(&rd.roster).min(rd.msg_val_sigs.len());
+                            let fill: String = (0..n).map(|i| {
+                                if      rd.msg_val_sigs[i][1].1 != TMSig::NIL { 'C' }
+                                else if rd.msg_nil_sigs[i][1]   != TMSig::NIL { 'n' }
+                                else if rd.msg_val_sigs[i][0].1 != TMSig::NIL ||
+                                        rd.msg_nil_sigs[i][0]   != TMSig::NIL { 'p' }
+                                else                                          { '.' }
+                            }).collect();
+                            println!("{ctx_str} {ANSI_YLW}DECIDE_WAIT{ANSI_RST} {}.{}: yc:{}/{} (yv:{} total:{} f:{}) proposal:{}/{} votes:{} validity:{:?}",
                                      rd.height, rd.round,
                                      rd.counts.yes_precommits, big_threshold,
                                      rd.counts.yes_prevotes, total_active_stake, f,
                                      rd.proposal_sigs_n, rd.proposal_sigs.len(),
+                                     fill,
                                      rd.proposal_checked_validity);
+                            // Index -> (key, stake) legend for the fill string, once per wedged round.
+                            if decide_wait_roster_printed != (rd.height, rd.round) {
+                                decide_wait_roster_printed = (rd.height, rd.round);
+                                let members: Vec<String> = rd.roster[..n].iter().enumerate()
+                                    .map(|(i, m)| format!("{}:{:?}={}", i, m.pub_key, m.stake)).collect();
+                                println!("{ctx_str} {ANSI_YLW}DECIDE_WAIT{ANSI_RST} {}.{} roster: [{}]", rd.height, rd.round, members.join(", "));
+                            }
                         }
                     }
                 }
