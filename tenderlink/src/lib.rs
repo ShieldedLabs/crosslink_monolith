@@ -710,7 +710,7 @@ impl TMState {
         //       network is faulty; we just need to wait and see which one
         //       is the decisive one.)  -Phil 2025-10-20
         // NOTE: @Incomplete: for now, only track the latest proposal.
-        let is_my_proposal = (from_pub_key == self.my_pub_key);
+        let is_from_me = (from_pub_key == self.my_pub_key);
 
         match packet_type {
             PACKET_TYPE_PROPOSAL_CHUNK => {
@@ -719,7 +719,7 @@ impl TMState {
 
                 // "have they previously proposed a different value?"
                 if is_prev_seen_round && round_data.proposal_sigs_n > 0 {
-                    if is_my_proposal &&
+                    if is_from_me &&
                       (round_data.proposal.0.len() != hdr.proposal_size as usize ||
                        round_data.proposal_id != value_id ||
                        round_data.proposal_valid_round != valid_round) { // Amnesiac Proposer's Dilemma
@@ -801,7 +801,7 @@ impl TMState {
 
                     // TODO: include signed prevote & precommit for self?
                 } else if round_data.proposal_sigs[chunk_i] != sig { // TODO: check value/sig conformance
-                    if is_my_proposal { // Amnesiac Proposer's Dilemma
+                    if is_from_me { // Amnesiac Proposer's Dilemma
                         round_data.flush_for_amnesiac_proposer(value_id, valid_round, roster, hdr.proposal_size);
                         eprintln!("{ctx_str} {ANSI_YLW}AMNESIAC PROPOSER{ANSI_RST} at {}.{}.{}: Flushing proposal...", height, round, chunk_i);
                     } else {
@@ -839,9 +839,17 @@ impl TMState {
                 let old_val_sig = round_data.msg_val_sigs[roster_i][is_precommit];
                 let new_val_sig = (value_id, sig);
                 if old_val_sig.1 != TMSig::NIL && new_val_sig != old_val_sig {
-                    // TODO: do we want to allow for NIL updating to valid?
-                    eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} voted on 2 different values ({:?}, {:?}). Ignoring latest...", height, round, roster_i, new_val_sig, old_val_sig);
-                    return TMStatus::Fail;
+                    // Amnesiac Voter's Dilemma. Same shape as the proposer case above, but a vote is a
+                    // commitment, so we can't just take the newer one. We only ever upgrade our own NIL
+                    // to a real value: that direction can't retract anything we already broadcast, and
+                    // it's what unsticks a node resyncing from zero that already NIL'd this round.
+                    if is_from_me && old_val_sig.0 == ValueId::NIL && value_id != ValueId::NIL {
+                        eprintln!("{ctx_str} {ANSI_YLW}AMNESIAC VOTER{ANSI_RST} at {}.{}: adopting our own {} on {} over the NIL we cast this session.",
+                            height, round, ["prevote", "precommit"][is_precommit], value_id);
+                    } else {
+                        eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} voted on 2 different values ({:?}, {:?}). Ignoring latest...", height, round, roster_i, new_val_sig, old_val_sig);
+                        return TMStatus::Fail;
+                    }
                 }
                 // Checks now finished //////////////////////////
 
