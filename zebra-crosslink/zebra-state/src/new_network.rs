@@ -723,7 +723,9 @@ const IDLE_MS: u64 = 100;
 
 const MAX_BANDWIDTH_BYTES_PER_MS: usize = 7_000; // 7 MB/s
 const MAX_BANDWIDTH_BYTES_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_MS * PEER_RESPOND_MS as usize;
-const MAX_BANDWIDTH_BLOCKS_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_RES / zebra_chain::block::MAX_BLOCK_BYTES as usize;
+// x2: the budget sizes every in-flight block at MAX_BLOCK_BYTES, but real blocks are a small
+// fraction of that, so the unscaled count leaves most of the bandwidth budget unused.
+const MAX_BANDWIDTH_BLOCKS_PER_RES: usize = 2 * (MAX_BANDWIDTH_BYTES_PER_RES / zebra_chain::block::MAX_BLOCK_BYTES as usize);
 
 
 // use crate::crosslink::TFLServiceRequest;
@@ -982,7 +984,7 @@ impl SliceWrite for PeerPowBlockResponseChunkHdr {
     }
 }
 
-const BLOCK_DOWNLOADS_N: usize = 8;
+const BLOCK_DOWNLOADS_N: usize = 32;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BlockDownloads {
@@ -1902,7 +1904,7 @@ pub fn sync(
             let prev_active_block_dls = active_block_dls;
 
             // TODO: weight peers by observed quality
-            const MAX_PEERS_TO_INIT_DLS_FROM: usize = 8;
+            const MAX_PEERS_TO_INIT_DLS_FROM: usize = 16;
 
             /*  Note(Sam): CRITICAL BUG THAT I AM ADDRESSING NOW. We cannot randomly select a fixed number of
                 peers. We must first filter the peers by who has something we can download. Otherwise we will
