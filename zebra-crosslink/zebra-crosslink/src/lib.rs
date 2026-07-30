@@ -246,6 +246,24 @@ pub(crate) fn terminated_finalizers_at(
     set
 }
 
+// The key is already a blake3 hash — uniformly distributed — so re-hashing it (SipHash)
+// is wasted work. Xor-fold the written bytes to a u64 instead; the map's full-key Eq
+// still guards against fold collisions.
+#[derive(Default)]
+pub(crate) struct Blake3HashFold(u64);
+impl std::hash::Hasher for Blake3HashFold {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut v = [0u8; 8];
+            v[..chunk.len()].copy_from_slice(chunk);
+            self.0 ^= u64::from_le_bytes(v);
+        }
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct TFLServiceInternal {
@@ -259,6 +277,13 @@ pub(crate) struct TFLServiceInternal {
     bft_msg_flags: u64, // ALT: Vec of messages/combine flags
     bft_err_flags: u64,
     bft_blocks: Vec<BftBlock>,
+    // Accelerates fat-pointer resolution: block hash -> 0-based height (== index into
+    // bft_blocks). blake3_hash() re-serializes the whole block per call, so resolving a
+    // pointer by scanning bft_blocks costs ~150 MB of hashing at 9.5k blocks — this map
+    // makes it a lookup. Real blocks only (the filler placeholders in
+    // handle_new_decided_bft_block are never valid pointer targets); append-only, so
+    // entries are never invalidated.
+    bft_block_hash_to_height: HashMap<Blake3Hash, u64, std::hash::BuildHasherDefault<Blake3HashFold>>,
     fat_pointer_to_tip: FatPointerToBftBlock,
     our_set_bft_string: Option<String>,
     active_bft_string: Option<String>,
@@ -311,8 +336,8 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     let child_index = if child_is_null {
         None
     } else {
-        match internal.bft_blocks.iter().position(|b| b.blake3_hash() == child_fat_pointer.points_at_block_hash()) {
-            Some(h) => Some(h),
+        match internal.bft_block_hash_to_height.get(&child_fat_pointer.points_at_block_hash()) {
+            Some(&h) => Some(h as usize),
             None => return None, // unresolved child -> defer (reversible)
         }
     };
@@ -332,8 +357,8 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     let parent_index = if parent_is_null {
         None
     } else {
-        match internal.bft_blocks.iter().position(|b| b.blake3_hash() == parent_fat_pointer.points_at_block_hash()) {
-            Some(h) => Some(h),
+        match internal.bft_block_hash_to_height.get(&parent_fat_pointer.points_at_block_hash()) {
+            Some(&h) => Some(h as usize),
             None => return None, // unresolved parent -> defer (reversible)
         }
     };
@@ -753,6 +778,7 @@ async fn handle_new_decided_bft_block(
     );
     assert!(!new_block.headers.is_empty());
     // info!("Inserting bft block at {} with hash {}", insert_i, new_block.blake3_hash());
+    internal.bft_block_hash_to_height.insert(new_block.blake3_hash(), insert_i as u64);
     internal.bft_blocks[insert_i] = new_block.clone();
     internal.fat_pointer_to_tip = fat_pointer.clone();
     internal.latest_final_block = Some((new_final_height, new_final_hash));
@@ -1349,6 +1375,11 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
             let terminated = terminated_finalizers_at(&config.hardforks, startup_bft_height, new_final_height.0 as u64);
             let roster = tenderlink_roster_from_internal(&unsorted_roster, &terminated);
             internal.finalizers_at_current_height = unsorted_roster;
+            internal.bft_block_hash_to_height = i_bft_blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.blake3_hash(), i as u64))
+                .collect();
             internal.bft_blocks = i_bft_blocks;
             internal.fat_pointer_to_tip = fat_pointer_to_tip;
             if new_final_hash != ZebBlockHash([0; 32]) {
