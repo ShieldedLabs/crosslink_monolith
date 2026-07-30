@@ -470,6 +470,9 @@ pub struct TMState {
 
     pub recent_commit_round_cache: Vec<RoundData>, // for now will hold all completed heights
 
+    /// Rate limiter for the always-on sig-fault print (re-delivered dead votes would flood).
+    last_sig_fault_print: Option<std::time::Instant>,
+
     propose_closure: ClosureToProposeNewBlock,
     validate_closure: ClosureToValidateProposedBlock,
     push_block_closure: ClosureToPushDecidedBlock,
@@ -500,6 +503,7 @@ impl TMState {
 
             rounds_data: Vec::new(),
             recent_commit_round_cache: Vec::new(),
+            last_sig_fault_print: None,
 
             propose_closure,
             validate_closure,
@@ -675,15 +679,21 @@ impl TMState {
         // check if data was signed by pub key. Vote namespacing: mix in this height's
         // namespace (nil -> unchanged). `height == self.height` is guaranteed above, so
         // `self.vote_namespace` is the correct namespace for `signed_data`.
-        match sig.verify_with_namespace(from_pub_key, signed_data, &self.vote_namespace) { Ok(())=>{}, Err((err, str))=> {
-            if PRINT_BFT_SIG_FAULT {
-                eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST}: {} (..{}): for {} {}", str, signed_data.len(), value_id, err);
-                #[cfg(debug_assertions)]
-                {
-                    println!("DEBUG LOOP OVER ALL ROSTER AND TRIAL VERIFY only success should be {} but that is not so... :(", roster_i);
-                    for i in 0..roster.len() {
-                        println!("{}: success={} pub_key: {:?} stake: {} cumulative_stake: {}", i, sig.verify_with_namespace(roster[i].pub_key, signed_data, &self.vote_namespace).is_ok(), roster[i].pub_key, roster[i].stake, roster[i].cumulative_stake);
-                    }
+        match sig.verify_with_namespace(from_pub_key, signed_data, &self.vote_namespace) { Ok(())=>{}, Err((err, _str))=> {
+            // Always-on, rate-limited: sig failures are the silent killer in roster-divergence
+            // bugs -- votes are addressed by roster index, so an order/membership mismatch
+            // verifies against the wrong key with no other symptom. Trial-verify against the
+            // whole roster to name the actual signer: "verifies as roster_i N" = index shift
+            // (roster divergence); "verifies as nobody" = namespace divergence or garbage.
+            // Dead votes are re-delivered forever by catchup, hence the 1/s cap.
+            if self.last_sig_fault_print.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+                self.last_sig_fault_print = Some(std::time::Instant::now());
+                let actual = (0..active_roster_len(roster)).find(|&i| sig.verify_with_namespace(roster[i].pub_key, signed_data, &self.vote_namespace).is_ok());
+                match actual {
+                    Some(i) => eprintln!("{ctx_str} {ANSI_RED}SIG FAULT{ANSI_RST}: claimed roster_i {} {:?} but verifies as roster_i {} {:?} (stake {}) -- roster order/membership divergence",
+                                         roster_i, from_pub_key, i, roster[i].pub_key, roster[i].stake),
+                    None    => eprintln!("{ctx_str} {ANSI_RED}SIG FAULT{ANSI_RST}: claimed roster_i {} {:?}, verifies as nobody on the roster (namespace divergence or garbage): {}",
+                                         roster_i, from_pub_key, err),
                 }
             }
             return TMStatus::Fail;
