@@ -240,6 +240,10 @@ pub struct RoundData {
 
     // TODO: we may be able to compress valueid, but we do need to track it before we have the proposal
     pub msg_val_sigs: Vec<[(ValueId, TMSig); 2]>, // prevote then precommit
+    // NIL votes are stored apart from value votes: a finalizer that restarts mid-height can
+    // legitimately sign both (e.g. NIL this life, a value last life), so NIL + value is not
+    // equivocation -- only two different *value* votes are. Both slots count toward the tallies.
+    pub msg_nil_sigs: Vec<[TMSig; 2]>, // prevote then precommit
     pub roster: Vec<SortedRosterMember>,
 
     pub counts: ConsensusCounts,
@@ -267,6 +271,7 @@ impl RoundData {
         proposal_is_faulty: false,
         // TODO: probably put both step messages next to each other
         msg_val_sigs: Vec::new(),
+        msg_nil_sigs: Vec::new(),
         roster: Vec::new(),
         counts: ConsensusCounts::ZERO,
 
@@ -287,6 +292,7 @@ impl RoundData {
             proposal_id:          value_id,
             proposal_valid_round: valid_round,
             msg_val_sigs:         vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n],
+            msg_nil_sigs:         vec![[TMSig::NIL; 2]; roster_n],
             roster:               Vec::from(&roster[0..roster_n]),
             active_timeout:       self.active_timeout.clone(),
             timeout_triggered:    self.timeout_triggered,
@@ -370,22 +376,28 @@ impl std::ops::Sub for ConsensusCounts {
         }
     }
 }
-impl From<&([(ValueId, TMSig); 2], u64)> for ConsensusCounts {
-    fn from(val: &([(ValueId, TMSig); 2], u64)) -> ConsensusCounts {
-        let (val, stake) = val;
+impl From<&([(ValueId, TMSig); 2], [TMSig; 2], u64)> for ConsensusCounts {
+    fn from(val: &([(ValueId, TMSig); 2], [TMSig; 2], u64)) -> ConsensusCounts {
+        let (val, nil, stake) = val;
         let has_sigs     = [(val[0].1 != TMSig::NIL) as usize, (val[1].1 != TMSig::NIL) as usize];
-        let has_any_sigs = has_sigs[0] | has_sigs[1]; // TODO: confirm prevote + precommit from the same person counts as 1
+        let has_nil_sigs = [(nil[0]   != TMSig::NIL) as usize, (nil[1]   != TMSig::NIL) as usize];
+        let has_any_sigs = has_sigs[0] | has_sigs[1] | has_nil_sigs[0] | has_nil_sigs[1]; // TODO: confirm prevote + precommit from the same person counts as 1
 
+        // A dual voter (NIL + value in the same step) counts once toward the any-vote
+        // totals but toward both the nil and yes tallies, so nv+yv can exceed v; every
+        // condition consumes each count independently, so the overlap is harmless.
         let mut status = [[0,0], [0,0]];
         status[0][(val[0].0 != ValueId::NIL) as usize] = has_sigs[0];
         status[1][(val[1].0 != ValueId::NIL) as usize] = has_sigs[1];
+        status[0][0] |= has_nil_sigs[0];
+        status[1][0] |= has_nil_sigs[1];
 
         ConsensusCounts {
             anys: has_any_sigs as u64 * stake,
-            prevotes: has_sigs[0] as u64 * stake,
+            prevotes: (has_sigs[0] | has_nil_sigs[0]) as u64 * stake,
             nil_prevotes: status[0][0] as u64 * stake,
             yes_prevotes: status[0][1] as u64 * stake,
-            precommits: has_sigs[1] as u64 * stake,
+            precommits: (has_sigs[1] | has_nil_sigs[1]) as u64 * stake,
             yes_precommits: status[1][1] as u64 * stake,
         }
     }
@@ -458,6 +470,9 @@ pub struct TMState {
 
     pub recent_commit_round_cache: Vec<RoundData>, // for now will hold all completed heights
 
+    /// Rate limiter for the always-on sig-fault print (re-delivered dead votes would flood).
+    last_sig_fault_print: Option<std::time::Instant>,
+
     propose_closure: ClosureToProposeNewBlock,
     validate_closure: ClosureToValidateProposedBlock,
     push_block_closure: ClosureToPushDecidedBlock,
@@ -488,6 +503,7 @@ impl TMState {
 
             rounds_data: Vec::new(),
             recent_commit_round_cache: Vec::new(),
+            last_sig_fault_print: None,
 
             propose_closure,
             validate_closure,
@@ -595,6 +611,7 @@ impl TMState {
             height: self.height,
             round,
             msg_val_sigs: vec![[(ValueId::NIL, TMSig::NIL); 2]; roster_n], // TODO: just use ROSTER_MAX_N?
+            msg_nil_sigs: vec![[TMSig::NIL; 2]; roster_n],
             roster: roster.to_vec(),
             vote_namespace: self.vote_namespace,
             ..RoundData::EMPTY
@@ -662,15 +679,39 @@ impl TMState {
         // check if data was signed by pub key. Vote namespacing: mix in this height's
         // namespace (nil -> unchanged). `height == self.height` is guaranteed above, so
         // `self.vote_namespace` is the correct namespace for `signed_data`.
-        match sig.verify_with_namespace(from_pub_key, signed_data, &self.vote_namespace) { Ok(())=>{}, Err((err, str))=> {
-            if PRINT_BFT_SIG_FAULT {
-                eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST}: {} (..{}): for {} {}", str, signed_data.len(), value_id, err);
-                #[cfg(debug_assertions)]
-                {
-                    println!("DEBUG LOOP OVER ALL ROSTER AND TRIAL VERIFY only success should be {} but that is not so... :(", roster_i);
-                    for i in 0..roster.len() {
-                        println!("{}: success={} pub_key: {:?} stake: {} cumulative_stake: {}", i, sig.verify_with_namespace(roster[i].pub_key, signed_data, &self.vote_namespace).is_ok(), roster[i].pub_key, roster[i].stake, roster[i].cumulative_stake);
+        match sig.verify_with_namespace(from_pub_key, signed_data, &self.vote_namespace) { Ok(())=>{}, Err((err, _str))=> {
+            // Always-on, rate-limited: sig failures are the silent killer in roster-divergence
+            // bugs -- votes are addressed by roster index, so an order/membership mismatch
+            // verifies against the wrong key with no other symptom. Trial-verify against the
+            // whole roster to name the actual signer: "verifies as roster_i N" = index shift
+            // (roster divergence); "verifies as nobody" = namespace divergence or garbage.
+            // Dead votes are re-delivered forever by catchup, hence the 1/s cap.
+            if self.last_sig_fault_print.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+                self.last_sig_fault_print = Some(std::time::Instant::now());
+                // The vote payload embeds the signer's pub key in bytes 0..32, so naming a
+                // shifted signer requires rebuilding the payload per candidate key -- swapping
+                // only the verification key can never match. Proposal chunk payloads don't
+                // embed the key, so for those the raw payload is reused as-is.
+                let is_vote      = packet_type == PACKET_TYPE_PREVOTE_SIGNATURES || packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES;
+                let is_precommit = packet_type == PACKET_TYPE_PRECOMMIT_SIGNATURES;
+                let variant      = (value_id != ValueId::NIL) as usize;
+                let actual = (0..active_roster_len(roster)).find(|&i| {
+                    if is_vote {
+                        let sd = make_vote_sign_datas(roster[i].pub_key, is_precommit, height, round, value_id);
+                        sig.verify_with_namespace(roster[i].pub_key, &sd[variant], &self.vote_namespace).is_ok()
+                    } else {
+                        sig.verify_with_namespace(roster[i].pub_key, signed_data, &self.vote_namespace).is_ok()
                     }
+                });
+                let nil_ns_ok = self.vote_namespace != [0u8; 32] &&
+                    sig.verify_with_namespace(from_pub_key, signed_data, &[0u8; 32]).is_ok();
+                match (actual, nil_ns_ok) {
+                    (Some(i), _) => eprintln!("{ctx_str} {ANSI_RED}SIG FAULT{ANSI_RST}: claimed roster_i {} {:?} but verifies as roster_i {} {:?} (stake {}) -- roster order/membership divergence",
+                                              roster_i, from_pub_key, i, roster[i].pub_key, roster[i].stake),
+                    (None, true) => eprintln!("{ctx_str} {ANSI_RED}SIG FAULT{ANSI_RST}: claimed roster_i {} {:?} verifies under the NIL namespace -- sender did not apply this height's vote namespace",
+                                              roster_i, from_pub_key),
+                    (None, false) => eprintln!("{ctx_str} {ANSI_RED}SIG FAULT{ANSI_RST}: claimed roster_i {} {:?}, verifies as nobody on the roster (key absent from our roster, or garbage): {}",
+                                               roster_i, from_pub_key, err),
                 }
             }
             return TMStatus::Fail;
@@ -710,7 +751,7 @@ impl TMState {
         //       network is faulty; we just need to wait and see which one
         //       is the decisive one.)  -Phil 2025-10-20
         // NOTE: @Incomplete: for now, only track the latest proposal.
-        let is_from_me = (from_pub_key == self.my_pub_key);
+        let is_my_proposal = (from_pub_key == self.my_pub_key);
 
         match packet_type {
             PACKET_TYPE_PROPOSAL_CHUNK => {
@@ -719,7 +760,7 @@ impl TMState {
 
                 // "have they previously proposed a different value?"
                 if is_prev_seen_round && round_data.proposal_sigs_n > 0 {
-                    if is_from_me &&
+                    if is_my_proposal &&
                       (round_data.proposal.0.len() != hdr.proposal_size as usize ||
                        round_data.proposal_id != value_id ||
                        round_data.proposal_valid_round != valid_round) { // Amnesiac Proposer's Dilemma
@@ -781,7 +822,7 @@ impl TMState {
                             // NOTE: this does NOT imply the current packet/proposal is faulty, so we should continue with it
                             let mut check_counts = ConsensusCounts::ZERO;
                             for (roster_i, sig) in round_data.msg_val_sigs.iter().enumerate() {
-                                check_counts = check_counts + ConsensusCounts::from(&(*sig, roster[roster_i].stake));
+                                check_counts = check_counts + ConsensusCounts::from(&(*sig, round_data.msg_nil_sigs[roster_i], roster[roster_i].stake));
                             }
                             round_data.counts = check_counts;
                         }
@@ -801,7 +842,7 @@ impl TMState {
 
                     // TODO: include signed prevote & precommit for self?
                 } else if round_data.proposal_sigs[chunk_i] != sig { // TODO: check value/sig conformance
-                    if is_from_me { // Amnesiac Proposer's Dilemma
+                    if is_my_proposal { // Amnesiac Proposer's Dilemma
                         round_data.flush_for_amnesiac_proposer(value_id, valid_round, roster, hdr.proposal_size);
                         eprintln!("{ctx_str} {ANSI_YLW}AMNESIAC PROPOSER{ANSI_RST} at {}.{}.{}: Flushing proposal...", height, round, chunk_i);
                     } else {
@@ -836,27 +877,32 @@ impl TMState {
 
                 // TODO: check if specified valid_round had a different value_id
 
-                let old_val_sig = round_data.msg_val_sigs[roster_i][is_precommit];
-                let new_val_sig = (value_id, sig);
-                if old_val_sig.1 != TMSig::NIL && new_val_sig != old_val_sig {
-                    // Amnesiac Voter's Dilemma. Same shape as the proposer case above, but a vote is a
-                    // commitment, so we can't just take the newer one. We only ever upgrade our own NIL
-                    // to a real value: that direction can't retract anything we already broadcast, and
-                    // it's what unsticks a node resyncing from zero that already NIL'd this round.
-                    if is_from_me && old_val_sig.0 == ValueId::NIL && value_id != ValueId::NIL {
-                        eprintln!("{ctx_str} {ANSI_YLW}AMNESIAC VOTER{ANSI_RST} at {}.{}: adopting our own {} on {} over the NIL we cast this session.",
-                            height, round, ["prevote", "precommit"][is_precommit], value_id);
-                    } else {
-                        eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} voted on 2 different values ({:?}, {:?}). Ignoring latest...", height, round, roster_i, new_val_sig, old_val_sig);
-                        return TMStatus::Fail;
+                // NIL and value votes live in separate slots, so NIL + value from the same
+                // finalizer is not a conflict; only two different *value* votes are a fault.
+                if value_id == ValueId::NIL {
+                    if round_data.msg_nil_sigs[roster_i][is_precommit] != TMSig::NIL {
+                        return TMStatus::Pass; // already have it
+                    }
+                } else {
+                    let old_val_sig = round_data.msg_val_sigs[roster_i][is_precommit];
+                    if old_val_sig.1 != TMSig::NIL {
+                        if old_val_sig.0 != value_id {
+                            eprintln!("{ctx_str} {ANSI_RED}BFT FAULT{ANSI_RST} at {}.{}: finalizer {} voted on 2 different values ({:?}, {:?}). Ignoring latest...", height, round, roster_i, (value_id, sig), old_val_sig);
+                            return TMStatus::Fail;
+                        }
+                        return TMStatus::Pass; // already have it
                     }
                 }
                 // Checks now finished //////////////////////////
 
                 // Add the signature to the list & update counts
-                let old_cs = ConsensusCounts::from(&(round_data.msg_val_sigs[roster_i], roster[roster_i].stake));
-                round_data.msg_val_sigs[roster_i][is_precommit] = new_val_sig;
-                let new_cs = ConsensusCounts::from(&(round_data.msg_val_sigs[roster_i], roster[roster_i].stake));
+                let old_cs = ConsensusCounts::from(&(round_data.msg_val_sigs[roster_i], round_data.msg_nil_sigs[roster_i], roster[roster_i].stake));
+                if value_id == ValueId::NIL {
+                    round_data.msg_nil_sigs[roster_i][is_precommit] = sig;
+                } else {
+                    round_data.msg_val_sigs[roster_i][is_precommit] = (value_id, sig);
+                }
+                let new_cs = ConsensusCounts::from(&(round_data.msg_val_sigs[roster_i], round_data.msg_nil_sigs[roster_i], roster[roster_i].stake));
                 let d = new_cs - old_cs; // add 1 to counts that have been updated by this message
                 round_data.counts = round_data.counts + d;
 
@@ -874,7 +920,7 @@ impl TMState {
                 {
                     let mut check_counts = ConsensusCounts::ZERO;
                     for (i, sig) in round_data.msg_val_sigs.iter().enumerate() {
-                        check_counts = check_counts + ConsensusCounts::from(&(*sig, roster[i].stake));
+                        check_counts = check_counts + ConsensusCounts::from(&(*sig, round_data.msg_nil_sigs[i], roster[i].stake));
                     }
                     if check_counts != round_data.counts {
                         eprintln!("{ctx_str} {ANSI_RED}BFT ERROR{ANSI_RST}: counts don't match: incremental: {:?}, absolute: {:?}", round_data.counts, check_counts);
@@ -1510,6 +1556,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
     let mut next_peer_gossip  = std::time::Instant::now();
     let mut next_peer_connect = std::time::Instant::now();
+    let mut decide_wait_roster_printed: (u64, u32) = (u64::MAX, 0);
 
     let mut send_buf1 = [0u8; 2048];
     let mut next_tick_time = tokio::time::Instant::now();
@@ -1759,8 +1806,10 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         }
 
                         for roster_i in 0..round_data.msg_val_sigs.len() {
-                            let (value_id, sig) = round_data.msg_val_sigs[roster_i][is_precommit as usize];
-                            if sig != TMSig::NIL {
+                            // gossip both slots: a finalizer may hold a NIL vote and a value vote
+                            for (value_id, sig) in [(ValueId::NIL, round_data.msg_nil_sigs[roster_i][is_precommit as usize]),
+                                                    round_data.msg_val_sigs[roster_i][is_precommit as usize]] {
+                                if sig == TMSig::NIL { continue; }
                                 let pub_key_sig = PubKeySig{ roster_i: roster_i.try_into().unwrap(), sig };
                                 // println!("{} {}: packing in sig from {}", PubKeyID(my_root_public_bft_key.into()), pub_key_sig.pub_key);
 
@@ -2006,6 +2055,46 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     if kbps != 0 {
                         println!("{ctx_str} {ANSI_GRN}NET{ANSI_RST}: {} KB/s | {} packets/s | {} bytes/packet",
                                  kbps, pps, bpp);
+                    }
+                }
+
+                // Decide-watch: a round holding yes-precommit stake at the current height
+                // normally decides within a tick, so at this sampling cadence the line only
+                // ever appears when completion is wedged -- cert short of the threshold, or
+                // validity unresolved. Shows the exact numbers needed to tell which. Silent
+                // in healthy operation, so it can stay on permanently.
+                {
+                    let mut total_active_stake = 0;
+                    for i in 0..active_roster_len(&roster) { total_active_stake += roster[i].stake; }
+                    if total_active_stake > 0 {
+                        let f = TMState::f_from_n(total_active_stake);
+                        let big_threshold = if f == 0 { total_active_stake } else { 2*f + 1 };
+                        for rd in bft_state.rounds_data.iter().filter(|r| r.height == bft_state.height && r.counts.yes_precommits > 0) {
+                            // Per-member vote fill, one char per active roster index:
+                            // C yes-precommit (counts toward yc), n nil-precommit, p prevote only, . silent.
+                            let n = active_roster_len(&rd.roster).min(rd.msg_val_sigs.len());
+                            let fill: String = (0..n).map(|i| {
+                                if      rd.msg_val_sigs[i][1].1 != TMSig::NIL { 'C' }
+                                else if rd.msg_nil_sigs[i][1]   != TMSig::NIL { 'n' }
+                                else if rd.msg_val_sigs[i][0].1 != TMSig::NIL ||
+                                        rd.msg_nil_sigs[i][0]   != TMSig::NIL { 'p' }
+                                else                                          { '.' }
+                            }).collect();
+                            println!("{ctx_str} {ANSI_YLW}DECIDE_WAIT{ANSI_RST} {}.{}: yc:{}/{} (yv:{} total:{} f:{}) proposal:{}/{} votes:{} validity:{:?}",
+                                     rd.height, rd.round,
+                                     rd.counts.yes_precommits, big_threshold,
+                                     rd.counts.yes_prevotes, total_active_stake, f,
+                                     rd.proposal_sigs_n, rd.proposal_sigs.len(),
+                                     fill,
+                                     rd.proposal_checked_validity);
+                            // Index -> (key, stake) legend for the fill string, once per wedged round.
+                            if decide_wait_roster_printed != (rd.height, rd.round) {
+                                decide_wait_roster_printed = (rd.height, rd.round);
+                                let members: Vec<String> = rd.roster[..n].iter().enumerate()
+                                    .map(|(i, m)| format!("{}:{:?}={}", i, m.pub_key, m.stake)).collect();
+                                println!("{ctx_str} {ANSI_YLW}DECIDE_WAIT{ANSI_RST} {}.{} roster: [{}]", rd.height, rd.round, members.join(", "));
+                            }
+                        }
                     }
                 }
             }

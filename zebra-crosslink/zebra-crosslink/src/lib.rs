@@ -1295,6 +1295,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                 let this_terminated = terminated_finalizers_at(&config.hardforks, this_bft_height, this_finalized_bc_height);
                 round_data.roster = tenderlink_roster_from_internal(&unsorted_roster, &this_terminated);
                 round_data.msg_val_sigs = round_data.roster.iter().map(|v| fat_pointer.signatures.iter().find(|s| s.pub_key == v.pub_key).map(|s| s.vote_signature).unwrap_or([0u8; 64])).map(|s| [(tenderlink::ValueId::NIL, TMSig::NIL), (tenderlink::ValueId(fat_pointer.points_at_block_hash().0), TMSig(s))]).collect();
+                round_data.msg_nil_sigs = vec![[TMSig::NIL; 2]; round_data.roster.len()];
                 round_data.counts.precommits = fat_pointer.signatures.len() as u64;
                 round_data.counts.yes_precommits = fat_pointer.signatures.len() as u64;
                 round_data.proposal_sigs_n = proposal_sigs_n as usize;
@@ -1447,7 +1448,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                                 &mut finalizer_statuses[last_i]
                             };
 
-                            let cs = ConsensusCounts::from(&(round.msg_val_sigs[roster_i], 1)); // simple (not weighted) counts
+                            let cs = ConsensusCounts::from(&(round.msg_val_sigs[roster_i], round.msg_nil_sigs[roster_i], 1)); // simple (not weighted) counts
                             if cs.anys > 0 {
                                 if is_my_height {
                                     st.1.no_yes_votes_in_my_height[0][0] += cs.nil_prevotes;
