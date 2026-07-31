@@ -404,7 +404,7 @@ pub const PROTOTYPE_PARAMETERS: ZcashCrosslinkParameters = ZcashCrosslinkParamet
 };
 
 /// A BLAKE3 hash.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Copy, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Copy, Hash, Serialize, Deserialize)]
 pub struct Blake3Hash(pub [u8; 32]);
 
 impl std::fmt::Display for Blake3Hash {

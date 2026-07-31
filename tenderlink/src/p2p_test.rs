@@ -37,7 +37,7 @@ use std::io::BufRead;
 use crossterm::{event::{poll, read, Event, KeyCode, KeyEventKind}, terminal};
 use std::io::{stdout, Write};
 
-use crate::bandwidth_test::*;
+use crate::stp::*;
 use crate::STP_ADDRESS_SERIALIZED_SIZE;
 
 use std::collections::HashMap;

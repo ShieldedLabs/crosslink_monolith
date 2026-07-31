@@ -128,6 +128,20 @@ pub enum BlockDownloadVerifyError {
         advertiser_addr: Option<PeerSocketAddr>,
     },
 
+    #[error("block rejected by new_network ingest: {reason} {height:?} {hash:?}")]
+    IngestRejected {
+        reason: String,
+        /// Mirrors `RouterError::misbehavior_score()`, so peer scoring is unchanged by the
+        /// move off the verifier router.
+        misbehavior_score: u32,
+        /// The state already had this block. Benign -- several peers gossiping the same block
+        /// is normal, and it must not restart the sync or penalise anyone.
+        duplicate: bool,
+        height: block::Height,
+        hash: block::Hash,
+        advertiser_addr: Option<PeerSocketAddr>,
+    },
+
     #[error("block validation request failed: {error:?} {height:?} {hash:?}")]
     ValidationRequestError {
         #[source]
@@ -520,16 +534,67 @@ where
                     verifier = readiness => verifier,
                 };
 
-                // Verify the block.
-                let mut rsp = verifier
-                    .map_err(|error| BlockDownloadVerifyError::VerifierServiceError { error })?
-                    .call(zebra_consensus::Request::Commit(block)).boxed();
+                // Verify and commit through new_network's ingest queue, the same doorway
+                // submit_block and gossiped blocks use, so there is one admission point and one
+                // set of verification rules.
+                //
+                // @Todo: this syncer will probably need reworking to sit well with the new
+                // system. It is built around wide concurrent verification (download concurrency
+                // 50, lookahead), whereas new_network commits serially from its tick loop, so
+                // blocks queue up behind each other instead of verifying in parallel. It also
+                // submits out of order, which new_network answers with a "dropped from the
+                // commit queue" rejection and relies on the syncer to retry. Functionally
+                // correct, but the shapes do not match.
+                let _ = verifier;
+                let mut rsp = zebra_state::new_network::submit_block_to_new_network(
+                    block,
+                    std::time::Duration::from_secs(30),
+                )
+                .map(move |outcome| match outcome {
+                    Ok(zebra_state::new_network::IngestOutcome::Committed(hash)) => Ok(hash),
+                    Ok(zebra_state::new_network::IngestOutcome::Known { .. }) => {
+                        Err(BlockDownloadVerifyError::IngestRejected {
+                            reason: "already known to the state".to_string(),
+                            misbehavior_score: 0,
+                            duplicate: true,
+                            height: block_height,
+                            hash,
+                            advertiser_addr,
+                        })
+                    }
+                    Ok(zebra_state::new_network::IngestOutcome::Failed { reason, misbehavior_score }) => {
+                        Err(BlockDownloadVerifyError::IngestRejected {
+                            reason,
+                            misbehavior_score,
+                            duplicate: false,
+                            height: block_height,
+                            hash,
+                            advertiser_addr,
+                        })
+                    }
+                    Err(reason) => Err(BlockDownloadVerifyError::IngestRejected {
+                        reason,
+                        misbehavior_score: 0,
+                        duplicate: false,
+                        height: block_height,
+                        hash,
+                        advertiser_addr,
+                    }),
+                })
+                .boxed();
 
                 // Add a shorter timeout to workaround a known bug (#5125)
                 let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).expect("checkpoint block height is in valid range");
                 if block_height >= max_checkpoint_height && block_height <= short_timeout_max {
                     rsp = timeout(FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT, rsp)
-                        .map_err(|timeout| format!("initial fully verified block timed out: retrying: {timeout:?}").into())
+                        .map_err(move |timeout| BlockDownloadVerifyError::IngestRejected {
+                            reason: format!("initial fully verified block timed out: retrying: {timeout:?}"),
+                            misbehavior_score: 0,
+                            duplicate: false,
+                            height: block_height,
+                            hash,
+                            advertiser_addr,
+                        })
                         .map(|nested_result| nested_result.and_then(convert::identity)).boxed();
                 }
 
@@ -547,14 +612,7 @@ where
                     metrics::counter!("sync.verified.block.count").increment(1);
                 }
 
-                verification
-                    .map(|hash| (block_height, hash))
-                    .map_err(|err| {
-                        match err.downcast::<zebra_consensus::router::RouterError>() {
-                            Ok(error) => BlockDownloadVerifyError::Invalid { error: *error, height: block_height, hash, advertiser_addr },
-                            Err(error) => BlockDownloadVerifyError::ValidationRequestError { error, height: block_height, hash },
-                        }
-                    })
+                verification.map(|hash| (block_height, hash))
             }
             .in_current_span()
             // Tack the hash onto the error so we can remove the cancel handle

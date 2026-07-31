@@ -140,11 +140,15 @@ impl CopyStateCmd {
         // TODO: call Options::PrepareForBulkLoad()
         // See "What's the fastest way to load data into RocksDB?" in
         // https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ
+        // copy-state owns the target's block writer directly: the state service no longer
+        // commits blocks, since new_network holds the writer in a running node. Here there is
+        // no new_network, so this command is the writer's owner.
         let (
             mut target_state,
             _target_read_only_state_service,
             _target_latest_chain_tip,
             _target_chain_tip_change,
+            mut target_block_writer,
         ) = new_zs::spawn_init(target_config.clone(), network, Height::MAX, 0, std::sync::Arc::new(move |_fat_pointer_a, _fat_pointer_b, _height| { Some(true) })).await?;
 
         let elapsed = target_start_time.elapsed();
@@ -231,23 +235,9 @@ impl CopyStateCmd {
             let source_block_hash = source_block.hash();
 
             // Write block to target
-            let target_block_commit_hash = target_state
-                .ready()
-                .await?
-                .call(new_zs::Request::CommitCheckpointVerifiedBlock(
-                    source_block.clone().into(),
-                ))
-                .await?;
-            let target_block_commit_hash = match target_block_commit_hash {
-                new_zs::Response::Committed(target_block_commit_hash) => {
-                    trace!(?target_block_commit_hash, "wrote target block");
-                    target_block_commit_hash
-                }
-                response => Err(format!(
-                    "unexpected response to CommitCheckpointVerifiedBlock request, height: {height}\n \
-                     response: {response:?}",
-                ))?,
-            };
+            let target_block_commit_hash = target_block_writer
+                .commit_checkpoint_verified(source_block.clone().into())?;
+            trace!(?target_block_commit_hash, "wrote target block");
 
             // Read written block from target
             let target_block = target_state

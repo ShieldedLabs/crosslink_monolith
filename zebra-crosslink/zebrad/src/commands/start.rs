@@ -244,11 +244,13 @@ impl StartCmd {
 
         let actual_closure: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>> = Arc::new(std::sync::Mutex::new(None));
         let actual_closure2 = Arc::clone(&actual_closure);
+        let actual_closure3 = Arc::clone(&actual_closure);
 
         let mut state_config = config.state.clone();
-        state_config.hardfork_schedule = Arc::new(HardForkSchedule::new(config.crosslink.hardforks.clone()));
+        // config.crosslink.hardforks is already canonical and merged (see ZebradConfig::load)
+        state_config.hardfork_schedule = Arc::new(HardForkSchedule::from_canonical(config.crosslink.hardforks.clone()));
 
-        let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
+        let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change, block_writer) =
             zebra_state::spawn_init(
                 state_config,
                 &config.network.network,
@@ -378,17 +380,6 @@ impl StartCmd {
         // Create a channel to send mined blocks to the gossip task
         let submit_block_channel = SubmitBlockChannel::new();
 
-        // Note(Sam): We do not need the whole GBT thing. We just need block_verifier_router. Andrew should use this for new sync.
-        let gbt_for_force_feeding_pow = Arc::new(
-            zebra_rpc::methods::types::get_block_template::GetBlockTemplateHandler::new(
-                &config.network.network.clone(),
-                config.mining.clone(),
-                block_verifier_router.clone(),
-                sync_status.clone(),
-                Some(submit_block_channel.sender()),
-            ),
-        );
-
         let mempool2 = mempool.clone();
         info!("spawning tfl service task");
         let (tfl_handle, tfl_service_task_handle) = {
@@ -410,94 +401,6 @@ impl StartCmd {
                     let mempool = mempool2.clone();
                     Box::pin(async move { mempool.clone().ready().await?.call(req).await })
                 }),
-                Arc::new(move |block| {
-                    let gbt = Arc::clone(&gbt_for_force_feeding_pow);
-
-                    let height = block
-                        .coinbase_height()
-                        // .ok_or_error(0, "coinbase height not found")?;
-                        .unwrap();
-
-                    let parent_hash = block.header.previous_block_hash;
-                    let block_hash = block.hash();
-
-                    Box::pin(async move {
-                        let attempt_result = timeout(Duration::from_millis(500), async move {
-                            let mut block_verifier_router = gbt.block_verifier_router();
-
-                            let height = block
-                                .coinbase_height()
-                                // .ok_or_error(0, "coinbase height not found")?;
-                                .unwrap();
-                            let block_hash = block.hash();
-
-                            let block_verifier_router_response =
-                                block_verifier_router.ready().await;
-                            if let Err(err) = block_verifier_router_response {
-                                return Err(format!("{err:?}"));
-                            }
-                            let block_verifier_router_response =
-                                block_verifier_router_response.unwrap();
-
-                            // .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
-                            let block_verifier_router_response = block_verifier_router_response
-                                .call(zebra_consensus::Request::Commit(block))
-                                .await;
-
-                            match block_verifier_router_response {
-                                // Currently, this match arm returns `null` (Accepted) for blocks committed
-                                // to any chain, but Accepted is only for blocks in the best chain.
-                                //
-                                // TODO (#5487):
-                                // - Inconclusive: check if the block is on a side-chain
-                                // The difference is important to miners, because they want to mine on the best chain.
-                                Ok(hash) => {
-                                    tracing::info!(?hash, ?height, "submit block accepted");
-
-                                    // gbt.advertise_mined_block(hash, height)
-                                    //     // .map_error_with_prefix(0, "failed to send mined block")?;
-                                    //     .unwrap();
-
-                                    // return Ok(submit_block::Response::Accepted);
-                                    Ok(())
-                                }
-
-                                // Turns BoxError into Result<VerifyChainError, BoxError>,
-                                // by downcasting from Any to VerifyChainError.
-                                Err(box_error) => {
-                                    let error = box_error
-                                        .downcast::<zebra_consensus::RouterError>()
-                                        .map(|boxed_chain_error| *boxed_chain_error);
-
-                                    tracing::error!(
-                                        ?error,
-                                        ?block_hash,
-                                        ?height,
-                                        "submit block failed verification"
-                                    );
-
-                                    // error
-                                    Err(format!("submit block failed verification: {error:?}"))
-                                }
-                            }
-                        })
-                        .await;
-
-                        match attempt_result {
-                            Ok(success) => success,
-                            Err(err) => {
-                                tracing::error!(
-                                    ?height,
-                                    ?block_hash,
-                                    ?parent_hash,
-                                    "submit block timed out"
-                                );
-                                // return Err("submit block timed out".to_string());
-                                Err(format!("{err:?}"))
-                            }
-                        }
-                    })
-                }),
                 config.crosslink.clone(),
                 actual_closure2,
             )
@@ -505,29 +408,52 @@ impl StartCmd {
         let tfl_service = BoxService::new(tfl_handle);
         let tfl_service = ServiceBuilder::new().buffer(1).service(tfl_service);
 
-        #[cfg(feature = "new-net")]
+        // new_network is the block pipeline, not an option: every block entering this node
+        // goes through it, so there is nothing to gate.
         {
-            // let tfl_service2 = tfl_service.clone();
 
             let config = Arc::clone(&config);
             let sync_read_state = read_only_state_service.clone();
+
+            // new_network owns the block writer, so it is the only thing that can commit
+            // genesis. It does so before waiting for a tip -- otherwise it would wait forever
+            // for a block only it can write.
+            let genesis_block_for_new_network: Arc<zebra_chain::block::Block> = if is_regtest {
+                regtest_genesis_block()
+            } else if is_clt0 {
+                use zebra_chain::serialization::ZcashDeserialize;
+                let genesis_bytes = include_bytes!("../../../ClT0-genesis.pow");
+                Arc::new(zebra_chain::block::Block::zcash_deserialize(&genesis_bytes[..]).expect("hardcoded genesis must be valid"))
+            } else {
+                panic!("unhandled special-case genesis");
+            };
+            assert_eq!(genesis_block_for_new_network.hash(), config.network.network.genesis_hash(),
+                "genesis hash does not match the configured network genesis; consider editing your config");
             let sync_block_verifier = block_verifier_router.clone();
             tokio::task::spawn_blocking(move || {
                 use zebra_state::new_network::BlockCommitError;
-                let commit_block = |block: std::sync::Arc<zebra_chain::block::Block>| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<zebra_chain::block::Hash, BlockCommitError>> + Send>> {
-                    let mut verifier = sync_block_verifier.clone();
-                    Box::pin(async move {
-                        use tower::ServiceExt;
-                        let ready = verifier.ready().await.map_err(|e| BlockCommitError::Other(format!("{e:?}")))?;
-                        ready.call(zebra_consensus::Request::Commit(block)).await
-                            .map_err(|e| {
-                                let is_dup = e.downcast_ref::<zebra_consensus::router::RouterError>()
-                                    .map_or(false, |re| re.is_duplicate_request());
-                                if is_dup { BlockCommitError::Duplicate } else { BlockCommitError::Other(format!("{e:?}")) }
-                            })
-                    })
+
+                // Synchronous verification entry points. Passed as plain fn pointers because
+                // zebra-state cannot depend on zebra-consensus (the dependency runs the other
+                // way), so new_network cannot call these directly.
+                let verify_fns = zebra_state::new_network::VerifyFns {
+                    check_header: zebra_consensus::sync_verify::block_check_header,
+                    check_body: zebra_consensus::sync_verify::block_check_body,
+                    check_cheap: zebra_consensus::sync_verify::block_check_cheap,
+                    verify_expensive: zebra_consensus::sync_verify::block_verify_expensive,
                 };
-                zebra_state::new_network::sync(commit_block, &config.state, sync_read_state, /* tfl_service2, */ tokio::runtime::Handle::current())
+                // The same state -> crosslink closure the state service holds, so new_network
+                // can run the fat-pointer gate itself rather than discovering it at commit time.
+                let crosslink_gate: zebra_state::ClosureToCallIntoCrosslinkFromState =
+                    Arc::new(move |fat_pointer_a, fat_pointer_b, height| {
+                        if let Some(closure) = actual_closure3.lock().unwrap().as_mut() {
+                            (closure)(fat_pointer_a, fat_pointer_b, height)
+                        } else {
+                            tracing::error!("NewNet -> Crosslink closure not yet initialized.");
+                            None
+                        }
+                    });
+                zebra_state::new_network::sync(&config.state, sync_read_state, /* tfl_service2, */ tokio::runtime::Handle::current(), verify_fns, crosslink_gate, block_writer, genesis_block_for_new_network)
             });
         }
 
@@ -643,40 +569,8 @@ impl StartCmd {
 
         info!("spawning syncer task");
         let syncer_task_handle = if is_regtest || is_clt0 {
-            if !syncer
-                .state_contains(config.network.network.genesis_hash())
-                .await?
-            {
-                let genesis_hash = if is_regtest {
-                    block_verifier_router
-                        .clone()
-                        .oneshot(zebra_consensus::Request::Commit(regtest_genesis_block()))
-                        .await
-                        .expect("should validate Regtest genesis block")
-                } else if is_clt0 {
-                    use zebra_chain::serialization::ZcashDeserialize;
-                    let genesis_bytes = include_bytes!("../../../ClT0-genesis.pow");
-                    let genesis_block = Arc::new(zebra_chain::block::Block::zcash_deserialize(&genesis_bytes[..]).expect("hardcoded genesis must be valid"));
-
-                    assert_eq!(genesis_block.hash(), config.network.network.genesis_hash(),
-                    "config genesis hash doesn't match hash of baked genesis; consider editing your config");
-
-                    block_verifier_router
-                        .clone()
-                        .oneshot(zebra_consensus::Request::Commit(genesis_block))
-                        .await
-                        .expect("should validate baked-in genesis block")
-                } else {
-                    panic!("unhandled special-case genesis");
-                };
-
-                assert_eq!(
-                    genesis_hash,
-                    config.network.network.genesis_hash(),
-                    "validated block hash should match network genesis hash"
-                )
-            }
-
+            // Genesis is committed by new_network at startup: it owns the block writer, so no
+            // one else can. See the genesis handling in `new_network::sync`.
             tokio::spawn(std::future::pending().in_current_span())
         } else {
             tokio::spawn(syncer.sync().in_current_span())

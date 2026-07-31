@@ -620,7 +620,7 @@ pub struct ConnectionStateConnected {
     pub ack_arrival_times: [u64; 16], // timestamp_ns of each ack arrival, ring buffer
     pub ack_pace_estimate: u16,       // median inter-ack gap in 0.1 ms units, clamped to RTT_mean*2
     
-    pub packets_waiting_ack_field: [u64; 2048],
+    pub packets_waiting_ack_field: [u64; PACKETS_WAITING_ACK_WORDS],
     // head is the send_sequence_number
     pub packets_waiting_ack_tail: u64,
     
@@ -666,7 +666,7 @@ pub fn new_connection_state_connected(cipher: Option<ConnectionCipherTriplet>, m
         RTT_mean: u16::MAX,
         ack_arrival_times: [0; 16],
         ack_pace_estimate: 0,
-        packets_waiting_ack_field: [0; 2048],
+        packets_waiting_ack_field: [0; PACKETS_WAITING_ACK_WORDS],
         packets_waiting_ack_tail: 0,
         
         current_tu: ASSUMED_UDP_PAYLOAD_SIZE_WITH_GUARANTEED_DELIVERY as u64,
@@ -706,9 +706,13 @@ pub fn get_send_time_for_sequence_number(sequence_number: u64, send_time_band: &
     0 // failed lookup
 }
 
-pub fn increment_sequence_number_and_account(send_time_ns: u64, send_sequence_number: &mut u64, send_time_band: &mut [u64; 1024], send_time_band_head_index: &mut u64, packets_waiting_ack_field: &mut [u64; 2048]) {
+// ring of in-flight sequence numbers; head-tail span must stay under capacity or bits alias
+pub const PACKETS_WAITING_ACK_WORDS: usize = 4096;
+pub const PACKETS_WAITING_ACK_CAPACITY: u64 = PACKETS_WAITING_ACK_WORDS as u64 * 64;
+
+pub fn increment_sequence_number_and_account(send_time_ns: u64, send_sequence_number: &mut u64, send_time_band: &mut [u64; 1024], send_time_band_head_index: &mut u64, packets_waiting_ack_field: &mut [u64; PACKETS_WAITING_ACK_WORDS]) {
     {
-        let bit_index = *send_sequence_number % (2048*64);
+        let bit_index = *send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
         packets_waiting_ack_field[(bit_index / 64) as usize] |= 1u64 << (bit_index % 64);
     }
 
@@ -1427,7 +1431,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                                     let bit_index = (index-field_base);
                                     let acked = 0 != (1u64 << (bit_index % 64)) & ack.field[bit_index as usize / 64];
                                     if acked && index >= state.packets_waiting_ack_tail && index < state.send_sequence_number {
-                                        let bit_index = index % (2048*64);
+                                        let bit_index = index % PACKETS_WAITING_ACK_CAPACITY;
                                         if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                             state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                                             state.last_ack_received_time = timestamp_ns;
@@ -1522,13 +1526,15 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             }
 
                             if nonce >= state.ack_field.field_base + 4096 {
+                                // ring full: drop inbound instead of ack+slide (sliding would forget un-acked nonces). peer retransmits.
+                                if state.send_sequence_number - state.packets_waiting_ack_tail >= PACKETS_WAITING_ACK_CAPACITY - 1 { break 'conn; }
                                 { // send ack
                                     let mut o = 0;
                                     let virtual_nonce = state.send_sequence_number;
                                     o += existing_connection.two_byte_send_prefix.write_to(&mut packet_memory_send[o..]);
                                     o += (virtual_nonce as u32).write_to(&mut packet_memory_send[o..]);
                                     {
-                                        let bit_index = state.send_sequence_number % (2048*64);
+                                        let bit_index = state.send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
                                         state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                                         state.send_sequence_number += 1;
                                     }
@@ -1696,14 +1702,14 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                             return false; // connection timeout
                         }
                         
-                        if current_time_now_ns > state.ack_timer {
+                        if current_time_now_ns > state.ack_timer && state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 {
                             { // send ack
                                 let mut o = 0;
                                 let virtual_nonce = state.send_sequence_number;
                                 o += connection_tracking_data.two_byte_send_prefix.write_to(&mut packet_memory_send[o..]);
                                 o += (virtual_nonce as u32).write_to(&mut packet_memory_send[o..]);
                                 {
-                                    let bit_index = state.send_sequence_number % (2048*64);
+                                    let bit_index = state.send_sequence_number % PACKETS_WAITING_ACK_CAPACITY;
                                     state.packets_waiting_ack_field[(bit_index / 64) as usize] &= !(1u64 << (bit_index % 64));
                                     state.send_sequence_number += 1;
                                 }
@@ -1832,10 +1838,10 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         
                         let time_to_considered_dropped = (state.RTT_mean as u64 * 100_000 * 2).max((2*(current_time_now_ns - state.last_ack_received_time)).min(1_000_000_000));
                         
-                        // TODO: Block sending until we have space.
-                        assert!(state.send_sequence_number - state.packets_waiting_ack_tail < 2048*64);
+                        // every send site (data loop, tu probe, keepalive, both ack paths) gates on ring space, so head never laps tail
+                        assert!(state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY);
                         while state.packets_waiting_ack_tail < state.send_sequence_number {
-                            let bit_index = state.packets_waiting_ack_tail % (2048*64);
+                            let bit_index = state.packets_waiting_ack_tail % PACKETS_WAITING_ACK_CAPACITY;
                             if state.packets_waiting_ack_field[(bit_index / 64) as usize] & (1u64 << (bit_index % 64)) != 0 {
                                 let mut send_time = get_send_time_for_sequence_number(state.packets_waiting_ack_tail, &state.send_time_band, state.send_time_band_head_index);
                                 if send_time != 0 && (state.RTT_mean == 0 || (current_time_now_ns - send_time) < time_to_considered_dropped) {
@@ -1916,10 +1922,10 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         }
                         let could_have_sent = packet_send_allowance_now != 0;
                         
-                        let ring_buffer_not_full = state.send_sequence_number - state.packets_waiting_ack_tail < 2048*64 - 1;
+                        // ring space is checked live at each send site below so the head can never lap the tail within a tick
 
                         state.current_tu = state.current_tu.min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
-                        if ring_buffer_not_full && state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.last_sent_tu_probe_time_ns + (state.tu_probe_failed_count.min(50)*state.tu_probe_failed_count.min(50)*250_000_000).max(time_between_sends_ns) < current_time_now_ns {
+                        if state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.current_tu != ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64 && state.tu_probe_sequence_number == u64::MAX && state.last_sent_tu_probe_time_ns + (state.tu_probe_failed_count.min(50)*state.tu_probe_failed_count.min(50)*250_000_000).max(time_between_sends_ns) < current_time_now_ns {
                             state.tu_probe_size_advance = state.tu_probe_size_advance.max(1).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                             state.tu_probe_size = (state.current_tu + state.tu_probe_size_advance).min(ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE as u64);
                             let payload_size = state.tu_probe_size as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
@@ -1949,7 +1955,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
                         
                         let payload_size = state.current_tu as usize - total_packet_payload_overhead_from_connect_magic1_inside_udp_payload(state.magic1).unwrap();
                         
-                        if ring_buffer_not_full && state.last_sent_data_packet + 15_000_000_000/3 < current_time_now_ns {
+                        if state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && state.last_sent_data_packet + 15_000_000_000/3 < current_time_now_ns {
                             let null_bytes = [0u8; ASSUMED_BIGGEST_POSSIBLE_UDP_PAYLOAD_ON_EXISTING_HARDWARE];
                         
                             let virtual_nonce = state.send_sequence_number;
@@ -1977,7 +1983,7 @@ pub fn new_network_thread(my_keypairs: Vec<IdentityKeyPair>, my_port: u16, max_p
 
                         connection_tracking_data.unreliable_send_buffer.current_bytes_per_second = payload_size as u64 * allowed_bandwidth_upps / 1000_000;
                         connection_tracking_data.unreliable_send_buffer.cut_to_size();
-                        while ring_buffer_not_full && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer) {
+                        while state.send_sequence_number - state.packets_waiting_ack_tail < PACKETS_WAITING_ACK_CAPACITY - 1 && packet_send_allowance_now > 0 && state.packets_in_flight < allowed_packets_in_flight && fill_packet_payload_with_unreliable_fragments(&mut packet_memory_send[0..payload_size], &mut connection_tracking_data.unreliable_send_buffer) {
                         
                             let virtual_nonce = state.send_sequence_number;
                             store_u16(&mut packet_memory_encrypted[0..2], connection_tracking_data.two_byte_send_prefix);

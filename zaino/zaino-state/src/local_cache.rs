@@ -58,16 +58,20 @@ impl BlockCache {
         info!("Launching Local Block Cache..");
         let (channel_tx, channel_rx) = tokio::sync::mpsc::channel(100);
 
+        // Shared watermark: the finalised writer bumps it as blocks land durably in LMDB;
+        // the non-finalised state reads it to know when a handed-off block is safe to drop.
+        let finalised_height = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         let db_size = config.storage.database.size;
         let finalised_state = match db_size {
             zaino_common::DatabaseSize::Gb(0) => None,
             zaino_common::DatabaseSize::Gb(_) => {
-                Some(FinalisedState::spawn(fetcher, state, channel_rx, config.clone()).await?)
+                Some(FinalisedState::spawn(fetcher, state, channel_rx, finalised_height.clone(), config.clone()).await?)
             }
         };
 
         let non_finalised_state =
-            NonFinalisedState::spawn(fetcher, state, channel_tx, config.clone()).await?;
+            NonFinalisedState::spawn(fetcher, state, channel_tx, finalised_height, config.clone()).await?;
 
         Ok(BlockCache {
             fetcher: fetcher.clone(),

@@ -211,43 +211,21 @@ pub async fn populated_state(
     LatestChainTip,
     ChainTipChange,
 ) {
-    let requests = blocks
-        .into_iter()
-        .map(|block| Request::CommitCheckpointVerifiedBlock(block.into()));
-
     // TODO: write a test that checks the finalized to non-finalized transition with UTXOs,
     //       and set max_checkpoint_height and checkpoint_verify_concurrency_limit correctly.
-    let (state, read_state, latest_chain_tip, mut chain_tip_change) =
+    let (state, read_state, latest_chain_tip, chain_tip_change, mut block_writer) =
         StateService::new(Config::ephemeral(), network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
-    let mut state = Buffer::new(BoxService::new(state), 1);
 
-    let mut responses = FuturesUnordered::new();
-
-    for request in requests {
-        let rsp = state.ready().await.unwrap().call(request);
-        responses.push(rsp);
+    // Commit straight through the writer, the way new_network does. The state service does not
+    // accept blocks any more, and there is no separate write thread left to wait on, so this
+    // needs neither the request/response round trip nor the chain-tip-change wait it used to.
+    for block in blocks {
+        block_writer
+            .commit_checkpoint_verified(block.into())
+            .expect("unexpected block commit failure");
     }
 
-    while let Some(rsp) = responses.next().await {
-        // Wait for the block result and the chain tip update,
-        // which both happen in a separate thread from this one.
-        rsp.expect("unexpected block commit failure");
-
-        // Wait for the chain tip update
-        if let Err(timeout_error) = timeout(
-            CHAIN_TIP_UPDATE_WAIT_LIMIT,
-            chain_tip_change.wait_for_tip_change(),
-        )
-        .await
-        .map(|change_result| change_result.expect("unexpected chain tip update failure"))
-        {
-            debug!(
-                timeout = ?humantime_seconds(CHAIN_TIP_UPDATE_WAIT_LIMIT),
-                ?timeout_error,
-                "timeout waiting for chain tip change after committing block"
-            );
-        }
-    }
+    let state = Buffer::new(BoxService::new(state), 1);
 
     (state, read_state, latest_chain_tip, chain_tip_change)
 }

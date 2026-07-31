@@ -58,7 +58,7 @@ use tracing::Instrument;
 
 use zcash_address::{unified::Encoding, TryFromAddress};
 use zcash_protocol::consensus::Parameters;
-use zcash_primitives::transaction::RosterMember;
+use zcash_primitives::transaction::{ StakingActionRequest, RosterMember };
 use zcash_primitives::bft::{ FatPointerToBftBlock, ScanInfo };
 
 use zebra_chain::{
@@ -540,6 +540,10 @@ pub trait Rpc {
     #[method(name = "get_wallet_ufvk")]
     async fn get_wallet_ufvk(&self) -> Option<String>;
 
+    /// send a staking action from the given wallet
+    #[method(name = "wallet_staking_action")]
+    async fn wallet_staking_action(&self, staking_action: StakingActionRequest) -> Result<String>;
+
     /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
     /// If the block is not in Zebra's state,
     /// returns [error code `-8`.](https://github.com/zcash/zcash/issues/5758)
@@ -922,24 +926,6 @@ pub trait Rpc {
         &self,
         address: String,
     ) -> Result<ZListUnifiedReceiversResponse>;
-
-    /// Invalidates a block if it is not yet finalized, removing it from the non-finalized
-    /// state if it is present and rejecting it during contextual validation if it is submitted.
-    ///
-    /// # Parameters
-    ///
-    /// - `block_hash`: (hex-encoded block hash, required) The block hash to invalidate.
-    // TODO: Invalidate block hashes even if they're not present in the non-finalized state (#9553).
-    #[method(name = "invalidateblock")]
-    async fn invalidate_block(&self, block_hash: block::Hash) -> Result<()>;
-
-    /// Reconsiders a previously invalidated block if it exists in the cache of previously invalidated blocks.
-    ///
-    /// # Parameters
-    ///
-    /// - `block_hash`: (hex-encoded block hash, required) The block hash to reconsider.
-    #[method(name = "reconsiderblock")]
-    async fn reconsider_block(&self, block_hash: block::Hash) -> Result<Vec<block::Hash>>;
 
     #[method(name = "generate")]
     /// Mine blocks immediately. Returns the block hashes of the generated blocks.
@@ -2359,6 +2345,32 @@ where
         }
     }
 
+    async fn wallet_staking_action(&self, staking_action: StakingActionRequest) -> Result<String> {
+        let res = self
+            .tfl_service
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(TFLServiceRequest::WalletStakingAction(staking_action.clone()))
+            .await;
+
+        match res {
+            Ok(TFLServiceResponse::WalletStakingAction(Ok(res))) => Ok(res),
+            Ok(TFLServiceResponse::WalletStakingAction(Err(err))) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::Verify.into(),
+                    format!("Faucet request for \"{staking_action:?}\" failed: {err}"),
+                    None::<()>,
+            )),
+            Err(err) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::Verify.into(),
+                    format!("Faucet request for \"{staking_action:?}\" failed: {err}"),
+                    None::<()>,
+            )),
+            _ => unreachable!(""),
+        }
+    }
+
     async fn get_block_header(
         &self,
         hash_or_height: String,
@@ -3409,8 +3421,6 @@ where
         HexData(block_bytes): HexData,
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
-        let mut block_verifier_router = self.gbt.block_verifier_router();
-
         let block: Block = match block_bytes.zcash_deserialize_into() {
             Ok(block_bytes) => block_bytes,
             Err(error) => {
@@ -3428,74 +3438,44 @@ where
             .ok_or_error(0, "coinbase height not found")?;
         let block_hash = block.hash();
 
-        let block_verifier_router_response = block_verifier_router
-            .ready()
-            .await
-            .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?
-            .call(zebra_consensus::Request::Commit(Arc::new(block)))
-            .await;
+        // Submitted blocks go through new_network, the same path network-sourced blocks take,
+        // so there is one admission point and one set of verification rules. new_network applies
+        // backpressure rather than dropping: nothing re-submits a solved block.
+        let outcome = zebra_state::new_network::submit_block_to_new_network(
+            Arc::new(block),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
 
-        let chain_error = match block_verifier_router_response {
-            // Currently, this match arm returns `null` (Accepted) for blocks committed
-            // to any chain, but Accepted is only for blocks in the best chain.
-            //
-            // TODO (#5487):
-            // - Inconclusive: check if the block is on a side-chain
-            // The difference is important to miners, because they want to mine on the best chain.
-            Ok(hash) => {
+        match outcome {
+            Ok(zebra_state::new_network::IngestOutcome::Committed(hash)) => {
                 tracing::info!(?hash, ?height, "submit block accepted");
 
                 self.gbt
                     .advertise_mined_block(hash, height)
                     .map_error_with_prefix(0, "failed to send mined block")?;
 
-                return Ok(SubmitBlockResponse::Accepted);
+                Ok(SubmitBlockResponse::Accepted)
             }
 
-            // Turns BoxError into Result<VerifyChainError, BoxError>,
-            // by downcasting from Any to VerifyChainError.
-            Err(box_error) => {
-                let error = box_error
-                    .downcast::<RouterError>()
-                    .map(|boxed_chain_error| *boxed_chain_error);
-
-                tracing::info!(
-                    ?error,
-                    ?block_hash,
-                    ?height,
-                    "submit block failed verification"
-                );
-
-                error
+            Ok(zebra_state::new_network::IngestOutcome::Known { location, height }) => {
+                // TODO (#5487): a side-chain block is Inconclusive rather than Duplicate -- the
+                // distinction matters to miners, who want to be on the best chain. The location
+                // is carried here now, so that can be refined without more plumbing.
+                tracing::info!(?block_hash, ?height, ?location, "submit block already known");
+                Ok(SubmitBlockErrorResponse::Duplicate.into())
             }
-        };
 
-        let response = match chain_error {
-            Ok(source) if source.is_duplicate_request() => SubmitBlockErrorResponse::Duplicate,
+            Ok(zebra_state::new_network::IngestOutcome::Failed { reason, .. }) => {
+                tracing::info!(?block_hash, ?height, ?reason, "submit block failed verification");
+                Ok(SubmitBlockErrorResponse::Rejected.into())
+            }
 
-            // Currently, these match arms return Reject for the older duplicate in a queue,
-            // but queued duplicates should be DuplicateInconclusive.
-            //
-            // Optional TODO (#5487):
-            // - DuplicateInconclusive: turn these non-finalized state duplicate block errors
-            //   into BlockError enum variants, and handle them as DuplicateInconclusive:
-            //   - "block already sent to be committed to the state"
-            //   - "replaced by newer request"
-            // - keep the older request in the queue,
-            //   and return a duplicate error for the newer request immediately.
-            //   This improves the speed of the RPC response.
-            //
-            // Checking the download queues and BlockVerifierRouter buffer for duplicates
-            // might require architectural changes to Zebra, so we should only do it
-            // if mining pools really need it.
-            Ok(_verify_chain_error) => SubmitBlockErrorResponse::Rejected,
-
-            // This match arm is currently unreachable, but if future changes add extra error types,
-            // we want to turn them into `Rejected`.
-            Err(_unknown_error_type) => SubmitBlockErrorResponse::Rejected,
-        };
-
-        Ok(response.into())
+            Err(error) => {
+                tracing::warn!(?block_hash, ?height, ?error, "submit block could not be ingested");
+                Ok(SubmitBlockErrorResponse::Rejected.into())
+            }
+        }
     }
 
     async fn get_mining_info(&self) -> Result<GetMiningInfoResponse> {
@@ -3730,26 +3710,6 @@ where
         ))
     }
 
-    async fn invalidate_block(&self, block_hash: block::Hash) -> Result<()> {
-        self.state
-            .clone()
-            .oneshot(zebra_state::Request::InvalidateBlock(block_hash))
-            .await
-            .map(|rsp| assert_eq!(rsp, zebra_state::Response::Invalidated(block_hash)))
-            .map_misc_error()
-    }
-
-    async fn reconsider_block(&self, block_hash: block::Hash) -> Result<Vec<block::Hash>> {
-        self.state
-            .clone()
-            .oneshot(zebra_state::Request::ReconsiderBlock(block_hash))
-            .await
-            .map(|rsp| match rsp {
-                zebra_state::Response::Reconsidered(block_hashes) => block_hashes,
-                _ => unreachable!("unmatched response to a reconsider block request"),
-            })
-            .map_misc_error()
-    }
 
     async fn generate(&self, num_blocks: u32) -> Result<Vec<Hash>> {
         let rpc = self.clone();

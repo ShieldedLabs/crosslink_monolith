@@ -6,26 +6,14 @@ use static_assertions::const_assert;
 use zebra_chain::block::{self, Block, Hash, Height};
 use zebra_chain::serialization::{ZcashSerialize, ZcashDeserialize};
 
-use tenderlink::bandwidth_test::*;
+use tenderlink::stp::*;
 use tenderlink::native_sockets::*;
 use tenderlink::parse_to_ipv6_bytes;
 use tenderlink::{SliceWrite, SliceRead};
 use tenderlink::{dbg_panic, dbg_verify};
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum BlockEvent {
-    Dequeued(ShadowBlock),
-    Committed(ShadowBlock),
-    TradFinalized(ShadowBlock),
-    CrosslinkFinalized(ShadowBlock),
-}
-static BLOCK_EVENT_QUEUE_SENDER: std::sync::OnceLock<tokio::sync::mpsc::Sender<BlockEvent>> = std::sync::OnceLock::new();
-
-pub fn push_block_event(event: BlockEvent) {
-    if let Some(tx) = BLOCK_EVENT_QUEUE_SENDER.get() {
-        tx.blocking_send(event).unwrap();
-    }
-}
+mod checkpoint;
+use checkpoint::Checkpoint;
 
 // ---------------------------------------------------------------------------
 // NewNet packet types // @Todo: share common messages/code with Tenderlink
@@ -273,16 +261,14 @@ impl NearTipChain {
     }
 }
 
-/// Similar parallel chain model to Zebra's NonFinalizedState.
+/// Parallel chain branches, as they go on the wire in a STATUS packet.
 ///
-/// Not exactly "non-finalized", as it may include finalized blocks
-/// (either on startup or after crosslink finalization).
+/// Transient: built on demand by `near_tip_chains_from_state()` out of the NonFinalizedState
+/// plus a tail of the finalized best chain, and dropped again the same tick. Nothing maintains
+/// it incrementally, so it cannot drift from what the node actually has.
 ///
-/// :ReplicatingZebraState
-/// There is a big @Todo here which is: don't replicate Zebra NonFinalizedState at all!
-/// However, by design, our replica currently does not exactly overlap NonFinalizedState.
-/// We ignore whether blocks are finalized or not when storing in the NearTipChains.
-///
+/// Not the same shape as NonFinalizedState: that one is rooted at the finalized tip, and this
+/// deliberately reaches past it so peers that are behind us have something to attach to.
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NearTipChains {
     pub finalized_height: u32,
@@ -365,30 +351,6 @@ impl NearTipChains {
 
         self.chains.sort_by_key(|ch| std::cmp::Reverse(ch.work));
     }
-
-    fn remove_chains_invalidated_by_finalized(&mut self, final_block: &ShadowBlock) {
-        self.finalized_height = self.finalized_height.max(final_block.this_height);
-        self.chains.retain_mut(|chain| {
-            debug_assert!(chain.blocks.len() > 0, "should have been removed if empty");
-            let final_block_slice = [*final_block];
-            let prefix = chain_intersect_prefix(&final_block_slice, &chain.blocks);
-
-            if prefix.len() > 0 && prefix[0].this_hash == final_block.this_hash {
-                // contains finalized block; all good
-                return true;
-            }
-
-            if chain.blocks[0].this_height > final_block.this_height {
-                // possibly long branch that clipped after finalized; too soon to tell
-                // TODO: work out if finalized is ancestor; it will eventually get phased out anyway
-                return true;
-            }
-
-            // finalization invalidates chain, remove it
-            false
-        });
-    }
-
 
     /// 0 print_bytes => no print, otherwise it's the number of bytes to print from the hashes
     fn roundtrip_to_branches(&self, max_size: usize, hash_bytes_n: usize) {
@@ -746,22 +708,24 @@ const TRACE     :bool=0!=       0;
 //        coprime millisecond intervals, so we can make sure our code is not relying on
 //        any kind of consistent or clean timing in order to function properly.
 
-const STATUS_MS: u64 = 8000;  // fastest interval at which to send status messages
-const BLOCK_SEND_MS: u64 = 1000; // fastest interval at which to send blocks to peers
+const STATUS_MS: u64 = 4000;  // fastest interval at which to send status messages
+const BLOCK_SEND_MS: u64 = 500; // fastest interval at which to send blocks to peers
 
 
 const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 2;
 const PEER_CONNECT_MS: u64 = 6000;
 const PEER_GOSSIP_MS:  u64 = 2500;
-const PEER_REQUEST_MS: u64 = 400;
-const PEER_RESPOND_MS: u64 = 400;
+const PEER_REQUEST_MS: u64 = 300;
+const PEER_RESPOND_MS: u64 = 300;
 
 
-const IDLE_MS: u64 = 400;
+const IDLE_MS: u64 = 100;
 
-const MAX_BANDWIDTH_BYTES_PER_MS: usize = 5_000; // 5 MB/s
+const MAX_BANDWIDTH_BYTES_PER_MS: usize = 7_000; // 7 MB/s
 const MAX_BANDWIDTH_BYTES_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_MS * PEER_RESPOND_MS as usize;
-const MAX_BANDWIDTH_BLOCKS_PER_RES: usize = MAX_BANDWIDTH_BYTES_PER_RES / zebra_chain::block::MAX_BLOCK_BYTES as usize;
+// x2: the budget sizes every in-flight block at MAX_BLOCK_BYTES, but real blocks are a small
+// fraction of that, so the unscaled count leaves most of the bandwidth budget unused.
+const MAX_BANDWIDTH_BLOCKS_PER_RES: usize = 2 * (MAX_BANDWIDTH_BYTES_PER_RES / zebra_chain::block::MAX_BLOCK_BYTES as usize);
 
 
 // use crate::crosslink::TFLServiceRequest;
@@ -782,23 +746,75 @@ pub fn get_tips_blocking(read_state: &ReadState) -> ((Height, Hash), (Height, Ha
     }
 }
 
-pub fn is_parent_in_chains(read_state: &ReadState, near_tip_chains: &NearTipChains, parent_hash: Hash) -> bool {
-    for our_chain in &near_tip_chains.chains {
-        if our_chain.blocks.iter().any(|block| block.this_hash == parent_hash) {
-            return true;
-        }
-    }
+/// The heights we advertise: the last [`NEAR_TIP_CHAIN_LEN`] ending at `tip_h`.
+fn near_tip_start_height(tip_h: u32) -> u32 {
+    tip_h.saturating_sub(NEAR_TIP_CHAIN_LEN - 1)
+}
 
-    // @Dev @Debug, but we would like to be able to quickly do this in production as well...
-    match read_state.known_block(parent_hash) {
-        None => false,
-        Some(_block) => {
-            // @Note: if we don't find the parent in near tip chains, but we ask Zebra and Zebra is aware of it, warn loudly.
-            tracing::warn!("NewNet: Block hash {parent_hash} was NOT in near tip chains but contained by Zebra state!!");
-            //dbg_panic!();
-            true
-        }
+/// Materialize one run of blocks over `[bgn_h ..= tip_h]`.
+///
+/// `in_chain` answers for the non-finalized part. Anything it declines comes from the finalized
+/// state, which is the shared ancestry of every non-finalized chain.
+fn shadow_run(
+    db: &crate::service::finalized_state::ZebraDb,
+    bgn_h: u32,
+    tip_h: u32,
+    in_chain: impl Fn(u32) -> Option<Hash>,
+) -> Option<Vec<ShadowBlock>> {
+    let hash_at = |h: u32| in_chain(h).or_else(|| db.hash(Height(h)));
+
+    let mut parent_hash = if bgn_h == 0 { Hash([0; 32]) } else { hash_at(bgn_h - 1)? };
+
+    let mut blocks = Vec::with_capacity((tip_h + 1 - bgn_h) as usize);
+    for this_height in bgn_h..=tip_h {
+        let this_hash = hash_at(this_height)?;
+        blocks.push(ShadowBlock { parent_hash, this_hash, this_height });
+        parent_hash = this_hash;
     }
+    Some(blocks)
+}
+
+/// Build the near-tip chain tree from the state, rather than mirroring it.
+///
+/// The non-finalized state alone isn't enough. It is rooted at the finalized tip and is empty
+/// on a fresh node, but a peer that is behind us needs a finalized tail to find an attach
+/// point in. So every chain is extended backwards along the finalized best chain until the run
+/// starts at the same height for all of them.
+fn near_tip_chains_from_state(read_state: &ReadState) -> Option<NearTipChains> {
+    let db = read_state.db_clone();
+    let (finalized_height, _) = db.tip()?;
+
+    read_state.with_non_finalized_state(|nfs| {
+        let best_tip_h = match nfs.best_chain() {
+            Some(chain) => chain.non_finalized_tip_height().0,
+            None => finalized_height.0,
+        };
+        let bgn_h = near_tip_start_height(best_tip_h);
+
+        let mut out = NearTipChains { finalized_height: finalized_height.0, chains: Vec::new() };
+
+        // chain_iter() is best-first by real cumulative work, and we don't re-sort, so branch 0
+        // of the status packet is the chain we actually consider best.
+        for chain in nfs.chain_iter() {
+            let tip_h  = chain.non_finalized_tip_height().0;
+            let root_h = chain.non_finalized_root_height().0;
+            if tip_h < bgn_h {
+                continue; // aged out from under the window
+            }
+            let in_chain = |h| if h >= root_h { chain.hash_by_height(Height(h)) } else { None };
+            if let Some(blocks) = shadow_run(&db, bgn_h, tip_h, in_chain) {
+                out.push_chain_unchecked(blocks);
+            }
+        }
+
+        if out.chains.is_empty() {
+            // Nothing non-finalized: the finalized best chain is the only chain there is.
+            out.push_chain_unchecked(shadow_run(&db, bgn_h, best_tip_h, |_| None)?);
+        }
+
+        debug_assert!(out.finalized_height <= out.tip_height().unwrap_or(0));
+        Some(out)
+    })
 }
 
 use tenderlink::STP_ADDRESS_MEMORY_SIZE;
@@ -849,7 +865,26 @@ pub enum PeerOrigin {
     Selected,               // chosen from our address map diversely; less likely to be Sybil. AKA: outbound connection.
 }
 
-const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 10; // DO NOT MAKE LARGE, subject to N^2!!!
+/// How many queued block hashes we advertise in a STATUS packet.
+///
+/// @Volatile: this is WIRE FORMAT. It sizes the status buffer and peers reject a status that
+/// claims more than this. Changing it is a protocol change, not a tuning knob -- which is why
+/// the local cache below is a separate limit.
+const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 10;
+
+/// How many blocks to hold locally while they wait for something.
+///
+/// Two things make a block wait, and neither means it is invalid:
+///   - its parent has not been committed yet (arrived out of order), or
+///   - the crosslink gate cannot resolve its BFT pointer yet.
+///
+/// Both resolve on their own as the chain advances. Without this cache we drop the block and
+/// re-download it, which on a fresh sync cost ~2 redundant downloads per commit. Holding it
+/// costs memory and nothing else.
+///
+/// Every block still gets a commit attempt in the tick it arrives -- the cache is only where
+/// it lands after that attempt defers.
+const MAX_DEFERRED_BLOCKS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeightAndHashOr0 {
@@ -949,7 +984,7 @@ impl SliceWrite for PeerPowBlockResponseChunkHdr {
     }
 }
 
-const BLOCK_DOWNLOADS_N: usize = 8;
+const BLOCK_DOWNLOADS_N: usize = 32;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BlockDownloads {
@@ -1036,15 +1071,8 @@ pub struct Peer {
     // TODO: cross-peer tracking
     block_downloads: BlockDownloads,
 
-    // Lite checkpointing (only meaningful while CheckpointState::Locked).
-    // Whether this peer's main chain has been confirmed to contain the configured
-    // checkpoint block: we requested the block at the checkpoint height and they
-    // returned the expected hash.
-    checkpoint_passed: bool,
-    // When we last sent (or evaluated) a checkpoint test for this peer. Used to
-    // re-test non-passing peers periodically in case their chain reorgs onto the
-    // checkpoint.
-    checkpoint_last_tested: Option<std::time::Instant>,
+    // has served us the checkpoint block (see the checkpoint gate in dl-init)
+    has_checkpoint_block: bool,
 }
 
 #[derive(Debug)]
@@ -1053,102 +1081,228 @@ pub enum BlockCommitError {
     Other(String),
 }
 
-/// Lite-checkpointing state machine, engaged when the operator configures
-/// `config.network_checkpoint_block_hash`. When no checkpoint is configured we
-/// stay in `Normal` and behave exactly as before.
+// ---------------------------------------------------------------------------
+// Synchronous verification: types shared with zebra-consensus.
+//
+// These live here, not in zebra-consensus, because of the crate dependency direction:
+// zebra-consensus depends on zebra-state, so it can name these, but zebra-state can NOT
+// name anything in zebra-consensus. Defining them here is what lets `sync()` hold plain
+// `fn` pointers to the verification functions instead of boxed closures.
+// ---------------------------------------------------------------------------
+
+/// Values derived while running the cheap block checks.
 ///
-/// ```text
-///   SEARCH ──(obtained block from a peer)──► LOCKED ──(committed on best chain)──► NORMAL
-///
-///   Startup entry point:
-///     - no checkpoint configured ............................ NORMAL
-///     - configured, already committed locally .............. NORMAL
-///     - configured, not yet committed locally .............. SEARCH
-/// ```
-///
-/// - `Search`: we have the target hash but not the block. Freeze normal sync (do
-///   not accept/commit any block), actively probe peers for the block *by hash*,
-///   and watch for it locally. As soon as we obtain it (and thus learn its
-///   height) → `Locked`. LOCKED is only ever reached from here.
-/// - `Locked`: only request blocks from peers that pass the height test (asked
-///   for the block at the checkpoint height, returned the expected hash). Non-passing
-///   peers are skipped and periodically re-tested.
-/// - `Normal`: no gating; behave as if no checkpoint was configured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CheckpointState {
-    Normal,
-    Search { target: Hash },
-    Locked { target: Hash, height: u32 },
+/// Returned rather than recomputed: `transaction_hashes` costs a hash of every transaction
+/// in the block, and the expensive pass needs it again for sighashing.
+#[derive(Clone, Debug)]
+pub struct CheapBlockChecks {
+    pub hash: Hash,
+    pub height: Height,
+    pub transaction_hashes: std::sync::Arc<[zebra_chain::transaction::Hash]>,
+    pub coinbase_tx: std::sync::Arc<zebra_chain::transaction::Transaction>,
+    pub expected_block_subsidy: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    pub deferred_pool_balance_change: zebra_chain::amount::DeferredPoolBalanceChange,
 }
 
-/// Sentinel "height unknown" value used for SEARCH-mode by-hash probe downloads.
-/// Peers serve blocks by hash regardless of the requested height, and no real
-/// block download ever uses this height, so it doubles as a tag we can clean up.
-const CHECKPOINT_SEARCH_HEIGHT: u32 = u32::MAX;
-/// How often to re-test a peer that has not (yet) passed the checkpoint test.
-const CHECKPOINT_RETEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// A block verification failure.
+///
+/// `misbehavior_score` mirrors `zebra_consensus::RouterError::misbehavior_score()`, so the
+/// caller can weight or drop a peer without needing to name the consensus error types.
+#[derive(Clone, Debug)]
+pub struct BlockVerifyError {
+    pub msg: String,
+    pub misbehavior_score: u32,
+}
+
+/// The synchronous verification entry points, injected from zebrad.
+///
+/// Plain `fn` pointers, not closures: these functions capture nothing, so there is no
+/// allocation and no dynamic dispatch. @Todo: `verify_expensive` currently covers the
+/// shielded batches only; transparent scripts and sigops/fees are still to come.
+#[derive(Clone, Copy)]
+pub struct VerifyFns {
+    /// Header-only: PoW, difficulty, header time. Runs before the body is trusted.
+    pub check_header: fn(
+        &zebra_chain::block::Header,
+        &zebra_chain::parameters::Network,
+        Height,
+        chrono::DateTime<chrono::Utc>,
+        bool,
+    ) -> Result<(), BlockVerifyError>,
+
+    /// Body: binds the transactions to the header (merkle), then the subsidy rules.
+    /// Must run before anything trusts the height, including the crosslink gate.
+    pub check_body: fn(
+        &Block,
+        &zebra_chain::parameters::Network,
+    ) -> Result<CheapBlockChecks, BlockVerifyError>,
+
+    pub check_cheap: fn(
+        &Block,
+        &zebra_chain::parameters::Network,
+        chrono::DateTime<chrono::Utc>,
+        bool,
+    ) -> Result<CheapBlockChecks, BlockVerifyError>,
+
+    pub verify_expensive: fn(
+        &Block,
+        &zebra_chain::parameters::Network,
+        &CheapBlockChecks,
+        &dyn Fn(&zebra_chain::transparent::OutPoint) -> Option<zebra_chain::transparent::Utxo>,
+    ) -> Result<
+        std::collections::HashMap<
+            zebra_chain::transparent::OutPoint,
+            zebra_chain::transparent::OrderedUtxo,
+        >,
+        BlockVerifyError,
+    >,
+}
+
+// ---------------------------------------------------------------------------
+// Block ingest: the doorway for everything that is NOT new_network's own downloads.
+//
+// Producers are submit_block (the RPC, and therefore the internal miner) and the crosslink
+// test harness. Network-sourced blocks do NOT come through here -- they go straight into
+// blocks_to_commit -- so every entry on this queue is a local submission with no retry path
+// behind it. That is why the send side applies backpressure instead of dropping.
+// ---------------------------------------------------------------------------
+
+/// What happened to a submitted block.
+#[derive(Clone, Debug)]
+pub enum IngestOutcome {
+    /// Verified and committed.
+    Committed(Hash),
+    /// The state already knows this hash.
+    ///
+    /// `location` distinguishes best chain from a side chain or the commit queue -- a
+    /// distinction `is_duplicate_request()` throws away, and one miners care about.
+    Known {
+        location: crate::response::KnownBlockLocation,
+        height: Height,
+    },
+    /// Rejected. `misbehavior_score` mirrors the consensus error's own score.
+    Failed {
+        reason: String,
+        misbehavior_score: u32,
+    },
+}
+
+/// A crosslink-finalization request, with a channel for the result.
+///
+/// BFT finalization used to reach the write task through the state service. new_network owns
+/// the writer now, so the request comes here instead. This is the narrow version of routing BFT
+/// through new_network -- it moves the finalize call, not the chain sync.
+pub struct CrosslinkFinalizeRequest {
+    pub hash: Hash,
+    pub reply: tokio::sync::oneshot::Sender<Result<(Hash, Vec<([u8; 32], u64)>), String>>,
+}
+
+static CROSSLINK_FINALIZE_SENDER: std::sync::OnceLock<
+    tokio::sync::mpsc::Sender<CrosslinkFinalizeRequest>,
+> = std::sync::OnceLock::new();
+
+/// Ask new_network to crosslink-finalize `hash`, and wait for the result.
+pub async fn crosslink_finalize_via_new_network(
+    hash: Hash,
+    timeout: std::time::Duration,
+) -> Result<(Hash, Vec<([u8; 32], u64)>), String> {
+    let Some(tx) = CROSSLINK_FINALIZE_SENDER.get() else {
+        return Err("new_network is not running".to_string());
+    };
+
+    let permit = match tokio::time::timeout(timeout, tx.reserve()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err("new_network stopped accepting finalizations".to_string()),
+        Err(_) => return Err("timed out waiting for the finalize queue".to_string()),
+    };
+
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    permit.send(CrosslinkFinalizeRequest { hash, reply });
+
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("new_network dropped the finalize reply channel".to_string()),
+        Err(_) => Err("timed out waiting for the finalize result".to_string()),
+    }
+}
+
+/// A block submitted from outside new_network, with a channel for the verdict.
+pub struct BlockSubmission {
+    pub block: std::sync::Arc<Block>,
+    pub reply: tokio::sync::oneshot::Sender<IngestOutcome>,
+}
+
+/// Bounded, but sized for bulk: the legacy syncer submits here too, and it runs with a
+/// download concurrency of 50 and a lookahead. Backpressure still applies -- submitters wait
+/// for a slot rather than being dropped -- this just stops the common case blocking.
+const BLOCK_SUBMISSION_QUEUE_LEN: usize = 256;
+
+static BLOCK_SUBMISSION_SENDER: std::sync::OnceLock<tokio::sync::mpsc::Sender<BlockSubmission>> =
+    std::sync::OnceLock::new();
+
+/// Submit a block to new_network and wait for its verdict.
+///
+/// Applies backpressure rather than dropping: nothing re-submits a miner's solved block, so a
+/// silent drop loses it. Never blocks the calling task -- `reserve()` yields instead.
+pub async fn submit_block_to_new_network(
+    block: std::sync::Arc<Block>,
+    timeout: std::time::Duration,
+) -> Result<IngestOutcome, String> {
+    let Some(tx) = BLOCK_SUBMISSION_SENDER.get() else {
+        return Err("new_network is not running".to_string());
+    };
+
+    let permit = match tokio::time::timeout(timeout, tx.reserve()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err("new_network stopped accepting blocks".to_string()),
+        Err(_) => return Err("timed out waiting for the block ingest queue".to_string()),
+    };
+
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    permit.send(BlockSubmission { block, reply });
+
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(_)) => Err("new_network dropped the reply channel".to_string()),
+        Err(_) => Err("timed out waiting for the block verdict".to_string()),
+    }
+}
 
 pub fn sync(
-    commit_block: impl Fn(std::sync::Arc<Block>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Hash, BlockCommitError>> + Send>>,
     config: &crate::config::Config,
     read_state: ReadState,
     // tfl_service: TFLService, // no TFLServiceHandle. Sadge!
     rt: tokio::runtime::Handle,
+    verify_fns: VerifyFns,
+    crosslink_gate: crate::ClosureToCallIntoCrosslinkFromState,
+    // The block writer. This loop owns it, so every mutation of the chain state happens on
+    // this thread, in a known order, with the result available synchronously.
+    mut block_writer: crate::service::write::WriteBlockWorkerTask,
+    genesis: std::sync::Arc<Block>,
 ) {
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(500);
-    BLOCK_EVENT_QUEUE_SENDER.set(event_tx).unwrap();
+    let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel(BLOCK_SUBMISSION_QUEUE_LEN);
+    let _ = BLOCK_SUBMISSION_SENDER.set(submit_tx);
 
-    let mut near_tip_chains = NearTipChains::default();
-    // @Todo: @Refactor into a fn we can call to flush and reset the NearTipChains state.
-    'init_near_tip_chains: {
+    let (finalize_tx, mut finalize_rx) = tokio::sync::mpsc::channel(64);
+    let _ = CROSSLINK_FINALIZE_SENDER.set(finalize_tx);
+
+    // Commit genesis before anything waits on a tip. This loop owns the writer, so nothing else
+    // can do it -- and `get_tips_blocking` below spins until a finalized tip exists, which would
+    // never happen.
+    if read_state.finalized_tip().is_none() {
+        match block_writer.commit_genesis(genesis) {
+            Ok(hash) => tracing::info!("NewNet: committed genesis {hash}"),
+            Err(err) => panic!("could not commit genesis block: {err}"),
+        }
+    }
+    // Replies live beside blocks_to_commit rather than inside it, so the existing queue and
+    // its eviction logic are untouched.
+    let mut submission_replies: HashMap<Hash, tokio::sync::oneshot::Sender<IngestOutcome>> = HashMap::new();
+
+    {
         let ((tip_height, tip_hash), (finalized_tip_height, finalized_tip_hash)) = get_tips_blocking(&read_state);
         tracing::info!("NewNet: Starting at height={} hash={:?} finalized_height={} finalized_hash={}", tip_height.0, tip_hash, finalized_tip_height.0, finalized_tip_hash);
-
-        near_tip_chains.finalized_height = finalized_tip_height.0;
-
-        assert!(near_tip_chains.finalized_height <= tip_height.0);
-
-        // let res = rt.block_on(async { tfl_service.clone().oneshot(Request::Get).await });
-        // if let Some((height, hash)) = match res {
-        //     Ok(TFLServiceResponse::FinalBlockHeightHash(height_and_hash)) => height_and_hash,
-        //     Err(err) => {
-        //         tracing::error!("FinalBlockHeightHash(): Error: {err:?}");
-        //         None
-        //     }
-        //     _ => panic!("FinalBlockHeightHash(): Unhandled response: {res:?}"),
-        // } {
-        //     near_tip_chains.finalized_height_crosslink = height.0;
-        // }
-
-        // Push genesis into near_tip_chains for two reasons:
-        // - Prevents NearTipChains serialization asserts on new nodes
-        // - Allows early nodes to overlap with and push to new nodes
-        // This can be undone once fartipchain sync is ready.
-        near_tip_chains.push_blocks(&[ShadowBlock { this_hash: read_state.best_chain_block_hash(Height(0)).expect("failed to get genesis block"), ..ShadowBlock::default() }]);
-
-        let near_tip_start_height = Height(tip_height.0.saturating_sub(NEAR_TIP_CHAIN_LEN+1));
-        let Some(near_tip_start_hash) = read_state.best_chain_block_hash(near_tip_start_height) else {
-            break 'init_near_tip_chains;
-        };
-        let near_tip_hdrs = read_state.find_block_headers(vec![near_tip_start_hash], None);
-
-        let mut parent_hash = near_tip_start_hash;
-        let mut shadow_blocks = Vec::with_capacity(near_tip_hdrs.len());
-        for (i, hdr) in near_tip_hdrs.iter().enumerate() {
-            let this_height = near_tip_start_height.0 + 1 + i as u32;
-            // TODO: double-check height
-            let block = ShadowBlock {
-                parent_hash,
-                this_hash: hdr.header.hash(),
-                this_height,
-            };
-            parent_hash = block.this_hash;
-            shadow_blocks.push(block);
-        };
-
-        near_tip_chains.push_blocks(&shadow_blocks);
-
-        assert!(near_tip_chains.finalized_height <= near_tip_chains.tip_height().unwrap()); // :AssumeGenesisBlockIncludedInNearTipChains
+        assert!(finalized_tip_height <= tip_height);
     }
 
     // Keypair setup
@@ -1178,7 +1332,8 @@ pub fn sync(
     };
 
     let my_keypairs = vec![network_keypair.clone()];
-    let network_thread_handle = new_network_thread(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024));
+    // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
+    let network_thread_handle = new_network_thread(my_keypairs.clone(), actual_network_local_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
     tracing::info!("NewNet: Bound to port {}", actual_network_local_port);
 
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
@@ -1192,10 +1347,10 @@ pub fn sync(
             if address.magic1 != CRYPTO_MAGIC {
                 // @Dev
                 panic!("The magic in the config toml - {} ({}) is different from the crypto magic - {} ({})! Modify one or the other!",
-                        tenderlink::bandwidth_test::b64(&address.magic1.to_le_bytes()[..6]),
-                        tenderlink::bandwidth_test::crypto_string_from_connect_magic1(address.magic1).unwrap_or("<invalid>"),
-                        tenderlink::bandwidth_test::b64(&CRYPTO_MAGIC  .to_le_bytes()[..6]),
-                        tenderlink::bandwidth_test::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
+                        tenderlink::stp::b64(&address.magic1.to_le_bytes()[..6]),
+                        tenderlink::stp::crypto_string_from_connect_magic1(address.magic1).unwrap_or("<invalid>"),
+                        tenderlink::stp::b64(&CRYPTO_MAGIC  .to_le_bytes()[..6]),
+                        tenderlink::stp::crypto_string_from_connect_magic1(CRYPTO_MAGIC).unwrap(),
                         );
             }
             tracing::info!("NewNet: Connecting to peer: {:?}", address);
@@ -1238,38 +1393,24 @@ pub fn sync(
     let mut next_peer_request = std::time::Instant::now();
     let mut next_console_status_print = std::time::Instant::now();
 
-    // Lite checkpointing. See CheckpointState.
-    let checkpoint_target: Option<Hash> = match &config.network_checkpoint_block_hash {
-        None => None,
-        // "" is the explicit opt-out: with a default checkpoint baked into the
-        // config, omitting the field no longer means "no checkpoint".
-        Some(s) if s.is_empty() => None,
-        Some(s) => match s.parse::<Hash>() {
-            Ok(hash) => Some(hash),
-            Err(err) => {
-                tracing::error!("NewNet: Failed to parse network_checkpoint_block_hash {s:?}: {err:?}. Ignoring checkpoint.");
-                None
-            }
-        },
+
+    // Lite checkpoint: enforced at the commit-queue push, and stays armed forever.
+    let checkpoint = Checkpoint::from_config(&config.network_checkpoint);
+    // while false we need to filter out peers who do not have the checkpoint
+    let mut checkpoint_committed_locally = match &checkpoint {
+        None => true,
+        Some(cp) => read_state.best_chain_block_hash(Height(cp.height)) == Some(cp.hash),
     };
-    let mut checkpoint_state = match checkpoint_target {
-        None => CheckpointState::Normal,
-        Some(target) => {
-            // If the checkpoint is already committed on our best chain, there's nothing to do.
-            let already_committed_locally = read_state.block_header(target.into())
-                .map(|(_, height, _, _)| read_state.best_chain_block_hash(height) == Some(target))
-                .unwrap_or(false);
-            if already_committed_locally {
-                tracing::info!("NewNet: Checkpoint {target} already committed locally; checkpointing satisfied (NORMAL).");
-                CheckpointState::Normal
-            } else {
-                tracing::info!("NewNet: Checkpoint {target} configured but not committed locally; entering SEARCH.");
-                CheckpointState::Search { target }
+    if let Some(cp) = &checkpoint {
+        tracing::info!("NewNet: Checkpoint {} @ height {} active.", cp.hash, cp.height);
+        if let Some(local) = read_state.best_chain_block_hash(Height(cp.height)) {
+            if local != cp.hash {
+                // We synced past the checkpoint height on the wrong chain before this
+                // checkpoint was configured; the commit rule can't undo that.
+                tracing::error!("NewNet: local best chain has {local} at checkpoint height {}, expected {}! On the wrong chain; a resync is needed.", cp.height, cp.hash);
             }
         }
-    };
-    let checkpoint_check_interval = std::time::Duration::from_millis(1000);
-    let mut next_checkpoint_check = std::time::Instant::now() + checkpoint_check_interval;
+    }
 
     let stp_address_get_short_string = |address| {
         let addr = format!("{:?}", address);
@@ -1290,35 +1431,77 @@ pub fn sync(
                 }
             }
 
-            tracing::info!("tip height: {:?}, finalized height: {:?}, peers: {:?}", near_tip_chains.tip_height(), near_tip_chains.finalized_height, my_peers_to_print);
+            tracing::info!("tip height: {:?}, finalized height: {:?}, peers: {:?}",
+                           read_state.best_tip().map(|(h, _)| h.0),
+                           read_state.finalized_tip().map(|(h, _)| h.0),
+                           my_peers_to_print);
             next_console_status_print = loop_start + std::time::Duration::from_secs(2);
         }
 
-        // Drain block events
+        // Crosslink finalization: the BFT side asks, this loop performs it. It used to reach
+        // the write task through the state service, which can no longer reach the writer.
         loop {
-            match event_rx.try_recv() {
-                Ok(block_event) => {
-                    match block_event {
-                        BlockEvent::Committed(block) => {
-                            near_tip_chains.push_blocks(&[block]);
-                        }
-                        BlockEvent::TradFinalized(block) | BlockEvent::CrosslinkFinalized(block) => {
-                            near_tip_chains.remove_chains_invalidated_by_finalized(&block);
-                        }
+            match finalize_rx.try_recv() {
+                Ok(CrosslinkFinalizeRequest { hash, reply }) => {
+                    // Only finalize blocks we actually hold. Finalizing anything else would push
+                    // finalized_height past the best-chain tip and violate the
+                    // finalized_height <= tip_height invariant. Replying with an error stalls the
+                    // BFT decision (the caller retries forever) while PoW proceeds.
+                    let held = block_writer.non_finalized_state.any_chain_contains(&hash)
+                            || block_writer.finalized_state.db.contains_hash(hash);
 
-                        _ => {
-                            tracing::info!("NewNet: block_event: {:?}", block_event);
-                        }
-                    }
+                    let result = if held {
+                        block_writer
+                            .handle_crosslink_finalize(hash)
+                            .map_err(|err| format!("{err:?}"))
+                    } else {
+                        Err(format!(
+                            "BFT finalized {hash}, which we do not have; stalling finalization"
+                        ))
+                    };
+
+                    let _ = reply.send(result);
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(err) => { tracing::error!("{err:?}"); break; },
+                Err(err) => { tracing::error!("crosslink finalize queue: {err:?}"); break; }
+            }
+        }
+
+        // Drain externally submitted blocks (submit_block RPC, miner, test harness) into the
+        // same commit queue the network path uses, so they go through identical verification.
+        loop {
+            match submit_rx.try_recv() {
+                Ok(BlockSubmission { block, reply }) => {
+                    let hash = block.hash();
+
+                    if let Some(known) = read_state.known_block(hash) {
+                        let _ = reply.send(IngestOutcome::Known {
+                            location: known.location,
+                            height: known.height,
+                        });
+                        continue;
+                    }
+                    if blocks_to_commit.iter().any(|(queued, _)| *queued == hash) {
+                        let _ = reply.send(IngestOutcome::Known {
+                            location: crate::response::KnownBlockLocation::Queue,
+                            height: block.coinbase_height().unwrap_or(Height(0)),
+                        });
+                        continue;
+                    }
+
+                    blocks_to_commit.push((hash, block));
+                    submission_replies.insert(hash, reply);
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(err) => { tracing::error!("block submission queue: {err:?}"); break; }
             }
         }
 
         #[cfg(debug_assertions)]
         if false { // @Dev @Debug: Roundtrip test.
-            near_tip_chains.roundtrip_to_branches(PACKET_STATUS_MAX_SIZE, if XXX_tick_loop_counter % 20 == 0 { 2 } else { 0 });
+            if let Some(chains) = near_tip_chains_from_state(&read_state) {
+                chains.roundtrip_to_branches(PACKET_STATUS_MAX_SIZE, if XXX_tick_loop_counter % 20 == 0 { 2 } else { 0 });
+            }
             XXX_tick_loop_counter += 1;
         }
 
@@ -1559,17 +1742,22 @@ pub fn sync(
         }
         blocks_to_send.clear();
 
-        // Invariant: near_tip_chains contains at least the genesis. Currently.
-        assert!(near_tip_chains.tip_height().is_some());
-        if std::time::Instant::now() >= next_status {
+        if std::time::Instant::now() >= next_status { 'send_status: {
+            next_status = std::time::Instant::now() + status_interval;
 
-            assert!(blocks_to_commit.len() < MAX_BLOCKS_TO_QUEUE_TO_COMMIT);
+            // Our chain tree, as of right now. Built here and dropped at the end of the block, so
+            // it cannot go stale and nothing has to keep it up to date.
+            let Some(near_tip_chains) = near_tip_chains_from_state(&read_state) else {
+                tracing::warn!("NewNet: no tip yet; skipping STATUS");
+                break 'send_status;
+            };
+
             let queue_len = blocks_to_commit.len().min(MAX_BLOCKS_TO_QUEUE_TO_COMMIT) as u8;
 
             let (mut buf, mut o) = ([0u8; 1 + 1 + MAX_BLOCKS_TO_QUEUE_TO_COMMIT * 32 + PACKET_STATUS_MAX_SIZE], 0);
             o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
             o += queue_len         .write_to(&mut buf[o..]);
-            for (queued_hash, _) in &blocks_to_commit {
+            for (queued_hash, _) in blocks_to_commit.iter().take(queue_len as usize) {
                 o += queued_hash.0.write_to(&mut buf[o..]);
             }
             o += near_tip_chains   .write_to(&mut buf[o..], None);
@@ -1647,10 +1835,10 @@ pub fn sync(
                         let (mut buf, mut o) = ([0u8; 1 + 1 + MAX_BLOCKS_TO_QUEUE_TO_COMMIT * 32 + PACKET_STATUS_MAX_SIZE], 0);
                         o += PACKET_TYPE_STATUS.write_to(&mut buf[o..]);
                         o += queue_len         .write_to(&mut buf[o..]);
-                        for (queued_hash, _) in &blocks_to_commit {
+                        for (queued_hash, _) in blocks_to_commit.iter().take(queue_len as usize) {
                             o += queued_hash.0 .write_to(&mut buf[o..]);
                         }
-                        o += historical_chains .write_to(&mut buf[o..], Some(near_tip_chains.tip_height().expect("at least genesis block assumed included in near tip chains"))); // @TODO: this will break if we remove genesis...
+                        o += historical_chains .write_to(&mut buf[o..], Some(near_tip_chains.tip_height().expect("near_tip_chains_from_state() always produces at least one chain")));
 
 
                         // if TRACE { tracing::info!("Send a historical STATUS to {:?} @ {}", address, their_final_parent_parent_height + 1); }
@@ -1663,14 +1851,26 @@ pub fn sync(
                     packets_to_send.push((key, Vec::from(&buf[..o])));
                 }
             }
-
-            next_status = std::time::Instant::now() + status_interval;
-        }
+        }}
 
         // Discard statuses of disconnected peers
         peers.retain(|connection_key, _| current_connections.iter().any(|(addr, _)| addr.connection_key() == *connection_key));
 
-        if std::time::Instant::now() >= next_dl_init {
+        if std::time::Instant::now() >= next_dl_init { 'init_dls: {
+            next_dl_init = std::time::Instant::now() + dl_init_interval;
+
+            // Same deal as the STATUS block: built here, used here, dropped here.
+            let Some(near_tip_chains) = near_tip_chains_from_state(&read_state) else {
+                tracing::warn!("NewNet: no tip yet; skipping download init");
+                break 'init_dls;
+            };
+
+            if !checkpoint_committed_locally {
+                if let Some(cp) = &checkpoint {
+                    checkpoint_committed_locally = read_state.best_chain_block_hash(Height(cp.height)) == Some(cp.hash);
+                }
+            }
+
             let mut active_block_dls = 0;
             let mut requests_by_hash: HashMap<Hash, usize> = HashMap::new();
             let mut requests_by_height: HashMap<u32, usize> = HashMap::new();
@@ -1680,12 +1880,7 @@ pub fn sync(
                     if peer.block_downloads.slot_is_used(dl_i) {
                         let HeightAndHashOr0 { height: block::Height(height), hash_or_0 } = peer.block_downloads.slots[dl_i].height_hash;
 
-                        // Drop leftover SEARCH-mode by-hash probes once we've left SEARCH.
-                        if height == CHECKPOINT_SEARCH_HEIGHT
-                            && !matches!(checkpoint_state, CheckpointState::Search { .. }) {
-                            peer.block_downloads.remove(dl_i);
-
-                        } else if height <= near_tip_chains.finalized_height {
+                        if height <= near_tip_chains.finalized_height {
                             if TRACE { tracing::info!("Cancelling download request for block @ {}, {} - <= finalized @ {}", height, hash_or_0, near_tip_chains.finalized_height); }
                             peer.block_downloads.remove(dl_i);
 
@@ -1696,19 +1891,20 @@ pub fn sync(
 
                         } else if hash_or_0 != block::Hash([0; 32]) {
                             requests_by_hash.entry(hash_or_0).and_modify(|c| *c += 1).or_insert(1);
+                            let is_probe = !checkpoint_committed_locally && checkpoint.is_some_and(|cp| cp.height == height && cp.hash == hash_or_0);
+                            if !is_probe { active_block_dls += 1; }
 
                         } else {
                             requests_by_height.entry(height).and_modify(|c| *c += 1).or_insert(1);
+                            active_block_dls += 1;
                         }
                     }
                 }
-
-                active_block_dls += peer.block_downloads.used_count();
             }
             let prev_active_block_dls = active_block_dls;
 
             // TODO: weight peers by observed quality
-            const MAX_PEERS_TO_INIT_DLS_FROM: usize = 8;
+            const MAX_PEERS_TO_INIT_DLS_FROM: usize = 16;
 
             /*  Note(Sam): CRITICAL BUG THAT I AM ADDRESSING NOW. We cannot randomly select a fixed number of
                 peers. We must first filter the peers by who has something we can download. Otherwise we will
@@ -1721,9 +1917,9 @@ pub fn sync(
 
             let mut count_of_peers_we_started_download_from = 0;
             'send_to_peers: for connection_key in peer_random_keys {
-                let Peer { origin, their_tree, their_queue, ref mut block_downloads, checkpoint_passed, checkpoint_last_tested, .. } = peers.get_mut(&connection_key).unwrap();
+                let Peer { origin, their_tree, their_queue, ref mut block_downloads, has_checkpoint_block, .. } = peers.get_mut(&connection_key).unwrap();
                 if count_of_peers_we_started_download_from >= MAX_PEERS_TO_INIT_DLS_FROM { break 'send_to_peers; }
-                let mut did_we_actually_start_a_download_bool_for_increment_at_the_end = false;
+                let active_block_dls_before_this_peer = active_block_dls; // to detect if we start any dl for this peer
 
 
                 if *their_tree == NearTipBranches::default() {
@@ -1740,39 +1936,22 @@ pub fn sync(
                     addr.clone()
                 };
 
-                // Lite checkpointing: gate / redirect what we request from this peer.
-                match checkpoint_state {
-                    CheckpointState::Search { target } => {
-                        // Freeze normal sync; only probe this peer for the checkpoint block by hash
-                        // (height unknown until we obtain it, hence the sentinel height).
+                // Checkpoint gate: until our own best chain contains the checkpoint block, only
+                // sync from peers that have proven they hold it (served it to a by-hash request,
+                // see BLOCK_CHUNK). Otherwise an eclipsing wrong-chain peer could feed us its
+                // whole chain and we'd only find out at the checkpoint height. The probe slot
+                // times out and gets reinserted, so it doubles as the retry pacing.
+                if let Some(cp) = &checkpoint {
+                    if !checkpoint_committed_locally && !*has_checkpoint_block {
                         let probe = HeightAndHashOr0 {
-                            height: block::Height(CHECKPOINT_SEARCH_HEIGHT),
-                            hash_or_0: target,
+                            height: block::Height(cp.height),
+                            hash_or_0: cp.hash,
                         };
                         if block_downloads.position(probe).is_none() {
                             block_downloads.insert(probe);
                         }
                         continue 'send_to_peers;
                     }
-                    CheckpointState::Locked { height: cp_height, .. } => {
-                        if !*checkpoint_passed {
-                            // Only sync from peers that pass the test; (re)issue the height test otherwise.
-                            let due = checkpoint_last_tested.as_ref().map_or(true, |t| t.elapsed() >= CHECKPOINT_RETEST_INTERVAL);
-                            if due {
-                                let probe = HeightAndHashOr0 {
-                                    height: block::Height(cp_height),
-                                    hash_or_0: block::Hash([0; 32]),
-                                };
-                                if block_downloads.position(probe).is_none() {
-                                    block_downloads.insert(probe);
-                                }
-                                *checkpoint_last_tested = Some(std::time::Instant::now());
-                            }
-                            continue 'send_to_peers;
-                        }
-                        // Passed peer: fall through to normal sync.
-                    }
-                    CheckpointState::Normal => {}
                 }
 
                 macro_rules! warning {
@@ -1781,14 +1960,6 @@ pub fn sync(
                         tracing::warn!("{}", format!("NewNet: Peer {:?}: {}", connection_address, format!($($arg)*)).to_string());
                     }};
                 }
-
-                let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height())
-                else {
-                    warning!("I don't have a tip height yet");
-                    continue 'send_to_peers;
-                };
-
-
 
                 // // rule to push:
                 // //     per each of our chains:
@@ -1909,12 +2080,17 @@ pub fn sync(
                             // print_shadow_block_intersection(&their_branch, &our_chain.blocks, 1);
 
 
-                            // If the prefix was empty, there was no overlap.
-                            if prefix.is_empty() {
-                                continue;
-                            }
-
-                            let height_of_match = prefix.last().unwrap().this_height;
+                            let height_of_match = if !prefix.is_empty() {
+                                prefix.last().unwrap().this_height
+                            } else if their_branch_height_bgn > 0
+                                   && our_chain.blocks.iter().any(|b| b.this_hash == their_branch[0].parent_hash
+                                                                   && b.this_height + 1 == their_branch_height_bgn) {
+                                // no common height, but their branch extends our chain by parent link
+                                // (e.g. a fresh block mined right above our tip)
+                                their_branch_height_bgn - 1
+                            } else {
+                                continue; // no overlap
+                            };
 
                             assert!(height_of_match < our_chain_height_end);
                             assert!(height_of_match < their_branch_height_end);
@@ -1957,7 +2133,6 @@ pub fn sync(
                                     let dups = requests_by_hash.entry(hash).or_insert(0);
                                     if *dups < MAX_REQUEST_DUPLICATES_N {
                                         if let Some(dl_i) = block_downloads.insert(height_hash) {
-                                            did_we_actually_start_a_download_bool_for_increment_at_the_end = true;
                                             active_block_dls += 1; // total in flight
                                             *dups += 1; // duplicates of this block
                                             if TRACE { tracing::info!("Include request for near-tip   block @ {height}, {hash}, x{}! New DL count for peer: {}", *dups, block_downloads.used_flags.count_ones()); }
@@ -2000,14 +2175,15 @@ pub fn sync(
 
                 queue_blocks_to_request();
 
-                if did_we_actually_start_a_download_bool_for_increment_at_the_end {
+                // active_block_dls only advances inside queue_blocks_to_request, so a bump
+                // means this peer started at least one download.
+                if active_block_dls > active_block_dls_before_this_peer {
                     count_of_peers_we_started_download_from += 1;
                 }
             }
 
             if TRACE { tracing::info!("Started {} new block dls (currently {active_block_dls}/{MAX_BANDWIDTH_BLOCKS_PER_RES})", active_block_dls - prev_active_block_dls); }
-            next_dl_init = std::time::Instant::now() + dl_init_interval;
-        }
+        }}
 
         if std::time::Instant::now() >= next_peer_request {
             for (connection_key, peer) in peers.iter_mut() {
@@ -2021,14 +2197,10 @@ pub fn sync(
                         // Prevent cycles of receiving a sub-chunk after completing, then re-requesting a block we now have
                         // TODO: there may be a neater way to achieve the same thing
                         let HeightAndHashOr0 { height: block::Height(height), hash_or_0 } = peer.block_downloads.slots[dl_i].height_hash;
-                        if hash_or_0 != block::Hash([0;32]) {
-                            for our_chain in &near_tip_chains.chains {
-                                if our_chain.blocks.iter().any(|block| block.this_hash == hash_or_0) {
-                                    tracing::warn!("Don't need to re-request: block @ {height}, {hash_or_0} was already committed!");
-                                    peer.block_downloads.remove(dl_i);
-                                    continue 'downloads;
-                                }
-                            }
+                        if hash_or_0 != block::Hash([0;32]) && read_state.known_block(hash_or_0).is_some() {
+                            tracing::warn!("Don't need to re-request: block @ {height}, {hash_or_0} was already committed!");
+                            peer.block_downloads.remove(dl_i);
+                            continue 'downloads;
                         }
 
                         let dl = &peer.block_downloads.slots[dl_i];
@@ -2214,9 +2386,20 @@ pub fn sync(
                     their_queue.insert(Hash(hash));
                 };
 
-                let Some(their_tree) = some_or_kill!(NearTipBranches::read_from(&mut msg), "NearTipBranches read failed") else {
+                let Some(mut their_tree) = some_or_kill!(NearTipBranches::read_from(&mut msg), "NearTipBranches read failed") else {
                     continue 'process_packets;
                 };
+
+                // Lite checkpoint: don't track gossiped branches past a conflicting block at the
+                // checkpoint height — we'd reject them at commit anyway, so don't request them.
+                if let Some(cp) = &checkpoint {
+                    for branch in &mut their_tree.branches {
+                        if let Some(i) = branch.iter().position(|b| cp.rejects(b.this_height, b.this_hash)) {
+                            branch.truncate(i);
+                        }
+                    }
+                    their_tree.branches.retain(|b| !b.is_empty());
+                }
 
                 peer.their_tree = their_tree;
                 peer.their_queue = their_queue;
@@ -2239,14 +2422,10 @@ pub fn sync(
                 if height_hash.hash_or_0 != block::Hash([0;32]) {
                     blocks_to_send.push((connection_key, height_hash.hash_or_0, height_hash.height.0, request.offset as usize));
                 } else {
-                    println!("Height requested that doesn't exist on BC: {:?}", height_hash.height);
+                    // by-height request for a block we don't have on the best chain; nothing to send
+                    // println!("Height requested that doesn't exist on BC: {:?}", height_hash.height);
                 }
             } else if packet_type == PACKET_TYPE_BLOCK_CHUNK {
-                let Some(our_tip_height) = dbg_verify(near_tip_chains.tip_height()) else {
-                    warning!("I don't have a tip height yet");
-                    continue 'process_packets;
-                };
-
                 let Some(hdr) = some_or_kill!(PeerPowBlockResponseChunkHdr::read_from(&mut msg), "failed to read PoW chunk header") else {
                     continue 'process_packets;
                 };
@@ -2268,29 +2447,12 @@ pub fn sync(
                 // @Note: for valid blocks the height can be computed from block data, so this is an early-out optimization.
                 let alleged_height = hdr.height_hash.height.0;
 
-                // Lite checkpointing: a block arriving at the checkpoint height reveals whether
-                // this peer's main chain matches the checkpoint. (Evaluated from the chunk header,
-                // so a wrong-chain peer is rejected after a single chunk rather than a full block.)
-                if let CheckpointState::Locked { target, height: cp_height } = checkpoint_state {
-                    if alleged_height == cp_height {
-                        let their_hash = hdr.height_hash.hash_or_0;
-                        let passed = their_hash == target;
-                        peer.checkpoint_passed = passed;
-                        peer.checkpoint_last_tested = Some(std::time::Instant::now());
-                        if !passed {
-                            if TRACE { tracing::info!("NewNet: Peer failed checkpoint test: {their_hash} != target {target} @ height {cp_height}"); }
-                            peer.block_downloads.remove(dl_i);
-                            continue 'process_packets;
-                        }
-                        // Passed: this is the checkpoint block itself; let it commit normally.
-                    }
-                }
-
-                // @Note: Skip blocks that are older than the base of our NearTipChain view of the best chain.
-                // Depending on whether our NEAR_TIP_CHAIN_LEN is < or > Zebra's MAX_BLOCK_REORG_HEIGHT,
-                // presence in the best NearTipChain *may* or *may not* logically imply that this new block
-                // is "not even worth" submitting to Zebra (rejected due to being too far back).
-                let min_height = near_tip_chains.chains[0].blocks[0].this_height; // @Todo: this assumes :AssumeGenesisBlockIncludedInNearTipChains
+                // @Note: Skip blocks older than the base of the window we advertise. Depending on
+                // whether NEAR_TIP_CHAIN_LEN is < or > Zebra's MAX_BLOCK_REORG_HEIGHT, being below
+                // it *may* or *may not* imply the block is "not even worth" submitting to Zebra
+                // (rejected due to being too far back).
+                let (best_tip_height, _) = read_state.best_tip().expect("genesis is committed before the sync loop starts");
+                let min_height = near_tip_start_height(best_tip_height.0);
 
                 // if TRACE { tracing::info!("Block @ {alleged_height}, offset {}...", hdr.offset); }
 
@@ -2300,7 +2462,8 @@ pub fn sync(
                     continue 'process_packets; // Deciding that it's "not even worth" sending to Zebra
                 }
 
-                if alleged_height <= near_tip_chains.finalized_height {
+                let finalized_height = read_state.finalized_tip().map_or(0, |(h, _)| h.0);
+                if alleged_height <= finalized_height {
                     warning!("Block at height {alleged_height} is already finalized");
                     peer.block_downloads.remove(dl_i);
                     continue 'process_packets; // Definitely already committed :)
@@ -2338,14 +2501,20 @@ pub fn sync(
                 }
 
 
-                if blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == alleged_hash) {
-                    warning!("Block was already queued to commit!: {alleged_hash}");
-                    peer.block_downloads.remove(dl_i);
-                    continue 'process_packets;
-                }
+                // an unproven peer's checkpoint probe still needs to reassemble even if we
+                // already have the block, so the possession proof lands; dropped post-proof below
+                let is_unproven_checkpoint_probe = !checkpoint_committed_locally
+                    && !peer.has_checkpoint_block
+                    && checkpoint.is_some_and(|cp| cp.hash == alleged_hash);
 
-                for our_chain in &near_tip_chains.chains {
-                    if our_chain.blocks.iter().any(|block| block.this_hash == alleged_hash) {
+                if !is_unproven_checkpoint_probe {
+                    if blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == alleged_hash) {
+                        warning!("Block was already queued to commit!: {alleged_hash}");
+                        peer.block_downloads.remove(dl_i);
+                        continue 'process_packets;
+                    }
+
+                    if read_state.known_block(alleged_hash).is_some() {
                         warning!("Block was already committed!: {alleged_hash}");
                         peer.block_downloads.remove(dl_i);
                         continue 'process_packets;
@@ -2380,31 +2549,6 @@ pub fn sync(
                 let block_data_vec = peer.block_downloads.remove(dl_i).reassembly.buf;
                 let block_data = &block_data_vec[..];
 
-                // Lite checkpointing: handle SEARCH-mode by-hash probe responses (sentinel height).
-                // If it's the target we acquire it (learning its height) and lock on; otherwise it's
-                // a leftover probe and we simply drop it. The download slot was already removed above.
-                if alleged_height == CHECKPOINT_SEARCH_HEIGHT {
-                    if let CheckpointState::Search { target } = checkpoint_state {
-                        if alleged_hash == target {
-                            if let Some(b) = block_data.zcash_deserialize_into::<Block>().ok() {
-                                if b.hash() == target {
-                                    if let Some(h) = b.coinbase_height() {
-                                        tracing::info!("NewNet: Acquired checkpoint block {target} @ height {}; SEARCH -> LOCKED.", h.0);
-                                        checkpoint_state = CheckpointState::Locked { target, height: h.0 };
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    continue 'process_packets;
-                }
-
-                // Lite checkpointing: while SEARCHing we do not accept/commit any block from any peer.
-                if matches!(checkpoint_state, CheckpointState::Search { .. }) {
-                    continue 'process_packets;
-                }
-
-
                 // TODO: we should be able to early out once we have chunk 0 or a hdr-contained parent hash
                 // @Volatile, depends on block header format.
                 let parent_hash = {
@@ -2418,16 +2562,16 @@ pub fn sync(
                     Hash(parent_hash)
                 };
 
-                let have_parent_in_chains           = is_parent_in_chains(&read_state, &near_tip_chains, parent_hash);
+                let have_parent_in_chains           = read_state.known_block(parent_hash).is_some();
                 let have_parent_in_blocks_to_commit = blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == parent_hash);
 
-                if !have_parent_in_chains && !have_parent_in_blocks_to_commit {
-                    // TODO: we should keep these, but have them easily evictable, for OoO block downloads
-                    warning!("Block does not link anywhere known, neither to our chains nor to our blocks-to-commit queue! Not queueing; dropping: height {alleged_height} hash {alleged_hash}, parent {parent_hash}");
-                    continue 'process_packets;
-                }
-
-                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, valid hash and height and links somewhere known..."); }
+                // @Experimental: Accept non-committable tails by commenting out the skip. This should be vetted for DoS - could an adversary queue nonsense blocks?
+                // if !have_parent_in_chains && !have_parent_in_blocks_to_commit {
+                //     // TODO: we should keep these, but have them easily evictable, for OoO block downloads
+                //     warning!("Block does not link anywhere known, neither to our chains nor to our blocks-to-commit queue! Not queueing; dropping: height {alleged_height} hash {alleged_hash}, parent {parent_hash}");
+                //     continue 'process_packets;
+                // }
+                if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}, valid hash and height"); } // and links somewhere known..."); }
 
                 use zebra_chain::serialization::ZcashDeserializeInto;
                 let Some(block) = some_or_kill!(block_data.zcash_deserialize_into::<Block>().ok(), "Failed to deserialize block") else {
@@ -2461,38 +2605,37 @@ pub fn sync(
                     continue 'process_packets;
                 }
 
+                // Lite checkpoint: never commit a conflicting block at the pinned height. Just
+                // drop the block, not the peer — they served what we asked for, and peers on the
+                // wrong fork still share all their pre-fork blocks with us.
+                if let Some(cp) = &checkpoint {
+                    if cp.rejects(height.0, hash) {
+                        warning!("block {hash} @ {} conflicts with checkpoint {} @ {}; dropping block", height.0, cp.hash, cp.height);
+                        continue 'process_packets;
+                    }
+                    if hash == cp.hash {
+                        // peer proved it holds the checkpoint block; passes the dl-init gate now
+                        peer.has_checkpoint_block = true;
+                        // re-run the dup checks skipped for probes; don't queue the block twice
+                        if blocks_to_commit.iter().any(|(queued_hash, _)| *queued_hash == hash)
+                            || read_state.known_block(hash).is_some() {
+                            continue 'process_packets;
+                        }
+                    }
+                }
+
                 if TRACE { tracing::info!("NewNet: \x1b[93mGOT BLOCK HASH\x1b[0m: {}", hash); }
 
                 // @Todo(Phil): Semantic verification.
 
                 // @Note: Evict a sidechain tail to make room. Prefer non-committable tails.
-                if blocks_to_commit.len() >= MAX_BLOCKS_TO_QUEUE_TO_COMMIT {
-
-                    // @Lazy. N squared. Not cool.
-                    let is_tail = |i: usize| {
-                        let (h, _) = &blocks_to_commit[i];
-                        !blocks_to_commit.iter().any(|(_, b)| b.header.previous_block_hash == *h)
-                    };
-
-                    // Prefer a non-committable tail (parent not in chains).
-                    // Never evict the incoming block's parent — that would orphan the block we're about to push.
-                    let evict_idx = (0..blocks_to_commit.len()).find(|&i| {
-                        blocks_to_commit[i].0 != parent_hash
-                        && is_tail(i) && !is_parent_in_chains(&read_state, &near_tip_chains, blocks_to_commit[i].1.header.previous_block_hash)
-                    }).or_else(|| if have_parent_in_chains {
-                        // All tails are committable; only evict if new block is also committable.
-                        (0..blocks_to_commit.len()).filter(|&i| blocks_to_commit[i].0 != parent_hash && is_tail(i)).last()
-                    } else {
-                        None
-                    });
-
-                    if let Some(idx) = evict_idx {
-                        warning!("Evicting block from commit queue to make room");
-                        blocks_to_commit.swap_remove(idx);
-                    } else {
-                        warning!("Commit queue full of committable blocks; dropping non-committable block");
-                        continue 'process_packets;
-                    }
+                // Make room if the cache is full. Oldest first: the queue is roughly in arrival
+                // order, and a block that has waited longest is the most likely to be waiting on
+                // something that is not coming. Anything evicted gets re-downloaded if a peer
+                // still advertises it, so this is a cost, not a correctness issue.
+                if blocks_to_commit.len() >= MAX_DEFERRED_BLOCKS {
+                    let evicted = blocks_to_commit.remove(0);
+                    warning!("Block cache full ({MAX_DEFERRED_BLOCKS}); evicting oldest: {}", evicted.0);
                 }
 
                 println!("Queueing for commit: {}", hash);
@@ -2544,7 +2687,7 @@ pub fn sync(
 
             let parent_hash = block_arc.header.previous_block_hash;
 
-            if !is_parent_in_chains(&read_state, &near_tip_chains, parent_hash) {
+            if read_state.known_block(parent_hash).is_none() {
                 return true; // keep
             }
 
@@ -2552,15 +2695,154 @@ pub fn sync(
 
             let height = block_arc.coinbase_height().expect("all blocks in the commit queue should already have been confirmed to have a height").0;
             println!("Committing: @ {height}, {hash}");
-            let res = rt.block_on(commit_block(block_arc));
+            // Verify synchronously, immediately before committing. This must NOT run at
+            // packet-receipt time: the block that created the outputs this one spends may still
+            // be sitting in this queue rather than committed, and the UTXO load would fail for a
+            // perfectly valid block.
+            let verdict = {
+                let network = read_state.network().clone();
+                // Matches SemanticBlockVerifier: PoW is skipped on networks that disable it.
+                let check_pow = !network.disable_pow();
+
+                // The agreed order: header (PoW gate) -> body (merkle binds the height) ->
+                // crosslink gate -> expensive. The crosslink gate MUST come after the body:
+                // it makes permanent, height-keyed decisions, and until the merkle root is
+                // checked the height is not bound to the PoW'd header.
+                let cheap_result = (verify_fns.check_header)(&block_arc.header, &network, block::Height(height), chrono::Utc::now(), check_pow)
+                    .and_then(|()| (verify_fns.check_body)(&block_arc, &network));
+                match cheap_result {
+                    Err(err) => Err(("cheap", err.msg, false)),
+                    Ok(cheap) => {
+                        // Crosslink fat-pointer gate, mirroring the state service's version
+                        // (:CrosslinkGate in service.rs). Three-way:
+                        //   None        -> the parent's pointer or the referenced BFT block is
+                        //                  not resolvable yet. Reversible, but per the agreed
+                        //                  policy we fail rather than defer: an internal retry
+                        //                  queue is unbounded in time, and the network layer
+                        //                  re-offers the block anyway.
+                        //   Some(false) -> permanently invalid.
+                        //   Some(true)  -> proceed.
+                        // @Volatile: the 32265/32266 bypass is carried across verbatim from
+                        // service.rs. It is a height-keyed hole in a consensus gate.
+                        let child_fat_pointer = block_arc.header.fat_pointer_to_bft_block.clone();
+                        let parent_fat_pointer = read_state
+                            .any_chain_block_header(parent_hash.into())
+                            .map(|hdr| hdr.fat_pointer_to_bft_block.clone());
+
+                        // Signatures dominate the Display form and never matter for "why is this
+                        // stuck" -- hash + ovd + count is enough to identify the pointer.
+                        let fp_brief = |fp: &zcash_primitives::bft::FatPointerToBftBlock| {
+                            let v = &fp.vote_for_block_without_finalizer_public_key;
+                            format!("{{hash:{} ovd:{} sigs:{}}}", hex::encode(&v[0..32]), hex::encode(&v[32..]), fp.signatures.len())
+                        };
+
+                        let (gate, defer_msg) = if height == 32265 || height == 32266 {
+                            (Some(true), String::new())
+                        } else if let Some(parent_fp) = parent_fat_pointer {
+                            let msg = format!("child fp {} / parent fp {} not resolvable yet", fp_brief(&child_fat_pointer), fp_brief(&parent_fp));
+                            ((crosslink_gate)(parent_fp, child_fat_pointer, block::Height(height)), msg)
+                        } else {
+                            // known_block() saw the parent but any_chain_block_header() did not;
+                            // the two views disagreeing is itself worth seeing in the log.
+                            (None, format!("parent header {parent_hash} not found (child fp {})", fp_brief(&child_fat_pointer)))
+                        };
+
+                        // @Todo: this rejects on the REVERSIBLE answer, which costs re-downloads.
+                        //
+                        // `None` means "not resolvable yet" and is explicitly documented as
+                        // reversible; `Some(false)` is permanent. We currently fail on both.
+                        // Measured on a fresh sync to height 62: 108 rejections across 20
+                        // distinct blocks -- ~5.4 network re-downloads per affected block --
+                        // while every other verification phase rejected nothing at all.
+                        //
+                        // The real fix is not to re-check the gate later, but for new_network to
+                        // sync the BFT chain itself. Then it knows when each fat pointer becomes
+                        // resolvable and can submit blocks in dependency order, so the gate never
+                        // sees an unresolvable pointer and this whole class of retry disappears
+                        // by construction. Accepting the redundant traffic until then: it costs
+                        // apparent sync speed but keeps this path simple.
+                        match gate {
+                            // Reversible: the BFT block has not arrived. Hold the block and
+                            // re-check next tick rather than dropping and re-downloading it.
+                            None => Err(("crosslink", defer_msg, true)),
+                            // Permanent, per the gate's own documentation. Drop it.
+                            Some(false) => Err(("crosslink", "fat pointer regressed or is too early".to_string(), false)),
+                            Some(true) => {
+                                let lookup = |outpoint: &zebra_chain::transparent::OutPoint| read_state.any_chain_utxo(outpoint);
+                                match (verify_fns.verify_expensive)(&block_arc, &network, &cheap, &lookup) {
+                                    Err(err) => Err(("expensive", err.msg, false)),
+                                    Ok(new_outputs) => Ok((cheap, new_outputs)),
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            // The sync path now GATES the commit: a rejection here means the block is never
+            // submitted. The old route (verifier router -> StateService -> queue_and_commit ->
+            // orphan queue -> sent-hash bookkeeping) is bypassed entirely; the write task is
+            // handed a block we already verified, leaving only contextual validation.
+            let res = match &verdict {
+                Ok((cheap, new_outputs)) => {
+                    let semantically_verified = crate::SemanticallyVerifiedBlock {
+                        block: block_arc.clone(),
+                        hash,
+                        height: cheap.height,
+                        new_outputs: new_outputs.clone(),
+                        transaction_hashes: cheap.transaction_hashes.clone(),
+                        deferred_pool_balance_change: Some(cheap.deferred_pool_balance_change),
+                    };
+                    block_writer
+                        .handle_commit(semantically_verified)
+                        .map(|()| hash)
+                        .map_err(|err| {
+                            let msg = format!("{err:?}");
+                            if msg.contains("Duplicate") || msg.contains("AlreadyFinalized") {
+                                BlockCommitError::Duplicate
+                            } else {
+                                BlockCommitError::Other(msg)
+                            }
+                        })
+                }
+                Err((phase, msg, _)) => Err(BlockCommitError::Other(format!("{phase}: {msg}"))),
+            };
+
+            if let Some(reply) = submission_replies.remove(&hash) {
+                let outcome = match (&verdict, &res) {
+                    (_, Ok(committed)) => IngestOutcome::Committed(*committed),
+                    (_, Err(BlockCommitError::Duplicate)) => IngestOutcome::Known {
+                        location: crate::response::KnownBlockLocation::BestChain,
+                        height: block::Height(height),
+                    },
+                    (Err((phase, msg, _)), _) => IngestOutcome::Failed {
+                        reason: format!("{phase}: {msg}"),
+                        misbehavior_score: 0,
+                    },
+                    (_, Err(BlockCommitError::Other(why))) => IngestOutcome::Failed {
+                        reason: why.clone(),
+                        misbehavior_score: 0,
+                    },
+                };
+                let _ = reply.send(outcome);
+            }
+
+            // A deferrable verdict means "not yet", not "no": keep the block so the next tick
+            // can retry it, instead of dropping it and paying for another download.
+            if let Err((phase, msg, true)) = &verdict {
+                println!("Deferring: @ {height}, {hash}: {phase}: {msg}");
+                return true; // keep
+            }
+
             match res {
                 Ok(_) => {
+                    // handle_commit() already published the new chain state through the tip and
+                    // non-finalized-state channels, on this thread, before returning. Anything
+                    // that wants the chain view reads it back out of the state.
                     println!("committed!: @ {height}, {hash}");
                     false // remove
                 }
                 Err(BlockCommitError::Duplicate) => {
-                    // @Todo: We would like to update the finalized height here, but
-                    //        we would also have to call near_tip_chains.remove_chains_invalidated_by_finalized() with that height.
                     println!("Already was committed: {}", hash);
                     false // remove
                 }
@@ -2572,23 +2854,26 @@ pub fn sync(
             }
         });
 
-        if blocks_to_commit.len() > 0 && !any_blocks_in_the_queue_can_make_progress {
-            // dbg_panic!("No blocks made progress in the queue this tick!? This should never hit! Currently we are only queueing blocks that can make progress!"); // @Temporary.
-            blocks_to_commit.clear();
-        }
-
-        // Lite checkpointing: exit LOCKED once the checkpoint block is committed on our best
-        // chain locally (not merely sitting in the commit queue). SEARCH -> LOCKED happens
-        // inline when we acquire the block (see the BLOCK_CHUNK handler).
-        if std::time::Instant::now() >= next_checkpoint_check {
-            if let CheckpointState::Locked { target, height } = checkpoint_state {
-                if read_state.best_chain_block_hash(Height(height)) == Some(target) {
-                    tracing::info!("NewNet: Checkpoint {target} committed locally @ height {height}; LOCKED -> NORMAL.");
-                    checkpoint_state = CheckpointState::Normal;
-                }
+        // Blocks at or below the finalized height can never commit, so holding them is pure
+        // waste. This replaces a blanket clear() that used to throw away the whole cache --
+        // including blocks that were merely waiting for their parent -- whenever no block
+        // happened to make progress in a tick.
+        let finalized_height = read_state.finalized_tip().map_or(0, |(h, _)| h.0);
+        blocks_to_commit.retain(|(hash, block)| {
+            let height = block.coinbase_height().map_or(0, |h| h.0);
+            if height <= finalized_height {
+                if TRACE { tracing::info!("Dropping cached block @ {height} {hash}: at or below finalized {finalized_height}"); }
+                return false;
             }
-            next_checkpoint_check = std::time::Instant::now() + checkpoint_check_interval;
+            true
+        });
+
+        // Bound the cache. Oldest first; see MAX_DEFERRED_BLOCKS.
+        while blocks_to_commit.len() > MAX_DEFERRED_BLOCKS {
+            let evicted = blocks_to_commit.remove(0);
+            if TRACE { tracing::info!("Block cache full; evicting oldest: {}", evicted.0); }
         }
+        let _ = any_blocks_in_the_queue_can_make_progress;
 
         // Sleep remainder of tick
         let elapsed = loop_start.elapsed();

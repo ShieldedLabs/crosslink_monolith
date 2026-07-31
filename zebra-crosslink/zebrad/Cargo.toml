@@ -46,7 +46,6 @@ features = [
     "filter-reload",
     "flamegraph",
     "journald",
-    "new-net",
     "prometheus",
     "sentry",
     "indexer",
@@ -54,6 +53,11 @@ features = [
 
 [features]
 
+# No-op, kept for compatibility with build scripts that still pass `--features new-net`.
+#
+# new_network is the block pipeline now, not an option: every block entering this node goes
+# through it, so there is nothing to gate and nothing this flag can turn off. Enabling or
+# omitting it produces an identical binary. Safe to delete once no caller passes it.
 new-net = []
 
 # In release builds, don't compile debug logging code, to improve performance.
@@ -61,7 +65,7 @@ default-release-binaries = ["release_max_level_info", "progress-bar", "prometheu
 viz_gui = ["zebra-crosslink/viz_gui"]
 
 # Default features for official ZF binary release builds
-default = ["default-release-binaries", "internal-miner", "new-net"]
+default = ["default-release-binaries", "internal-miner"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 

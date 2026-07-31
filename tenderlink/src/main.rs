@@ -14,10 +14,10 @@ fn main() {
         let seed = [7, 11, 99, 220, 101, 143, 113,   4, 242, 136,  58, 150, 223, 186, 106, 203,
                    67, 18, 48,  96, 176,  69, 152, 173, 224,  46, 206, 156, 217,  31, 170, 165];
     
-        let seeder_keypair = bandwidth_test::new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
+        let seeder_keypair = stp::new_keypair_from_connect_magic1_with_seed(CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2s, seed).unwrap();
         
     
-        use crate::bandwidth_test::*;
+        use crate::stp::*;
         if args[1] == "reflector" {
             let port : u16 = args[2].parse().unwrap();
             println!("running reflector on port: {}", port);
@@ -50,12 +50,12 @@ fn main() {
     /*
     const P2P_PORT: u16 = 12345;
 
-    const SEEDER_CRYPTO: u64 = bandwidth_test::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
+    const SEEDER_CRYPTO: u64 = stp::CONNECT_MAGIC1_Noise_IK_25519_ChaChaPoly_BLAKE2b;
 
     let seed = [7, 11, 99, 220, 101, 143, 113,   4, 242, 136,  58, 150, 223, 186, 106, 203,
                67, 18, 48,  96, 176,  69, 152, 173, 224,  46, 206, 156, 217,  31, 170, 165];
 
-    let seeder_keypair = bandwidth_test::new_keypair_from_connect_magic1_with_seed(SEEDER_CRYPTO, seed).unwrap();
+    let seeder_keypair = stp::new_keypair_from_connect_magic1_with_seed(SEEDER_CRYPTO, seed).unwrap();
 
     let port: u16 = {
         if let Some(i) = args.iter().position(|x| x == "-port") {
@@ -83,8 +83,8 @@ fn main() {
     let (ip4, ip6) = (ip4.parse().unwrap(), ip6.parse().unwrap());
 
     let mut peers = Vec::with_capacity(2);
-    if use_ipv4 { peers.push(bandwidth_test::STPAddress::from(ip4, P2P_PORT, &seeder_keypair)); }
-    if use_ipv6 { peers.push(bandwidth_test::STPAddress::from(ip6, P2P_PORT, &seeder_keypair)); }
+    if use_ipv4 { peers.push(stp::STPAddress::from(ip4, P2P_PORT, &seeder_keypair)); }
+    if use_ipv6 { peers.push(stp::STPAddress::from(ip6, P2P_PORT, &seeder_keypair)); }
 
     p2p_test::p2p(0, SEEDER_CRYPTO, None, peers, use_ipv4, use_ipv6);
     */
