@@ -59,7 +59,7 @@ use tracing::Instrument;
 use zcash_address::{unified::Encoding, TryFromAddress};
 use zcash_protocol::consensus::Parameters;
 use zcash_primitives::transaction::RosterMember;
-use zcash_primitives::bft::{ FatPointerToBftBlock, ScanInfo };
+use zcash_primitives::bft::{ FatPointerToBftBlock, PubKeyID, ScanInfo };
 
 use zebra_chain::{
     amount::{self, Amount, NegativeAllowed, NonNegative},
@@ -200,13 +200,15 @@ pub trait Rpc {
     ///
     /// # Parameters
     ///
-    /// - `bond_key`: (string, required) The 32-byte bond key as a hex string.
+    /// - `bond_key`: (string, required) The 32-byte bond key as a byte-reversed hex string
+    ///   (the same display convention used everywhere else a [`PubKeyID`] is shown, e.g. the
+    ///   `unique_public_key`/`bond_key` fields returned by `wallet_staking_action`).
     ///
     /// # Returns
     ///
     /// Bond information including amount and status, or null if the bond doesn't exist.
     #[method(name = "getbondinfo")]
-    async fn get_bond_info(&self, bond_key: String) -> Result<Option<GetBondInfoResponse>>;
+    async fn get_bond_info(&self, bond_key: PubKeyID) -> Result<Option<GetBondInfoResponse>>;
 
     /// Requests a donation from an attached faucet
     ///
@@ -1550,21 +1552,8 @@ where
         }
     }
 
-    async fn get_bond_info(&self, bond_key: String) -> Result<Option<GetBondInfoResponse>> {
-        let bond_key_bytes: [u8; 32] = Vec::from_hex(&bond_key)
-            .map_err(|_| ErrorObject::owned(
-                ErrorCode::InvalidParams.code(),
-                "invalid hex string for bond_key",
-                None::<()>,
-            ))?
-            .try_into()
-            .map_err(|_| ErrorObject::owned(
-                ErrorCode::InvalidParams.code(),
-                "bond_key must be exactly 32 bytes",
-                None::<()>,
-            ))?;
-
-        let request = zebra_state::ReadRequest::BondInfo(bond_key_bytes);
+    async fn get_bond_info(&self, bond_key: PubKeyID) -> Result<Option<GetBondInfoResponse>> {
+        let request = zebra_state::ReadRequest::BondInfo(bond_key.0);
         let response = self
             .read_state
             .clone()
