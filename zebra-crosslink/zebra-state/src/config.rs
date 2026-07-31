@@ -245,8 +245,8 @@ impl Default for Config {
             network_local_port: 0,
             network_initial_peers: Vec::new(),
             network_checkpoint: Some((
-                187572,
-                "02fc9aa7652b2a9a9f6196a446265fed6012227373ed34e0b17c7a3298db005e".parse().expect("valid checkpoint hash"),
+                280520,
+                "005f8ea35cded28a6e1529595f6d941dd67e11b9e0d92ce2705cd416cb020926".parse().expect("valid checkpoint hash"),
             )),
             hardfork_schedule: Default::default(),
         }
