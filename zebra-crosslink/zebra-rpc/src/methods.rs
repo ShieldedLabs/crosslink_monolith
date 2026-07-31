@@ -58,7 +58,7 @@ use tracing::Instrument;
 
 use zcash_address::{unified::Encoding, TryFromAddress};
 use zcash_protocol::consensus::Parameters;
-use zcash_primitives::transaction::RosterMember;
+use zcash_primitives::transaction::{ StakingActionRequest, RosterMember };
 use zcash_primitives::bft::{ FatPointerToBftBlock, ScanInfo };
 
 use zebra_chain::{
@@ -539,6 +539,10 @@ pub trait Rpc {
     /// Get the UFVK for the attached wallet
     #[method(name = "get_wallet_ufvk")]
     async fn get_wallet_ufvk(&self) -> Option<String>;
+
+    /// send a staking action from the given wallet
+    #[method(name = "wallet_staking_action")]
+    async fn wallet_staking_action(&self, staking_action: StakingActionRequest) -> Result<String>;
 
     /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
     /// If the block is not in Zebra's state,
@@ -2356,6 +2360,32 @@ where
         match res {
             Ok(TFLServiceResponse::WalletUfvk(ufvk_str)) => ufvk_str,
             _ => None
+        }
+    }
+
+    async fn wallet_staking_action(&self, staking_action: StakingActionRequest) -> Result<String> {
+        let res = self
+            .tfl_service
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(TFLServiceRequest::WalletStakingAction(staking_action.clone()))
+            .await;
+
+        match res {
+            Ok(TFLServiceResponse::WalletStakingAction(Ok(res))) => Ok(res),
+            Ok(TFLServiceResponse::WalletStakingAction(Err(err))) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::Verify.into(),
+                    format!("Faucet request for \"{staking_action:?}\" failed: {err}"),
+                    None::<()>,
+            )),
+            Err(err) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::Verify.into(),
+                    format!("Faucet request for \"{staking_action:?}\" failed: {err}"),
+                    None::<()>,
+            )),
+            _ => unreachable!(""),
         }
     }
 

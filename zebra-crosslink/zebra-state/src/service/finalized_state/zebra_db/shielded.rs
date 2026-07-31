@@ -557,6 +557,13 @@ impl DiskWriteBatch {
             ..
         } = finalized;
 
+        // debug_assert(no duplicate trees)
+        #[cfg(debug_assertions)]
+        if let Some(prev_trees) = prev_note_commitment_trees.as_ref() {
+            assert_eq!(prev_trees.sapling.root(), zebra_db.sapling_tree_for_tip().root(), "caller passed stale prev sapling tree for height {height:?}");
+            assert_eq!(prev_trees.orchard.root(), zebra_db.orchard_tree_for_tip().root(), "caller passed stale prev orchard tree for height {height:?}");
+        }
+
         let prev_sprout_tree = prev_note_commitment_trees.as_ref().map_or_else(
             || zebra_db.sprout_tree_for_tip(),
             |prev_trees| prev_trees.sprout.clone(),

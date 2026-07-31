@@ -1803,6 +1803,26 @@ async fn tfl_service_incoming_request(
             }))
         }
 
+        TFLServiceRequest::WalletStakingAction(request) => Ok(TFLServiceResponse::WalletStakingAction({
+            let rx = {
+                let mut lock = wallet::STAKING_STAGE.lock().unwrap();
+                match *lock {
+                    None => {
+                        let (tx, mut rx) = tokio::sync::oneshot::channel();
+                        *lock = Some((request, tx));
+                        rx
+                    }
+
+                    Some(_) => return Err(zebra_state::crosslink::TFLServiceError::Misc("Another stake in progress, please try again soon".to_string())),
+                }
+            };
+
+            match rx.await {
+                Ok(result) => result,
+                Err(err) => return Err(zebra_state::crosslink::TFLServiceError::Misc(format!("{err}"))),
+            }
+        })),
+
         // workshop - mining & staking via PoW
         TFLServiceRequest::TotalIssuanceFromKey(ufvk_str, first_height, last_height) => {
             Ok(TFLServiceResponse::TotalIssuanceFromKey({

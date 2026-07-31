@@ -16,6 +16,7 @@ pub mod util;
 pub mod tests;
 
 use crate::encoding::{ReadBytesExt, WriteBytesExt};
+use crate::bft::PubKeyID;
 use blake2b_simd::Hash as Blake2bHash;
 use core::convert::TryFrom;
 use core::fmt::Debug;
@@ -1863,7 +1864,19 @@ impl StakingAction {
 }
 impl std::fmt::Display for StakingAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut fmter = f.debug_struct("StakingAction");
+        let fmter = &mut f.debug_struct("StakingAction");
+
+        let fmt_le_bytes = |fmter: &mut std::fmt::DebugStruct<'_, '_>, name, bytes: &[u8]| { // max length 64 bytes
+            let le_bytes = &mut[0u8; 64][..bytes.len()];
+            le_bytes.copy_from_slice(bytes);
+            le_bytes.reverse();
+
+            let buf = &mut[0u8; 128][..2*bytes.len()];
+            hex::encode_to_slice(&le_bytes, buf).expect("buffer large enough to print hex");
+            let le_str = std::str::from_utf8(buf).expect("encoding should be ASCII-only");
+
+            fmter.field(name, &le_str);
+        };
 
         fmter.field("kind", match self.kind {
             StakingActionKind::Null => &"Null",
@@ -1877,53 +1890,61 @@ impl std::fmt::Display for StakingAction {
         });
 
         if self.kind == StakingActionKind::CreateNewDelegationBond {
-            fmter.field("unique_public_key", &self.arg32_0);
-            fmter.field("challenge", &self.arg32_1);
-            fmter.field("signature", &self.arg64_0);
-            fmter.field("target_finalizer", &self.arg32_2);
+            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
+            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
+            fmt_le_bytes(fmter, "signature", &self.arg64_0);
+            fmt_le_bytes(fmter, "target_finalizer", &self.arg32_2);
             fmter.field("amount_zats", &self.amount_zats);
         }
         if self.kind == StakingActionKind::BeginDelegationUnbonding {
-            fmter.field("unique_public_key", &self.arg32_0);
-            fmter.field("challenge", &self.arg32_1);
-            fmter.field("signature", &self.arg64_0);
+            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
+            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
+            fmt_le_bytes(fmter, "signature", &self.arg64_0);
         }
         if self.kind == StakingActionKind::WithdrawDelegationBond {
-            fmter.field("unique_public_key", &self.arg32_0);
-            fmter.field("challenge", &self.arg32_1);
-            fmter.field("signature", &self.arg64_0);
+            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
+            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
+            fmt_le_bytes(fmter, "signature", &self.arg64_0);
             fmter.field("amount_zats", &self.amount_zats);
         }
         if self.kind == StakingActionKind::RetargetDelegationBond {
-            fmter.field("unique_public_key", &self.arg32_0);
-            fmter.field("challenge", &self.arg32_1);
-            fmter.field("signature", &self.arg64_0);
-            fmter.field("target_finalizer", &self.arg32_2);
+            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
+            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
+            fmt_le_bytes(fmter, "signature", &self.arg64_0);
+            fmt_le_bytes(fmter, "target_finalizer", &self.arg32_2);
         }
         if self.kind == StakingActionKind::RegisterFinalizer {
-            fmter.field("unique_public_key", &self.arg32_0);
-            fmter.field("challenge", &self.arg32_1);
-            fmter.field("signature", &self.arg64_0);
+            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
+            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
+            fmt_le_bytes(fmter, "signature", &self.arg64_0);
         }
         if self.kind == StakingActionKind::ConvertFinalizerRewardToDelegationBond {
-            fmter.field("unique_public_key", &self.arg32_0);
-            fmter.field("challenge", &self.arg32_1);
-            fmter.field("signature", &self.arg64_0);
-            fmter.field("this_finalizer", &self.arg32_2);
+            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
+            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
+            fmt_le_bytes(fmter, "signature", &self.arg64_0);
+            fmt_le_bytes(fmter, "this_finalizer", &self.arg32_2);
             fmter.field("amount_zats", &self.amount_zats);
-            fmter.field("second_challenge", &self.arg32_3);
-            fmter.field("finalizer_signature", &self.arg64_1);
+            fmt_le_bytes(fmter, "second_challenge", &self.arg32_3);
+            fmt_le_bytes(fmter, "finalizer_signature", &self.arg64_1);
         }
         if self.kind == StakingActionKind::UpdateFinalizerKey {
-            fmter.field("unique_public_key", &self.arg32_0);
-            fmter.field("challenge", &self.arg32_1);
-            fmter.field("signature", &self.arg64_0);
-            fmter.field("this_finalizer", &self.arg32_2);
-            fmter.field("second_challenge", &self.arg32_3);
-            fmter.field("finalizer_signature", &self.arg64_1);
+            fmt_le_bytes(fmter, "unique_public_key", &self.arg32_0);
+            fmt_le_bytes(fmter, "challenge", &self.arg32_1);
+            fmt_le_bytes(fmter, "signature", &self.arg64_0);
+            fmt_le_bytes(fmter, "this_finalizer", &self.arg32_2);
+            fmt_le_bytes(fmter, "second_challenge", &self.arg32_3);
+            fmt_le_bytes(fmter, "finalizer_signature", &self.arg64_1);
         }
         fmter.finish()
     }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum StakingActionRequest {
+    CreateNewDelegationBond{ amount_zats: u64, target_finalizer: PubKeyID },
+    RetargetDelegationBond{ bond_key: PubKeyID, target_finalizer: PubKeyID },
+    BeginDelegationUnbonding{ bond_key: PubKeyID  },
+    WithdrawDelegationBond{ bond_key: PubKeyID  },
 }
 
 #[cfg(any(test, feature = "test-dependencies"))]

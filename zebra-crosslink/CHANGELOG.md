@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   `ZEBRA_COOKIE_DIR`, `NETWORK`, `ENABLE_COOKIE_AUTH`, or `MINER_ADDRESS` must switch to the
   config-rs equivalents shown above ([#9768](https://github.com/ZcashFoundation/zebra/pull/9768)).
 
+### Added
+
+- Add a `zebrad rollback-tip-height` recovery command that rebuilds cached chain state up to a
+  requested height while preserving the previous state directory as a backup.
+
 ### Changed
 
 - `zebrad` now loads configuration from defaults, an optional TOML file, and environment variables,

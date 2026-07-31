@@ -907,6 +907,8 @@ impl TMState {
     }
 
     async fn bft_update(&mut self, roster: &mut Vec<SortedRosterMember>) {
+        debug_assert!(self.rounds_data.iter().all(|r| r.height >= self.height));
+
         let now = Instant::now();
         let mut total_active_stake = 0;
         for i in 0..active_roster_len(roster) {
@@ -1067,10 +1069,11 @@ impl TMState {
                 // new roster by the decided-block closure).
                 self.vote_namespace = new_vote_namespace;
                 self.recent_commit_round_cache.push(self.rounds_data[i].clone());
-                self.rounds_data.retain(|r| r.height < self.height);
+                self.rounds_data.retain(|r| r.height >= self.height);
                 self.locked_value_round = (None, -1);
                 self.valid_value_round = (None, -1);
                 self.start_round(roster, now, 0).await;
+                break;
             }
 
             // line 55: round catchup
@@ -1448,7 +1451,8 @@ pub async fn entry_point(my_root_private_key: SigningKey,
     use crate::native_sockets::*;
 
     let my_port = my_endpoint.map(|e| e.port).unwrap_or(23485); // @Dev: .unwrap_or(0); // @Todo! Get local port after sock creation! @@@
-    let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 256 * 1024 * 1024, 256 * 1024 * 1024));
+    // small min keeps the send buffer rate-adaptive (clamp(1s * rate, 512KiB, 256MiB)) instead of a flat 256MiB/conn
+    let network_thread_handle = new_network_thread(vec![my_stp_keypair.clone()], my_port, None, (1_000_000, 512 * 1024, 256 * 1024 * 1024));
     let mut current_connections = Vec::<(STPAddress, [u8; 64])>::new();
     let mut initiate_connections = Vec::<STPAddress>::new();
     let mut messages_to_send = Vec::new();
@@ -1942,7 +1946,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                     let rng = &mut rand::thread_rng();
 
                     const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 2;
-                    const PEERS_TO_ASK_PUNCH:               usize = 5;
+                    const PEERS_TO_ASK_PUNCH:               usize = 2;
 
                     let mut all_addresses: Vec<(&PubKeyID, &HashMap<STPAddress, Option<PeerAttestation>>)> = bft_address_map.by_key.iter().collect(); all_addresses.shuffle(rng);
                     for (_, map) in &all_addresses {
@@ -1966,7 +1970,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                         o += address.connection_key().write_to(&mut send_buf1[o..]);
 
                         for (conn_address, _) in current_connections.iter().choose_multiple(rng, PEERS_TO_ASK_PUNCH) {
-                            if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_GRY}PROTOCOL{ANSI_RST}: Requesting hole punch to address {:?} via random peer: {:?}...", address, conn_address); }
+                            // if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_GRY}PROTOCOL{ANSI_RST}: Requesting hole punch to address {:?} via random peer: {:?}...", address, conn_address); }
 
                             print_packet_tag_send(header);
                             send_stp_msg(&mut messages_to_send, &conn_address.connection_key(), &send_buf1[..o], &mut net_stats);

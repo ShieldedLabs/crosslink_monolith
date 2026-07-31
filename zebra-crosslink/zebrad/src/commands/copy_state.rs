@@ -102,18 +102,25 @@ impl CopyStateCmd {
 
         info!(?base_config, "state copy base config");
 
-        self.copy(&base_config.network.network, source_config, target_config)
-            .await
-            .map_err(|e| eyre!(e))
+        Self::copy_state_to_height(
+            &base_config.network.network,
+            source_config,
+            target_config,
+            self.max_source_height,
+            self.target_config_path.as_ref(),
+        )
+        .await
+        .map_err(|e| eyre!(e))
     }
 
     /// Initialize the source and target states,
     /// then copy from the source to the target state.
-    async fn copy(
-        &self,
+    pub(crate) async fn copy_state_to_height(
         network: &Network,
         source_config: old_zs::Config,
         target_config: new_zs::Config,
+        max_source_height: Option<u32>,
+        target_config_path: Option<&PathBuf>,
     ) -> Result<(), BoxError> {
         info!(
             ?source_config,
@@ -130,7 +137,8 @@ impl CopyStateCmd {
         info!(?elapsed, "finished initializing source state service");
 
         info!(
-            ?target_config, target_config_path = ?self.target_config_path,
+            ?target_config,
+            ?target_config_path,
             "initializing target state service (new format)"
         );
 
@@ -145,7 +153,14 @@ impl CopyStateCmd {
             _target_read_only_state_service,
             _target_latest_chain_tip,
             _target_chain_tip_change,
-        ) = new_zs::spawn_init(target_config.clone(), network, Height::MAX, 0, std::sync::Arc::new(move |_fat_pointer_a, _fat_pointer_b, _height| { Some(true) })).await?;
+        ) = new_zs::spawn_init(
+            target_config.clone(),
+            network,
+            Height::MAX,
+            0,
+            std::sync::Arc::new(move |_fat_pointer_a, _fat_pointer_b, _height| Some(true)),
+        )
+        .await?;
 
         let elapsed = target_start_time.elapsed();
         info!(?elapsed, "finished initializing target state service");
@@ -179,16 +194,15 @@ impl CopyStateCmd {
             .map(|target_tip| target_tip.0 .0 + 1)
             .unwrap_or(0);
 
-        let max_copy_height = self
-            .max_source_height
+        let max_copy_height = max_source_height
             .map(|max_source_height| min(source_tip_height, max_source_height))
             .unwrap_or(source_tip_height);
 
-        if min_target_height >= max_copy_height {
+        if min_target_height > max_copy_height {
             info!(
                 ?min_target_height,
                 ?max_copy_height,
-                max_source_height = ?self.max_source_height,
+                ?max_source_height,
                 ?source_tip,
                 ?initial_target_tip,
                 "target is already at or after max copy height"
@@ -200,7 +214,7 @@ impl CopyStateCmd {
         info!(
             ?min_target_height,
             ?max_copy_height,
-            max_source_height = ?self.max_source_height,
+            ?max_source_height,
             ?source_tip,
             ?initial_target_tip,
             "starting copy from source to target"

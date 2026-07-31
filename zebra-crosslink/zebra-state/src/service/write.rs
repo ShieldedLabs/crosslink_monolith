@@ -383,6 +383,9 @@ impl WriteBlockWorkerTask {
                             }
                         }
 
+                        // The finalized tip changed, so this is stale and needs invalidation, or else it will write duplicate trees.
+                        prev_finalized_note_commitment_trees = None;
+
                         let aggregated_stakes = finalized_state.db.aggregated_stakes(&hash)
                             .unwrap_or_default();
 
@@ -499,6 +502,10 @@ impl WriteBlockWorkerTask {
 
                 let inner_block = contextually_verified_with_trees.inner_block();
                 let this_height = inner_block.coinbase_height().expect("finalized block must have a coinbase height").0;
+                // the finalized root's own hashes, NOT the just-committed child's:
+                // a wrong hash here makes remove_chains_invalidated_by_finalized() nuke the best chain
+                let this_hash = inner_block.hash();
+                let finalized_parent_hash = inner_block.header.previous_block_hash;
 
                 prev_finalized_note_commitment_trees = finalized_state
                             .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), "commit contextually-verified request")
@@ -506,8 +513,8 @@ impl WriteBlockWorkerTask {
                                 "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                             ).1.into();
                 push_block_event(BlockEvent::TradFinalized(ShadowBlock {
-                    this_hash: child_hash,
-                    parent_hash,
+                    this_hash,
+                    parent_hash: finalized_parent_hash,
                     this_height
                 }));
             }

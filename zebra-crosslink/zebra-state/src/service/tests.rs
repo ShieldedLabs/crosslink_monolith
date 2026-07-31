@@ -2,11 +2,12 @@
 //!
 //! TODO: move these tests into tests::vectors and tests::prop modules.
 
-use std::{env, sync::Arc, time::Duration};
+use std::{collections::HashMap, env, sync::Arc, time::Duration};
 
 use tower::{buffer::Buffer, util::BoxService};
 
 use zebra_chain::{
+    amount::Amount,
     block::{self, Block, CountedHeader, Height},
     chain_tip::ChainTip,
     fmt::SummaryDebug,
@@ -18,6 +19,13 @@ use zebra_chain::{
 
 use zebra_test::{prelude::*, transcript::Transcript};
 
+use super::{
+    bond_rewards_for_active_bonds,
+    finalized_state::disk_format::{DelegationBond, TransactionLocation},
+    non_finalized_state::BondStatusInChain,
+    update_bonds_with_pos_issuance,
+};
+
 use crate::{
     arbitrary::Prepare,
     init_test,
@@ -27,6 +35,69 @@ use crate::{
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+#[test]
+fn pos_reward_helper_matches_non_finalized_bond_update() {
+    let active_key = [1u8; 32];
+    let smaller_active_key = [2u8; 32];
+    let inactive_key = [3u8; 32];
+    let transaction_location = TransactionLocation::from_usize(Height(1), 0);
+
+    let active_bond = DelegationBond::new(
+        Amount::try_from(10_000i64).expect("test amount is valid"),
+        [11u8; 32],
+        transaction_location,
+    );
+    let smaller_active_bond = DelegationBond::new(
+        Amount::try_from(5_000i64).expect("test amount is valid"),
+        [22u8; 32],
+        transaction_location,
+    );
+    let inactive_bond = DelegationBond::new(
+        Amount::try_from(100_000i64).expect("test amount is valid"),
+        [33u8; 32],
+        transaction_location,
+    );
+
+    let mut delegation_bonds = HashMap::from([
+        (active_key, (active_bond, BondStatusInChain::Active)),
+        (
+            smaller_active_key,
+            (smaller_active_bond, BondStatusInChain::Active),
+        ),
+        (inactive_key, (inactive_bond, BondStatusInChain::Unbonding)),
+    ]);
+
+    let reward_total = 101u64;
+    let mut expected_rewards = bond_rewards_for_active_bonds(
+        reward_total,
+        [
+            (active_key, u64::from(active_bond.amount)),
+            (smaller_active_key, u64::from(smaller_active_bond.amount)),
+        ],
+    );
+    let mut actual_rewards = update_bonds_with_pos_issuance(reward_total, &mut delegation_bonds);
+
+    expected_rewards.sort_by_key(|(bond_key, _reward)| *bond_key);
+    actual_rewards.sort_by_key(|(bond_key, _reward)| *bond_key);
+
+    assert_eq!(actual_rewards, expected_rewards);
+    assert_eq!(
+        actual_rewards
+            .iter()
+            .map(|(_bond_key, reward)| reward)
+            .sum::<u64>(),
+        reward_total
+    );
+    assert_eq!(
+        delegation_bonds
+            .get(&inactive_key)
+            .expect("inactive bond remains present")
+            .0
+            .amount,
+        inactive_bond.amount
+    );
+}
 
 async fn test_populated_state_responds_correctly(
     mut state: Buffer<BoxService<Request, Response, BoxError>, Request>,

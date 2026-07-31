@@ -246,7 +246,8 @@ impl StartCmd {
         let actual_closure2 = Arc::clone(&actual_closure);
 
         let mut state_config = config.state.clone();
-        state_config.hardfork_schedule = Arc::new(HardForkSchedule::new(config.crosslink.hardforks.clone()));
+        // config.crosslink.hardforks is already canonical and merged (see ZebradConfig::load)
+        state_config.hardfork_schedule = Arc::new(HardForkSchedule::from_canonical(config.crosslink.hardforks.clone()));
 
         let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
             zebra_state::spawn_init(
