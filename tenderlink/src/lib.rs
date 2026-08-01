@@ -470,8 +470,11 @@ pub struct TMState {
 
     pub recent_commit_round_cache: Vec<RoundData>, // for now will hold all completed heights
 
-    /// Rate limiter for the always-on sig-fault print (re-delivered dead votes would flood).
-    last_sig_fault_print: Option<std::time::Instant>,
+    /// Dedup for the always-on sig-fault print: one line per distinct
+    /// (height, round, claimed roster_i, packet_type). Re-delivered dead votes
+    /// would otherwise flood, and a global time cap hides all but the first
+    /// failing index in each packet.
+    sig_fault_printed: std::collections::HashSet<(u64, u32, usize, u8)>,
 
     propose_closure: ClosureToProposeNewBlock,
     validate_closure: ClosureToValidateProposedBlock,
@@ -503,7 +506,7 @@ impl TMState {
 
             rounds_data: Vec::new(),
             recent_commit_round_cache: Vec::new(),
-            last_sig_fault_print: None,
+            sig_fault_printed: std::collections::HashSet::new(),
 
             propose_closure,
             validate_closure,
@@ -686,8 +689,7 @@ impl TMState {
             // whole roster to name the actual signer: "verifies as roster_i N" = index shift
             // (roster divergence); "verifies as nobody" = namespace divergence or garbage.
             // Dead votes are re-delivered forever by catchup, hence the 1/s cap.
-            if self.last_sig_fault_print.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(1)) {
-                self.last_sig_fault_print = Some(std::time::Instant::now());
+            if self.sig_fault_printed.insert((height, round, roster_i, packet_type)) {
                 // The vote payload embeds the signer's pub key in bytes 0..32, so naming a
                 // shifted signer requires rebuilding the payload per candidate key -- swapping
                 // only the verification key can never match. Proposal chunk payloads don't
