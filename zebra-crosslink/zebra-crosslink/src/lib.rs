@@ -2008,7 +2008,7 @@ async fn tfl_block_sequence(
                 if c == 0 && include_start_hash && !chunk_hashes.is_empty() {
                     assert_eq!(
                         chunk_hashes[0], start_hash,
-                        "first hash is not the one requested"
+                        "first hash is not the one requested. chunk_hashes: start_height: {start_height:?}, init_hash: {init_hash}, final_height: {final_height:?}, final_hash: {final_hash:?}, {chunk_hashes:?}"
                     );
                 }
 
