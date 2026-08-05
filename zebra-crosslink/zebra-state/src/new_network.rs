@@ -1268,6 +1268,28 @@ pub async fn submit_block_to_new_network(
     }
 }
 
+// Which cached block to evict when the cache is full. The queue is kept sorted by height,
+// and the low blocks are the next in line to commit, so evict from the top: prefer the
+// highest block whose parent is neither committed nor queued (a tail that can't commit any
+// time soon); if everything connects, take the highest. The lowest block is never picked --
+// even "dangling" it's the closest to committable (its parent is the most imminent arrival).
+fn eviction_index(blocks_to_commit: &[(Hash, std::sync::Arc<Block>)], read_state: &ReadState) -> Option<usize> {
+    if blocks_to_commit.is_empty() {
+        return None;
+    }
+    let queued: HashSet<Hash> = blocks_to_commit.iter().map(|(hash, _)| *hash).collect();
+    for (i, (_, block)) in blocks_to_commit.iter().enumerate().rev() {
+        if i == 0 {
+            break;
+        }
+        let parent = block.header.previous_block_hash;
+        if !queued.contains(&parent) && read_state.known_block(parent).is_none() {
+            return Some(i);
+        }
+    }
+    Some(blocks_to_commit.len() - 1)
+}
+
 pub fn sync(
     config: &crate::config::Config,
     read_state: ReadState,
@@ -2647,14 +2669,13 @@ pub fn sync(
 
                 // @Todo(Phil): Semantic verification.
 
-                // @Note: Evict a sidechain tail to make room. Prefer non-committable tails.
-                // Make room if the cache is full. Oldest first: the queue is roughly in arrival
-                // order, and a block that has waited longest is the most likely to be waiting on
-                // something that is not coming. Anything evicted gets re-downloaded if a peer
-                // still advertises it, so this is a cost, not a correctness issue.
+                // @Note: Make room if the cache is full. Anything evicted gets re-downloaded if
+                // a peer still advertises it, so this is a cost, not a correctness issue.
                 if blocks_to_commit.len() >= MAX_DEFERRED_BLOCKS {
-                    let evicted = blocks_to_commit.remove(0);
-                    warning!("Block cache full ({MAX_DEFERRED_BLOCKS}); evicting oldest: {}", evicted.0);
+                    if let Some(evict_i) = eviction_index(&blocks_to_commit, &read_state) {
+                        let evicted = blocks_to_commit.remove(evict_i);
+                        warning!("Block cache full ({MAX_DEFERRED_BLOCKS}); evicting: {}", evicted.0);
+                    }
                 }
 
                 println!("Queueing for commit: {}", hash);
@@ -2887,10 +2908,11 @@ pub fn sync(
             true
         });
 
-        // Bound the cache. Oldest first; see MAX_DEFERRED_BLOCKS.
+        // Bound the cache. See MAX_DEFERRED_BLOCKS and eviction_index().
         while blocks_to_commit.len() > MAX_DEFERRED_BLOCKS {
-            let evicted = blocks_to_commit.remove(0);
-            if TRACE { tracing::info!("Block cache full; evicting oldest: {}", evicted.0); }
+            let Some(evict_i) = eviction_index(&blocks_to_commit, &read_state) else { break; };
+            let evicted = blocks_to_commit.remove(evict_i);
+            if TRACE { tracing::info!("Block cache full; evicting: {}", evicted.0); }
         }
         let _ = any_blocks_in_the_queue_can_make_progress;
 
