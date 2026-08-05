@@ -945,6 +945,7 @@ struct PeerPowBlockDownload {
     height_hash: HeightAndHashOr0,
     reassembly: ReassemblySlot, // accumulates block fragments across (re)requests
     last_modified: std::time::Instant,
+    timeout_strikes: u8, // quiet periods survived; fragments reset it (see dl-init timeout)
 }
 impl Default for PeerPowBlockDownload {
     fn default() -> Self {
@@ -952,6 +953,7 @@ impl Default for PeerPowBlockDownload {
             height_hash: HeightAndHashOr0::default(),
             reassembly: ReassemblySlot::new(),
             last_modified: std::time::Instant::now(),
+            timeout_strikes: 0,
         }
     }
 }
@@ -998,6 +1000,7 @@ impl BlockDownloads {
                 height_hash,
                 reassembly: ReassemblySlot::new(),
                 last_modified: std::time::Instant::now(),
+                timeout_strikes: 0,
             };
             self.used_flags |= 1 << dl_i;
             Some(dl_i)
@@ -1926,9 +1929,20 @@ pub fn sync(
                             peer.block_downloads.remove(dl_i);
 
                         } else if peer.block_downloads.slots[dl_i].last_modified.elapsed() > DOWNLOAD_UNMODIFIED_TIMEOUT_DUR {
-                            if TRACE { tracing::info!("Cancelling download request for block @ {}, {} - timed out", height, hash_or_0); }
-                            peer.block_downloads.remove(dl_i);
-                            // TODO: lower weighting on this peer?
+                            let dl = &mut peer.block_downloads.slots[dl_i];
+                            if dl.timeout_strikes == 0 {
+                                // one grace period before cancelling: cancelling throws away the
+                                // partial reassembly, and a slow tick can strand already-arrived
+                                // fragments in the network thread until *after* this pass runs.
+                                // any fragment resets the strike (see BLOCK_CHUNK), so only a
+                                // genuinely dead download gets cancelled.
+                                dl.timeout_strikes = 1;
+                                dl.last_modified = std::time::Instant::now();
+                            } else {
+                                if TRACE { tracing::info!("Cancelling download request for block @ {}, {} - timed out", height, hash_or_0); }
+                                peer.block_downloads.remove(dl_i);
+                                // TODO: lower weighting on this peer?
+                            }
 
                         } else if hash_or_0 != block::Hash([0; 32]) {
                             requests_by_hash.entry(hash_or_0).and_modify(|c| *c += 1).or_insert(1);
@@ -2579,6 +2593,7 @@ pub fn sync(
                     continue 'process_packets;
                 }
                 peer.block_downloads.slots[dl_i].last_modified = std::time::Instant::now();
+                peer.block_downloads.slots[dl_i].timeout_strikes = 0;
 
                 if !complete {
                     if TRACE { tracing::info!("Block @ {alleged_height} hash {alleged_hash}: fragment at offset {} ({} bytes); awaiting more", hdr.offset, msg.len()); }
