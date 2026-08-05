@@ -13,7 +13,8 @@ use std::time::Instant;
 static AUDIO_EPOCH: OnceLock<Instant> = OnceLock::new();
 fn tms() -> u128 { AUDIO_EPOCH.get_or_init(Instant::now).elapsed().as_millis() }
 
-const VOICES_MAX: usize = 64; // Oldest gets dropped; also bounds pile-up when no backend ever comes up
+const VOICES_MAX: usize = 64;  // Oldest gets dropped; also bounds pile-up when no backend ever comes up
+const FADE_IN_N:  usize = 200; // Ramp back in after a silent gap, same length play_sine bakes into its own edges
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Sound {
@@ -33,14 +34,16 @@ struct AudioState {
     sounds: Vec<Sound>, // Callers wanting reuse load_sound() once; play_sound_pcm() grows this per call
     voices: Vec<Voice>,
     master: f32,
-    device_rate: u32, // Zero until a backend is up
+    device_rate:  u32,   // Zero until a backend is up
+    fade_in_left: usize, // Output frames still owed a ramp after a silent gap
 }
 
 static AUDIO: Mutex<AudioState> = Mutex::new(AudioState {
     sounds: Vec::new(),
     voices: Vec::new(),
     master: 1.0,
-    device_rate: 0,
+    device_rate:  0,
+    fade_in_left: 0,
 });
 static AUDIO_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -121,6 +124,31 @@ fn mix_into(buf: &mut [f32], ch_n: usize) {
         }
         true
     });
+
+    let fade_n = usize::min(audio.fade_in_left, out_frames_n);
+    for out_i in 0..fade_n {
+        let gain = (FADE_IN_N - audio.fade_in_left + out_i) as f32 / FADE_IN_N as f32;
+        for ch_i in 0..ch_n { buf[out_i*ch_n + ch_i] *= gain; }
+    }
+    audio.fade_in_left -= fade_n;
+}
+
+// Winds every voice past the content that should have sounded while the device had nothing to play.
+// Free in continuity, since the output was already silent there; the ramp covers the seam it leaves.
+fn skip_output(gap_secs: f64) {
+    let audio = &mut *AUDIO.lock().unwrap();
+    audio.fade_in_left = FADE_IN_N;
+
+    let AudioState { sounds, voices, .. } = audio; // Split borrow
+    voices.retain_mut(|v| {
+        let sound = &sounds[v.sound_i];
+        v.cursor += gap_secs * sound.rate as f64 * v.speed as f64;
+        if (v.cursor as usize) + 1 >= sound.frames.len() {
+            if PRINT_AUDIO_TIMING { eprintln!("[{}ms] retire voice: sound_i {} (skipped past end)", tms(), v.sound_i); }
+            return false;
+        }
+        true
+    });
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -138,7 +166,7 @@ mod wasapi {
     // Hand-bound COM. Any failed HRESULT soft-fails the whole backend: no sound, no crash.
 
     use std::ffi::c_void;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use super::{mix_into, AUDIO, PRINT_AUDIO};
 
     type HRESULT = i32;
@@ -146,18 +174,22 @@ mod wasapi {
     #[repr(C)] #[derive(Clone, Copy, PartialEq)]
     struct Guid { a: u32, b: u16, c: u16, d: [u8; 8] }
 
-    const CLSID_MMDeviceEnumerator:       Guid = Guid { a: 0xBCDE0395, b: 0xE52F, c: 0x467C, d: [0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E] };
-    const IID_IMMDeviceEnumerator:        Guid = Guid { a: 0xA95664D2, b: 0x9614, c: 0x4F35, d: [0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6] };
-    const IID_IMMNotificationClient:      Guid = Guid { a: 0x7991EEC9, b: 0x7E89, c: 0x4D85, d: [0x83,0x90,0x6C,0x70,0x3C,0xEC,0x60,0xC0] };
-    const IID_IUnknown:                   Guid = Guid { a: 0x00000000, b: 0x0000, c: 0x0000, d: [0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46] };
-    const IID_IAudioClient:               Guid = Guid { a: 0x1CB9AD4C, b: 0xDBFA, c: 0x4C32, d: [0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2] };
-    const IID_IAudioRenderClient:         Guid = Guid { a: 0xF294ACFC, b: 0x3146, c: 0x4483, d: [0xA7,0xBF,0xAD,0xDC,0xA7,0xC2,0x60,0xE2] };
-    const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: Guid = Guid { a: 0x00000003, b: 0x0000, c: 0x0010, d: [0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71] };
+    const IID_IUnknown:                                  Guid = Guid { a: 0x00000000, b: 0x0000, c: 0x0000, d: [0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46] };
+    const IID_IAudioClient:                              Guid = Guid { a: 0x1CB9AD4C, b: 0xDBFA, c: 0x4C32, d: [0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2] };
+    const IID_IAudioRenderClient:                        Guid = Guid { a: 0xF294ACFC, b: 0x3146, c: 0x4483, d: [0xA7,0xBF,0xAD,0xDC,0xA7,0xC2,0x60,0xE2] };
+    const IID_IAgileObject:                              Guid = Guid { a: 0x94EA2B94, b: 0xE9CC, c: 0x49E0, d: [0xC0,0xFF,0xEE,0x64,0xCA,0x8F,0x5B,0x90] };
+    const IID_IActivateAudioInterfaceCompletionHandler:  Guid = Guid { a: 0x41D949AB, b: 0x9862, c: 0x444A, d: [0x80,0xF6,0xC2,0x61,0x33,0x4D,0xA5,0xEB] };
+    const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT:               Guid = Guid { a: 0x00000003, b: 0x0000, c: 0x0010, d: [0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71] };
+
+    // Activating this virtual endpoint rather than a concrete device is what makes the audio engine
+    // keep our stream pointed at whatever the system default becomes, so headphones plugged in
+    // halfway through a sound move it across by themselves and there is nothing to do here about
+    // devices coming and going. The text is exactly what StringFromIID(DEVINTERFACE_AUDIO_RENDER)
+    // returns, written out literally so that neither the GUID nor StringFromIID needs binding.
+    const DEVINTERFACE_AUDIO_RENDER: &str = "{E6327CAD-DCEC-4949-AE8A-991E976A79D2}";
 
     const COINIT_MULTITHREADED: u32 = 0;
-    const CLSCTX_ALL:           u32 = 0x17;
-    const eRender:              u32 = 0;
-    const eConsole:             u32 = 0;
+    const INFINITE:             u32 = 0xFFFF_FFFF;
     const AUDCLNT_SHAREMODE_SHARED: u32 = 0;
     const AUDCLNT_STREAMFLAGS_EVENTCALLBACK: u32 = 0x00040000;
     const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
@@ -168,11 +200,15 @@ mod wasapi {
     #[link(name = "ole32")]
     unsafe extern "system" {
         fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> HRESULT;
-        fn CoCreateInstance(clsid: *const Guid, outer: *mut c_void, clsctx: u32, iid: *const Guid, out: *mut *mut c_void) -> HRESULT;
+    }
+    #[link(name = "mmdevapi")]
+    unsafe extern "system" {
+        fn ActivateAudioInterfaceAsync(path: *const u16, iid: *const Guid, params: *mut c_void, handler: *mut c_void, op_out: *mut *mut c_void) -> HRESULT;
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateEventW(attrs: *mut c_void, manual_reset: i32, initial_state: i32, name: *const u16) -> *mut c_void;
+        fn SetEvent(handle: *mut c_void) -> i32;
         fn WaitForSingleObject(handle: *mut c_void, timeout_ms: u32) -> u32;
         fn CloseHandle(handle: *mut c_void) -> i32;
     }
@@ -201,16 +237,9 @@ mod wasapi {
         AddRef:         usize,
         Release:        unsafe extern "system" fn(*mut c_void) -> u32,
     }
-    #[repr(C)] struct MMDeviceEnumeratorVtbl {
+    #[repr(C)] struct ActivateOperationVtbl {
         _iunknown: [usize; 3],
-        EnumAudioEndpoints: usize,
-        GetDefaultAudioEndpoint: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
-        GetDevice: usize,
-        RegisterEndpointNotificationCallback: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
-    }
-    #[repr(C)] struct MMDeviceVtbl {
-        _iunknown: [usize; 3],
-        Activate: unsafe extern "system" fn(*mut c_void, *const Guid, u32, *mut c_void, *mut *mut c_void) -> HRESULT,
+        GetActivateResult: unsafe extern "system" fn(*mut c_void, *mut HRESULT, *mut *mut c_void) -> HRESULT,
     }
     #[repr(C)] struct AudioClientVtbl {
         _iunknown: [usize; 3],
@@ -244,58 +273,48 @@ mod wasapi {
     unsafe fn vt<T>(com: *mut c_void) -> &'static T { &**(com as *mut *const T) }
     unsafe fn release(com: *mut c_void) { if !com.is_null() { (vt::<IUnknownVtbl>(com).Release)(com); } }
 
-    // Default-device changes arrive by callback, not polling: IMMNotificationClient is a COM
-    // interface that WE implement, so this is COM binding in reverse. The OS calls through this
-    // vtable from its own thread, so the methods only touch atomics. The object is a static with
-    // a fake refcount because it lives for the whole process. Note the x86_64 ABI passes structs
-    // wider than 8 bytes by pointer, which is why every ignored argument can be typed as usize.
-    static DEFAULT_CHANGED: AtomicBool = AtomicBool::new(false);
+    // Activation is asynchronous and its completion callback arrives on a COM worker thread, so this
+    // object exists only to wake the audio thread back up. It is COM binding in reverse: WE implement
+    // the interface and the OS calls through this vtable. The object is a static with a fake refcount
+    // because it lives for the whole process. COM also demands that a completion handler be agile,
+    // meaning callable from any thread; an object holding no thread-affine state is that by
+    // construction, so satisfying the demand amounts to admitting to IID_IAgileObject when asked.
+    static ACTIVATE_DONE: AtomicUsize = AtomicUsize::new(0); // Auto-reset event, made once by thread_main
 
-    #[repr(C)] struct NotificationClientVtbl {
-        QueryInterface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> HRESULT,
-        AddRef:         unsafe extern "system" fn(*mut c_void) -> u32,
-        Release:        unsafe extern "system" fn(*mut c_void) -> u32,
-        OnDeviceStateChanged:   unsafe extern "system" fn(*mut c_void, usize, usize) -> HRESULT,
-        OnDeviceAdded:          unsafe extern "system" fn(*mut c_void, usize) -> HRESULT,
-        OnDeviceRemoved:        unsafe extern "system" fn(*mut c_void, usize) -> HRESULT,
-        OnDefaultDeviceChanged: unsafe extern "system" fn(*mut c_void, u32, u32, usize) -> HRESULT,
-        OnPropertyValueChanged: unsafe extern "system" fn(*mut c_void, usize, usize) -> HRESULT,
+    #[repr(C)] struct CompletionHandlerVtbl {
+        QueryInterface:    unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> HRESULT,
+        AddRef:            unsafe extern "system" fn(*mut c_void) -> u32,
+        Release:           unsafe extern "system" fn(*mut c_void) -> u32,
+        ActivateCompleted: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
     }
-    unsafe extern "system" fn notify_qi(this: *mut c_void, iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
-        if *iid == IID_IUnknown || *iid == IID_IMMNotificationClient { *out = this; 0 }
+    unsafe extern "system" fn complete_qi(this: *mut c_void, iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
+        if *iid == IID_IUnknown || *iid == IID_IActivateAudioInterfaceCompletionHandler || *iid == IID_IAgileObject { *out = this; 0 }
         else { *out = std::ptr::null_mut(); E_NOINTERFACE }
     }
-    unsafe extern "system" fn notify_ref(_this: *mut c_void) -> u32 { 1 }
-    unsafe extern "system" fn notify_nop1(_this: *mut c_void, _a: usize) -> HRESULT { 0 }
-    unsafe extern "system" fn notify_nop2(_this: *mut c_void, _a: usize, _b: usize) -> HRESULT { 0 }
-    unsafe extern "system" fn notify_default_changed(_this: *mut c_void, flow: u32, role: u32, _id: usize) -> HRESULT {
-        if flow == eRender && role == eConsole { DEFAULT_CHANGED.store(true, Ordering::Relaxed); }
+    unsafe extern "system" fn complete_ref(_this: *mut c_void) -> u32 { 1 }
+    unsafe extern "system" fn complete_activated(_this: *mut c_void, _op: *mut c_void) -> HRESULT {
+        SetEvent(ACTIVATE_DONE.load(Ordering::Relaxed) as *mut c_void);
         0
     }
-    static NOTIFY_VTBL: NotificationClientVtbl = NotificationClientVtbl {
-        QueryInterface:         notify_qi,
-        AddRef:                 notify_ref,
-        Release:                notify_ref,
-        OnDeviceStateChanged:   notify_nop2,
-        OnDeviceAdded:          notify_nop1,
-        OnDeviceRemoved:        notify_nop1,
-        OnDefaultDeviceChanged: notify_default_changed,
-        OnPropertyValueChanged: notify_nop2,
+    static COMPLETION_VTBL: CompletionHandlerVtbl = CompletionHandlerVtbl {
+        QueryInterface:    complete_qi,
+        AddRef:            complete_ref,
+        Release:           complete_ref,
+        ActivateCompleted: complete_activated,
     };
-    #[repr(transparent)] struct NotifyPtr(*const NotificationClientVtbl);
-    unsafe impl Sync for NotifyPtr {}
-    static NOTIFY: NotifyPtr = NotifyPtr(&NOTIFY_VTBL);
+    #[repr(transparent)] struct CompletionPtr(*const CompletionHandlerVtbl);
+    unsafe impl Sync for CompletionPtr {}
+    static COMPLETION: CompletionPtr = CompletionPtr(&COMPLETION_VTBL);
 
     pub fn thread_main() { unsafe {
         try_hr!(CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED), "CoInitializeEx");
 
-        let mut enumr: *mut c_void = std::ptr::null_mut();
-        try_hr!(CoCreateInstance(&CLSID_MMDeviceEnumerator, std::ptr::null_mut(), CLSCTX_ALL, &IID_IMMDeviceEnumerator, &mut enumr), "CoCreateInstance(MMDeviceEnumerator)");
-
-        try_hr!((vt::<MMDeviceEnumeratorVtbl>(enumr).RegisterEndpointNotificationCallback)(enumr, &NOTIFY as *const NotifyPtr as *mut c_void), "RegisterEndpointNotificationCallback");
+        let done = CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null());
+        if done.is_null() { if PRINT_AUDIO { eprintln!("audio: CreateEventW failed"); } return; }
+        ACTIVATE_DONE.store(done as usize, Ordering::Relaxed);
 
         loop {
-            let ran = run_device(enumr);
+            let ran = run_device();
             AUDIO.lock().unwrap().device_rate = 0;
             if !ran {
                 // No usable output device right now; retry until one appears
@@ -304,32 +323,43 @@ mod wasapi {
         }
     } }
 
-    // One device session: open the current default endpoint, render until the device dies or the
-    // default changes, then tear down so the caller reopens. False = no session could start at all.
-    unsafe fn run_device(enumr: *mut c_void) -> bool {
-        DEFAULT_CHANGED.store(false, Ordering::Relaxed); // Any change after this point causes a reopen
+    // One device session: activate the default endpoint, render until the stream dies, then tear
+    // down so the caller reopens. False = no session could start at all.
+    unsafe fn run_device() -> bool {
+        let client = activate_audio_client();
+        if client.is_null() { return false; }
 
-        let mut device: *mut c_void = std::ptr::null_mut();
-        try_hr!((vt::<MMDeviceEnumeratorVtbl>(enumr).GetDefaultAudioEndpoint)(enumr, eRender, eConsole, &mut device), "GetDefaultAudioEndpoint", false);
-
-        let mut client: *mut c_void = std::ptr::null_mut();
         let mut render: *mut c_void = std::ptr::null_mut();
         let mut event:  *mut c_void = std::ptr::null_mut();
-        let ran = run_device_session(device, &mut client, &mut render, &mut event);
+        let ran = run_device_session(client, &mut render, &mut event);
 
-        if !client.is_null() { let _ = (vt::<AudioClientVtbl>(client).Stop)(client); }
+        let _ = (vt::<AudioClientVtbl>(client).Stop)(client);
         release(render);
         release(client);
-        release(device);
         if !event.is_null() { CloseHandle(event); }
         ran
     }
 
-    unsafe fn run_device_session(device: *mut c_void, client_out: &mut *mut c_void, render_out: &mut *mut c_void, event_out: &mut *mut c_void) -> bool {
-        let mut client: *mut c_void = std::ptr::null_mut();
-        try_hr!((vt::<MMDeviceVtbl>(device).Activate)(device, &IID_IAudioClient, CLSCTX_ALL, std::ptr::null_mut(), &mut client), "Activate(IAudioClient)", false);
-        *client_out = client;
+    unsafe fn activate_audio_client() -> *mut c_void {
+        let mut path = [0u16; 64];
+        for (i, unit) in DEVINTERFACE_AUDIO_RENDER.encode_utf16().enumerate() { path[i] = unit; }
 
+        let mut op: *mut c_void = std::ptr::null_mut();
+        try_hr!(ActivateAudioInterfaceAsync(path.as_ptr(), &IID_IAudioClient, std::ptr::null_mut(), &COMPLETION as *const CompletionPtr as *mut c_void, &mut op), "ActivateAudioInterfaceAsync", std::ptr::null_mut());
+
+        WaitForSingleObject(ACTIVATE_DONE.load(Ordering::Relaxed) as *mut c_void, INFINITE);
+
+        let mut activate_hr: HRESULT = 0;
+        let mut client: *mut c_void = std::ptr::null_mut();
+        let got = (vt::<ActivateOperationVtbl>(op).GetActivateResult)(op, &mut activate_hr, &mut client);
+        release(op);
+
+        try_hr!(got,         "GetActivateResult",      std::ptr::null_mut());
+        try_hr!(activate_hr, "Activate(IAudioClient)", std::ptr::null_mut());
+        client
+    }
+
+    unsafe fn run_device_session(client: *mut c_void, render_out: &mut *mut c_void, event_out: &mut *mut c_void) -> bool {
         let mut fmt_ptr: *mut WaveFormatEx = std::ptr::null_mut();
         try_hr!((vt::<AudioClientVtbl>(client).GetMixFormat)(client, &mut fmt_ptr), "GetMixFormat", false);
         // Leaked on purpose; one small alloc per device open
@@ -370,13 +400,9 @@ mod wasapi {
         if PRINT_AUDIO { eprintln!("audio: wasapi up, {rate}hz {ch_n}ch, {buf_frames_n} frame buffer"); }
 
         let mut started = false;
+        let mut last_fill = std::time::Instant::now();
         loop {
             WaitForSingleObject(event, 200); // The engine signals every 10ms quantum; timeout is a safety net
-
-            if DEFAULT_CHANGED.swap(false, Ordering::Relaxed) {
-                if PRINT_AUDIO { eprintln!("audio: default device changed, reopening"); }
-                return true;
-            }
 
             let mut pad: u32 = 0;
             let hr = (vt::<AudioClientVtbl>(client).GetCurrentPadding)(client, &mut pad);
@@ -384,7 +410,14 @@ mod wasapi {
                 if PRINT_AUDIO { eprintln!("audio: device lost (hr={:#010x}), reopening", hr as u32); }
                 return true;
             }
-            if super::PRINT_AUDIO_TIMING && started && pad == 0 { eprintln!("[{}ms] underrun (buffer drained)", super::tms()); }
+            if started && pad == 0 {
+                // Every fill leaves the buffer full, so it carries buf_frames_n frames of wall clock
+                // and anything past that is time spent with nothing to play. A buffer that arrives
+                // empty on schedule comes out at or below zero, so no threshold is needed here.
+                let starved_secs = last_fill.elapsed().as_secs_f64() - buf_frames_n as f64 / rate as f64;
+                if super::PRINT_AUDIO_TIMING { eprintln!("[{}ms] underrun (buffer drained, starved {:.0}ms)", super::tms(), f64::max(starved_secs, 0.0) * 1000.0); }
+                if starved_secs > 0.0 { super::skip_output(starved_secs); }
+            }
 
             let free_n = buf_frames_n - pad;
             if free_n > 0 {
@@ -394,6 +427,7 @@ mod wasapi {
                 mix_into(buf, ch_n);
                 if (vt::<AudioRenderClientVtbl>(render).ReleaseBuffer)(render, free_n, 0) < 0 { return true; }
                 started = true;
+                last_fill = std::time::Instant::now();
             }
         }
     }

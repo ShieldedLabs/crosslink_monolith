@@ -1,6 +1,7 @@
 // Interactive device test: beeps forever so you can unplug, replug, and switch default
-// outputs while listening. Backend messages (wasapi up / device lost / default device
-// changed) print as they happen. Press Enter (or Ctrl+C) to quit.
+// outputs while listening. The beeps are expected to follow the new default without a gap
+// and without the backend reopening, so a second "wasapi up" line during a switch means
+// routing failed. Press Enter (or Ctrl+C) to quit.
 
 use visualizer_zcash::audio;
 
