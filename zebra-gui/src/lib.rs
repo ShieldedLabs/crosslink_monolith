@@ -16,6 +16,8 @@ use wallet;
 mod viz_gui;
 pub use viz_gui::*;
 
+pub mod audio;
+
 const TURN_OFF_HASH_BASED_LAZY_RENDER: usize = 0;
 
 #[derive(Clone, Copy, PartialOrd, PartialEq, Ord, Eq, Debug, Default)]
