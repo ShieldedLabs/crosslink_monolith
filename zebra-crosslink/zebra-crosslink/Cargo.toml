@@ -77,7 +77,7 @@ zebra-test = { path = "../zebra-test", version = "1.0.0-beta.45" }
 
 [features]
 default = []
-viz_gui = ["macroquad", "macroquad-profiler", "image", "miniquad", "visualizer_zcash"]
+viz_gui = ["macroquad", "macroquad-profiler", "image", "miniquad", "visualizer_zcash", "visualizer_zcash/audio"]
 audio = []
 
 [build-dependencies]

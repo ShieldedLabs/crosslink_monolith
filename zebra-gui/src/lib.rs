@@ -994,16 +994,28 @@ pub static FONT_PIXEL_GOHU_11: &[u8] = include_bytes!("../assets/gohufont-uni-11
 pub static FONT_PIXEL_GOHU_14: &[u8] = include_bytes!("../assets/gohufont-uni-14.ttf");
 
 // These only exist for global volume. A mixer would be better but this is the minimal diff.
+#[cfg(feature = "audio")]
 struct PlayingSound {
     sink: rodio::Sink,
     volume: f32, // base volume before multiplication by global volume
 }
 
+#[cfg(feature = "audio")]
 const GLOBAL_AUDIO_SCALE_FACTOR: f32 = 0.316; // 0.316 ~= perceptually "half volume"
 
+#[cfg(feature = "audio")]
 static mut GLOBAL_OUTPUT_STREAM : *mut rodio::OutputStream = std::ptr::null_mut();
+#[cfg(feature = "audio")]
 static mut playing_sounds: *mut Vec<PlayingSound> = std::ptr::null_mut(); // These only exist for global volume. A mixer would be better but this is the minimal diff.
+#[cfg(feature = "audio")]
 static mut global_audio_volume: f32 = GLOBAL_AUDIO_SCALE_FACTOR;
+
+#[cfg(not(feature = "audio"))]
+pub fn setup_audio() {}
+#[cfg(not(feature = "audio"))]
+pub fn play_sound(_sound_file: &'static [u8], _volume: f32, _speed: f32) {}
+
+#[cfg(feature = "audio")]
 pub fn setup_audio() {
     unsafe {
         if GLOBAL_OUTPUT_STREAM == std::ptr::null_mut() {
@@ -1023,6 +1035,7 @@ pub fn setup_audio() {
     }
 }
 
+#[cfg(feature = "audio")]
 pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
     unsafe {
         if GLOBAL_OUTPUT_STREAM != std::ptr::null_mut() {
@@ -1216,6 +1229,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
 
     #[allow(deprecated)]
     event_loop.run(move |event, elwt: &winit::event_loop::ActiveEventLoop| {
+        #[cfg(feature = "audio")]
         unsafe {
             global_audio_volume = ui.global_audio_volume * GLOBAL_AUDIO_SCALE_FACTOR;
 
