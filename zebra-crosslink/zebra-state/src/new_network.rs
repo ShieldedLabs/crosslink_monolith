@@ -1784,22 +1784,41 @@ pub fn sync(
                     send_tip_chains = 'try_send_historical: {
                         // they are very far behind us: construct & send them a historical status
 
-                        // subtract once to get the finalized block at their height to confirm the attach point (because our chain_intersect_prefix() does not match parents),
-                        // subtract again because in order to send them that block we need to get that block's parent.
-                        let their_final_parent_parent_height = peer.their_tree.finalized_height.saturating_sub(2);
-                        let Some(their_final_parent_parent_hash) = read_state.best_chain_block_hash(block::Height(their_final_parent_parent_height)) else {
-                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we don't have blocks @ {}", address, their_final_parent_parent_height); }
+                        // Root the window at the highest block of theirs that's on our best chain
+                        // (their pre-fork blocks are ours too), so it lands right where they can
+                        // attach, regardless of how far their finalized height lags their tip.
+                        let mut shared_h = None;
+                        for branch in &peer.their_tree.branches {
+                            for b in branch.iter().rev() {
+                                if shared_h.is_some_and(|sh| b.this_height <= sh) {
+                                    break;
+                                }
+                                if read_state.best_chain_block_hash(block::Height(b.this_height)) == Some(b.this_hash) {
+                                    shared_h = Some(b.this_height);
+                                    break;
+                                }
+                            }
+                        }
+
+                        // subtract once so the first block of the window is one they provably have, confirming the attach point (because our chain_intersect_prefix() does not match parents),
+                        // (in the fallback, subtract again because in order to send them that block we need to get that block's parent.)
+                        let root_height = match shared_h {
+                            Some(h) => h.saturating_sub(1),
+                            None    => peer.their_tree.finalized_height.saturating_sub(2), // nothing of theirs is on our chain; old finalized-based rooting
+                        };
+                        let Some(root_hash) = read_state.best_chain_block_hash(block::Height(root_height)) else {
+                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we don't have blocks @ {}", address, root_height); }
                             break 'try_send_historical true; // fallback to tip chains if we don't successfully send historical here
                         };
 
-                        let mut hashes_from_their_final_parent = read_state.find_block_hashes(vec![their_final_parent_parent_hash], None);
-                        if hashes_from_their_final_parent.len() == 0 {
-                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we found 0 hashes after block @ {}, {}", address, their_final_parent_parent_height, their_final_parent_parent_hash); }
+                        let hashes_from_root = read_state.find_block_hashes(vec![root_hash], None);
+                        if hashes_from_root.len() == 0 {
+                            if TRACE { tracing::info!("Can't send a historical STATUS to {:?} as we found 0 hashes after block @ {}, {}", address, root_height, root_hash); }
                             break 'try_send_historical true;
                         }
 
-                        let mut parent_hash = their_final_parent_parent_hash;
-                        let mut this_height = their_final_parent_parent_height + 1;
+                        let mut parent_hash = root_hash;
+                        let mut this_height = root_height + 1;
                         let mut historical_chain: Vec<ShadowBlock> = Vec::new();
 
                         // if the first block we send is the block-after-genesis,
@@ -1812,7 +1831,7 @@ pub fn sync(
                             });
                         }
 
-                        for &this_hash in &hashes_from_their_final_parent {
+                        for &this_hash in &hashes_from_root {
                             historical_chain.push(ShadowBlock {
                                 parent_hash,
                                 this_height,
