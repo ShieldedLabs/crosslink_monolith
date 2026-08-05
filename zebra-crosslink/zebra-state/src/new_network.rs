@@ -1399,6 +1399,11 @@ pub fn sync(
     let mut blocks_to_commit:  Vec<(Hash, std::sync::Arc<Block>)>     = Vec::new();
     let mut blocks_to_send:    Vec<(ConnectionKey, Hash, u32, usize)> = Vec::new();
     let mut serialized_blocks: HashMap<Hash, Vec<u8>>             = HashMap::new(); // @Todo: cap max memory storage size for this map.
+    // crosslink-deferred blocks get a commit re-attempt every tick; header+body checks are
+    // deterministic per block, so cache the pass rather than re-running PoW etc. on every
+    // retry. also how first attempts are told apart from retries, for logging.
+    // swept against blocks_to_commit at the end of each tick.
+    let mut cheap_checks_memo: HashMap<Hash, CheapBlockChecks> = HashMap::new();
 
     use rand::Rng;
     let mut local_addresses_secret: u64 = rand::thread_rng().gen();
@@ -2749,7 +2754,9 @@ pub fn sync(
             any_blocks_in_the_queue_can_make_progress = true;
 
             let height = block_arc.coinbase_height().expect("all blocks in the commit queue should already have been confirmed to have a height").0;
-            println!("Committing: @ {height}, {hash}");
+            // a deferred block gets retried every tick; only narrate the first attempt
+            let first_attempt = !cheap_checks_memo.contains_key(&hash);
+            if first_attempt { println!("Committing: @ {height}, {hash}"); }
             // Verify synchronously, immediately before committing. This must NOT run at
             // packet-receipt time: the block that created the outputs this one spends may still
             // be sitting in this queue rather than committed, and the UTXO load would fail for a
@@ -2763,8 +2770,16 @@ pub fn sync(
                 // crosslink gate -> expensive. The crosslink gate MUST come after the body:
                 // it makes permanent, height-keyed decisions, and until the merkle root is
                 // checked the height is not bound to the PoW'd header.
-                let cheap_result = (verify_fns.check_header)(&block_arc.header, &network, block::Height(height), chrono::Utc::now(), check_pow)
-                    .and_then(|()| (verify_fns.check_body)(&block_arc, &network));
+                let cheap_result = if let Some(cheap) = cheap_checks_memo.get(&hash) {
+                    Ok(cheap.clone())
+                } else {
+                    let res = (verify_fns.check_header)(&block_arc.header, &network, block::Height(height), chrono::Utc::now(), check_pow)
+                        .and_then(|()| (verify_fns.check_body)(&block_arc, &network));
+                    if let Ok(cheap) = &res {
+                        cheap_checks_memo.insert(hash, cheap.clone());
+                    }
+                    res
+                };
                 match cheap_result {
                     Err(err) => Err(("cheap", err.msg, false)),
                     Ok(cheap) => {
@@ -2885,7 +2900,7 @@ pub fn sync(
             // A deferrable verdict means "not yet", not "no": keep the block so the next tick
             // can retry it, instead of dropping it and paying for another download.
             if let Err((phase, msg, true)) = &verdict {
-                println!("Deferring: @ {height}, {hash}: {phase}: {msg}");
+                if first_attempt { println!("Deferring: @ {height}, {hash}: {phase}: {msg}"); }
                 return true; // keep
             }
 
@@ -2929,6 +2944,10 @@ pub fn sync(
             let evicted = blocks_to_commit.remove(evict_i);
             if TRACE { tracing::info!("Block cache full; evicting: {}", evicted.0); }
         }
+
+        // memoized cheap checks live exactly as long as their queue entry
+        cheap_checks_memo.retain(|hash, _| blocks_to_commit.iter().any(|(queued, _)| queued == hash));
+
         let _ = any_blocks_in_the_queue_can_make_progress;
 
         // Sleep remainder of tick
