@@ -2,18 +2,59 @@
 # Streams cargo output in real-time, showing only the first error.
 # Kills the cargo process once a second error line appears (no wasted compile time).
 #
-# Usage: cargo_errorlimit.ps1 <subcommand> [cargo args...]   e.g. build / test
+# Usage: cargo_errorlimit.ps1 <exe> <subcommand> [cargo args...]   e.g. cargo build
+#                                                                      wsl -e ~/.cargo/bin/cargo test
 
-if ($args.Count -lt 1) {
-    [Console]::Error.WriteLine("cargo_errorlimit.ps1: missing cargo subcommand (e.g. build or test)")
+if ($args.Count -lt 2) {
+    [Console]::Error.WriteLine("cargo_errorlimit.ps1: usage: <exe> <cargo subcommand> [cargo args...]")
     exit 1
 }
 
-# First arg is the cargo subcommand (build/test/...); the rest are cargo args.
-$cargoArgs = $args -join " "
+# Every descendant of $rootId, deepest first, from a single snapshot walked in memory.
+# rustc spawns the linker, so stopping at direct children leaves link.exe running.
+# Nothing that started before the root can be its descendant, and that check is what
+# keeps a recycled PID from ever pulling an unrelated process into the walk.
+function Get-Descendants([int]$rootId) {
+    $all  = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $root = $all | Where-Object { $_.ProcessId -eq $rootId } | Select-Object -First 1
+    if ($null -eq $root) { return @() }
+
+    $byParent = @{}
+    foreach ($p in $all) {
+        if ($null -eq $p.CreationDate -or $p.CreationDate -lt $root.CreationDate) { continue }
+        $key = [int]$p.ParentProcessId
+        if (-not $byParent.ContainsKey($key)) { $byParent[$key] = @() }
+        $byParent[$key] += [int]$p.ProcessId
+    }
+
+    $ordered  = @()
+    $seen     = @{ $rootId = $true }
+    $frontier = @($rootId)
+
+    while ($frontier.Count -gt 0) {
+        $next = @()
+        foreach ($id in $frontier) {
+            foreach ($child in $byParent[$id]) {
+                if ($seen.ContainsKey($child)) { continue }
+                $seen[$child] = $true
+                $ordered += $child
+                $next    += $child
+            }
+        }
+        $frontier = $next
+    }
+
+    [array]::Reverse($ordered)
+    return $ordered
+}
+
+# First arg is the program to launch: cargo directly, or wsl.exe relaying to a Linux
+# cargo. Everything after it is that program's arguments.
+$exe = $args[0]
+$cargoArgs = ($args | Select-Object -Skip 1) -join " "
 
 $psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = "cargo"
+$psi.FileName = $exe
 $psi.Arguments = $cargoArgs
 $psi.RedirectStandardError  = $true
 $psi.RedirectStandardOutput = $false   # stdout passes straight through
@@ -31,15 +72,18 @@ while ($null -ne ($line = $proc.StandardError.ReadLine())) {
         $errorCount++
     }
     if ($errorCount -ge 2) {
-        # First error fully printed; kill cargo + any child rustc processes
-        try {
-            $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($proc.Id)" -ErrorAction SilentlyContinue
-            foreach ($child in $children) {
-                Write-Host "Killing $($child.ProcessId)"
-                Stop-Process -Id $child.ProcessId -Force -ErrorAction SilentlyContinue
-            }
-            $proc.Kill()
-        } catch {}
+        # First error fully printed; kill cargo and everything below it. The tree has to be
+        # collected before the root dies, because orphaned children keep a ParentProcessId
+        # that no longer leads back to it.
+        # Under WSL there are no Win32 descendants to find, but killing the wsl.exe relay
+        # tears down the whole Linux process tree, rustc included.
+        $doomed = @()
+        try { $doomed = @(Get-Descendants $proc.Id) } catch {}
+        try { $proc.Kill() } catch {}
+        foreach ($id in $doomed) {
+            Write-Host "Killing $id"
+            Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+        }
         break
     }
 
