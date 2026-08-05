@@ -995,29 +995,68 @@ pub static FONT_PIXEL_TINY5: &[u8] = include_bytes!("../assets/Tiny5-Regular.ttf
 pub static FONT_PIXEL_GOHU_11: &[u8] = include_bytes!("../assets/gohufont-uni-11.ttf");
 pub static FONT_PIXEL_GOHU_14: &[u8] = include_bytes!("../assets/gohufont-uni-14.ttf");
 
-// These only exist for global volume. A mixer would be better but this is the minimal diff.
-#[cfg(feature = "audio")]
-struct PlayingSound {
-    sink: rodio::Sink,
-    volume: f32, // base volume before multiplication by global volume
-}
-
-#[cfg(feature = "audio")]
 const GLOBAL_AUDIO_SCALE_FACTOR: f32 = 0.316; // 0.316 ~= perceptually "half volume"
-
-#[cfg(feature = "audio")]
-static mut GLOBAL_OUTPUT_STREAM : *mut rodio::OutputStream = std::ptr::null_mut();
-#[cfg(feature = "audio")]
-static mut playing_sounds: *mut Vec<PlayingSound> = std::ptr::null_mut(); // These only exist for global volume. A mixer would be better but this is the minimal diff.
-#[cfg(feature = "audio")]
-static mut global_audio_volume: f32 = GLOBAL_AUDIO_SCALE_FACTOR;
 
 #[cfg(not(feature = "audio"))]
 pub fn setup_audio() {}
 #[cfg(not(feature = "audio"))]
 pub fn play_sound(_sound_file: &'static [u8], _volume: f32, _speed: f32) {}
 
-#[cfg(feature = "audio")]
+// On windows, playback is the handmade mixer in audio.rs and rodio is only the ogg decoder.
+#[cfg(all(feature = "audio", target_os = "windows"))]
+pub fn setup_audio() { audio::setup_audio(); }
+
+#[cfg(all(feature = "audio", target_os = "windows"))]
+static DECODED_SOUNDS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new()); // (ogg data ptr, audio sound_i)
+
+#[cfg(all(feature = "audio", target_os = "windows"))]
+pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
+    let key = sound_file.as_ptr() as usize;
+    let sound_i_maybe = DECODED_SOUNDS.lock().unwrap().iter().find(|s| s.0 == key).map(|s| s.1);
+    let sound_i = match sound_i_maybe {
+        Some(sound_i) => sound_i,
+        None => {
+            let Some(sound) = decode_ogg(sound_file) else { return; };
+            let sound_i = audio::load_sound(sound);
+            DECODED_SOUNDS.lock().unwrap().push((key, sound_i));
+            sound_i
+        }
+    };
+    audio::play_loaded(sound_i, volume, speed);
+}
+
+#[cfg(all(feature = "audio", target_os = "windows"))]
+fn decode_ogg(data: &'static [u8]) -> Option<audio::Sound> {
+    use rodio::Source;
+    let decoder = rodio::Decoder::new(std::io::Cursor::new(data)).ok()?;
+    let ch_n = decoder.channels() as usize;
+    let rate = decoder.sample_rate();
+    if ch_n == 0 { return None; }
+    let mut frames = Vec::new();
+    let mut samples = decoder.into_iter();
+    while let Some(l) = samples.next() {
+        let r = if ch_n > 1 { samples.next().unwrap_or(l) } else { l };
+        for _ in 2..ch_n { samples.next(); }
+        frames.push([l, r]);
+    }
+    Some(audio::Sound { rate, frames })
+}
+
+// These only exist for global volume. A mixer would be better but this is the minimal diff.
+#[cfg(all(feature = "audio", not(target_os = "windows")))]
+struct PlayingSound {
+    sink: rodio::Sink,
+    volume: f32, // base volume before multiplication by global volume
+}
+
+#[cfg(all(feature = "audio", not(target_os = "windows")))]
+static mut GLOBAL_OUTPUT_STREAM : *mut rodio::OutputStream = std::ptr::null_mut();
+#[cfg(all(feature = "audio", not(target_os = "windows")))]
+static mut playing_sounds: *mut Vec<PlayingSound> = std::ptr::null_mut(); // These only exist for global volume. A mixer would be better but this is the minimal diff.
+#[cfg(all(feature = "audio", not(target_os = "windows")))]
+static mut global_audio_volume: f32 = GLOBAL_AUDIO_SCALE_FACTOR;
+
+#[cfg(all(feature = "audio", not(target_os = "windows")))]
 pub fn setup_audio() {
     unsafe {
         if GLOBAL_OUTPUT_STREAM == std::ptr::null_mut() {
@@ -1037,7 +1076,7 @@ pub fn setup_audio() {
     }
 }
 
-#[cfg(feature = "audio")]
+#[cfg(all(feature = "audio", not(target_os = "windows")))]
 pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
     unsafe {
         if GLOBAL_OUTPUT_STREAM != std::ptr::null_mut() {
@@ -1231,7 +1270,10 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
 
     #[allow(deprecated)]
     event_loop.run(move |event, elwt: &winit::event_loop::ActiveEventLoop| {
-        #[cfg(feature = "audio")]
+        #[cfg(all(feature = "audio", target_os = "windows"))]
+        audio::set_master_volume(ui.global_audio_volume * GLOBAL_AUDIO_SCALE_FACTOR);
+
+        #[cfg(all(feature = "audio", not(target_os = "windows")))]
         unsafe {
             global_audio_volume = ui.global_audio_volume * GLOBAL_AUDIO_SCALE_FACTOR;
 

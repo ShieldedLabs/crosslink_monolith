@@ -1,5 +1,4 @@
 // Shared mixer core with per-OS leaf output threads.
-// @Todo: Ogg decode (lewton) + replace the rodio path in lib.rs
 // @Todo: Linux backend (dlopen libasound.so.2)
 // @Todo: Mac backend (CoreAudio)
 
@@ -31,7 +30,7 @@ struct Voice {
 }
 
 struct AudioState {
-    sounds: Vec<Sound>, // @Todo: Keyed cache; grows on every play
+    sounds: Vec<Sound>, // Callers wanting reuse load_sound() once; play_sound_pcm() grows this per call
     voices: Vec<Voice>,
     master: f32,
     device_rate: u32, // Zero until a backend is up
@@ -57,14 +56,25 @@ pub fn set_master_volume(vol: f32) { AUDIO.lock().unwrap().master = vol; }
 
 pub fn device_ready() -> bool { AUDIO.lock().unwrap().device_rate != 0 }
 
-pub fn play_sound_pcm(sound: Sound, vol: f32, speed: f32) {
+pub fn load_sound(sound: Sound) -> usize {
+    let audio = &mut *AUDIO.lock().unwrap();
+    audio.sounds.push(sound);
+    audio.sounds.len() - 1
+}
+
+pub fn play_loaded(sound_i: usize, vol: f32, speed: f32) {
     let audio = &mut *AUDIO.lock().unwrap();
     if audio.device_rate == 0 { return; } // No backend, drop rather than queue a stale burst
-    if PRINT_AUDIO_TIMING { eprintln!("[{}ms] add voice: {} frames at {}hz speed {}", tms(), sound.frames.len(), sound.rate, speed); }
-    audio.sounds.push(sound);
-    let sound_i = audio.sounds.len() - 1;
+    if sound_i >= audio.sounds.len() { return; }
+    if PRINT_AUDIO_TIMING { eprintln!("[{}ms] add voice: sound_i {} speed {}", tms(), sound_i, speed); }
     if audio.voices.len() >= VOICES_MAX { audio.voices.remove(0); }
     audio.voices.push(Voice { sound_i, cursor: 0.0, speed, vol });
+}
+
+pub fn play_sound_pcm(sound: Sound, vol: f32, speed: f32) {
+    if !device_ready() { return; }
+    let sound_i = load_sound(sound);
+    play_loaded(sound_i, vol, speed);
 }
 
 pub fn play_sine(hz: f32, secs: f32, vol: f32, speed: f32) {
