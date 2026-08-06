@@ -13,7 +13,7 @@ const DUMP_TREES:     bool = false;
 const DUMP_TX_BUILD:  bool = false;
 const DUMP_TX_RECV:   bool = false;
 const DUMP_TX_SEND:   bool = false;
-const AUDIT_TXS:      bool = true;
+const AUDIT_TXS:      bool = false;
 
 // const PUSH_GUI_NOTES: bool = true;
 
