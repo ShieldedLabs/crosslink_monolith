@@ -1002,15 +1002,14 @@ pub fn setup_audio() {}
 #[cfg(not(feature = "audio"))]
 pub fn play_sound(_sound_file: &'static [u8], _volume: f32, _speed: f32) {}
 
-// Playback is the handmade mixer in audio.rs and rodio is only the ogg decoder. Mac is the one
-// platform still on rodio's own playback, until the CoreAudio backend lands.
-#[cfg(all(feature = "audio", not(target_os = "macos")))]
+// Playback is the handmade mixer in audio.rs and rodio is only the ogg decoder.
+#[cfg(feature = "audio")]
 pub fn setup_audio() { audio::setup_audio(); }
 
-#[cfg(all(feature = "audio", not(target_os = "macos")))]
+#[cfg(feature = "audio")]
 static DECODED_SOUNDS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new()); // (ogg data ptr, audio sound_i)
 
-#[cfg(all(feature = "audio", not(target_os = "macos")))]
+#[cfg(feature = "audio")]
 pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
     let key = sound_file.as_ptr() as usize;
     let sound_i_maybe = DECODED_SOUNDS.lock().unwrap().iter().find(|s| s.0 == key).map(|s| s.1);
@@ -1026,7 +1025,7 @@ pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
     audio::play_loaded(sound_i, volume, speed);
 }
 
-#[cfg(all(feature = "audio", not(target_os = "macos")))]
+#[cfg(feature = "audio")]
 fn decode_ogg(data: &'static [u8]) -> Option<audio::Sound> {
     use rodio::Source;
     let decoder = rodio::Decoder::new(std::io::Cursor::new(data)).ok()?;
@@ -1041,56 +1040,6 @@ fn decode_ogg(data: &'static [u8]) -> Option<audio::Sound> {
         frames.push([l, r]);
     }
     Some(audio::Sound { rate, frames })
-}
-
-// These only exist for global volume. A mixer would be better but this is the minimal diff.
-#[cfg(all(feature = "audio", target_os = "macos"))]
-struct PlayingSound {
-    sink: rodio::Sink,
-    volume: f32, // base volume before multiplication by global volume
-}
-
-#[cfg(all(feature = "audio", target_os = "macos"))]
-static mut GLOBAL_OUTPUT_STREAM : *mut rodio::OutputStream = std::ptr::null_mut();
-#[cfg(all(feature = "audio", target_os = "macos"))]
-static mut playing_sounds: *mut Vec<PlayingSound> = std::ptr::null_mut(); // These only exist for global volume. A mixer would be better but this is the minimal diff.
-#[cfg(all(feature = "audio", target_os = "macos"))]
-static mut global_audio_volume: f32 = GLOBAL_AUDIO_SCALE_FACTOR;
-
-#[cfg(all(feature = "audio", target_os = "macos"))]
-pub fn setup_audio() {
-    unsafe {
-        if GLOBAL_OUTPUT_STREAM == std::ptr::null_mut() {
-            if let Ok(stream) = rodio::OutputStreamBuilder::open_default_stream() {
-                GLOBAL_OUTPUT_STREAM = alloc(Layout::new::<rodio::OutputStream>()) as *mut rodio::OutputStream;
-                copy_nonoverlapping(&stream, GLOBAL_OUTPUT_STREAM, 1);
-                std::mem::forget(stream);
-            }
-        }
-        if playing_sounds == std::ptr::null_mut() {
-            if let vec = Vec::<PlayingSound>::new() {
-                playing_sounds = alloc(Layout::new::<Vec<PlayingSound>>()) as *mut Vec<PlayingSound>;
-                copy_nonoverlapping(&vec, playing_sounds, 1);
-                std::mem::forget(vec);
-            }
-        }
-    }
-}
-
-#[cfg(all(feature = "audio", target_os = "macos"))]
-pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
-    unsafe {
-        if GLOBAL_OUTPUT_STREAM != std::ptr::null_mut() {
-            let stream = &mut *GLOBAL_OUTPUT_STREAM;
-            let sink = rodio::play(stream.mixer(), std::io::Cursor::new(sound_file)).unwrap();
-            sink.set_volume(volume * global_audio_volume);
-            sink.set_speed(speed);
-
-            let playing = &mut *playing_sounds;
-            playing.retain(|s| !s.sink.empty()); // prune finished sounds
-            playing.push(PlayingSound { sink, volume });
-        }
-    }
 }
 
 pub static SOUND_UI_WOOSH: &[u8] = include_bytes!("../assets/ui_woosh.ogg");
@@ -1271,21 +1220,8 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
 
     #[allow(deprecated)]
     event_loop.run(move |event, elwt: &winit::event_loop::ActiveEventLoop| {
-        #[cfg(all(feature = "audio", not(target_os = "macos")))]
+        #[cfg(feature = "audio")]
         audio::set_master_volume(ui.global_audio_volume * GLOBAL_AUDIO_SCALE_FACTOR);
-
-        #[cfg(all(feature = "audio", target_os = "macos"))]
-        unsafe {
-            global_audio_volume = ui.global_audio_volume * GLOBAL_AUDIO_SCALE_FACTOR;
-
-            if playing_sounds != std::ptr::null_mut() {
-                let playing = &mut *playing_sounds;
-                playing.retain(|s| !s.sink.empty());
-                for s in playing.iter() {
-                    s.sink.set_volume(s.volume * global_audio_volume);
-                }
-            }
-        }
 
         match event {
             winit::event::Event::Resumed => { // Runs at startup and is where we have to do init.

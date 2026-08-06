@@ -17,12 +17,7 @@ wallet = { path = "../zebra-crosslink/wallet" }
 chrono = "0.4.44"
 
 # Rodio is decode-only (no cpal): playback goes through src/audio.rs instead.
-# On mac rodio still owns playback until the CoreAudio backend lands.
-[target.'cfg(not(target_os = "macos"))'.dependencies]
 rodio = { version = "0.21.1", optional = true, default-features = false, features = ["vorbis"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-rodio = { version = "0.21.1", optional = true }
 
 [features]
 # Off by default so headless builds don't link libasound on linux
