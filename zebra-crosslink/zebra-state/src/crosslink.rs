@@ -8,7 +8,7 @@ use zebra_chain::block::{Hash as BlockHash, Height as BlockHeight};
 
 use serde_with::serde_as;
 
-pub use zcash_primitives::bft::{FinalizerRecencyStatus, TFLRecencyStatus, ScanInfo};
+pub use zcash_primitives::bft::{FinalizerRecencyStatus, TFLRecencyStatus, ScanBond, ScanInfo, WalletStakingPositions};
 use zcash_primitives::transaction::StakingActionRequest;
 
 /// The finality status of a block
@@ -63,6 +63,8 @@ pub enum TFLServiceRequest {
     WalletUfvk,
     /// Send staking action from wallet
     WalletStakingAction(StakingActionRequest),
+    /// Query wallet staking positions grouped by finalizer
+    WalletStakingPositions,
 }
 
 /// Types of responses that can be returned by the TFLService.
@@ -98,6 +100,8 @@ pub enum TFLServiceResponse {
     WalletUfvk(Option<String>),
     /// Send staking action from wallet
     WalletStakingAction(Result<String, String>),
+    /// Query wallet staking positions grouped by finalizer
+    WalletStakingPositions(WalletStakingPositions),
 }
 
 /// Errors that can occur when interacting with the TFLService.

@@ -540,9 +540,14 @@ pub trait Rpc {
     #[method(name = "get_wallet_ufvk")]
     async fn get_wallet_ufvk(&self) -> Option<String>;
 
-    /// send a staking action from the given wallet
+    /// Send a staking action from the given wallet
     #[method(name = "wallet_staking_action")]
     async fn wallet_staking_action(&self, staking_action: StakingActionRequest) -> Result<String>;
+
+    /// Get all staking positions for the wallet: active bonds grouped by target
+    /// finalizer, withdrawable bonds as a flat list
+    #[method(name = "wallet_staking_positions")]
+    async fn wallet_staking_positions(&self) -> Result<serde_json::Value>;
 
     /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
     /// If the block is not in Zebra's state,
@@ -2368,6 +2373,43 @@ where
                     None::<()>,
             )),
             _ => unreachable!(""),
+        }
+    }
+
+    async fn wallet_staking_positions(&self) -> Result<serde_json::Value> {
+        let res = self
+            .tfl_service
+            .clone()
+            .ready()
+            .await
+            .unwrap()
+            .call(TFLServiceRequest::WalletStakingPositions)
+            .await;
+
+        match res {
+            Ok(TFLServiceResponse::WalletStakingPositions((active, withdrawable))) => {
+                // present each (bond, latest value) pair as one flat JSON object
+                let position = |(bond, latest_zats): &(zebra_state::crosslink::ScanBond, u64)| {
+                    let mut val = serde_json::to_value(bond).expect("ScanBond serializes to an object");
+                    val.as_object_mut().unwrap().insert("latest_val".to_string(), (*latest_zats).into());
+                    val
+                };
+
+                let active: serde_json::Map<String, serde_json::Value> = active.iter()
+                    .map(|(finalizer, positions)| (finalizer.to_string(), positions.iter().map(position).collect()))
+                    .collect();
+
+                Ok(serde_json::json!({
+                    "active": active,
+                    "withdrawable": withdrawable.iter().map(position).collect::<Vec<_>>(),
+                }))
+            }
+            Ok(_) => unreachable!("unmatched response to a WalletStakingPositions request"),
+            Err(err) => Err(ErrorObject::owned(
+                    server::error::LegacyCode::Verify.into(),
+                    format!("Staking positions query failed: {err}"),
+                    None::<()>,
+            )),
         }
     }
 

@@ -893,6 +893,15 @@ pub struct ScanBond {
     pub create_txid: PubKeyID, // typed for serialization
 }
 
+/// Wallet staking positions. The u64 paired with each bond is its last-observed on-chain
+/// value in zats, incl. accumulated rewards (initial_val until refreshed).
+/// Withdrawable bonds are no longer targeted at a finalizer, so they are a flat list.
+/// BTreeMap so serialized order is deterministic.
+pub type WalletStakingPositions = (
+    std::collections::BTreeMap<PubKeyID, Vec<(ScanBond, u64)>>, // active, by target finalizer
+    Vec<(ScanBond, u64)>,                                       // withdrawable
+);
+
 #[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScanInfo {
     pub ufvk: std::string::String,

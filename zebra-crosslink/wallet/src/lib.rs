@@ -46,7 +46,7 @@ use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_note_encryption::{try_compact_note_decryption, try_note_decryption, try_output_recovery_with_ovk, ShieldedOutput};
 pub use zcash_primitives::bft;
 pub use zcash_primitives::block::BlockHeader;
-pub use bft::{FinalizerRecencyStatus, TFLRecencyStatus};
+pub use bft::{FinalizerRecencyStatus, TFLRecencyStatus, PubKeyID, ScanBond};
 use zcash_primitives::transaction::builder::{self, BuildConfig, Builder as TxBuilder, BuildResult as TxBuildResult};
 use zcash_primitives::transaction::components::TxOut;
 use zcash_primitives::transaction::fees::{
@@ -114,6 +114,8 @@ pub static USER_UFVK_STRING: Mutex<Option<String>> = Mutex::new(None);
 pub static GUI_ENABLE_MINE: Mutex<bool> = Mutex::new(true);
 
 pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
+
+pub static STAKING_POSITIONS: Mutex<zcash_primitives::bft::WalletStakingPositions> = Mutex::new((BTreeMap::new(), Vec::new()));
 
 #[derive(Clone)]
 pub struct RecencyRequestClosure(pub Arc<dyn Fn() -> Option<String> + Sync + Send + 'static>);
@@ -969,8 +971,8 @@ pub struct WalletState {
 
     pub actions_in_flight: VecDeque<WalletAction>,
 
-    pub stake_positions_bonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* initial */)>,
-    pub stake_positions_unbonded: Vec<([u8; 32] /* bond key */, [u8; 32] /* target finalizer */, u64 /* initial */)>,
+    pub stake_positions_bonded: Vec<(ScanBond, [u8; 32] /* target finalizer */, u64 /* latest zats */)>,
+    pub stake_positions_unbonded: Vec<(ScanBond, u64 /* latest zats */)>, // withdrawable; no longer finalizer-targeted
 
     pub filters: FinalizerFilters,
 }
@@ -4250,29 +4252,41 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let user_txs = user_wallet.txs.clone();
             let miner_txs = miner_wallet.txs.clone();
 
-            let mut stake_positions_bonded = Vec::new();
-            let mut stake_positions_unbonded = Vec::new();
+            let mut stake_positions_bonded: Vec<(ScanBond, [u8; 32], u64)> = Vec::new();
+            let mut stake_positions_unbonded: Vec<(ScanBond, u64)> = Vec::new();
             for tx in &user_wallet.txs {
                 if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
                 if let Some(staking_action) = (&tx.staking_action) {
                     if let Some(create_bond) = StakingAction_CreateNewDelegationBond::try_from_union(staking_action) {
-                        stake_positions_bonded.push((create_bond.unique_pubkey, create_bond.target_finalizer, create_bond.amount_zats));
+                        stake_positions_bonded.push((ScanBond {
+                            pk: PubKeyID(create_bond.unique_pubkey),
+                            initial_val: create_bond.amount_zats,
+                            create_height: tx.h.0,
+                            create_txid: PubKeyID(<[u8; 32]>::from(tx.txid)),
+                        }, create_bond.target_finalizer, create_bond.amount_zats));
                     }
                     if let Some(retarget) = StakingAction_RetargetDelegationBond::try_from_union(staking_action) {
-                        if let Some(existing_i) = stake_positions_bonded.iter().position(|p| p.0 == retarget.unique_pubkey) {
-                            stake_positions_bonded[existing_i].1 = retarget.target_finalizer;
+                        if let Some((_bond, finalizer, _latest_zats)) = stake_positions_bonded.iter_mut().find(|(bond, _, _)| bond.pk.0 == retarget.unique_pubkey) {
+                            *finalizer = retarget.target_finalizer;
                         }
                     }
                     if let Some(unbond) = StakingAction_BeginDelegationUnbonding::try_from_union(staking_action) {
-                        if let Some(existing_i) = stake_positions_bonded.iter().position(|p| p.0 == unbond.unique_pubkey) {
-                            stake_positions_unbonded.push((unbond.unique_pubkey, stake_positions_bonded[existing_i].1, stake_positions_bonded[existing_i].2));
-                            stake_positions_bonded.remove(existing_i);
+                        if let Some(existing_i) = stake_positions_bonded.iter().position(|(bond, _, _)| bond.pk.0 == unbond.unique_pubkey) {
+                            let (bond, _finalizer, latest) = stake_positions_bonded.remove(existing_i);
+                            stake_positions_unbonded.push((bond, latest));
                         } else {
-                            stake_positions_unbonded.push((unbond.unique_pubkey, [0; 32], u64::MAX));
+                            // unbonding whose create-bond tx we haven't seen: value unknown,
+                            // marked with u64::MAX until seen_bond_values can correct it
+                            stake_positions_unbonded.push((ScanBond {
+                                pk: PubKeyID(unbond.unique_pubkey),
+                                initial_val: u64::MAX,
+                                create_height: 0,
+                                create_txid: PubKeyID::NIL,
+                            }, u64::MAX));
                         }
                     }
                     if let Some(unbond) = StakingAction_WithdrawDelegationBond::try_from_union(staking_action) {
-                        if let Some(existing_i) = stake_positions_unbonded.iter().position(|p| p.0 == unbond.unique_pubkey) {
+                        if let Some(existing_i) = stake_positions_unbonded.iter().position(|(bond, _)| bond.pk.0 == unbond.unique_pubkey) {
                             stake_positions_unbonded.remove(existing_i);
                         }
                     }
@@ -4280,19 +4294,37 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
             let mut user_staked_funds = 0;
             let mut user_withdrawable_funds = 0;
-            for p in &mut stake_positions_bonded {
-                if let Some(zats) = user_wallet.seen_bond_values.get(&p.0) {
-                    p.2 = *zats;
+            for (bond, _finalizer, latest_zats) in &mut stake_positions_bonded {
+                if let Some(zats) = user_wallet.seen_bond_values.get(&bond.pk.0) {
+                    *latest_zats = *zats;
                 }
-                user_staked_funds += p.2;
+                user_staked_funds += *latest_zats;
             }
-            for p in &mut stake_positions_unbonded {
-                if let Some(zats) = user_wallet.seen_bond_values.get(&p.0) {
-                    p.2 = *zats;
+            for (bond, latest_zats) in &mut stake_positions_unbonded {
+                if let Some(zats) = user_wallet.seen_bond_values.get(&bond.pk.0) {
+                    *latest_zats = *zats;
                 }
-                user_withdrawable_funds += p.2;
+                // u64::MAX is the not-yet-known placeholder from above; adding it would
+                // overflow (aborts under overflow-checks) and garble the balance.
+                if *latest_zats != u64::MAX {
+                    user_withdrawable_funds += *latest_zats;
+                }
             }
-            user_wallet.care_about_bonds = stake_positions_bonded.iter().map(|p| p.0).chain(stake_positions_unbonded.iter().map(|p| p.0)).collect();
+            user_wallet.care_about_bonds = stake_positions_bonded.iter().map(|(bond, _, _)| bond.pk.0).chain(stake_positions_unbonded.iter().map(|(bond, _)| bond.pk.0)).collect();
+
+            // Publish the latest positions snapshot for the wallet_staking_positions RPC:
+            // active bonds grouped by target finalizer, withdrawable bonds as a flat list.
+            {
+                let mut active: BTreeMap<PubKeyID, Vec<(ScanBond, u64)>> = BTreeMap::new();
+                for (bond, finalizer, latest) in &stake_positions_bonded {
+                    active.entry(PubKeyID(*finalizer)).or_default().push((bond.clone(), *latest));
+                }
+                let withdrawable = stake_positions_unbonded.iter()
+                    .filter(|(_bond, latest_zats)| *latest_zats != u64::MAX) // don't serialize still-unknown placeholders
+                    .cloned()
+                    .collect();
+                *STAKING_POSITIONS.lock().unwrap() = (active, withdrawable);
+            }
 
             fn push_if_proposed_tx(arr: &mut[WalletTx], n: &mut usize, proposed: &ProposedTx, min_stage: BlockHeight) -> bool {
                 if proposed.is_in_progress() && proposed.tx.h >= min_stage && proposed.tx.h != BlockHeight::INVALID {

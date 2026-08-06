@@ -71,11 +71,17 @@ fn main() {
             WalletRosterMember{ pub_key: [0x88u8; 32], voting_power: 250_000_000, txids: vec![] },
             WalletRosterMember{ pub_key: [0x99u8; 32], voting_power: 100_000_000, txids: vec![] },
         ];
+        let dummy_bond = |pk_byte: u8, finalizer_byte: u8| (wallet::ScanBond {
+            pk: wallet::PubKeyID([pk_byte; 32]),
+            initial_val: 100_000_000,
+            create_height: 0,
+            create_txid: wallet::PubKeyID([0; 32]),
+        }, [finalizer_byte; 32], 100_000_000u64);
         wallet_state.lock().unwrap().stake_positions_bonded = vec![
-            ([0x1u8; 32], [0xAAu8; 32], 100_000_000),
-            ([0x2u8; 32], [0xBBu8; 32], 100_000_000),
-            ([0x3u8; 32], [0xCCu8; 32], 100_000_000),
-            ([0x4u8; 32], [0xDDu8; 32], 100_000_000),
+            dummy_bond(0x1, 0xAA),
+            dummy_bond(0x2, 0xBB),
+            dummy_bond(0x3, 0xCC),
+            dummy_bond(0x4, 0xDD),
         ];
     }
 

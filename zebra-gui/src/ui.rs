@@ -1583,8 +1583,9 @@ pub fn ui_left_pane(ui: &mut Context,
     {
         {
             let lock = wallet_state.lock().unwrap();
-            staked_roster_unbonded = lock.stake_positions_unbonded.clone();
-            staked_roster_bonded = lock.stake_positions_bonded.clone();
+            // withdrawable bonds are no longer targeted at a finalizer; keep the tuple shape with a nil key
+            staked_roster_unbonded = lock.stake_positions_unbonded.iter().map(|(bond, latest_zats)| (bond.pk.0, [0u8; 32], *latest_zats)).collect();
+            staked_roster_bonded = lock.stake_positions_bonded.iter().map(|(bond, finalizer, latest_zats)| (bond.pk.0, *finalizer, *latest_zats)).collect();
         }
 
         staked_roster_unbonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
