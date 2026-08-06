@@ -1,5 +1,4 @@
 // Shared mixer core with per-OS leaf output threads.
-// @Todo: Mac backend (CoreAudio)
 
 const PRINT_AUDIO:        bool = 1 == 1;
 const PRINT_AUDIO_TIMING: bool = 0 == 1; // @Debug: Wall-clock trace of voice add/retire and underruns
@@ -94,10 +93,9 @@ pub fn play_sine(hz: f32, secs: f32, vol: f32, speed: f32) {
 }
 
 // Interleaved f32 out at whatever channel count the device wants; sounds are stereo, extra channels get 0
-fn mix_into(buf: &mut [f32], ch_n: usize) {
+fn mix_into(audio: &mut AudioState, buf: &mut [f32], ch_n: usize) {
     for s in buf.iter_mut() { *s = 0.0; }
 
-    let audio = &mut *AUDIO.lock().unwrap();
     let dev_rate = audio.device_rate as f64;
     if dev_rate == 0.0 { return; }
     let master = audio.master;
@@ -134,8 +132,7 @@ fn mix_into(buf: &mut [f32], ch_n: usize) {
 
 // Winds every voice past the content that should have sounded while the device had nothing to play.
 // Free in continuity, since the output was already silent there; the ramp covers the seam it leaves.
-fn skip_output(gap_secs: f64) {
-    let audio = &mut *AUDIO.lock().unwrap();
+fn skip_output(audio: &mut AudioState, gap_secs: f64) {
     audio.fade_in_left = FADE_IN_N;
 
     let AudioState { sounds, voices, .. } = audio; // Split borrow
@@ -150,9 +147,8 @@ fn skip_output(gap_secs: f64) {
     });
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 fn audio_thread_main() {
-    // @Todo: CoreAudio
     if PRINT_AUDIO { eprintln!("audio: no backend for this OS yet"); }
 }
 
@@ -161,6 +157,9 @@ fn audio_thread_main() { wasapi::thread_main() }
 
 #[cfg(target_os = "linux")]
 fn audio_thread_main() { alsa::thread_main() }
+
+#[cfg(target_os = "macos")]
+fn audio_thread_main() { coreaudio::thread_main() }
 
 #[cfg(target_os = "windows")]
 mod wasapi {
@@ -418,7 +417,7 @@ mod wasapi {
                 // empty on schedule comes out at or below zero, so no threshold is needed here.
                 let starved_secs = last_fill.elapsed().as_secs_f64() - buf_frames_n as f64 / rate as f64;
                 if super::PRINT_AUDIO_TIMING { eprintln!("[{}ms] underrun (buffer drained, starved {:.0}ms)", super::tms(), f64::max(starved_secs, 0.0) * 1000.0); }
-                if starved_secs > 0.0 { super::skip_output(starved_secs); }
+                if starved_secs > 0.0 { super::skip_output(&mut AUDIO.lock().unwrap(), starved_secs); }
             }
 
             let free_n = buf_frames_n - pad;
@@ -426,7 +425,7 @@ mod wasapi {
                 let mut ptr: *mut u8 = std::ptr::null_mut();
                 if (vt::<AudioRenderClientVtbl>(render).GetBuffer)(render, free_n, &mut ptr) < 0 { return true; }
                 let buf = std::slice::from_raw_parts_mut(ptr as *mut f32, free_n as usize * ch_n);
-                mix_into(buf, ch_n);
+                mix_into(&mut AUDIO.lock().unwrap(), buf, ch_n);
                 if (vt::<AudioRenderClientVtbl>(render).ReleaseBuffer)(render, free_n, 0) < 0 { return true; }
                 started = true;
                 last_fill = std::time::Instant::now();
@@ -599,7 +598,7 @@ mod alsa {
         let mut written_n = 0u64;
         let mut epoch = std::time::Instant::now();
         loop {
-            mix_into(&mut mix, CH_N);
+            mix_into(&mut AUDIO.lock().unwrap(), &mut mix, CH_N);
             let (frames, frame_bytes) = if fmt == SND_PCM_FORMAT_S16_LE {
                 for (out, s) in s16.iter_mut().zip(mix.iter()) { *out = (s.clamp(-1.0, 1.0) * 32767.0) as i16; }
                 (s16.as_ptr() as *const c_void, 2 * CH_N)
@@ -635,7 +634,7 @@ mod alsa {
                 // never starved comes out at or below zero here.
                 let starved_secs = epoch.elapsed().as_secs_f64() - written_n as f64 / rate as f64;
                 if super::PRINT_AUDIO_TIMING { eprintln!("[{}ms] xrun: {} (starved {:.0}ms)", super::tms(), err_text(a, n as c_int), f64::max(starved_secs, 0.0) * 1000.0); }
-                if starved_secs > 0.0 { skip_output(starved_secs); }
+                if starved_secs > 0.0 { skip_output(&mut AUDIO.lock().unwrap(), starved_secs); }
 
                 let recovered = (a.recover)(pcm, n as c_int, 1);
                 if recovered < 0 {
@@ -648,4 +647,264 @@ mod alsa {
             }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+mod coreaudio {
+    #![allow(non_upper_case_globals)]
+    // Hand-bound AudioToolbox, linked directly since the framework ships with every macOS. The
+    // unit opened is the *default output* AudioUnit rather than any concrete device, which is
+    // what keeps the stream pointed at whatever output the user picks, so devices coming and
+    // going need no handling here. The unit also contains a format converter, so it takes
+    // interleaved f32 at 48kHz no matter what the hardware runs at and mix_into stays untouched.
+
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::time::Instant;
+    use super::{AUDIO, PRINT_AUDIO, mix_into, skip_output};
+
+    type OSStatus = i32;
+
+    const fn fourcc(s: &[u8; 4]) -> u32 { u32::from_be_bytes(*s) }
+
+    const kAudioUnitType_Output:                    u32 = fourcc(b"auou");
+    const kAudioUnitSubType_DefaultOutput:          u32 = fourcc(b"def ");
+    const kAudioUnitManufacturer_Apple:             u32 = fourcc(b"appl");
+    const kAudioFormatLinearPCM:                    u32 = fourcc(b"lpcm");
+    const kAudioFormatFlagIsFloat:                  u32 = 1 << 0;
+    const kAudioFormatFlagIsPacked:                 u32 = 1 << 3;
+    const kAudioUnitProperty_StreamFormat:          u32 = 8;
+    const kAudioUnitProperty_MaximumFramesPerSlice: u32 = 14;
+    const kAudioUnitProperty_SetRenderCallback:     u32 = 23;
+    const kAudioOutputUnitProperty_IsRunning:       u32 = 2001;
+    const kAudioUnitScope_Global:                   u32 = 0;
+    const kAudioUnitScope_Input:                    u32 = 1;
+
+    const RATE: u32   = 48000;
+    const CH_N: usize = 2;
+
+    #[repr(C)] #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct AudioComponentDescription {
+        comp_type:    u32,
+        sub_type:     u32,
+        manufacturer: u32,
+        flags:        u32,
+        flags_mask:   u32,
+    }
+
+    #[repr(C)] #[derive(Debug, Default, Copy, Clone, PartialEq, PartialOrd)]
+    struct AudioStreamBasicDescription {
+        sample_rate:       f64,
+        format_id:         u32,
+        format_flags:      u32,
+        bytes_per_packet:  u32,
+        frames_per_packet: u32,
+        bytes_per_frame:   u32,
+        ch_n:              u32,
+        bits:              u32,
+        reserved:          u32,
+    }
+
+    #[repr(C)] #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct AudioBuffer {
+        ch_n:      u32,
+        byte_size: u32,
+        data:      *mut c_void,
+    }
+
+    // In C the array is variable-length, buffers_n entries long; only the first is declared
+    #[repr(C)] #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct AudioBufferList {
+        buffers_n: u32,
+        buffers:   [AudioBuffer; 1],
+    }
+
+    #[repr(C)] #[derive(Debug, Copy, Clone)] // Comparing function pointers is meaningless, so no comparison derives
+    struct AURenderCallbackStruct {
+        render:  AURenderCallback,
+        ref_con: *mut c_void,
+    }
+
+    // The AudioTimeStamp argument passes through unused, so it stays undeclared behind a void
+    // pointer; the action-flags argument points at a u32 of bit flags.
+    type AURenderCallback = unsafe extern "C" fn(*mut c_void, *mut u32, *const c_void, u32, u32, *mut AudioBufferList) -> OSStatus;
+
+    #[link(name = "AudioToolbox", kind = "framework")]
+    unsafe extern "C" {
+        fn AudioComponentFindNext(comp: *mut c_void, desc: *const AudioComponentDescription) -> *mut c_void;
+        fn AudioComponentInstanceNew(comp: *mut c_void, unit_out: *mut *mut c_void) -> OSStatus;
+        fn AudioComponentInstanceDispose(unit: *mut c_void) -> OSStatus;
+        fn AudioUnitSetProperty(unit: *mut c_void, prop: u32, scope: u32, elem: u32, data: *const c_void, size: u32) -> OSStatus;
+        fn AudioUnitGetProperty(unit: *mut c_void, prop: u32, scope: u32, elem: u32, data: *mut c_void, size: *mut u32) -> OSStatus;
+        fn AudioUnitInitialize(unit: *mut c_void) -> OSStatus;
+        fn AudioUnitUninitialize(unit: *mut c_void) -> OSStatus;
+        fn AudioOutputUnitStart(unit: *mut c_void) -> OSStatus;
+        fn AudioOutputUnitStop(unit: *mut c_void) -> OSStatus;
+    }
+
+    static CB_PREV_ENTRY_NS: AtomicU64 = AtomicU64::new(0); // 0 = no callback yet this session
+    static CB_QUANTUM_NS:    AtomicU64 = AtomicU64::new(0);
+    static CB_PENDING_NS:    AtomicU64 = AtomicU64::new(0); // Measured gap not yet applied to the voices
+    static CB_SKIP_US:       AtomicU64 = AtomicU64::new(0); // Running total for the watcher loop to report
+    static CB_ODD_LIST_N:    AtomicU32 = AtomicU32::new(0); // Callbacks whose buffer list wasn't the single interleaved buffer asked for
+
+    macro_rules! try_os {
+        ($status:expr, $report:expr, $what:expr, $ret:expr) => {
+            let status = $status;
+            if status != 0 { if PRINT_AUDIO && $report { eprintln!("audio: {} failed (status {})", $what, status); } return $ret; }
+        };
+    }
+
+    // This runs on a real-time CoreAudio thread, which must never block, allocate or print. The
+    // mixer lock is only ever held elsewhere for microseconds, so on contention one quantum goes
+    // out as silence rather than waiting, and anything worth reporting is parked in atomics for
+    // the watcher loop to print.
+    //
+    // Starvation is inferred rather than reported. The other backends get a discrete event when
+    // the device runs dry (a failed write, a drained buffer); a pulled callback just stops being
+    // called for a while, however long the process was stopped or the machine slept or a device
+    // switch stalled output. Each callback delivers one quantum of audio, worth frames_n / rate
+    // of wall clock, so consecutive callbacks normally arrive that far apart, and wall clock
+    // between callbacks beyond one quantum is time the device spent with nothing of ours to play.
+    // Acting on any positive excess would misfire on ordinary scheduler jitter, and every misfire
+    // re-arms the fade-in ramp, which is audible amplitude modulation, so the excess is only acted
+    // on past a bound of one further quantum, the device's own period rather than an invented
+    // number. Real stalls measure hundreds of milliseconds to seconds and clear that easily.
+    unsafe extern "C" fn render(_ref_con: *mut c_void, _flags: *mut u32, _timestamp: *const c_void, _bus_i: u32, frames_n: u32, io_data: *mut AudioBufferList) -> OSStatus { unsafe {
+        let now_ns     = super::AUDIO_EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64;
+        let prev_ns    = CB_PREV_ENTRY_NS.swap(now_ns, Ordering::Relaxed);
+        let quantum_ns = CB_QUANTUM_NS.load(Ordering::Relaxed);
+        // A zero-frame ask, however unlikely, must not become the bound the next measurement leans on
+        if frames_n != 0 { CB_QUANTUM_NS.store(frames_n as u64 * 1_000_000_000 / RATE as u64, Ordering::Relaxed); }
+        if prev_ns != 0 {
+            let dead_ns = (now_ns - prev_ns).saturating_sub(quantum_ns);
+            if dead_ns > quantum_ns { CB_PENDING_NS.fetch_add(dead_ns, Ordering::Relaxed); }
+        }
+
+        let list = &mut *io_data;
+        let good = list.buffers_n == 1 && !list.buffers[0].data.is_null();
+        if !good { CB_ODD_LIST_N.fetch_add(1, Ordering::Relaxed); }
+
+        let mut mixed = false;
+        if good {
+            if let Ok(mut audio) = AUDIO.try_lock() {
+                let pending_ns = CB_PENDING_NS.swap(0, Ordering::Relaxed);
+                if pending_ns > 0 {
+                    skip_output(&mut audio, pending_ns as f64 / 1e9);
+                    CB_SKIP_US.fetch_add(pending_ns / 1_000, Ordering::Relaxed);
+                }
+                let buf = &mut list.buffers[0];
+                mix_into(&mut audio, std::slice::from_raw_parts_mut(buf.data as *mut f32, buf.byte_size as usize / 4), CH_N);
+                mixed = true;
+            }
+        }
+        if !mixed {
+            for buf_i in 0..list.buffers_n as usize {
+                let buf = &*list.buffers.as_ptr().add(buf_i);
+                if !buf.data.is_null() { std::ptr::write_bytes(buf.data as *mut u8, 0, buf.byte_size as usize); }
+            }
+        }
+        0
+    } }
+
+    pub fn thread_main() {
+        super::AUDIO_EPOCH.get_or_init(Instant::now); // Done here so the render callback never takes the one-time init lock
+
+        // A mac with no output device at all fails here twice a second forever, so a failed
+        // attempt is described once and then repeats quietly until some attempt gets as far as
+        // playing something.
+        let mut report = true;
+        loop {
+            let ran = unsafe { run_device(report) };
+            AUDIO.lock().unwrap().device_rate = 0;
+            report = ran;
+            if !ran { std::thread::sleep(std::time::Duration::from_millis(500)); }
+        }
+    }
+
+    // One device session: open the default output unit, render until it stops, then tear down so
+    // the caller reopens. False = no session could start at all.
+    unsafe fn run_device(report: bool) -> bool { unsafe {
+        let desc = AudioComponentDescription {
+            comp_type:    kAudioUnitType_Output,
+            sub_type:     kAudioUnitSubType_DefaultOutput,
+            manufacturer: kAudioUnitManufacturer_Apple,
+            flags:        0,
+            flags_mask:   0,
+        };
+        let comp = AudioComponentFindNext(std::ptr::null_mut(), &desc);
+        if comp.is_null() {
+            if PRINT_AUDIO && report { eprintln!("audio: no default output unit, no sound"); }
+            return false;
+        }
+        let mut unit: *mut c_void = std::ptr::null_mut();
+        try_os!(AudioComponentInstanceNew(comp, &mut unit), report, "AudioComponentInstanceNew", false);
+
+        let ran = run_device_session(unit, report);
+        AudioOutputUnitStop(unit);   // Also fine on a unit that never started
+        AudioUnitUninitialize(unit); // Likewise on one never initialized
+        AudioComponentInstanceDispose(unit);
+        ran
+    } }
+
+    unsafe fn run_device_session(unit: *mut c_void, report: bool) -> bool { unsafe {
+        let fmt = AudioStreamBasicDescription {
+            sample_rate:       RATE as f64,
+            format_id:         kAudioFormatLinearPCM,
+            format_flags:      kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, // Interleaved is the absence of its flag
+            bytes_per_packet:  4 * CH_N as u32,
+            frames_per_packet: 1,
+            bytes_per_frame:   4 * CH_N as u32,
+            ch_n:              CH_N as u32,
+            bits:              32,
+            reserved:          0,
+        };
+        try_os!(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &fmt as *const AudioStreamBasicDescription as *const c_void, size_of::<AudioStreamBasicDescription>() as u32), report, "set StreamFormat", false);
+
+        let cb = AURenderCallbackStruct { render, ref_con: std::ptr::null_mut() };
+        try_os!(AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb as *const AURenderCallbackStruct as *const c_void, size_of::<AURenderCallbackStruct>() as u32), report, "set RenderCallback", false);
+
+        // The unit refuses any render bigger than this, and power saving can coalesce the device
+        // buffer well past the unit's small default, which would kill output exactly when nobody
+        // is watching the machine. The mixer takes any size, so ask for plenty of headroom.
+        let max_frames_n: u32 = 4096;
+        try_os!(AudioUnitSetProperty(unit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &max_frames_n as *const u32 as *const c_void, 4), report, "set MaximumFramesPerSlice", false);
+
+        try_os!(AudioUnitInitialize(unit), report, "AudioUnitInitialize", false);
+
+        CB_PREV_ENTRY_NS.store(0, Ordering::Relaxed);
+        CB_QUANTUM_NS.store(0, Ordering::Relaxed);
+        CB_PENDING_NS.store(0, Ordering::Relaxed);
+        try_os!(AudioOutputUnitStart(unit), report, "AudioOutputUnitStart", false);
+
+        // Only now is the stream actually rolling; readiness before this point would let sounds
+        // queue up against setup and come out bunched.
+        AUDIO.lock().unwrap().device_rate = RATE;
+        if PRINT_AUDIO { eprintln!("audio: coreaudio up, {RATE}hz {CH_N}ch f32"); }
+
+        // The unit renders on its own thread from here; this one only relays what the callback
+        // parked in atomics and watches for the unit stopping so the outer loop can reopen it.
+        let mut skip_seen_us = CB_SKIP_US.load(Ordering::Relaxed);
+        let mut odd_reported = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            if super::PRINT_AUDIO_TIMING {
+                let skip_us = CB_SKIP_US.load(Ordering::Relaxed);
+                if skip_us != skip_seen_us { eprintln!("[{}ms] gap: {}ms skipped so far", super::tms(), skip_us / 1000); skip_seen_us = skip_us; }
+            }
+            if !odd_reported && CB_ODD_LIST_N.load(Ordering::Relaxed) != 0 {
+                odd_reported = true;
+                if PRINT_AUDIO { eprintln!("audio: render callback got a buffer list shape it never asked for, no sound"); }
+            }
+
+            let mut running: u32 = 0;
+            let mut size:    u32 = 4;
+            let got = AudioUnitGetProperty(unit, kAudioOutputUnitProperty_IsRunning, kAudioUnitScope_Global, 0, &mut running as *mut u32 as *mut c_void, &mut size);
+            if got != 0 || running == 0 {
+                if PRINT_AUDIO { eprintln!("audio: output unit stopped, reopening"); }
+                return true;
+            }
+        }
+    } }
 }
