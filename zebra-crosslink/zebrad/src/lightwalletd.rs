@@ -9,7 +9,8 @@ use std::net::{TcpListener, TcpStream};
 use hex::ToHex;
 use libnghttp2_sys as ng;
 use prost::Message;
-use tower::{util::BoxService, ServiceExt};
+use tokio::task::JoinHandle;
+use tower::{util::BoxService, Service, ServiceExt};
 
 use zcash_client_backend::proto::compact_formats::{
     CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactSaplingSpend, CompactTx,
@@ -43,6 +44,7 @@ type TflSvc = tower::buffer::Buffer<
 >;
 
 /// Everything the handlers need. All handles are cheap clones.
+#[derive(Clone)]
 #[allow(missing_docs)]
 pub struct Ctx {
     pub rt: tokio::runtime::Handle,
@@ -72,6 +74,8 @@ type Grr = (u32, String);
 
 const REQ_MAX: usize = 4 * 1024 * 1024;
 const OUT_BUDGET: usize = 256 * 1024;
+/// Backend reads per spawned task for the streaming generators.
+const CHUNK: i64 = 32;
 const PATH_PREFIX: &[u8] = b"/cash.z.wallet.sdk.rpc.CompactTxStreamer/";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -146,22 +150,51 @@ fn internal(e: impl std::fmt::Display) -> Grr {
     (GRPC_INTERNAL, e.to_string())
 }
 
+/// Collect a finished runtime task's result; a JoinError (panic/abort) becomes
+/// INTERNAL. Only call once `is_finished()` — then this returns instantly.
+fn reap<T>(rt: &tokio::runtime::Handle, task: JoinHandle<Result<T, Grr>>) -> Result<T, Grr> {
+    match rt.block_on(task) {
+        Ok(r) => r,
+        Err(e) => Err((GRPC_INTERNAL, format!("task failed: {e}"))),
+    }
+}
+
 // -------------------------------------------------------------------------
 // Per-stream state
+//
+// All backend I/O runs as tasks spawned onto the tokio runtime; the server
+// thread only ever polls `is_finished()` and reaps. It never blocks, so one
+// slow backend call (e.g. the TFL roster) cannot stall other streams.
 
 enum Work {
     None,
     /// Pre-encoded messages, drained under the out-buffer budget.
     Items(VecDeque<Vec<u8>>),
-    /// Compact blocks over a height range (inclusive), one state read per block.
-    Blocks { next: u32, end: u32, step: i64, nulls: bool },
-    /// Full transactions by txid, one state read per tx.
-    Txs { hashes: Vec<transaction::Hash>, i: usize },
+    /// A spawned handler running on the runtime; resolves to the next Work.
+    /// Unary methods resolve to `Items` with their one response frame.
+    Pending(JoinHandle<Result<Work, Grr>>),
+    /// Compact blocks over a height range (inclusive), CHUNK reads per task.
+    /// The task result's bool is "hit a height past the best chain".
+    Blocks {
+        next: u32,
+        end: u32,
+        step: i64,
+        nulls: bool,
+        inflight: Option<(i64, JoinHandle<Result<(Vec<Vec<u8>>, bool), Grr>>)>,
+    },
+    /// Full transactions by txid, CHUNK reads per task.
+    Txs {
+        hashes: Vec<transaction::Hash>,
+        i: usize,
+        inflight: Option<(usize, JoinHandle<Result<Vec<Vec<u8>>, Grr>>)>,
+    },
     /// Live mempool feed; closes when the chain tip moves.
     Mempool {
+        backlog: VecDeque<Vec<u8>>,
         rx: tokio::sync::broadcast::Receiver<MempoolChange>,
         seen: HashSet<UnminedTxId>,
         tip0: block::Hash,
+        inflight: Option<JoinHandle<Result<Vec<Vec<u8>>, Grr>>>,
     },
 }
 
@@ -513,8 +546,10 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                     s.dispatched = true;
 
                                     // dispatch: decode the finished request and
-                                    // run its RPC; unary arms complete inline,
-                                    // streaming arms park Work on the stream
+                                    // start its RPC. Requests are parsed inline
+                                    // (cheap, pure); all backend I/O is spawned
+                                    // onto the runtime as Work so this thread
+                                    // never blocks on it.
                                     {
                                         let ctx = &ctx;
                                     let body = std::mem::take(&mut s.req);
@@ -550,9 +585,10 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                         },
                                     };
 
-                                    // Unary arms push their one response and finish OK; streaming arms set
-                                    // s.work. The immediately-called closure exists only so the arms can use
-                                    // `?` — its Err lands in s.finish below.
+                                    // Sync-only arms push their response and finish; the rest
+                                    // park Work (usually a spawned task) on the stream. The
+                                    // immediately-called closure exists only so the arms can
+                                    // use `?` — its Err lands in s.finish below.
                                     let r: Result<(), Grr> = (|| {
                                         match method {
                                             Method::GetLatestBlock => {
@@ -568,36 +604,30 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                 s.finish(GRPC_OK, "");
                                             }
 
-                                            Method::GetBlock => {
+                                            Method::GetBlock | Method::GetBlockNullifiers => {
                                                 // get_block
+                                                let nulls = method == Method::GetBlockNullifiers;
                                                 let req: BlockId = dec(one_msg(&body)?)?;
                                                 let hoh = hash_or_height(&req)?;
-                                                match ctx.state(ReadRequest::Block(hoh))? {
-                                                    ReadResponse::Block(Some(b)) => {
-                                                        s.push(enc(&compact_block(&b, false)));
-                                                        s.finish(GRPC_OK, "");
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    match c
+                                                        .read_state
+                                                        .clone()
+                                                        .oneshot(ReadRequest::Block(hoh))
+                                                        .await
+                                                        .map_err(internal)?
+                                                    {
+                                                        ReadResponse::Block(Some(b)) => Ok(Work::Items(
+                                                            [enc(&compact_block(&b, nulls))].into(),
+                                                        )),
+                                                        ReadResponse::Block(None) => Err((
+                                                            GRPC_OUT_OF_RANGE,
+                                                            "block not in best chain".into(),
+                                                        )),
+                                                        _ => Err((GRPC_INTERNAL, "unexpected state response".into())),
                                                     }
-                                                    ReadResponse::Block(None) => {
-                                                        return Err((GRPC_OUT_OF_RANGE, "block not in best chain".into()))
-                                                    }
-                                                    _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                }
-                                            }
-
-                                            Method::GetBlockNullifiers => {
-                                                // get_block (nullifiers form)
-                                                let req: BlockId = dec(one_msg(&body)?)?;
-                                                let hoh = hash_or_height(&req)?;
-                                                match ctx.state(ReadRequest::Block(hoh))? {
-                                                    ReadResponse::Block(Some(b)) => {
-                                                        s.push(enc(&compact_block(&b, true)));
-                                                        s.finish(GRPC_OK, "");
-                                                    }
-                                                    ReadResponse::Block(None) => {
-                                                        return Err((GRPC_OUT_OF_RANGE, "block not in best chain".into()))
-                                                    }
-                                                    _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                }
+                                                }));
                                             }
 
                                             Method::GetTransaction => {
@@ -608,55 +638,83 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                 }
                                                 let arr: [u8; 32] = req.hash[..].try_into().unwrap();
                                                 let txid = transaction::Hash(arr);
-
-                                                // mempool first, like zebra's own getrawtransaction
-                                                let mut framed = None;
-                                                if let mempool::Response::Transactions(txs) =
-                                                    ctx.mempool_call(mempool::Request::TransactionsByMinedId([txid].into()))?
-                                                {
-                                                    if let Some(tx) = txs.first() {
-                                                        let data = tx.transaction.zcash_serialize_to_vec().map_err(internal)?;
-                                                        let height = ctx.tip.best_tip_height().map(|h| h.0 as u64).unwrap_or(0);
-                                                        framed = Some(enc(&RawTransaction { data, height }));
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    // mempool first, like zebra's own getrawtransaction
+                                                    if let mempool::Response::Transactions(txs) = {
+                                                            let mut svc = c.mempool.clone();
+                                                            svc.ready().await.map_err(internal)?
+                                                                .call(mempool::Request::TransactionsByMinedId(
+                                                            [txid].into(),
+                                                        ))
+                                                                .await
+                                                                .map_err(internal)?
+                                                        }
+                                                    {
+                                                        if let Some(tx) = txs.first() {
+                                                            let data = tx
+                                                                .transaction
+                                                                .zcash_serialize_to_vec()
+                                                                .map_err(internal)?;
+                                                            let height = c
+                                                                .tip
+                                                                .best_tip_height()
+                                                                .map(|h| h.0 as u64)
+                                                                .unwrap_or(0);
+                                                            return Ok(Work::Items(
+                                                                [enc(&RawTransaction { data, height })].into(),
+                                                            ));
+                                                        }
                                                     }
-                                                }
-                                                let framed = match framed {
-                                                    Some(f) => f,
-                                                    None => match ctx.state(ReadRequest::Transaction(txid))? {
+                                                    match c
+                                                        .read_state
+                                                        .clone()
+                                                        .oneshot(ReadRequest::Transaction(txid))
+                                                        .await
+                                                        .map_err(internal)?
+                                                    {
                                                         ReadResponse::Transaction(Some(mined)) => {
-                                                            let data = mined.tx.zcash_serialize_to_vec().map_err(internal)?;
-                                                            enc(&RawTransaction {
-                                                                data,
-                                                                height: mined.height.0 as u64,
-                                                            })
+                                                            let data = mined
+                                                                .tx
+                                                                .zcash_serialize_to_vec()
+                                                                .map_err(internal)?;
+                                                            Ok(Work::Items(
+                                                                [enc(&RawTransaction {
+                                                                    data,
+                                                                    height: mined.height.0 as u64,
+                                                                })]
+                                                                .into(),
+                                                            ))
                                                         }
                                                         ReadResponse::Transaction(None) => {
-                                                            return Err((GRPC_NOT_FOUND, "transaction not found".into()))
+                                                            Err((GRPC_NOT_FOUND, "transaction not found".into()))
                                                         }
-                                                        _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                    },
-                                                };
-                                                s.push(framed);
-                                                s.finish(GRPC_OK, "");
+                                                        _ => Err((GRPC_INTERNAL, "unexpected state response".into())),
+                                                    }
+                                                }));
                                             }
 
                                             Method::GetRoster => {
                                                 // get_roster
-                                                let resp = ctx
-                                                    .rt
-                                                    .block_on(ctx.tfl.clone().oneshot(TFLServiceRequest::Roster))
-                                                    .map_err(internal)?;
-                                                match resp {
-                                                    TFLServiceResponse::Roster(roster) => {
-                                                        let mut data = Vec::new();
-                                                        for member in &roster {
-                                                            member.write_to_vec(&mut data);
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    match c
+                                                        .tfl
+                                                        .clone()
+                                                        .oneshot(TFLServiceRequest::Roster)
+                                                        .await
+                                                        .map_err(internal)?
+                                                    {
+                                                        TFLServiceResponse::Roster(roster) => {
+                                                            let mut data = Vec::new();
+                                                            for member in &roster {
+                                                                member.write_to_vec(&mut data);
+                                                            }
+                                                            Ok(Work::Items([enc(&Bytes { data })].into()))
                                                         }
-                                                        s.push(enc(&Bytes { data }));
-                                                        s.finish(GRPC_OK, "");
+                                                        _ => Err((GRPC_INTERNAL, "unexpected TFL response".into())),
                                                     }
-                                                    _ => return Err((GRPC_INTERNAL, "unexpected TFL response".into())),
-                                                }
+                                                }));
                                             }
 
                                             Method::SendTransaction => {
@@ -665,27 +723,38 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                 let tx = Transaction::zcash_deserialize(&req.data[..])
                                                     .map_err(|e| (GRPC_INVALID, format!("bad transaction bytes: {e}")))?;
                                                 let txid = tx.hash();
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    let queued = {
+                                                            let mut svc = c.mempool.clone();
+                                                            svc.ready().await.map_err(internal)?
+                                                                .call(mempool::Request::Queue(vec![
+                                                            mempool::Gossip::Tx(tx.into()),
+                                                        ]))
+                                                                .await
+                                                                .map_err(internal)?
+                                                        };
+                                                    let mempool::Response::Queued(mut results) = queued else {
+                                                        return Err((GRPC_INTERNAL, "unexpected mempool response".into()));
+                                                    };
+                                                    let receiver = results
+                                                        .pop()
+                                                        .ok_or((GRPC_INTERNAL, "empty mempool queue result".to_string()))?
+                                                        .map_err(|e| (GRPC_UNKNOWN, e.to_string()))?;
+                                                    receiver
+                                                        .await
+                                                        .map_err(internal)?
+                                                        .map_err(|e| (GRPC_UNKNOWN, e.to_string()))?;
 
-                                                let queued = ctx
-                                                    .mempool_call(mempool::Request::Queue(vec![mempool::Gossip::Tx(tx.into())]))?;
-                                                let mempool::Response::Queued(mut results) = queued else {
-                                                    return Err((GRPC_INTERNAL, "unexpected mempool response".into()));
-                                                };
-                                                let receiver = results
-                                                    .pop()
-                                                    .ok_or((GRPC_INTERNAL, "empty mempool queue result".to_string()))?
-                                                    .map_err(|e| (GRPC_UNKNOWN, e.to_string()))?;
-                                                ctx.rt
-                                                    .block_on(receiver)
-                                                    .map_err(internal)?
-                                                    .map_err(|e| (GRPC_UNKNOWN, e.to_string()))?;
-
-                                                // lightwalletd quirk: success carries the txid in error_message
-                                                s.push(enc(&SendResponse {
-                                                    error_code: 0,
-                                                    error_message: txid.to_string(),
+                                                    // lightwalletd quirk: success carries the txid in error_message
+                                                    Ok(Work::Items(
+                                                        [enc(&SendResponse {
+                                                            error_code: 0,
+                                                            error_message: txid.to_string(),
+                                                        })]
+                                                        .into(),
+                                                    ))
                                                 }));
-                                                s.finish(GRPC_OK, "");
                                             }
 
                                             Method::GetTaddressBalance => {
@@ -703,15 +772,24 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                 if set.is_empty() {
                                                     return Err((GRPC_INVALID, "no addresses given".into()));
                                                 }
-                                                match ctx.state(ReadRequest::AddressBalance(set))? {
-                                                    ReadResponse::AddressBalance { balance, .. } => {
-                                                        s.push(enc(&Balance {
-                                                            value_zat: u64::from(balance) as i64,
-                                                        }));
-                                                        s.finish(GRPC_OK, "");
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    match c
+                                                        .read_state
+                                                        .clone()
+                                                        .oneshot(ReadRequest::AddressBalance(set))
+                                                        .await
+                                                        .map_err(internal)?
+                                                    {
+                                                        ReadResponse::AddressBalance { balance, .. } => Ok(Work::Items(
+                                                            [enc(&Balance {
+                                                                value_zat: u64::from(balance) as i64,
+                                                            })]
+                                                            .into(),
+                                                        )),
+                                                        _ => Err((GRPC_INTERNAL, "unexpected state response".into())),
                                                     }
-                                                    _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                }
+                                                }));
                                             }
 
                                             Method::GetTaddressBalanceStream => {
@@ -744,117 +822,108 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                 if set.is_empty() {
                                                     return Err((GRPC_INVALID, "no addresses given".into()));
                                                 }
-                                                match ctx.state(ReadRequest::AddressBalance(set))? {
-                                                    ReadResponse::AddressBalance { balance, .. } => {
-                                                        s.push(enc(&Balance {
-                                                            value_zat: u64::from(balance) as i64,
-                                                        }));
-                                                        s.finish(GRPC_OK, "");
-                                                    }
-                                                    _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                }
-                                            }
-
-                                            Method::GetTreeState => {
-                                                // get_tree_state
-                                                let req: BlockId = dec(one_msg(&body)?)?;
-                                                let hoh = hash_or_height(&req)?;
-
-                                                // tree_state_at
-                                                let (header, hash, height) = match ctx
-                                                    .rt
-                                                    .block_on(ctx.read_state.clone().oneshot(ReadRequest::BlockHeader(hoh)))
-                                                {
-                                                    Ok(ReadResponse::BlockHeader { header, hash, height, .. }) => {
-                                                        (header, hash, height)
-                                                    }
-                                                    Ok(_) => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                    Err(_) => return Err((GRPC_NOT_FOUND, "block not found".into())),
-                                                };
-                                                let active = |nu: NetworkUpgrade| -> bool {
-                                                    nu.activation_height(&ctx.network).is_some_and(|a| height >= a)
-                                                };
-                                                let sapling_tree = if active(NetworkUpgrade::Sapling) {
-                                                    match ctx.state(ReadRequest::SaplingTree(hash.into()))? {
-                                                        ReadResponse::SaplingTree(Some(t)) => hex::encode(t.to_rpc_bytes()),
-                                                        _ => String::new(),
-                                                    }
-                                                } else {
-                                                    String::new()
-                                                };
-                                                let orchard_tree = if active(NetworkUpgrade::Nu5) {
-                                                    match ctx.state(ReadRequest::OrchardTree(hash.into()))? {
-                                                        ReadResponse::OrchardTree(Some(t)) => hex::encode(t.to_rpc_bytes()),
-                                                        _ => String::new(),
-                                                    }
-                                                } else {
-                                                    String::new()
-                                                };
-                                                s.push(enc(&TreeState {
-                                                    network: ctx.network.bip70_network_name(),
-                                                    height: height.0 as u64,
-                                                    hash: hash.to_string(), // display-order hex, what the wallet parses
-                                                    time: header.time.timestamp() as u32,
-                                                    sapling_tree,
-                                                    orchard_tree,
-                                                }));
-                                                s.finish(GRPC_OK, "");
-                                            }
-
-                                            Method::GetLatestTreeState => {
-                                                // get_latest_tree_state
-                                                let (_, tip_hash) = ctx
-                                                    .tip
-                                                    .best_tip_height_and_hash()
-                                                    .ok_or((GRPC_UNAVAILABLE, "no chain tip".to_string()))?;
-
-                                                // tree_state_at
-                                                let (header, hash, height) = match ctx.rt.block_on(
-                                                    ctx.read_state
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    match c
+                                                        .read_state
                                                         .clone()
-                                                        .oneshot(ReadRequest::BlockHeader(tip_hash.into())),
-                                                ) {
-                                                    Ok(ReadResponse::BlockHeader { header, hash, height, .. }) => {
-                                                        (header, hash, height)
+                                                        .oneshot(ReadRequest::AddressBalance(set))
+                                                        .await
+                                                        .map_err(internal)?
+                                                    {
+                                                        ReadResponse::AddressBalance { balance, .. } => Ok(Work::Items(
+                                                            [enc(&Balance {
+                                                                value_zat: u64::from(balance) as i64,
+                                                            })]
+                                                            .into(),
+                                                        )),
+                                                        _ => Err((GRPC_INTERNAL, "unexpected state response".into())),
                                                     }
-                                                    Ok(_) => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                    Err(_) => return Err((GRPC_NOT_FOUND, "block not found".into())),
-                                                };
-                                                let active = |nu: NetworkUpgrade| -> bool {
-                                                    nu.activation_height(&ctx.network).is_some_and(|a| height >= a)
-                                                };
-                                                let sapling_tree = if active(NetworkUpgrade::Sapling) {
-                                                    match ctx.state(ReadRequest::SaplingTree(hash.into()))? {
-                                                        ReadResponse::SaplingTree(Some(t)) => hex::encode(t.to_rpc_bytes()),
-                                                        _ => String::new(),
-                                                    }
-                                                } else {
-                                                    String::new()
-                                                };
-                                                let orchard_tree = if active(NetworkUpgrade::Nu5) {
-                                                    match ctx.state(ReadRequest::OrchardTree(hash.into()))? {
-                                                        ReadResponse::OrchardTree(Some(t)) => hex::encode(t.to_rpc_bytes()),
-                                                        _ => String::new(),
-                                                    }
-                                                } else {
-                                                    String::new()
-                                                };
-                                                s.push(enc(&TreeState {
-                                                    network: ctx.network.bip70_network_name(),
-                                                    height: height.0 as u64,
-                                                    hash: hash.to_string(), // display-order hex, what the wallet parses
-                                                    time: header.time.timestamp() as u32,
-                                                    sapling_tree,
-                                                    orchard_tree,
                                                 }));
-                                                s.finish(GRPC_OK, "");
                                             }
 
-                                            Method::GetAddressUtxos => {
-                                                // get_address_utxos
+                                            Method::GetTreeState | Method::GetLatestTreeState => {
+                                                // get_tree_state / get_latest_tree_state
+                                                let hoh = if method == Method::GetTreeState {
+                                                    let req: BlockId = dec(one_msg(&body)?)?;
+                                                    hash_or_height(&req)?
+                                                } else {
+                                                    let (_, tip_hash) = ctx
+                                                        .tip
+                                                        .best_tip_height_and_hash()
+                                                        .ok_or((GRPC_UNAVAILABLE, "no chain tip".to_string()))?;
+                                                    tip_hash.into()
+                                                };
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    // tree_state_at
+                                                    let (header, hash, height) = match c
+                                                        .read_state
+                                                        .clone()
+                                                        .oneshot(ReadRequest::BlockHeader(hoh))
+                                                        .await
+                                                    {
+                                                        Ok(ReadResponse::BlockHeader { header, hash, height, .. }) => {
+                                                            (header, hash, height)
+                                                        }
+                                                        Ok(_) => return Err((GRPC_INTERNAL, "unexpected state response".into())),
+                                                        Err(_) => return Err((GRPC_NOT_FOUND, "block not found".into())),
+                                                    };
+                                                    let active = |nu: NetworkUpgrade| -> bool {
+                                                        nu.activation_height(&c.network).is_some_and(|a| height >= a)
+                                                    };
+                                                    let sapling_tree = if active(NetworkUpgrade::Sapling) {
+                                                        match c
+                                                            .read_state
+                                                            .clone()
+                                                            .oneshot(ReadRequest::SaplingTree(hash.into()))
+                                                            .await
+                                                            .map_err(internal)?
+                                                        {
+                                                            ReadResponse::SaplingTree(Some(t)) => {
+                                                                hex::encode(t.to_rpc_bytes())
+                                                            }
+                                                            _ => String::new(),
+                                                        }
+                                                    } else {
+                                                        String::new()
+                                                    };
+                                                    let orchard_tree = if active(NetworkUpgrade::Nu5) {
+                                                        match c
+                                                            .read_state
+                                                            .clone()
+                                                            .oneshot(ReadRequest::OrchardTree(hash.into()))
+                                                            .await
+                                                            .map_err(internal)?
+                                                        {
+                                                            ReadResponse::OrchardTree(Some(t)) => {
+                                                                hex::encode(t.to_rpc_bytes())
+                                                            }
+                                                            _ => String::new(),
+                                                        }
+                                                    } else {
+                                                        String::new()
+                                                    };
+                                                    Ok(Work::Items(
+                                                        [enc(&TreeState {
+                                                            network: c.network.bip70_network_name(),
+                                                            height: height.0 as u64,
+                                                            // display-order hex, what the wallet parses
+                                                            hash: hash.to_string(),
+                                                            time: header.time.timestamp() as u32,
+                                                            sapling_tree,
+                                                            orchard_tree,
+                                                        })]
+                                                        .into(),
+                                                    ))
+                                                }));
+                                            }
+
+                                            Method::GetAddressUtxos | Method::GetAddressUtxosStream => {
+                                                // get_address_utxos / begin_address_utxos_stream
+                                                let unary = method == Method::GetAddressUtxos;
                                                 let req: GetAddressUtxosArg = dec(one_msg(&body)?)?;
 
-                                                // collect_utxos
                                                 let mut set = HashSet::new();
                                                 for a in &req.addresses {
                                                     set.insert(
@@ -867,31 +936,50 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                 if set.is_empty() {
                                                     return Err((GRPC_INVALID, "no addresses given".into()));
                                                 }
-                                                let utxos = match ctx.state(ReadRequest::UtxosByAddresses(set))? {
-                                                    ReadResponse::AddressUtxos(utxos) => utxos,
-                                                    _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                };
-                                                let mut address_utxos = Vec::new();
-                                                for (address, txid, location, output) in utxos.utxos() {
-                                                    let height = location.height().0 as u64;
-                                                    if height < req.start_height {
-                                                        continue;
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    let utxos = match c
+                                                        .read_state
+                                                        .clone()
+                                                        .oneshot(ReadRequest::UtxosByAddresses(set))
+                                                        .await
+                                                        .map_err(internal)?
+                                                    {
+                                                        ReadResponse::AddressUtxos(utxos) => utxos,
+                                                        _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
+                                                    };
+                                                    // collect_utxos
+                                                    let mut replies = Vec::new();
+                                                    for (address, txid, location, output) in utxos.utxos() {
+                                                        let height = location.height().0 as u64;
+                                                        if height < req.start_height {
+                                                            continue;
+                                                        }
+                                                        replies.push(GetAddressUtxosReply {
+                                                            address: address.to_string(),
+                                                            txid: txid.0.to_vec(),
+                                                            index: location.output_index().index() as i32,
+                                                            script: output.lock_script.as_raw_bytes().to_vec(),
+                                                            value_zat: u64::from(output.value) as i64,
+                                                            height,
+                                                        });
+                                                        if req.max_entries > 0
+                                                            && replies.len() >= req.max_entries as usize
+                                                        {
+                                                            break;
+                                                        }
                                                     }
-                                                    address_utxos.push(GetAddressUtxosReply {
-                                                        address: address.to_string(),
-                                                        txid: txid.0.to_vec(),
-                                                        index: location.output_index().index() as i32,
-                                                        script: output.lock_script.as_raw_bytes().to_vec(),
-                                                        value_zat: u64::from(output.value) as i64,
-                                                        height,
-                                                    });
-                                                    if req.max_entries > 0 && address_utxos.len() >= req.max_entries as usize {
-                                                        break;
+                                                    if unary {
+                                                        Ok(Work::Items(
+                                                            [enc(&GetAddressUtxosReplyList {
+                                                                address_utxos: replies,
+                                                            })]
+                                                            .into(),
+                                                        ))
+                                                    } else {
+                                                        Ok(Work::Items(replies.iter().map(enc).collect()))
                                                     }
-                                                }
-
-                                                s.push(enc(&GetAddressUtxosReplyList { address_utxos }));
-                                                s.finish(GRPC_OK, "");
+                                                }));
                                             }
 
                                             Method::GetBondInfo => {
@@ -900,37 +988,52 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                 let key: [u8; 32] = req.bond_key[..]
                                                     .try_into()
                                                     .map_err(|_| (GRPC_INVALID, "bond key must be 32 bytes".to_string()))?;
-                                                match ctx.state(ReadRequest::BondInfo(key))? {
-                                                    ReadResponse::BondInfo(Some(info)) => {
-                                                        s.push(enc(&BondInfoResponse {
-                                                            amount: u64::from(info.amount),
-                                                            status: info.status as u32,
-                                                            last_action_height: info.last_action_height,
-                                                        }));
-                                                        s.finish(GRPC_OK, "");
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    match c
+                                                        .read_state
+                                                        .clone()
+                                                        .oneshot(ReadRequest::BondInfo(key))
+                                                        .await
+                                                        .map_err(internal)?
+                                                    {
+                                                        ReadResponse::BondInfo(Some(info)) => Ok(Work::Items(
+                                                            [enc(&BondInfoResponse {
+                                                                amount: u64::from(info.amount),
+                                                                status: info.status as u32,
+                                                                last_action_height: info.last_action_height,
+                                                            })]
+                                                            .into(),
+                                                        )),
+                                                        ReadResponse::BondInfo(None) => {
+                                                            Err((GRPC_NOT_FOUND, "Bond not found".into()))
+                                                        }
+                                                        _ => Err((GRPC_INTERNAL, "unexpected state response".into())),
                                                     }
-                                                    ReadResponse::BondInfo(None) => {
-                                                        return Err((GRPC_NOT_FOUND, "Bond not found".into()))
-                                                    }
-                                                    _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                }
+                                                }));
                                             }
 
                                             Method::RequestFaucetDonation => {
                                                 // request_faucet_donation
                                                 let req: FaucetRequest = dec(one_msg(&body)?)?;
-                                                let resp = ctx
-                                                    .rt
-                                                    .block_on(ctx.tfl.clone().oneshot(TFLServiceRequest::Faucet(req.address)))
-                                                    .map_err(internal)?;
-                                                match resp {
-                                                    TFLServiceResponse::Faucet(Ok(amount)) => {
-                                                        s.push(enc(&FaucetResponse { amount }));
-                                                        s.finish(GRPC_OK, "");
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    match c
+                                                        .tfl
+                                                        .clone()
+                                                        .oneshot(TFLServiceRequest::Faucet(req.address))
+                                                        .await
+                                                        .map_err(internal)?
+                                                    {
+                                                        TFLServiceResponse::Faucet(Ok(amount)) => {
+                                                            Ok(Work::Items([enc(&FaucetResponse { amount })].into()))
+                                                        }
+                                                        TFLServiceResponse::Faucet(Err(msg)) => {
+                                                            Err((GRPC_INTERNAL, msg))
+                                                        }
+                                                        _ => Err((GRPC_INTERNAL, "unexpected TFL response".into())),
                                                     }
-                                                    TFLServiceResponse::Faucet(Err(msg)) => return Err((GRPC_INTERNAL, msg)),
-                                                    _ => return Err((GRPC_INTERNAL, "unexpected TFL response".into())),
-                                                }
+                                                }));
                                             }
 
                                             Method::GetLightdInfo => {
@@ -966,8 +1069,9 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                 s.finish(GRPC_OK, "");
                                             }
 
-                                            Method::GetBlockRange => {
+                                            Method::GetBlockRange | Method::GetBlockRangeNullifiers => {
                                                 // begin_block_range
+                                                let nulls = method == Method::GetBlockRangeNullifiers;
                                                 let req: BlockRange = dec(one_msg(&body)?)?;
                                                 let start: u32 = req
                                                     .start
@@ -982,26 +1086,7 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                     .try_into()
                                                     .map_err(|_| (GRPC_INVALID, "end height out of range".to_string()))?;
                                                 let step = if end >= start { 1 } else { -1 };
-                                                s.work = Work::Blocks { next: start, end, step, nulls: false };
-                                            }
-
-                                            Method::GetBlockRangeNullifiers => {
-                                                // begin_block_range (nullifiers form)
-                                                let req: BlockRange = dec(one_msg(&body)?)?;
-                                                let start: u32 = req
-                                                    .start
-                                                    .ok_or((GRPC_INVALID, "missing start".to_string()))?
-                                                    .height
-                                                    .try_into()
-                                                    .map_err(|_| (GRPC_INVALID, "start height out of range".to_string()))?;
-                                                let end: u32 = req
-                                                    .end
-                                                    .ok_or((GRPC_INVALID, "missing end".to_string()))?
-                                                    .height
-                                                    .try_into()
-                                                    .map_err(|_| (GRPC_INVALID, "end height out of range".to_string()))?;
-                                                let step = if end >= start { 1 } else { -1 };
-                                                s.work = Work::Blocks { next: start, end, step, nulls: true };
+                                                s.work = Work::Blocks { next: start, end, step, nulls, inflight: None };
                                             }
 
                                             Method::GetTaddressTransactions => {
@@ -1034,18 +1119,26 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                     return Ok(());
                                                 }
 
-                                                match ctx.state(ReadRequest::TransactionIdsByAddresses {
-                                                    addresses: [addr].into(),
-                                                    height_range: Height(start)..=Height(end),
-                                                })? {
-                                                    ReadResponse::AddressesTransactionIds(map) => {
-                                                        s.work = Work::Txs {
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    match c
+                                                        .read_state
+                                                        .clone()
+                                                        .oneshot(ReadRequest::TransactionIdsByAddresses {
+                                                            addresses: [addr].into(),
+                                                            height_range: Height(start)..=Height(end),
+                                                        })
+                                                        .await
+                                                        .map_err(internal)?
+                                                    {
+                                                        ReadResponse::AddressesTransactionIds(map) => Ok(Work::Txs {
                                                             hashes: map.into_values().collect(),
                                                             i: 0,
-                                                        };
+                                                            inflight: None,
+                                                        }),
+                                                        _ => Err((GRPC_INTERNAL, "unexpected state response".into())),
                                                     }
-                                                    _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                }
+                                                }));
                                             }
 
                                             Method::GetMempoolTx => {
@@ -1059,55 +1152,68 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                     .map(|e| e.iter().rev().copied().collect())
                                                     .collect();
 
-                                                let mempool::Response::FullTransactions { transactions, .. } =
-                                                    ctx.mempool_call(mempool::Request::FullTransactions)?
-                                                else {
-                                                    return Err((GRPC_INTERNAL, "unexpected mempool response".into()));
-                                                };
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    let full = {
+                                                        let mut svc = c.mempool.clone();
+                                                        svc.ready().await.map_err(internal)?
+                                                            .call(mempool::Request::FullTransactions)
+                                                            .await
+                                                            .map_err(internal)?
+                                                    };
+                                                    let mempool::Response::FullTransactions { transactions, .. } = full
+                                                    else {
+                                                        return Err((GRPC_INTERNAL, "unexpected mempool response".into()));
+                                                    };
 
-                                                let mut items = VecDeque::new();
-                                                for vtx in &transactions {
-                                                    let display = vtx.transaction.id.mined_id().bytes_in_display_order();
-                                                    if excludes.iter().any(|e| !e.is_empty() && display.starts_with(e)) {
-                                                        continue;
-                                                    }
+                                                    let mut items = VecDeque::new();
+                                                    for vtx in &transactions {
+                                                        let display =
+                                                            vtx.transaction.id.mined_id().bytes_in_display_order();
+                                                        if excludes
+                                                            .iter()
+                                                            .any(|e| !e.is_empty() && display.starts_with(e))
+                                                        {
+                                                            continue;
+                                                        }
 
-                                                    // compact_tx (full form, index 0 for mempool)
-                                                    let tx = &vtx.transaction.transaction;
-                                                    let spends: Vec<CompactSaplingSpend> = tx
-                                                        .sapling_nullifiers()
-                                                        .map(|nf| CompactSaplingSpend { nf: (*nf.0).to_vec() })
-                                                        .collect();
-                                                    let outputs: Vec<CompactSaplingOutput> = tx
-                                                        .sapling_outputs()
-                                                        .map(|o| CompactSaplingOutput {
-                                                            cmu: o.cm_u.to_bytes().to_vec(),
-                                                            ephemeral_key: <[u8; 32]>::from(o.ephemeral_key).to_vec(),
-                                                            ciphertext: <[u8; 580]>::from(o.enc_ciphertext)[..52].to_vec(),
-                                                        })
-                                                        .collect();
-                                                    let actions: Vec<CompactOrchardAction> = tx
-                                                        .orchard_actions()
-                                                        .map(|a| CompactOrchardAction {
-                                                            nullifier: <[u8; 32]>::from(a.nullifier).to_vec(),
-                                                            cmx: <[u8; 32]>::from(a.cm_x).to_vec(),
-                                                            ephemeral_key: <[u8; 32]>::from(a.ephemeral_key).to_vec(),
-                                                            ciphertext: <[u8; 580]>::from(a.enc_ciphertext)[..52].to_vec(),
-                                                        })
-                                                        .collect();
-                                                    if spends.is_empty() && outputs.is_empty() && actions.is_empty() {
-                                                        continue;
+                                                        // compact_tx (full form, index 0 for mempool)
+                                                        let tx = &vtx.transaction.transaction;
+                                                        let spends: Vec<CompactSaplingSpend> = tx
+                                                            .sapling_nullifiers()
+                                                            .map(|nf| CompactSaplingSpend { nf: (*nf.0).to_vec() })
+                                                            .collect();
+                                                        let outputs: Vec<CompactSaplingOutput> = tx
+                                                            .sapling_outputs()
+                                                            .map(|o| CompactSaplingOutput {
+                                                                cmu: o.cm_u.to_bytes().to_vec(),
+                                                                ephemeral_key: <[u8; 32]>::from(o.ephemeral_key).to_vec(),
+                                                                ciphertext: <[u8; 580]>::from(o.enc_ciphertext)[..52].to_vec(),
+                                                            })
+                                                            .collect();
+                                                        let actions: Vec<CompactOrchardAction> = tx
+                                                            .orchard_actions()
+                                                            .map(|a| CompactOrchardAction {
+                                                                nullifier: <[u8; 32]>::from(a.nullifier).to_vec(),
+                                                                cmx: <[u8; 32]>::from(a.cm_x).to_vec(),
+                                                                ephemeral_key: <[u8; 32]>::from(a.ephemeral_key).to_vec(),
+                                                                ciphertext: <[u8; 580]>::from(a.enc_ciphertext)[..52].to_vec(),
+                                                            })
+                                                            .collect();
+                                                        if spends.is_empty() && outputs.is_empty() && actions.is_empty() {
+                                                            continue;
+                                                        }
+                                                        items.push_back(enc(&CompactTx {
+                                                            index: 0,
+                                                            hash: tx.hash().0.to_vec(),
+                                                            fee: 0,
+                                                            spends,
+                                                            outputs,
+                                                            actions,
+                                                        }));
                                                     }
-                                                    items.push_back(enc(&CompactTx {
-                                                        index: 0,
-                                                        hash: tx.hash().0.to_vec(),
-                                                        fee: 0,
-                                                        spends,
-                                                        outputs,
-                                                        actions,
-                                                    }));
-                                                }
-                                                s.work = Work::Items(items);
+                                                    Ok(Work::Items(items))
+                                                }));
                                             }
 
                                             Method::GetMempoolStream => {
@@ -1117,23 +1223,34 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                     return Ok(());
                                                 };
                                                 let rx = ctx.mempool_events.subscribe();
-
-                                                // current mempool contents first, then live additions until the tip moves
-                                                let mut seen = HashSet::new();
-                                                if let mempool::Response::FullTransactions { transactions, .. } =
-                                                    ctx.mempool_call(mempool::Request::FullTransactions)?
-                                                {
-                                                    for vtx in &transactions {
-                                                        seen.insert(vtx.transaction.id);
-                                                        if let Ok(data) = vtx.transaction.transaction.zcash_serialize_to_vec() {
-                                                            s.push(enc(&RawTransaction {
-                                                                data,
-                                                                height: tip_height.0 as u64,
-                                                            }));
+                                                let c = ctx.clone();
+                                                // current mempool contents first, then live additions
+                                                // until the tip moves
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    let mut seen = HashSet::new();
+                                                    let mut backlog = VecDeque::new();
+                                                    if let mempool::Response::FullTransactions { transactions, .. } = {
+                                                            let mut svc = c.mempool.clone();
+                                                            svc.ready().await.map_err(internal)?
+                                                                .call(mempool::Request::FullTransactions)
+                                                                .await
+                                                                .map_err(internal)?
+                                                        }
+                                                    {
+                                                        for vtx in &transactions {
+                                                            seen.insert(vtx.transaction.id);
+                                                            if let Ok(data) =
+                                                                vtx.transaction.transaction.zcash_serialize_to_vec()
+                                                            {
+                                                                backlog.push_back(enc(&RawTransaction {
+                                                                    data,
+                                                                    height: tip_height.0 as u64,
+                                                                }));
+                                                            }
                                                         }
                                                     }
-                                                }
-                                                s.work = Work::Mempool { rx, seen, tip0 };
+                                                    Ok(Work::Mempool { backlog, rx, seen, tip0, inflight: None })
+                                                }));
                                             }
 
                                             Method::GetSubtreeRoots => {
@@ -1152,90 +1269,68 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                 } else {
                                                     None
                                                 };
+                                                let protocol = req.shielded_protocol;
+                                                let c = ctx.clone();
+                                                s.work = Work::Pending(ctx.rt.spawn(async move {
+                                                    // (root hex, end height) for either pool, then
+                                                    // resolve completing block hashes
+                                                    let subtrees: Vec<(String, Height)> = match protocol {
+                                                        0 => match c
+                                                            .read_state
+                                                            .clone()
+                                                            .oneshot(ReadRequest::SaplingSubtrees {
+                                                                start_index: NoteCommitmentSubtreeIndex(start),
+                                                                limit,
+                                                            })
+                                                            .await
+                                                            .map_err(internal)?
+                                                        {
+                                                            ReadResponse::SaplingSubtrees(map) => map
+                                                                .values()
+                                                                .map(|d| (d.root.encode_hex::<String>(), d.end_height))
+                                                                .collect(),
+                                                            _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
+                                                        },
+                                                        1 => match c
+                                                            .read_state
+                                                            .clone()
+                                                            .oneshot(ReadRequest::OrchardSubtrees {
+                                                                start_index: NoteCommitmentSubtreeIndex(start),
+                                                                limit,
+                                                            })
+                                                            .await
+                                                            .map_err(internal)?
+                                                        {
+                                                            ReadResponse::OrchardSubtrees(map) => map
+                                                                .values()
+                                                                .map(|d| (d.root.encode_hex::<String>(), d.end_height))
+                                                                .collect(),
+                                                            _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
+                                                        },
+                                                        _ => return Err((GRPC_INVALID, "unknown shielded protocol".into())),
+                                                    };
 
-                                                // (root hex, end height) for either pool, then resolve completing block hashes
-                                                let subtrees: Vec<(String, Height)> = match req.shielded_protocol {
-                                                    0 => match ctx.state(ReadRequest::SaplingSubtrees {
-                                                        start_index: NoteCommitmentSubtreeIndex(start),
-                                                        limit,
-                                                    })? {
-                                                        ReadResponse::SaplingSubtrees(map) => map
-                                                            .values()
-                                                            .map(|d| (d.root.encode_hex::<String>(), d.end_height))
-                                                            .collect(),
-                                                        _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                    },
-                                                    1 => match ctx.state(ReadRequest::OrchardSubtrees {
-                                                        start_index: NoteCommitmentSubtreeIndex(start),
-                                                        limit,
-                                                    })? {
-                                                        ReadResponse::OrchardSubtrees(map) => map
-                                                            .values()
-                                                            .map(|d| (d.root.encode_hex::<String>(), d.end_height))
-                                                            .collect(),
-                                                        _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                    },
-                                                    _ => return Err((GRPC_INVALID, "unknown shielded protocol".into())),
-                                                };
-
-                                                let mut items = VecDeque::new();
-                                                for (root_hex, end_height) in subtrees {
-                                                    let root_hash = hex::decode(&root_hex).map_err(internal)?;
-                                                    let completing_block_hash =
-                                                        match ctx.state(ReadRequest::BestChainBlockHash(end_height))? {
+                                                    let mut items = VecDeque::new();
+                                                    for (root_hex, end_height) in subtrees {
+                                                        let root_hash = hex::decode(&root_hex).map_err(internal)?;
+                                                        let completing_block_hash = match c
+                                                            .read_state
+                                                            .clone()
+                                                            .oneshot(ReadRequest::BestChainBlockHash(end_height))
+                                                            .await
+                                                            .map_err(internal)?
+                                                        {
                                                             ReadResponse::BlockHash(Some(h)) => h.0.to_vec(),
                                                             _ => Vec::new(),
                                                         };
-                                                    items.push_back(enc(&SubtreeRoot {
-                                                        root_hash,
-                                                        completing_block_hash,
-                                                        completing_block_height: end_height.0 as u64,
-                                                    }));
-                                                }
-                                                s.work = Work::Items(items);
-                                            }
-
-                                            Method::GetAddressUtxosStream => {
-                                                // begin_address_utxos_stream
-                                                let req: GetAddressUtxosArg = dec(one_msg(&body)?)?;
-
-                                                // collect_utxos
-                                                let mut set = HashSet::new();
-                                                for a in &req.addresses {
-                                                    set.insert(
-                                                        // parse_taddr
-                                                        a.parse::<transparent::Address>().map_err(|e| {
-                                                            (GRPC_INVALID, format!("bad transparent address {a:?}: {e}"))
-                                                        })?,
-                                                    );
-                                                }
-                                                if set.is_empty() {
-                                                    return Err((GRPC_INVALID, "no addresses given".into()));
-                                                }
-                                                let utxos = match ctx.state(ReadRequest::UtxosByAddresses(set))? {
-                                                    ReadResponse::AddressUtxos(utxos) => utxos,
-                                                    _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
-                                                };
-                                                let mut items = VecDeque::new();
-                                                for (address, txid, location, output) in utxos.utxos() {
-                                                    let height = location.height().0 as u64;
-                                                    if height < req.start_height {
-                                                        continue;
+                                                        items.push_back(enc(&SubtreeRoot {
+                                                            root_hash,
+                                                            completing_block_hash,
+                                                            completing_block_height: end_height.0 as u64,
+                                                        }));
                                                     }
-                                                    items.push_back(enc(&GetAddressUtxosReply {
-                                                        address: address.to_string(),
-                                                        txid: txid.0.to_vec(),
-                                                        index: location.output_index().index() as i32,
-                                                        script: output.lock_script.as_raw_bytes().to_vec(),
-                                                        value_zat: u64::from(output.value) as i64,
-                                                        height,
-                                                    }));
-                                                    if req.max_entries > 0 && items.len() >= req.max_entries as usize {
-                                                        break;
-                                                    }
-                                                }
-
-                                                s.work = Work::Items(items);
+                                                    Ok(Work::Items(items))
+                                                }));
                                             }
 
                                             Method::Unknown => {
@@ -1264,8 +1359,9 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                 .collect();
                             for id in work_ids {
                                 if let Some(s) = (*c).streams.get_mut(&id) {
-                                    // advance: drain this stream's work under the
-                                    // out-buffer budget; true if it produced or finished
+                                    // advance: poll/reap this stream's in-flight
+                                    // runtime task and refill the out buffer under
+                                    // the budget; true if it produced or finished
                                     lap |= {
                                         let ctx = &ctx;
                                     let mut progress = false;
@@ -1274,94 +1370,245 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                         if s.done || s.out.len() >= OUT_BUDGET {
                                             break;
                                         }
-                                        match &mut s.work {
+                                        let work = std::mem::replace(&mut s.work, Work::None);
+                                        match work {
                                             Work::None => break,
 
-                                            Work::Items(items) => match items.pop_front() {
-                                                Some(m) => {
-                                                    s.out.extend(m);
-                                                    progress = true;
+                                            Work::Items(mut items) => {
+                                                while s.out.len() < OUT_BUDGET {
+                                                    match items.pop_front() {
+                                                        Some(m) => {
+                                                            s.out.extend(m);
+                                                            progress = true;
+                                                        }
+                                                        None => break,
+                                                    }
                                                 }
-                                                None => {
+                                                if items.is_empty() {
                                                     s.finish(GRPC_OK, "");
                                                     progress = true;
-                                                }
-                                            },
-
-                                            Work::Blocks { next, end, step, nulls } => {
-                                                let (h, last, step, nulls) = (*next, *next == *end, *step, *nulls);
-                                                match ctx.state(ReadRequest::Block(Height(h).into())) {
-                                                    Ok(ReadResponse::Block(Some(b))) => {
-                                                        let framed = enc(&compact_block(&b, nulls));
-                                                        s.push(framed);
-                                                        progress = true;
-                                                        if last {
-                                                            s.finish(GRPC_OK, "");
-                                                        } else if let Work::Blocks { next, .. } = &mut s.work {
-                                                            *next = (h as i64 + step) as u32;
-                                                        }
-                                                    }
-                                                    Ok(ReadResponse::Block(None)) => {
-                                                        s.finish(GRPC_OUT_OF_RANGE, format!("height {h} is not in the best chain"));
-                                                        progress = true;
-                                                    }
-                                                    Ok(_) => {
-                                                        s.finish(GRPC_INTERNAL, "unexpected state response");
-                                                        progress = true;
-                                                    }
-                                                    Err((code, msg)) => {
-                                                        s.finish(code, msg);
-                                                        progress = true;
-                                                    }
-                                                }
-                                            }
-
-                                            Work::Txs { hashes, i } => {
-                                                let hash = if *i >= hashes.len() {
-                                                    None
                                                 } else {
-                                                    let h = hashes[*i];
-                                                    *i += 1;
-                                                    Some(h)
-                                                };
-                                                let Some(hash) = hash else {
-                                                    s.finish(GRPC_OK, "");
-                                                    progress = true;
-                                                    continue;
-                                                };
-                                                match ctx.state(ReadRequest::Transaction(hash)) {
-                                                    Ok(ReadResponse::Transaction(Some(mined))) => {
-                                                        match mined.tx.zcash_serialize_to_vec() {
-                                                            Ok(data) => {
-                                                                let framed = enc(&RawTransaction {
-                                                                    data,
-                                                                    height: mined.height.0 as u64,
-                                                                });
-                                                                s.push(framed);
-                                                                progress = true;
-                                                            }
-                                                            Err(e) => {
-                                                                s.finish(GRPC_INTERNAL, e.to_string());
-                                                                progress = true;
-                                                            }
-                                                        }
-                                                    }
-                                                    // txid was indexed but the tx vanished (reorg between calls): skip it
-                                                    Ok(_) => {}
-                                                    Err((code, msg)) => {
-                                                        s.finish(code, msg);
-                                                        progress = true;
-                                                    }
+                                                    s.work = Work::Items(items);
+                                                }
+                                                break;
+                                            }
+
+                                            Work::Pending(task) => {
+                                                if !task.is_finished() {
+                                                    s.work = Work::Pending(task);
+                                                    break;
+                                                }
+                                                progress = true;
+                                                match reap(&ctx.rt, task) {
+                                                    // loop again to run the resolved work
+                                                    Ok(next_work) => s.work = next_work,
+                                                    Err((code, msg)) => s.finish(code, msg),
                                                 }
                                             }
 
-                                            Work::Mempool { rx, seen, tip0 } => {
-                                                if ctx.tip.best_tip_hash() != Some(*tip0) {
+                                            Work::Blocks { next, end, step, nulls, inflight } => {
+                                                if let Some((count, task)) = inflight {
+                                                    if !task.is_finished() {
+                                                        s.work = Work::Blocks {
+                                                            next, end, step, nulls,
+                                                            inflight: Some((count, task)),
+                                                        };
+                                                        break;
+                                                    }
+                                                    progress = true;
+                                                    match reap(&ctx.rt, task) {
+                                                        Ok((frames, hit_none)) => {
+                                                            let got = frames.len() as i64;
+                                                            for f in frames {
+                                                                s.out.extend(f);
+                                                            }
+                                                            if hit_none {
+                                                                let h = (next as i64 + got * step) as u32;
+                                                                s.finish(
+                                                                    GRPC_OUT_OF_RANGE,
+                                                                    format!("height {h} is not in the best chain"),
+                                                                );
+                                                            } else {
+                                                                let remaining = if step > 0 {
+                                                                    (end - next) as i64 + 1
+                                                                } else {
+                                                                    (next - end) as i64 + 1
+                                                                };
+                                                                if count >= remaining {
+                                                                    s.finish(GRPC_OK, "");
+                                                                } else {
+                                                                    s.work = Work::Blocks {
+                                                                        next: (next as i64 + count * step) as u32,
+                                                                        end, step, nulls,
+                                                                        inflight: None,
+                                                                    };
+                                                                }
+                                                            }
+                                                        }
+                                                        Err((code, msg)) => s.finish(code, msg),
+                                                    }
+                                                } else {
+                                                    // spawn the next chunk of block reads
+                                                    let remaining = if step > 0 {
+                                                        (end - next) as i64 + 1
+                                                    } else {
+                                                        (next - end) as i64 + 1
+                                                    };
+                                                    let count = remaining.min(CHUNK);
+                                                    let c = ctx.clone();
+                                                    let task = ctx.rt.spawn(async move {
+                                                        let mut frames = Vec::with_capacity(count as usize);
+                                                        let mut h = next;
+                                                        for _ in 0..count {
+                                                            match c
+                                                                .read_state
+                                                                .clone()
+                                                                .oneshot(ReadRequest::Block(Height(h).into()))
+                                                                .await
+                                                                .map_err(internal)?
+                                                            {
+                                                                ReadResponse::Block(Some(b)) => {
+                                                                    frames.push(enc(&compact_block(&b, nulls)))
+                                                                }
+                                                                ReadResponse::Block(None) => return Ok((frames, true)),
+                                                                _ => {
+                                                                    return Err((
+                                                                        GRPC_INTERNAL,
+                                                                        "unexpected state response".into(),
+                                                                    ))
+                                                                }
+                                                            }
+                                                            h = (h as i64 + step) as u32;
+                                                        }
+                                                        Ok((frames, false))
+                                                    });
+                                                    s.work = Work::Blocks {
+                                                        next, end, step, nulls,
+                                                        inflight: Some((count, task)),
+                                                    };
+                                                    progress = true;
+                                                    break;
+                                                }
+                                            }
+
+                                            Work::Txs { hashes, i, inflight } => {
+                                                if let Some((count, task)) = inflight {
+                                                    if !task.is_finished() {
+                                                        s.work = Work::Txs { hashes, i, inflight: Some((count, task)) };
+                                                        break;
+                                                    }
+                                                    progress = true;
+                                                    match reap(&ctx.rt, task) {
+                                                        Ok(frames) => {
+                                                            for f in frames {
+                                                                s.out.extend(f);
+                                                            }
+                                                            let i = i + count;
+                                                            if i >= hashes.len() {
+                                                                s.finish(GRPC_OK, "");
+                                                            } else {
+                                                                s.work = Work::Txs { hashes, i, inflight: None };
+                                                            }
+                                                        }
+                                                        Err((code, msg)) => s.finish(code, msg),
+                                                    }
+                                                } else if i >= hashes.len() {
                                                     s.finish(GRPC_OK, "");
                                                     progress = true;
-                                                    continue;
+                                                    break;
+                                                } else {
+                                                    // spawn the next chunk of tx reads
+                                                    let count = (hashes.len() - i).min(CHUNK as usize);
+                                                    let chunk: Vec<transaction::Hash> =
+                                                        hashes[i..i + count].to_vec();
+                                                    let c = ctx.clone();
+                                                    let task = ctx.rt.spawn(async move {
+                                                        let mut frames = Vec::new();
+                                                        for hash in chunk {
+                                                            match c
+                                                                .read_state
+                                                                .clone()
+                                                                .oneshot(ReadRequest::Transaction(hash))
+                                                                .await
+                                                                .map_err(internal)?
+                                                            {
+                                                                ReadResponse::Transaction(Some(mined)) => {
+                                                                    let data = mined
+                                                                        .tx
+                                                                        .zcash_serialize_to_vec()
+                                                                        .map_err(internal)?;
+                                                                    frames.push(enc(&RawTransaction {
+                                                                        data,
+                                                                        height: mined.height.0 as u64,
+                                                                    }));
+                                                                }
+                                                                // txid was indexed but the tx vanished
+                                                                // (reorg between calls): skip it
+                                                                ReadResponse::Transaction(None) => {}
+                                                                _ => {
+                                                                    return Err((
+                                                                        GRPC_INTERNAL,
+                                                                        "unexpected state response".into(),
+                                                                    ))
+                                                                }
+                                                            }
+                                                        }
+                                                        Ok(frames)
+                                                    });
+                                                    s.work = Work::Txs { hashes, i, inflight: Some((count, task)) };
+                                                    progress = true;
+                                                    break;
                                                 }
-                                                let tip_height = ctx.tip.best_tip_height().map(|h| h.0 as u64).unwrap_or(0);
+                                            }
+
+                                            Work::Mempool { mut backlog, mut rx, mut seen, tip0, inflight } => {
+                                                while s.out.len() < OUT_BUDGET {
+                                                    match backlog.pop_front() {
+                                                        Some(m) => {
+                                                            s.out.extend(m);
+                                                            progress = true;
+                                                        }
+                                                        None => break,
+                                                    }
+                                                }
+                                                if s.out.len() >= OUT_BUDGET {
+                                                    s.work = Work::Mempool { backlog, rx, seen, tip0, inflight };
+                                                    break;
+                                                }
+                                                if let Some(task) = inflight {
+                                                    if !task.is_finished() {
+                                                        s.work = Work::Mempool {
+                                                            backlog, rx, seen, tip0,
+                                                            inflight: Some(task),
+                                                        };
+                                                        break;
+                                                    }
+                                                    progress = true;
+                                                    match reap(&ctx.rt, task) {
+                                                        Ok(frames) => {
+                                                            for f in frames {
+                                                                backlog.push_back(f);
+                                                            }
+                                                            // drain the fresh frames next iteration
+                                                            s.work = Work::Mempool {
+                                                                backlog, rx, seen, tip0,
+                                                                inflight: None,
+                                                            };
+                                                            continue;
+                                                        }
+                                                        Err((code, msg)) => {
+                                                            s.finish(code, msg);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if ctx.tip.best_tip_hash() != Some(tip0) {
+                                                    s.finish(GRPC_OK, "");
+                                                    progress = true;
+                                                    break;
+                                                }
+                                                let tip_height =
+                                                    ctx.tip.best_tip_height().map(|h| h.0 as u64).unwrap_or(0);
                                                 let mut new_ids: HashSet<UnminedTxId> = HashSet::new();
                                                 let mut closed = false;
                                                 loop {
@@ -1385,33 +1632,44 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                         }
                                                     }
                                                 }
-                                                let mut frames: Vec<Vec<u8>> = Vec::new();
-                                                let mut fail: Option<Grr> = None;
                                                 if !new_ids.is_empty() {
-                                                    match ctx.mempool_call(mempool::Request::TransactionsById(new_ids)) {
-                                                        Ok(mempool::Response::Transactions(txs)) => {
+                                                    let c = ctx.clone();
+                                                    let task = ctx.rt.spawn(async move {
+                                                        let mut frames = Vec::new();
+                                                        if let mempool::Response::Transactions(txs) = {
+                                                                let mut svc = c.mempool.clone();
+                                                                svc.ready().await.map_err(internal)?
+                                                                    .call(mempool::Request::TransactionsById(new_ids))
+                                                                    .await
+                                                                    .map_err(internal)?
+                                                            }
+                                                        {
                                                             for tx in txs {
-                                                                if let Ok(data) = tx.transaction.zcash_serialize_to_vec() {
-                                                                    frames.push(enc(&RawTransaction { data, height: tip_height }));
+                                                                if let Ok(data) =
+                                                                    tx.transaction.zcash_serialize_to_vec()
+                                                                {
+                                                                    frames.push(enc(&RawTransaction {
+                                                                        data,
+                                                                        height: tip_height,
+                                                                    }));
                                                                 }
                                                             }
                                                         }
-                                                        Ok(_) => {}
-                                                        Err(g) => fail = Some(g),
-                                                    }
-                                                }
-                                                for framed in frames {
-                                                    s.push(framed);
+                                                        Ok(frames)
+                                                    });
+                                                    s.work = Work::Mempool {
+                                                        backlog, rx, seen, tip0,
+                                                        inflight: Some(task),
+                                                    };
                                                     progress = true;
+                                                    break;
                                                 }
-                                                if let Some((code, msg)) = fail {
-                                                    s.finish(code, msg);
-                                                    progress = true;
-                                                } else if closed && !s.done {
+                                                if closed {
                                                     s.finish(GRPC_OK, "");
                                                     progress = true;
+                                                    break;
                                                 }
-                                                // nothing more to poll this lap
+                                                s.work = Work::Mempool { backlog, rx, seen, tip0, inflight: None };
                                                 break;
                                             }
                                         }
@@ -1615,12 +1873,21 @@ unsafe extern "C" fn cb_stream_close(
     user_data: *mut std::os::raw::c_void,
 ) -> std::os::raw::c_int {
     let conn = &mut *(user_data as *mut Conn);
-    conn.streams.remove(&stream_id);
+    if let Some(s) = conn.streams.remove(&stream_id) {
+        // a dead client's in-flight backend call shouldn't keep running
+        match s.work {
+            Work::Pending(t) => t.abort(),
+            Work::Blocks { inflight: Some((_, t)), .. } => t.abort(),
+            Work::Txs { inflight: Some((_, t)), .. } => t.abort(),
+            Work::Mempool { inflight: Some(t), .. } => t.abort(),
+            _ => {}
+        }
+    }
     0
 }
 
 /// Pull-based response body. Empty + not done => park (DEFERRED); the pump
-/// resumes us once `advance` produced bytes. Empty + done => trailers.
+/// resumes us once advance produced bytes. Empty + done => trailers.
 unsafe extern "C" fn cb_data_read(
     session: *mut ng::nghttp2_session,
     stream_id: i32,
@@ -1689,23 +1956,6 @@ fn nv(name: &[u8], value: &[u8]) -> ng::nghttp2_nv {
         namelen: name.len(),
         valuelen: value.len(),
         flags: ng::NGHTTP2_NV_FLAG_NONE as u8,
-    }
-}
-
-// -------------------------------------------------------------------------
-// Service call helpers
-
-impl Ctx {
-    fn state(&self, req: ReadRequest) -> Result<ReadResponse, Grr> {
-        self.rt
-            .block_on(self.read_state.clone().oneshot(req))
-            .map_err(internal)
-    }
-
-    fn mempool_call(&self, req: mempool::Request) -> Result<mempool::Response, Grr> {
-        self.rt
-            .block_on(self.mempool.clone().oneshot(req))
-            .map_err(internal)
     }
 }
 
@@ -1803,4 +2053,3 @@ fn compact_block(b: &Block, nulls: bool) -> CompactBlock {
         chain_metadata: None,
     }
 }
-
