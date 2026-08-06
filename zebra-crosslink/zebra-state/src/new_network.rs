@@ -884,7 +884,7 @@ const MAX_BLOCKS_TO_QUEUE_TO_COMMIT: usize = 10;
 ///
 /// Every block still gets a commit attempt in the tick it arrives -- the cache is only where
 /// it lands after that attempt defers.
-const MAX_DEFERRED_BLOCKS: usize = 128;
+const MAX_DEFERRED_BLOCKS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeightAndHashOr0 {
