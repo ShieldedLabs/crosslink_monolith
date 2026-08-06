@@ -439,7 +439,7 @@ mod wasapi {
 mod alsa {
     // Hand-bound libasound, looked up by name at run time so that nothing links against it and a
     // machine without ALSA installed still runs, merely silent. Opening the "default" device is not
-    // a way around whatever sound server is in charge: the server drops a config file in that
+    // a way around whatever sound server is in charge: the server drops in a config file that
     // points that name back at itself, so this one leaf reaches PipeWire, PulseAudio and bare ALSA
     // alike, and the server is then also the thing that follows the user's chosen output around.
     // Never open hw:N, which would take a card away from the server.
@@ -452,9 +452,15 @@ mod alsa {
     const SND_PCM_FORMAT_S16_LE:         c_int = 2;
     const SND_PCM_FORMAT_FLOAT_LE:       c_int = 14;
     const RTLD_NOW:                      c_int = 2;
+    const EINTR:                         isize = 4;
 
     const CH_N:              usize  = 2;
-    const BUFFER_LATENCY_US: c_uint = 20_000; // Whole buffer, which snd_pcm_set_params cuts into periods
+    // Whole buffer, which snd_pcm_set_params cuts into periods. Wider than the WASAPI figure
+    // because plumbing between here and linux hardware (WSLg, VMs, bluetooth) jitters more than
+    // a native windows path, and there is no asking what the chain would prefer: alsa has no
+    // notion of a recommended buffer, and leaving it unconstrained selects the smallest legal
+    // configuration rather than a sensible one. 20ms buzzed audibly in WSLg; 60ms did not.
+    const BUFFER_LATENCY_US: c_uint = 60_000;
 
     unsafe extern "C" {
         fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
@@ -609,6 +615,13 @@ mod alsa {
                     written_n += n as u64;
                     continue;
                 }
+                // A signal cutting the wait short is not the device running dry: the stream keeps
+                // rolling and still holds whatever was queued, so the write is simply reissued.
+                // Handing this to snd_pcm_recover instead would report success without touching
+                // the stream, and resetting the counters below on that non-event would leave them
+                // claiming a freshly-started stream while a full buffer plays out, overstating the
+                // next real starvation measurement by that buffer's length.
+                if n == -EINTR { continue; }
                 if n == 0 {
                     // A blocking write waits for room rather than taking nothing, so this cannot
                     // happen; going round again on the assumption that it can would spin forever.
