@@ -1,5 +1,4 @@
 // Shared mixer core with per-OS leaf output threads.
-// @Todo: Linux backend (dlopen libasound.so.2)
 // @Todo: Mac backend (CoreAudio)
 
 const PRINT_AUDIO:        bool = 1 == 1;
@@ -151,14 +150,17 @@ fn skip_output(gap_secs: f64) {
     });
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn audio_thread_main() {
-    // @Todo: ALSA via dlopen, CoreAudio
+    // @Todo: CoreAudio
     if PRINT_AUDIO { eprintln!("audio: no backend for this OS yet"); }
 }
 
 #[cfg(target_os = "windows")]
 fn audio_thread_main() { wasapi::thread_main() }
+
+#[cfg(target_os = "linux")]
+fn audio_thread_main() { alsa::thread_main() }
 
 #[cfg(target_os = "windows")]
 mod wasapi {
@@ -428,6 +430,208 @@ mod wasapi {
                 if (vt::<AudioRenderClientVtbl>(render).ReleaseBuffer)(render, free_n, 0) < 0 { return true; }
                 started = true;
                 last_fill = std::time::Instant::now();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod alsa {
+    // Hand-bound libasound, looked up by name at run time so that nothing links against it and a
+    // machine without ALSA installed still runs, merely silent. Opening the "default" device is not
+    // a way around whatever sound server is in charge: the server drops a config file in that
+    // points that name back at itself, so this one leaf reaches PipeWire, PulseAudio and bare ALSA
+    // alike, and the server is then also the thing that follows the user's chosen output around.
+    // Never open hw:N, which would take a card away from the server.
+
+    use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+    use super::{AUDIO, PRINT_AUDIO, mix_into, skip_output};
+
+    const SND_PCM_STREAM_PLAYBACK:       c_int = 0;
+    const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
+    const SND_PCM_FORMAT_S16_LE:         c_int = 2;
+    const SND_PCM_FORMAT_FLOAT_LE:       c_int = 14;
+    const RTLD_NOW:                      c_int = 2;
+
+    const CH_N:              usize  = 2;
+    const BUFFER_LATENCY_US: c_uint = 20_000; // Whole buffer, which snd_pcm_set_params cuts into periods
+
+    unsafe extern "C" {
+        fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlsym(lib: *mut c_void, name: *const c_char) -> *mut c_void;
+    }
+
+    // snd_pcm_uframes_t is an unsigned long, which is a usize on every linux, and the enum arguments
+    // are plain ints. snd_pcm_t only ever passes through as an opaque pointer.
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct Alsa {
+        open:       unsafe extern "C" fn(*mut *mut c_void, *const c_char, c_int, c_int) -> c_int,
+        close:      unsafe extern "C" fn(*mut c_void) -> c_int,
+        set_params: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_uint, c_uint, c_int, c_uint) -> c_int,
+        get_params: unsafe extern "C" fn(*mut c_void, *mut usize, *mut usize) -> c_int,
+        prepare:    unsafe extern "C" fn(*mut c_void) -> c_int,
+        writei:     unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> isize,
+        recover:    unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int,
+        strerror:   unsafe extern "C" fn(c_int) -> *const c_char,
+        set_error:  unsafe extern "C" fn(*mut c_void) -> c_int,
+    }
+
+    // Libasound writes its own diagnostics straight to stderr, eight lines deep, and a machine with
+    // no sound reaches them on every retry for as long as the process lives. They are worth reading
+    // once and never again, so they are silenced by handing libasound somewhere else to put them.
+    // The handler it expects is variadic; this stand-in reads none of the variable arguments, and
+    // leaving them untouched is something every calling convention involved here permits.
+    unsafe extern "C" fn drop_error(_file: *const c_char, _line: c_int, _func: *const c_char, _err: c_int, _fmt: *const c_char) {}
+
+    macro_rules! sym {
+        ($lib:expr, $name:literal) => { {
+            let f = dlsym($lib, concat!($name, "\0").as_ptr() as *const c_char);
+            if f.is_null() { if PRINT_AUDIO { eprintln!("audio: libasound.so.2 has no {}, no sound", $name); } return None; }
+            std::mem::transmute(f)
+        } };
+    }
+
+    macro_rules! try_snd {
+        ($a:expr, $report:expr, $err:expr, $what:expr, $ret:expr) => {
+            let err = $err;
+            if err < 0 { if PRINT_AUDIO && $report { eprintln!("audio: {} failed ({})", $what, err_text($a, err)); } return $ret; }
+        };
+    }
+
+    unsafe fn err_text(a: &Alsa, err: c_int) -> &'static str {
+        CStr::from_ptr((a.strerror)(err)).to_str().unwrap_or("unknown error")
+    }
+
+    unsafe fn load() -> Option<Alsa> {
+        let lib = dlopen(c"libasound.so.2".as_ptr(), RTLD_NOW);
+        if lib.is_null() {
+            if PRINT_AUDIO { eprintln!("audio: no libasound.so.2 on this machine, no sound"); }
+            return None;
+        }
+        Some(Alsa {
+            open:       sym!(lib, "snd_pcm_open"),
+            close:      sym!(lib, "snd_pcm_close"),
+            set_params: sym!(lib, "snd_pcm_set_params"),
+            get_params: sym!(lib, "snd_pcm_get_params"),
+            prepare:    sym!(lib, "snd_pcm_prepare"),
+            writei:     sym!(lib, "snd_pcm_writei"),
+            recover:    sym!(lib, "snd_pcm_recover"),
+            strerror:   sym!(lib, "snd_strerror"),
+            set_error:  sym!(lib, "snd_lib_error_set_handler"),
+        })
+    }
+
+    pub fn thread_main() { unsafe {
+        let Some(alsa) = load() else { return; };
+
+        // A machine with no sound at all fails here twice a second forever, which is the normal
+        // state of a headless server, so a failed attempt is described once and then repeats quietly
+        // until some attempt gets as far as playing something.
+        let mut report = true;
+        loop {
+            let ran = run_device(&alsa, report);
+            AUDIO.lock().unwrap().device_rate = 0;
+            report = ran;
+            if !ran { std::thread::sleep(std::time::Duration::from_millis(500)); }
+        }
+    } }
+
+    // One device session: open the default output, render until the stream dies, then tear down so
+    // the caller reopens. False = no session could start at all.
+    unsafe fn run_device(a: &Alsa, report: bool) -> bool {
+        (a.set_error)(if report { std::ptr::null_mut() } else { drop_error as *mut c_void }); // Null puts libasound's own handler back
+
+        let mut pcm: *mut c_void = std::ptr::null_mut();
+        let err = (a.open)(&mut pcm, c"default".as_ptr(), SND_PCM_STREAM_PLAYBACK, 0);
+        if err < 0 {
+            if PRINT_AUDIO && report { eprintln!("audio: snd_pcm_open(default) failed ({})", err_text(a, err)); }
+            return false;
+        }
+
+        let ran = run_device_session(a, pcm, report);
+        (a.close)(pcm);
+        ran
+    }
+
+    unsafe fn run_device_session(a: &Alsa, pcm: *mut c_void, report: bool) -> bool {
+        let mut rate = 0u32;
+        let mut fmt  = SND_PCM_FORMAT_FLOAT_LE;
+        'setup: for &want_rate in &[48000u32, 44100] {
+            for &want_fmt in &[SND_PCM_FORMAT_FLOAT_LE, SND_PCM_FORMAT_S16_LE] {
+                if (a.set_params)(pcm, want_fmt, SND_PCM_ACCESS_RW_INTERLEAVED, CH_N as c_uint, want_rate, 1, BUFFER_LATENCY_US) >= 0 {
+                    rate = want_rate;
+                    fmt  = want_fmt;
+                    break 'setup;
+                }
+            }
+        }
+        if rate == 0 {
+            if PRINT_AUDIO && report { eprintln!("audio: no usable pcm format, no sound"); }
+            return false;
+        }
+
+        let mut buffer_n: usize = 0;
+        let mut period_n: usize = 0;
+        try_snd!(a, report, (a.get_params)(pcm, &mut buffer_n, &mut period_n), "snd_pcm_get_params", false);
+        if period_n == 0 {
+            if PRINT_AUDIO && report { eprintln!("audio: pcm reports a zero-frame period, no sound"); }
+            return false;
+        }
+        try_snd!(a, report, (a.prepare)(pcm), "snd_pcm_prepare", false);
+
+        // Only now is the stream ready to take frames; readiness before this point would let sounds
+        // queue up against setup and come out bunched.
+        AUDIO.lock().unwrap().device_rate = rate;
+        if PRINT_AUDIO {
+            let fmt_name = if fmt == SND_PCM_FORMAT_FLOAT_LE { "f32" } else { "s16" };
+            eprintln!("audio: alsa up, {rate}hz {CH_N}ch {fmt_name}, {period_n} frame period, {buffer_n} frame buffer");
+        }
+
+        let mut mix = vec![0f32; period_n * CH_N];
+        let mut s16 = vec![0i16; if fmt == SND_PCM_FORMAT_S16_LE { period_n * CH_N } else { 0 }];
+
+        let mut written_n = 0u64;
+        let mut epoch = std::time::Instant::now();
+        loop {
+            mix_into(&mut mix, CH_N);
+            let (frames, frame_bytes) = if fmt == SND_PCM_FORMAT_S16_LE {
+                for (out, s) in s16.iter_mut().zip(mix.iter()) { *out = (s.clamp(-1.0, 1.0) * 32767.0) as i16; }
+                (s16.as_ptr() as *const c_void, 2 * CH_N)
+            } else {
+                (mix.as_ptr() as *const c_void, 4 * CH_N)
+            };
+
+            let mut off = 0usize;
+            while off < period_n {
+                let n = (a.writei)(pcm, frames.byte_add(off * frame_bytes), period_n - off);
+                if n > 0 {
+                    off       += n as usize;
+                    written_n += n as u64;
+                    continue;
+                }
+                if n == 0 {
+                    // A blocking write waits for room rather than taking nothing, so this cannot
+                    // happen; going round again on the assumption that it can would spin forever.
+                    if PRINT_AUDIO { eprintln!("audio: pcm took no frames, reopening"); }
+                    return true;
+                }
+
+                // A write only fails once the device has run dry, and running dry means everything
+                // handed over has been played, so wall clock beyond what those frames were worth is
+                // time the device spent with nothing to play. No threshold is needed: a stream that
+                // never starved comes out at or below zero here.
+                let starved_secs = epoch.elapsed().as_secs_f64() - written_n as f64 / rate as f64;
+                if super::PRINT_AUDIO_TIMING { eprintln!("[{}ms] xrun: {} (starved {:.0}ms)", super::tms(), err_text(a, n as c_int), f64::max(starved_secs, 0.0) * 1000.0); }
+                if starved_secs > 0.0 { skip_output(starved_secs); }
+
+                let recovered = (a.recover)(pcm, n as c_int, 1);
+                if recovered < 0 {
+                    if PRINT_AUDIO { eprintln!("audio: device lost ({}), reopening", err_text(a, recovered)); }
+                    return true;
+                }
+                written_n = 0;
+                epoch = std::time::Instant::now();
+                break; // Whatever is left of this period goes with the silence it followed
             }
         }
     }

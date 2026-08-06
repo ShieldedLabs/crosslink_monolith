@@ -1002,14 +1002,15 @@ pub fn setup_audio() {}
 #[cfg(not(feature = "audio"))]
 pub fn play_sound(_sound_file: &'static [u8], _volume: f32, _speed: f32) {}
 
-// On windows, playback is the handmade mixer in audio.rs and rodio is only the ogg decoder.
-#[cfg(all(feature = "audio", target_os = "windows"))]
+// Playback is the handmade mixer in audio.rs and rodio is only the ogg decoder. Mac is the one
+// platform still on rodio's own playback, until the CoreAudio backend lands.
+#[cfg(all(feature = "audio", not(target_os = "macos")))]
 pub fn setup_audio() { audio::setup_audio(); }
 
-#[cfg(all(feature = "audio", target_os = "windows"))]
+#[cfg(all(feature = "audio", not(target_os = "macos")))]
 static DECODED_SOUNDS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new()); // (ogg data ptr, audio sound_i)
 
-#[cfg(all(feature = "audio", target_os = "windows"))]
+#[cfg(all(feature = "audio", not(target_os = "macos")))]
 pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
     let key = sound_file.as_ptr() as usize;
     let sound_i_maybe = DECODED_SOUNDS.lock().unwrap().iter().find(|s| s.0 == key).map(|s| s.1);
@@ -1025,7 +1026,7 @@ pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
     audio::play_loaded(sound_i, volume, speed);
 }
 
-#[cfg(all(feature = "audio", target_os = "windows"))]
+#[cfg(all(feature = "audio", not(target_os = "macos")))]
 fn decode_ogg(data: &'static [u8]) -> Option<audio::Sound> {
     use rodio::Source;
     let decoder = rodio::Decoder::new(std::io::Cursor::new(data)).ok()?;
@@ -1043,20 +1044,20 @@ fn decode_ogg(data: &'static [u8]) -> Option<audio::Sound> {
 }
 
 // These only exist for global volume. A mixer would be better but this is the minimal diff.
-#[cfg(all(feature = "audio", not(target_os = "windows")))]
+#[cfg(all(feature = "audio", target_os = "macos"))]
 struct PlayingSound {
     sink: rodio::Sink,
     volume: f32, // base volume before multiplication by global volume
 }
 
-#[cfg(all(feature = "audio", not(target_os = "windows")))]
+#[cfg(all(feature = "audio", target_os = "macos"))]
 static mut GLOBAL_OUTPUT_STREAM : *mut rodio::OutputStream = std::ptr::null_mut();
-#[cfg(all(feature = "audio", not(target_os = "windows")))]
+#[cfg(all(feature = "audio", target_os = "macos"))]
 static mut playing_sounds: *mut Vec<PlayingSound> = std::ptr::null_mut(); // These only exist for global volume. A mixer would be better but this is the minimal diff.
-#[cfg(all(feature = "audio", not(target_os = "windows")))]
+#[cfg(all(feature = "audio", target_os = "macos"))]
 static mut global_audio_volume: f32 = GLOBAL_AUDIO_SCALE_FACTOR;
 
-#[cfg(all(feature = "audio", not(target_os = "windows")))]
+#[cfg(all(feature = "audio", target_os = "macos"))]
 pub fn setup_audio() {
     unsafe {
         if GLOBAL_OUTPUT_STREAM == std::ptr::null_mut() {
@@ -1076,7 +1077,7 @@ pub fn setup_audio() {
     }
 }
 
-#[cfg(all(feature = "audio", not(target_os = "windows")))]
+#[cfg(all(feature = "audio", target_os = "macos"))]
 pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
     unsafe {
         if GLOBAL_OUTPUT_STREAM != std::ptr::null_mut() {
@@ -1270,10 +1271,10 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
 
     #[allow(deprecated)]
     event_loop.run(move |event, elwt: &winit::event_loop::ActiveEventLoop| {
-        #[cfg(all(feature = "audio", target_os = "windows"))]
+        #[cfg(all(feature = "audio", not(target_os = "macos")))]
         audio::set_master_volume(ui.global_audio_volume * GLOBAL_AUDIO_SCALE_FACTOR);
 
-        #[cfg(all(feature = "audio", not(target_os = "windows")))]
+        #[cfg(all(feature = "audio", target_os = "macos"))]
         unsafe {
             global_audio_volume = ui.global_audio_volume * GLOBAL_AUDIO_SCALE_FACTOR;
 
