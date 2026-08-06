@@ -16,12 +16,12 @@ clay-layout = { path = "../clay-rs" }
 wallet = { path = "../zebra-crosslink/wallet" }
 chrono = "0.4.44"
 
-# Rodio is decode-only (no cpal): playback goes through src/audio.rs instead.
-rodio = { version = "0.21.1", optional = true, default-features = false, features = ["vorbis"] }
+# Vorbis decode at the packet level; the ogg demuxer is ours.
+lewton = { version = "0.10.2", optional = true, default-features = false }
 
 [features]
-# Off by default so headless builds don't link libasound on linux
-audio = ["dep:rodio"]
+# Off by default so headless builds skip all of this
+audio = ["dep:lewton"]
 
 [profile.release]
 debug = 2   # full debug info (0 = none, 1 = line tables only, 2 = full)

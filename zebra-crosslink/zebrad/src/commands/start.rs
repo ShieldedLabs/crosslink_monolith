@@ -651,7 +651,7 @@ impl StartCmd {
         let old_databases_task_handle_fused = (&mut old_databases_task_handle).fuse();
         pin!(old_databases_task_handle_fused);
 
-        // Handmade lightwalletd gRPC server, served straight from the read state
+        // Lightwalletd gRPC server, served straight from the read state
         // service and mempool. Takes over the port zaino used to serve; the
         // wallet connects to it unchanged.
         {

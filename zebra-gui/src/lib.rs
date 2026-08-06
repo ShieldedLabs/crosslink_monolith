@@ -1002,7 +1002,7 @@ pub fn setup_audio() {}
 #[cfg(not(feature = "audio"))]
 pub fn play_sound(_sound_file: &'static [u8], _volume: f32, _speed: f32) {}
 
-// Playback is the handmade mixer in audio.rs and rodio is only the ogg decoder.
+// Playback is the mixer in audio.rs; decode is the handmade ogg demuxer over lewton
 #[cfg(feature = "audio")]
 pub fn setup_audio() { audio::setup_audio(); }
 
@@ -1016,30 +1016,13 @@ pub fn play_sound(sound_file: &'static [u8], volume: f32, speed: f32) {
     let sound_i = match sound_i_maybe {
         Some(sound_i) => sound_i,
         None => {
-            let Some(sound) = decode_ogg(sound_file) else { return; };
+            let Some(sound) = audio::decode_ogg(sound_file) else { return; };
             let sound_i = audio::load_sound(sound);
             DECODED_SOUNDS.lock().unwrap().push((key, sound_i));
             sound_i
         }
     };
     audio::play_loaded(sound_i, volume, speed);
-}
-
-#[cfg(feature = "audio")]
-fn decode_ogg(data: &'static [u8]) -> Option<audio::Sound> {
-    use rodio::Source;
-    let decoder = rodio::Decoder::new(std::io::Cursor::new(data)).ok()?;
-    let ch_n = decoder.channels() as usize;
-    let rate = decoder.sample_rate();
-    if ch_n == 0 { return None; }
-    let mut frames = Vec::new();
-    let mut samples = decoder.into_iter();
-    while let Some(l) = samples.next() {
-        let r = if ch_n > 1 { samples.next().unwrap_or(l) } else { l };
-        for _ in 2..ch_n { samples.next(); }
-        frames.push([l, r]);
-    }
-    Some(audio::Sound { rate, frames })
 }
 
 pub static SOUND_UI_WOOSH: &[u8] = include_bytes!("../assets/ui_woosh.ogg");

@@ -92,6 +92,78 @@ pub fn play_sine(hz: f32, secs: f32, vol: f32, speed: f32) {
     play_sound_pcm(Sound { rate, frames }, vol, speed);
 }
 
+// Ogg demuxer feeding lewton's packet-level vorbis decoder, in place of a whole
+// container/decoder framework. Ogg is simple: each page starts "OggS" and carries a lacing
+// table cutting its payload into segments, and a packet is segments concatenated until one
+// shorter than 255 bytes ends it, spanning pages when needed. The first three packets of a
+// vorbis stream are its identification, comment and setup headers, and every later packet is
+// audio. Page CRCs go unchecked, since a corrupt embedded asset is a build problem rather than
+// a runtime one. The last page's granule position is the stream's total frame count, which
+// trims the encoder's padding off the tail.
+#[cfg(feature = "audio")]
+pub fn decode_ogg(data: &[u8]) -> Option<Sound> {
+    let mut ident_maybe = None;
+    let mut setup_maybe = None;
+    let mut serial_maybe = None;
+    let mut pwr      = lewton::audio::PreviousWindowRight::new();
+    let mut frames   = Vec::new();
+    let mut packet   = Vec::new();
+    let mut packet_i = 0usize;
+    let mut granule  = -1i64;
+
+    let mut o = 0usize;
+    while o < data.len() {
+        let hdr = data.get(o .. o + 27)?;
+        if &hdr[0..4] != b"OggS" { return None; }
+        let page_granule = i64::from_le_bytes(hdr[6..14].try_into().unwrap());
+        let page_serial  = u32::from_le_bytes(hdr[14..18].try_into().unwrap());
+        let segs_n       = hdr[26] as usize;
+        let laces        = data.get(o + 27 .. o + 27 + segs_n)?;
+
+        let mut p = o + 27 + segs_n;
+        if *serial_maybe.get_or_insert(page_serial) != page_serial {
+            for &lace in laces { p += lace as usize; } // Some other multiplexed stream; not ours
+            o = p;
+            continue;
+        }
+        if page_granule != -1 { granule = page_granule; }
+
+        for &lace in laces {
+            let seg = data.get(p .. p + lace as usize)?;
+            p += lace as usize;
+            packet.extend_from_slice(seg);
+            if lace == 255 { continue; } // Packet continues, possibly into the next page
+
+            match packet_i {
+                0 => ident_maybe = Some(lewton::header::read_header_ident(&packet).ok()?),
+                1 => {} // The comment header must exist but nothing in it matters here
+                2 => {
+                    let ident = ident_maybe.as_ref()?;
+                    setup_maybe = Some(lewton::header::read_header_setup(&packet, ident.audio_channels, (ident.blocksize_0, ident.blocksize_1)).ok()?);
+                }
+                _ => {
+                    let ident = ident_maybe.as_ref()?;
+                    let setup = setup_maybe.as_ref()?;
+                    let pcm = lewton::audio::read_audio_packet(ident, setup, &packet, &mut pwr).ok()?;
+                    if !pcm.is_empty() {
+                        let l = &pcm[0];
+                        let r = &pcm[usize::min(1, pcm.len() - 1)];
+                        for i in 0..l.len() { frames.push([l[i] as f32 / 32768.0, r[i] as f32 / 32768.0]); }
+                    }
+                }
+            }
+            packet.clear();
+            packet_i += 1;
+        }
+        o = p;
+    }
+
+    let ident = ident_maybe?;
+    if granule >= 0 { frames.truncate(granule as usize); }
+    if frames.is_empty() { return None; }
+    Some(Sound { rate: ident.audio_sample_rate, frames })
+}
+
 // Interleaved f32 out at whatever channel count the device wants; sounds are stereo, extra channels get 0
 fn mix_into(audio: &mut AudioState, buf: &mut [f32], ch_n: usize) {
     for s in buf.iter_mut() { *s = 0.0; }
