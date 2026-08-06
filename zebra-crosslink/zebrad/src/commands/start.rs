@@ -651,72 +651,23 @@ impl StartCmd {
         let old_databases_task_handle_fused = (&mut old_databases_task_handle).fuse();
         pin!(old_databases_task_handle_fused);
 
-        let mut zaino_enabled = true;
-
-        #[cfg(not(feature = "viz_gui"))]
+        // Handmade lightwalletd gRPC server, served straight from the read state
+        // service and mempool. Takes over the port zaino used to serve; the
+        // wallet connects to it unchanged.
         {
-            if config.crosslink.disable_zaino {
-                zaino_enabled = false;
-            }
-        }
-
-        if zaino_enabled
-        {
-            use std::path::PathBuf;
             let zebra_port_base = config.network.listen_addr.port();
-            let mut zaino_db_path = config.state.cache_dir.clone();
-            zaino_db_path.push(PathBuf::from("zaino"));
-            // std::fs::remove_dir_all(&zaino_db_path);
-
-
-            let zaino_config = zainodlib::config::ZainodConfig {
-                backend: zaino_state::BackendType::Fetch,
-                json_server_settings: Some(zaino_serve::server::config::JsonRpcServerConfig {
-                    json_rpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), zebra_port_base + 10000),
-                    cookie_dir: None,
-                }),
-                grpc_settings: zaino_serve::server::config::GrpcServerConfig {
-                    listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), zebra_port_base + 10001),
-                    tls: None,
-                },
-                validator_settings: zaino_common::ValidatorConfig {
-                    validator_grpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), zebra_port_base-1),
-                    validator_jsonrpc_listen_address: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), zebra_port_base-1),
-                    validator_cookie_path: None,
-                    validator_user: Some("xxxxxx".to_owned()),
-                    validator_password: Some("xxxxxx".to_owned()),
-                },
-                service: zaino_common::ServiceConfig {
-                    timeout: 30,
-                    channel_size: 32,
-                },
-                storage: zaino_common::StorageConfig {
-                    cache: zaino_common::CacheConfig {
-                        capacity: 10000,
-                        shard_power: 4,
-                    },
-                    database: zaino_common::DatabaseConfig {
-                        path: zaino_db_path,
-                        size: zaino_common::DatabaseSize::Gb(4),
-                    },
-                },
-                zebra_db_path: std::path::PathBuf::from(&config.state.cache_dir),
-                network: zaino_common::Network::Regtest(zaino_common::ActivationHeights {
-                    before_overwinter: Some(1),
-                    overwinter: Some(1),
-                    sapling: Some(1),
-                    blossom: Some(1),
-                    heartwood: Some(1),
-                    canopy: Some(1),
-                    nu5: Some(1),
-                    nu6: Some(1),
-                    nu6_1: None,
-                    nu7: None,
-                }),
+            let lwd_port = zebra_port_base + 10001;
+            let lwd_ctx = crate::lightwalletd::Ctx {
+                rt: tokio::runtime::Handle::current(),
+                read_state: read_only_state_service.clone(),
+                mempool: mempool.clone(),
+                tfl: tfl_service.clone(),
+                tip: latest_chain_tip.clone(),
+                mempool_events: mempool_transaction_subscriber.clone(),
+                network: config.network.network.clone(),
             };
-            *zebra_crosslink::wallet::wallet_main_zaino_port.lock().unwrap() = zebra_port_base + 10001;
-
-            zainodlib::indexer::spawn_indexer(zaino_config).await.unwrap();
+            crate::lightwalletd::lightwalletd_spawn(lwd_ctx, lwd_port, zebra_port_base + 10000);
+            *zebra_crosslink::wallet::wallet_main_zaino_port.lock().unwrap() = lwd_port;
         }
 
         // Wait for tasks to finish

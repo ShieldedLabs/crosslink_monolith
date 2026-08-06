@@ -13,7 +13,7 @@ const DUMP_TREES:     bool = false;
 const DUMP_TX_BUILD:  bool = false;
 const DUMP_TX_RECV:   bool = false;
 const DUMP_TX_SEND:   bool = false;
-const AUDIT_TXS:      bool = true;
+const AUDIT_TXS:      bool = false;
 
 // const PUSH_GUI_NOTES: bool = true;
 
@@ -3339,7 +3339,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     // NOTE: current model is to reorg this many blocks back
     // ALT: have checkpoints every 16/32 blocks and always sync from the start of one of these
-    const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u64 = 64;
+    const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u64 = 4096;
     let mut time_since_last_transparent_shielded = std::time::Instant::now() - std::time::Duration::from_secs(1000);
 
     let mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly = Vec::<TxId>::new();
@@ -3359,7 +3359,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut orchard_tree = OrchardShardTree::new(shardtree::store::memory::MemoryShardStore::empty(), CHECKPOINTS_N);
     orchard_tree.checkpoint(BlockHeight(0)).unwrap();
 
-    const MAX_TXS_TO_DOWNLOAD_AT_TIME: u64 = 64;
+    const MAX_TXS_TO_DOWNLOAD_AT_TIME: u64 = 2048;
     // TODO: this is bad and should be replaced
     let mut in_flight_tx_requests = HashSet::<TxId>::new();
     let mut in_flight_tx_join_set = tokio::task::JoinSet::new();

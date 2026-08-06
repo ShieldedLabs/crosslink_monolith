@@ -148,6 +148,7 @@ pub mod application;
 pub mod commands;
 pub mod components;
 pub mod config;
+pub mod lightwalletd;
 pub mod prelude;
 
 #[cfg(feature = "sentry")]
