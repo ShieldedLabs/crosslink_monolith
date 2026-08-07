@@ -37,6 +37,7 @@ pub async fn service_viz_requests(
     let call = tfl_handle.clone().call;
 
     let mut bc_ack_height = 0;
+    let mut instr_strings: Vec<String> = Vec::new();
 
     loop {
         let request_queue = visualizer_zcash::REQUESTS_TO_ZEBRA.lock().unwrap();
@@ -172,6 +173,25 @@ pub async fn service_viz_requests(
                 if let Ok(request) = request_queue.try_recv() {
                     crate::BFT_PAUSE.store(request.bft_pause, std::sync::atomic::Ordering::Relaxed);
 
+                    if !request.load_instrs_path.is_empty() {
+                        match test_format::TF::read_from_file(std::path::Path::new(&request.load_instrs_path)) {
+                            Ok((bytes, tf)) => {
+                                instr_strings = tf.instrs.iter()
+                                    .map(|instr| test_format::TFInstr::string_from_instr(&bytes, instr))
+                                    .collect();
+                                *TEST_INSTR_C.lock().unwrap() = 0;
+                                TEST_FAILED_INSTR_IDXS.lock().unwrap().clear();
+                                let handle = tfl_handle.clone();
+                                tokio::task::spawn(async move {
+                                    test_format::read_instrs(handle, &bytes, &tf.instrs).await;
+                                });
+                            }
+                            Err(err) => {
+                                instr_strings = vec![format!("Failed to load {}: {}", request.load_instrs_path, err)];
+                            }
+                        }
+                    }
+
                     let mut internal = tfl_handle.internal.lock().await;
                     let mut response = visualizer_zcash::ResponseFromZebra::_0();
                     response.bft_recency = internal.recency_status.clone(); // TODO: do we want a better way of communicating singleton data
@@ -201,6 +221,9 @@ pub async fn service_viz_requests(
                     response.pos_tip_signers = internal.fat_pointer_to_tip.signatures.iter()
                         .map(|sig| Hash32::from_bytes(sig.pub_key.0))
                         .collect();
+                    response.instr_strings = instr_strings.clone();
+                    response.instr_done_n = *TEST_INSTR_C.lock().unwrap();
+                    response.instr_failed = TEST_FAILED_INSTR_IDXS.lock().unwrap().clone();
 
                     response.orchard_pool_balance = orchard_pool_balance;
                     response.staking_bonded_pool_balance = staking_bonded_pool_balance;

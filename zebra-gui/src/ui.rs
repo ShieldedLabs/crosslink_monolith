@@ -4334,6 +4334,59 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 }
                             }
 
+                            if let _ = elem().decl(group_decl) {
+                                ui.text("Test Format", hdr_text_decl);
+
+                                let path_tb_id = ui::id("Test Format Path Textbox");
+                                let path_str = ui.textbox(
+                                    data,
+                                    path_tb_id,
+                                    "blocks.zeccltf",
+                                    TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
+                                );
+                                let path = if path_str.trim().is_empty() { "blocks.zeccltf".to_string() } else { path_str.trim().to_string() };
+
+                                {
+                                    let label = "Load into zebra";
+                                    let load_id = id(label);
+                                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, load_id, true, winit::window::CursorIcon::Default);
+                                    let radius = ui.scale(16.0);
+                                    if ui.hovered(load_id) { ui.capture = true; }
+                                    if let _ = elem().decl(Decl {
+                                        id: load_id,
+                                        colour,
+                                        radius: radius.dup4(),
+                                        align: Center,
+                                        width:  fit!(ui.scale(160.0)),
+                                        height: fit!(radius * 2.0),
+                                        ..Decl
+                                    }) {
+                                        ui.text(label, TextDecl { h: ui.scale(14.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
+                                    }
+                                    if clicked {
+                                        viz.load_instrs_path_pending = path;
+                                    }
+                                }
+
+                                if viz.instr_strings.len() > 0 {
+                                    ui.text(frame_strf!(data, "{}/{} done, {} failed",
+                                        viz.instr_done_n.min(viz.instr_strings.len()), viz.instr_strings.len(), viz.instr_failed.len()), hdr_text_decl);
+                                    let done_colour   = (100u8, 220u8, 120u8, 255u8);
+                                    let failed_colour = (235u8,  90u8,  90u8, 255u8);
+                                    let todo_colour   = WHITE.mul(0.5);
+                                    let first = viz.instr_done_n.saturating_sub(12).min(viz.instr_strings.len().saturating_sub(16));
+                                    for (i, instr_str) in viz.instr_strings.iter().enumerate().skip(first).take(16) {
+                                        let colour = if viz.instr_failed.iter().any(|(failed_i, _)| *failed_i == i) { failed_colour }
+                                                     else if i < viz.instr_done_n { done_colour }
+                                                     else { todo_colour };
+                                        ui.text(frame_strf!(data, "{}", instr_str), TextDecl { font: Mono, h: ui.scale(13.0), colour, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+                                    }
+                                    for (_, failed_msg) in viz.instr_failed.iter().take(4) {
+                                        ui.text(frame_strf!(data, "{}", failed_msg), TextDecl { font: Mono, h: ui.scale(13.0), colour: failed_colour, wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+                                    }
+                                }
+                            }
+
                             let decl = TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl };
                             if ui.viz_op != InteractiveVizOp::None {
                                 ui.text(frame_strf!(data, "Visualizing op: {:?}", ui.viz_op), decl);

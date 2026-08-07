@@ -18,6 +18,8 @@ pub struct RequestToZebra {
     pub bc_ack_height: u64,
     /// While set, this node proposes no new BFT blocks.
     pub bft_pause: bool,
+    /// Path of a .zeccltf test-format file for zebra to load. Empty = nothing to load.
+    pub load_instrs_path: String,
 }
 impl RequestToZebra {
     pub fn _0() -> Self {
@@ -26,6 +28,7 @@ impl RequestToZebra {
             bft_ack_height: 0,
             bc_ack_height: 0,
             bft_pause: false,
+            load_instrs_path: String::new(),
         }
     }
 }
@@ -155,6 +158,12 @@ pub struct ResponseFromZebra {
 
     /// One display line per mempool transaction: truncated txid plus any staking action.
     pub mempool_tx_strings: Vec<String>,
+    /// One display line per instruction in the last-loaded test-format file.
+    pub instr_strings: Vec<String>,
+    /// How many of those instructions have completed.
+    pub instr_done_n: usize,
+    /// (instruction index, message) for each failed test check.
+    pub instr_failed: Vec<(usize, String)>,
     /// Public keys of the finalizers whose signatures are on the fat pointer to the BFT tip.
     pub pos_tip_signers: Vec<Hash32>,
 
@@ -181,6 +190,9 @@ impl ResponseFromZebra {
             staking_unbonded_pool_balance: 0,
             peer_strings: Vec::new(),
             mempool_tx_strings: Vec::new(),
+            instr_strings: Vec::new(),
+            instr_done_n: 0,
+            instr_failed: Vec::new(),
             pos_tip_signers: Vec::new(),
             bft_recency: wallet::TFLRecencyStatus::default(),
             blacklisted_finalizers: Vec::new(),
@@ -349,6 +361,11 @@ pub struct VizState {
     /// channel back-pressures harmlessly while set.
     pub pause_incoming: bool,
     pub bft_paused: bool,
+    /// Path the user asked zebra to load a test-format file from; sent once, then cleared.
+    pub load_instrs_path_pending: String,
+    pub instr_strings: Vec<String>,
+    pub instr_done_n: usize,
+    pub instr_failed: Vec<(usize, String)>,
     pub on_screen_bcs: HashMap<Hash32, OnScreenBc>,
     pub on_screen_bfts: HashMap<Hash32, OnScreenBft>,
     pub send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
@@ -599,6 +616,10 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         follow_tip: false,
         pause_incoming: false,
         bft_paused: false,
+        load_instrs_path_pending: String::new(),
+        instr_strings: Vec::new(),
+        instr_done_n: 0,
+        instr_failed: Vec::new(),
         on_screen_bcs: HashMap::new(),
         on_screen_bfts: HashMap::new(),
         send_to_zebra: me_send,
@@ -748,6 +769,13 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         anything_happened |= viz_state.pos_tip_signers != message.pos_tip_signers;
         viz_state.pos_tip_signers = message.pos_tip_signers;
 
+        anything_happened |= viz_state.instr_strings != message.instr_strings;
+        viz_state.instr_strings = message.instr_strings;
+        anything_happened |= viz_state.instr_done_n != message.instr_done_n;
+        viz_state.instr_done_n = message.instr_done_n;
+        anything_happened |= viz_state.instr_failed != message.instr_failed;
+        viz_state.instr_failed = message.instr_failed;
+
         viz_state.orchard_pool_balance = message.orchard_pool_balance;
         viz_state.staking_bonded_pool_balance = message.staking_bonded_pool_balance;
         viz_state.staking_unbonded_pool_balance = message.staking_unbonded_pool_balance;
@@ -831,12 +859,14 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
     }
 
     if anything_happened == false {
-        let _ = viz_state.send_to_zebra.try_send(RequestToZebra {
+        let sent = viz_state.send_to_zebra.try_send(RequestToZebra {
             want_to_inspect_block: viz_state.inspecting_block_hash,
             bft_ack_height: viz_state.bft_ack_height,
             bc_ack_height: viz_state.bc_ack_height,
             bft_pause: viz_state.bft_paused,
+            load_instrs_path: viz_state.load_instrs_path_pending.clone(),
         });
+        if sent.is_ok() { viz_state.load_instrs_path_pending = String::new(); }
     }
 
     // animations
