@@ -147,6 +147,11 @@ pub struct ResponseFromZebra {
 
     pub peer_strings: Vec<String>,
 
+    /// One display line per mempool transaction: truncated txid plus any staking action.
+    pub mempool_tx_strings: Vec<String>,
+    /// Public keys of the finalizers whose signatures are on the fat pointer to the BFT tip.
+    pub pos_tip_signers: Vec<Hash32>,
+
     pub bft_recency: wallet::TFLRecencyStatus,
 
     /// 32-byte ids of finalizers terminated by a user-led hardfork (the rolling
@@ -169,6 +174,8 @@ impl ResponseFromZebra {
             staking_bonded_pool_balance: 0,
             staking_unbonded_pool_balance: 0,
             peer_strings: Vec::new(),
+            mempool_tx_strings: Vec::new(),
+            pos_tip_signers: Vec::new(),
             bft_recency: wallet::TFLRecencyStatus::default(),
             blacklisted_finalizers: Vec::new(),
         }
@@ -373,6 +380,8 @@ pub struct VizState {
     pub staking_unbonded_pool_balance: i64,
 
     pub peer_strings: Vec<String>,
+    pub mempool_tx_strings: Vec<String>,
+    pub pos_tip_signers: Vec<Hash32>,
 }
 
 impl VizState {
@@ -614,6 +623,8 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         staking_bonded_pool_balance: 0,
         staking_unbonded_pool_balance: 0,
         peer_strings: Vec::new(),
+        mempool_tx_strings: Vec::new(),
+        pos_tip_signers: Vec::new(),
     };
 
     if fake_data {
@@ -722,6 +733,12 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         viz_state.bc_finalized_tip_height = message.bc_finalized_tip_height;
 
         viz_state.peer_strings = message.peer_strings;
+
+        anything_happened |= viz_state.mempool_tx_strings != message.mempool_tx_strings;
+        viz_state.mempool_tx_strings = message.mempool_tx_strings;
+
+        anything_happened |= viz_state.pos_tip_signers != message.pos_tip_signers;
+        viz_state.pos_tip_signers = message.pos_tip_signers;
 
         viz_state.orchard_pool_balance = message.orchard_pool_balance;
         viz_state.staking_bonded_pool_balance = message.staking_bonded_pool_balance;

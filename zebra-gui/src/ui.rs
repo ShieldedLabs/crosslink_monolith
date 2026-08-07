@@ -3586,6 +3586,30 @@ pub fn ui_right_pane(ui: &mut Context,
 
         finalizer_ratio_bar(ui, data, bft_status, &bar_roster, total_stake, height, seconds_since_connected, &filters, ui::id("Right Pane Ratio Bar 2"), true);
 
+        // Who actually signed the fat pointer to the BFT tip. Chips share colours with
+        // the roster below and light up when the matching roster member is hovered.
+        if viz.pos_tip_signers.len() > 0 {
+            let sig_row_id = id("PoS Tip Signatures");
+            if let _ = elem().decl(Decl {
+                id: sig_row_id,
+                child_gap: ui.scale(4.0),
+                align: Left,
+                width: percent!(1.0),
+                height: fit!(),
+                ..Decl
+            }) {
+                let n = viz.pos_tip_signers.len();
+                ui.text(frame_strf!(data, "{} sig{} for PoS tip", n, if n == 1 { "" } else { "s" }), TextDecl { h: ui.scale(14.0), colour: WHITE.mul(0.7), wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+                for signer in viz.pos_tip_signers.iter().take(32) {
+                    let pk = signer.as_bytes();
+                    ui_colour_chip(ui, ui.scale(16.0), colour_from_hash(&pk, true), data.hovered_finalizer_pk == pk, "", WHITE);
+                }
+            }
+            if ui.hovered(sig_row_id) {
+                set_tooltip_text!(data, "Finalizers whose signatures are on the fat pointer to the current BFT tip.");
+            }
+        }
+
         let (id, mut clip, mut scroll, content_h, viewport_h, max) = ui.scroll_container(data, id("Finalizer Scroll Container"), 48.0);
         if roster.len() == 0 {
             clip = ClipMode::None;
@@ -4280,6 +4304,17 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 row(ui, data, "Orchard", &format!("{}", viz.orchard_pool_balance));
                                 row(ui, data, "Staking Bonded", &format!("{}", viz.staking_bonded_pool_balance));
                                 row(ui, data, "Staking Unbonded", &format!("{}", viz.staking_unbonded_pool_balance));
+                            }
+
+                            if let _ = elem().decl(group_decl) {
+                                ui.text(frame_strf!(data, "Mempool ({})", viz.mempool_tx_strings.len()), hdr_text_decl);
+                                let mono_text_decl = TextDecl { font: Mono, h: ui.scale(13.0), colour: WHITE.mul(0.85), wrap: Wrap::None, align: AlignX::Left, ..TextDecl };
+                                for tx_str in viz.mempool_tx_strings.iter().take(16) {
+                                    ui.text(frame_strf!(data, "{}", tx_str), mono_text_decl);
+                                }
+                                if viz.mempool_tx_strings.len() > 16 {
+                                    ui.text(frame_strf!(data, "... and {} more", viz.mempool_tx_strings.len() - 16), hdr_text_decl);
+                                }
                             }
 
                             {

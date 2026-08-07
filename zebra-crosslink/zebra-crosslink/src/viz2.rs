@@ -63,6 +63,22 @@ pub async fn service_viz_requests(
             };
             let bc_tip_height: u64 = tip_height_hash.0.0 as u64;
 
+            let mempool_tx_strings: Vec<String> = if let Ok(MempoolResponse::FullTransactions { transactions, .. }) =
+                (call.mempool)(MempoolRequest::FullTransactions).await
+            {
+                transactions.iter().map(|tx| {
+                    use zebra_chain::transaction::Transaction;
+                    let txid = tx.transaction.transaction.hash().to_string();
+                    let mut s = format!("{}..{}", &txid[..8], &txid[txid.len() - 8..]);
+                    if let Transaction::VCrosslink { staking_action: Some(sa), .. } = tx.transaction.transaction.as_ref() {
+                        s.push_str(&format!(" {sa}"));
+                    }
+                    s
+                }).collect()
+            } else {
+                Vec::new()
+            };
+
             let bc_req_h = (bc_ack_height, -1);
 
             #[allow(clippy::never_loop)]
@@ -179,6 +195,10 @@ pub async fn service_viz_requests(
                     };
                     response.bft_tip_height = (internal.bft_blocks.len() as u64).saturating_sub(1);
                     response.peer_strings = internal.peer_strings.clone();
+                    response.mempool_tx_strings = mempool_tx_strings.clone();
+                    response.pos_tip_signers = internal.fat_pointer_to_tip.signatures.iter()
+                        .map(|sig| Hash32::from_bytes(sig.pub_key.0))
+                        .collect();
 
                     response.orchard_pool_balance = orchard_pool_balance;
                     response.staking_bonded_pool_balance = staking_bonded_pool_balance;
