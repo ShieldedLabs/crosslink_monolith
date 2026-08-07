@@ -4318,7 +4318,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 }
                             }
 
-                            {
+                            if ui.debug {
                                 let pause_id = id("Pause Incoming Blocks");
                                 ui.checkbox_pill(pause_id, &mut viz.pause_incoming, "Pause Incoming Blocks", grow!());
                                 if ui.hovered(pause_id) {
@@ -4326,7 +4326,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 }
                             }
 
-                            {
+                            if ui.debug {
                                 let bft_pause_id = id("Pause BFT Proposals");
                                 ui.checkbox_pill(bft_pause_id, &mut viz.bft_paused, "Pause BFT Proposals", grow!());
                                 if ui.hovered(bft_pause_id) {
@@ -4334,7 +4334,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 }
                             }
 
-                            if let _ = elem().decl(group_decl) {
+                            if ui.debug && let _ = elem().decl(group_decl) {
                                 ui.text("Test Format", hdr_text_decl);
 
                                 let path_tb_id = ui::id("Test Format Path Textbox");
