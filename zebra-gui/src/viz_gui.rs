@@ -1330,6 +1330,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
 
     if viz_state.follow_tip {
         viz_state.camera_y = e_lerp(viz_state.camera_y, viz_state.bc_tip_y, dt);
+        viz_state.camera_x = e_lerp(viz_state.camera_x, 0.0, dt);
     }
 
     if ui.mouse_pressed_id == ui::Id::VIZ_GUI && input_ctx.mouse_held(MouseButton::Left) {
