@@ -50,6 +50,9 @@ pub struct PowBlockInspection {
     pub time: i64,
     pub fat_pointer: String,
     pub transactions: Vec<TxInspection>,
+    /// Canonical zcash serialization of the whole block, hex-encoded, for feeding
+    /// the block to other tools from the inspector's copy button.
+    pub serialized_hex: String,
 }
 
 #[derive(Clone, Debug)]

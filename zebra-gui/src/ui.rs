@@ -4637,6 +4637,26 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                         ui.input().send_to_clipboard(&data_str);
                                     }
                                 }
+                                if let Some(BlockInspection::Pow(pow)) = viz.block_inspection.as_ref() && pow.serialized_hex.len() > 0 {
+                                    let copy_id = id("Block Inspector Copy Hex");
+                                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, copy_id, true, winit::window::CursorIcon::Default);
+                                    let radius = ui.scale(14.0);
+                                    if let _ = elem().decl(Decl {
+                                        id: copy_id,
+                                        colour,
+                                        padding,
+                                        radius: radius.dup4(),
+                                        align: Center,
+                                        width:  fit!(),
+                                        height: fit!(radius * 2.0),
+                                        ..Decl
+                                    }) {
+                                        ui.text("Copy block hex", TextDecl { h: ui.scale(13.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
+                                    }
+                                    if clicked {
+                                        ui.input().send_to_clipboard(&pow.serialized_hex);
+                                    }
+                                }
                             }
 
                             let _ = elem().decl(Decl {

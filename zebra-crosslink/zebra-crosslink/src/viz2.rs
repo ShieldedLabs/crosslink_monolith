@@ -226,6 +226,11 @@ pub async fn service_viz_requests(
                                     _ => None,
                                 },
                             }).collect(),
+                            serialized_hex: {
+                                let mut bytes = Vec::new();
+                                let _ = block.zcash_serialize(&mut bytes);
+                                bytes.iter().map(|b| format!("{b:02x}")).collect()
+                            },
                         })
                     };
 
