@@ -2951,6 +2951,7 @@ pub fn ui_left_pane(ui: &mut Context,
                                 viz.camera_x = cx;
                                 viz.camera_y = cy;
                                 viz.zoom = 2.0;
+                                viz.follow_tip = false;
                             }
                         }
 
