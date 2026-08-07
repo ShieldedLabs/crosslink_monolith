@@ -1497,6 +1497,36 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
 
     let viz_blocks = apply_viz_op(viz_state, hovered_block, ui.viz_op);
 
+    // While a block is hovered, everything except its relatives (ancestors,
+    // descendants, cross-chain links) fades out.
+    let no_hash = Hash32::from_u64(0);
+    let mut hover_related = std::collections::HashSet::<Hash32>::new();
+    if hovered_block != no_hash {
+        let mut bc_children  = HashMap::<Hash32, Vec<Hash32>>::new();
+        let mut bft_children = HashMap::<Hash32, Vec<Hash32>>::new();
+        for bc  in viz_state.on_screen_bcs.values()  { bc_children .entry(bc .block.parent_hash).or_default().push(bc .block.this_hash); }
+        for bft in viz_state.on_screen_bfts.values() { bft_children.entry(bft.block.parent_hash).or_default().push(bft.block.this_hash); }
+
+        hover_related.insert(hovered_block);
+
+        let mut walk = hovered_block;
+        while let Some(bc)  = viz_state.on_screen_bcs.get(&walk)  { walk = bc .block.parent_hash; hover_related.insert(walk); }
+        let mut walk = hovered_block;
+        while let Some(bft) = viz_state.on_screen_bfts.get(&walk) { walk = bft.block.parent_hash; hover_related.insert(walk); }
+
+        let mut stack = vec![hovered_block];
+        while let Some(hash) = stack.pop() {
+            for children in [bc_children.get(&hash), bft_children.get(&hash)] {
+                if let Some(children) = children {
+                    for child in children { if hover_related.insert(*child) { stack.push(*child); } }
+                }
+            }
+        }
+
+        if let Some(bc)  = viz_state.on_screen_bcs.get(&hovered_block)  { hover_related.insert(bc.block.points_at_bft_block); }
+        if let Some(bft) = viz_state.on_screen_bfts.get(&hovered_block) { hover_related.insert(bft.block.points_at_bc_block); }
+    }
+
     for on_screen_bc in magic(&mut viz_state.on_screen_bcs).values_mut() {
         if on_screen_bc.block.this_hash == hovered_block || viz_blocks.contains(&on_screen_bc.block.this_hash) {
             on_screen_bc.t_roundness = 0.3;
@@ -1521,6 +1551,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             on_screen_bc.t_bft_arrow_alpha = if on_screen_bc.block.is_best_chain { 1.0 } else { 0.1 };
         }
         if on_screen_bc.block.this_hash == viz_state.inspecting_block_hash { on_screen_bc.t_darkness += 0.2; }
+        on_screen_bc.t_alpha = if hovered_block == no_hash || hover_related.contains(&on_screen_bc.block.this_hash) { 1.0 } else { 0.5 };
         on_screen_bc.t_finalized_alpha = if on_screen_bc.block.is_finalized { 1.0 } else { 0.0 };
         on_screen_bc.t_implicated_by_bft_alpha = if on_screen_bc.block.is_implicated_by_bft { 1.0 } else { 0.0 };
         on_screen_bc.t_x = -5.0;
@@ -1530,7 +1561,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             viz_state.bc_tip_y = on_screen_bc.t_y;
         }
 
-        if !on_screen_bc.block.is_best_chain {
+        if !on_screen_bc.block.is_best_chain && !hover_related.contains(&on_screen_bc.block.this_hash) {
             on_screen_bc.alpha = 0.25;
         }
     }
@@ -1555,6 +1586,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             on_screen_bft.t_darkness = 0.0;
         }
         if on_screen_bft.block.this_hash == viz_state.inspecting_block_hash { on_screen_bft.t_darkness += 0.2; }
+        on_screen_bft.t_alpha = if hovered_block == no_hash || hover_related.contains(&on_screen_bft.block.this_hash) { 1.0 } else { 0.5 };
         on_screen_bft.t_x = 5.0;
         on_screen_bft.t_y = if let Some(on_screen_bc) = viz_state.on_screen_bcs.get(&on_screen_bft.block.points_at_bc_block) {
             on_screen_bc.y - 10.0 / 2.0
