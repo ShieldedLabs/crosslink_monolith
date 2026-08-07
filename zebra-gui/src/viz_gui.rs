@@ -329,6 +329,12 @@ pub struct VizState {
     pub camera_x: f32,
     pub camera_y: f32,
     pub zoom: f32,
+    /// Camera eases toward the PoW tip every frame. Any manual camera movement
+    /// (pan, world scroll, minimap scrub, jump, click-to-recenter) switches it off.
+    pub follow_tip: bool,
+    /// Freeze ingestion from zebra so a moving chain can be inspected. The sync
+    /// channel back-pressures harmlessly while set.
+    pub pause_incoming: bool,
     pub on_screen_bcs: HashMap<Hash32, OnScreenBc>,
     pub on_screen_bfts: HashMap<Hash32, OnScreenBft>,
     pub send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
@@ -393,6 +399,7 @@ impl VizState {
     }
 
     pub fn goto_pow_height(&mut self, h: u64) {
+        self.follow_tip = false;
         self.camera_y = -10.0 * h as f32;
         self.zoom = 2.0;
     }
@@ -409,6 +416,7 @@ impl VizState {
             return false;
         };
         // self.camera_x = 5.0;
+        self.follow_tip = false;
         self.camera_y = cy;
         true
     }
@@ -572,6 +580,8 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         camera_x: 0.0,
         camera_y: 0.0,
         zoom: 0.0,
+        follow_tip: false,
+        pause_incoming: false,
         on_screen_bcs: HashMap::new(),
         on_screen_bfts: HashMap::new(),
         send_to_zebra: me_send,
@@ -680,7 +690,20 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         viz_state.time_since_last_animation = Instant::now();
     }
 
+    let mut new_blocks_n = 0usize;
     while let Ok(message) = viz_state.receive_from_zebra.try_recv() {
+        if viz_state.pause_incoming {
+            // Block ingestion frozen; only serve inspection so clicked blocks still resolve.
+            if message.what_block_it_is == viz_state.inspecting_block_hash
+                && message.what_block_it_is != Hash32::from_u64(0)
+            {
+                anything_happened = true;
+                viz_state.should_reset_clay_text_cache = true;
+                viz_state.block_inspection = Some(message.block_inspection);
+            }
+            continue;
+        }
+
         anything_happened |= viz_state.bc_tip_height != message.bc_tip_height;
         viz_state.bc_tip_height = message.bc_tip_height;
 
@@ -729,6 +752,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                 r.block.is_implicated_by_bft = was_implicated;
             } else {
                 anything_happened |= true;
+                new_blocks_n += 1;
                 viz_state.on_screen_bcs.insert(bc.this_hash, OnScreenBc { y: spawn_y, block: *bc, alpha: 0.0, ..Default::default() });
             }
         }
@@ -770,9 +794,15 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
             } else {
                 if missing == false { viz_state.bft_ack_height = viz_state.bft_ack_height.max(bft.this_height); }
                 anything_happened |= true;
+                new_blocks_n += 1;
                 viz_state.on_screen_bfts.insert(bft.this_hash, OnScreenBft { block: bft, alpha: 0.0, y: spawn_y, ..Default::default() });
             }
         }
+    }
+
+    // Once per drain, pitched-up hover blip. Large batches are sync catch-up, not news.
+    if new_blocks_n >= 1 && new_blocks_n < 8 {
+        play_sound(SOUND_UI_HOVER, 0.4, 1.6);
     }
 
     if anything_happened == false {
@@ -785,6 +815,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
 
     // animations
     const MARGIN : f32 = 0.001;
+    anything_happened |= viz_state.follow_tip && (viz_state.camera_y - viz_state.bc_tip_y).abs() > MARGIN;
     for on_screen_bc in viz_state.on_screen_bcs.values() {
         anything_happened |= (on_screen_bc.t_x - on_screen_bc.x).abs() > MARGIN;
         anything_happened |= (on_screen_bc.t_y - on_screen_bc.y).abs() > MARGIN;
@@ -955,6 +986,7 @@ fn apply_scrub_bft_height(viz: &mut VizState, mut h: u64) {
 
 fn apply_scrub_pow_height(viz: &mut VizState, h: f32, h_min: u64, h_max: u64) {
     let h_next = h.clamp(h_min as f32, h_max as f32);
+    viz.follow_tip = false;
     viz.camera_y = -10.0 * h_next;
     // viz.camera_x = 0.0;
 }
@@ -1263,7 +1295,14 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     let screen_unit = SCREEN_UNIT_CONST * zoom;
     let very_zoom_out = screen_unit < 0.16;
 
+    if viz_state.follow_tip {
+        viz_state.camera_y = e_lerp(viz_state.camera_y, viz_state.bc_tip_y, dt);
+    }
+
     if ui.mouse_pressed_id == ui::Id::VIZ_GUI && input_ctx.mouse_held(MouseButton::Left) {
+        if input_ctx.mouse_delta() != (0, 0) {
+            viz_state.follow_tip = false;
+        }
         viz_state.camera_x -= input_ctx.mouse_delta().0 as f32 / screen_unit;
         viz_state.camera_y -= input_ctx.mouse_delta().1 as f32 / screen_unit;
     }
@@ -1299,6 +1338,9 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
 
     viz_state.camera_x -= input_ctx.scroll_delta.0 as f32 / screen_unit;
     if !inside_any_minimap || !minimap_wheel_scrubbed {
+        if input_ctx.scroll_delta.1 != 0.0 {
+            viz_state.follow_tip = false;
+        }
         viz_state.camera_y -= input_ctx.scroll_delta.1 as f32 / screen_unit;
     }
 
@@ -1438,6 +1480,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 on_screen_bc.alpha = 0.0;
             }
             if input_ctx.mouse_pressed(MouseButton::Left) && !minimap_scrub_this_frame {
+                viz_state.follow_tip = false;
                 viz_state.camera_x = on_screen_bc.t_x;
                 viz_state.camera_y = on_screen_bc.t_y;
                 viz_state.zoom = 2.0;
@@ -1475,6 +1518,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             }
             // same deal as PoW branch above, bft click to recenter should not piggyback on minimap press
             if input_ctx.mouse_pressed(MouseButton::Left) && !minimap_scrub_this_frame {
+                viz_state.follow_tip = false;
                 viz_state.camera_x = on_screen_bft.t_x;
                 viz_state.camera_y = on_screen_bft.t_y;
                 viz_state.zoom = 2.0;

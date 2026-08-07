@@ -4282,6 +4282,14 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 row(ui, data, "Staking Unbonded", &format!("{}", viz.staking_unbonded_pool_balance));
                             }
 
+                            {
+                                let pause_id = id("Pause Incoming Blocks");
+                                ui.checkbox_pill(pause_id, &mut viz.pause_incoming, "Pause Incoming Blocks", grow!());
+                                if ui.hovered(pause_id) {
+                                    set_tooltip_text!(data, "Freeze the chain display so it can be inspected while the node keeps syncing.");
+                                }
+                            }
+
                             let decl = TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl };
                             if ui.viz_op != InteractiveVizOp::None {
                                 ui.text(frame_strf!(data, "Visualizing op: {:?}", ui.viz_op), decl);
@@ -4300,7 +4308,13 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             if let _ = elem().decl(Decl { height: grow!(), ..Decl }) {}
 
             // "Reset View" button
-            if let _ = elem().decl(Decl { align: Bottom, width: grow!(), ..Decl }) {
+            if let _ = elem().decl(Decl { align: Bottom, width: grow!(), child_gap, ..Decl }) {
+                {
+                    let follow_id = id("Follow Tip");
+                    if ui.hovered(follow_id) { ui.capture = true; }
+                    ui.checkbox_pill(follow_id, &mut viz.follow_tip, "Follow Tip", fit!());
+                }
+
                 let label = "Reset View";
 
                 let enabled = viz.camera_x != 0.0 || viz.camera_y != viz.bc_tip_y || viz.zoom != 0.0;
