@@ -192,6 +192,59 @@ pub async fn service_viz_requests(
                         }
                     }
 
+                    if !request.serialize_instrs_path.is_empty() {
+                        let handle = tfl_handle.clone();
+                        let ser_call = call.clone();
+                        let path_string = request.serialize_instrs_path.clone();
+                        tokio::task::spawn(async move {
+                            let Ok(StateResponse::Tip(Some(tip))) = (ser_call.state)(StateRequest::Tip).await else { return; };
+                            let Ok(StateResponse::BlockHeader { hash: lo_hash, .. }) =
+                                (ser_call.state)(StateRequest::BlockHeader(ZebBlockHeight(1).into())).await else { return; };
+                            let (_, blocks) = tfl_block_sequence(&ser_call, lo_hash, Some(tip), true, true).await;
+
+                            let (bft_blocks, fat_pointer_to_tip) = {
+                                let internal = handle.internal.lock().await;
+                                (internal.bft_blocks.clone(), internal.fat_pointer_to_tip.clone())
+                            };
+                            // The signed fat pointer to BFT block i rides in block i+1; the tip's rides alone.
+                            let fat_ptr_to = |i: usize| {
+                                if i + 1 < bft_blocks.len() { bft_blocks[i + 1].previous_block_fat_ptr.clone() }
+                                else { fat_pointer_to_tip.clone() }
+                            };
+                            let bft_hashes: Vec<_> = bft_blocks.iter().map(|b| b.blake3_hash()).collect();
+
+                            let mut tf = test_format::TF::new(params);
+                            let mut next_bft = 0usize;
+                            // Each BFT block goes just before the first PoW block that commits to it,
+                            // preserving the chronology a replay needs.
+                            for block in blocks.iter().flatten() {
+                                let target = block.header.fat_pointer_to_bft_block.points_at_block_hash();
+                                if let Some(j) = bft_hashes.iter().position(|h| *h == target) {
+                                    while next_bft <= j {
+                                        tf.push_instr_load_pos(&test_format::BftBlockAndFatPointerToItWrap(
+                                            zcash_primitives::bft::BftBlockAndFatPointerToIt {
+                                                block: bft_blocks[next_bft].clone(),
+                                                fat_ptr: fat_ptr_to(next_bft),
+                                            }), 0);
+                                        next_bft += 1;
+                                    }
+                                }
+                                tf.push_instr_load_pow(block.as_ref(), 0);
+                            }
+                            while next_bft < bft_blocks.len() {
+                                tf.push_instr_load_pos(&test_format::BftBlockAndFatPointerToItWrap(
+                                    zcash_primitives::bft::BftBlockAndFatPointerToIt {
+                                        block: bft_blocks[next_bft].clone(),
+                                        fat_ptr: fat_ptr_to(next_bft),
+                                    }), 0);
+                                next_bft += 1;
+                            }
+
+                            let ok = tf.write_to_file(std::path::Path::new(&path_string));
+                            info!("serialized {} instructions to {}: ok={}", tf.instrs.len(), path_string, ok);
+                        });
+                    }
+
                     let mut internal = tfl_handle.internal.lock().await;
                     let mut response = visualizer_zcash::ResponseFromZebra::_0();
                     response.bft_recency = internal.recency_status.clone(); // TODO: do we want a better way of communicating singleton data

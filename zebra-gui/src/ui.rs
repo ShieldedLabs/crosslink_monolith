@@ -4346,25 +4346,31 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 );
                                 let path = if path_str.trim().is_empty() { "blocks.zeccltf".to_string() } else { path_str.trim().to_string() };
 
-                                {
-                                    let label = "Load into zebra";
-                                    let load_id = id(label);
-                                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, load_id, true, winit::window::CursorIcon::Default);
+                                let tf_button = |ui: &mut Context, label: &str| -> bool {
+                                    let button_id = id(label);
+                                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, button_id, true, winit::window::CursorIcon::Default);
                                     let radius = ui.scale(16.0);
-                                    if ui.hovered(load_id) { ui.capture = true; }
+                                    if ui.hovered(button_id) { ui.capture = true; }
                                     if let _ = elem().decl(Decl {
-                                        id: load_id,
+                                        id: button_id,
                                         colour,
                                         radius: radius.dup4(),
                                         align: Center,
-                                        width:  fit!(ui.scale(160.0)),
+                                        width:  fit!(ui.scale(150.0)),
                                         height: fit!(radius * 2.0),
                                         ..Decl
                                     }) {
                                         ui.text(label, TextDecl { h: ui.scale(14.0), colour: text_colour, align: AlignX::Center, ..TextDecl });
                                     }
-                                    if clicked {
-                                        viz.load_instrs_path_pending = path;
+                                    clicked
+                                };
+
+                                if let _ = elem().decl(Decl { direction: LeftToRight, child_gap: ui.scale(8.0), width: grow!(), height: fit!(), ..Decl }) {
+                                    if tf_button(ui, "Load into zebra") {
+                                        viz.load_instrs_path_pending = path.clone();
+                                    }
+                                    if tf_button(ui, "Serialize chains") {
+                                        viz.serialize_instrs_path_pending = path.clone();
                                     }
                                 }
 

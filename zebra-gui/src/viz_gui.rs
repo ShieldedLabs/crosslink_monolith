@@ -20,6 +20,8 @@ pub struct RequestToZebra {
     pub bft_pause: bool,
     /// Path of a .zeccltf test-format file for zebra to load. Empty = nothing to load.
     pub load_instrs_path: String,
+    /// Path for zebra to serialize its current chains to as a .zeccltf. Empty = no request.
+    pub serialize_instrs_path: String,
 }
 impl RequestToZebra {
     pub fn _0() -> Self {
@@ -29,6 +31,7 @@ impl RequestToZebra {
             bc_ack_height: 0,
             bft_pause: false,
             load_instrs_path: String::new(),
+            serialize_instrs_path: String::new(),
         }
     }
 }
@@ -363,6 +366,8 @@ pub struct VizState {
     pub bft_paused: bool,
     /// Path the user asked zebra to load a test-format file from; sent once, then cleared.
     pub load_instrs_path_pending: String,
+    /// Path the user asked zebra to serialize its chains to; sent once, then cleared.
+    pub serialize_instrs_path_pending: String,
     pub instr_strings: Vec<String>,
     pub instr_done_n: usize,
     pub instr_failed: Vec<(usize, String)>,
@@ -617,6 +622,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         pause_incoming: false,
         bft_paused: false,
         load_instrs_path_pending: String::new(),
+        serialize_instrs_path_pending: String::new(),
         instr_strings: Vec::new(),
         instr_done_n: 0,
         instr_failed: Vec::new(),
@@ -865,8 +871,12 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
             bc_ack_height: viz_state.bc_ack_height,
             bft_pause: viz_state.bft_paused,
             load_instrs_path: viz_state.load_instrs_path_pending.clone(),
+            serialize_instrs_path: viz_state.serialize_instrs_path_pending.clone(),
         });
-        if sent.is_ok() { viz_state.load_instrs_path_pending = String::new(); }
+        if sent.is_ok() {
+            viz_state.load_instrs_path_pending = String::new();
+            viz_state.serialize_instrs_path_pending = String::new();
+        }
     }
 
     // animations
