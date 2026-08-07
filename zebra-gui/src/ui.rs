@@ -4385,11 +4385,41 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
             if let _ = elem().decl(Decl { height: grow!(), ..Decl }) {}
 
             // "Reset View" button
-            if let _ = elem().decl(Decl { align: Bottom, width: grow!(), child_gap, ..Decl }) {
+            if let _ = elem().decl(Decl { direction: TopToBottom, align: Bottom, width: grow!(), child_gap, ..Decl }) {
                 {
                     let follow_id = id("Follow Tip");
                     if ui.hovered(follow_id) { ui.capture = true; }
                     ui.checkbox_pill(follow_id, &mut viz.follow_tip, "Follow Tip", fit!());
+                }
+
+                {
+                    let label = "Jump To Height...";
+                    let id = id(label);
+                    let (clicked, colour, text_colour) = ui.button_ex(true, BUTTON_GREY, id, true, winit::window::CursorIcon::Default);
+                    let radius = ui.scale(20.0);
+
+                    if ui.hovered(id) {
+                        ui.capture = true;
+                    }
+
+                    if let _ = elem().decl(Decl {
+                        id,
+                        colour,
+                        padding,
+                        child_gap,
+                        radius: radius.dup4(),
+                        align: Center,
+                        width:  fit!(ui.scale(128.0)),
+                        height: fit!(radius * 2.0),
+                        ..Decl
+                    }) {
+                        let button_text_h = ui.scale(16.0);
+                        ui.text(label, TextDecl { h: button_text_h, colour: text_colour, align: AlignX::Center, ..TextDecl });
+                    }
+
+                    if clicked {
+                        ui.modal = Modal::Jump;
+                    }
                 }
 
                 let label = "Reset View";
