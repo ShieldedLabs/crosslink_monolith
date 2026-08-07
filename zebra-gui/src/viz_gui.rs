@@ -1501,6 +1501,8 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     // descendants, cross-chain links) fades out.
     let no_hash = Hash32::from_u64(0);
     let mut hover_related = std::collections::HashSet::<Hash32>::new();
+    // Hovering a BFT block also squares off every PoW block its proving headers cover.
+    let mut hover_pow_range: Vec<Hash32> = Vec::new();
     if hovered_block != no_hash {
         let mut bc_children  = HashMap::<Hash32, Vec<Hash32>>::new();
         let mut bft_children = HashMap::<Hash32, Vec<Hash32>>::new();
@@ -1524,7 +1526,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         }
 
         if let Some(bc)  = viz_state.on_screen_bcs.get(&hovered_block)  { hover_related.insert(bc.block.points_at_bft_block); }
-        if let Some(bft) = viz_state.on_screen_bfts.get(&hovered_block) { hover_related.insert(bft.block.points_at_bc_block); }
+        if let Some(bft) = viz_state.on_screen_bfts.get(&hovered_block) {
+            hover_related.insert(bft.block.points_at_bc_block);
+            hover_pow_range = bft.block.proving_blocks.clone();
+            for hash in &hover_pow_range { hover_related.insert(*hash); }
+        }
     }
 
     for on_screen_bc in magic(&mut viz_state.on_screen_bcs).values_mut() {
@@ -1544,6 +1550,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
             }
 
             on_screen_bc.t_bft_arrow_alpha = 1.0;
+        } else if hover_pow_range.contains(&on_screen_bc.block.this_hash) {
+            on_screen_bc.t_roundness = 0.3;
+            on_screen_bc.t_darkness = 0.2;
+
+            on_screen_bc.t_bft_arrow_alpha = if on_screen_bc.block.is_best_chain { 1.0 } else { 0.1 };
         } else {
             on_screen_bc.t_roundness = 1.0;
             on_screen_bc.t_darkness = 0.0;
