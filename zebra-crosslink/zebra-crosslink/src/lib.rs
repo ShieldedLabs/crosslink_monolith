@@ -169,6 +169,13 @@ pub mod viz;
 #[cfg(feature = "viz_gui")]
 pub mod viz2;
 
+/// Byte 30 of every nonce this node mines. Setting different values on different
+/// nodes deliberately splits miners onto forks for testing.
+pub static MINER_NONCE_BYTE: std::sync::Mutex<u8> = std::sync::Mutex::new(1);
+
+/// While set, this node proposes no new BFT blocks.
+pub static BFT_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 use crate::service::{TFLServiceCalls, TFLServiceHandle};
 
 // TODO: do we want to start differentiating BCHeight/PoWHeight, MalHeight/PoSHeigh etc?
@@ -577,6 +584,10 @@ async fn push_new_bft_msg_flags(
 }
 
 async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock> {
+    if BFT_PAUSE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+
     #[cfg(feature = "viz_gui")]
     if let Some(state) = viz::VIZ_G.lock().unwrap().as_ref() {
         if state.bft_pause_button {

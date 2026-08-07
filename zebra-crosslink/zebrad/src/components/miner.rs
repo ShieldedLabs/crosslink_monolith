@@ -687,7 +687,7 @@ where
 
     #[cfg(feature = "viz_gui")]
     {
-        header.nonce[30] = *zebra_crosslink::viz::MINER_NONCE_BYTE.lock().unwrap();
+        header.nonce[30] = *zebra_crosslink::MINER_NONCE_BYTE.lock().unwrap();
         println!("PoW Block Nonce: {:?}", header.nonce);
     }
 

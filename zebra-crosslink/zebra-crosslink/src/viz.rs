@@ -549,8 +549,6 @@ pub struct VizGlobals {
 }
 pub static VIZ_G: std::sync::Mutex<Option<VizGlobals>> = std::sync::Mutex::new(None);
 
-pub static MINER_NONCE_BYTE: std::sync::Mutex<u8> = std::sync::Mutex::new(1);
-
 /// Blocks to be injected into zebra via getblocktemplate, submitblock etc
 static G_FORCE_INSTRS: std::sync::Mutex<(Vec<u8>, Vec<TFInstr>)> =
     std::sync::Mutex::new((Vec::new(), Vec::new()));

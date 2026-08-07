@@ -4325,6 +4325,47 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 }
                             }
 
+                            {
+                                let bft_pause_id = id("Pause BFT Proposals");
+                                ui.checkbox_pill(bft_pause_id, &mut viz.bft_paused, "Pause BFT Proposals", grow!());
+                                if ui.hovered(bft_pause_id) {
+                                    set_tooltip_text!(data, "Stop this node from proposing new BFT blocks.");
+                                }
+                            }
+
+                            {
+                                let nonce_row_id = id("Miner Nonce Byte Row");
+                                if let _ = elem().decl(Decl {
+                                    id: nonce_row_id,
+                                    direction: LeftToRight,
+                                    align: Center,
+                                    child_gap: ui.scale(8.0),
+                                    width: grow!(),
+                                    height: fit!(),
+                                    ..Decl
+                                }) {
+                                    ui.text("Miner nonce byte", TextDecl { h: ui.scale(15.0), colour: WHITE.mul(0.78), wrap: Wrap::None, align: AlignX::Left, ..TextDecl });
+                                    let nonce_tb_id = ui::id("Miner Nonce Byte Textbox");
+                                    let nonce_str = ui.textbox(
+                                        data,
+                                        nonce_tb_id,
+                                        "1",
+                                        TextDecl { font: Mono, h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
+                                    );
+                                    let mut textbox_state = &mut data.textboxes.entry(nonce_tb_id.id).or_default();
+                                    textbox_state.text_buf.retain(|c| *c >= '0' && *c <= '9');
+                                    let len = textbox_state.text_buf.len();
+                                    textbox_state.selection.0 = textbox_state.selection.0.min(len);
+                                    textbox_state.selection.1 = textbox_state.selection.1.min(len);
+                                    if let Ok(byte) = nonce_str.trim().parse::<u8>() {
+                                        viz.miner_nonce_byte = byte;
+                                    }
+                                }
+                                if ui.hovered(nonce_row_id) {
+                                    set_tooltip_text!(data, "Byte 30 of every nonce this node mines. Different values on different nodes deliberately split miners onto forks.");
+                                }
+                            }
+
                             let decl = TextDecl { h: ui.scale(16.0), align: AlignX::Center, ..TextDecl };
                             if ui.viz_op != InteractiveVizOp::None {
                                 ui.text(frame_strf!(data, "Visualizing op: {:?}", ui.viz_op), decl);
