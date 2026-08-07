@@ -786,10 +786,15 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         viz_state.staking_bonded_pool_balance = message.staking_bonded_pool_balance;
         viz_state.staking_unbonded_pool_balance = message.staking_unbonded_pool_balance;
 
-        // @hack
-        for bc in viz_state.on_screen_bcs.values_mut() {
-            if bc.block.this_height >= message.start_bc_height {
-                bc.block.is_best_chain = false;
+        // Reset is_best_chain only for blocks that actually arrived in this message
+        // (and are at or above start_bc_height). This is more targeted than the old
+        // blanket reset that cleared ALL on-screen blocks >= start_bc_height — blocks
+        // that weren't resent stay whatever they were.
+        for bc in &message.bc_blocks {
+            if bc.this_height >= message.start_bc_height {
+                if let Some(on_screen) = viz_state.on_screen_bcs.get_mut(&bc.this_hash) {
+                    on_screen.block.is_best_chain = false;
+                }
             }
         }
 
@@ -805,10 +810,34 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
 
         for bc in &message.bc_blocks {
             if let Some(r) = viz_state.on_screen_bcs.get_mut(&bc.this_hash) {
-                anything_happened |= r.block != *bc;
-                let was_implicated = r.block.is_implicated_by_bft;
-                r.block = *bc;
-                r.block.is_implicated_by_bft = was_implicated;
+                // merge existing & new blocks to minimize info-loss
+                let updated_block = BcBlock {
+                    // old-wins
+                    this_hash:   r.block.this_hash,
+                    parent_hash: r.block.parent_hash,
+
+                    // OR-merging
+                    is_best_chain:          r.block.is_best_chain          || bc.is_best_chain,
+                    is_finalized:           r.block.is_finalized           || bc.is_finalized,
+                    is_implicated_by_bft:   r.block.is_implicated_by_bft   || bc.is_implicated_by_bft,
+                    is_hardfork_activation: r.block.is_hardfork_activation || bc.is_hardfork_activation,
+
+                    // max-merging (mostly avoiding 0s)
+                    this_height:     bc.this_height.max(r.block.this_height),
+                    txs_n:           bc.txs_n.max(r.block.txs_n),
+                    work:            bc.work.max(r.block.work),
+                    utc:             bc.utc.max(r.block.utc),
+                    serialized_size: bc.serialized_size.max(r.block.serialized_size),
+
+                    points_at_bft_block: if bc.points_at_bft_block != Hash32::from_u64(0) {
+                        bc.points_at_bft_block
+                    } else {
+                        r.block.points_at_bft_block
+                    },
+                };
+
+                anything_happened |= r.block != updated_block;
+                r.block = updated_block;
             } else {
                 anything_happened |= true;
                 new_blocks_n += 1;

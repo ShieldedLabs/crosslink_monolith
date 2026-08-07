@@ -85,7 +85,16 @@ pub async fn service_viz_requests(
                 Vec::new()
             };
 
-            let bc_req_h = (bc_ack_height, -1);
+            // Keep the window covering the whole non-finalized span [finalized tip..tip]:
+            // sidechain forks root above the finalized tip and BFT finalization candidates
+            // lag the PoW tip, so anchoring both on screen needs these best-chain blocks
+            // resent every cycle. With only [ack..tip] (ack ratchets to just behind the
+            // PoW tip), older on-screen content has nothing to attach to and floats
+            // detached, leaving a gap below the tip cluster.
+            let finalized_height = tfl_handle.internal.lock().await.latest_final_block
+                .map(|(h, _)| h.0 as i32)
+                .unwrap_or(bc_ack_height);
+            let bc_req_h = (bc_ack_height.min(finalized_height), -1);
 
             #[allow(clippy::never_loop)]
             let (lo_height, bc_tip, height_hashes, suspect_seq_blocks) = {
@@ -155,8 +164,8 @@ pub async fn service_viz_requests(
             };
 
             // paranoid guards
-            if lo_height.0 as i64 != bc_ack_height as i64 {
-                println!("PARANOID != WRONG: lo {} vs ack {bc_ack_height}", lo_height.0);
+            if lo_height.0 as i64 != bc_req_h.0 as i64 {
+                println!("PARANOID != WRONG: lo {} vs requested {}", lo_height.0, bc_req_h.0);
                 continue 'main_loop;
             }
             if suspect_seq_blocks.is_empty() {
@@ -287,7 +296,7 @@ pub async fn service_viz_requests(
                     response.staking_bonded_pool_balance = staking_bonded_pool_balance;
                     response.staking_unbonded_pool_balance = staking_unbonded_pool_balance;
 
-                    response.start_bc_height = bc_ack_height as u64;
+                    response.start_bc_height = lo_height.0 as u64; // actual window start (may be below ack; see bc_req_h)
                     bc_ack_height = bc_ack_height.max(request.bc_ack_height as i32);
 
                     let pow_inspection = |block: &Block| {
@@ -368,6 +377,39 @@ pub async fn service_viz_requests(
                             },
                         });
                     }
+
+                    // Fetch sidechain blocks from NonFinalizedState so the visualizer
+                    // can render forks alongside the best chain.
+                    if let Ok(StateReadResponse::SidechainBlocks(sidechain_blocks)) =
+                        (call.read_state)(StateReadRequest::SidechainBlocks).await
+                    {
+                        use zebra_chain::work::difficulty::ExpandedDifficulty;
+
+                        for (height, hash, block) in sidechain_blocks {
+                            let header = &block.header;
+                            let work = header.difficulty_threshold
+                                .to_work()
+                                .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
+                                .unwrap_or(0);
+
+                            response.bc_blocks.push(visualizer_zcash::BcBlock {
+                                this_hash: Hash32::from_bytes(hash.0),
+                                parent_hash: Hash32::from_bytes(header.previous_block_hash.0),
+                                this_height: height.0 as u64,
+                                txs_n: block.transactions.len(),
+                                is_best_chain: false,
+                                is_finalized: false,
+                                is_implicated_by_bft: false,
+                                points_at_bft_block: Hash32::from_u64(0),
+                                work,
+                                utc: header.time.timestamp(),
+                                serialized_size: block.zcash_serialized_size(),
+                                is_hardfork_activation: tfl_handle.config.hardforks.iter()
+                                    .any(|hf| hf.pow_activation_height == height.0 as u64),
+                            });
+                        }
+                    }
+
                     for i in request.bft_ack_height as usize..internal.bft_blocks.len() {
                         let b = &internal.bft_blocks[i];
                         let this_hash = Hash32::from_bytes(b.blake3_hash().0);

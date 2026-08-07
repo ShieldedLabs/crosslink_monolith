@@ -427,6 +427,13 @@ pub enum ReadResponse {
     ///
     /// Returns `None` if the bond does not exist.
     BondInfo(Option<BondInfoResponse>),
+
+    /// Response to [`ReadRequest::SidechainBlocks`] with `(height, hash, header)`
+    /// for all non-finalized blocks that are NOT on the best chain.
+    ///
+    /// The visualizer extracts the fields it needs (parent hash, timestamp,
+    /// difficulty, serialized size) directly from the block's header.
+    SidechainBlocks(Vec<(block::Height, block::Hash, Arc<block::Block>)>),
 }
 
 /// Information about a delegation bond.
@@ -542,7 +549,8 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::ValidBlockProposal => Ok(Response::ValidBlockProposal),
 
             ReadResponse::SolutionRate(_)
-            | ReadResponse::TipBlockSize(_) => {
+            | ReadResponse::TipBlockSize(_)
+            | ReadResponse::SidechainBlocks(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
 
