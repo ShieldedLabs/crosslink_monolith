@@ -169,10 +169,6 @@ pub mod viz;
 #[cfg(feature = "viz_gui")]
 pub mod viz2;
 
-/// Byte 30 of every nonce this node mines. Setting different values on different
-/// nodes deliberately splits miners onto forks for testing.
-pub static MINER_NONCE_BYTE: std::sync::Mutex<u8> = std::sync::Mutex::new(1);
-
 /// While set, this node proposes no new BFT blocks.
 pub static BFT_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

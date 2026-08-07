@@ -16,9 +16,6 @@ pub struct RequestToZebra {
     pub want_to_inspect_block: Hash32,
     pub bft_ack_height: u64,
     pub bc_ack_height: u64,
-    /// Byte 30 of every nonce this node mines; different values on different nodes
-    /// deliberately split miners onto forks for testing.
-    pub miner_nonce_byte: u8,
     /// While set, this node proposes no new BFT blocks.
     pub bft_pause: bool,
 }
@@ -28,7 +25,6 @@ impl RequestToZebra {
             want_to_inspect_block: Hash32::from_u64(0),
             bft_ack_height: 0,
             bc_ack_height: 0,
-            miner_nonce_byte: 1,
             bft_pause: false,
         }
     }
@@ -352,7 +348,6 @@ pub struct VizState {
     /// Freeze ingestion from zebra so a moving chain can be inspected. The sync
     /// channel back-pressures harmlessly while set.
     pub pause_incoming: bool,
-    pub miner_nonce_byte: u8,
     pub bft_paused: bool,
     pub on_screen_bcs: HashMap<Hash32, OnScreenBc>,
     pub on_screen_bfts: HashMap<Hash32, OnScreenBft>,
@@ -603,7 +598,6 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         zoom: 0.0,
         follow_tip: false,
         pause_incoming: false,
-        miner_nonce_byte: 1,
         bft_paused: false,
         on_screen_bcs: HashMap::new(),
         on_screen_bfts: HashMap::new(),
@@ -841,7 +835,6 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
             want_to_inspect_block: viz_state.inspecting_block_hash,
             bft_ack_height: viz_state.bft_ack_height,
             bc_ack_height: viz_state.bc_ack_height,
-            miner_nonce_byte: viz_state.miner_nonce_byte,
             bft_pause: viz_state.bft_paused,
         });
     }

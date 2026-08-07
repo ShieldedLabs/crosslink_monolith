@@ -170,7 +170,6 @@ pub async fn service_viz_requests(
 
             for _ in 0..256 {
                 if let Ok(request) = request_queue.try_recv() {
-                    *crate::MINER_NONCE_BYTE.lock().unwrap() = request.miner_nonce_byte;
                     crate::BFT_PAUSE.store(request.bft_pause, std::sync::atomic::Ordering::Relaxed);
 
                     let mut internal = tfl_handle.internal.lock().await;

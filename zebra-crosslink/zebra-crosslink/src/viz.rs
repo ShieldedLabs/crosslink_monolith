@@ -3793,16 +3793,6 @@ pub async fn viz_main(
                     }
 
                     {
-                        ui_editbox(
-                            ui,
-                            hash!(),
-                            vec2(tray_w - 4. * ch_w, font_size),
-                            &mut pow_block_nonce_str,
-                        );
-                        let try_parse: Option<u8> = pow_block_nonce_str.parse().ok();
-                        if let Some(byte) = try_parse {
-                            *MINER_NONCE_BYTE.lock().unwrap() = byte;
-                        }
                         checkbox(ui, hash!(), "BFT Paused", &mut bft_pause_button);
                     }
                     {
