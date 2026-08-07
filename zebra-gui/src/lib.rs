@@ -1060,6 +1060,9 @@ const GLYPH_RUN_MAX: usize = 16384;
 pub const DEV_WIN32_WINDOW_ARRANGEMENT: bool = false;
 pub static DEV_WIN32_WINDOW_RIGHT: AtomicBool = AtomicBool::new(false);
 
+/// Overrides the window title when set before the window is created (e.g. "TEST: <name>").
+pub static WINDOW_TITLE: Mutex<String> = Mutex::new(String::new());
+
 pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fake_data: bool) {
 
     let mut viz_state = viz_gui_init(fake_data);
@@ -1214,7 +1217,10 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                         #[cfg(target_os = "windows")]      if DEV_WIN32_WINDOW_ARRANGEMENT { false } else { true }
                         #[cfg(not(target_os = "windows"))] true
                     })
-                    .with_title("Zcash Visualizer")
+                    .with_title({
+                        let title = WINDOW_TITLE.lock().unwrap();
+                        if title.is_empty() { "Zcash Visualizer".to_string() } else { title.clone() }
+                    })
                     .with_inner_size(Size::Physical(winit::dpi::PhysicalSize { width: 1600, height: 900 }))
                 ).unwrap());
                 let context = softbuffer::Context::new(twindow.clone()).unwrap();

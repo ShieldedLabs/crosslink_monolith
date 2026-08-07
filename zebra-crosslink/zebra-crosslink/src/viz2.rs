@@ -17,6 +17,11 @@ pub fn viz_main(tokio_root_thread_handle: Option<std::thread::JoinHandle<()>>, w
     //     }
     // }
 
+    let test_name: &'static str = *TEST_NAME.lock().unwrap();
+    if test_name != "‰‰TEST_NAME_NOT_SET‰‰" {
+        *visualizer_zcash::WINDOW_TITLE.lock().unwrap() = format!("TEST: {}", test_name);
+    }
+
     // @Dev @Debug: detect which instance we are to position viz window
     #[cfg(target_os = "windows")] if visualizer_zcash::DEV_WIN32_WINDOW_ARRANGEMENT {
         let args: Vec<String> = std::env::args().collect();
