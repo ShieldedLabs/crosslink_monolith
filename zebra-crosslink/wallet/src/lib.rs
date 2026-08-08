@@ -113,6 +113,33 @@ pub static FAUCET_REQUEST: Mutex<Option<FaucetRequestClosure>> = Mutex::new(None
 pub static USER_UFVK_STRING: Mutex<Option<String>> = Mutex::new(None);
 pub static GUI_ENABLE_MINE: Mutex<bool> = Mutex::new(true);
 
+/// Cheap, point-in-time snapshot of the headless wallet's own note-scan progress and
+/// balances, updated as a handful of plain field assignments alongside the existing
+/// `WalletState` update (see the write site in `wallet_main`) -- no new per-block cost.
+/// Mirrors `zebra_state::crosslink::WalletSyncStatusSnapshot`; kept as a separate,
+/// dependency-free struct here so this crate doesn't need to depend on zebra-state just to
+/// hold this value. The RPC layer (which already depends on both crates) converts between
+/// the two at the point where it builds the RPC response.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WalletSyncStatus {
+    pub sync_height: u32,
+    pub tip_height: u32,
+    pub user_shielded_spendable_zats: u64,
+    pub user_shielded_pending_zats: u64,
+    pub user_unshielded_zats: u64,
+    pub staked_zats: u64,
+    pub withdrawable_zats: u64,
+}
+pub static WALLET_SYNC_STATUS: Mutex<WalletSyncStatus> = Mutex::new(WalletSyncStatus {
+    sync_height: 0,
+    tip_height: 0,
+    user_shielded_spendable_zats: 0,
+    user_shielded_pending_zats: 0,
+    user_unshielded_zats: 0,
+    staked_zats: 0,
+    withdrawable_zats: 0,
+});
+
 pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
 
 #[derive(Clone)]
@@ -4357,6 +4384,16 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             lock.staked_balance = user_staked_funds;
             lock.withdrawable_balance = user_withdrawable_funds;
+
+            *WALLET_SYNC_STATUS.lock().unwrap() = WalletSyncStatus {
+                sync_height: wallets_sync_h.0,
+                tip_height: network_tip_h.0,
+                user_shielded_spendable_zats: user_shielded_spendable_funds,
+                user_shielded_pending_zats: user_shielded_pending_funds,
+                user_unshielded_zats: user_unshielded_funds,
+                staked_zats: user_staked_funds,
+                withdrawable_zats: user_withdrawable_funds,
+            };
         }
 
 

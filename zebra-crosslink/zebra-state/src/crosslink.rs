@@ -11,6 +11,33 @@ use serde_with::serde_as;
 pub use zcash_primitives::bft::{FinalizerRecencyStatus, TFLRecencyStatus, ScanInfo};
 use zcash_primitives::transaction::StakingActionRequest;
 
+/// A cheap, point-in-time snapshot of the headless wallet's own note-scan progress and
+/// balances. Updated as a handful of plain field assignments once per wallet loop iteration
+/// (see `wallet::WALLET_SYNC_STATUS`), so reading it via RPC costs nothing beyond what the
+/// wallet already computes for its own internal use -- unlike deriving this information from
+/// the `DUMP_NOTES` debug log, which reprints the *entire* notes list from scratch every
+/// iteration and does not scale as that list grows.
+#[derive(Debug, Default, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WalletSyncStatusSnapshot {
+    /// The highest block height the headless wallet's own note-scan has processed so far.
+    /// Distinct from the raw node's chain-sync height (see `getblockchaininfo`) -- this can
+    /// lag behind it, particularly right after a restart, since wallet note-scanning is
+    /// in-memory only and always restarts from genesis.
+    pub sync_height: u32,
+    /// The chain tip height the wallet is scanning towards, as of the same snapshot.
+    pub tip_height: u32,
+    /// The user wallet's confirmed, spendable (not staked, not pending) balance, in zatoshis.
+    pub user_shielded_spendable_zats: u64,
+    /// The user wallet's unconfirmed/pending shielded balance, in zatoshis.
+    pub user_shielded_pending_zats: u64,
+    /// The user wallet's transparent balance, in zatoshis.
+    pub user_unshielded_zats: u64,
+    /// Total currently staked (bonded) balance, in zatoshis.
+    pub staked_zats: u64,
+    /// Balance available to withdraw from completed unbonding, in zatoshis.
+    pub withdrawable_zats: u64,
+}
+
 /// The finality status of a block
 #[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TFLBlockFinality {
@@ -63,6 +90,8 @@ pub enum TFLServiceRequest {
     WalletUfvk,
     /// Send staking action from wallet
     WalletStakingAction(StakingActionRequest),
+    /// Get the headless wallet's own note-scan progress and balances
+    WalletSyncStatus,
 }
 
 /// Types of responses that can be returned by the TFLService.
@@ -98,6 +127,8 @@ pub enum TFLServiceResponse {
     WalletUfvk(Option<String>),
     /// Send staking action from wallet
     WalletStakingAction(Result<String, String>),
+    /// The headless wallet's own note-scan progress and balances
+    WalletSyncStatus(WalletSyncStatusSnapshot),
 }
 
 /// Errors that can occur when interacting with the TFLService.
