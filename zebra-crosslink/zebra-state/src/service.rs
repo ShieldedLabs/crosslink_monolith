@@ -556,21 +556,45 @@ impl ReadStateService {
 
     /// Return the header, height, hash, and next block hash for the best-chain block identified
     /// by `hash_or_height`, if any.
+    ///
+    /// Every field comes from the one source that knows the block. The chain snapshot and the
+    /// live db can disagree at overlapping heights while a Crosslink finalization is landing,
+    /// so per-field chain-then-db lookups could pair a hash with another block's header.
     pub fn block_header(
         &self,
         hash_or_height: crate::HashOrHeight,
     ) -> Option<(Arc<block::Header>, block::Height, block::Hash, Option<block::Hash>)> {
         let best_chain = self.latest_best_chain();
-        let height = hash_or_height
-            .height_or_else(|hash| read::find::height_by_hash(best_chain.clone(), &self.db, hash))?;
-        let hash = hash_or_height
-            .hash_or_else(|height| read::find::hash_by_height(best_chain.clone(), &self.db, height))?;
-        let next_block_hash = height
-            .next()
-            .ok()
-            .and_then(|next_height| read::find::hash_by_height(best_chain.clone(), &self.db, next_height));
-        let header = read::block_header(best_chain, &self.db, height.into())?;
+        let chain = best_chain.as_deref();
+
+        if let Some(block) = chain.and_then(|chain| chain.block(hash_or_height)) {
+            let next_block_hash = self.next_block_hash(chain, block.height, block.hash);
+            return Some((block.block.header.clone(), block.height, block.hash, next_block_hash));
+        }
+
+        let height = hash_or_height.height_or_else(|hash| self.db.height(hash))?;
+        let hash = hash_or_height.hash_or_else(|height| self.db.hash(height))?;
+        let header = self.db.block_header(height.into())?;
+        let next_block_hash = self.next_block_hash(chain, height, hash);
         Some((header, height, hash, next_block_hash))
+    }
+
+    /// Return the hash of the block above the block `hash` at `height`, from either source,
+    /// but only if it actually extends `hash`: an unchecked height lookup could name a block
+    /// from the other side of an in-flight Crosslink finalization.
+    fn next_block_hash(
+        &self,
+        chain: Option<&Chain>,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Option<block::Hash> {
+        let next_height = height.next().ok()?;
+        if let Some(child) = chain.and_then(|chain| chain.block(next_height.into())) {
+            return (child.block.header.previous_block_hash == hash).then_some(child.hash);
+        }
+        let child_hash = self.db.hash(next_height)?;
+        let child = self.db.block_header(next_height.into())?;
+        (child.previous_block_hash == hash).then_some(child_hash)
     }
 
     /// Run `f` against the latest non-finalized state.
