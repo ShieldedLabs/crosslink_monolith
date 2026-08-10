@@ -776,8 +776,7 @@ impl Service<Request> for StateService {
             | Request::FindBlockHashes { .. }
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
-            | Request::BondInfo(_)
-            | Request::SidechainBlocks => {
+            | Request::BondInfo(_) => {
                 // Redirect the request to the concurrent ReadStateService
                 let read_service = self.read_service.clone();
 
@@ -1761,41 +1760,22 @@ impl Service<ReadRequest> for ReadStateService {
                 .wait_for_panics()
             }
 
-            // Used by the visualizer to render sidechain forks.
-            ReadRequest::SidechainBlocks => {
+            // Used by the visualizer to render forks alongside the best chain: it follows each
+            // one with a BlockSequence anchored on the tip.
+            ReadRequest::SidechainForks => {
                 let state = self.clone();
 
                 tokio::task::spawn_blocking(move || {
                     span.in_scope(move || {
-                        let blocks = state
+                        let forks = state
                             .non_finalized_state_receiver
                             .with_watch_data(|non_finalized_state| {
-                                let mut result = Vec::new();
-                                let mut chains = non_finalized_state.chain_iter();
-
-                                // Each Chain holds its full non-finalized block set, so side
-                                // chains repeat the prefix they share with the best chain (and
-                                // with each other). Report each non-best block once: seed the
-                                // seen-set with the best chain, then dedupe across side chains.
-                                let mut seen: std::collections::HashSet<block::Hash> = chains
-                                    .next() // best chain
-                                    .map(|best| best.blocks.values().map(|b| b.hash).collect())
-                                    .unwrap_or_default();
-
-                                for chain in chains {
-                                    for (height, ctx_block) in &chain.blocks {
-                                        if seen.insert(ctx_block.hash) {
-                                            result.push((*height, ctx_block.hash, ctx_block.block.clone()));
-                                        }
-                                    }
-                                }
-
-                                result
+                                read::sidechain_forks(&non_finalized_state)
                             });
 
-                        timer.finish(module_path!(), line!(), "ReadRequest::SidechainBlocks");
+                        timer.finish(module_path!(), line!(), "ReadRequest::SidechainForks");
 
-                        Ok(ReadResponse::SidechainBlocks(blocks))
+                        Ok(ReadResponse::SidechainForks(forks))
                     })
                 })
                 .wait_for_panics()

@@ -279,6 +279,24 @@ pub async fn service_viz_requests(
                         backfill_blocks = tfl_block_sequence(&call, tip_height_hash.1, hi_h, lo_h, BC_PAGE_SIZE as u32).await;
                     }
 
+                    // Forks alongside the best chain, each read as its own sequence anchored on
+                    // its tip: a real branch with real heights whose lowest block is the child
+                    // of a best-chain block in the same response. A fork rooted below the page
+                    // cap (finality stalled by more than a page) is served from its tip down and
+                    // renders unattached, like anything else below the window. Overlaps — forks
+                    // of forks, or a reorganization between the window read and this one — send
+                    // a block twice; the GUI keys blocks by hash and merges, so no dedup here.
+                    let mut fork_blocks: Vec<(ZebBlockHeight, ZebBlockHash, Arc<Block>)> = Vec::new();
+                    if let Ok(StateReadResponse::SidechainForks(forks)) =
+                        (call.read_state)(StateReadRequest::SidechainForks).await
+                    {
+                        for fork in forks {
+                            fork_blocks.extend(tfl_block_sequence(
+                                &call, fork.tip_hash, fork.tip_height, fork.fork_height, BC_PAGE_SIZE as u32,
+                            ).await);
+                        }
+                    }
+
                     let mut internal = tfl_handle.internal.lock().await;
                     let mut response = visualizer_zcash::ResponseFromZebra::_0();
                     response.bc_attested = bc_attested.clone();
@@ -372,22 +390,25 @@ pub async fn service_viz_requests(
                         })
                     };
 
-                    for (height, hash, bc) in seq_blocks.iter() {
+                    let push_bc_block = |response: &mut visualizer_zcash::ResponseFromZebra,
+                                         height: &ZebBlockHeight,
+                                         hash: &ZebBlockHash,
+                                         bc: &Block,
+                                         is_best_chain: bool| {
                         let this_hash = Hash32::from_bytes(hash.0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;
-                            response.block_inspection = pow_inspection(bc.as_ref());
+                            response.block_inspection = pow_inspection(bc);
                         }
                         response.bc_blocks.push(visualizer_zcash::BcBlock {
                             this_hash,
                             parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
                             this_height: height.0 as u64,
                             txs_n: bc.transactions.len(),
-                            is_best_chain: true,
+                            is_best_chain,
                             is_finalized: false,
                             knowledge: visualizer_zcash::BcKnowledge::FullBlock,
                             points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash().0),
-                            // #[cfg(debug_assertions)]
                             work: bc.header.difficulty_threshold.to_work()
                                 .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
                                 .unwrap_or(0xdeadbeef),
@@ -398,65 +419,17 @@ pub async fn service_viz_requests(
                             is_hardfork_activation: tfl_handle.config.hardforks.iter()
                                 .any(|hf| hf.pow_activation_height == height.0 as u64),
                         });
-                    }
+                    };
 
+                    for (height, hash, bc) in seq_blocks.iter() {
+                        push_bc_block(&mut response, height, hash, bc, true);
+                    }
                     // backfill page (older best-chain blocks below the GUI's coverage)
                     for (height, hash, bc) in backfill_blocks.iter() {
-                        let this_hash = Hash32::from_bytes(hash.0);
-                        if request.want_to_inspect_block == this_hash {
-                            response.what_block_it_is = this_hash;
-                            response.block_inspection = pow_inspection(bc.as_ref());
-                        }
-                        response.bc_blocks.push(visualizer_zcash::BcBlock {
-                            this_hash,
-                            parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
-                            this_height: height.0 as u64,
-                            txs_n: bc.transactions.len(),
-                            is_best_chain: true,
-                            is_finalized: false,
-                            knowledge: visualizer_zcash::BcKnowledge::FullBlock,
-                            points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash().0),
-                            work: bc.header.difficulty_threshold.to_work()
-                                .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
-                                .unwrap_or(0xdeadbeef),
-                            utc: bc.header.time.timestamp(),
-                            serialized_size: bc.zcash_serialized_size(),
-                            is_hardfork_activation: tfl_handle.config.hardforks.iter()
-                                .any(|hf| hf.pow_activation_height == height.0 as u64),
-                        });
+                        push_bc_block(&mut response, height, hash, bc, true);
                     }
-
-
-                    // Fetch sidechain blocks from NonFinalizedState so the visualizer
-                    // can render forks alongside the best chain.
-                    if let Ok(StateReadResponse::SidechainBlocks(sidechain_blocks)) =
-                        (call.read_state)(StateReadRequest::SidechainBlocks).await
-                    {
-                        use zebra_chain::work::difficulty::ExpandedDifficulty;
-
-                        for (height, hash, block) in sidechain_blocks {
-                            let header = &block.header;
-                            let work = header.difficulty_threshold
-                                .to_work()
-                                .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
-                                .unwrap_or(0);
-
-                            response.bc_blocks.push(visualizer_zcash::BcBlock {
-                                this_hash: Hash32::from_bytes(hash.0),
-                                parent_hash: Hash32::from_bytes(header.previous_block_hash.0),
-                                this_height: height.0 as u64,
-                                txs_n: block.transactions.len(),
-                                is_best_chain: false,
-                                is_finalized: false,
-                                knowledge: visualizer_zcash::BcKnowledge::FullBlock,
-                                points_at_bft_block: Hash32::from_u64(0),
-                                work,
-                                utc: header.time.timestamp(),
-                                serialized_size: block.zcash_serialized_size(),
-                                is_hardfork_activation: tfl_handle.config.hardforks.iter()
-                                    .any(|hf| hf.pow_activation_height == height.0 as u64),
-                            });
-                        }
+                    for (height, hash, bc) in fork_blocks.iter() {
+                        push_bc_block(&mut response, height, hash, bc, false);
                     }
 
                     // Newest-page cap: a fresh GUI acks 0; the newest BFT blocks anchor to

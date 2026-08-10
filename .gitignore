@@ -10,6 +10,8 @@
 *.local.toml
 zebra-gui/icon-font/fontello-*/
 ignored_dir/**
+BB_*
+NN_*
 ZZ*
 .AA*
 zebra-crosslink/testnet_online*

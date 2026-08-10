@@ -428,17 +428,26 @@ pub enum ReadResponse {
     /// Returns `None` if the bond does not exist.
     BondInfo(Option<BondInfoResponse>),
 
-    /// Response to [`ReadRequest::SidechainBlocks`] with `(height, hash, header)`
-    /// for all non-finalized blocks that are NOT on the best chain.
-    ///
-    /// The visualizer extracts the fields it needs (parent hash, timestamp,
-    /// difficulty, serialized size) directly from the block's header.
-    SidechainBlocks(Vec<(block::Height, block::Hash, Arc<block::Block>)>),
+    /// Response to [`ReadRequest::SidechainForks`], strongest fork first.
+    SidechainForks(Vec<SidechainFork>),
 
     /// Response to [`ReadRequest::BlockSequence`], ascending by height.
     ///
     /// A single chain, shorter than requested if the walk ran out.
     BlockSequence(Vec<(block::Height, block::Hash, Arc<block::Block>)>),
+}
+
+/// A non-finalized chain that is not the best chain, as the visualizer needs it: the tip to
+/// anchor a [`ReadRequest::BlockSequence`] on, and the height to stop that walk at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SidechainFork {
+    /// Tip of the fork.
+    pub tip_height: block::Height,
+    /// Hash of the tip block.
+    pub tip_hash: block::Hash,
+    /// Height of the lowest block on this chain that is not on the best chain. Everything
+    /// below it is shared with the best chain.
+    pub fork_height: block::Height,
 }
 
 /// Information about a delegation bond.
@@ -555,7 +564,7 @@ impl TryFrom<ReadResponse> for Response {
 
             ReadResponse::SolutionRate(_)
             | ReadResponse::TipBlockSize(_)
-            | ReadResponse::SidechainBlocks(_)
+            | ReadResponse::SidechainForks(_)
             | ReadResponse::BlockSequence(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }

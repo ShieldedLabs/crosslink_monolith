@@ -1,4 +1,5 @@
-//! Fixed test vectors for reading a run of blocks as a single chain.
+//! Fixed test vectors for reading a run of blocks as a single chain, and for finding the forks
+//! a caller would read that way.
 
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use crate::{
     arbitrary::Prepare,
     service::{
         finalized_state::FinalizedState, non_finalized_state::NonFinalizedState,
-        read::find::block_sequence,
+        read::find::{block_sequence, sidechain_forks},
     },
     tests::FakeChainHelper,
     Config,
@@ -192,6 +193,85 @@ fn max_len_keeps_the_blocks_nearest_the_top() {
     assert_eq!(seq.len(), 2);
     assert_eq!(seq[0].1, best[1].hash());
     assert_eq!(seq[1].1, best[2].hash());
+}
+
+#[test]
+fn a_fork_is_reported_with_its_tip_and_the_height_it_leaves_the_best_chain() {
+    let _init_guard = zebra_test::init();
+    let (non_finalized_state, _finalized_state, best, side) = fixture();
+
+    let forks = sidechain_forks(&non_finalized_state);
+
+    assert_eq!(forks.len(), 1, "the best chain must not be reported as a fork");
+    assert_eq!(forks[0].tip_hash, side[1].hash());
+    assert_eq!(forks[0].tip_height, height_of(&side[1]));
+    assert_eq!(
+        forks[0].fork_height,
+        height_of(&best[2]),
+        "the fork height is where the branches first disagree, not the chain root",
+    );
+}
+
+/// What the visualizer does: read every reported fork as its own run.
+#[test]
+fn following_a_reported_fork_gives_exactly_the_divergent_branch() {
+    let _init_guard = zebra_test::init();
+    let (non_finalized_state, finalized_state, best, side) = fixture();
+
+    let fork = sidechain_forks(&non_finalized_state)[0];
+    let seq = block_sequence(
+        &non_finalized_state,
+        &finalized_state.db,
+        fork.tip_hash,
+        fork.tip_height,
+        fork.fork_height,
+        1000,
+    );
+
+    assert_is_one_chain(&seq);
+    assert_eq!(
+        seq.iter().map(|(_, hash, _)| *hash).collect::<Vec<_>>(),
+        side.iter().map(|block| block.hash()).collect::<Vec<_>>(),
+        "no shared blocks, no missing ones",
+    );
+    assert_eq!(
+        seq[0].2.header.previous_block_hash,
+        best[1].hash(),
+        "the branch must hang off a best-chain block, so a caller holding the best chain can \
+         attach it",
+    );
+}
+
+/// Forks of forks share their lower blocks, so a caller reading each run separately sees those
+/// blocks more than once.
+#[test]
+fn forks_of_forks_are_reported_separately() {
+    let _init_guard = zebra_test::init();
+    let (mut non_finalized_state, finalized_state, _best, side) = fixture();
+
+    let sibling = side[0].make_fake_child().set_work(2);
+    non_finalized_state
+        .commit_block(sibling.clone().prepare(), &finalized_state)
+        .unwrap();
+
+    let forks = sidechain_forks(&non_finalized_state);
+
+    assert_eq!(forks.len(), 2);
+    assert!(forks
+        .iter()
+        .all(|fork| fork.fork_height == height_of(&side[0])));
+    let tips: Vec<_> = forks.iter().map(|fork| fork.tip_hash).collect();
+    assert!(tips.contains(&side[1].hash()));
+    assert!(tips.contains(&sibling.hash()));
+}
+
+#[test]
+fn a_state_with_no_chains_has_no_forks() {
+    let _init_guard = zebra_test::init();
+
+    assert!(
+        sidechain_forks(&NonFinalizedState::new(&Network::Mainnet, Default::default())).is_empty()
+    );
 }
 
 #[test]

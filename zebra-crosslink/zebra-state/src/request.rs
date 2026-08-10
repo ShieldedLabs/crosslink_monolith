@@ -845,13 +845,6 @@ pub enum Request {
     /// * [`Response::BondInfo(Some(...))`](Response::BondInfo) if the bond exists;
     /// * [`Response::BondInfo(None)`](Response::BondInfo) otherwise.
     BondInfo([u8; 32]),
-
-    /// Returns header-level details for all non-finalized blocks that are NOT on the best chain.
-    ///
-    /// Used by the visualizer to render sidechain forks alongside the best chain.
-    ///
-    /// Returns [`ReadResponse::SidechainBlocks(Vec<SidechainBlockMeta>)`](ReadResponse::SidechainBlocks).
-    SidechainBlocks,
 }
 
 impl Request {
@@ -880,7 +873,6 @@ impl Request {
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
             Request::BondInfo(_) => "bond_info",
-            Request::SidechainBlocks => "sidechain_blocks",
         }
     }
 
@@ -1203,12 +1195,14 @@ pub enum ReadRequest {
     /// * [`ReadResponse::BondInfo(None)`](ReadResponse::BondInfo) otherwise.
     BondInfo([u8; 32]),
 
-    /// Returns header-level details for all non-finalized blocks that are NOT on the best chain.
+    /// Returns the tip of every non-finalized chain other than the best chain, with the height
+    /// at which it leaves the best chain.
     ///
-    /// Used by the visualizer to render sidechain forks alongside the best chain.
+    /// Used by the visualizer, which reads each fork with
+    /// [`ReadRequest::BlockSequence`](ReadRequest::BlockSequence) anchored on the tip.
     ///
-    /// Returns [`ReadResponse::SidechainBlocks(Vec<SidechainBlockMeta>)`](ReadResponse::SidechainBlocks).
-    SidechainBlocks,
+    /// Returns [`ReadResponse::SidechainForks`](ReadResponse::SidechainForks).
+    SidechainForks,
 
     /// Blocks in `[lo_height ..= hi_height]` on the chain containing `anchor`, ascending by
     /// height, following parent links down from the top of that range.
@@ -1275,7 +1269,7 @@ impl ReadRequest {
             ReadRequest::TipBlockSize => "tip_block_size",
             ReadRequest::NonFinalizedBlocksListener => "non_finalized_blocks_listener",
             ReadRequest::BondInfo(_) => "bond_info",
-            ReadRequest::SidechainBlocks => "sidechain_blocks",
+            ReadRequest::SidechainForks => "sidechain_forks",
             ReadRequest::BlockSequence { .. } => "block_sequence",
         }
     }
@@ -1339,8 +1333,6 @@ impl TryFrom<Request> for ReadRequest {
             ),
 
             Request::BondInfo(bond_key) => Ok(ReadRequest::BondInfo(bond_key)),
-
-            Request::SidechainBlocks => Ok(ReadRequest::SidechainBlocks),
         }
     }
 }

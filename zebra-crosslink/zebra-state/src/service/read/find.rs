@@ -34,7 +34,7 @@ use crate::{
         non_finalized_state::{Chain, NonFinalizedState},
         read::{self, block::block_header, FINALIZED_STATE_QUERY_RETRIES},
     },
-    BoxError, KnownBlock, KnownBlockLocation,
+    BoxError, KnownBlock, KnownBlockLocation, SidechainFork,
 };
 
 #[cfg(test)]
@@ -669,6 +669,41 @@ pub fn block_sequence(
 
     seq.reverse();
     seq
+}
+
+/// Returns every non-finalized chain except the best one, as a tip to walk down from and the
+/// height where it leaves the best chain. Best-work order, so the strongest fork comes first.
+///
+/// Forks of forks are reported separately, so their shared blocks are described by more than
+/// one entry. Only the non-finalized state holds forks at all, so the shared block below
+/// `fork_height` is always within a reorganization's reach of the tip.
+pub fn sidechain_forks(non_finalized_state: &NonFinalizedState) -> Vec<SidechainFork> {
+    let mut chains = non_finalized_state.chain_iter();
+    let Some(best_chain) = chains.next() else {
+        return Vec::new();
+    };
+
+    chains
+        .filter_map(|chain| {
+            // Each Chain holds every block from the non-finalized root up, so a fork repeats
+            // the best chain's blocks below the height where it diverges, and only below it:
+            // a hash commits to its parent, so divergence cannot heal going up. Scanning down
+            // from the tip therefore costs the short branch, not the shared run.
+            let fork_height = *chain
+                .blocks
+                .iter()
+                .rev()
+                .take_while(|(_, block)| !best_chain.contains_block_hash(block.hash))
+                .last()?
+                .0;
+
+            Some(SidechainFork {
+                tip_height: chain.non_finalized_tip_height(),
+                tip_hash: chain.non_finalized_tip_hash(),
+                fork_height,
+            })
+        })
+        .collect()
 }
 
 /// Returns the median-time-past of the *next* block to be added to the best chain in

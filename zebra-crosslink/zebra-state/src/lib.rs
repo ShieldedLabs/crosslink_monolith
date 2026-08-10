@@ -54,6 +54,7 @@ pub use request::Spend;
 
 pub use response::{
     GetBlockTemplateChainInfo, KnownBlock, KnownBlockLocation, MinedTx, ReadResponse, Response,
+    SidechainFork,
 };
 pub use service::write::WriteBlockWorkerTask;
 pub use service::{
