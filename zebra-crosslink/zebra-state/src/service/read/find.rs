@@ -612,6 +612,65 @@ where
     collect_chain_headers(chain, db, intersection, stop, max_len)
 }
 
+/// Returns the blocks in `[lo_height ..= hi_height]` on the chain containing `anchor`,
+/// ascending by height, by following parent links down from the top of that range. At most
+/// `max_len` blocks, counting down. `hi_height` is clamped to `anchor`'s own height. Empty
+/// if `anchor` is unknown, or its height is below `lo_height`.
+///
+/// `anchor` can be on any chain, best or side, and it is what picks the chain: heights are
+/// resolved within it, so a caller holding a tip hash gets a run from that tip's chain even
+/// once the state has moved on. Since the walk follows parent links, the result is one
+/// chain: a reorganization concurrent with the walk can shorten it, but cannot splice two
+/// chains together.
+pub fn block_sequence(
+    non_finalized_state: &NonFinalizedState,
+    db: &ZebraDb,
+    anchor: block::Hash,
+    hi_height: Height,
+    lo_height: Height,
+    max_len: u32,
+) -> Vec<(Height, block::Hash, Arc<Block>)> {
+    let chain = non_finalized_state.find_chain(|chain| chain.contains_block_hash(anchor));
+    let Some(anchor_height) = height_by_hash(chain.as_ref(), db, anchor) else {
+        return Vec::new();
+    };
+
+    // Above the anchor there is no block on the anchor's chain to start from, so the window
+    // tops out there.
+    let hi_height = std::cmp::min(hi_height, anchor_height);
+    if hi_height < lo_height {
+        return Vec::new();
+    }
+
+    let Some(hi_hash) = hash_by_height(chain.as_ref(), db, hi_height) else {
+        return Vec::new();
+    };
+
+    let len = std::cmp::min((hi_height.0 - lo_height.0 + 1) as usize, max_len as usize);
+    let mut seq: Vec<(Height, block::Hash, Arc<Block>)> =
+        any_ancestor_blocks(non_finalized_state, db, hi_hash)
+            .take(len)
+            .enumerate()
+            .map(|(i, block)| {
+                // The iterator yields exactly one block per height, descending from hi.
+                (Height(hi_height.0 - i as u32), block.hash(), block)
+            })
+            .collect();
+
+    // A cloned chain that is pruned by a concurrent finalization can drop the iterator into
+    // the finalized state at the previous height, so check the parent links rather than
+    // trusting them. Keeping the prefix keeps the result a single chain.
+    for i in 1..seq.len() {
+        if seq[i - 1].2.header.previous_block_hash != seq[i].1 {
+            seq.truncate(i);
+            break;
+        }
+    }
+
+    seq.reverse();
+    seq
+}
+
 /// Returns the median-time-past of the *next* block to be added to the best chain in
 /// `non_finalized_state` or `db`.
 ///

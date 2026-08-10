@@ -1800,6 +1800,34 @@ impl Service<ReadRequest> for ReadStateService {
                 })
                 .wait_for_panics()
             }
+
+            // A run of blocks read from one snapshot, so the caller cannot see half of one
+            // chain and half of another. Used by the visualizer for its whole window.
+            ReadRequest::BlockSequence { anchor, hi_height, lo_height, max_len } => {
+                let state = self.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || {
+                        let seq = state.non_finalized_state_receiver.with_watch_data(
+                            |non_finalized_state| {
+                                read::block_sequence(
+                                    &non_finalized_state,
+                                    &state.db,
+                                    anchor,
+                                    hi_height,
+                                    lo_height,
+                                    max_len,
+                                )
+                            },
+                        );
+
+                        timer.finish(module_path!(), line!(), "ReadRequest::BlockSequence");
+
+                        Ok(ReadResponse::BlockSequence(seq))
+                    })
+                })
+                .wait_for_panics()
+            }
         }
     }
 }

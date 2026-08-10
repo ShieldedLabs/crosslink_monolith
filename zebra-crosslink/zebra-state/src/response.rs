@@ -434,6 +434,11 @@ pub enum ReadResponse {
     /// The visualizer extracts the fields it needs (parent hash, timestamp,
     /// difficulty, serialized size) directly from the block's header.
     SidechainBlocks(Vec<(block::Height, block::Hash, Arc<block::Block>)>),
+
+    /// Response to [`ReadRequest::BlockSequence`], ascending by height.
+    ///
+    /// A single chain, shorter than requested if the walk ran out.
+    BlockSequence(Vec<(block::Height, block::Hash, Arc<block::Block>)>),
 }
 
 /// Information about a delegation bond.
@@ -550,7 +555,8 @@ impl TryFrom<ReadResponse> for Response {
 
             ReadResponse::SolutionRate(_)
             | ReadResponse::TipBlockSize(_)
-            | ReadResponse::SidechainBlocks(_) => {
+            | ReadResponse::SidechainBlocks(_)
+            | ReadResponse::BlockSequence(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
 

@@ -1209,6 +1209,30 @@ pub enum ReadRequest {
     ///
     /// Returns [`ReadResponse::SidechainBlocks(Vec<SidechainBlockMeta>)`](ReadResponse::SidechainBlocks).
     SidechainBlocks,
+
+    /// Blocks in `[lo_height ..= hi_height]` on the chain containing `anchor`, ascending by
+    /// height, following parent links down from the top of that range.
+    ///
+    /// The result is always a single chain, even when `anchor` is not on the best chain, and
+    /// a reorganization during the walk can shorten the result but never splice two chains
+    /// together. At most `max_len` blocks. Empty if `anchor` is unknown or below `lo_height`.
+    ///
+    /// Callers that already hold a hash want this rather than
+    /// [`ReadRequest::FindBlockHashes`], which negotiates an intersection with a peer whose
+    /// chain it does not know.
+    ///
+    /// Returns [`ReadResponse::BlockSequence`](ReadResponse::BlockSequence).
+    BlockSequence {
+        /// Block naming the chain to read: heights below are resolved within it, so a caller
+        /// holding a tip hash gets that tip's chain rather than whichever is best right now.
+        anchor: block::Hash,
+        /// Highest height to include, clamped to `anchor`'s own height.
+        hi_height: block::Height,
+        /// Lowest height to include.
+        lo_height: block::Height,
+        /// Hard cap on the number of blocks returned, counting down from the top of the range.
+        max_len: u32,
+    },
 }
 
 impl ReadRequest {
@@ -1252,6 +1276,7 @@ impl ReadRequest {
             ReadRequest::NonFinalizedBlocksListener => "non_finalized_blocks_listener",
             ReadRequest::BondInfo(_) => "bond_info",
             ReadRequest::SidechainBlocks => "sidechain_blocks",
+            ReadRequest::BlockSequence { .. } => "block_sequence",
         }
     }
 

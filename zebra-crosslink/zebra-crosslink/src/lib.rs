@@ -1936,135 +1936,31 @@ impl SatSubAffine<i32> for ZebBlockHeight {
     }
 }
 
-// TODO: can we change the signature to unwrap the block options? The blocks must exist if the
-// hashes do
-// NOTE: this is currently best-chain-only due to request/response limitations
-// TODO: add more request/response pairs directly in zebra-state's StateService
-/// always returns block hashes. If read_extra_info is set, also returns Blocks, otherwise returns an empty vector.
+/// Blocks in `[lo_height ..= hi_height]` on `anchor`'s chain as one chain, ascending by
+/// height, at most `max_len` of them counting down. `hi_height` is clamped to `anchor`'s own
+/// height. Empty if the state holds no such run right now.
+///
+/// The state resolves the heights within `anchor`'s chain and walks parent links inside one
+/// snapshot, so the result is a single chain even when `anchor` is not on the best chain, and
+/// a reorganization can only shorten it. Callers that pass a tip hash they read earlier get a
+/// run from that tip's chain or nothing, never a mixture; they redraw from whatever comes back
+/// and retry, and there is nothing here to assert.
 async fn tfl_block_sequence(
     call: &TFLServiceCalls,
-    start_hash: ZebBlockHash,
-    final_height_hash: Option<(ZebBlockHeight, ZebBlockHash)>,
-    include_start_hash: bool,
-    read_extra_info: bool, // NOTE: done here rather than on print to isolate async from sync code
-) -> (Vec<(ZebBlockHeight, ZebBlockHash)>, Vec<Option<Arc<Block>>>) {
-    // get "real" initial values //////////////////////////////
-    let (start_height, init_hash) = {
-        if let Ok(StateResponse::BlockHeader { height, header, .. }) =
-            (call.state)(StateRequest::BlockHeader(start_hash.into())).await
-        {
-            if include_start_hash {
-                // NOTE: BlockHashes does not return the first hash provided, so we move back 1.
-                //       We would probably also be fine to just push it directly.
-                (Some(height), Some(header.previous_block_hash))
-            } else {
-                (Some(ZebBlockHeight(height.0 + 1)), Some(start_hash))
-            }
-        } else {
-            (None, None)
-        }
-    };
-    let (final_height, final_hash) = if let Some((height, hash)) = final_height_hash {
-        (Some(height), Some(hash))
-    } else if let Ok(StateResponse::Tip(val)) = (call.state)(StateRequest::Tip).await {
-        val.unzip()
+    anchor: ZebBlockHash,
+    hi_height: ZebBlockHeight,
+    lo_height: ZebBlockHeight,
+    max_len: u32,
+) -> Vec<(ZebBlockHeight, ZebBlockHash, Arc<Block>)> {
+    if let Ok(StateReadResponse::BlockSequence(seq)) = (call.read_state)(
+        StateReadRequest::BlockSequence { anchor, hi_height, lo_height, max_len },
+    )
+    .await
+    {
+        seq
     } else {
-        (None, None)
-    };
-
-    // check validity //////////////////////////////
-    if start_height.is_none() {
-        error!(?start_hash, "start_hash has invalid height");
-        return (Vec::new(), Vec::new());
+        Vec::new()
     }
-    let start_height = start_height.unwrap();
-    let init_hash = init_hash.unwrap();
-
-    if final_height.is_none() {
-        error!(?final_height, "final_hash has invalid height");
-        return (Vec::new(), Vec::new());
-    }
-    let final_height = final_height.unwrap();
-
-    if final_height < start_height {
-        error!(?final_height, ?start_height, "final_height < start_height");
-        return (Vec::new(), Vec::new());
-    }
-
-    // build vector //////////////////////////////
-    let mut hashes = Vec::with_capacity((final_height - start_height + 1) as usize);
-    let mut chunk_i = 0;
-    let mut chunk =
-        Vec::with_capacity(zebra_state::constants::MAX_FIND_BLOCK_HASHES_RESULTS as usize);
-    // NOTE: written as if for iterator
-    let mut c = 0;
-    loop {
-        if chunk_i >= chunk.len() {
-            let chunk_start_hash = if chunk.is_empty() {
-                &init_hash
-            } else {
-                // NOTE: as the new first element, this won't be repeated
-                chunk.last().expect("should have chunk elements by now")
-            };
-
-            let res = (call.state)(StateRequest::FindBlockHashes {
-                known_blocks: vec![*chunk_start_hash],
-                stop: final_hash,
-            })
-            .await;
-
-            if let Ok(StateResponse::BlockHashes(chunk_hashes)) = res {
-                if c == 0 && include_start_hash && !chunk_hashes.is_empty() {
-                    assert_eq!(
-                        chunk_hashes[0], start_hash,
-                        "first hash is not the one requested. chunk_hashes: start_height: {start_height:?}, init_hash: {init_hash}, final_height: {final_height:?}, final_hash: {final_hash:?}, {chunk_hashes:?}"
-                    );
-                }
-
-                chunk = chunk_hashes;
-            } else {
-                break; // unexpected
-            }
-
-            chunk_i = 0;
-        }
-
-        if let Some(val) = chunk.get(chunk_i) {
-            let height = ZebBlockHeight(
-                start_height.0 + <u32>::try_from(hashes.len()).expect("should fit in u32"),
-            );
-            // debug_assert!(if let Some(h) = block_height_from_hash(call, *val).await {
-            //     if h != height {
-            //         error!("expected: {:?}, actual: {:?}", height, h);
-            //     }
-            //     h == height
-            // } else {
-            //     true
-            // });
-            hashes.push((height, *val));
-        } else {
-            break; // expected
-        };
-        chunk_i += 1;
-        c += 1;
-    }
-
-    let mut infos = Vec::with_capacity(if read_extra_info { hashes.len() } else { 0 });
-    if read_extra_info {
-        for hash in &hashes {
-            infos.push(
-                if let Ok(StateResponse::Block(block)) =
-                    (call.state)(StateRequest::Block((hash.1).into())).await
-                {
-                    block
-                } else {
-                    None
-                },
-            )
-        }
-    }
-
-    (hashes, infos)
 }
 
 fn dump_hash_highlight_lo(hash: &ZebBlockHash, highlight_chars_n: usize) {
@@ -2101,6 +1997,11 @@ impl HasBlockHash for ZebBlockHash {
     }
 }
 impl HasBlockHash for (ZebBlockHeight, ZebBlockHash) {
+    fn get_hash(&self) -> Option<ZebBlockHash> {
+        Some(self.1)
+    }
+}
+impl HasBlockHash for (ZebBlockHeight, ZebBlockHash, Arc<Block>) {
     fn get_hash(&self) -> Option<ZebBlockHash> {
         Some(self.1)
     }
@@ -2146,12 +2047,12 @@ where
     unique_chars_n
 }
 
-fn tfl_dump_blocks(blocks: &[(ZebBlockHeight, ZebBlockHash)], infos: &[Option<Arc<Block>>]) {
+fn tfl_dump_blocks(blocks: &[(ZebBlockHeight, ZebBlockHash, Arc<Block>)]) {
     let highlight_chars_n = block_hash_unique_chars_n(blocks);
 
     let print_color = true;
 
-    for (block_i, (_, hash)) in blocks.iter().enumerate() {
+    for (_, hash, block) in blocks.iter() {
         print!("  ");
         if print_color {
             dump_hash_highlight_lo(hash, highlight_chars_n);
@@ -2159,7 +2060,7 @@ fn tfl_dump_blocks(blocks: &[(ZebBlockHeight, ZebBlockHash)], infos: &[Option<Ar
             print!("{}", hash);
         }
 
-        if let Some(Some(block)) = infos.get(block_i) {
+        {
             let shielded_c = block
                 .transactions
                 .iter()
@@ -2181,17 +2082,11 @@ fn tfl_dump_blocks(blocks: &[(ZebBlockHeight, ZebBlockHash)], infos: &[Option<Ar
 
 async fn _tfl_dump_block_sequence(
     call: &TFLServiceCalls,
-    start_hash: ZebBlockHash,
-    final_height_hash: Option<(ZebBlockHeight, ZebBlockHash)>,
-    include_start_hash: bool,
+    anchor: ZebBlockHash,
+    hi_height: ZebBlockHeight,
+    lo_height: ZebBlockHeight,
+    max_len: u32,
 ) {
-    let (blocks, infos) = tfl_block_sequence(
-        call,
-        start_hash,
-        final_height_hash,
-        include_start_hash,
-        true,
-    )
-    .await;
-    tfl_dump_blocks(&blocks[..], &infos[..]);
+    let blocks = tfl_block_sequence(call, anchor, hi_height, lo_height, max_len).await;
+    tfl_dump_blocks(&blocks[..]);
 }

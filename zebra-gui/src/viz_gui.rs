@@ -927,7 +927,11 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
             let mut missing = true;
             if let Some(bc) = viz_state.on_screen_bcs.get_mut(&bft.points_at_bc_block) {
                 missing = false;
-                viz_state.bc_ack_height = viz_state.bc_ack_height.max(bc.block.this_height);
+                // Only heights we know first-hand move the ack. A peer's claimed height is
+                // unvalidated, and the ack decides which blocks the node keeps serving.
+                if bc.block.knowledge > BcKnowledge::PeerAttested {
+                    viz_state.bc_ack_height = viz_state.bc_ack_height.max(bc.block.this_height);
+                }
 
                 // BFT proving headers are real header data for blocks we may never have
                 // received the body of. Headers are deepest-first: proving_blocks[i] sits

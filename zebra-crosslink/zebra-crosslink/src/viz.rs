@@ -743,48 +743,25 @@ pub async fn service_viz_requests(
             // temp
             //assert!(h_lo.0 <= h_hi.0, "lo ({}) should be below hi ({})", h_lo.0, h_hi.0);
 
-            async fn get_height_hash(
-                call: TFLServiceCalls,
-                h: ZebBlockHeight,
-                existing_height_hash: (ZebBlockHeight, ZebBlockHash),
-            ) -> Option<(ZebBlockHeight, ZebBlockHash)> {
-                if h == existing_height_hash.0 {
-                    // avoid duplicating work if we've already got that value
-                    Some(existing_height_hash)
-                } else if let Ok(StateResponse::BlockHeader { hash, .. }) =
-                    (call.state)(StateRequest::BlockHeader(h.into())).await
-                {
-                    Some((h, hash))
-                } else {
-                    error!("Failed to read block header at height {}", h.0);
-                    None
-                }
-            }
-
-            let hi_height_hash = if let Some(hi_height_hash) =
-                get_height_hash(call.clone(), h_hi, tip_height_hash).await
-            {
-                hi_height_hash
-            } else {
+            // Anchored on the tip hash just read, so scrolled-back windows come from the same
+            // chain this cycle reports as the tip rather than whichever chain is best by the
+            // time the state answers.
+            let seq = tfl_block_sequence(
+                &call,
+                tip_height_hash.1,
+                h_hi,
+                h_lo,
+                h_hi.0.saturating_sub(h_lo.0) + 1,
+            )
+            .await;
+            let Some(&(lo_height, _, _)) = seq.first() else {
                 break (ZebBlockHeight(0), None, Vec::new(), Vec::new());
             };
-
-            let lo_height_hash = if let Some(lo_height_hash) =
-                get_height_hash(call.clone(), h_lo, hi_height_hash).await
-            {
-                lo_height_hash
-            } else {
-                break (ZebBlockHeight(0), None, Vec::new(), Vec::new());
-            };
-
-            let (height_hashes, blocks) =
-                tfl_block_sequence(&call, lo_height_hash.1, Some(hi_height_hash), true, true).await;
-            break (
-                lo_height_hash.0,
-                Some(tip_height_hash),
-                height_hashes,
-                blocks,
-            );
+            let height_hashes: Vec<(ZebBlockHeight, ZebBlockHash)> =
+                seq.iter().map(|(height, hash, _)| (*height, *hash)).collect();
+            let blocks: Vec<Option<Arc<Block>>> =
+                seq.into_iter().map(|(_, _, block)| Some(block)).collect();
+            break (lo_height, Some(tip_height_hash), height_hashes, blocks);
         };
 
         if height_hashes.len() != pow_blocks.len() {

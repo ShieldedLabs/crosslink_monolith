@@ -4,7 +4,7 @@ use visualizer_zcash::{
     TxInspection,
 };
 use zebra_chain::value_balance::ValueBalance;
-use std::cmp::{max, min};
+use std::cmp::max;
 
 use crate::*;
 
@@ -55,7 +55,8 @@ pub async fn service_viz_requests(
 ) {
     let call = tfl_handle.clone().call;
 
-    let mut bc_ack_height = 0;
+    let mut bc_ack_height: u64 = 0;
+    let mut skipped_windows_n: u64 = 0;
     let mut instr_strings: Vec<String> = Vec::new();
     // Finalization-candidate heights by candidate hash, resolved lazily from the state.
     // Lets the GUI position BFT certs at their candidate height before it has the PoW
@@ -111,98 +112,28 @@ pub async fn service_viz_requests(
             // PoW tip), older on-screen content has nothing to attach to and floats
             // detached, leaving a gap below the tip cluster.
             let finalized_height = tfl_handle.internal.lock().await.latest_final_block
-                .map(|(h, _)| h.0 as i32)
+                .map(|(h, _)| h.0 as u64)
                 .unwrap_or(bc_ack_height);
             // Page cap: never serve more than the newest BC_PAGE_SIZE blocks; older
             // history is not served for now (history browsing deferred).
-            let page_lo = (bc_tip_height + 1).saturating_sub(BC_PAGE_SIZE) as i32;
-            let bc_req_h = (max(bc_ack_height.min(finalized_height), page_lo), -1);
+            let page_lo = (bc_tip_height + 1).saturating_sub(BC_PAGE_SIZE);
+            let req_lo_height = ZebBlockHeight(max(bc_ack_height.min(finalized_height).min(bc_tip_height), page_lo) as u32);
 
-            #[allow(clippy::never_loop)]
-            let (lo_height, bc_tip, height_hashes, suspect_seq_blocks) = {
-                let (lo, hi) = (bc_req_h.0, bc_req_h.1);
-                assert!(
-                    lo <= hi || (lo >= 0 && hi < 0),
-                    "lo ({}) should be below hi ({})",
-                    lo,
-                    hi
-                );
-
-                let Ok(StateResponse::Tip(Some(tip_height_hash))) = (call.state)(StateRequest::Tip).await
-                else {
-                    continue 'main_loop;
-                };
-
-                let (h_lo, h_hi) = (
-                    min(
-                        tip_height_hash.0,
-                        abs_block_height(lo, Some(tip_height_hash)),
-                    ),
-                    min(
-                        tip_height_hash.0,
-                        abs_block_height(hi, Some(tip_height_hash)),
-                    ),
-                );
-                // temp
-                //assert!(h_lo.0 <= h_hi.0, "lo ({}) should be below hi ({})", h_lo.0, h_hi.0);
-
-                async fn get_height_hash(
-                    call: TFLServiceCalls,
-                    h: ZebBlockHeight,
-                    existing_height_hash: (ZebBlockHeight, ZebBlockHash),
-                ) -> Option<(ZebBlockHeight, ZebBlockHash)> {
-                    if h == existing_height_hash.0 {
-                        // avoid duplicating work if we've already got that value
-                        // TODO: does this miss reorgs?
-                        Some(existing_height_hash)
-                    } else if let Ok(StateResponse::BlockHeader { hash, .. }) =
-                        (call.state)(StateRequest::BlockHeader(h.into())).await
-                    {
-                        Some((h, hash))
-                    } else {
-                        error!("Failed to read block header at height {}", h.0);
-                        None
-                    }
+            // Anchored on the same tip hash this response reports, so every block in it
+            // belongs to the one chain the GUI is being told about. A tip that flipped in
+            // the last few milliseconds leaves this one cycle stale, and self-corrects.
+            let seq_blocks = tfl_block_sequence(&call, tip_height_hash.1, tip_height_hash.0, req_lo_height, BC_PAGE_SIZE as u32).await;
+            if seq_blocks.is_empty() {
+                // The anchor left the state between the tip read and this one. Ordinary
+                // during a reorganization; kept visible, and quiet, in case it is not.
+                skipped_windows_n += 1;
+                if skipped_windows_n == 1 || skipped_windows_n % 1000 == 0 {
+                    info!("no block sequence for [{}..{}], {} skipped", req_lo_height.0, bc_tip_height, skipped_windows_n);
                 }
-
-                let Some(hi_height_hash) = get_height_hash(call.clone(), h_hi, tip_height_hash).await
-                else {
-                    continue 'main_loop;
-                };
-
-                let Some(lo_height_hash) = get_height_hash(call.clone(), h_lo, hi_height_hash).await
-                else {
-                    continue 'main_loop;
-                };
-
-                let (height_hashes, blocks) =
-                    tfl_block_sequence(&call, lo_height_hash.1, Some(hi_height_hash), true, true).await;
-                (
-                    lo_height_hash.0,
-                    Some(tip_height_hash),
-                    height_hashes,
-                    blocks,
-                )
-            };
-
-            // paranoid guards
-            if lo_height.0 as i64 != bc_req_h.0 as i64 {
-                println!("PARANOID != WRONG: lo {} vs requested {}", lo_height.0, bc_req_h.0);
                 continue 'main_loop;
             }
-            if suspect_seq_blocks.is_empty() {
-                println!("PARANOID != WRONG: empty seq blocks");
-                continue 'main_loop;
-            }
-            let mut seq_blocks = Vec::new();
-            for (i, maybe) in suspect_seq_blocks.iter().enumerate() {
-                let Some(block) = maybe
-                else {
-                    println!("PARANOID != WRONG: None seq block at {i}");
-                    continue 'main_loop;
-                };
-                seq_blocks.push(block);
-            }
+            skipped_windows_n = 0;
+            let lo_height = seq_blocks[0].0;
 
 
             // Blocks peers claim to have (from the new_network STATUS exchange) that we
@@ -268,9 +199,28 @@ pub async fn service_viz_requests(
                         let path_string = request.serialize_instrs_path.clone();
                         tokio::task::spawn(async move {
                             let Ok(StateResponse::Tip(Some(tip))) = (ser_call.state)(StateRequest::Tip).await else { return; };
-                            let Ok(StateResponse::BlockHeader { hash: lo_hash, .. }) =
-                                (ser_call.state)(StateRequest::BlockHeader(ZebBlockHeight(1).into())).await else { return; };
-                            let (_, blocks) = tfl_block_sequence(&ser_call, lo_hash, Some(tip), true, true).await;
+
+                            // The whole chain, paged so no single response has to hold it.
+                            // Each page is anchored on the previous page's parent hash, so
+                            // consecutive pages join into one chain by construction; a page
+                            // coming back short means the chain moved and the file would be
+                            // missing its base, so abandon it rather than write a gap.
+                            const SER_PAGE_SIZE: u32 = 8192;
+                            let mut pages: Vec<Vec<(ZebBlockHeight, ZebBlockHash, Arc<Block>)>> = Vec::new();
+                            let (mut hi_hash, mut hi_height) = (tip.1, tip.0);
+                            loop {
+                                let page = tfl_block_sequence(&ser_call, hi_hash, hi_height, ZebBlockHeight(1), SER_PAGE_SIZE).await;
+                                let Some((lo_height, _, lowest)) = page.first().cloned() else {
+                                    info!("serialization abandoned: the chain moved while paging");
+                                    return;
+                                };
+                                hi_hash = lowest.header.previous_block_hash;
+                                hi_height = ZebBlockHeight(lo_height.0.saturating_sub(1));
+                                pages.push(page);
+                                if lo_height <= ZebBlockHeight(1) { break; }
+                            }
+                            pages.reverse();
+                            let blocks: Vec<Arc<Block>> = pages.into_iter().flatten().map(|(_, _, block)| block).collect();
 
                             let (bft_blocks, fat_pointer_to_tip) = {
                                 let internal = handle.internal.lock().await;
@@ -287,7 +237,7 @@ pub async fn service_viz_requests(
                             let mut next_bft = 0usize;
                             // Each BFT block goes just before the first PoW block that commits to it,
                             // preserving the chronology a replay needs.
-                            for block in blocks.iter().flatten() {
+                            for block in blocks.iter() {
                                 let target = block.header.fat_pointer_to_bft_block.points_at_block_hash();
                                 if let Some(j) = bft_hashes.iter().position(|h| *h == target) {
                                     while next_bft <= j {
@@ -316,22 +266,17 @@ pub async fn service_viz_requests(
                     }
 
                     // Backfill: the GUI can see the bottom of its loaded chain; serve the next
-                    // page of older best-chain blocks so coverage extends downward contiguously.
+                    // page of older blocks so coverage extends downward contiguously.
                     // Fetched before taking the internal lock since state calls await.
-                    let mut backfill_hh: Vec<(ZebBlockHeight, ZebBlockHash)> = Vec::new();
-                    let mut backfill_blocks: Vec<Option<Arc<Block>>> = Vec::new();
+                    //
+                    // Anchored on the same tip hash as the window above, so the two pages are
+                    // from one chain and join. If that tip is gone by now this comes back empty
+                    // and the GUI asks again, which beats splicing in a page from elsewhere.
+                    let mut backfill_blocks: Vec<(ZebBlockHeight, ZebBlockHash, Arc<Block>)> = Vec::new();
                     if request.bc_want_below > 0 && request.bc_want_below <= bc_tip_height {
                         let hi_h = ZebBlockHeight((request.bc_want_below - 1) as u32);
                         let lo_h = ZebBlockHeight(hi_h.0.saturating_sub(BC_PAGE_SIZE as u32 - 1));
-                        if let (
-                            Ok(StateResponse::BlockHeader { hash: lo_hash, .. }),
-                            Ok(StateResponse::BlockHeader { hash: hi_hash, .. }),
-                        ) = (
-                            (call.state)(StateRequest::BlockHeader(lo_h.into())).await,
-                            (call.state)(StateRequest::BlockHeader(hi_h.into())).await,
-                        ) {
-                            (backfill_hh, backfill_blocks) = tfl_block_sequence(&call, lo_hash, Some((hi_h, hi_hash)), true, true).await;
-                        }
+                        backfill_blocks = tfl_block_sequence(&call, tip_height_hash.1, hi_h, lo_h, BC_PAGE_SIZE as u32).await;
                     }
 
                     let mut internal = tfl_handle.internal.lock().await;
@@ -372,8 +317,11 @@ pub async fn service_viz_requests(
                     response.staking_bonded_pool_balance = staking_bonded_pool_balance;
                     response.staking_unbonded_pool_balance = staking_unbonded_pool_balance;
 
-                    response.start_bc_height = lo_height.0 as u64; // actual window start (may be below ack; see bc_req_h)
-                    bc_ack_height = bc_ack_height.max(request.bc_ack_height as i32);
+                    response.start_bc_height = lo_height.0 as u64; // actual window start, may be below ack
+                    // Clamped to the tip: the GUI derives its ack from on-screen block
+                    // heights, and a bogus one above the tip would otherwise collapse the
+                    // window onto the tip block itself.
+                    bc_ack_height = bc_ack_height.max(request.bc_ack_height).min(bc_tip_height);
 
                     let pow_inspection = |block: &Block| {
                         use zebra_chain::{transaction::Transaction, transparent};
@@ -424,8 +372,8 @@ pub async fn service_viz_requests(
                         })
                     };
 
-                    for (i, bc) in seq_blocks.iter().enumerate() {
-                        let this_hash = Hash32::from_bytes(bc.header.hash().0);
+                    for (height, hash, bc) in seq_blocks.iter() {
+                        let this_hash = Hash32::from_bytes(hash.0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;
                             response.block_inspection = pow_inspection(bc.as_ref());
@@ -433,7 +381,7 @@ pub async fn service_viz_requests(
                         response.bc_blocks.push(visualizer_zcash::BcBlock {
                             this_hash,
                             parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
-                            this_height: lo_height.0 as u64 + i as u64,
+                            this_height: height.0 as u64,
                             txs_n: bc.transactions.len(),
                             is_best_chain: true,
                             is_finalized: false,
@@ -447,17 +395,14 @@ pub async fn service_viz_requests(
                             serialized_size: bc.zcash_serialized_size(),
                             // Flag this block when it sits at a hardfork's PoW activation height.
                             // Many forks may share that height; each is flagged independently.
-                            is_hardfork_activation: {
-                                let h = lo_height.0 as u64 + i as u64;
-                                tfl_handle.config.hardforks.iter().any(|hf| hf.pow_activation_height == h)
-                            },
+                            is_hardfork_activation: tfl_handle.config.hardforks.iter()
+                                .any(|hf| hf.pow_activation_height == height.0 as u64),
                         });
                     }
 
                     // backfill page (older best-chain blocks below the GUI's coverage)
-                    for (hh, maybe_block) in backfill_hh.iter().zip(backfill_blocks.iter()) {
-                        let Some(bc) = maybe_block else { continue };
-                        let this_hash = Hash32::from_bytes(hh.1.0);
+                    for (height, hash, bc) in backfill_blocks.iter() {
+                        let this_hash = Hash32::from_bytes(hash.0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;
                             response.block_inspection = pow_inspection(bc.as_ref());
@@ -465,7 +410,7 @@ pub async fn service_viz_requests(
                         response.bc_blocks.push(visualizer_zcash::BcBlock {
                             this_hash,
                             parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
-                            this_height: hh.0.0 as u64,
+                            this_height: height.0 as u64,
                             txs_n: bc.transactions.len(),
                             is_best_chain: true,
                             is_finalized: false,
@@ -477,7 +422,7 @@ pub async fn service_viz_requests(
                             utc: bc.header.time.timestamp(),
                             serialized_size: bc.zcash_serialized_size(),
                             is_hardfork_activation: tfl_handle.config.hardforks.iter()
-                                .any(|hf| hf.pow_activation_height == hh.0.0 as u64),
+                                .any(|hf| hf.pow_activation_height == height.0 as u64),
                         });
                     }
 
@@ -524,8 +469,7 @@ pub async fn service_viz_requests(
                     // the certs decided over that PoW span. (Candidate-height inversion would
                     // also work as an extent source; fat pointers are the direct one.)
                     let mut bft_extent: Option<(usize, usize)> = None;
-                    for maybe_block in &backfill_blocks {
-                        let Some(bc) = maybe_block else { continue };
+                    for (_, _, bc) in &backfill_blocks {
                         let ptr = bc.header.fat_pointer_to_bft_block.points_at_block_hash();
                         if let Some(&h) = internal.bft_block_hash_to_height.get(&ptr) {
                             let h = h as usize;
@@ -541,7 +485,7 @@ pub async fn service_viz_requests(
                     // the load boundary. Folding the window blocks' pointers into the extent
                     // makes the served cert range contiguous across the seam.
                     if bft_extent.is_some() {
-                        for bc in &seq_blocks {
+                        for (_, _, bc) in &seq_blocks {
                             let ptr = bc.header.fat_pointer_to_bft_block.points_at_block_hash();
                             if let Some(&h) = internal.bft_block_hash_to_height.get(&ptr) {
                                 let h = h as usize;
@@ -632,22 +576,3 @@ pub async fn service_viz_requests(
     }
 }
 
-fn abs_block_height(height: i32, tip: Option<(ZebBlockHeight, ZebBlockHash)>) -> ZebBlockHeight {
-    if height >= 0 {
-        ZebBlockHeight(height.try_into().unwrap())
-    } else if let Some(tip) = tip {
-        tip.0.sat_sub(!height)
-    } else {
-        ZebBlockHeight(0)
-    }
-}
-
-fn abs_block_heights(
-    heights: (i32, i32),
-    tip: Option<(ZebBlockHeight, ZebBlockHash)>,
-) -> (ZebBlockHeight, ZebBlockHeight) {
-    (
-        abs_block_height(heights.0, tip),
-        abs_block_height(heights.1, tip),
-    )
-}
