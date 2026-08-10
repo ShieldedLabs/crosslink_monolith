@@ -407,6 +407,8 @@ pub struct VizState {
     pub on_screen_bfts: HashMap<Hash32, OnScreenBft>,
     pub did_initial_tip_jump: bool, // "reset view" to the tip once, as soon as the first blocks load
     pub bc_lowest_loaded: u64, // lowest best-chain height on screen; scrolling to it triggers downward backfill
+    pub bc_best_heights: std::collections::HashSet<u64>, // heights with a best-chain full block on screen
+    pub bc_covered_down_to: u64, // [this..tip] is contiguously covered; a gap down to bc_lowest_loaded is a hole to fill
     pub send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
     pub receive_from_zebra: std::sync::mpsc::Receiver<ResponseFromZebra>,
 
@@ -664,6 +666,8 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         on_screen_bfts: HashMap::new(),
         did_initial_tip_jump: false,
         bc_lowest_loaded: u64::MAX,
+        bc_best_heights: std::collections::HashSet::new(),
+        bc_covered_down_to: u64::MAX,
         send_to_zebra: me_send,
         receive_from_zebra: me_receive,
         bc_tip_height: 0,
@@ -822,28 +826,26 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         viz_state.staking_bonded_pool_balance = message.staking_bonded_pool_balance;
         viz_state.staking_unbonded_pool_balance = message.staking_unbonded_pool_balance;
 
-        // Within the height span this message ACTUALLY served best-chain blocks for,
-        // the message is authoritative: an on-screen block in that span is best iff
-        // the message says so, which lets reorged-out blocks (re-served at the same
-        // heights under new hashes) go gray instead of staying red forever.
-        // Bounding by the served span rather than [start_bc_height..tip] means a
-        // message that under-covers its claimed window can never gray out real
-        // best-chain blocks (the failure the old blanket reset was suspected of).
-        // Below-span blocks keep their flags: they are finalized-stable.
-        let mut served_lo = u64::MAX;
-        let mut served_hi = 0u64;
-        let mut served_best: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
+        // At each height this message ACTUALLY served a best-chain block for, the
+        // message is authoritative: an on-screen block there is best iff the message
+        // says so, which lets reorged-out blocks (re-served at the same heights under
+        // new hashes) go gray instead of staying red forever. Membership is per
+        // served HEIGHT, not the min..max span: one response can carry the window
+        // plus a backfill page with an un-served gap between them, and a span test
+        // grays out every real best-chain block in that gap (and previously loaded
+        // pages). Heights the message did not serve keep their flags.
+        let mut served_best_hashes: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
+        let mut served_heights: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for bc in &message.bc_blocks {
             if bc.is_best_chain {
-                served_lo = served_lo.min(bc.this_height);
-                served_hi = served_hi.max(bc.this_height);
-                served_best.insert(bc.this_hash);
+                served_best_hashes.insert(bc.this_hash);
+                served_heights.insert(bc.this_height);
             }
         }
-        if served_lo <= served_hi {
+        if !served_heights.is_empty() {
             for on_screen in viz_state.on_screen_bcs.values_mut() {
-                let h = on_screen.block.this_height;
-                if h >= served_lo && h <= served_hi && !served_best.contains(&on_screen.block.this_hash) {
+                if served_heights.contains(&on_screen.block.this_height)
+                    && !served_best_hashes.contains(&on_screen.block.this_hash) {
                     on_screen.block.is_best_chain = false;
                 }
             }
@@ -903,12 +905,14 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                 r.block = updated_block;
                 if r.block.is_best_chain {
                     viz_state.bc_lowest_loaded = viz_state.bc_lowest_loaded.min(r.block.this_height);
+                    viz_state.bc_best_heights.insert(r.block.this_height);
                 }
             } else {
                 anything_happened |= true;
                 new_blocks_n += 1;
                 if bc.is_best_chain {
                     viz_state.bc_lowest_loaded = viz_state.bc_lowest_loaded.min(bc.this_height);
+                    viz_state.bc_best_heights.insert(bc.this_height);
                 }
                 // spawn at the target height (fade in only): a fly-in from spawn_y is fine
                 // for a few tip blocks, but bulk arrivals (pages, BFT catch-up bursts) streaking
@@ -1007,10 +1011,29 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         viz_state.camera_y = y_for_height(viz_state.bc_tip_height as f32);
     }
 
+    // Contiguous coverage: [bc_covered_down_to..tip] all have best-chain full blocks
+    // on screen. Walk the floor down as heights arrive.
+    if viz_state.bc_covered_down_to == u64::MAX
+        && viz_state.bc_best_heights.contains(&viz_state.bc_tip_height) {
+        viz_state.bc_covered_down_to = viz_state.bc_tip_height;
+    }
+    while viz_state.bc_covered_down_to != u64::MAX
+        && viz_state.bc_covered_down_to > 0
+        && viz_state.bc_best_heights.contains(&(viz_state.bc_covered_down_to - 1)) {
+        viz_state.bc_covered_down_to -= 1;
+    }
+
     if anything_happened == false {
-        // if the camera can see the bottom of the loaded chain and older blocks exist,
-        // ask for the next page below the current coverage
-        let bc_want_below = {
+        let bc_want_below = if viz_state.bc_covered_down_to != u64::MAX
+            && viz_state.bc_covered_down_to > viz_state.bc_lowest_loaded
+        {
+            // A hole: full blocks exist below the covered floor, so the state must hold
+            // the best-chain blocks in between (later blocks imply their ancestors);
+            // we just haven't got them for viz. Fill the page below the floor.
+            viz_state.bc_covered_down_to
+        } else {
+            // if the camera can see the bottom of the loaded chain and older blocks
+            // exist, ask for the next page below the current coverage
             let screen_unit = SCREEN_UNIT_CONST * ZOOM_FACTOR.powf(viz_state.zoom);
             let camera_h = height_for_y(viz_state.camera_y);
             let half_span_h = (1500.0 / screen_unit) / BLOCK_SPACING; // ~half a viewport's worth, in heights
