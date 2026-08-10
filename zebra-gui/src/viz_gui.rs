@@ -22,6 +22,7 @@ pub struct RequestToZebra {
     pub load_instrs_path: String,
     /// Path for zebra to serialize its current chains to as a .zeccltf. Empty = no request.
     pub serialize_instrs_path: String,
+    pub bc_want_below: u64, // camera can see the bottom of loaded coverage: serve a page of best-chain blocks below this height; 0 = nothing wanted
 }
 impl RequestToZebra {
     pub fn _0() -> Self {
@@ -32,6 +33,7 @@ impl RequestToZebra {
             bft_pause: false,
             load_instrs_path: String::new(),
             serialize_instrs_path: String::new(),
+            bc_want_below: 0,
         }
     }
 }
@@ -148,6 +150,7 @@ pub struct ResponseFromZebra {
     pub bc_finalized_tip_height: u64,
     pub bft_tip_height: u64,
     pub bc_blocks: Vec<BcBlock>,
+    pub bc_attested: Vec<(Hash32, Hash32, u64)>, // blocks peers claim that we haven't seen: (hash, claimed parent hash, claimed height)
     pub bft_blocks: Vec<BftBlock>,
     pub what_block_it_is: Hash32,
     pub block_inspection: BlockInspection,
@@ -184,6 +187,7 @@ impl ResponseFromZebra {
             bc_finalized_tip_height: 0,
             bft_tip_height: 0,
             bc_blocks: Vec::new(),
+            bc_attested: Vec::new(),
             bft_blocks: Vec::new(),
             what_block_it_is: Hash32::from_u64(0),
             block_inspection: BlockInspection::None,
@@ -203,6 +207,16 @@ impl ResponseFromZebra {
     }
 }
 
+/// Best knowledge we have of a PoW block, ordered so merging is a `max`.
+/// HeaderSeen implies BFT attestation: BFT blocks are currently our only source
+/// of headers without bodies; split the variant if headers ever arrive alone.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum BcKnowledge {
+    PeerAttested, // hash + claimed height announced by a peer; nothing else known
+    HeaderSeen,   // full header known (from a BFT block): parent/time/work are real; txs/size unknown
+    FullBlock,    // we hold the block
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)] // , Serialize, Deserialize)]
 pub struct BcBlock {
     pub this_hash: Hash32,
@@ -211,7 +225,7 @@ pub struct BcBlock {
     pub txs_n: usize,
     pub is_best_chain: bool,
     pub is_finalized: bool,
-    pub is_implicated_by_bft: bool,
+    pub knowledge: BcKnowledge,
     pub points_at_bft_block: Hash32,
     // #[cfg(debug_assertions)]
     pub work: u64,
@@ -231,7 +245,7 @@ impl Default for BcBlock {
             txs_n: 0,
             is_best_chain: false,
             is_finalized: false,
-            is_implicated_by_bft: false,
+            knowledge: BcKnowledge::PeerAttested,
             points_at_bft_block: Hash32::from_u64(0),
             // #[cfg(debug_assertions)]
             work: 0,
@@ -249,7 +263,6 @@ struct OnScreenBc {
     alpha: f32,
     bft_arrow_alpha: f32,
     finalized_alpha: f32,
-    implicated_by_bft_alpha: f32,
 
     t_x: f32,
     t_y: f32,
@@ -258,7 +271,7 @@ struct OnScreenBc {
     t_alpha: f32,
     t_bft_arrow_alpha: f32,
     t_finalized_alpha: f32,
-    t_implicated_by_bft_alpha: f32,
+    last_attested: Instant, // latest time peers attested this block; drives the stale-claim fade (PeerAttested only)
     block: BcBlock,
 }
 impl Default for OnScreenBc {
@@ -271,7 +284,6 @@ impl Default for OnScreenBc {
             alpha: 1.0,
             bft_arrow_alpha: 1.0,
             finalized_alpha: 0.0,
-            implicated_by_bft_alpha: 0.0,
             t_x: 0.0,
             t_y: 0.0,
             t_roundness: 1.0,
@@ -279,10 +291,21 @@ impl Default for OnScreenBc {
             t_alpha: 1.0,
             t_bft_arrow_alpha: 1.0,
             t_finalized_alpha: 0.0,
-            t_implicated_by_bft_alpha: 0.0,
+            last_attested: Instant::now(),
             block: BcBlock::default(),
         }
     }
+}
+
+/// A PoW header carried inside a BFT block (a confirmation header above the
+/// finalization candidate). Real header data: lets the GUI show blocks it has
+/// never received the body of.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct ProvingHeader {
+    pub hash: Hash32,
+    pub parent_hash: Hash32,
+    pub utc: i64,
+    pub work: u64,
 }
 
 // use serde::{Serialize, Deserialize};
@@ -292,7 +315,8 @@ pub struct BftBlock {
     pub parent_hash: Hash32,
     pub this_height: u64,
     pub points_at_bc_block: Hash32,
-    pub proving_blocks: Vec<Hash32>,
+    pub points_at_bc_height: u64, // finalization candidate's BC height (0 = unknown): positions the cert even before its PoW block arrives
+    pub proving_blocks: Vec<ProvingHeader>,
     /// The *next* BFT block (this block's successor) activates a user-led
     /// hardfork. We mark this block so the GUI can signal that a hardfork is
     /// imminent — i.e. that the block about to be built is special.
@@ -305,6 +329,7 @@ impl Default for BftBlock {
             parent_hash: Hash32::from_u64(0),
             this_height: 0,
             points_at_bc_block: Hash32::from_u64(0),
+            points_at_bc_height: 0,
             proving_blocks: Vec::with_capacity(0),
             next_block_is_hardfork: false,
         }
@@ -348,6 +373,11 @@ const COLOR_BFT:    u32 = 0xdc4c4f;
 const COLOR_ACCENT: u32 = 0x121212;
 const COLOR_BRIGHT: u32 = 0xffffff;
 
+// stale-claim fade: a PeerAttested block holds full claim alpha for FRESH_SECS after
+// its last attestation, then fades to a greyed-out floor over FADE_SECS
+const PEER_ATTEST_FRESH_SECS: f32 = 10.0;
+const PEER_ATTEST_FADE_SECS:  f32 = 20.0;
+
 const COLOR_BC_LINK:    u32 = 0x4e7b73;
 const COLOR_BFT_LINK:   u32 = 0x9a2d37;
 const COLOR_CROSS_LINK: u32 = 0x4e7b73;
@@ -373,6 +403,8 @@ pub struct VizState {
     pub instr_failed: Vec<(usize, String)>,
     pub on_screen_bcs: HashMap<Hash32, OnScreenBc>,
     pub on_screen_bfts: HashMap<Hash32, OnScreenBft>,
+    pub did_initial_tip_jump: bool, // "reset view" to the tip once, as soon as the first blocks load
+    pub bc_lowest_loaded: u64, // lowest best-chain height on screen; scrolling to it triggers downward backfill
     pub send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
     pub receive_from_zebra: std::sync::mpsc::Receiver<ResponseFromZebra>,
 
@@ -592,14 +624,14 @@ pub fn apply_viz_op(state: &VizState, block: Hash32, op: InteractiveVizOp) -> Ve
         },
 
         InteractiveVizOp::tip => {
-            res.push(*bft.unwrap().block.proving_blocks.last().unwrap_or(&Hash32::from_u64(0)));
+            res.push(bft.unwrap().block.proving_blocks.last().map(|ph| ph.hash).unwrap_or(Hash32::from_u64(0)));
         }
 
         InteractiveVizOp::bft_last_final => res.push(bft.unwrap().block.parent_hash),
         InteractiveVizOp::origbft_last_final => todo!(),
         InteractiveVizOp::snapshot => {
             // TODO: what is the `ceil(1, bc')` suffix?
-            res.push(*bft.unwrap().block.proving_blocks.first().unwrap_or(&Hash32::from_u64(0))); // TODO: fall back to genesis hash instead of 0
+            res.push(bft.unwrap().block.proving_blocks.first().map(|ph| ph.hash).unwrap_or(Hash32::from_u64(0))); // TODO: fall back to genesis hash instead of 0
         },
     }
 
@@ -628,6 +660,8 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         instr_failed: Vec::new(),
         on_screen_bcs: HashMap::new(),
         on_screen_bfts: HashMap::new(),
+        did_initial_tip_jump: false,
+        bc_lowest_loaded: u64::MAX,
         send_to_zebra: me_send,
         receive_from_zebra: me_receive,
         bc_tip_height: 0,
@@ -664,7 +698,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 
     if fake_data {
         // TODO: pull from binary test data
-        let mut make_bc = |seq: &mut u64, parent_hash: Hash32, points_at_bft_block: Hash32, txs_n: usize, is_best_chain: bool, is_finalized: bool, is_implicated_by_bft: bool| -> Hash32 {
+        let mut make_bc = |seq: &mut u64, parent_hash: Hash32, points_at_bft_block: Hash32, txs_n: usize, is_best_chain: bool, is_finalized: bool, _bft_implicated: bool| -> Hash32 {
             let this_height = if let Some(parent) = viz_state.on_screen_bcs.get(&parent_hash) {
                 parent.block.this_height+1
             } else {
@@ -680,7 +714,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 
             *seq += 1;
             let this_hash = Hash32::from_u64(*seq);
-            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, is_implicated_by_bft, points_at_bft_block, work:1234, utc:0, serialized_size: 0, is_hardfork_activation: false }, ..Default::default() };
+            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, knowledge: BcKnowledge::FullBlock, points_at_bft_block, work:1234, utc:0, serialized_size: 0, is_hardfork_activation: false }, ..Default::default() };
             viz_state.on_screen_bcs.insert(block.block.this_hash, block);
             this_hash
         };
@@ -692,7 +726,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
             viz_state.bft_tip_height = this_height;
 
             let this_hash = Hash32::from_u64(*seq);
-            let block = OnScreenBft { block: BftBlock { this_hash, parent_hash: bft_parent_hash, this_height, points_at_bc_block, proving_blocks: vec![points_at_bc_block], next_block_is_hardfork: false }, ..Default::default() };
+            let block = OnScreenBft { block: BftBlock { this_hash, parent_hash: bft_parent_hash, this_height, points_at_bc_block, points_at_bc_height: 0, proving_blocks: vec![], next_block_is_hardfork: false }, ..Default::default() };
             viz_state.on_screen_bfts.insert(block.block.this_hash, block);
 
             bft_parent_hash = this_hash;
@@ -810,70 +844,121 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
 
         for bc in &message.bc_blocks {
             if let Some(r) = viz_state.on_screen_bcs.get_mut(&bc.this_hash) {
-                // merge existing & new blocks to minimize info-loss
-                let updated_block = BcBlock {
-                    // old-wins
-                    this_hash:   r.block.this_hash,
-                    parent_hash: r.block.parent_hash,
+                let updated_block = if bc.knowledge > r.block.knowledge {
+                    // strictly better knowledge: the incoming record's structural fields
+                    // (parent, height, time, work, ...) supersede the old guesses/claims
+                    // outright; only monotone display flags carry over
+                    BcBlock {
+                        is_best_chain:          r.block.is_best_chain          || bc.is_best_chain,
+                        is_finalized:           r.block.is_finalized           || bc.is_finalized,
+                        is_hardfork_activation: r.block.is_hardfork_activation || bc.is_hardfork_activation,
+                        ..*bc
+                    }
+                } else {
+                    // equal (or worse) knowledge: merge field-wise to minimize info-loss
+                    BcBlock {
+                        // old-wins
+                        this_hash:   r.block.this_hash,
+                        parent_hash: r.block.parent_hash,
+                        knowledge:   r.block.knowledge,
 
-                    // OR-merging
-                    is_best_chain:          r.block.is_best_chain          || bc.is_best_chain,
-                    is_finalized:           r.block.is_finalized           || bc.is_finalized,
-                    is_implicated_by_bft:   r.block.is_implicated_by_bft   || bc.is_implicated_by_bft,
-                    is_hardfork_activation: r.block.is_hardfork_activation || bc.is_hardfork_activation,
+                        // OR-merging
+                        is_best_chain:          r.block.is_best_chain          || bc.is_best_chain,
+                        is_finalized:           r.block.is_finalized           || bc.is_finalized,
+                        is_hardfork_activation: r.block.is_hardfork_activation || bc.is_hardfork_activation,
 
-                    // max-merging (mostly avoiding 0s)
-                    this_height:     bc.this_height.max(r.block.this_height),
-                    txs_n:           bc.txs_n.max(r.block.txs_n),
-                    work:            bc.work.max(r.block.work),
-                    utc:             bc.utc.max(r.block.utc),
-                    serialized_size: bc.serialized_size.max(r.block.serialized_size),
+                        // max-merging (mostly avoiding 0s)
+                        this_height:     bc.this_height.max(r.block.this_height),
+                        txs_n:           bc.txs_n.max(r.block.txs_n),
+                        work:            bc.work.max(r.block.work),
+                        utc:             bc.utc.max(r.block.utc),
+                        serialized_size: bc.serialized_size.max(r.block.serialized_size),
 
-                    points_at_bft_block: if bc.points_at_bft_block != Hash32::from_u64(0) {
-                        bc.points_at_bft_block
-                    } else {
-                        r.block.points_at_bft_block
-                    },
+                        points_at_bft_block: if bc.points_at_bft_block != Hash32::from_u64(0) {
+                            bc.points_at_bft_block
+                        } else {
+                            r.block.points_at_bft_block
+                        },
+                    }
                 };
 
                 anything_happened |= r.block != updated_block;
                 r.block = updated_block;
+                if r.block.is_best_chain {
+                    viz_state.bc_lowest_loaded = viz_state.bc_lowest_loaded.min(r.block.this_height);
+                }
             } else {
                 anything_happened |= true;
                 new_blocks_n += 1;
-                viz_state.on_screen_bcs.insert(bc.this_hash, OnScreenBc { y: spawn_y, block: *bc, alpha: 0.0, ..Default::default() });
+                if bc.is_best_chain {
+                    viz_state.bc_lowest_loaded = viz_state.bc_lowest_loaded.min(bc.this_height);
+                }
+                // spawn at the target height (fade in only): a fly-in from spawn_y is fine
+                // for a few tip blocks, but bulk arrivals (pages, cert floods) streaking
+                // across the whole chain read as screen-wide flashing
+                viz_state.on_screen_bcs.insert(bc.this_hash, OnScreenBc { y: -10.0 * bc.this_height as f32, block: *bc, alpha: 0.0, ..Default::default() });
             }
         }
+        for (hash, claimed_parent, claimed_height) in &message.bc_attested {
+            if let Some(existing) = viz_state.on_screen_bcs.get_mut(hash) {
+                // any real knowledge beats a peer claim; the re-attestation still counts
+                // as fresh (only read while knowledge == PeerAttested)
+                existing.last_attested = Instant::now();
+                continue;
+            }
+            anything_happened |= true;
+            viz_state.on_screen_bcs.insert(*hash, OnScreenBc { y: -10.0 * *claimed_height as f32, alpha: 0.0, block: BcBlock {
+                this_hash: *hash,
+                parent_hash: *claimed_parent, // links up if we know (or learn) the parent
+                this_height: *claimed_height,
+                txs_n: 0,
+                is_best_chain: false,
+                is_finalized: false,
+                knowledge: BcKnowledge::PeerAttested,
+                points_at_bft_block: Hash32::from_u64(0),
+                work: 0,
+                utc: 0,
+                serialized_size: 0,
+                is_hardfork_activation: false,
+            }, ..Default::default() });
+        }
+
         for bft in message.bft_blocks {
             let mut missing = true;
             if let Some(bc) = viz_state.on_screen_bcs.get_mut(&bft.points_at_bc_block) {
                 missing = false;
                 viz_state.bc_ack_height = viz_state.bc_ack_height.max(bc.block.this_height);
-                bc.block.is_implicated_by_bft = true;
 
-                let mut prev = bft.points_at_bc_block;
-                for hash in &bft.proving_blocks {
-                    if let Some(bc) = viz_state.on_screen_bcs.get_mut(hash) { bc.block.is_implicated_by_bft = true; }
-                    else {
-                        let parent = viz_state.on_screen_bcs.get(&prev).unwrap();
-                        let block = OnScreenBc { y: spawn_y, block: BcBlock {
-                            this_hash: *hash,
-                            parent_hash: parent.block.this_hash,
-                            txs_n: 1,
-                            this_height: parent.block.this_height + 1,
-                            is_best_chain: false,
-                            is_finalized: false,
-                            is_implicated_by_bft: true,
-                            points_at_bft_block: Hash32::from_u64(0),
-                            // #[cfg(debug_assertions)]
-                            work: 0,
-                            utc: 0,
-                            serialized_size: 0,
-                            is_hardfork_activation: false,
-                        }, ..Default::default() };
-                        viz_state.on_screen_bcs.insert(block.block.this_hash, block);
+                // BFT proving headers are real header data for blocks we may never have
+                // received the body of. Headers are deepest-first: proving_blocks[i] sits
+                // i+1 above the finalization candidate this BFT block points at.
+                let candidate_height = bc.block.this_height;
+                for (i, ph) in bft.proving_blocks.iter().enumerate() {
+                    let header_block = BcBlock {
+                        this_hash: ph.hash,
+                        parent_hash: ph.parent_hash,
+                        txs_n: 0,
+                        this_height: candidate_height + 1 + i as u64,
+                        is_best_chain: false,
+                        is_finalized: false,
+                        knowledge: BcKnowledge::HeaderSeen,
+                        points_at_bft_block: Hash32::from_u64(0),
+                        work: ph.work,
+                        utc: ph.utc,
+                        serialized_size: 0,
+                        is_hardfork_activation: false,
+                    };
+                    match viz_state.on_screen_bcs.get_mut(&ph.hash) {
+                        Some(existing) if existing.block.knowledge < BcKnowledge::HeaderSeen => {
+                            anything_happened |= true;
+                            existing.block = header_block;
+                        }
+                        Some(_) => {} // full block already known; a header adds nothing
+                        None => {
+                            anything_happened |= true;
+                            viz_state.on_screen_bcs.insert(ph.hash, OnScreenBc { y: -10.0 * header_block.this_height as f32, alpha: 0.0, block: header_block, ..Default::default() });
+                        }
                     }
-                    prev = *hash;
                 }
             }
             if let Some(r) = viz_state.on_screen_bfts.get_mut(&bft.this_hash) {
@@ -883,7 +968,8 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                 if missing == false { viz_state.bft_ack_height = viz_state.bft_ack_height.max(bft.this_height); }
                 anything_happened |= true;
                 new_blocks_n += 1;
-                viz_state.on_screen_bfts.insert(bft.this_hash, OnScreenBft { block: bft, alpha: 0.0, y: spawn_y, ..Default::default() });
+                let bft_spawn_y = if bft.points_at_bc_height > 0 { -10.0 * bft.points_at_bc_height as f32 - 10.0 / 2.0 } else { spawn_y };
+                viz_state.on_screen_bfts.insert(bft.this_hash, OnScreenBft { block: bft, alpha: 0.0, y: bft_spawn_y, ..Default::default() });
             }
         }
     }
@@ -893,7 +979,30 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         play_sound(SOUND_UI_HOVER, 0.4, 1.6);
     }
 
+    // jump to the tip once, as soon as the first blocks have loaded ("reset view" on startup)
+    if !viz_state.did_initial_tip_jump && viz_state.bc_tip_height > 0 && !viz_state.on_screen_bcs.is_empty() {
+        viz_state.did_initial_tip_jump = true;
+        viz_state.camera_x = 0.0;
+        viz_state.camera_y = -10.0 * viz_state.bc_tip_height as f32;
+    }
+
     if anything_happened == false {
+        // if the camera can see the bottom of the loaded chain and older blocks exist,
+        // ask for the next page below the current coverage
+        let bc_want_below = {
+            let screen_unit = SCREEN_UNIT_CONST * ZOOM_FACTOR.powf(viz_state.zoom);
+            let camera_h = -viz_state.camera_y / 10.0;
+            let half_span_h = (1500.0 / screen_unit) / 10.0; // ~half a viewport's worth, in heights
+            let visible_bottom_h = (camera_h - half_span_h) as i64;
+            if viz_state.bc_lowest_loaded != u64::MAX
+                && viz_state.bc_lowest_loaded > 0
+                && visible_bottom_h <= viz_state.bc_lowest_loaded as i64
+            {
+                viz_state.bc_lowest_loaded
+            } else {
+                0
+            }
+        };
         let sent = viz_state.send_to_zebra.try_send(RequestToZebra {
             want_to_inspect_block: viz_state.inspecting_block_hash,
             bft_ack_height: viz_state.bft_ack_height,
@@ -901,6 +1010,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
             bft_pause: viz_state.bft_paused,
             load_instrs_path: viz_state.load_instrs_path_pending.clone(),
             serialize_instrs_path: viz_state.serialize_instrs_path_pending.clone(),
+            bc_want_below,
         });
         if sent.is_ok() {
             viz_state.load_instrs_path_pending = String::new();
@@ -967,7 +1077,6 @@ fn animate_bc_towards_target(on_screen_bc: &mut OnScreenBc, dt: f32) {
     on_screen_bc.alpha = e_lerp(on_screen_bc.alpha, on_screen_bc.t_alpha, dt);
     on_screen_bc.bft_arrow_alpha = e_lerp(on_screen_bc.bft_arrow_alpha, on_screen_bc.t_bft_arrow_alpha, dt);
     on_screen_bc.finalized_alpha = e_lerp(on_screen_bc.finalized_alpha, on_screen_bc.t_finalized_alpha, dt);
-    on_screen_bc.implicated_by_bft_alpha = e_lerp(on_screen_bc.implicated_by_bft_alpha, on_screen_bc.t_implicated_by_bft_alpha, dt);
 }
 
 fn animate_bft_towards_target(on_screen_bft: &mut OnScreenBft, dt: f32) {
@@ -1597,7 +1706,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         if let Some(bc)  = viz_state.on_screen_bcs.get(&hovered_block)  { hover_related.insert(bc.block.points_at_bft_block); }
         if let Some(bft) = viz_state.on_screen_bfts.get(&hovered_block) {
             hover_related.insert(bft.block.points_at_bc_block);
-            hover_pow_range = bft.block.proving_blocks.clone();
+            hover_pow_range = bft.block.proving_blocks.iter().map(|ph| ph.hash).collect();
             for hash in &hover_pow_range { hover_related.insert(*hash); }
         }
     }
@@ -1633,7 +1742,6 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         if on_screen_bc.block.this_hash == viz_state.inspecting_block_hash { on_screen_bc.t_darkness += 0.2; }
         on_screen_bc.t_alpha = if hovered_block == no_hash || hover_related.contains(&on_screen_bc.block.this_hash) { 1.0 } else { 0.5 };
         on_screen_bc.t_finalized_alpha = if on_screen_bc.block.is_finalized { 1.0 } else { 0.0 };
-        on_screen_bc.t_implicated_by_bft_alpha = if on_screen_bc.block.is_implicated_by_bft { 1.0 } else { 0.0 };
         on_screen_bc.t_x = -5.0;
         on_screen_bc.t_y = -10.0 * on_screen_bc.block.this_height as f32;
 
@@ -1642,7 +1750,17 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         }
 
         if !on_screen_bc.block.is_best_chain && !hover_related.contains(&on_screen_bc.block.this_hash) {
-            on_screen_bc.alpha = 0.25;
+            on_screen_bc.alpha = match on_screen_bc.block.knowledge {
+                BcKnowledge::FullBlock    => 0.25,
+                BcKnowledge::HeaderSeen   => 0.20,
+                BcKnowledge::PeerAttested => {
+                    // claims fade toward a greyed-out floor unless peers keep re-attesting
+                    // (or the block is seen at a better knowledge level, leaving this tier)
+                    let stale_s = on_screen_bc.last_attested.elapsed().as_secs_f32();
+                    let fade = 1.0 - ((stale_s - PEER_ATTEST_FRESH_SECS) / PEER_ATTEST_FADE_SECS).clamp(0.0, 1.0);
+                    0.04 + 0.11 * fade
+                }
+            };
         }
     }
     for on_screen_bft in magic(&mut viz_state.on_screen_bfts).values_mut() {
@@ -1670,6 +1788,10 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         on_screen_bft.t_x = 5.0;
         on_screen_bft.t_y = if let Some(on_screen_bc) = viz_state.on_screen_bcs.get(&on_screen_bft.block.points_at_bc_block) {
             on_screen_bc.y - 10.0 / 2.0
+        } else if on_screen_bft.block.points_at_bc_height > 0 {
+            // candidate block not on screen (yet): position at its known height, so the
+            // cert sits where its PoW blocks belong and camera paging fetches them
+            -10.0 * on_screen_bft.block.points_at_bc_height as f32 - 10.0 / 2.0
         } else {
             if let Some(parent_bft) = viz_state.on_screen_bfts.get(&on_screen_bft.block.parent_hash) {
                 parent_bft.y - 10.0
@@ -1833,15 +1955,26 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                     w
                 };
 
-                let extra_info = DateTime::<Utc>::from_timestamp_secs(on_screen_bc.block.utc).unwrap_or(DateTime::<Utc>::MAX_UTC).to_string();
-                let extra_info = &extra_info[..extra_info.len()-4]; // remove " UTC"
-                let extra_info2 = format!("work: 0x{:x}", on_screen_bc.block.work);
-                let extra_info3 = format!("size: {} ({})", on_screen_bc.block.serialized_size, (on_screen_bc.block.serialized_size + 37 + 1399) / 1400);
-                // #[cfg(debug_assertions)]
+                // info lines gated on knowledge: only draw what's real, not placeholders
                 let s = screen_unit as f32 * 1.2; // .2 to include padding
-                draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y + 1.0*s, screen_unit, extra_info, color);
-                draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y + 2.0*s, screen_unit, &extra_info2, color);
-                draw_ctx.text_line(FontKind::Mono, origin_x + (x - 1.5 - w)*screen_unit, here_text_y + 3.0*s, screen_unit, &extra_info3, color);
+                let info_x = origin_x + (x - 1.5 - w)*screen_unit;
+                match on_screen_bc.block.knowledge {
+                    BcKnowledge::PeerAttested => {
+                        let extra_info = format!("claimed @ {} by peers", on_screen_bc.block.this_height);
+                        draw_ctx.text_line(FontKind::Mono, info_x, here_text_y + 1.0*s, screen_unit, &extra_info, color);
+                    }
+                    knowledge => {
+                        let extra_info = DateTime::<Utc>::from_timestamp_secs(on_screen_bc.block.utc).unwrap_or(DateTime::<Utc>::MAX_UTC).to_string();
+                        let extra_info = &extra_info[..extra_info.len()-4]; // remove " UTC"
+                        let extra_info2 = format!("work: 0x{:x}", on_screen_bc.block.work);
+                        draw_ctx.text_line(FontKind::Mono, info_x, here_text_y + 1.0*s, screen_unit, extra_info, color);
+                        draw_ctx.text_line(FontKind::Mono, info_x, here_text_y + 2.0*s, screen_unit, &extra_info2, color);
+                        if knowledge == BcKnowledge::FullBlock {
+                            let extra_info3 = format!("size: {} ({})", on_screen_bc.block.serialized_size, (on_screen_bc.block.serialized_size + 37 + 1399) / 1400);
+                            draw_ctx.text_line(FontKind::Mono, info_x, here_text_y + 3.0*s, screen_unit, &extra_info3, color);
+                        }
+                    }
+                }
             }
 
             if let Some(parent) = viz_state.on_screen_bcs.get(&on_screen_bc.block.parent_hash) {

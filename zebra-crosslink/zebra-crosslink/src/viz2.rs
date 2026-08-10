@@ -34,6 +34,20 @@ pub fn viz_main(tokio_root_thread_handle: Option<std::thread::JoinHandle<()>>, w
 }
 
 
+/// Max best-chain blocks served per response. Bounds the startup burst (a fresh GUI
+/// acks 0, which used to request the entire chain). Must comfortably exceed the
+/// non-finalized window (~100) so the always-served [finalized tip..tip] span is
+/// never cut. History below the window is not served for now; proper demand paging
+/// is deferred (see the viz-paging branch for a prototype).
+const BC_PAGE_SIZE: u64 = 1024;
+
+/// Max BFT blocks served per response. A fresh GUI acks 0; serving only the newest
+/// page keeps the first message bounded, and since the newest BFT blocks anchor to
+/// on-screen best-chain blocks the ack then ratchets up and steady-state resends
+/// are small. Deep BFT history is not yet demand-paged.
+/// TODO: page old BFT blocks in on demand (e.g. from camera position), as bc does.
+const BFT_PAGE_SIZE: usize = 2048;
+
 /// Bridge between tokio & viz code
 pub async fn service_viz_requests(
     tfl_handle: crate::TFLServiceHandle,
@@ -43,6 +57,11 @@ pub async fn service_viz_requests(
 
     let mut bc_ack_height = 0;
     let mut instr_strings: Vec<String> = Vec::new();
+    // Finalization-candidate heights by candidate hash, resolved lazily from the state.
+    // Lets the GUI position BFT certs at their candidate height before it has the PoW
+    // block, which in turn lets camera paging fetch those blocks (a shown cert should
+    // never be left without its PoW blocks). Bounded by total cert count.
+    let mut bft_candidate_heights: std::collections::HashMap<Hash32, u64> = std::collections::HashMap::new();
 
     loop {
         let request_queue = visualizer_zcash::REQUESTS_TO_ZEBRA.lock().unwrap();
@@ -94,7 +113,10 @@ pub async fn service_viz_requests(
             let finalized_height = tfl_handle.internal.lock().await.latest_final_block
                 .map(|(h, _)| h.0 as i32)
                 .unwrap_or(bc_ack_height);
-            let bc_req_h = (bc_ack_height.min(finalized_height), -1);
+            // Page cap: never serve more than the newest BC_PAGE_SIZE blocks; older
+            // history is not served for now (history browsing deferred).
+            let page_lo = (bc_tip_height + 1).saturating_sub(BC_PAGE_SIZE) as i32;
+            let bc_req_h = (max(bc_ack_height.min(finalized_height), page_lo), -1);
 
             #[allow(clippy::never_loop)]
             let (lo_height, bc_tip, height_hashes, suspect_seq_blocks) = {
@@ -183,6 +205,40 @@ pub async fn service_viz_requests(
             }
 
 
+            // Blocks peers claim to have (from the new_network STATUS exchange) that we
+            // don't: shown by the GUI as PeerAttested at their claimed heights. The sync
+            // loop filters against our near-tip chains when publishing (see
+            // PEER_ATTESTED_BLOCKS for the deep no-overlap caveat), and the GUI drops
+            // claims for blocks already on screen; same data serves every response below.
+            let bc_attested: Vec<(Hash32, Hash32, u64)> = zebra_state::new_network::PEER_ATTESTED_BLOCKS
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|sb| (Hash32::from_bytes(sb.this_hash.0), Hash32::from_bytes(sb.parent_hash.0), sb.this_height as u64))
+                .collect();
+
+            // Resolve any unresolved finalization-candidate heights for the BFT page.
+            // Hashes are collected under a short internal lock; the state lookups await
+            // outside it. Steady-state this is 0-1 lookups; the first cycle resolves the
+            // whole page once.
+            {
+                let unresolved: Vec<Hash32> = {
+                    let internal = tfl_handle.internal.lock().await;
+                    let page_start = internal.bft_blocks.len().saturating_sub(BFT_PAGE_SIZE);
+                    internal.bft_blocks[page_start..].iter()
+                        .map(|b| Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0))
+                        .filter(|h| !bft_candidate_heights.contains_key(h))
+                        .collect()
+                };
+                for hash in unresolved {
+                    if let Ok(StateResponse::BlockHeader { height, .. }) =
+                        (call.state)(StateRequest::BlockHeader(zebra_state::HashOrHeight::Hash(ZebBlockHash(hash.as_bytes()).into()))).await
+                    {
+                        bft_candidate_heights.insert(hash, height.0 as u64);
+                    }
+                }
+            }
+
             for _ in 0..256 {
                 if let Ok(request) = request_queue.try_recv() {
                     crate::BFT_PAUSE.store(request.bft_pause, std::sync::atomic::Ordering::Relaxed);
@@ -259,8 +315,28 @@ pub async fn service_viz_requests(
                         });
                     }
 
+                    // Backfill: the GUI can see the bottom of its loaded chain; serve the next
+                    // page of older best-chain blocks so coverage extends downward contiguously.
+                    // Fetched before taking the internal lock since state calls await.
+                    let mut backfill_hh: Vec<(ZebBlockHeight, ZebBlockHash)> = Vec::new();
+                    let mut backfill_blocks: Vec<Option<Arc<Block>>> = Vec::new();
+                    if request.bc_want_below > 0 && request.bc_want_below <= bc_tip_height {
+                        let hi_h = ZebBlockHeight((request.bc_want_below - 1) as u32);
+                        let lo_h = ZebBlockHeight(hi_h.0.saturating_sub(BC_PAGE_SIZE as u32 - 1));
+                        if let (
+                            Ok(StateResponse::BlockHeader { hash: lo_hash, .. }),
+                            Ok(StateResponse::BlockHeader { hash: hi_hash, .. }),
+                        ) = (
+                            (call.state)(StateRequest::BlockHeader(lo_h.into())).await,
+                            (call.state)(StateRequest::BlockHeader(hi_h.into())).await,
+                        ) {
+                            (backfill_hh, backfill_blocks) = tfl_block_sequence(&call, lo_hash, Some((hi_h, hi_hash)), true, true).await;
+                        }
+                    }
+
                     let mut internal = tfl_handle.internal.lock().await;
                     let mut response = visualizer_zcash::ResponseFromZebra::_0();
+                    response.bc_attested = bc_attested.clone();
                     response.bft_recency = internal.recency_status.clone(); // TODO: do we want a better way of communicating singleton data
                     {
                         // Terminated finalizers, derived the same way tenderlink filters its roster:
@@ -361,7 +437,7 @@ pub async fn service_viz_requests(
                             txs_n: bc.transactions.len(),
                             is_best_chain: true,
                             is_finalized: false,
-                            is_implicated_by_bft: false,
+                            knowledge: visualizer_zcash::BcKnowledge::FullBlock,
                             points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash().0),
                             // #[cfg(debug_assertions)]
                             work: bc.header.difficulty_threshold.to_work()
@@ -377,6 +453,34 @@ pub async fn service_viz_requests(
                             },
                         });
                     }
+
+                    // backfill page (older best-chain blocks below the GUI's coverage)
+                    for (hh, maybe_block) in backfill_hh.iter().zip(backfill_blocks.iter()) {
+                        let Some(bc) = maybe_block else { continue };
+                        let this_hash = Hash32::from_bytes(hh.1.0);
+                        if request.want_to_inspect_block == this_hash {
+                            response.what_block_it_is = this_hash;
+                            response.block_inspection = pow_inspection(bc.as_ref());
+                        }
+                        response.bc_blocks.push(visualizer_zcash::BcBlock {
+                            this_hash,
+                            parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
+                            this_height: hh.0.0 as u64,
+                            txs_n: bc.transactions.len(),
+                            is_best_chain: true,
+                            is_finalized: false,
+                            knowledge: visualizer_zcash::BcKnowledge::FullBlock,
+                            points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash().0),
+                            work: bc.header.difficulty_threshold.to_work()
+                                .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
+                                .unwrap_or(0xdeadbeef),
+                            utc: bc.header.time.timestamp(),
+                            serialized_size: bc.zcash_serialized_size(),
+                            is_hardfork_activation: tfl_handle.config.hardforks.iter()
+                                .any(|hf| hf.pow_activation_height == hh.0.0 as u64),
+                        });
+                    }
+
 
                     // Fetch sidechain blocks from NonFinalizedState so the visualizer
                     // can render forks alongside the best chain.
@@ -399,7 +503,7 @@ pub async fn service_viz_requests(
                                 txs_n: block.transactions.len(),
                                 is_best_chain: false,
                                 is_finalized: false,
-                                is_implicated_by_bft: false,
+                                knowledge: visualizer_zcash::BcKnowledge::FullBlock,
                                 points_at_bft_block: Hash32::from_u64(0),
                                 work,
                                 utc: header.time.timestamp(),
@@ -410,8 +514,61 @@ pub async fn service_viz_requests(
                         }
                     }
 
-                    for i in request.bft_ack_height as usize..internal.bft_blocks.len() {
+                    // Newest-page cap: a fresh GUI acks 0; the newest BFT blocks anchor to
+                    // on-screen bc blocks, so its ack ratchets up after the first message.
+                    let bft_page_start = (request.bft_ack_height as usize)
+                        .max(internal.bft_blocks.len().saturating_sub(BFT_PAGE_SIZE));
+
+                    // BFT certs for the backfill page: each PoW block's fat pointer names a
+                    // cert, so the [min..max] cert-index extent linked from the page covers
+                    // the certs decided over that PoW span. (Candidate-height inversion would
+                    // also work as an extent source; fat pointers are the direct one.)
+                    let mut bft_extent: Option<(usize, usize)> = None;
+                    for maybe_block in &backfill_blocks {
+                        let Some(bc) = maybe_block else { continue };
+                        let ptr = bc.header.fat_pointer_to_bft_block.points_at_block_hash();
+                        if let Some(&h) = internal.bft_block_hash_to_height.get(&ptr) {
+                            let h = h as usize;
+                            bft_extent = Some(match bft_extent {
+                                None => (h, h),
+                                Some((lo, hi)) => (lo.min(h), hi.max(h)),
+                            });
+                        }
+                    }
+                    // Bridge the seam to the window: a cert whose candidate is just below the
+                    // window but which is only pointed at by in-window blocks belongs to
+                    // neither the newest-page serving nor the page extent, leaving a hole at
+                    // the load boundary. Folding the window blocks' pointers into the extent
+                    // makes the served cert range contiguous across the seam.
+                    if bft_extent.is_some() {
+                        for bc in &seq_blocks {
+                            let ptr = bc.header.fat_pointer_to_bft_block.points_at_block_hash();
+                            if let Some(&h) = internal.bft_block_hash_to_height.get(&ptr) {
+                                let h = h as usize;
+                                bft_extent = Some(match bft_extent {
+                                    None => (h, h),
+                                    Some((lo, hi)) => (lo.min(h), hi.max(h)),
+                                });
+                            }
+                        }
+                    }
+
+                    let mut bft_indices: Vec<usize> = Vec::new();
+                    if let Some((lo, hi)) = bft_extent {
+                        let hi = hi.min(lo + BFT_PAGE_SIZE - 1).min(internal.bft_blocks.len().saturating_sub(1));
+                        bft_indices.extend((lo..=hi).filter(|i| *i < bft_page_start));
+                    }
+                    bft_indices.extend(bft_page_start..internal.bft_blocks.len());
+
+                    for i in bft_indices {
                         let b = &internal.bft_blocks[i];
+                        let candidate_hash = Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0);
+                        let candidate_height = bft_candidate_heights.get(&candidate_hash).copied().unwrap_or(0);
+                        // Newest-page certs are served only if their finalization candidate lies
+                        // inside the served PoW window: a shown cert always has its PoW blocks
+                        // shown. Backfill-extent certs are exempt: their PoW page ships in this
+                        // very response (their candidate heights are also mostly unresolved).
+                        if i >= bft_page_start && candidate_height < lo_height.0 as u64 { continue; }
                         let this_hash = Hash32::from_bytes(b.blake3_hash().0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;
@@ -421,8 +578,18 @@ pub async fn service_viz_requests(
                             this_hash: this_hash,
                             parent_hash: Hash32::from_bytes(b.previous_block_hash().0),
                             this_height: i as u64,
-                            points_at_bc_block: Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0),
-                            proving_blocks: b.headers.iter().skip(1).map(|x| Hash32::from_bytes(BlockHash::from_header_data(x).0)).collect(),
+                            points_at_bc_block: candidate_hash,
+                            points_at_bc_height: candidate_height,
+                            // full header data, so the GUI can show proven blocks it never received
+                            proving_blocks: b.headers.iter().skip(1).map(|x| visualizer_zcash::ProvingHeader {
+                                hash: Hash32::from_bytes(BlockHash::from_header_data(x).0),
+                                parent_hash: Hash32::from_bytes(x.prev_block.0),
+                                utc: x.time as i64,
+                                work: zebra_chain::work::difficulty::CompactDifficulty(x.bits)
+                                    .to_work()
+                                    .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
+                                    .unwrap_or(0),
+                            }).collect(),
                             // Foreknowledge from the hardfork schedule (known at startup, not from
                             // the next block): flag this block when a hardfork activates at the next
                             // BFT height, so the GUI can warn before the hardfork block exists.

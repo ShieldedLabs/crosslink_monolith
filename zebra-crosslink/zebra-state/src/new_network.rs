@@ -710,6 +710,7 @@ const TRACE     :bool=0!=       0;
 
 const STATUS_MS: u64 = 4000;  // fastest interval at which to send status messages
 const BLOCK_SEND_MS: u64 = 500; // fastest interval at which to send blocks to peers
+const ATTESTED_PUBLISH_MS: u64 = 2000; // interval at which to publish PEER_ATTESTED_BLOCKS (display-facing; prime so it stays off the other timers)
 
 
 const MAX_PEERS_TO_CONNECT_PER_ATTEMPT: usize = 2;
@@ -1243,6 +1244,16 @@ const BLOCK_SUBMISSION_QUEUE_LEN: usize = 256;
 static BLOCK_SUBMISSION_SENDER: std::sync::OnceLock<tokio::sync::mpsc::Sender<BlockSubmission>> =
     std::sync::OnceLock::new();
 
+/// Blocks that peers claim to have (from the near-tip trees they send in STATUS
+/// packets) but that are absent from our own near-tip chains. Deduplicated across
+/// peers. Refreshed by the sync loop on the status cadence; readers (e.g. the
+/// visualizer) lock and clone at any time.
+///
+/// NOTE: a branch sharing no run with our near-tip chains is attested whole, so it
+/// may include old blocks we do have (below our comparison window); filter against
+/// the state if that matters.
+pub static PEER_ATTESTED_BLOCKS: std::sync::Mutex<Vec<ShadowBlock>> = std::sync::Mutex::new(Vec::new());
+
 /// Submit a block to new_network and wait for its verdict.
 ///
 /// Applies backpressure rather than dropping: nothing re-submits a miner's solved block, so a
@@ -1422,6 +1433,7 @@ pub fn sync(
     let mut next_peer_connect = std::time::Instant::now();
     let mut next_peer_request = std::time::Instant::now();
     let mut next_console_status_print = std::time::Instant::now();
+    let mut next_attested_publish = std::time::Instant::now();
 
 
     // Lite checkpoint: enforced at the commit-queue push, and stays armed forever.
@@ -1466,6 +1478,35 @@ pub fn sync(
                            read_state.finalized_tip().map(|(h, _)| h.0),
                            my_peers_to_print);
             next_console_status_print = loop_start + std::time::Duration::from_secs(2);
+        }
+
+        // Publish the blocks peers claim that we don't have ourselves (see
+        // PEER_ATTESTED_BLOCKS). Display-facing housekeeping on its own timer, kept
+        // out of the packet send/receive paths so they never touch the lock.
+        if loop_start >= next_attested_publish {
+            next_attested_publish = loop_start + std::time::Duration::from_millis(ATTESTED_PUBLISH_MS);
+
+            if let Some(near_tip_chains) = near_tip_chains_from_state(&read_state) {
+                let mut seen: HashSet<Hash> = HashSet::new(); // cross-peer dedup
+                let mut attested: Vec<ShadowBlock> = Vec::new();
+                for peer in peers.values() {
+                    for branch in &peer.their_tree.branches {
+                        // Everything above the longest run shared with any of our chains
+                        // is the peer's claim beyond our knowledge. A shared run also
+                        // vouches for the branch below it (parent-linked), so no run
+                        // means the whole branch is unshared. One block per height, so
+                        // the unshared part is just the suffix past the shared run.
+                        let mut shared_n = 0;
+                        for our_chain in &near_tip_chains.chains {
+                            if let Some(last) = chain_intersect_prefix(branch, &our_chain.blocks).last() {
+                                shared_n = shared_n.max((last.this_height + 1 - branch[0].this_height) as usize);
+                            }
+                        }
+                        attested.extend(branch[shared_n..].iter().copied().filter(|b| seen.insert(b.this_hash)));
+                    }
+                }
+                *PEER_ATTESTED_BLOCKS.lock().unwrap() = attested;
+            }
         }
 
         // Crosslink finalization: the BFT side asks, this loop performs it. It used to reach
