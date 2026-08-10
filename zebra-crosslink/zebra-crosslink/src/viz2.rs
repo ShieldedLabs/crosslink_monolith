@@ -37,8 +37,8 @@ pub fn viz_main(tokio_root_thread_handle: Option<std::thread::JoinHandle<()>>, w
 /// Max best-chain blocks served per response. Bounds the startup burst (a fresh GUI
 /// acks 0, which used to request the entire chain). Must comfortably exceed the
 /// non-finalized window (~100) so the always-served [finalized tip..tip] span is
-/// never cut. History below the window is not served for now; proper demand paging
-/// is deferred (see the viz-paging branch for a prototype).
+/// never cut. History below the window is served on demand as the camera reaches
+/// the bottom of loaded coverage (bc_want_below).
 const BC_PAGE_SIZE: u64 = 1024;
 
 /// Max BFT blocks served per response. A fresh GUI acks 0; serving only the newest
@@ -47,6 +47,37 @@ const BC_PAGE_SIZE: u64 = 1024;
 /// are small. Deep BFT history is not yet demand-paged.
 /// TODO: page old BFT blocks in on demand (e.g. from camera position), as bc does.
 const BFT_PAGE_SIZE: usize = 2048;
+
+fn work_from_difficulty(difficulty: zebra_chain::work::difficulty::CompactDifficulty) -> u64 {
+    difficulty.to_work()
+        .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// The one place a served PoW block becomes a viz BcBlock.
+fn bc_block_from_block(
+    bc: &Block,
+    this_height: u64,
+    is_best_chain: bool,
+    hardforks: &[crate::config::HardForkConfig],
+) -> visualizer_zcash::BcBlock {
+    visualizer_zcash::BcBlock {
+        this_hash: Hash32::from_bytes(bc.header.hash().0),
+        parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
+        this_height,
+        txs_n: bc.transactions.len(),
+        is_best_chain,
+        is_finalized: false,
+        knowledge: visualizer_zcash::BcKnowledge::FullBlock,
+        points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash().0),
+        work: work_from_difficulty(bc.header.difficulty_threshold),
+        utc: bc.header.time.timestamp(),
+        serialized_size: bc.zcash_serialized_size(),
+        // Flag this block when it sits at a hardfork's PoW activation height.
+        // Many forks may share that height; each is flagged independently.
+        is_hardfork_activation: hardforks.iter().any(|hf| hf.pow_activation_height == this_height),
+    }
+}
 
 /// Bridge between tokio & viz code
 pub async fn service_viz_requests(
@@ -115,10 +146,7 @@ pub async fn service_viz_requests(
             // Keep the window covering the whole non-finalized span [finalized tip..tip]:
             // sidechain forks root above the finalized tip and BFT finalization candidates
             // lag the PoW tip, so anchoring both on screen needs these best-chain blocks
-            // resent every cycle. With only [ack..tip] (ack ratchets to just behind the
-            // PoW tip), older on-screen content has nothing to attach to and floats
-            // detached, leaving a gap below the tip cluster.
-            // Never cut [finalized tip..tip] out of the window, even when finality lags
+            // resent every cycle. Never cut that span out of the window, even when finality lags
             // the PoW tip by more than a page (that lag is exactly what this visualizer
             // should show): the page cap only bounds ack-lag. While finality is still
             // unknown (fresh restart) the ack alone bounds the window; corrects itself
@@ -531,10 +559,7 @@ pub async fn service_viz_requests(
                                 hash: Hash32::from_bytes(BlockHash::from_header_data(x).0),
                                 parent_hash: Hash32::from_bytes(x.prev_block.0),
                                 utc: x.time as i64,
-                                work: zebra_chain::work::difficulty::CompactDifficulty(x.bits)
-                                    .to_work()
-                                    .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
-                                    .unwrap_or(0),
+                                work: work_from_difficulty(zebra_chain::work::difficulty::CompactDifficulty(x.bits)),
                             }).collect(),
                             // Foreknowledge from the hardfork schedule (known at startup, not from
                             // the next block): flag this block when a hardfork activates at the next
