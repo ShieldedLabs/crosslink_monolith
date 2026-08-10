@@ -89,7 +89,7 @@ pub enum TFLServiceResponse {
     /// Send a staking command transaction
     StakingCmd,
     /// Faucet
-    Faucet(Result<u64, String>),
+    Faucet(Result<(u64, String), String>),
     /// Response to [`ReadRequest::TotalIssuanceFromKey`]
     TotalIssuanceFromKey(Result<Vec<ScanInfo>, String>),
     /// Finalizer recency status + reference UTC

@@ -1843,12 +1843,26 @@ async fn tfl_service_incoming_request(
 
         // wallet
         TFLServiceRequest::Faucet(request) => {
+            // Stage the request and BLOCK until the wallet loop has actually built and
+            // broadcast the transaction, mirroring WalletStakingAction. The old path
+            // returned a fixed amount the instant the address was queued, before any
+            // send, so a caller could not tell a paid request from a dropped one. Now the
+            // reply carries the real (amount, txid) or a real error.
             Ok(TFLServiceResponse::Faucet({
-                let closure = wallet::FAUCET_REQUEST.lock().unwrap();
-                if let Some(closure) = closure.as_ref() {
-                    (closure.0)(request)
-                } else {
-                    Err("No faucet available".to_owned())
+                let rx = {
+                    let mut lock = wallet::FAUCET_STAGE.lock().unwrap();
+                    match *lock {
+                        None => {
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            *lock = Some((request, tx));
+                            rx
+                        }
+                        Some(_) => return Err(zebra_state::crosslink::TFLServiceError::Misc("faucet is busy with another request, come back soon".to_string())),
+                    }
+                };
+                match rx.await {
+                    Ok(result) => result,
+                    Err(err) => return Err(zebra_state::crosslink::TFLServiceError::Misc(format!("{err}"))),
                 }
             }))
         }
