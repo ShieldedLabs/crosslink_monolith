@@ -107,13 +107,14 @@ pub mod scanner;
 
 use zcash_protocol::consensus::{NetworkType, Parameters, MAIN_NETWORK, TEST_NETWORK};
 
-#[derive(Clone)]
-pub struct FaucetRequestClosure(pub Arc<dyn Fn(String) -> Result<u64, String> + Sync + Send + 'static>);
-pub static FAUCET_REQUEST: Mutex<Option<FaucetRequestClosure>> = Mutex::new(None);
 pub static USER_UFVK_STRING: Mutex<Option<String>> = Mutex::new(None);
 pub static GUI_ENABLE_MINE: Mutex<bool> = Mutex::new(true);
 
 pub static STAKING_STAGE: Mutex<Option<(StakingActionRequest, tokio::sync::oneshot::Sender<Result<String, String>>)>> = Mutex::new(None);
+
+// Faucet RPC requests, staged for the wallet loop the same way staking is: an address
+// plus a reply channel the loop fills with the real (amount, txid) once the send lands.
+pub static FAUCET_STAGE: Mutex<Option<(String, tokio::sync::oneshot::Sender<Result<(u64, String), String>>)>> = Mutex::new(None);
 
 #[derive(Clone)]
 pub struct RecencyRequestClosure(pub Arc<dyn Fn() -> Option<String> + Sync + Send + 'static>);
@@ -2711,23 +2712,6 @@ fn shard_tree_root(tree: &OrchardShardTree) -> orchard::tree::MerkleHashOrchard 
         .unwrap()
 }
 
-const FAUCET_Q_LEN: usize = 16;
-struct FaucetQ {
-    pub read_o: u8,
-    pub write_o: u8,
-    pub data: [Option<orchard::Address>; FAUCET_Q_LEN],
-}
-impl FaucetQ {
-    fn len(&self) -> usize {
-        self.write_o.wrapping_sub(self.read_o).into()
-    }
-}
-// TODO: atomic
-static FAUCET_Q: Mutex<FaucetQ> = Mutex::new(FaucetQ {
-    read_o: 0,
-    write_o: 0,
-    data: [None; FAUCET_Q_LEN],
-});
 const TEST_FAUCET: bool = false;
 const FAUCET_VALUE: u64 = 50_000_000;
 
@@ -3183,41 +3167,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let network = &TEST_NETWORK;
 
-    *FAUCET_REQUEST.lock().unwrap() = Some(FaucetRequestClosure(Arc::new(|ua_str: String| -> Result<u64, String> {
-        // let ua = zcash_address::unified::Address::decode(&ua_str).map_err(|err|
-        //     Err(format!("invalid address: \"{ua_str}\" failed: {err}"))
-        // )?.1;
-        let ua = match zcash_keys::address::Address::decode(network, &ua_str) {
-            Some(zcash_keys::address::Address::Unified(ua)) => ua,
-            Some(_) => return Err(format!("must be an orchard-containing UA")),
-            None => return Err(format!("couldn't decode address")),
-        };
-        let Some(orchard_addr) = ua.orchard() else {
-            return Err(format!("must contain an orchard receiver"));
-        };
-
-        let mut q = FAUCET_Q.lock().unwrap();
-        if q.len() == q.data.len() {
-            return Err(format!("faucet too busy, come back later"));
-        }
-
-        for idx in 0..q.len() {
-            let i = (q.read_o as usize + idx) % q.data.len();
-            if let Some(existing_addr) = &q.data[i] {
-                if orchard_addr == existing_addr {
-                    return Err(format!("the last request for this address is still pending, come back later"));
-                }
-            } else {
-                println!("Faucet Q error: got None result where there should be valid data");
-            }
-        }
-
-        let i = q.write_o as usize % q.data.len();
-        q.write_o += 1;
-        q.data[i] = Some(orchard_addr.clone());
-
-        Ok(FAUCET_VALUE)
-    })));
 
 
     let (
@@ -3333,7 +3282,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
         println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: "arosienarsoienaroisetn".to_owned() }).await);
         println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
-        FAUCET_Q.lock().unwrap().read_o += 1; // fake read
         println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
     }
 
@@ -3425,6 +3373,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut proposed_send = ProposedTx::EMPTY;
 
     let mut rpc_stake: Option<(ProposedTx, tokio::sync::oneshot::Sender<Result<String, String>>)> = None;
+    let mut rpc_faucet: Option<(ProposedTx, tokio::sync::oneshot::Sender<Result<(u64, String), String>>)> = None;
 
     let mut wallet_state_push_time = Instant::now();
 
@@ -4435,6 +4384,33 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
+        // Faucet: take a staged RPC request, decode the recipient, and PROPOSE the send
+        // from the miner wallet. The reply channel travels with it to the drive step
+        // below, which answers only once the tx actually reaches SENT.
+        if rpc_faucet.is_none() {
+            let staged = FAUCET_STAGE.lock().unwrap().take();
+            if let Some((ua_str, sender)) = staged {
+                let orchard_addr = match zcash_keys::address::Address::decode(network, &ua_str) {
+                    Some(zcash_keys::address::Address::Unified(ua)) => ua.orchard().cloned(),
+                    _ => None,
+                };
+                match orchard_addr {
+                    None => { let _ = sender.send(Err(format!("address must be an orchard-containing unified address: \"{ua_str}\""))); }
+                    Some(orchard_addr) => {
+                        let mut tx = ProposedTx::EMPTY;
+                        let memo = MemoBytes::from_bytes("With love from your favourite faucet... Don't spend it all at once!".as_bytes()).unwrap();
+                        let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut tx, &mut client, &miner_usk, FAUCET_VALUE, &orchard_tree, orchard_addr, memo).is_some();
+                        if ok {
+                            just_init_new_tx = true;
+                            rpc_faucet = Some((tx, sender));
+                        } else {
+                            let _ = sender.send(Err("faucet has no spendable orchard notes right now".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
         // @todo(judah): I'm thinking the weird frame hitch we get in the UI is caused by this loop,
         // since it's probably waiting for the wallet_state mutex to unlock.
         let mut retries_this_round = 6;
@@ -4456,25 +4432,6 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                 if DUMP_ACTIONS { println!("*** wallet has {:?} actions in flight", wallet_state.actions_in_flight.len()); }
                 let Some(action) = wallet_state.actions_in_flight.front() else {
-                    // if we're not doing anything else, process a faucet RPC request
-                    if ! proposed_faucet.is_in_progress() {
-                        let mut q = FAUCET_Q.lock().unwrap();
-                        if DUMP_FAUCET { println!("faucet Q read_o: {}, write_o: {}", q.read_o, q.write_o); }
-                        if q.len() > 0 {
-                            let i = q.read_o as usize % q.data.len();
-                            if DUMP_FAUCET { println!("faucet Q new element at {i}: {:?}", q.data[i]); }
-                            if let Some(orchard_addr) = q.data[i] {
-                                let memo = MemoBytes::from_bytes("With love from your favourite faucet... Don't spend it all at once!".as_bytes()).unwrap();
-                                let ok = miner_wallet.send_orchard_to_orchard_zats(network, &mut proposed_faucet, &mut client, &miner_usk, FAUCET_VALUE, &orchard_tree, orchard_addr, memo).is_some();
-                                proposed_faucet.is_user_faucet = false;
-                                if DUMP_ACTIONS { println!("Try RPC faucet send: {ok:?}"); }
-                                just_init_new_tx |= ok;
-                                q.read_o += 1;
-                            } else {
-                                println!("Faucet Q error: got None result where there should be valid data");
-                            }
-                        }
-                    }
 
                     break;
                 };
@@ -4643,6 +4600,19 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         println!("RPC staking progress: {}, {:?}", tx_progress.h, tx.tx_res);
                         rpc_stake = Some((tx, sender))
                     }
+                }
+            }
+
+            // Faucet: drive the proposed send through build -> broadcast. Answer the RPC
+            // caller ONLY on SENT (with the real txid) or a definite failure; otherwise
+            // keep it in flight for the next tick. This is what makes a cTAZ "sent" mean
+            // the same thing a TAZ "sent" does.
+            if let Some((mut tx, sender)) = rpc_faucet.take() {
+                let tx_progress = continue_proposed_tx(&mut miner_wallet, network, &mut tx, &mut client, "rpc faucet", DUMP_TX_SEND).await;
+                match tx_progress.h {
+                    BlockHeight::INVALID => { let _ = sender.send(Err("faucet transaction failed to build".to_string())); }
+                    BlockHeight::SENT => { let _ = sender.send(Ok((FAUCET_VALUE, format!("{}", tx_progress.txid)))); }
+                    _ => { rpc_faucet = Some((tx, sender)); }
                 }
             }
         }

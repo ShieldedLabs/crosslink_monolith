@@ -1585,7 +1585,7 @@ where
             .await;
 
         match ret {
-            Ok(TFLServiceResponse::Faucet(Ok(amount))) => Ok(FaucetResponse{ amount }),
+            Ok(TFLServiceResponse::Faucet(Ok((amount, txid)))) => Ok(FaucetResponse{ amount, txid }),
             Ok(TFLServiceResponse::Faucet(Err(err))) => Err(ErrorObject::owned(
                     server::error::LegacyCode::Verify.into(),
                     format!("Faucet request for \"{ua_str}\" failed: {err}"),
@@ -4261,6 +4261,7 @@ pub struct FaucetRequest {
 )]
 pub struct FaucetResponse {
     pub amount: u64,
+    pub txid: String,
 }
 
 /// A hex-encoded [`ConsensusBranchId`] string.
