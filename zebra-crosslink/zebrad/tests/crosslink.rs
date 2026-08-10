@@ -860,7 +860,6 @@ fn create_pos_and_ptr_to_finalize_pow(
         &PROTOTYPE_PARAMETERS,
         bft_height,
         parent_fat_ptr,
-        pow_blocks[0].coinbase_height().expect("valid height").0,
         hdrs,
     )
     .expect("valid PoS block");

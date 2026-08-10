@@ -394,6 +394,7 @@ async fn db_init_outside_future_executor() -> Result<()> {
         &config.network.network,
         Height::MAX,
         0,
+        std::sync::Arc::new(|_,_,_| Some(true)),
     );
 
     // it's faster to panic if it takes longer than expected, since the executor

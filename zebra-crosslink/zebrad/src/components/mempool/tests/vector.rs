@@ -61,6 +61,7 @@ async fn mempool_service_basic_single() -> Result<(), Report> {
         _tx_verifier,
         mut recent_syncs,
         _mempool_transaction_receiver,
+        _block_writer,
     ) = setup(&network, cost_limit, true).await;
 
     // Enable the mempool
@@ -217,6 +218,7 @@ async fn mempool_queue_single() -> Result<(), Report> {
         _tx_verifier,
         mut recent_syncs,
         _mempool_transaction_receiver,
+        _block_writer,
     ) = setup(&network, cost_limit, true).await;
 
     // Enable the mempool
@@ -298,6 +300,7 @@ async fn mempool_service_disabled() -> Result<(), Report> {
         _tx_verifier,
         mut recent_syncs,
         _mempool_transaction_receiver,
+        _block_writer,
     ) = setup(&network, u64::MAX, true).await;
 
     // get the genesis block transactions from the Zcash blockchain.
@@ -417,11 +420,12 @@ async fn mempool_cancel_mined() -> Result<(), Report> {
     let (
         mut mempool,
         _peer_set,
-        mut state_service,
+        _state_service,
         mut chain_tip_change,
         _tx_verifier,
         mut recent_syncs,
         mut mempool_transaction_receiver,
+        mut block_writer,
     ) = setup(&network, u64::MAX, true).await;
 
     // Enable the mempool
@@ -432,15 +436,7 @@ async fn mempool_cancel_mined() -> Result<(), Report> {
     mempool.dummy_call().await;
 
     // Push block 1 to the state
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
-            block1.clone().into(),
-        ))
-        .await
-        .unwrap();
+    block_writer.commit_checkpoint_verified(block1.clone().into()).unwrap();
 
     // Wait for the chain tip update
     if let Err(timeout_error) = timeout(
@@ -485,12 +481,7 @@ async fn mempool_cancel_mined() -> Result<(), Report> {
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
 
     // Push block 2 to the state
-    state_service
-        .oneshot(zebra_state::Request::CommitCheckpointVerifiedBlock(
-            block2.clone().into(),
-        ))
-        .await
-        .unwrap();
+    block_writer.commit_checkpoint_verified(block2.clone().into()).unwrap();
 
     // Wait for the chain tip update
     if let Err(timeout_error) = timeout(
@@ -556,11 +547,12 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
     let (
         mut mempool,
         mut peer_set,
-        mut state_service,
+        _state_service,
         mut chain_tip_change,
         _tx_verifier,
         mut recent_syncs,
         _mempool_transaction_receiver,
+        mut block_writer,
     ) = setup(&network, u64::MAX, true).await;
 
     // Enable the mempool
@@ -589,15 +581,7 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
 
     // Push block 1 to the state. This is considered a network upgrade,
     // and thus must cancel all pending transaction downloads.
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
-            block1.clone().into(),
-        ))
-        .await
-        .unwrap();
+    block_writer.commit_checkpoint_verified(block1.clone().into()).unwrap();
 
     // Wait for the chain tip update
     if let Err(timeout_error) = timeout(
@@ -649,6 +633,7 @@ async fn mempool_failed_verification_is_rejected() -> Result<(), Report> {
         mut tx_verifier,
         mut recent_syncs,
         mut mempool_transaction_receiver,
+        _block_writer,
     ) = setup(&network, u64::MAX, true).await;
 
     // Get transactions to use in the test
@@ -735,6 +720,7 @@ async fn mempool_failed_download_is_not_rejected() -> Result<(), Report> {
         _tx_verifier,
         mut recent_syncs,
         mut mempool_transaction_receiver,
+        _block_writer,
     ) = setup(&network, u64::MAX, true).await;
 
     // Get transactions to use in the test
@@ -826,11 +812,12 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
     let (
         mut mempool,
         mut peer_set,
-        mut state_service,
+        _state_service,
         mut chain_tip_change,
         mut tx_verifier,
         mut recent_syncs,
         _mempool_transaction_receiver,
+        mut block_writer,
     ) = setup(&network, u64::MAX, true).await;
 
     // Enable the mempool
@@ -889,15 +876,7 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
 
     // Push block 1 to the state. This is considered a network upgrade,
     // and must cancel all pending transaction downloads with a `TipAction::Reset`.
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
-            block1.clone().into(),
-        ))
-        .await
-        .unwrap();
+    block_writer.commit_checkpoint_verified(block1.clone().into()).unwrap();
 
     // Wait for the chain tip update without a timeout
     // (skipping the chain tip change here will fail the test)
@@ -949,15 +928,7 @@ async fn mempool_reverifies_after_tip_change() -> Result<(), Report> {
 
     // Push block 2 to the state. This will increase the tip height past the expected
     // tip height that the tx was verified at.
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
-            block2.clone().into(),
-        ))
-        .await
-        .unwrap();
+    block_writer.commit_checkpoint_verified(block2.clone().into()).unwrap();
 
     // Wait for the chain tip update without a timeout
     // (skipping the chain tip change here will fail the test)
@@ -993,6 +964,7 @@ async fn mempool_responds_to_await_output() -> Result<(), Report> {
         mut tx_verifier,
         mut recent_syncs,
         mut mempool_transaction_receiver,
+        _block_writer,
     ) = setup(&network, u64::MAX, true).await;
     mempool.enable(&mut recent_syncs).await;
 
@@ -1126,12 +1098,13 @@ async fn setup(
     MockTxVerifier,
     RecentSyncLengths,
     tokio::sync::broadcast::Receiver<MempoolChange>,
+    zebra_state::WriteBlockWorkerTask,
 ) {
     let peer_set = MockService::build().for_unit_tests();
 
     // UTXO verification doesn't matter here.
     let state_config = StateConfig::ephemeral();
-    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change) =
+    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change, mut block_writer) =
         zebra_state::init(state_config, network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
     let mut state_service = ServiceBuilder::new().buffer(10).service(state);
 
@@ -1162,14 +1135,8 @@ async fn setup(
             .unwrap();
 
         // Push the genesis block to the state
-        state_service
-            .ready()
-            .await
-            .unwrap()
-            .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
-                genesis_block.clone().into(),
-            ))
-            .await
+        block_writer
+            .commit_genesis(genesis_block.clone())
             .unwrap();
 
         // Wait for the chain tip update without a timeout
@@ -1187,5 +1154,6 @@ async fn setup(
         tx_verifier,
         recent_syncs,
         mempool_transaction_subscriber.subscribe(),
+        block_writer,
     )
 }

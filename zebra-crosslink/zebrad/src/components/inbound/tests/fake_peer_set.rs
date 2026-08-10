@@ -63,6 +63,7 @@ async fn mempool_requests_for_transactions() {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _block_writer,
     ) = setup(true).await;
 
     let added_transactions: Vec<UnminedTx> = added_transactions
@@ -149,6 +150,7 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _block_writer,
     ) = setup(false).await;
 
     // Test `Request::PushTransaction`
@@ -246,6 +248,7 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _block_writer,
     ) = setup(false).await;
 
     // Test `Request::AdvertiseTransactionIds`
@@ -354,10 +357,11 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         _added_transactions,
         mut tx_verifier,
         mut peer_set,
-        state_service,
+        _state_service,
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        mut block_writer,
     ) = setup(false).await;
 
     // Push test transaction
@@ -411,13 +415,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     let block_two: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
         .zcash_deserialize_into()
         .unwrap();
-    state_service
-        .clone()
-        .oneshot(zebra_state::Request::CommitCheckpointVerifiedBlock(
-            block_two.clone().into(),
-        ))
-        .await
-        .unwrap();
+    block_writer.commit_checkpoint_verified(block_two.clone().into()).unwrap();
 
     // Test transaction 1 is gossiped
     let mut hs = HashSet::new();
@@ -484,13 +482,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     let block_three: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_3_BYTES
         .zcash_deserialize_into()
         .unwrap();
-    state_service
-        .clone()
-        .oneshot(zebra_state::Request::CommitCheckpointVerifiedBlock(
-            block_three.clone().into(),
-        ))
-        .await
-        .unwrap();
+    block_writer.commit_checkpoint_verified(block_three.clone().into()).unwrap();
 
     // Test the block is gossiped, after waiting for the multi-gossip delay
     tokio::time::sleep(PEER_GOSSIP_DELAY).await;
@@ -592,13 +584,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
             .unwrap(),
     ];
     for block in more_blocks {
-        state_service
-            .clone()
-            .oneshot(zebra_state::Request::CommitCheckpointVerifiedBlock(
-                block.clone().into(),
-            ))
-            .await
-            .unwrap();
+        block_writer.commit_checkpoint_verified(block.clone().into()).unwrap();
 
         // Test the block is gossiped, after waiting for the multi-gossip delay
         tokio::time::sleep(PEER_GOSSIP_DELAY).await;
@@ -662,6 +648,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
         mut chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _block_writer,
     ) = setup(false).await;
 
     // Get the next block
@@ -778,7 +765,7 @@ async fn caches_getaddr_response() {
         let address_book = Arc::new(std::sync::Mutex::new(address_book));
 
         // UTXO verification doesn't matter for these tests.
-        let (state, _read_only_state_service, latest_chain_tip, _chain_tip_change) =
+        let (state, _read_only_state_service, latest_chain_tip, _chain_tip_change, _block_writer) =
             zebra_state::init(state_config.clone(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
 
         let state_service = ServiceBuilder::new().buffer(1).service(state);
@@ -876,6 +863,7 @@ async fn setup(
     ChainTipChange,
     JoinHandle<Result<(), BlockGossipError>>,
     JoinHandle<Result<(), BoxError>>,
+    zebra_state::WriteBlockWorkerTask,
 ) {
     let _init_guard = zebra_test::init();
 
@@ -892,7 +880,7 @@ async fn setup(
     let (sync_status, mut recent_syncs) = SyncStatus::new();
 
     // UTXO verification doesn't matter for these tests.
-    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change) =
+    let (state, _read_only_state_service, latest_chain_tip, mut chain_tip_change, mut block_writer) =
         zebra_state::init(state_config.clone(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
 
     let mut state_service = ServiceBuilder::new().buffer(1).service(state);
@@ -922,14 +910,8 @@ async fn setup(
     let genesis_block: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .unwrap();
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
-            genesis_block.clone().into(),
-        ))
-        .await
+    block_writer
+        .commit_genesis(genesis_block.clone())
         .unwrap();
     committed_blocks.push(genesis_block);
 
@@ -954,13 +936,7 @@ async fn setup(
     let block_one: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
         .unwrap();
-    state_service
-        .clone()
-        .oneshot(zebra_state::Request::CommitCheckpointVerifiedBlock(
-            block_one.clone().into(),
-        ))
-        .await
-        .unwrap();
+    block_writer.commit_checkpoint_verified(block_one.clone().into()).unwrap();
     committed_blocks.push(block_one);
 
     // Don't wait for the chain tip update here, we wait for expect_request(AdvertiseBlock) below,
@@ -1057,6 +1033,7 @@ async fn setup(
         chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        block_writer,
     )
 }
 

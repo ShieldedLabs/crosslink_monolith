@@ -175,40 +175,20 @@ impl WriteBlockWorkerTask {
             network = %self.non_finalized_state.network
         )
     )]
-    /// Commit the genesis block directly to the finalized state.
-    ///
-    /// Genesis is the one block with no parent and no possibility of reorg, so it goes to the
-    /// finalized state rather than entering a non-finalized chain. Its hash is checked against
-    /// the configured network genesis by the caller, which is the whole of what the checkpoint
-    /// verifier contributed at height 0.
     /// Commit a checkpoint-verified block straight to the finalized state.
     ///
-    /// Used by `zebrad copy-state`, which bulk-copies an already-validated chain between
-    /// databases and so needs the write path without any verification in front of it.
+    /// Used by `zebrad copy-state` and tests, which have an already-validated chain and so
+    /// need the write path without any verification in front of it.
     pub fn commit_checkpoint_verified(
         &mut self,
         checkpoint_verified: crate::CheckpointVerifiedBlock,
     ) -> Result<block::Hash, BoxError> {
-        let (hash, trees) = self.finalized_state.commit_finalized_direct(
-            checkpoint_verified.into(),
-            self.prev_finalized_note_commitment_trees.take(),
-            "copy-state bulk write",
-        )?;
-        self.prev_finalized_note_commitment_trees = Some(trees);
-        Ok(hash)
-    }
-
-    pub fn commit_genesis(
-        &mut self,
-        genesis: std::sync::Arc<zebra_chain::block::Block>,
-    ) -> Result<block::Hash, BoxError> {
-        let checkpoint_verified = crate::CheckpointVerifiedBlock::from(genesis);
         let tip_block = ChainTipBlock::from(checkpoint_verified.clone());
 
         let (hash, trees) = self.finalized_state.commit_finalized_direct(
             checkpoint_verified.into(),
             self.prev_finalized_note_commitment_trees.take(),
-            "commit genesis block",
+            "commit checkpoint-verified block",
         )?;
         self.prev_finalized_note_commitment_trees = Some(trees);
 
@@ -220,6 +200,19 @@ impl WriteBlockWorkerTask {
         self.chain_tip_sender.set_finalized_tip(tip_block);
 
         Ok(hash)
+    }
+
+    /// Commit the genesis block directly to the finalized state.
+    ///
+    /// Genesis is the one block with no parent and no possibility of reorg, so it goes to the
+    /// finalized state rather than entering a non-finalized chain. Its hash is checked against
+    /// the configured network genesis by the caller, which is the whole of what the checkpoint
+    /// verifier contributed at height 0.
+    pub fn commit_genesis(
+        &mut self,
+        genesis: std::sync::Arc<zebra_chain::block::Block>,
+    ) -> Result<block::Hash, BoxError> {
+        self.commit_checkpoint_verified(crate::CheckpointVerifiedBlock::from(genesis))
     }
 
     /// Crosslink-finalize `hash` and everything it implicitly finalizes.

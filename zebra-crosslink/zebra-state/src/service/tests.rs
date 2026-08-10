@@ -504,11 +504,11 @@ proptest! {
         let _init_guard = zebra_test::init();
 
         // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
-        // @Note: this test is still #[ignore]d, and the finalized half of it is now stale as well
-        // as whatever the activation-height problem is. queue_and_commit_to_finalized_state()
-        // published the chain tip; commit_checkpoint_verified() does not (only commit_genesis()
-        // does), so the latest_chain_tip / chain_tip_change assertions in the first loop will not
-        // hold as written. Ported to keep the crate's test target building, not revived.
+        // @Note: this test is still #[ignore]d for the activation-height problem.
+        // commit_checkpoint_verified() publishes the chain tip again (as the old
+        // queue_and_commit_to_finalized_state() did), so the latest_chain_tip /
+        // chain_tip_change assertions in the first loop hold as written once more.
+        // Ported to keep the crate's test target building, not revived.
         let (_state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change, mut block_writer) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
 
         prop_assert_eq!(latest_chain_tip.best_tip_height(), None);

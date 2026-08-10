@@ -373,7 +373,11 @@ mod tests {
     use super::*;
     use zebra_chain::serialization::ZcashDeserialize;
 
-    /// The cheap checks must accept every known-good mainnet block vector.
+    /// The cheap checks must accept every known-good mainnet block vector the semantic path
+    /// can verify. Heights below Canopy activation are excluded: `subsidy_is_valid` has an
+    /// explicit `unreachable!` for them (pre-Canopy funding rules were never implemented,
+    /// those heights are checkpoint-only territory), so `SemanticBlockVerifier` cannot
+    /// verify them either and acceptance would be unfaithful.
     ///
     /// This is the faithfulness test for the phase-2 hoist: these blocks are all real and all
     /// valid, so any rejection here means a check was reordered, dropped, or given the wrong
@@ -381,9 +385,16 @@ mod tests {
     #[test]
     fn cheap_checks_accept_all_mainnet_vectors() {
         let network = Network::Mainnet;
+        let canopy_height = NetworkUpgrade::Canopy
+            .activation_height(&network)
+            .expect("Canopy activation height is known on mainnet");
         let mut checked = 0;
 
         for (height, bytes) in zebra_test::vectors::MAINNET_BLOCKS.iter() {
+            if Height(*height) < canopy_height {
+                continue;
+            }
+
             let block = Block::zcash_deserialize(&bytes[..]).expect("test vector is a valid block");
 
             // `time_is_valid_at` rejects blocks more than 2h ahead of `now`, and these vectors
@@ -403,7 +414,9 @@ mod tests {
             checked += 1;
         }
 
-        assert!(checked > 30, "expected a reasonable number of vectors, got {checked}");
+        // 9 post-Canopy vectors exist today; the floor guards against a filter change
+        // silently emptying the loop, not against the vector set shrinking.
+        assert!(checked >= 5, "expected several post-Canopy vectors, got {checked}");
     }
 
     /// A block whose PoW does not meet the difficulty threshold must be rejected, and the
@@ -419,7 +432,7 @@ mod tests {
         // Bump the nonce: the header no longer hashes below its own difficulty threshold.
         block.header = Arc::new({
             let mut header = block::Header::clone(&block.header);
-            header.nonce = Box::new([0xff; 32]);
+            header.nonce = [0xff; 32].into();
             header
         });
 
