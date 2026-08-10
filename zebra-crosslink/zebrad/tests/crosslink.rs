@@ -8,15 +8,17 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use zcash_keys::address::Address;
 use zebra_chain::{
     block::{
-        Block, BftBlock, BftBlockAndFatPointerToIt, FatPointerSignature, FatPointerToBftBlock, PROTOTYPE_PARAMETERS, PubKeyID,
+        merkle, Block, BftBlock, BftBlockAndFatPointerToIt, ChainHistoryBlockTxAuthCommitmentHash,
+        FatPointerSignature, FatPointerToBftBlock, PROTOTYPE_PARAMETERS, PubKeyID,
         Hash as BlockHash, Header as BlockHeader, Height as BlockHeight,
     },
     fmt::HexDebug,
     history_tree::HistoryTree,
     orchard,
-    parameters::Network,
+    parameters::{Network, NetworkUpgrade},
     sapling,
     serialization::*,
+    transaction::{LockTime, Transaction},
     work::{self, difficulty::CompactDifficulty},
 };
 use zebra_crosslink::test_format::*;
@@ -386,7 +388,6 @@ fn crosslink_reject_pos_with_signature_on_different_data() {
     test_bytes(tf.write_to_bytes());
 }
 
-// failing
 #[test]
 fn crosslink_test_basic_finality() {
     set_test_name(function_name!());
@@ -692,6 +693,15 @@ impl BlockGen {
         genesis_hash: BlockHash,
         miner_addr: &Address,
     ) -> Self {
+        Self::init_at_genesis_plus_1_with_txs(network, genesis_hash, miner_addr, &[])
+    }
+
+    pub fn init_at_genesis_plus_1_with_txs(
+        network: Network,
+        genesis_hash: BlockHash,
+        miner_addr: &Address,
+        extra_txs: &[Arc<Transaction>],
+    ) -> Self {
         let history_tree = HistoryTree::default();
         let time = chrono::DateTime::<Utc>::from_timestamp(1758127904, 0).expect("valid time");
 
@@ -707,6 +717,7 @@ impl BlockGen {
             time,
             &history_tree,
             difficulty_threshold,
+            extra_txs,
         );
         BlockGen {
             network,
@@ -725,13 +736,16 @@ impl BlockGen {
         time: DateTime<Utc>,
         history_tree: &HistoryTree,
         difficulty_threshold: CompactDifficulty,
+        extra_txs: &[Arc<Transaction>],
     ) -> Arc<zebra_chain::block::Block> {
         let coinbase_outputs =
             zebra_rpc::methods::types::get_block_template::standard_coinbase_outputs(
                 network,
                 height,
                 miner_addr,
-                zebra_chain::amount::Amount::new(0), // TODO: update if we want to sim transactions
+                // NOTE: NU6 onward requires coinbase outputs == subsidy + fees exactly,
+                // so extra_txs must be zero-fee for this 0 to stay correct
+                zebra_chain::amount::Amount::new(0),
             );
 
         let coinbase_tx = if true {
@@ -748,21 +762,46 @@ impl BlockGen {
                 Vec::new(),
             )
         };
-        let default_roots =
-            zebra_rpc::methods::types::get_block_template::calculate_default_root_hashes(
-                &coinbase_tx.clone().into(),
-                &[],
-                [0; 32].into(),
-            );
+
+        let mut transactions: Vec<Arc<Transaction>> = Vec::with_capacity(1 + extra_txs.len());
+        transactions.push(coinbase_tx.into());
+        transactions.extend(extra_txs.iter().cloned());
+
+        // Both roots must cover *every* transaction in the block, not just the coinbase.
+        let merkle_root: merkle::Root = transactions.iter().collect();
+
+        // Mirrors the consensus dispatch (state service
+        // check::block_commitment_is_valid_for_chain_history): the Heartwood activation
+        // block carries the reserved all-zero commitment, Heartwood/Canopy carry the raw
+        // history MMR root, and NU5 onward carries the ZIP-244 hashBlockCommitments,
+        // which also commits to the auth data of every transaction.
+        let commitment_bytes: [u8; 32] =
+            if NetworkUpgrade::Heartwood.activation_height(network) == Some(height) {
+                [0u8; 32]
+            } else {
+                match NetworkUpgrade::current(network, height) {
+                    NetworkUpgrade::Heartwood | NetworkUpgrade::Canopy => {
+                        <[u8; 32]>::from(history_tree.hash().unwrap_or([0u8; 32].into()))
+                    }
+                    _ => {
+                        let auth_data_root: merkle::AuthDataRoot = transactions.iter().collect();
+                        ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                            &history_tree
+                                .hash()
+                                .expect("history tree is non-empty after the Heartwood activation block"),
+                            &auth_data_root,
+                        )
+                        .bytes_in_serialized_order()
+                    }
+                }
+            };
 
         Arc::new(Block {
             header: Arc::new(BlockHeader {
                 version: 6,
                 previous_block_hash,
-                merkle_root: default_roots.merkle_root(),
-                commitment_bytes: HexDebug(<[u8; 32]>::from(
-                    history_tree.hash().unwrap_or([0u8; 32].into()),
-                )),
+                merkle_root,
+                commitment_bytes: HexDebug(commitment_bytes),
                 time,
                 difficulty_threshold,
                 nonce: HexDebug([0; 32]),
@@ -770,11 +809,19 @@ impl BlockGen {
                 fat_pointer_to_bft_block: FatPointerToBftBlock::null(),
             }),
 
-            transactions: vec![coinbase_tx.into()],
+            transactions,
         })
     }
 
     pub fn next_block(&mut self, miner_addr: &Address) -> Arc<zebra_chain::block::Block> {
+        self.next_block_with_txs(miner_addr, &[])
+    }
+
+    pub fn next_block_with_txs(
+        &mut self,
+        miner_addr: &Address,
+        extra_txs: &[Arc<Transaction>],
+    ) -> Arc<zebra_chain::block::Block> {
         // NOTE: it's not completely obvious where this should be done. Having it here allows for
         // tip modification by the user, but means that the history_tree is never visibly
         // up-to-date.
@@ -801,6 +848,7 @@ impl BlockGen {
             time,
             &self.history_tree,
             difficulty_threshold,
+            extra_txs,
         );
 
         self.tip.clone()
@@ -851,6 +899,76 @@ fn crosslink_gen_pow_fork() {
     test_bytes(tf.write_to_bytes());
 }
 
+// NOTE: a staking action is the only transaction we can synthesize without spendable
+// UTXOs or shielded proofs: `has_inputs_and_outputs` waives the inputs/outputs rule for
+// it. The amount must be 0 unless the bond is funded: the per-tx value balance must be
+// non-negative, and coinbase outputs can't fund it before they mature (100 blocks).
+fn staking_tx_create_bond(
+    bond_key: [u8; 32],
+    target_finalizer: [u8; 32],
+    amount_zats: u64,
+) -> Arc<Transaction> {
+    use zcash_primitives::transaction::StakingAction_CreateNewDelegationBond;
+
+    Arc::new(Transaction::VCrosslink {
+        // must match NetworkUpgrade::current at the block's height (default regtest
+        // activates everything through NU6 at height 1)
+        network_upgrade: NetworkUpgrade::Nu6,
+        lock_time: LockTime::unlocked(),
+        expiry_height: BlockHeight(0),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        staking_action: Some(
+            StakingAction_CreateNewDelegationBond {
+                amount_zats,
+                unique_pubkey: bond_key,
+                challenge: [0; 32],
+                target_finalizer,
+                signature: [0; 64],
+            }
+            .to_union(),
+        ),
+    })
+}
+
+#[test]
+fn crosslink_pow_block_with_staking_tx() {
+    set_test_name(function_name!());
+    let mut tf = TF::new(&PROTOTYPE_PARAMETERS);
+
+    let network = Network::new_regtest(Default::default());
+    let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
+    let mut gen =
+        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
+    tf.push_instr_load_pow(&gen.tip, 0);
+
+    // height 2 is the first height whose commitment is the ZIP-244 hashBlockCommitments
+    // (height 1 carries the reserved all-zero commitment), so this exercises both the
+    // merkle root and the auth-data commitment accounting for the extra transaction
+    let block_with_tx =
+        gen.next_block_with_txs(&miner_addr, &[staking_tx_create_bond([0xcd; 32], [0xab; 32], 0)]);
+    assert_eq!(block_with_tx.transactions.len(), 2);
+    tf.push_instr_load_pow(&block_with_tx, 0);
+
+    for _ in 3..5 {
+        tf.push_instr_load_pow(&gen.next_block(&miner_addr), 0);
+    }
+    tf.push_instr_expect_pow_chain_length(5, 0);
+
+    // appending a transaction without rebuilding the header must be rejected: the
+    // merkle root & commitment no longer match the transaction list
+    let mut tampered = gen.next_block(&miner_addr).as_ref().clone();
+    tampered
+        .transactions
+        .push(staking_tx_create_bond([0xee; 32], [0xab; 32], 0));
+    tf.push_instr_load_pow(&tampered, SHOULD_FAIL);
+    tf.push_instr_expect_pow_chain_length(5, 0);
+
+    test_bytes(tf.write_to_bytes());
+}
+
 fn create_pos_and_ptr_to_finalize_pow(
     bft_height: u32,
     parent_fat_ptr: FatPointerToBftBlock,
@@ -892,8 +1010,12 @@ fn next_pos(
     pow_blocks: &[Arc<Block>],
     sigs: &[FatPointerSignature],
 ) -> BftBlockAndFatPointerToItWrap {
-    *cur_bft_height += 1;
+    // NOTE: BFT heights are 0-based: a block's height is the chain position it will
+    // occupy (validate_bft_block), so the first block is at height 0. Incrementing
+    // *after* keeps the counter equal to the resulting chain *length*, which is what
+    // EXPECT_POS_CHAIN_LENGTH callers pass it in as.
     let bft = create_pos_and_ptr_to_finalize_pow(*cur_bft_height, cur_fat_ptr.clone(), pow_blocks, sigs);
+    *cur_bft_height += 1;
     *cur_fat_ptr = bft.0.fat_ptr.clone();
     bft
 }
@@ -947,7 +1069,6 @@ fn crosslink_force_roster() {
     test_bytes(tf.write_to_bytes());
 }
 
-// failing
 #[test]
 fn crosslink_add_newcomer_to_roster_via_pow() {
     set_test_name(function_name!());
@@ -960,19 +1081,24 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
 
     let network = Network::new_regtest(Default::default());
     let miner_addr = Address::decode(&network, "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v").unwrap();
-    let mut gen =
-        BlockGen::init_at_genesis_plus_1(network, BlockGen::REGTEST_GENESIS_HASH, &miner_addr);
 
-    gen.tip = Arc::new(Block {
-        header: Arc::new(BlockHeader {
-            ..gen.tip.header.as_ref().clone()
-        }),
-        ..gen.tip.as_ref().clone()
-    });
+    let (_, _prv_key, pub_key) =
+        zebra_crosslink::rng_private_public_key_from_address("some_pub_key".as_bytes());
+
+    // NOTE: the bond must be in the height-1 block: the BFT block over headers 1..=3
+    // finalizes height 1, and the roster snapshot taken at finalization only sees bonds
+    // already in the finalized state. Amount 0 as the bond can't be funded (see
+    // staking_tx_create_bond).
+    let staking_tx = staking_tx_create_bond([0xcd; 32], pub_key.0, 0);
+    let mut gen = BlockGen::init_at_genesis_plus_1_with_txs(
+        network,
+        BlockGen::REGTEST_GENESIS_HASH,
+        &miner_addr,
+        &[staking_tx],
+    );
 
     let mut pow_common = vec![gen.tip.clone()];
     for _ in 2..4 {
-        // TODO: push a staking action
         pow_common.push(gen.next_block(&miner_addr));
     }
     for block in &pow_common[0..3] {
@@ -983,9 +1109,10 @@ fn crosslink_add_newcomer_to_roster_via_pow() {
     let bft = next_pos(pos_h, fat_ptr, &pow_common[0..3], &[]);
     tf.push_instr_load_pos(&bft, 0);
 
-    let (_, _prv_key, pub_key) =
-        zebra_crosslink::rng_private_public_key_from_address("some_pub_key".as_bytes());
-    tf.push_instr_expect_roster_includes(pub_key.0, 1234, 0);
+    // NOTE: membership only: the bond is created with 0 stake, but finalizer rewards
+    // accrue to it by the time the roster snapshot is taken, so the exact voting power
+    // depends on the reward schedule
+    tf.push_instr_expect_roster_includes(pub_key.0, TEST_STAKE_IGNORED, 0);
 
     test_bytes(tf.write_to_bytes());
 }
