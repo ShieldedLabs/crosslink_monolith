@@ -53,31 +53,6 @@ fn work_from_difficulty(difficulty: zebra_chain::work::difficulty::CompactDiffic
         .unwrap_or(0)
 }
 
-/// The one place a served PoW block becomes a viz BcBlock.
-fn bc_block_from_block(
-    bc: &Block,
-    this_height: u64,
-    is_best_chain: bool,
-    hardforks: &[crate::config::HardForkConfig],
-) -> visualizer_zcash::BcBlock {
-    visualizer_zcash::BcBlock {
-        this_hash: Hash32::from_bytes(bc.header.hash().0),
-        parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
-        this_height,
-        txs_n: bc.transactions.len(),
-        is_best_chain,
-        is_finalized: false,
-        knowledge: visualizer_zcash::BcKnowledge::FullBlock,
-        points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash().0),
-        work: work_from_difficulty(bc.header.difficulty_threshold),
-        utc: bc.header.time.timestamp(),
-        serialized_size: bc.zcash_serialized_size(),
-        // Flag this block when it sits at a hardfork's PoW activation height.
-        // Many forks may share that height; each is flagged independently.
-        is_hardfork_activation: hardforks.iter().any(|hf| hf.pow_activation_height == this_height),
-    }
-}
-
 /// Bridge between tokio & viz code
 pub async fn service_viz_requests(
     tfl_handle: crate::TFLServiceHandle,
@@ -100,6 +75,7 @@ pub async fn service_viz_requests(
     let mut bft_candidate_hashes: Vec<Hash32> = Vec::new();
     let mut bft_candidate_heights: std::collections::HashMap<Hash32, u64> = std::collections::HashMap::new();
     let mut bft_unresolved_heights: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
+    let mut bft_resolved_at_tip: u64 = u64::MAX; // PoW tip at the last resolution round
 
     loop {
         let request_queue = visualizer_zcash::REQUESTS_TO_ZEBRA.lock().unwrap();
@@ -213,16 +189,37 @@ pub async fn service_viz_requests(
                         bft_checked_n += 1;
                     }
                 }
-                // retry a bounded batch; the set drains as candidates sync into the state
-                let pending: Vec<Hash32> = bft_unresolved_heights.iter().copied().take(256).collect();
-                for hash in pending {
-                    if let Ok(StateResponse::BlockHeader { height, .. }) =
-                        (call.state)(StateRequest::BlockHeader(zebra_state::HashOrHeight::Hash(ZebBlockHash(hash.as_bytes()).into()))).await
-                    {
-                        bft_candidate_heights.insert(hash, height.0 as u64);
-                        bft_unresolved_heights.remove(&hash);
+                // retry a bounded batch; the set drains as candidates sync into the
+                // state. Only when the chain has grown since the last round: an
+                // unresolved candidate can only become resolvable when new blocks
+                // arrive, so retrying against an unchanged chain is pure cost
+                // (PoW catch-up used to pay hundreds of doomed lookups per cycle).
+                if !bft_unresolved_heights.is_empty() && bc_tip_height != bft_resolved_at_tip {
+                    bft_resolved_at_tip = bc_tip_height;
+                    let pending: Vec<Hash32> = bft_unresolved_heights.iter().copied().take(256).collect();
+                    for hash in pending {
+                        if let Ok(StateResponse::BlockHeader { height, .. }) =
+                            (call.state)(StateRequest::BlockHeader(zebra_state::HashOrHeight::Hash(ZebBlockHash(hash.as_bytes()).into()))).await
+                        {
+                            bft_candidate_heights.insert(hash, height.0 as u64);
+                            bft_unresolved_heights.remove(&hash);
+                        }
                     }
                 }
+            }
+
+            // Finality-frontier page: when finality lags more than the window's sanity
+            // bound below the tip (BFT catch-up), the finalization-candidate region falls
+            // out of the served window and the GUI can only show it as header ghosts and
+            // peer claims. Serve one page of real best-chain blocks up from the finalized
+            // tip so the region the BFT chain points at stays real; it chases the frontier
+            // upward as finality catches up, and disappears once the window covers it.
+            // Anchored on the same tip hash as the window, like the backfill page below.
+            let mut frontier_blocks: Vec<(ZebBlockHeight, ZebBlockHash, Arc<Block>)> = Vec::new();
+            if finalized_lo < sanity_lo {
+                let lo_h = ZebBlockHeight(finalized_lo as u32);
+                let hi_h = ZebBlockHeight((finalized_lo + BC_PAGE_SIZE - 1).min(sanity_lo - 1) as u32);
+                frontier_blocks = tfl_block_sequence(&call, tip_height_hash.1, hi_h, lo_h, BC_PAGE_SIZE as u32).await;
             }
 
             for _ in 0..256 {
@@ -480,7 +477,8 @@ pub async fn service_viz_requests(
                         push_bc_block(&mut response, height, hash, bc, true);
                     }
                     // backfill page (older best-chain blocks below the GUI's coverage)
-                    for (height, hash, bc) in backfill_blocks.iter() {
+                    // and finality-frontier page (real blocks where the BFT candidates point)
+                    for (height, hash, bc) in backfill_blocks.iter().chain(frontier_blocks.iter()) {
                         push_bc_block(&mut response, height, hash, bc, true);
                     }
                     for (height, hash, bc) in fork_blocks.iter() {
@@ -501,17 +499,26 @@ pub async fn service_viz_requests(
                             Some((lo, hi)) => (lo.min(h), hi.max(h)),
                         });
                     };
-                    for (_, _, bc) in seq_blocks.iter().chain(backfill_blocks.iter()) {
+                    for (_, _, bc) in seq_blocks.iter().chain(backfill_blocks.iter()).chain(frontier_blocks.iter()) {
                         let ptr = bc.header.fat_pointer_to_bft_block.points_at_block_hash();
                         if let Some(&h) = internal.bft_block_hash_to_height.get(&ptr) { fold(h as usize); }
                     }
 
                     const BFT_TIP_MARGIN: usize = 16;
+                    // No served PoW block names any BFT block yet (fat pointers are null
+                    // until the first decided block gets referenced, e.g. a fresh chain):
+                    // the just-decided tail is still news, same as the margin above the
+                    // newest pointer.
+                    let bft_extent = bft_extent.or_else(|| {
+                        let n = internal.bft_blocks.len();
+                        (n > 0).then(|| (n.saturating_sub(BFT_TIP_MARGIN), n - 1))
+                    });
                     let mut bft_indices: Vec<usize> = Vec::new();
                     if let Some((lo, hi)) = bft_extent {
-                        let hi = (hi + BFT_TIP_MARGIN)
-                            .min(lo + BFT_PAGE_SIZE - 1)
-                            .min(internal.bft_blocks.len().saturating_sub(1));
+                        // the page cap cuts the oldest indices, never the newest: under
+                        // pressure (catch-up, deep scrolling) the tip lane must keep moving
+                        let hi = (hi + BFT_TIP_MARGIN).min(internal.bft_blocks.len().saturating_sub(1));
+                        let lo = lo.max((hi + 1).saturating_sub(BFT_PAGE_SIZE));
                         bft_indices.extend(lo..=hi);
                     }
 
@@ -524,6 +531,12 @@ pub async fn service_viz_requests(
                         // placeholder (catch-up) compute on the fly until checked
                         let candidate_hash = bft_candidate_hashes.get(i).copied().unwrap_or_else(||
                             Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0));
+                        // past a stalled placeholder the fully-checked scan hasn't seen this
+                        // hash, so enqueue it here: resolution must still learn its height
+                        // or the block positions at 0 forever
+                        if !bft_candidate_heights.contains_key(&candidate_hash) {
+                            bft_unresolved_heights.insert(candidate_hash);
+                        }
                         // extent membership already proves this block's PoW span is served;
                         // the height is for GUI positioning only (0 = not yet resolved)
                         let candidate_height = bft_candidate_heights.get(&candidate_hash).copied().unwrap_or(0);
