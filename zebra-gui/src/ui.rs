@@ -2449,10 +2449,15 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }) {
                                                 let id = id_index("Unstake Clickable Text", index as u32);
                                                 let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
-                                                let mut str = frame_strf!(data, "{}", format_stake_amount(stake_amount));
+                                                // a bond discovered out of order carries a u64::MAX
+                                                // placeholder until the wallet learns the real value
+                                                let str = if initial == u64::MAX {
+                                                    frame_strf!(data, "...")
+                                                } else {
+                                                    frame_strf!(data, "{}", format_stake_amount(stake_amount))
+                                                };
                                                 if ui.hovered(id) {
                                                     colour = WHITE;
-                                                    str = frame_strf!(data, "{}", format_stake_amount(stake_amount));
                                                 }
 
                                                 if let _ = elem().decl(Decl {
@@ -2691,10 +2696,15 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }) {
                                                 let id = id_index("Unstake Clickable Text", index as u32);
                                                 let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
-                                                let mut str = frame_strf!(data, "{}", format_stake_amount(stake_amount));
+                                                // a bond discovered out of order carries a u64::MAX
+                                                // placeholder until the wallet learns the real value
+                                                let str = if initial == u64::MAX {
+                                                    frame_strf!(data, "...")
+                                                } else {
+                                                    frame_strf!(data, "{}", format_stake_amount(stake_amount))
+                                                };
                                                 if ui.hovered(id) {
                                                     colour = WHITE;
-                                                    str = frame_strf!(data, "{}", format_stake_amount(stake_amount));
                                                 }
 
                                                 if let _ = elem().decl(Decl {
