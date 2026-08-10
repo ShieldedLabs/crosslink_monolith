@@ -820,13 +820,28 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         viz_state.staking_bonded_pool_balance = message.staking_bonded_pool_balance;
         viz_state.staking_unbonded_pool_balance = message.staking_unbonded_pool_balance;
 
-        // Reset is_best_chain only for blocks that actually arrived in this message
-        // (and are at or above start_bc_height). This is more targeted than the old
-        // blanket reset that cleared ALL on-screen blocks >= start_bc_height — blocks
-        // that weren't resent stay whatever they were.
+        // Within the height span this message ACTUALLY served best-chain blocks for,
+        // the message is authoritative: an on-screen block in that span is best iff
+        // the message says so, which lets reorged-out blocks (re-served at the same
+        // heights under new hashes) go gray instead of staying red forever.
+        // Bounding by the served span rather than [start_bc_height..tip] means a
+        // message that under-covers its claimed window can never gray out real
+        // best-chain blocks (the failure the old blanket reset was suspected of).
+        // Below-span blocks keep their flags: they are finalized-stable.
+        let mut served_lo = u64::MAX;
+        let mut served_hi = 0u64;
+        let mut served_best: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
         for bc in &message.bc_blocks {
-            if bc.this_height >= message.start_bc_height {
-                if let Some(on_screen) = viz_state.on_screen_bcs.get_mut(&bc.this_hash) {
+            if bc.is_best_chain {
+                served_lo = served_lo.min(bc.this_height);
+                served_hi = served_hi.max(bc.this_height);
+                served_best.insert(bc.this_hash);
+            }
+        }
+        if served_lo <= served_hi {
+            for on_screen in viz_state.on_screen_bcs.values_mut() {
+                let h = on_screen.block.this_height;
+                if h >= served_lo && h <= served_hi && !served_best.contains(&on_screen.block.this_hash) {
                     on_screen.block.is_best_chain = false;
                 }
             }

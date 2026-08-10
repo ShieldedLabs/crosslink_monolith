@@ -157,6 +157,9 @@ pub async fn service_viz_requests(
                     let internal = tfl_handle.internal.lock().await;
                     let page_start = internal.bft_blocks.len().saturating_sub(BFT_PAGE_SIZE);
                     internal.bft_blocks[page_start..].iter()
+                        // out-of-order BFT ingest pads the chain with empty-headers placeholder
+                        // certs (see handle_new_decided_bft_block); they have no candidate yet
+                        .filter(|b| !b.headers.is_empty())
                         .map(|b| Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0))
                         .filter(|h| !bft_candidate_heights.contains_key(h))
                         .collect()
@@ -479,13 +482,18 @@ pub async fn service_viz_requests(
 
                     for i in bft_indices {
                         let b = &internal.bft_blocks[i];
+                        // Out-of-order BFT ingest pads the chain with empty-headers placeholder
+                        // certs; nothing to show until the real block arrives.
+                        if b.headers.is_empty() { continue; }
                         let candidate_hash = Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0);
-                        let candidate_height = bft_candidate_heights.get(&candidate_hash).copied().unwrap_or(0);
-                        // Newest-page certs are served only if their finalization candidate lies
-                        // inside the served PoW window: a shown cert always has its PoW blocks
-                        // shown. Backfill-extent certs are exempt: their PoW page ships in this
-                        // very response (their candidate heights are also mostly unresolved).
-                        if i >= bft_page_start && candidate_height < lo_height.0 as u64 { continue; }
+                        let candidate_height = bft_candidate_heights.get(&candidate_hash).copied();
+                        // Newest-page certs are skipped only when their finalization candidate is
+                        // KNOWN to lie below the served PoW window: unresolved heights must pass,
+                        // else one failed lookup permanently drops the cert once the GUI's ack
+                        // ratchets past it. Backfill-extent certs are exempt: their PoW page
+                        // ships in this very response.
+                        if i >= bft_page_start && candidate_height.is_some_and(|h| h < lo_height.0 as u64) { continue; }
+                        let candidate_height = candidate_height.unwrap_or(0);
                         let this_hash = Hash32::from_bytes(b.blake3_hash().0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;

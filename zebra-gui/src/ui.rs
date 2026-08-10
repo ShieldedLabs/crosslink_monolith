@@ -1592,7 +1592,11 @@ pub fn ui_left_pane(ui: &mut Context,
         staked_roster_bonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
 
         for position in &staked_roster_unbonded {
-            total_unbonded += position.2;
+            // u64::MAX marks a value-unknown placeholder (unbond seen before its create);
+            // summing it would overflow (aborts under overflow-checks)
+            if position.2 != u64::MAX {
+                total_unbonded += position.2;
+            }
         }
 
         let mut prev_finalizer: Option<[u8; 32]> = None;
