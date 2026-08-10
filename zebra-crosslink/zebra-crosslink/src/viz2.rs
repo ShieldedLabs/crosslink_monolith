@@ -111,18 +111,24 @@ pub async fn service_viz_requests(
             // resent every cycle. With only [ack..tip] (ack ratchets to just behind the
             // PoW tip), older on-screen content has nothing to attach to and floats
             // detached, leaving a gap below the tip cluster.
-            let finalized_height = tfl_handle.internal.lock().await.latest_final_block
-                .map(|(h, _)| h.0 as u64)
-                .unwrap_or(bc_ack_height);
-            // Page cap: never serve more than the newest BC_PAGE_SIZE blocks; older
-            // history is not served for now (history browsing deferred).
+            // Never cut [finalized tip..tip] out of the window, even when finality lags
+            // the PoW tip by more than a page (that lag is exactly what this visualizer
+            // should show): the page cap only bounds ack-lag. While finality is still
+            // unknown (fresh restart) the ack alone bounds the window; corrects itself
+            // on the first BFT block ingest.
             let page_lo = (bc_tip_height + 1).saturating_sub(BC_PAGE_SIZE);
-            let req_lo_height = ZebBlockHeight(max(bc_ack_height.min(finalized_height).min(bc_tip_height), page_lo) as u32);
+            let finalized_lo = tfl_handle.internal.lock().await.latest_final_block
+                .map(|(h, _)| h.0 as u64)
+                .unwrap_or(u64::MAX);
+            // lo = ack clamped to [page_lo, finalized_lo]; when finality lags below the
+            // page floor, the trailing min wins and the window extends down to it.
+            let req_lo_height = ZebBlockHeight(bc_ack_height.max(page_lo).min(finalized_lo).min(bc_tip_height) as u32);
 
             // Anchored on the same tip hash this response reports, so every block in it
             // belongs to the one chain the GUI is being told about. A tip that flipped in
             // the last few milliseconds leaves this one cycle stale, and self-corrects.
-            let seq_blocks = tfl_block_sequence(&call, tip_height_hash.1, tip_height_hash.0, req_lo_height, BC_PAGE_SIZE as u32).await;
+            let window_len = (bc_tip_height - req_lo_height.0 as u64 + 1) as u32;
+            let seq_blocks = tfl_block_sequence(&call, tip_height_hash.1, tip_height_hash.0, req_lo_height, window_len).await;
             if seq_blocks.is_empty() {
                 // The anchor left the state between the tip read and this one. Ordinary
                 // during a reorganization; kept visible, and quiet, in case it is not.
