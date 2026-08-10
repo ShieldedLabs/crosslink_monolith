@@ -26,10 +26,12 @@ struct Voice {
     cursor:  f64, // Fractional frame index into Sound.frames
     speed:   f32,
     vol:     f32,
+    owns_sound: bool, // A play_sound_pcm() one-shot; its slot frees when this voice goes
 }
 
 struct AudioState {
-    sounds: Vec<Sound>, // Callers wanting reuse load_sound() once; play_sound_pcm() grows this per call
+    sounds: Vec<Sound>, // Slots: load_sound() ones live forever, play_sound_pcm() ones free with their voice
+    sound_free: Vec<usize>, // Freed slots, reused before growing sounds
     voices: Vec<Voice>,
     master: f32,
     device_rate:  u32,   // Zero until a backend is up
@@ -38,6 +40,7 @@ struct AudioState {
 
 static AUDIO: Mutex<AudioState> = Mutex::new(AudioState {
     sounds: Vec::new(),
+    sound_free: Vec::new(),
     voices: Vec::new(),
     master: 1.0,
     device_rate:  0,
@@ -58,24 +61,45 @@ pub fn set_master_volume(vol: f32) { AUDIO.lock().unwrap().master = vol; }
 pub fn device_ready() -> bool { AUDIO.lock().unwrap().device_rate != 0 }
 
 pub fn load_sound(sound: Sound) -> usize {
-    let audio = &mut *AUDIO.lock().unwrap();
-    audio.sounds.push(sound);
-    audio.sounds.len() - 1
+    store_sound(&mut AUDIO.lock().unwrap(), sound)
+}
+
+fn store_sound(audio: &mut AudioState, sound: Sound) -> usize {
+    match audio.sound_free.pop() {
+        Some(i) => { audio.sounds[i] = sound; i }
+        None    => { audio.sounds.push(sound); audio.sounds.len() - 1 }
+    }
+}
+
+// A one-shot voice is its sound's only referent, so the slot frees with it
+fn free_if_owned(sounds: &mut [Sound], sound_free: &mut Vec<usize>, v: &Voice) {
+    if v.owns_sound {
+        sounds[v.sound_i] = Sound::default();
+        sound_free.push(v.sound_i);
+    }
+}
+
+fn add_voice(audio: &mut AudioState, voice: Voice) {
+    if PRINT_AUDIO_TIMING { eprintln!("[{}ms] add voice: sound_i {} speed {}", tms(), voice.sound_i, voice.speed); }
+    if audio.voices.len() >= VOICES_MAX {
+        let evicted = audio.voices.remove(0);
+        free_if_owned(&mut audio.sounds, &mut audio.sound_free, &evicted);
+    }
+    audio.voices.push(voice);
 }
 
 pub fn play_loaded(sound_i: usize, vol: f32, speed: f32) {
     let audio = &mut *AUDIO.lock().unwrap();
     if audio.device_rate == 0 { return; } // No backend, drop rather than queue a stale burst
     if sound_i >= audio.sounds.len() { return; }
-    if PRINT_AUDIO_TIMING { eprintln!("[{}ms] add voice: sound_i {} speed {}", tms(), sound_i, speed); }
-    if audio.voices.len() >= VOICES_MAX { audio.voices.remove(0); }
-    audio.voices.push(Voice { sound_i, cursor: 0.0, speed, vol });
+    add_voice(audio, Voice { sound_i, cursor: 0.0, speed, vol, owns_sound: false });
 }
 
 pub fn play_sound_pcm(sound: Sound, vol: f32, speed: f32) {
-    if !device_ready() { return; }
-    let sound_i = load_sound(sound);
-    play_loaded(sound_i, vol, speed);
+    let audio = &mut *AUDIO.lock().unwrap();
+    if audio.device_rate == 0 { return; } // No backend, drop rather than queue a stale burst
+    let sound_i = store_sound(audio, sound);
+    add_voice(audio, Voice { sound_i, cursor: 0.0, speed, vol, owns_sound: true });
 }
 
 pub fn play_sine(hz: f32, secs: f32, vol: f32, speed: f32) {
@@ -173,7 +197,7 @@ fn mix_into(audio: &mut AudioState, buf: &mut [f32], ch_n: usize) {
     let master = audio.master;
 
     let out_frames_n = buf.len() / ch_n;
-    let AudioState { sounds, voices, .. } = audio; // Split borrow
+    let AudioState { sounds, sound_free, voices, .. } = audio; // Split borrow
     voices.retain_mut(|v| {
         let sound = &sounds[v.sound_i];
         let step = sound.rate as f64 / dev_rate * v.speed as f64;
@@ -182,6 +206,7 @@ fn mix_into(audio: &mut AudioState, buf: &mut [f32], ch_n: usize) {
             let i = v.cursor as usize;
             if i + 1 >= sound.frames.len() {
                 if PRINT_AUDIO_TIMING { eprintln!("[{}ms] retire voice: sound_i {}", tms(), v.sound_i); }
+                free_if_owned(sounds, sound_free, v);
                 return false;
             }
             let t = (v.cursor - i as f64) as f32;
@@ -207,12 +232,13 @@ fn mix_into(audio: &mut AudioState, buf: &mut [f32], ch_n: usize) {
 fn skip_output(audio: &mut AudioState, gap_secs: f64) {
     audio.fade_in_left = FADE_IN_N;
 
-    let AudioState { sounds, voices, .. } = audio; // Split borrow
+    let AudioState { sounds, sound_free, voices, .. } = audio; // Split borrow
     voices.retain_mut(|v| {
         let sound = &sounds[v.sound_i];
         v.cursor += gap_secs * sound.rate as f64 * v.speed as f64;
         if (v.cursor as usize) + 1 >= sound.frames.len() {
             if PRINT_AUDIO_TIMING { eprintln!("[{}ms] retire voice: sound_i {} (skipped past end)", tms(), v.sound_i); }
+            free_if_owned(sounds, sound_free, v);
             return false;
         }
         true
