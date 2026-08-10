@@ -37,16 +37,21 @@ pub fn viz_main(tokio_root_thread_handle: Option<std::thread::JoinHandle<()>>, w
 /// Max best-chain blocks served per response. Bounds the startup burst (a fresh GUI
 /// acks 0, which used to request the entire chain). Must comfortably exceed the
 /// non-finalized window (~100) so the always-served [finalized tip..tip] span is
-/// never cut. History below the window is not served for now; proper demand paging
-/// is deferred (see the viz-paging branch for a prototype).
+/// never cut. History below the window is served on demand as the camera reaches
+/// the bottom of loaded coverage (bc_want_below).
 const BC_PAGE_SIZE: u64 = 1024;
 
-/// Max BFT blocks served per response. A fresh GUI acks 0; serving only the newest
-/// page keeps the first message bounded, and since the newest BFT blocks anchor to
-/// on-screen best-chain blocks the ack then ratchets up and steady-state resends
-/// are small. Deep BFT history is not yet demand-paged.
-/// TODO: page old BFT blocks in on demand (e.g. from camera position), as bc does.
+/// Max BFT blocks served per response: a safety cap on the fat-pointer extent.
+/// BFT blocks are served strictly in sync with the PoW blocks served (the extent
+/// over their fat pointers, plus BFT_TIP_MARGIN), so this only binds if a single
+/// PoW span references an absurd number of BFT blocks.
 const BFT_PAGE_SIZE: usize = 2048;
+
+fn work_from_difficulty(difficulty: zebra_chain::work::difficulty::CompactDifficulty) -> u64 {
+    difficulty.to_work()
+        .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
 
 /// Bridge between tokio & viz code
 pub async fn service_viz_requests(
@@ -58,11 +63,19 @@ pub async fn service_viz_requests(
     let mut bc_ack_height: u64 = 0;
     let mut skipped_windows_n: u64 = 0;
     let mut instr_strings: Vec<String> = Vec::new();
-    // Finalization-candidate heights by candidate hash, resolved lazily from the state.
-    // Lets the GUI position BFT certs at their candidate height before it has the PoW
-    // block, which in turn lets camera paging fetch those blocks (a shown cert should
-    // never be left without its PoW blocks). Bounded by total cert count.
+    // Finalization-candidate info per BFT block, checked exactly once per block:
+    // bft_candidate_hashes[i] caches the candidate hash of bft_blocks[i] for all
+    // i < bft_checked_n. The fully-checked range only advances past real blocks;
+    // an empty-headers placeholder block (see handle_new_decided_bft_block) stalls
+    // it until filled in, which is safe because only placeholders are ever
+    // overwritten. Candidate heights resolve from the state into
+    // bft_candidate_heights; hashes whose lookup failed (candidate not yet synced)
+    // wait in bft_unresolved_heights and retry a few per cycle.
+    let mut bft_checked_n: usize = 0;
+    let mut bft_candidate_hashes: Vec<Hash32> = Vec::new();
     let mut bft_candidate_heights: std::collections::HashMap<Hash32, u64> = std::collections::HashMap::new();
+    let mut bft_unresolved_heights: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
+    let mut bft_resolved_at_tip: u64 = u64::MAX; // PoW tip at the last resolution round
 
     loop {
         let request_queue = visualizer_zcash::REQUESTS_TO_ZEBRA.lock().unwrap();
@@ -108,21 +121,28 @@ pub async fn service_viz_requests(
             // Keep the window covering the whole non-finalized span [finalized tip..tip]:
             // sidechain forks root above the finalized tip and BFT finalization candidates
             // lag the PoW tip, so anchoring both on screen needs these best-chain blocks
-            // resent every cycle. With only [ack..tip] (ack ratchets to just behind the
-            // PoW tip), older on-screen content has nothing to attach to and floats
-            // detached, leaving a gap below the tip cluster.
-            let finalized_height = tfl_handle.internal.lock().await.latest_final_block
-                .map(|(h, _)| h.0 as u64)
-                .unwrap_or(bc_ack_height);
-            // Page cap: never serve more than the newest BC_PAGE_SIZE blocks; older
-            // history is not served for now (history browsing deferred).
+            // resent every cycle. Never cut that span out of the window, even when finality lags
+            // the PoW tip by more than a page (that lag is exactly what this visualizer
+            // should show): the page cap only bounds ack-lag. While finality is still
+            // unknown (fresh restart) the ack alone bounds the window; corrects itself
+            // on the first decided-block ingest.
             let page_lo = (bc_tip_height + 1).saturating_sub(BC_PAGE_SIZE);
-            let req_lo_height = ZebBlockHeight(max(bc_ack_height.min(finalized_height).min(bc_tip_height), page_lo) as u32);
+            let finalized_lo = tfl_handle.internal.lock().await.latest_final_block
+                .map(|(h, _)| h.0 as u64)
+                .unwrap_or(u64::MAX);
+            // lo = ack clamped to [page_lo, finalized_lo]; when finality lags below the
+            // page floor, the trailing min wins and the window extends down to it,
+            // bounded at a few pages: a restart mid-finality-catch-up can leave
+            // latest_final_block a whole chain below the tip, and an unbounded window
+            // would then serve everything down to ~0 every cycle.
+            let sanity_lo = (bc_tip_height + 1).saturating_sub(4 * BC_PAGE_SIZE);
+            let req_lo_height = ZebBlockHeight(bc_ack_height.max(page_lo).min(finalized_lo).max(sanity_lo).min(bc_tip_height) as u32);
 
             // Anchored on the same tip hash this response reports, so every block in it
             // belongs to the one chain the GUI is being told about. A tip that flipped in
             // the last few milliseconds leaves this one cycle stale, and self-corrects.
-            let seq_blocks = tfl_block_sequence(&call, tip_height_hash.1, tip_height_hash.0, req_lo_height, BC_PAGE_SIZE as u32).await;
+            let window_len = (bc_tip_height - req_lo_height.0 as u64 + 1) as u32;
+            let seq_blocks = tfl_block_sequence(&call, tip_height_hash.1, tip_height_hash.0, req_lo_height, window_len).await;
             if seq_blocks.is_empty() {
                 // The anchor left the state between the tip read and this one. Ordinary
                 // during a reorganization; kept visible, and quiet, in case it is not.
@@ -148,26 +168,58 @@ pub async fn service_viz_requests(
                 .map(|sb| (Hash32::from_bytes(sb.this_hash.0), Hash32::from_bytes(sb.parent_hash.0), sb.this_height as u64))
                 .collect();
 
-            // Resolve any unresolved finalization-candidate heights for the BFT page.
-            // Hashes are collected under a short internal lock; the state lookups await
-            // outside it. Steady-state this is 0-1 lookups; the first cycle resolves the
-            // whole page once.
+            // Advance the fully-checked range of BFT blocks: each block's finalization-
+            // candidate hash is computed exactly once, then never re-checked. The
+            // internal lock is held only for the scan; state lookups await outside it.
+            // Steady-state this touches nothing but newly decided blocks.
             {
-                let unresolved: Vec<Hash32> = {
+                {
                     let internal = tfl_handle.internal.lock().await;
-                    let page_start = internal.bft_blocks.len().saturating_sub(BFT_PAGE_SIZE);
-                    internal.bft_blocks[page_start..].iter()
-                        .map(|b| Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0))
-                        .filter(|h| !bft_candidate_heights.contains_key(h))
-                        .collect()
-                };
-                for hash in unresolved {
-                    if let Ok(StateResponse::BlockHeader { height, .. }) =
-                        (call.state)(StateRequest::BlockHeader(zebra_state::HashOrHeight::Hash(ZebBlockHash(hash.as_bytes()).into()))).await
-                    {
-                        bft_candidate_heights.insert(hash, height.0 as u64);
+                    // bounded per cycle so a bulk load (PoS store replay) doesn't hash the
+                    // whole chain under one lock hold
+                    let scan_end = (bft_checked_n + 4096).min(internal.bft_blocks.len());
+                    while bft_checked_n < scan_end {
+                        let b = &internal.bft_blocks[bft_checked_n];
+                        if b.headers.is_empty() { break; } // placeholder: recheck once filled
+                        let hash = Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0);
+                        bft_candidate_hashes.push(hash);
+                        if !bft_candidate_heights.contains_key(&hash) {
+                            bft_unresolved_heights.insert(hash);
+                        }
+                        bft_checked_n += 1;
                     }
                 }
+                // retry a bounded batch; the set drains as candidates sync into the
+                // state. Only when the chain has grown since the last round: an
+                // unresolved candidate can only become resolvable when new blocks
+                // arrive, so retrying against an unchanged chain is pure cost
+                // (PoW catch-up used to pay hundreds of doomed lookups per cycle).
+                if !bft_unresolved_heights.is_empty() && bc_tip_height != bft_resolved_at_tip {
+                    bft_resolved_at_tip = bc_tip_height;
+                    let pending: Vec<Hash32> = bft_unresolved_heights.iter().copied().take(256).collect();
+                    for hash in pending {
+                        if let Ok(StateResponse::BlockHeader { height, .. }) =
+                            (call.state)(StateRequest::BlockHeader(zebra_state::HashOrHeight::Hash(ZebBlockHash(hash.as_bytes()).into()))).await
+                        {
+                            bft_candidate_heights.insert(hash, height.0 as u64);
+                            bft_unresolved_heights.remove(&hash);
+                        }
+                    }
+                }
+            }
+
+            // Finality-frontier page: when finality lags more than the window's sanity
+            // bound below the tip (BFT catch-up), the finalization-candidate region falls
+            // out of the served window and the GUI can only show it as header ghosts and
+            // peer claims. Serve one page of real best-chain blocks up from the finalized
+            // tip so the region the BFT chain points at stays real; it chases the frontier
+            // upward as finality catches up, and disappears once the window covers it.
+            // Anchored on the same tip hash as the window, like the backfill page below.
+            let mut frontier_blocks: Vec<(ZebBlockHeight, ZebBlockHash, Arc<Block>)> = Vec::new();
+            if finalized_lo < sanity_lo {
+                let lo_h = ZebBlockHeight(finalized_lo as u32);
+                let hi_h = ZebBlockHeight((finalized_lo + BC_PAGE_SIZE - 1).min(sanity_lo - 1) as u32);
+                frontier_blocks = tfl_block_sequence(&call, tip_height_hash.1, hi_h, lo_h, BC_PAGE_SIZE as u32).await;
             }
 
             for _ in 0..256 {
@@ -425,67 +477,69 @@ pub async fn service_viz_requests(
                         push_bc_block(&mut response, height, hash, bc, true);
                     }
                     // backfill page (older best-chain blocks below the GUI's coverage)
-                    for (height, hash, bc) in backfill_blocks.iter() {
+                    // and finality-frontier page (real blocks where the BFT candidates point)
+                    for (height, hash, bc) in backfill_blocks.iter().chain(frontier_blocks.iter()) {
                         push_bc_block(&mut response, height, hash, bc, true);
                     }
                     for (height, hash, bc) in fork_blocks.iter() {
                         push_bc_block(&mut response, height, hash, bc, false);
                     }
 
-                    // Newest-page cap: a fresh GUI acks 0; the newest BFT blocks anchor to
-                    // on-screen bc blocks, so its ack ratchets up after the first message.
-                    let bft_page_start = (request.bft_ack_height as usize)
-                        .max(internal.bft_blocks.len().saturating_sub(BFT_PAGE_SIZE));
-
-                    // BFT certs for the backfill page: each PoW block's fat pointer names a
-                    // cert, so the [min..max] cert-index extent linked from the page covers
-                    // the certs decided over that PoW span. (Candidate-height inversion would
-                    // also work as an extent source; fat pointers are the direct one.)
+                    // BFT blocks strictly in sync with the PoW blocks served: each PoW block's
+                    // fat pointer names a BFT block, so the [min..max] index extent over the
+                    // window's and backfill page's pointers covers exactly the BFT blocks
+                    // decided over the served PoW spans, plus a small margin above the newest
+                    // pointer so just-decided blocks (not yet referenced by any PoW block)
+                    // still appear. Nothing else is served: a BFT catch-up burst past the
+                    // margin stays hidden until PoW blocks referencing it exist.
                     let mut bft_extent: Option<(usize, usize)> = None;
-                    for (_, _, bc) in &backfill_blocks {
+                    let mut fold = |h: usize| {
+                        bft_extent = Some(match bft_extent {
+                            None => (h, h),
+                            Some((lo, hi)) => (lo.min(h), hi.max(h)),
+                        });
+                    };
+                    for (_, _, bc) in seq_blocks.iter().chain(backfill_blocks.iter()).chain(frontier_blocks.iter()) {
                         let ptr = bc.header.fat_pointer_to_bft_block.points_at_block_hash();
-                        if let Some(&h) = internal.bft_block_hash_to_height.get(&ptr) {
-                            let h = h as usize;
-                            bft_extent = Some(match bft_extent {
-                                None => (h, h),
-                                Some((lo, hi)) => (lo.min(h), hi.max(h)),
-                            });
-                        }
-                    }
-                    // Bridge the seam to the window: a cert whose candidate is just below the
-                    // window but which is only pointed at by in-window blocks belongs to
-                    // neither the newest-page serving nor the page extent, leaving a hole at
-                    // the load boundary. Folding the window blocks' pointers into the extent
-                    // makes the served cert range contiguous across the seam.
-                    if bft_extent.is_some() {
-                        for (_, _, bc) in &seq_blocks {
-                            let ptr = bc.header.fat_pointer_to_bft_block.points_at_block_hash();
-                            if let Some(&h) = internal.bft_block_hash_to_height.get(&ptr) {
-                                let h = h as usize;
-                                bft_extent = Some(match bft_extent {
-                                    None => (h, h),
-                                    Some((lo, hi)) => (lo.min(h), hi.max(h)),
-                                });
-                            }
-                        }
+                        if let Some(&h) = internal.bft_block_hash_to_height.get(&ptr) { fold(h as usize); }
                     }
 
+                    const BFT_TIP_MARGIN: usize = 16;
+                    // No served PoW block names any BFT block yet (fat pointers are null
+                    // until the first decided block gets referenced, e.g. a fresh chain):
+                    // the just-decided tail is still news, same as the margin above the
+                    // newest pointer.
+                    let bft_extent = bft_extent.or_else(|| {
+                        let n = internal.bft_blocks.len();
+                        (n > 0).then(|| (n.saturating_sub(BFT_TIP_MARGIN), n - 1))
+                    });
                     let mut bft_indices: Vec<usize> = Vec::new();
                     if let Some((lo, hi)) = bft_extent {
-                        let hi = hi.min(lo + BFT_PAGE_SIZE - 1).min(internal.bft_blocks.len().saturating_sub(1));
-                        bft_indices.extend((lo..=hi).filter(|i| *i < bft_page_start));
+                        // the page cap cuts the oldest indices, never the newest: under
+                        // pressure (catch-up, deep scrolling) the tip lane must keep moving
+                        let hi = (hi + BFT_TIP_MARGIN).min(internal.bft_blocks.len().saturating_sub(1));
+                        let lo = lo.max((hi + 1).saturating_sub(BFT_PAGE_SIZE));
+                        bft_indices.extend(lo..=hi);
                     }
-                    bft_indices.extend(bft_page_start..internal.bft_blocks.len());
 
                     for i in bft_indices {
                         let b = &internal.bft_blocks[i];
-                        let candidate_hash = Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0);
+                        // Out-of-order BFT ingest pads the chain with empty-headers placeholder
+                        // blocks; nothing to show until the real block arrives.
+                        if b.headers.is_empty() { continue; }
+                        // cached for the fully-checked range; blocks past a stalled
+                        // placeholder (catch-up) compute on the fly until checked
+                        let candidate_hash = bft_candidate_hashes.get(i).copied().unwrap_or_else(||
+                            Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0));
+                        // past a stalled placeholder the fully-checked scan hasn't seen this
+                        // hash, so enqueue it here: resolution must still learn its height
+                        // or the block positions at 0 forever
+                        if !bft_candidate_heights.contains_key(&candidate_hash) {
+                            bft_unresolved_heights.insert(candidate_hash);
+                        }
+                        // extent membership already proves this block's PoW span is served;
+                        // the height is for GUI positioning only (0 = not yet resolved)
                         let candidate_height = bft_candidate_heights.get(&candidate_hash).copied().unwrap_or(0);
-                        // Newest-page certs are served only if their finalization candidate lies
-                        // inside the served PoW window: a shown cert always has its PoW blocks
-                        // shown. Backfill-extent certs are exempt: their PoW page ships in this
-                        // very response (their candidate heights are also mostly unresolved).
-                        if i >= bft_page_start && candidate_height < lo_height.0 as u64 { continue; }
                         let this_hash = Hash32::from_bytes(b.blake3_hash().0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;
@@ -502,10 +556,7 @@ pub async fn service_viz_requests(
                                 hash: Hash32::from_bytes(BlockHash::from_header_data(x).0),
                                 parent_hash: Hash32::from_bytes(x.prev_block.0),
                                 utc: x.time as i64,
-                                work: zebra_chain::work::difficulty::CompactDifficulty(x.bits)
-                                    .to_work()
-                                    .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
-                                    .unwrap_or(0),
+                                work: work_from_difficulty(zebra_chain::work::difficulty::CompactDifficulty(x.bits)),
                             }).collect(),
                             // Foreknowledge from the hardfork schedule (known at startup, not from
                             // the next block): flag this block when a hardfork activates at the next

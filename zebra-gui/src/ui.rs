@@ -1592,7 +1592,11 @@ pub fn ui_left_pane(ui: &mut Context,
         staked_roster_bonded.sort_by_key(|x| std::cmp::Reverse((x.1, x.2)));
 
         for position in &staked_roster_unbonded {
-            total_unbonded += position.2;
+            // u64::MAX marks a value-unknown placeholder (unbond seen before its create);
+            // summing it would overflow (aborts under overflow-checks)
+            if position.2 != u64::MAX {
+                total_unbonded += position.2;
+            }
         }
 
         let mut prev_finalizer: Option<[u8; 32]> = None;
@@ -2445,10 +2449,15 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }) {
                                                 let id = id_index("Unstake Clickable Text", index as u32);
                                                 let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
-                                                let mut str = frame_strf!(data, "{}", format_stake_amount(stake_amount));
+                                                // a bond discovered out of order carries a u64::MAX
+                                                // placeholder until the wallet learns the real value
+                                                let str = if initial == u64::MAX {
+                                                    frame_strf!(data, "...")
+                                                } else {
+                                                    frame_strf!(data, "{}", format_stake_amount(stake_amount))
+                                                };
                                                 if ui.hovered(id) {
                                                     colour = WHITE;
-                                                    str = frame_strf!(data, "{}", format_stake_amount(stake_amount));
                                                 }
 
                                                 if let _ = elem().decl(Decl {
@@ -2687,10 +2696,15 @@ pub fn ui_left_pane(ui: &mut Context,
                                             }) {
                                                 let id = id_index("Unstake Clickable Text", index as u32);
                                                 let mut colour = (0xff, 0xaf, 0x0e, 0xff); // @todo color
-                                                let mut str = frame_strf!(data, "{}", format_stake_amount(stake_amount));
+                                                // a bond discovered out of order carries a u64::MAX
+                                                // placeholder until the wallet learns the real value
+                                                let str = if initial == u64::MAX {
+                                                    frame_strf!(data, "...")
+                                                } else {
+                                                    frame_strf!(data, "{}", format_stake_amount(stake_amount))
+                                                };
                                                 if ui.hovered(id) {
                                                     colour = WHITE;
-                                                    str = frame_strf!(data, "{}", format_stake_amount(stake_amount));
                                                 }
 
                                                 if let _ = elem().decl(Decl {

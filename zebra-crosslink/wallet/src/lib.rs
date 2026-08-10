@@ -4254,6 +4254,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
             let mut stake_positions_bonded: Vec<(ScanBond, [u8; 32], u64)> = Vec::new();
             let mut stake_positions_unbonded: Vec<(ScanBond, u64)> = Vec::new();
+            // Two passes, creates first: txs are sorted by (height, discovery), so an
+            // unbond can be iterated before its same-height create; a single pass then
+            // mints a value-unknown placeholder that coexists with (and double-counts)
+            // the real bond once the create is reached.
             for tx in &user_wallet.txs {
                 if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
                 if let Some(staking_action) = (&tx.staking_action) {
@@ -4265,6 +4269,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                             create_txid: PubKeyID(<[u8; 32]>::from(tx.txid)),
                         }, create_bond.target_finalizer, create_bond.amount_zats));
                     }
+                }
+            }
+            for tx in &user_wallet.txs {
+                if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
+                if let Some(staking_action) = (&tx.staking_action) {
                     if let Some(retarget) = StakingAction_RetargetDelegationBond::try_from_union(staking_action) {
                         if let Some((_bond, finalizer, _latest_zats)) = stake_positions_bonded.iter_mut().find(|(bond, _, _)| bond.pk.0 == retarget.unique_pubkey) {
                             *finalizer = retarget.target_finalizer;
@@ -4320,7 +4329,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     active.entry(PubKeyID(*finalizer)).or_default().push((bond.clone(), *latest));
                 }
                 let withdrawable = stake_positions_unbonded.iter()
-                    .filter(|(_bond, latest_zats)| *latest_zats != u64::MAX) // don't serialize still-unknown placeholders
+                    // don't serialize placeholders: latest still unknown, or initial never
+                    // learned (seen_bond_values can correct latest but not initial)
+                    .filter(|(bond, latest_zats)| *latest_zats != u64::MAX && bond.initial_val != u64::MAX)
                     .cloned()
                     .collect();
                 *STAKING_POSITIONS.lock().unwrap() = (active, withdrawable);

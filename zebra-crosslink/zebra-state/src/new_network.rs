@@ -1502,7 +1502,11 @@ pub fn sync(
                                 shared_n = shared_n.max((last.this_height + 1 - branch[0].this_height) as usize);
                             }
                         }
-                        attested.extend(branch[shared_n..].iter().copied().filter(|b| seen.insert(b.this_hash)));
+                        // never attest blocks we hold ourselves (a no-overlap branch from a
+                        // far-behind peer is otherwise published whole, and the GUI would
+                        // show real best-chain blocks as mere claims)
+                        attested.extend(branch[shared_n..].iter().copied().filter(|b|
+                            seen.insert(b.this_hash) && read_state.known_block(b.this_hash).is_none()));
                     }
                 }
                 *PEER_ATTESTED_BLOCKS.lock().unwrap() = attested;

@@ -315,7 +315,7 @@ pub struct BftBlock {
     pub parent_hash: Hash32,
     pub this_height: u64,
     pub points_at_bc_block: Hash32,
-    pub points_at_bc_height: u64, // finalization candidate's BC height (0 = unknown): positions the cert even before its PoW block arrives
+    pub points_at_bc_height: u64, // finalization candidate's BC height (0 = unknown): positions the BFT block even before its PoW block arrives
     pub proving_blocks: Vec<ProvingHeader>,
     /// The *next* BFT block (this block's successor) activates a user-led
     /// hardfork. We mark this block so the GUI can signal that a hardfork is
@@ -377,6 +377,8 @@ const COLOR_BRIGHT: u32 = 0xffffff;
 // its last attestation, then fades to a greyed-out floor over FADE_SECS
 const PEER_ATTEST_FRESH_SECS: f32 = 10.0;
 const PEER_ATTEST_FADE_SECS:  f32 = 20.0;
+const PEER_ATTEST_ALPHA_FRESH: f32 = 0.15;
+const PEER_ATTEST_ALPHA_STALE: f32 = 0.04;
 
 const COLOR_BC_LINK:    u32 = 0x4e7b73;
 const COLOR_BFT_LINK:   u32 = 0x9a2d37;
@@ -405,6 +407,9 @@ pub struct VizState {
     pub on_screen_bfts: HashMap<Hash32, OnScreenBft>,
     pub did_initial_tip_jump: bool, // "reset view" to the tip once, as soon as the first blocks load
     pub bc_lowest_loaded: u64, // lowest best-chain height on screen; scrolling to it triggers downward backfill
+    pub bc_best_heights: std::collections::HashSet<u64>, // heights with a best-chain full block on screen
+    pub bc_covered_down_to: u64, // [this..tip] is contiguously covered; a gap down to bc_lowest_loaded is a hole to fill
+    pub bc_last_hole_fill: u64, // floor of the last hole-fill request; don't re-request until the floor moves
     pub send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
     pub receive_from_zebra: std::sync::mpsc::Receiver<ResponseFromZebra>,
 
@@ -448,7 +453,7 @@ pub struct VizState {
 impl VizState {
     pub fn pos_at_height(&self, height: BlockHeight) -> (f32, f32, bool) {
         if height.is_in_block() {
-            (0.0, -10.0 * height.0 as f32, true) // @todo: should handle sidechain x-axis, maybe this should take a hash instead
+            (0.0, y_for_height(height.0 as f32), true) // @todo: should handle sidechain x-axis, maybe this should take a hash instead
         } else {
             (0.0, 0.0, false)
         }
@@ -458,7 +463,7 @@ impl VizState {
         for _ in 0usize..65536 {
             let bft = self.on_screen_bfts.get(&bft_hash)?;
             if let Some(bc) = self.on_screen_bcs.get(&bft.block.points_at_bc_block) {
-                return Some(bc.t_y - 10.0 / 2.0);
+                return Some(bc.t_y - BLOCK_SPACING / 2.0);
             }
             if bft.block.parent_hash == Hash32::from_u64(0) {
                 return None;
@@ -470,7 +475,7 @@ impl VizState {
 
     pub fn goto_pow_height(&mut self, h: u64) {
         self.follow_tip = false;
-        self.camera_y = -10.0 * h as f32;
+        self.camera_y = y_for_height(h as f32);
         self.zoom = 2.0;
     }
 
@@ -662,6 +667,9 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         on_screen_bfts: HashMap::new(),
         did_initial_tip_jump: false,
         bc_lowest_loaded: u64::MAX,
+        bc_best_heights: std::collections::HashSet::new(),
+        bc_covered_down_to: u64::MAX,
+        bc_last_hole_fill: 0,
         send_to_zebra: me_send,
         receive_from_zebra: me_receive,
         bc_tip_height: 0,
@@ -698,7 +706,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 
     if fake_data {
         // TODO: pull from binary test data
-        let mut make_bc = |seq: &mut u64, parent_hash: Hash32, points_at_bft_block: Hash32, txs_n: usize, is_best_chain: bool, is_finalized: bool, _bft_implicated: bool| -> Hash32 {
+        let mut make_bc = |seq: &mut u64, parent_hash: Hash32, points_at_bft_block: Hash32, txs_n: usize, is_best_chain: bool, is_finalized: bool| -> Hash32 {
             let this_height = if let Some(parent) = viz_state.on_screen_bcs.get(&parent_hash) {
                 parent.block.this_height+1
             } else {
@@ -736,27 +744,27 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         let seq = &mut 0u64;
 
 
-        let bc_0  = make_bc(seq, Hash32::from_u64(0), Hash32::from_u64(0), 1, /*bc*/true, /*final*/true, /*bft-implicated*/false);
+        let bc_0  = make_bc(seq, Hash32::from_u64(0), Hash32::from_u64(0), 1, /*bc*/true, /*final*/true);
         let bft0  = make_bft(seq, bc_0);
-        let bc_1  = make_bc(seq, bc_0,  bft0,    6, /*bc*/true,  /*final*/true,  /*bft-implicated*/true);
-        let bc_2  = make_bc(seq, bc_1,  bft0,    2, /*bc*/true,  /*final*/true,  /*bft-implicated*/true);
-        let bc_1a = make_bc(seq, bc_0,  bft0, 4256, /*bc*/false, /*final*/false, /*bft-implicated*/false);
-        let bc_2a = make_bc(seq, bc_1,  bft0,   16, /*bc*/false, /*final*/false, /*bft-implicated*/false);
-        let bc_2b = make_bc(seq, bc_1a, bft0,   15, /*bc*/false, /*final*/false, /*bft-implicated*/false);
-        let bc_3b = make_bc(seq, bc_2b, bft0,    3, /*bc*/false, /*final*/false, /*bft-implicated*/false);
+        let bc_1  = make_bc(seq, bc_0,  bft0,    6, /*bc*/true,  /*final*/true);
+        let bc_2  = make_bc(seq, bc_1,  bft0,    2, /*bc*/true,  /*final*/true);
+        let bc_1a = make_bc(seq, bc_0,  bft0, 4256, /*bc*/false, /*final*/false);
+        let bc_2a = make_bc(seq, bc_1,  bft0,   16, /*bc*/false, /*final*/false);
+        let bc_2b = make_bc(seq, bc_1a, bft0,   15, /*bc*/false, /*final*/false);
+        let bc_3b = make_bc(seq, bc_2b, bft0,    3, /*bc*/false, /*final*/false);
 
         let bft1  = make_bft(seq, bc_1);
         let bft2  = make_bft(seq, bc_2);
 
-        let bc_3  = make_bc(seq, bc_2,  bft2,    3, /*bc*/true, /*final*/true,  /*bft-implicated*/false);
-        let bc_4  = make_bc(seq, bc_3,  bft2,    3, /*bc*/true, /*final*/true,  /*bft-implicated*/false);
-        let bc_5  = make_bc(seq, bc_4,  bft2,   18, /*bc*/true, /*final*/false, /*bft-implicated*/false);
+        let bc_3  = make_bc(seq, bc_2,  bft2,    3, /*bc*/true, /*final*/true);
+        let bc_4  = make_bc(seq, bc_3,  bft2,    3, /*bc*/true, /*final*/true);
+        let bc_5  = make_bc(seq, bc_4,  bft2,   18, /*bc*/true, /*final*/false);
         let bft3  = make_bft(seq, bc_4);
 
-        let bc_6  = make_bc(seq, bc_5,  bft3,    5, /*bc*/true, /*final*/false, /*bft-implicated*/false);
-        let bc_7  = make_bc(seq, bc_6,  bft3,    5, /*bc*/true, /*final*/false, /*bft-implicated*/false);
-        let bc_8  = make_bc(seq, bc_7,  bft3,    5, /*bc*/true, /*final*/false, /*bft-implicated*/false);
-        let bc_8  = make_bc(seq, bc_7,  bft3,    5, /*bc*/true, /*final*/false, /*bft-implicated*/false);
+        let bc_6  = make_bc(seq, bc_5,  bft3,    5, /*bc*/true, /*final*/false);
+        let bc_7  = make_bc(seq, bc_6,  bft3,    5, /*bc*/true, /*final*/false);
+        let bc_8  = make_bc(seq, bc_7,  bft3,    5, /*bc*/true, /*final*/false);
+        let bc_8  = make_bc(seq, bc_7,  bft3,    5, /*bc*/true, /*final*/false);
     }
 
     viz_state
@@ -820,13 +828,26 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         viz_state.staking_bonded_pool_balance = message.staking_bonded_pool_balance;
         viz_state.staking_unbonded_pool_balance = message.staking_unbonded_pool_balance;
 
-        // Reset is_best_chain only for blocks that actually arrived in this message
-        // (and are at or above start_bc_height). This is more targeted than the old
-        // blanket reset that cleared ALL on-screen blocks >= start_bc_height — blocks
-        // that weren't resent stay whatever they were.
+        // At each height this message ACTUALLY served a best-chain block for, the
+        // message is authoritative: an on-screen block there is best iff the message
+        // says so, which lets reorged-out blocks (re-served at the same heights under
+        // new hashes) go gray instead of staying red forever. Membership is per
+        // served HEIGHT, not the min..max span: one response can carry the window
+        // plus a backfill page with an un-served gap between them, and a span test
+        // grays out every real best-chain block in that gap (and previously loaded
+        // pages). Heights the message did not serve keep their flags.
+        let mut served_best_hashes: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
+        let mut served_heights: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for bc in &message.bc_blocks {
-            if bc.this_height >= message.start_bc_height {
-                if let Some(on_screen) = viz_state.on_screen_bcs.get_mut(&bc.this_hash) {
+            if bc.is_best_chain {
+                served_best_hashes.insert(bc.this_hash);
+                served_heights.insert(bc.this_height);
+            }
+        }
+        if !served_heights.is_empty() {
+            for on_screen in viz_state.on_screen_bcs.values_mut() {
+                if served_heights.contains(&on_screen.block.this_height)
+                    && !served_best_hashes.contains(&on_screen.block.this_hash) {
                     on_screen.block.is_best_chain = false;
                 }
             }
@@ -886,17 +907,19 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                 r.block = updated_block;
                 if r.block.is_best_chain {
                     viz_state.bc_lowest_loaded = viz_state.bc_lowest_loaded.min(r.block.this_height);
+                    viz_state.bc_best_heights.insert(r.block.this_height);
                 }
             } else {
                 anything_happened |= true;
                 new_blocks_n += 1;
                 if bc.is_best_chain {
                     viz_state.bc_lowest_loaded = viz_state.bc_lowest_loaded.min(bc.this_height);
+                    viz_state.bc_best_heights.insert(bc.this_height);
                 }
                 // spawn at the target height (fade in only): a fly-in from spawn_y is fine
-                // for a few tip blocks, but bulk arrivals (pages, cert floods) streaking
+                // for a few tip blocks, but bulk arrivals (pages, BFT catch-up bursts) streaking
                 // across the whole chain read as screen-wide flashing
-                viz_state.on_screen_bcs.insert(bc.this_hash, OnScreenBc { y: -10.0 * bc.this_height as f32, block: *bc, alpha: 0.0, ..Default::default() });
+                viz_state.on_screen_bcs.insert(bc.this_hash, OnScreenBc { y: y_for_height(bc.this_height as f32), block: *bc, alpha: 0.0, ..Default::default() });
             }
         }
         for (hash, claimed_parent, claimed_height) in &message.bc_attested {
@@ -907,7 +930,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                 continue;
             }
             anything_happened |= true;
-            viz_state.on_screen_bcs.insert(*hash, OnScreenBc { y: -10.0 * *claimed_height as f32, alpha: 0.0, block: BcBlock {
+            viz_state.on_screen_bcs.insert(*hash, OnScreenBc { y: y_for_height(*claimed_height as f32), alpha: 0.0, block: BcBlock {
                 this_hash: *hash,
                 parent_hash: *claimed_parent, // links up if we know (or learn) the parent
                 this_height: *claimed_height,
@@ -960,7 +983,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                         Some(_) => {} // full block already known; a header adds nothing
                         None => {
                             anything_happened |= true;
-                            viz_state.on_screen_bcs.insert(ph.hash, OnScreenBc { y: -10.0 * header_block.this_height as f32, alpha: 0.0, block: header_block, ..Default::default() });
+                            viz_state.on_screen_bcs.insert(ph.hash, OnScreenBc { y: y_for_height(header_block.this_height as f32), alpha: 0.0, block: header_block, ..Default::default() });
                         }
                     }
                 }
@@ -972,7 +995,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                 if missing == false { viz_state.bft_ack_height = viz_state.bft_ack_height.max(bft.this_height); }
                 anything_happened |= true;
                 new_blocks_n += 1;
-                let bft_spawn_y = if bft.points_at_bc_height > 0 { -10.0 * bft.points_at_bc_height as f32 - 10.0 / 2.0 } else { spawn_y };
+                let bft_spawn_y = if bft.points_at_bc_height > 0 { y_for_height(bft.points_at_bc_height as f32) - BLOCK_SPACING / 2.0 } else { spawn_y };
                 viz_state.on_screen_bfts.insert(bft.this_hash, OnScreenBft { block: bft, alpha: 0.0, y: bft_spawn_y, ..Default::default() });
             }
         }
@@ -987,18 +1010,44 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
     if !viz_state.did_initial_tip_jump && viz_state.bc_tip_height > 0 && !viz_state.on_screen_bcs.is_empty() {
         viz_state.did_initial_tip_jump = true;
         viz_state.camera_x = 0.0;
-        viz_state.camera_y = -10.0 * viz_state.bc_tip_height as f32;
+        viz_state.camera_y = y_for_height(viz_state.bc_tip_height as f32);
+    }
+
+    // Contiguous coverage: [bc_covered_down_to..tip] all have best-chain full blocks
+    // on screen. Walk the floor down as heights arrive.
+    if viz_state.bc_covered_down_to == u64::MAX
+        && viz_state.bc_best_heights.contains(&viz_state.bc_tip_height) {
+        viz_state.bc_covered_down_to = viz_state.bc_tip_height;
+    }
+    while viz_state.bc_covered_down_to != u64::MAX
+        && viz_state.bc_covered_down_to > 0
+        && viz_state.bc_best_heights.contains(&(viz_state.bc_covered_down_to - 1)) {
+        viz_state.bc_covered_down_to -= 1;
     }
 
     if anything_happened == false {
-        // if the camera can see the bottom of the loaded chain and older blocks exist,
-        // ask for the next page below the current coverage
-        let bc_want_below = {
+        let bc_want_below = if viz_state.bc_covered_down_to != u64::MAX
+            && viz_state.bc_covered_down_to > viz_state.bc_lowest_loaded
+            && viz_state.bc_covered_down_to != viz_state.bc_last_hole_fill
+        {
+            // A hole: full blocks exist below the covered floor, so the state must hold
+            // the best-chain blocks in between (later blocks imply their ancestors);
+            // we just haven't got them for viz. Fill the page below the floor, once per
+            // floor position: a page the server can't fully serve must not re-request
+            // forever.
+            viz_state.bc_last_hole_fill = viz_state.bc_covered_down_to;
+            viz_state.bc_covered_down_to
+        } else {
+            // if the camera can see the bottom of the loaded chain and older blocks
+            // exist, ask for the next page below the current coverage; only while
+            // zoomed in enough that block detail is the point: fully zoomed out, the
+            // bottom is always visible and this would page the whole chain to 0
             let screen_unit = SCREEN_UNIT_CONST * ZOOM_FACTOR.powf(viz_state.zoom);
-            let camera_h = -viz_state.camera_y / 10.0;
-            let half_span_h = (1500.0 / screen_unit) / 10.0; // ~half a viewport's worth, in heights
+            let camera_h = height_for_y(viz_state.camera_y);
+            let half_span_h = (1500.0 / screen_unit) / BLOCK_SPACING; // ~half a viewport's worth, in heights
             let visible_bottom_h = (camera_h - half_span_h) as i64;
-            if viz_state.bc_lowest_loaded != u64::MAX
+            if half_span_h < 4096.0
+                && viz_state.bc_lowest_loaded != u64::MAX
                 && viz_state.bc_lowest_loaded > 0
                 && visible_bottom_h <= viz_state.bc_lowest_loaded as i64
             {
@@ -1093,6 +1142,11 @@ fn animate_bft_towards_target(on_screen_bft: &mut OnScreenBft, dt: f32) {
 
 const ZOOM_FACTOR : f32 = 1.2;
 const SCREEN_UNIT_CONST : f32 = 10.0;
+
+/// World-units of y per block height; the chain runs along -y (tip at the top).
+const BLOCK_SPACING: f32 = 10.0;
+fn y_for_height(height: f32) -> f32 { -BLOCK_SPACING * height }
+fn height_for_y(y: f32) -> f32 { -y / BLOCK_SPACING }
 
 fn effective_vertical_wheel_for_scrub(input_ctx: &InputCtx) -> f32 {
     if input_ctx.scroll_delta.1.abs() > 1e-6 || input_ctx.scroll_delta.0.abs() > 1e-6 {
@@ -1195,7 +1249,7 @@ fn apply_scrub_bft_height(viz: &mut VizState, mut h: u64) {
 fn apply_scrub_pow_height(viz: &mut VizState, h: f32, h_min: u64, h_max: u64) {
     let h_next = h.clamp(h_min as f32, h_max as f32);
     viz.follow_tip = false;
-    viz.camera_y = -10.0 * h_next;
+    viz.camera_y = y_for_height(h_next);
     // viz.camera_x = 0.0;
 }
 
@@ -1277,8 +1331,8 @@ fn draw_chain_minimap_overlay(
 
     let wy_top = (0.0 - origin_y) / screen_unit;
     let wy_bot = ((draw_ctx.window_height as f32) - origin_y) / screen_unit;
-    let h_top = -wy_top / 10.0;
-    let h_bot = -wy_bot / 10.0;
+    let h_top = height_for_y(wy_top);
+    let h_bot = height_for_y(wy_bot);
     let (hv_lo, hv_hi) = if h_top <= h_bot { (h_top, h_bot) } else { (h_bot, h_top) };
     let hv_lo = hv_lo.max(h_min as f32);
     let hv_hi = hv_hi.min(h_max as f32).max(hv_lo);
@@ -1538,7 +1592,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 let strip_h = (mm_y1 - mm_y0).max(1.0);
                 let span_h = h_max.saturating_sub(h_min).max(1) as f32;
                 let dh = minimap_wheel_delta_height(dy, strip_h, span_h);
-                let h_cur = ((-viz_state.camera_y) / 10.0).clamp(h_min as f32, h_max as f32);
+                let h_cur = height_for_y(viz_state.camera_y).clamp(h_min as f32, h_max as f32);
                 apply_scrub_pow_height(viz_state, h_cur + dh, h_min, h_max);
                 minimap_wheel_scrubbed = true;
             }
@@ -1619,8 +1673,8 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
     {
         let sday = (viz_state.bc_finalized_tip_height) / UI_COPY_STAKING_PERIOD;
         let mut draw_staking_day_section = | day | {
-            let y2 = -10.0 * ((day*UI_COPY_STAKING_PERIOD) as f32 - 0.25) * screen_unit;
-            let y1 = -10.0 * ((day*UI_COPY_STAKING_PERIOD + UI_COPY_STAKING_DAY_WINDOW) as f32 - 0.75) * screen_unit;
+            let y2 = y_for_height((day*UI_COPY_STAKING_PERIOD) as f32 - 0.25) * screen_unit;
+            let y1 = y_for_height((day*UI_COPY_STAKING_PERIOD + UI_COPY_STAKING_DAY_WINDOW) as f32 - 0.75) * screen_unit;
 
             let text_height = 2.0 * screen_unit;
             let line_thickness = 0.5 * screen_unit;
@@ -1747,7 +1801,7 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         on_screen_bc.t_alpha = if hovered_block == no_hash || hover_related.contains(&on_screen_bc.block.this_hash) { 1.0 } else { 0.5 };
         on_screen_bc.t_finalized_alpha = if on_screen_bc.block.is_finalized { 1.0 } else { 0.0 };
         on_screen_bc.t_x = -5.0;
-        on_screen_bc.t_y = -10.0 * on_screen_bc.block.this_height as f32;
+        on_screen_bc.t_y = y_for_height(on_screen_bc.block.this_height as f32);
 
         if on_screen_bc.block.this_height == viz_state.bc_tip_height {
             viz_state.bc_tip_y = on_screen_bc.t_y;
@@ -1758,11 +1812,11 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
                 BcKnowledge::FullBlock    => 0.25,
                 BcKnowledge::HeaderSeen   => 0.20,
                 BcKnowledge::PeerAttested => {
-                    // claims fade toward a greyed-out floor unless peers keep re-attesting
+                    // claims fade unless peers keep re-attesting
                     // (or the block is seen at a better knowledge level, leaving this tier)
                     let stale_s = on_screen_bc.last_attested.elapsed().as_secs_f32();
                     let fade = 1.0 - ((stale_s - PEER_ATTEST_FRESH_SECS) / PEER_ATTEST_FADE_SECS).clamp(0.0, 1.0);
-                    0.04 + 0.11 * fade
+                    PEER_ATTEST_ALPHA_STALE + (PEER_ATTEST_ALPHA_FRESH - PEER_ATTEST_ALPHA_STALE) * fade
                 }
             };
         }
@@ -1791,14 +1845,14 @@ pub(crate) fn viz_gui_draw_the_stuff_for_the_things(viz_state: &mut VizState, ui
         on_screen_bft.t_alpha = if hovered_block == no_hash || hover_related.contains(&on_screen_bft.block.this_hash) { 1.0 } else { 0.5 };
         on_screen_bft.t_x = 5.0;
         on_screen_bft.t_y = if let Some(on_screen_bc) = viz_state.on_screen_bcs.get(&on_screen_bft.block.points_at_bc_block) {
-            on_screen_bc.y - 10.0 / 2.0
+            on_screen_bc.y - BLOCK_SPACING / 2.0
         } else if on_screen_bft.block.points_at_bc_height > 0 {
             // candidate block not on screen (yet): position at its known height, so the
-            // cert sits where its PoW blocks belong and camera paging fetches them
-            -10.0 * on_screen_bft.block.points_at_bc_height as f32 - 10.0 / 2.0
+            // BFT block sits where its PoW blocks belong and camera paging fetches them
+            y_for_height(on_screen_bft.block.points_at_bc_height as f32) - BLOCK_SPACING / 2.0
         } else {
             if let Some(parent_bft) = viz_state.on_screen_bfts.get(&on_screen_bft.block.parent_hash) {
-                parent_bft.y - 10.0
+                parent_bft.y - BLOCK_SPACING
             } else {
                 on_screen_bft.t_y
             }
