@@ -41,11 +41,10 @@ pub fn viz_main(tokio_root_thread_handle: Option<std::thread::JoinHandle<()>>, w
 /// the bottom of loaded coverage (bc_want_below).
 const BC_PAGE_SIZE: u64 = 1024;
 
-/// Max BFT blocks served per response. A fresh GUI acks 0; serving only the newest
-/// page keeps the first message bounded, and since the newest BFT blocks anchor to
-/// on-screen best-chain blocks the ack then ratchets up and steady-state resends
-/// are small. Deep BFT history is not yet demand-paged.
-/// TODO: page old BFT blocks in on demand (e.g. from camera position), as bc does.
+/// Max BFT blocks served per response: a safety cap on the fat-pointer extent.
+/// BFT blocks are served strictly in sync with the PoW blocks served (the extent
+/// over their fat pointers, plus BFT_TIP_MARGIN), so this only binds if a single
+/// PoW span references an absurd number of BFT blocks.
 const BFT_PAGE_SIZE: usize = 2048;
 
 fn work_from_difficulty(difficulty: zebra_chain::work::difficulty::CompactDifficulty) -> u64 {
@@ -488,56 +487,32 @@ pub async fn service_viz_requests(
                         push_bc_block(&mut response, height, hash, bc, false);
                     }
 
-                    // Newest-page cap: a fresh GUI acks 0; the newest BFT blocks anchor to
-                    // on-screen bc blocks, so its ack ratchets up after the first message.
-                    let bft_page_start = (request.bft_ack_height as usize)
-                        .max(internal.bft_blocks.len().saturating_sub(BFT_PAGE_SIZE));
-
-                    // BFT blocks for the backfill page: each PoW block's fat pointer names a
-                    // BFT block, so the [min..max] index extent linked from the page covers
-                    // the BFT blocks decided over that PoW span. (Candidate-height inversion would
-                    // also work as an extent source; fat pointers are the direct one.)
+                    // BFT blocks strictly in sync with the PoW blocks served: each PoW block's
+                    // fat pointer names a BFT block, so the [min..max] index extent over the
+                    // window's and backfill page's pointers covers exactly the BFT blocks
+                    // decided over the served PoW spans, plus a small margin above the newest
+                    // pointer so just-decided blocks (not yet referenced by any PoW block)
+                    // still appear. Nothing else is served: a BFT catch-up burst past the
+                    // margin stays hidden until PoW blocks referencing it exist.
                     let mut bft_extent: Option<(usize, usize)> = None;
-                    for (_, _, bc) in &backfill_blocks {
+                    let mut fold = |h: usize| {
+                        bft_extent = Some(match bft_extent {
+                            None => (h, h),
+                            Some((lo, hi)) => (lo.min(h), hi.max(h)),
+                        });
+                    };
+                    for (_, _, bc) in seq_blocks.iter().chain(backfill_blocks.iter()) {
                         let ptr = bc.header.fat_pointer_to_bft_block.points_at_block_hash();
-                        if let Some(&h) = internal.bft_block_hash_to_height.get(&ptr) {
-                            let h = h as usize;
-                            bft_extent = Some(match bft_extent {
-                                None => (h, h),
-                                Some((lo, hi)) => (lo.min(h), hi.max(h)),
-                            });
-                        }
-                    }
-                    // Bridge the seam to the window: a BFT block whose candidate is just below the
-                    // window but which is only pointed at by in-window blocks belongs to
-                    // neither the newest-page serving nor the page extent, leaving a hole at
-                    // the load boundary. Folding the window blocks' pointers into the extent
-                    // makes the served BFT block range contiguous across the seam.
-                    if bft_extent.is_some() {
-                        for (_, _, bc) in &seq_blocks {
-                            let ptr = bc.header.fat_pointer_to_bft_block.points_at_block_hash();
-                            if let Some(&h) = internal.bft_block_hash_to_height.get(&ptr) {
-                                let h = h as usize;
-                                bft_extent = Some(match bft_extent {
-                                    None => (h, h),
-                                    Some((lo, hi)) => (lo.min(h), hi.max(h)),
-                                });
-                            }
-                        }
+                        if let Some(&h) = internal.bft_block_hash_to_height.get(&ptr) { fold(h as usize); }
                     }
 
+                    const BFT_TIP_MARGIN: usize = 16;
                     let mut bft_indices: Vec<usize> = Vec::new();
-                    // While finality is unknown (startup transient: PoS store replay / first
-                    // decided-block ingest pending), candidate heights are still resolving in
-                    // bulk; serving BFT blocks now would place thousands at fallback positions
-                    // and reposition them as heights resolve (screen-wide flicker). Serve none
-                    // until the finalized height exists.
-                    if internal.latest_final_block.is_some() {
-                        if let Some((lo, hi)) = bft_extent {
-                            let hi = hi.min(lo + BFT_PAGE_SIZE - 1).min(internal.bft_blocks.len().saturating_sub(1));
-                            bft_indices.extend((lo..=hi).filter(|i| *i < bft_page_start));
-                        }
-                        bft_indices.extend(bft_page_start..internal.bft_blocks.len());
+                    if let Some((lo, hi)) = bft_extent {
+                        let hi = (hi + BFT_TIP_MARGIN)
+                            .min(lo + BFT_PAGE_SIZE - 1)
+                            .min(internal.bft_blocks.len().saturating_sub(1));
+                        bft_indices.extend(lo..=hi);
                     }
 
                     for i in bft_indices {
@@ -549,14 +524,9 @@ pub async fn service_viz_requests(
                         // placeholder (catch-up) compute on the fly until checked
                         let candidate_hash = bft_candidate_hashes.get(i).copied().unwrap_or_else(||
                             Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0));
-                        let candidate_height = bft_candidate_heights.get(&candidate_hash).copied();
-                        // Newest-page BFT blocks are skipped only when their finalization candidate is
-                        // KNOWN to lie below the served PoW window: unresolved heights must pass,
-                        // else one failed lookup permanently drops the block once the GUI's ack
-                        // ratchets past it. Backfill-extent BFT blocks are exempt: their PoW page
-                        // ships in this very response.
-                        if i >= bft_page_start && candidate_height.is_some_and(|h| h < lo_height.0 as u64) { continue; }
-                        let candidate_height = candidate_height.unwrap_or(0);
+                        // extent membership already proves this block's PoW span is served;
+                        // the height is for GUI positioning only (0 = not yet resolved)
+                        let candidate_height = bft_candidate_heights.get(&candidate_hash).copied().unwrap_or(0);
                         let this_hash = Hash32::from_bytes(b.blake3_hash().0);
                         if request.want_to_inspect_block == this_hash {
                             response.what_block_it_is = this_hash;
