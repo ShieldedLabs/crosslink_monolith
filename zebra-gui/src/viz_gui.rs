@@ -409,6 +409,7 @@ pub struct VizState {
     pub bc_lowest_loaded: u64, // lowest best-chain height on screen; scrolling to it triggers downward backfill
     pub bc_best_heights: std::collections::HashSet<u64>, // heights with a best-chain full block on screen
     pub bc_covered_down_to: u64, // [this..tip] is contiguously covered; a gap down to bc_lowest_loaded is a hole to fill
+    pub bc_last_hole_fill: u64, // floor of the last hole-fill request; don't re-request until the floor moves
     pub send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
     pub receive_from_zebra: std::sync::mpsc::Receiver<ResponseFromZebra>,
 
@@ -668,6 +669,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         bc_lowest_loaded: u64::MAX,
         bc_best_heights: std::collections::HashSet::new(),
         bc_covered_down_to: u64::MAX,
+        bc_last_hole_fill: 0,
         send_to_zebra: me_send,
         receive_from_zebra: me_receive,
         bc_tip_height: 0,
@@ -1026,19 +1028,26 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
     if anything_happened == false {
         let bc_want_below = if viz_state.bc_covered_down_to != u64::MAX
             && viz_state.bc_covered_down_to > viz_state.bc_lowest_loaded
+            && viz_state.bc_covered_down_to != viz_state.bc_last_hole_fill
         {
             // A hole: full blocks exist below the covered floor, so the state must hold
             // the best-chain blocks in between (later blocks imply their ancestors);
-            // we just haven't got them for viz. Fill the page below the floor.
+            // we just haven't got them for viz. Fill the page below the floor, once per
+            // floor position: a page the server can't fully serve must not re-request
+            // forever.
+            viz_state.bc_last_hole_fill = viz_state.bc_covered_down_to;
             viz_state.bc_covered_down_to
         } else {
             // if the camera can see the bottom of the loaded chain and older blocks
-            // exist, ask for the next page below the current coverage
+            // exist, ask for the next page below the current coverage; only while
+            // zoomed in enough that block detail is the point: fully zoomed out, the
+            // bottom is always visible and this would page the whole chain to 0
             let screen_unit = SCREEN_UNIT_CONST * ZOOM_FACTOR.powf(viz_state.zoom);
             let camera_h = height_for_y(viz_state.camera_y);
             let half_span_h = (1500.0 / screen_unit) / BLOCK_SPACING; // ~half a viewport's worth, in heights
             let visible_bottom_h = (camera_h - half_span_h) as i64;
-            if viz_state.bc_lowest_loaded != u64::MAX
+            if half_span_h < 4096.0
+                && viz_state.bc_lowest_loaded != u64::MAX
                 && viz_state.bc_lowest_loaded > 0
                 && visible_bottom_h <= viz_state.bc_lowest_loaded as i64
             {

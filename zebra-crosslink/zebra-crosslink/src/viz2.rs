@@ -156,8 +156,12 @@ pub async fn service_viz_requests(
                 .map(|(h, _)| h.0 as u64)
                 .unwrap_or(u64::MAX);
             // lo = ack clamped to [page_lo, finalized_lo]; when finality lags below the
-            // page floor, the trailing min wins and the window extends down to it.
-            let req_lo_height = ZebBlockHeight(bc_ack_height.max(page_lo).min(finalized_lo).min(bc_tip_height) as u32);
+            // page floor, the trailing min wins and the window extends down to it,
+            // bounded at a few pages: a restart mid-finality-catch-up can leave
+            // latest_final_block a whole chain below the tip, and an unbounded window
+            // would then serve everything down to ~0 every cycle.
+            let sanity_lo = (bc_tip_height + 1).saturating_sub(4 * BC_PAGE_SIZE);
+            let req_lo_height = ZebBlockHeight(bc_ack_height.max(page_lo).min(finalized_lo).max(sanity_lo).min(bc_tip_height) as u32);
 
             // Anchored on the same tip hash this response reports, so every block in it
             // belongs to the one chain the GUI is being told about. A tip that flipped in
@@ -196,7 +200,10 @@ pub async fn service_viz_requests(
             {
                 {
                     let internal = tfl_handle.internal.lock().await;
-                    while bft_checked_n < internal.bft_blocks.len() {
+                    // bounded per cycle so a bulk load (PoS store replay) doesn't hash the
+                    // whole chain under one lock hold
+                    let scan_end = (bft_checked_n + 4096).min(internal.bft_blocks.len());
+                    while bft_checked_n < scan_end {
                         let b = &internal.bft_blocks[bft_checked_n];
                         if b.headers.is_empty() { break; } // placeholder: recheck once filled
                         let hash = Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0);
@@ -208,7 +215,7 @@ pub async fn service_viz_requests(
                     }
                 }
                 // retry a bounded batch; the set drains as candidates sync into the state
-                let pending: Vec<Hash32> = bft_unresolved_heights.iter().copied().take(16).collect();
+                let pending: Vec<Hash32> = bft_unresolved_heights.iter().copied().take(256).collect();
                 for hash in pending {
                     if let Ok(StateResponse::BlockHeader { height, .. }) =
                         (call.state)(StateRequest::BlockHeader(zebra_state::HashOrHeight::Hash(ZebBlockHash(hash.as_bytes()).into()))).await
@@ -520,11 +527,18 @@ pub async fn service_viz_requests(
                     }
 
                     let mut bft_indices: Vec<usize> = Vec::new();
-                    if let Some((lo, hi)) = bft_extent {
-                        let hi = hi.min(lo + BFT_PAGE_SIZE - 1).min(internal.bft_blocks.len().saturating_sub(1));
-                        bft_indices.extend((lo..=hi).filter(|i| *i < bft_page_start));
+                    // While finality is unknown (startup transient: PoS store replay / first
+                    // decided-block ingest pending), candidate heights are still resolving in
+                    // bulk; serving BFT blocks now would place thousands at fallback positions
+                    // and reposition them as heights resolve (screen-wide flicker). Serve none
+                    // until the finalized height exists.
+                    if internal.latest_final_block.is_some() {
+                        if let Some((lo, hi)) = bft_extent {
+                            let hi = hi.min(lo + BFT_PAGE_SIZE - 1).min(internal.bft_blocks.len().saturating_sub(1));
+                            bft_indices.extend((lo..=hi).filter(|i| *i < bft_page_start));
+                        }
+                        bft_indices.extend(bft_page_start..internal.bft_blocks.len());
                     }
-                    bft_indices.extend(bft_page_start..internal.bft_blocks.len());
 
                     for i in bft_indices {
                         let b = &internal.bft_blocks[i];
