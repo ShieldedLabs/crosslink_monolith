@@ -10006,6 +10006,7 @@ dependencies = [
  "zcash_address",
  "zcash_client_backend",
  "zcash_keys",
+ "zcash_primitives",
  "zcash_script",
  "zebra-chain",
  "zebra-consensus",
