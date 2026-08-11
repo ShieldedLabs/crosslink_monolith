@@ -42,6 +42,14 @@ pub struct EntryPoint {
     // This can be applied to the default start command if no subcommand is provided.
     #[clap(long, help = "tracing filters which override the zebrad.toml config")]
     filters: Vec<String>,
+
+    /// Run the `fixup-db-stake` subcommand instead of starting the node.
+    #[clap(
+        long,
+        help = "check the state cache's aggregated-stakes rows and repair any missing ones, \
+                then exit"
+    )]
+    fixup_db_stake: bool,
 }
 
 impl EntryPoint {
@@ -71,12 +79,23 @@ impl EntryPoint {
     pub fn process_cli_args(mut args: Vec<OsString>) -> clap::error::Result<Vec<OsString>> {
         let entry_point = EntryPoint::try_parse_from(&args)?;
 
+        if entry_point.fixup_db_stake && !entry_point.should_add_default_subcommand() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--fixup-db-stake replaces the subcommand; pass it alone\n",
+            ));
+        }
+
         // Add the default subcommand to args after the top-level args if cmd is None
         if entry_point.should_add_default_subcommand() {
-            args.push(EntryPoint::default_cmd_as_str().into());
-            // This duplicates the top-level filters args, but the tracing component only checks `StartCmd.filters`.
-            for filter in entry_point.filters {
-                args.push(filter.into())
+            if entry_point.fixup_db_stake {
+                args.push("fixup-db-stake".into());
+            } else {
+                args.push(EntryPoint::default_cmd_as_str().into());
+                // This duplicates the top-level filters args, but the tracing component only checks `StartCmd.filters`.
+                for filter in entry_point.filters {
+                    args.push(filter.into())
+                }
             }
         }
 

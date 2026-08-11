@@ -10,12 +10,16 @@ use crate::config::ZebradConfig;
 
 pub use self::{entry_point::EntryPoint, start::StartCmd};
 
-use self::{copy_state::CopyStateCmd, generate::GenerateCmd, tip_height::TipHeightCmd};
+use self::{
+    copy_state::CopyStateCmd, fixup_db_stake::FixupDbStakeCmd, generate::GenerateCmd,
+    tip_height::TipHeightCmd,
+};
 
 pub mod start;
 
 mod copy_state;
 mod entry_point;
+mod fixup_db_stake;
 mod generate;
 mod tip_height;
 
@@ -33,6 +37,9 @@ pub enum ZebradCmd {
     /// The `copy-state` subcommand, used to debug cached chain state (expert users only)
     // TODO: hide this command from users in release builds (#3279)
     CopyState(CopyStateCmd),
+
+    /// Check the state cache's aggregated-stakes rows and repair any missing ones
+    FixupDbStake(FixupDbStakeCmd),
 
     /// Generate a default `zebrad.toml` configuration
     Generate(GenerateCmd),
@@ -57,7 +64,7 @@ impl ZebradCmd {
             CopyState(_) | Start(_) => true,
 
             // Utility commands that don't use server components
-            Generate(_) | TipHeight(_) => false,
+            FixupDbStake(_) | Generate(_) | TipHeight(_) => false,
         }
     }
 
@@ -71,7 +78,7 @@ impl ZebradCmd {
             Start(_) => true,
 
             // Utility commands
-            CopyState(_) | Generate(_) | TipHeight(_) => false,
+            CopyState(_) | FixupDbStake(_) | Generate(_) | TipHeight(_) => false,
         }
     }
 
@@ -90,7 +97,7 @@ impl ZebradCmd {
             // This output:
             // - is used by automated tools, or
             // - needs to be read easily.
-            Generate(_) | TipHeight(_) => true,
+            FixupDbStake(_) | Generate(_) | TipHeight(_) => true,
 
             // Commands that generate informative logging output by default.
             CopyState(_) | Start(_) => false,
@@ -110,6 +117,7 @@ impl Runnable for ZebradCmd {
     fn run(&self) {
         match self {
             CopyState(cmd) => cmd.run(),
+            FixupDbStake(cmd) => cmd.run(),
             Generate(cmd) => cmd.run(),
             Start(cmd) => cmd.run(),
             TipHeight(cmd) => cmd.run(),

@@ -591,28 +591,39 @@ pub fn boot(app_cell: &'static AppCell<ZebradApp>) -> ! {
 
     #[cfg(feature = "viz_gui")]
     {
-        let wallet_state = Arc::new(std::sync::Mutex::new(wallet::WalletState::new()));
-        let wallet_state2 = wallet_state.clone();
+        use clap::Parser;
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_time()
-                .enable_io()
-                .build()
-                .unwrap();
+        // The visualization owns the main thread, so it only opens for the
+        // `start` command; utility commands (generate, tip-height,
+        // fixup-db-stake, copy-state) run headless. `process_cli_args` already
+        // exited on unparseable args, and always appends the subcommand.
+        let is_start = EntryPoint::try_parse_from(&args)
+            .map(|entry_point| matches!(entry_point.cmd, Some(crate::commands::ZebradCmd::Start(_))))
+            .unwrap_or(false);
 
-            rt.block_on(zebra_crosslink::wallet::wallet_main(wallet_state2));
-        });
+        if is_start {
+            let wallet_state = Arc::new(std::sync::Mutex::new(wallet::WalletState::new()));
+            let wallet_state2 = wallet_state.clone();
 
-        // TODO: gate behind feature-flag
-        // TODO: only open the visualization window for the `start` command.
-        // i.e.: can we move it to that code without major refactor to make compiler happy?
-        let tokio_root_thread_handle = std::thread::spawn(move || {
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_time()
+                    .enable_io()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(zebra_crosslink::wallet::wallet_main(wallet_state2));
+            });
+
+            let tokio_root_thread_handle = std::thread::spawn(move || {
+                ZebradApp::run(app_cell, args);
+            });
+
+            zebra_crosslink::viz2::viz_main(Some(tokio_root_thread_handle), wallet_state);
+        } else {
             ZebradApp::run(app_cell, args);
-        });
-
-        zebra_crosslink::viz2::viz_main(Some(tokio_root_thread_handle), wallet_state);
+        }
     }
     #[cfg(not(feature = "viz_gui"))]
     ZebradApp::run(app_cell, args);

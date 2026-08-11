@@ -71,6 +71,7 @@ pub(crate) mod non_finalized_state;
 mod pending_utxos;
 mod queued_blocks;
 pub(crate) mod read;
+pub mod stake_fixup;
 pub mod write;
 
 #[cfg(any(test, feature = "proptest-impl"))]

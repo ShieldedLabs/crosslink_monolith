@@ -826,7 +826,13 @@ async fn handle_new_decided_bft_block(
             }
         }
         if any_non_zero {
-            panic!("We must never get zero stakes except at init!");
+            panic!(
+                "We must never get zero stakes except at init! The finalized state has no \
+                 usable aggregated-stakes row for block {new_final_hash} at height \
+                 {new_final_height:?}, most likely a state cache torn by the pre-atomic \
+                 snapshot write. Stop this node, run \
+                 `zebrad --fixup-db-stake` to check and repair the cache, then start it again."
+            );
         }
     }
 
