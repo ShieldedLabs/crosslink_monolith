@@ -630,7 +630,7 @@ impl DiskWriteBatch {
         // So we ignore the genesis UTXO, transparent address index, and value pool updates
         // for the genesis block. This also ignores genesis shielded value pool updates, but there
         // aren't any of those on mainnet or testnet.
-        if !finalized.height.is_min() {
+        let bond_overlay = if !finalized.height.is_min() {
             // Commit transaction indexes
             self.prepare_transparent_transaction_batch(
                 zebra_db,
@@ -645,8 +645,15 @@ impl DiskWriteBatch {
             )?;
 
             // Commit delegation bonds
-            self.prepare_delegation_bonds_batch(zebra_db, finalized, &finalized.height)?;
-        }
+            self.prepare_delegation_bonds_batch(zebra_db, finalized, &finalized.height)?
+        } else {
+            Default::default()
+        };
+
+        // Snapshot the aggregated stakes as of this block, in this same batch: a
+        // separate write could be torn from the block by a process death between them.
+        self.prepare_aggregated_stakes_batch(zebra_db, finalized.hash, &bond_overlay);
+
         // Commit UTXOs and value pools
         self.prepare_chain_value_pools_batch(
             zebra_db,

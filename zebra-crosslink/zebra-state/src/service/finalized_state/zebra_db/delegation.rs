@@ -1,6 +1,6 @@
 //! Delegation bond database access and write methods.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use zebra_chain::{amount::Amount, block, block::Height};
 
@@ -123,20 +123,23 @@ impl ZebraDb {
             .map(|a| a.0)
     }
 
-    /// Stores the aggregated stakes snapshot for a finalized block hash.
-    pub fn store_aggregated_stakes(&self, hash: block::Hash, stakes: Vec<([u8; 32], u64)>) {
-        let cf = self.db.cf_handle(AGGREGATED_STAKES_BY_HASH).unwrap();
-        let mut batch = DiskWriteBatch::new();
-        batch.zs_insert(&cf, hash, AggregatedStakes(stakes));
-        self.db
-            .write(batch)
-            .expect("writing aggregated stakes should succeed");
-    }
+}
+
+/// The last value a block's batch writes per bond key, per bond column family.
+///
+/// [`DiskWriteBatch::prepare_aggregated_stakes_batch`] lays these over the database's
+/// bond set to see the post-block bond state before the batch is written. The snapshot
+/// must ride in the same batch as the block itself: written separately, a process death
+/// between the two writes leaves a committed block with no stakes row, permanently.
+#[derive(Default)]
+pub struct BondBatchOverlay {
+    bonds: HashMap<BondKey, DelegationBond>,
+    statuses: HashMap<BondKey, BondStatus>,
 }
 
 impl DiskWriteBatch {
-    /// Prepare a database batch containing the delegation bonds in `finalized.block`,
-    /// and return it (without actually writing anything).
+    /// Prepare the delegation bond writes for `finalized.block` into this batch, and
+    /// return the overlay of those writes for the stakes snapshot.
     ///
     /// # Errors
     ///
@@ -146,13 +149,14 @@ impl DiskWriteBatch {
         db: &ZebraDb,
         finalized: &FinalizedBlock,
         height: &Height,
-    ) -> Result<(), BoxError> {
+    ) -> Result<BondBatchOverlay, BoxError> {
         // Process transactions to update bond state
         use zcash_primitives::transaction::StakingActionKind;
 
-        // Track bonds created in this block so we can apply rewards to them
-        // (they won't be in the DB yet when we apply rewards)
-        let mut bonds_created_in_block: HashMap<BondKey, DelegationBond> = HashMap::new();
+        // Also serves the in-block role of `bonds_created_in_block`: rewards and
+        // retargets must see bonds created or modified earlier in this same block,
+        // which aren't in the DB yet.
+        let mut overlay = BondBatchOverlay::default();
 
         // Iterate through all transactions in the block
         for (transaction_index, transaction) in finalized.block.transactions.iter().enumerate() {
@@ -171,19 +175,16 @@ impl DiskWriteBatch {
                         let bond =
                             DelegationBond::new(amount, target_finalizer, transaction_location);
 
-                        // Track this bond for reward application
-                        bonds_created_in_block.insert(bond_key, bond.clone());
-
                         // Insert new bond
-                        self.prepare_new_delegation_bond(&db.db, bond_key, bond);
+                        self.prepare_new_delegation_bond(&db.db, bond_key, bond, &mut overlay);
                     }
                     StakingActionKind::BeginDelegationUnbonding => {
                         // Mark bond as unbonding
-                        self.prepare_unbonding_delegation_bond(&db.db, db, bond_key, transaction_location)?;
+                        self.prepare_unbonding_delegation_bond(&db.db, db, bond_key, transaction_location, &mut overlay)?;
                     }
                     StakingActionKind::WithdrawDelegationBond => {
                         // Mark bond as withdrawn
-                        self.prepare_withdrawn_delegation_bond(&db.db, db, bond_key, transaction_location)?;
+                        self.prepare_withdrawn_delegation_bond(&db.db, db, bond_key, transaction_location, &mut overlay)?;
                     }
                     StakingActionKind::RetargetDelegationBond => {
                         // Update the bond's target_finalizer
@@ -193,7 +194,7 @@ impl DiskWriteBatch {
                             db,
                             bond_key,
                             new_target,
-                            &mut bonds_created_in_block,
+                            &mut overlay,
                         )?;
                     }
                     // Other staking actions don't affect delegation bonds
@@ -207,13 +208,14 @@ impl DiskWriteBatch {
         for (bond_key, reward_amount) in &finalized.bond_rewards {
             // Get current bond from bonds modified in this block first, then fall back to DB.
             // This ensures we use the updated bond if it was retargeted/created in this block.
-            let bond_opt = bonds_created_in_block.get(bond_key).cloned()
+            let bond_opt = overlay.bonds.get(bond_key).cloned()
                 .or_else(|| db.delegation_bond(bond_key));
 
             if let Some(mut bond) = bond_opt {
                 // Add reward to bond amount
                 bond.amount = (bond.amount + Amount::try_from(*reward_amount as i64)?)?;
                 // Write updated bond back
+                overlay.bonds.insert(*bond_key, bond.clone());
                 self.zs_insert(&delegation_bond_by_key_cf, *bond_key, bond);
             }
         }
@@ -226,10 +228,70 @@ impl DiskWriteBatch {
         // non-finalized push orders it the same way (rewards in push, burns after).
         let bond_status_by_key_cf = db.db.cf_handle(BOND_STATUS_BY_KEY).unwrap();
         for bond_key in &finalized.bond_burns {
+            overlay.statuses.insert(*bond_key, BondStatus::Burned);
             self.zs_insert(&bond_status_by_key_cf, *bond_key, BondStatus::Burned);
         }
 
-        Ok(())
+        Ok(overlay)
+    }
+
+    /// Prepare the aggregated-stakes snapshot for `hash` into this batch: the total
+    /// active bond amount per finalizer as of this block, i.e. the database's bond set
+    /// with this batch's own bond writes (`overlay`) applied on top.
+    pub fn prepare_aggregated_stakes_batch(
+        &mut self,
+        db: &ZebraDb,
+        hash: block::Hash,
+        overlay: &BondBatchOverlay,
+    ) {
+        let mut stakes_by_finalizer: HashMap<[u8; 32], u64> = HashMap::new();
+
+        let mut unseen: HashSet<BondKey> = overlay
+            .bonds
+            .keys()
+            .chain(overlay.statuses.keys())
+            .copied()
+            .collect();
+
+        for (key, bond, status) in db.all_bonds() {
+            unseen.remove(&key);
+            let status = overlay.statuses.get(&key).unwrap_or(&status);
+            if status.is_active() {
+                let bond = overlay.bonds.get(&key).unwrap_or(&bond);
+                let amount: u64 = bond.amount.into();
+                *stakes_by_finalizer.entry(bond.target_finalizer).or_insert(0) += amount;
+            }
+        }
+
+        // Keys this batch touches that `all_bonds` didn't yield, in particular bonds
+        // created in this block.
+        for key in unseen {
+            let Some(status) = overlay
+                .statuses
+                .get(&key)
+                .cloned()
+                .or_else(|| db.bond_status(&key))
+            else {
+                continue;
+            };
+            if !status.is_active() {
+                continue;
+            }
+            let Some(bond) = overlay
+                .bonds
+                .get(&key)
+                .cloned()
+                .or_else(|| db.delegation_bond(&key))
+            else {
+                continue;
+            };
+            let amount: u64 = bond.amount.into();
+            *stakes_by_finalizer.entry(bond.target_finalizer).or_insert(0) += amount;
+        }
+
+        let aggregated: Vec<([u8; 32], u64)> = stakes_by_finalizer.into_iter().collect();
+        let cf = db.db.cf_handle(AGGREGATED_STAKES_BY_HASH).unwrap();
+        self.zs_insert(&cf, hash, AggregatedStakes(aggregated));
     }
 
     /// Insert a new delegation bond into the database batch.
@@ -237,14 +299,22 @@ impl DiskWriteBatch {
     /// Inserts into:
     /// - `delegation_bond_by_key`: stores the bond data
     /// - `bond_status_by_key`: stores Active status
-    fn prepare_new_delegation_bond(&mut self, db: &DiskDb, bond_key: BondKey, bond: DelegationBond) {
+    fn prepare_new_delegation_bond(
+        &mut self,
+        db: &DiskDb,
+        bond_key: BondKey,
+        bond: DelegationBond,
+        overlay: &mut BondBatchOverlay,
+    ) {
         let delegation_bond_by_key_cf = db.cf_handle(DELEGATION_BOND_BY_KEY).unwrap();
         let bond_status_by_key_cf = db.cf_handle(BOND_STATUS_BY_KEY).unwrap();
 
         // Insert bond data
+        overlay.bonds.insert(bond_key, bond.clone());
         self.zs_insert(&delegation_bond_by_key_cf, bond_key, bond);
 
         // Insert active status
+        overlay.statuses.insert(bond_key, BondStatus::Active);
         self.zs_insert(&bond_status_by_key_cf, bond_key, BondStatus::Active);
     }
 
@@ -261,6 +331,7 @@ impl DiskWriteBatch {
         zebra_db: &ZebraDb,
         bond_key: BondKey,
         transaction_location: TransactionLocation,
+        overlay: &mut BondBatchOverlay,
     ) -> Result<(), BoxError> {
         let bond_status_by_key_cf = disk_db.cf_handle(BOND_STATUS_BY_KEY).unwrap();
 
@@ -274,13 +345,11 @@ impl DiskWriteBatch {
         }
 
         // Update status to unbonding
-        self.zs_insert(
-            &bond_status_by_key_cf,
-            bond_key,
-            BondStatus::Unbonding {
-                unbonded_at: transaction_location,
-            },
-        );
+        let status = BondStatus::Unbonding {
+            unbonded_at: transaction_location,
+        };
+        overlay.statuses.insert(bond_key, status.clone());
+        self.zs_insert(&bond_status_by_key_cf, bond_key, status);
 
         Ok(())
     }
@@ -298,6 +367,7 @@ impl DiskWriteBatch {
         zebra_db: &ZebraDb,
         bond_key: BondKey,
         transaction_location: TransactionLocation,
+        overlay: &mut BondBatchOverlay,
     ) -> Result<(), BoxError> {
         let bond_status_by_key_cf = disk_db.cf_handle(BOND_STATUS_BY_KEY).unwrap();
 
@@ -311,13 +381,11 @@ impl DiskWriteBatch {
         }
 
         // Update status to withdrawn
-        self.zs_insert(
-            &bond_status_by_key_cf,
-            bond_key,
-            BondStatus::Withdrawn {
-                withdrawn_at: transaction_location,
-            },
-        );
+        let status = BondStatus::Withdrawn {
+            withdrawn_at: transaction_location,
+        };
+        overlay.statuses.insert(bond_key, status.clone());
+        self.zs_insert(&bond_status_by_key_cf, bond_key, status);
 
         Ok(())
     }
@@ -335,13 +403,13 @@ impl DiskWriteBatch {
         zebra_db: &ZebraDb,
         bond_key: BondKey,
         new_target: [u8; 32],
-        bonds_created_in_block: &mut HashMap<BondKey, DelegationBond>,
+        overlay: &mut BondBatchOverlay,
     ) -> Result<(), BoxError> {
         let delegation_bond_by_key_cf = disk_db.cf_handle(DELEGATION_BOND_BY_KEY).unwrap();
 
         // Get current bond from bonds modified in this block first, then fall back to DB.
         // This ensures we use the updated bond if it was modified earlier in this block.
-        let bond_opt = bonds_created_in_block.get(&bond_key).cloned()
+        let bond_opt = overlay.bonds.get(&bond_key).cloned()
             .or_else(|| zebra_db.delegation_bond(&bond_key));
 
         let mut bond = bond_opt.ok_or_else(|| format!("bond {:?} not found for retarget", bond_key))?;
@@ -349,9 +417,9 @@ impl DiskWriteBatch {
         // Update only target_finalizer (not created_at or amount)
         bond.target_finalizer = new_target;
 
-        // Always update bonds_created_in_block so subsequent operations in this block
+        // Always update the overlay so subsequent operations in this block
         // (e.g., rewards application) see the updated bond instead of the stale DB value
-        bonds_created_in_block.insert(bond_key, bond.clone());
+        overlay.bonds.insert(bond_key, bond.clone());
 
         // Write updated bond
         self.zs_insert(&delegation_bond_by_key_cf, bond_key, bond);

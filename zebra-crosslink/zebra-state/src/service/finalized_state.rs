@@ -467,17 +467,6 @@ impl FinalizedState {
             #[cfg(feature = "elasticsearch")]
             self.elasticsearch(&finalized_inner_block);
 
-            // Snapshot the aggregated stakes at this finalization point.
-            // Bond state is mutable, so this preserves the aggregation as of this block.
-            let mut stakes_by_finalizer: std::collections::HashMap<[u8; 32], u64> =
-                std::collections::HashMap::new();
-            for (_bond_key, bond) in self.db.active_bonds() {
-                let amount: u64 = bond.amount.into();
-                *stakes_by_finalizer.entry(bond.target_finalizer).or_insert(0) += amount;
-            }
-            let aggregated: Vec<([u8; 32], u64)> = stakes_by_finalizer.into_iter().collect();
-            self.db.store_aggregated_stakes(hash, aggregated);
-
             // TODO: move the stop height check to the syncer (#3442)
             if self.is_at_stop_height(height) {
                 tracing::info!(
