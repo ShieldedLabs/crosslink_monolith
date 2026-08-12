@@ -1383,7 +1383,8 @@ pub fn finalizer_ratio_bar(ui: &mut Context, data: &mut UiData, bft_status: &wal
             let pct = finalizer.voting_power as f32 / total_val as f32;
             let is_hovered_finalizer = is_real_finalizers && data.hovered_finalizer_pk == finalizer.pub_key;
 
-            if pct <= 0.01 {
+            let tail_val = total_val - seen_voting_power + finalizer.voting_power; // @Note: Assumes finalizers are sorted.
+            if pct <= 0.01 && tail_val <= total_val / 50 {
                 rem += finalizer.voting_power;
                 rem_hovered |= is_hovered_finalizer;
                 continue;
