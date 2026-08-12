@@ -2,10 +2,11 @@
 //! blocks by the pre-atomic snapshot write. Also reachable as
 //! `zebrad --fixup-db-stake`.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use abscissa_core::{Application, Command, Runnable};
 use clap::Parser;
+use zebra_chain::parameters::HardForkSchedule;
 
 use crate::prelude::APPLICATION;
 
@@ -35,6 +36,12 @@ impl Runnable for FixupDbStakeCmd {
         if let Some(cache_dir) = self.cache_dir.clone() {
             state_config.cache_dir = cache_dir;
         }
+
+        // The state config's schedule defaults to empty; every command that needs
+        // it builds it from the canonical merged rules, as `start` does.
+        state_config.hardfork_schedule = Arc::new(HardForkSchedule::from_canonical(
+            config.crosslink.hardforks.clone(),
+        ));
 
         if let Err(error) = zebra_state::fixup_aggregated_stakes(
             &state_config,
