@@ -1,18 +1,22 @@
 //! Structs for handling supported address types.
 
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 
 use transparent::address::TransparentAddress;
 use zcash_address::{
     ConversionError, ToAddress, TryFromAddress, ZcashAddress,
     unified::{self, Container, Encoding, Typecode},
 };
-use zcash_protocol::consensus::{self, NetworkType};
+use zcash_protocol::{
+    PoolType, ShieldedPool,
+    consensus::{self, NetworkType},
+};
 
 #[cfg(feature = "sapling")]
 use sapling::PaymentAddress;
-use zcash_protocol::{PoolType, ShieldedProtocol};
 
 /// A Unified Address.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -436,15 +440,18 @@ impl Address {
         match self {
             #[cfg(feature = "sapling")]
             Address::Sapling(_) => {
-                matches!(pool_type, PoolType::Shielded(ShieldedProtocol::Sapling))
+                matches!(pool_type, PoolType::Shielded(ShieldedPool::Sapling))
             }
             Address::Transparent(_) | Address::Tex(_) => {
                 matches!(pool_type, PoolType::Transparent)
             }
             Address::Unified(ua) => match pool_type {
                 PoolType::Transparent => ua.has_transparent(),
-                PoolType::Shielded(ShieldedProtocol::Sapling) => ua.has_sapling(),
-                PoolType::Shielded(ShieldedProtocol::Orchard) => ua.has_orchard(),
+                PoolType::Shielded(ShieldedPool::Sapling) => ua.has_sapling(),
+                // Ironwood shares the Orchard receiver.
+                PoolType::Shielded(ShieldedPool::Orchard | ShieldedPool::Ironwood) => {
+                    ua.has_orchard()
+                }
             },
         }
     }
@@ -536,11 +543,11 @@ pub mod testing {
 
     #[cfg(not(feature = "sapling"))]
     pub fn arb_addr(request: UnifiedAddressRequest) -> impl Strategy<Value = Address> {
-        return prop_oneof![
+        prop_oneof![
             arb_transparent_addr().prop_map(Address::Transparent),
             arb_unified_addr(Network::TestNetwork, request).prop_map(Address::Unified),
             proptest::array::uniform20(any::<u8>()).prop_map(Address::Tex),
-        ];
+        ]
     }
 }
 

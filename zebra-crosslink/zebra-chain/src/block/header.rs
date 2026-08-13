@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::{
     fmt::HexDebug,
     parameters::Network,
-    serialization::{TrustedPreallocate, MAX_PROTOCOL_MESSAGE_LEN},
+    serialization::{TrustedPreallocate, MAX_HEADERS_PER_MESSAGE},
     work::{difficulty::CompactDifficulty, equihash::Solution},
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -168,6 +168,31 @@ impl Header {
     pub fn hash(&self) -> Hash {
         Hash::from(self)
     }
+
+    /// The serialized size of a block header on Mainnet and Testnet (except Regtest), in bytes:
+    /// the fields before the nonce, the 32-byte nonce, and the length-prefixed solution.
+    pub const SERIALIZED_SIZE: usize =
+        Solution::INPUT_LENGTH + 32 + Solution::SERIALIZED_SIZE + FAT_POINTER_MAX_SERIALIZED_SIZE;
+
+    /// The serialized size of a block header on Regtest, in bytes:
+    /// the fields before the nonce, the 32-byte nonce, and the length-prefixed solution.
+    pub const REGTEST_SERIALIZED_SIZE: usize = Solution::INPUT_LENGTH
+        + 32
+        + Solution::REGTEST_SERIALIZED_SIZE
+        + FAT_POINTER_MAX_SERIALIZED_SIZE;
+
+    /// Returns the size of a serialized block header on `network`, in bytes.
+    ///
+    /// Every header field has a fixed size, except the Equihash solution,
+    /// whose size is constant per network, so this is also constant per network:
+    /// [`Self::REGTEST_SERIALIZED_SIZE`] on Regtest, [`Self::SERIALIZED_SIZE`] everywhere else.
+    pub fn serialized_size(network: &Network) -> usize {
+        if network.is_regtest() {
+            Self::REGTEST_SERIALIZED_SIZE
+        } else {
+            Self::SERIALIZED_SIZE
+        }
+    }
 }
 
 /// A header with a count of the number of transactions in its block.
@@ -181,20 +206,24 @@ pub struct CountedHeader {
     pub header: Arc<Header>,
 }
 
-/// The serialized size of a Zcash block header.
+/// An upper bound on the serialized size of the Crosslink [`bft::FatPointerToBftBlock`]
+/// carried in every block header.
 ///
-/// Includes the equihash input, 32-byte nonce, 3-byte equihash length field, and equihash solution.
-const BLOCK_HEADER_LENGTH: usize = crate::work::equihash::Solution::INPUT_LENGTH
-    + 32
-    + 3
-    + crate::work::equihash::SOLUTION_SIZE
-    + (76 - 32 + 2)
-    + 128;
-
-/// The minimum size for a serialized CountedHeader.
+/// Unlike every other header field, the fat pointer is *not* fixed-size: it is a 44-byte
+/// vote (`[u8; 76 - 32]`), a compact-size count, and a `Vec<FatPointerSignature>` whose
+/// length varies with the finalizer roster. Upstream's header-size API assumes a header
+/// whose size is constant per network, so we bound the variable part instead of measuring
+/// it, and the constants below become an over-estimate rather than an exact size.
 ///
-/// A CountedHeader has BLOCK_HEADER_LENGTH bytes + 1 or more bytes for the transaction count
-pub(crate) const MIN_COUNTED_HEADER_LEN: usize = BLOCK_HEADER_LENGTH + 1;
+/// Over-estimating is the safe direction for the one consensus-relevant caller,
+/// `zip317::block_production_fee_weight`, which subtracts the header size from the block
+/// byte budget: too large wastes a few bytes of block space, too small can build a block
+/// over `MAX_BLOCK_BYTES`. The 128-byte signature allowance is inherited from the previous
+/// `BLOCK_HEADER_LENGTH` and is an assumption, not a proof -- a roster large enough to
+/// exceed it would make this bound wrong.
+///
+/// @todo(crosslink): derive this from the roster size limit instead of assuming 128 bytes.
+pub const FAT_POINTER_MAX_SERIALIZED_SIZE: usize = (76 - 32) + 2 + 128;
 
 /// The Zcash accepted block version.
 ///
@@ -203,9 +232,14 @@ pub(crate) const MIN_COUNTED_HEADER_LEN: usize = BLOCK_HEADER_LENGTH + 1;
 pub const ZCASH_BLOCK_VERSION: u32 = 4;
 
 impl TrustedPreallocate for CountedHeader {
+    /// Cap `CountedHeader` preallocation at the existing protocol-level
+    /// constant `MAX_HEADERS_PER_MESSAGE = 160`. The previous return value was
+    /// derived from `MAX_PROTOCOL_MESSAGE_LEN`, allowing peer-controlled
+    /// preallocation amplification — same shape as GHSA-xr93-pcq3-pxf8 for
+    /// `AddrV1`/`AddrV2` (PR #10494).
     fn max_allocation() -> u64 {
-        // Every vector type requires a length field of at least one byte for de/serialization.
-        // Therefore, we can never receive more than (MAX_PROTOCOL_MESSAGE_LEN - 1) / MIN_COUNTED_HEADER_LEN counted headers in a single message
-        ((MAX_PROTOCOL_MESSAGE_LEN - 1) / MIN_COUNTED_HEADER_LEN) as u64
+        // Cast safe: MAX_HEADERS_PER_MESSAGE is the constant 160, which fits
+        // trivially in u64 on every platform.
+        MAX_HEADERS_PER_MESSAGE as u64
     }
 }

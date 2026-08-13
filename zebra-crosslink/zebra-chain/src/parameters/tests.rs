@@ -1,5 +1,7 @@
 //! Consensus parameter tests for Zebra.
 
+#![allow(clippy::unwrap_in_result)]
+
 use std::collections::HashSet;
 
 use crate::block;
@@ -256,4 +258,41 @@ proptest! {
             prop_assert_eq!(hex_branch, new_branch.to_string());
         }
     }
+}
+
+/// A list of network upgrades in the order that they must be activated.
+const NETWORK_UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
+    Genesis,
+    BeforeOverwinter,
+    Overwinter,
+    Sapling,
+    Blossom,
+    Heartwood,
+    Canopy,
+    Nu5,
+    Nu6,
+    Nu6_1,
+    Nu6_2,
+    #[cfg(any(test, feature = "zebra-test"))]
+    Nu6_3,
+    #[cfg(any(test, feature = "zebra-test"))]
+    Nu7,
+];
+
+#[test]
+fn network_upgrade_iter_matches_order_constant() {
+    let iter_upgrades: Vec<NetworkUpgrade> = NetworkUpgrade::iter().collect();
+    let expected_upgrades: Vec<NetworkUpgrade> = NETWORK_UPGRADES_IN_ORDER.to_vec();
+
+    assert_eq!(iter_upgrades, expected_upgrades);
+}
+
+#[test]
+fn full_activation_list_contains_all_upgrades() {
+    let network = Network::Mainnet;
+    let full_list = network.full_activation_list();
+
+    // NU7 is unscheduled on Mainnet (no activation height committed), so it is absent from the
+    // full activation list even though it is always present in the iter.
+    assert_eq!(full_list.len(), NetworkUpgrade::iter().count() - 1);
 }

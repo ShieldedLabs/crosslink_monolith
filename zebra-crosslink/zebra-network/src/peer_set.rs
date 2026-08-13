@@ -3,6 +3,7 @@ mod initialize;
 mod inventory_registry;
 mod limit;
 mod set;
+mod stall_tracker;
 mod unready_service;
 
 pub(crate) use candidate_set::CandidateSet;
@@ -10,6 +11,6 @@ pub(crate) use inventory_registry::InventoryChange;
 pub(crate) use limit::{ActiveConnectionCounter, ConnectionTracker};
 
 use inventory_registry::InventoryRegistry;
-use set::PeerSet;
+pub(crate) use set::PeerSet;
 
-pub use initialize::init;
+pub use initialize::{init, init_with_block_gossip_peer_ips};

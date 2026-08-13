@@ -18,6 +18,7 @@ use tracing::Span;
 use zebra_chain::{parameters::Network, serialization::DateTime32};
 
 use crate::{
+    connection_metrics::network_kind_label,
     constants::{self, ADDR_RESPONSE_LIMIT_DENOMINATOR, MAX_ADDRS_IN_MESSAGE},
     meta_addr::MetaAddrChange,
     protocol::external::{canonical_peer_addr, canonical_socket_addr},
@@ -158,7 +159,7 @@ impl AddressBook {
         // Avoid initiating outbound handshakes when max_connections_per_ip is 1.
         let should_limit_outbound_conns_per_ip = max_connections_per_ip == 1;
         let mut new_book = AddressBook {
-            by_addr: OrderedMap::new(|meta_addr| Reverse(*meta_addr)),
+            by_addr: OrderedMap::new(|meta_addr: &MetaAddr| Reverse(meta_addr.clone())),
             local_listener: canonical_socket_addr(local_listener),
             network: network.clone(),
             addr_limit: constants::MAX_ADDRS_IN_ADDRESS_BOOK,
@@ -215,16 +216,16 @@ impl AddressBook {
             .map(|meta_addr| (meta_addr.addr, meta_addr));
 
         for (socket_addr, meta_addr) in addrs {
-            // overwrite any duplicate addresses
-            new_book.by_addr.insert(socket_addr, meta_addr);
             // Add the address to `most_recent_by_ip` if it has responded
-            if new_book.should_update_most_recent_by_ip(meta_addr) {
+            if new_book.should_update_most_recent_by_ip(&meta_addr) {
                 new_book
                     .most_recent_by_ip
                     .as_mut()
                     .expect("should be some when should_update_most_recent_by_ip is true")
-                    .insert(socket_addr.ip(), meta_addr);
+                    .insert(socket_addr.ip(), meta_addr.clone());
             }
+            // overwrite any duplicate addresses
+            new_book.by_addr.insert(socket_addr, meta_addr);
             // exit as soon as we get enough addresses
             if new_book.by_addr.len() >= addr_limit {
                 break;
@@ -347,8 +348,8 @@ impl AddressBook {
         // Unfortunately, `OrderedMap` doesn't implement `get`.
         let meta_addr = self.by_addr.remove(&addr);
 
-        if let Some(meta_addr) = meta_addr {
-            self.by_addr.insert(addr, meta_addr);
+        if let Some(ref meta_addr) = meta_addr {
+            self.by_addr.insert(addr, meta_addr.clone());
         }
 
         meta_addr
@@ -366,7 +367,7 @@ impl AddressBook {
     /// - this is the only field checked by `has_connection_recently_responded()`
     ///
     /// See [`AddressBook::is_ready_for_connection_attempt_with_ip`] for more details.
-    fn should_update_most_recent_by_ip(&self, updated: MetaAddr) -> bool {
+    fn should_update_most_recent_by_ip(&self, updated: &MetaAddr) -> bool {
         let Some(most_recent_by_ip) = self.most_recent_by_ip.as_ref() else {
             return false;
         };
@@ -415,7 +416,8 @@ impl AddressBook {
     #[allow(clippy::unwrap_in_result)]
     pub fn update(&mut self, change: MetaAddrChange) -> Option<MetaAddr> {
         if self.bans_by_ip.contains_key(&change.addr().ip()) {
-            tracing::warn!(
+            // Remote peers control how often this fires, so keep it below `warn` (#11134).
+            tracing::debug!(
                 ?change,
                 "attempted to add a banned peer addr to address book"
             );
@@ -429,7 +431,7 @@ impl AddressBook {
         let instant_now = Instant::now();
         let chrono_now = Utc::now();
 
-        let updated = change.apply_to_meta_addr(previous, instant_now, chrono_now);
+        let updated = change.apply_to_meta_addr(previous.clone(), instant_now, chrono_now);
 
         trace!(
             ?change,
@@ -440,7 +442,7 @@ impl AddressBook {
             "calculated updated address book entry",
         );
 
-        if let Some(updated) = updated {
+        if let Some(ref updated) = updated {
             if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
                 // Ban and skip outbound connections with excessively misbehaving peers.
                 let banned_ip = updated.addr.ip();
@@ -452,16 +454,18 @@ impl AddressBook {
                     bans_by_ip.shift_remove_index(0);
                 }
 
-                self.most_recent_by_ip
-                    .as_mut()
-                    .expect("should be some when should_remove_most_recent_by_ip is true")
-                    .remove(&banned_ip);
+                // `most_recent_by_ip` is only populated when
+                // `max_connections_per_ip == 1`. The ban path runs for any
+                // configured value, so we must guard the optional cache rather
+                // than unwrap it.
+                if let Some(most_recent_by_ip) = self.most_recent_by_ip.as_mut() {
+                    most_recent_by_ip.remove(&banned_ip);
+                }
 
                 let banned_addrs: Vec<_> = self
                     .by_addr
                     .descending_keys()
-                    .skip_while(|addr| addr.ip() != banned_ip)
-                    .take_while(|addr| addr.ip() == banned_ip)
+                    .filter(|addr| addr.ip() == banned_ip)
                     .cloned()
                     .collect();
 
@@ -496,16 +500,16 @@ impl AddressBook {
                 return None;
             }
 
-            self.by_addr.insert(updated.addr, updated);
-
             // Add the address to `most_recent_by_ip` if it sent the most recent
             // response Zebra has received from this IP.
             if self.should_update_most_recent_by_ip(updated) {
                 self.most_recent_by_ip
                     .as_mut()
                     .expect("should be some when should_update_most_recent_by_ip is true")
-                    .insert(updated.addr.ip(), updated);
+                    .insert(updated.addr.ip(), updated.clone());
             }
+
+            self.by_addr.insert(updated.addr, updated.clone());
 
             debug!(
                 ?change,
@@ -643,12 +647,13 @@ impl AddressBook {
     ) -> impl DoubleEndedIterator<Item = MetaAddr> + '_ {
         let _guard = self.span.enter();
 
-        // Skip live peers, and peers pending a reconnect attempt.
+        // Skip live peers, banned peers, and peers pending a reconnect attempt.
         // The peers are already stored in sorted order.
         self.by_addr
             .descending_values()
             .filter(move |peer| {
-                peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
+                !self.bans_by_ip.contains_key(&peer.addr.ip())
+                    && peer.is_ready_for_connection_attempt(instant_now, chrono_now, &self.network)
                     && self.is_ready_for_connection_attempt_with_ip(&peer.addr.ip(), chrono_now)
             })
             .cloned()
@@ -700,7 +705,7 @@ impl AddressBook {
     ///
     /// # Correctness
     ///
-    /// Use [`AddressBook::address_metrics_watcher().borrow()`] in production code,
+    /// Use [`AddressBook::address_metrics_watcher`] in production code,
     /// to avoid deadlocks.
     #[cfg(test)]
     pub fn address_metrics(&self, now: chrono::DateTime<Utc>) -> AddressMetrics {
@@ -711,7 +716,7 @@ impl AddressBook {
     ///
     /// # Correctness
     ///
-    /// External callers should use [`AddressBook::address_metrics_watcher().borrow()`]
+    /// External callers should use [`AddressBook::address_metrics_watcher`]
     /// in production code, to avoid deadlocks.
     /// (Using the watch channel receiver does not lock the address book mutex.)
     fn address_metrics_internal(&self, now: chrono::DateTime<Utc>) -> AddressMetrics {
@@ -751,15 +756,20 @@ impl AddressBook {
         let _ = self.address_metrics_tx.send(m);
 
         // TODO: rename to address_book.[state_name]
-        metrics::gauge!("candidate_set.responded").set(m.responded as f64);
-        metrics::gauge!("candidate_set.gossiped").set(m.never_attempted_gossiped as f64);
-        metrics::gauge!("candidate_set.failed").set(m.failed as f64);
-        metrics::gauge!("candidate_set.pending").set(m.attempt_pending as f64);
+        let network = network_kind_label(&self.network);
+        metrics::gauge!("candidate_set.responded", "network" => network).set(m.responded as f64);
+        metrics::gauge!("candidate_set.gossiped", "network" => network)
+            .set(m.never_attempted_gossiped as f64);
+        metrics::gauge!("candidate_set.failed", "network" => network).set(m.failed as f64);
+        metrics::gauge!("candidate_set.pending", "network" => network)
+            .set(m.attempt_pending as f64);
 
         // TODO: rename to address_book.responded.recently_live
-        metrics::gauge!("candidate_set.recently_live").set(m.recently_live as f64);
+        metrics::gauge!("candidate_set.recently_live", "network" => network)
+            .set(m.recently_live as f64);
         // TODO: rename to address_book.responded.stopped_responding
-        metrics::gauge!("candidate_set.disconnected").set(m.recently_stopped_responding as f64);
+        metrics::gauge!("candidate_set.disconnected", "network" => network)
+            .set(m.recently_stopped_responding as f64);
 
         std::mem::drop(_guard);
         self.log_metrics(&m, instant_now);

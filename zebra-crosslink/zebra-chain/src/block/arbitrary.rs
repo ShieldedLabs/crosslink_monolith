@@ -8,7 +8,8 @@ use crate::{
     fmt::{HexDebug, SummaryDebug},
     history_tree::HistoryTree,
     parameters::{NetworkUpgrade::*, GENESIS_PREVIOUS_BLOCK_HASH},
-    serialization,
+    primitives::zcash_history::BlockCommitmentTreeRoots,
+    serialization::{self, BytesInDisplayOrder},
     transaction::arbitrary::MAX_ARBITRARY_ITEMS,
     transparent::{
         new_transaction_ordered_outputs, CoinbaseSpendRestriction,
@@ -429,6 +430,11 @@ impl Block {
             let mut chain_value_pools = ValueBalance::zero();
             let mut sapling_tree = sapling::tree::NoteCommitmentTree::default();
             let mut orchard_tree = orchard::tree::NoteCommitmentTree::default();
+            // Ironwood reuses the Orchard note commitment tree type. Generated v6 transactions
+            // (NU6.3+) can carry Ironwood bundles, whose note commitments are appended below and
+            // threaded through the V3 history node so commitments match validation. For pre-NU6.3
+            // chains this stays empty, and its real empty-tree root is used the same way.
+            let mut ironwood_tree = orchard::tree::NoteCommitmentTree::default();
             // The history tree usually takes care of "creating itself". But this
             // only works when blocks are pushed into it starting from genesis
             // (or at least pre-Heartwood, where the tree is not required).
@@ -467,6 +473,10 @@ impl Block {
                             }
                             for orchard_note_commitment in transaction.orchard_note_commitments() {
                                 orchard_tree.append(*orchard_note_commitment).unwrap();
+                            }
+                            for ironwood_note_commitment in transaction.ironwood_note_commitments()
+                            {
+                                ironwood_tree.append(*ironwood_note_commitment).unwrap();
                             }
                         }
                         new_transactions.push(Arc::new(transaction));
@@ -529,8 +539,11 @@ impl Block {
                             .push(
                                 &current.network,
                                 Arc::new(block.clone()),
-                                &sapling_tree.root(),
-                                &orchard_tree.root(),
+                                BlockCommitmentTreeRoots {
+                                    sapling: &sapling_tree.root(),
+                                    orchard: &orchard_tree.root(),
+                                    ironwood: &ironwood_tree.root(),
+                                },
                             )
                             .unwrap();
                     } else {
@@ -538,8 +551,11 @@ impl Block {
                             HistoryTree::from_block(
                                 &current.network,
                                 Arc::new(block.clone()),
-                                &sapling_tree.root(),
-                                &orchard_tree.root(),
+                                BlockCommitmentTreeRoots {
+                                    sapling: &sapling_tree.root(),
+                                    orchard: &orchard_tree.root(),
+                                    ironwood: &ironwood_tree.root(),
+                                },
                             )
                             .unwrap(),
                         );
@@ -582,6 +598,34 @@ where
         + Copy
         + 'static,
 {
+    // Coinbase transactions must not contain Sapling spends (GHSA-rgwx-8r98-p34c).
+    // The arbitrary `Transaction` strategy generates these independently, so clear
+    // any generated Sapling shielded data on coinbase transactions before the chain
+    // builder commits them. The deserialization rejection path is still exercised
+    // by the `transaction_roundtrip` proptest and the GHSA-rgwx-8r98-p34c reproduction
+    // vector in `zebra-chain`.
+    if transaction.is_coinbase() {
+        match &mut transaction {
+            Transaction::V4 {
+                sapling_shielded_data,
+                ..
+            } => *sapling_shielded_data = None,
+            Transaction::V5 {
+                sapling_shielded_data,
+                ..
+            } => *sapling_shielded_data = None,
+            Transaction::V6 {
+                sapling_shielded_data,
+                ..
+            }
+            | Transaction::VCrosslink {
+                sapling_shielded_data,
+                ..
+            } => *sapling_shielded_data = None,
+            Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {}
+        }
+    }
+
     let mut spend_restriction = transaction.coinbase_spend_restriction(&Network::Mainnet, height);
     let mut new_inputs = Vec::new();
     let mut spent_outputs = HashMap::new();
@@ -602,9 +646,7 @@ where
                 input.set_outpoint(selected_outpoint);
                 new_inputs.push(input);
 
-                let spent_utxo = utxos
-                    .remove(&selected_outpoint)
-                    .expect("selected outpoint must have a UTXO");
+                let spent_utxo = utxos.remove(&selected_outpoint)?;
                 spent_outputs.insert(selected_outpoint, spent_utxo.utxo.output);
             }
             // otherwise, drop the invalid input, because it has no valid UTXOs to spend

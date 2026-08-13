@@ -1,9 +1,10 @@
 //! Adds tables for tracking transactions to be downloaded for transparent output and/or memo retrieval.
 
-use rusqlite::{Transaction, named_params};
+use rusqlite::named_params;
 use schemerz_rusqlite::RusqliteMigration;
 use std::collections::HashSet;
 use uuid::Uuid;
+
 use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
 use zcash_protocol::consensus;
 
@@ -14,7 +15,9 @@ use super::{
     spend_key_available,
 };
 
-pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xfec02b61_3988_4b4f_9699_98977fac9e7f);
+/// Adds tables for tracking transactions to be downloaded for transparent output and/or memo
+/// retrieval.
+pub const MIGRATION_ID: Uuid = Uuid::from_u128(0xfec02b61_3988_4b4f_9699_98977fac9e7f);
 
 #[cfg(feature = "transparent-inputs")]
 use {
@@ -28,13 +31,14 @@ use {
     transparent::address::TransparentAddress,
     zcash_client_backend::data_api::DecryptedTransaction,
     zcash_keys::encoding::AddressCodec,
+    zcash_primitives::transaction::Transaction,
     zcash_protocol::{
         TxId,
         consensus::{BlockHeight, BranchId},
     },
 };
 
-const DEPENDENCIES: &[Uuid] = &[
+pub(super) const DEPENDENCIES: &[Uuid] = &[
     orchard_shardtree::MIGRATION_ID,
     ensure_orchard_ua_receiver::MIGRATION_ID,
     ephemeral_addresses::MIGRATION_ID,
@@ -63,7 +67,7 @@ impl<P> schemerz::Migration<Uuid> for Migration<P> {
 impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
     type Error = WalletMigrationError;
 
-    fn up(&self, conn: &Transaction) -> Result<(), WalletMigrationError> {
+    fn up(&self, conn: &rusqlite::Transaction) -> Result<(), WalletMigrationError> {
         conn.execute_batch(
             "CREATE TABLE tx_retrieval_queue (
                 txid BLOB NOT NULL UNIQUE,
@@ -120,7 +124,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                 let mined_height = row.get::<_, Option<u32>>(2)?.map(BlockHeight::from);
 
                 if let Some(tx_data) = tx_data {
-                    let tx = zcash_primitives::transaction::Transaction::read(
+                    let tx = Transaction::read(
                         &tx_data[..],
                         // We assume unmined transactions are created with the current consensus branch ID.
                         mined_height.map_or(BranchId::Sapling, |h| {
@@ -165,10 +169,9 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                                                 &self._params,
                                                 &uivk_str,
                                             )?
+                                            && legacy_taddr == address
                                         {
-                                            if legacy_taddr == address {
-                                                return Ok(Some(account_id));
-                                            }
+                                            return Ok(Some(account_id));
                                         }
                                     }
 
@@ -189,9 +192,11 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                         }
                     }
 
-                    let d_tx = DecryptedTransaction::<'_, Infallible>::new(
+                    let d_tx = DecryptedTransaction::<Transaction, Infallible>::new(
                         mined_height,
                         &tx,
+                        vec![],
+                        #[cfg(feature = "orchard")]
                         vec![],
                         #[cfg(feature = "orchard")]
                         vec![],
@@ -206,7 +211,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
         Ok(())
     }
 
-    fn down(&self, conn: &Transaction) -> Result<(), WalletMigrationError> {
+    fn down(&self, conn: &rusqlite::Transaction) -> Result<(), WalletMigrationError> {
         conn.execute_batch(
             "DROP TABLE transparent_spend_map;
              DROP TABLE transparent_spend_search_queue;
@@ -248,17 +253,17 @@ fn queue_transparent_spend_detection<P: consensus::Parameters>(
 fn queue_transparent_input_retrieval<AccountId>(
     conn: &rusqlite::Transaction<'_>,
     tx_ref: TxRef,
-    d_tx: &DecryptedTransaction<'_, AccountId>,
+    d_tx: &DecryptedTransaction<Transaction, AccountId>,
 ) -> Result<(), SqliteClientError> {
-    if let Some(b) = d_tx.tx().transparent_bundle() {
-        if !b.is_coinbase() {
-            // queue the transparent inputs for enhancement
-            queue_tx_retrieval(
-                conn,
-                b.vin.iter().map(|txin| *txin.prevout().txid()),
-                Some(tx_ref),
-            )?;
-        }
+    if let Some(b) = d_tx.tx().transparent_bundle()
+        && !b.is_coinbase()
+    {
+        // queue the transparent inputs for enhancement
+        queue_tx_retrieval(
+            conn,
+            b.vin.iter().map(|txin| *txin.prevout().txid()),
+            Some(tx_ref),
+        )?;
     }
 
     Ok(())
@@ -267,7 +272,7 @@ fn queue_transparent_input_retrieval<AccountId>(
 #[cfg(feature = "transparent-inputs")]
 fn queue_unmined_tx_retrieval<AccountId>(
     conn: &rusqlite::Transaction<'_>,
-    d_tx: &DecryptedTransaction<'_, AccountId>,
+    d_tx: &DecryptedTransaction<Transaction, AccountId>,
 ) -> Result<(), SqliteClientError> {
     let detectable_via_scanning = d_tx.tx().sapling_bundle().is_some();
     #[cfg(feature = "orchard")]
@@ -387,10 +392,7 @@ mod tests {
             BranchId::Nu5,
             0,
             12345678.into(),
-            #[cfg(all(
-                any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-                feature = "zip-233"
-            ))]
+            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
             Zatoshis::ZERO,
             Some(transparent::bundle::Bundle {
                 vin: vec![TxIn::from_parts(OutPoint::fake(), Script::default(), 0)],

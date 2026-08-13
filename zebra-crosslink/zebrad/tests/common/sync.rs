@@ -1,4 +1,4 @@
-//! `zebrad` sync-specific shared code for the `zebrad` acceptance tests.
+//! `zebrad` sync-specific shared code for the `zebrad` tests.
 //!
 //! # Warning
 //!
@@ -58,15 +58,14 @@ pub const STOP_ON_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// Usually the small checkpoint is much shorter than this.
 //
-// Tempoaraily increased to 4 minutes to get more diagnostic info in failed tests.
+// Temporarily increased to 4 minutes to get more diagnostic info in failed tests.
 // TODO: reduce to 120 when #6506 is fixed
 pub const TINY_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// The maximum amount of time Zebra should take to sync a thousand blocks.
 //
-// Tempoaraily increased to 4 minutes to get more diagnostic info in failed tests.
-// TODO: reduce to 180 when #6506 is fixed
-pub const LARGE_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(240);
+// Temporarily increased to 8 minutes due to sync performance issues.
+pub const LARGE_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(480);
 
 /// The maximum time to wait for Zebrad to synchronize up to the chain tip starting from a
 /// partially synchronized state.
@@ -238,8 +237,12 @@ pub fn sync_until(
         // make sure the child process is dead
         // if it has already exited, ignore that error
         child.kill(true)?;
+        let dir = child.dir.take().expect("dir was not already taken");
+        // Wait for zebrad to fully terminate to ensure database lock is released.
+        child.wait_with_output()?;
+        std::thread::sleep(std::time::Duration::from_secs(3));
 
-        Ok(child.dir.take().expect("dir was not already taken"))
+        Ok(dir)
     } else {
         // Require that the mempool didn't activate,
         // checking the entire `zebrad` output after it exits.

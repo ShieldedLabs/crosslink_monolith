@@ -11,12 +11,24 @@ use crate::{
     transparent,
 };
 
+mod error;
 pub mod magic;
 pub mod subsidy;
 pub mod testnet;
 
 #[cfg(test)]
 mod tests;
+
+// Mainnet temporary Orchard-disabling soft-fork height, shipped publicly in Zebra v4.5.3.
+// This is DISTINCT from the NU6.2 *activation* (re-enable) height (3_364_600, see
+// `network_upgrade.rs`), which lands 1_174 blocks later. Do NOT change this value: it is
+// already deployed, so changing it would fork from live v4.5.3 nodes in the disable window.
+const MAINNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT: Height = Height(3_363_426);
+
+// Default Testnet temporary Orchard-disabling soft-fork height. As on Mainnet, this is DISTINCT
+// from the NU6.2 *activation* (re-enable) height (4_052_000, see `network_upgrade.rs`), which
+// lands 3_500 blocks later.
+const TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT: Height = Height(4_048_500);
 
 /// An enum describing the kind of network, whether it's the production mainnet or a testnet.
 // Note: The order of these variants is important for correct bincode (de)serialization
@@ -146,6 +158,8 @@ impl std::fmt::Debug for Network {
                 .debug_struct("Regtest")
                 .field("activation_heights", params.activation_heights())
                 .field("funding_streams", params.funding_streams())
+                .field("lockbox_disbursements", &params.lockbox_disbursements())
+                .field("checkpoints", &params.checkpoints())
                 .finish(),
             Self::Testnet(params) if params.is_default_testnet() => {
                 write!(f, "{self}")
@@ -168,7 +182,10 @@ impl Network {
 
     /// Creates a new [`Network::Testnet`] with `Regtest` parameters and the provided network upgrade activation heights.
     pub fn new_regtest(params: testnet::RegtestParameters) -> Self {
-        Self::new_configured_testnet(testnet::Parameters::new_regtest(params))
+        Self::new_configured_testnet(
+            testnet::Parameters::new_regtest(params)
+                .expect("regtest parameters should always be valid"),
+        )
     }
 
     /// Returns true if the network is the default Testnet, or false otherwise.
@@ -288,9 +305,11 @@ impl Network {
         };
 
         match self {
-            Self::Mainnet => subsidy::EXPECTED_NU6_1_LOCKBOX_DISBURSEMENTS_TOTAL_MAINNET,
+            Self::Mainnet => {
+                subsidy::constants::mainnet::EXPECTED_NU6_1_LOCKBOX_DISBURSEMENTS_TOTAL
+            }
             Self::Testnet(params) if params.is_default_testnet() => {
-                subsidy::EXPECTED_NU6_1_LOCKBOX_DISBURSEMENTS_TOTAL_TESTNET
+                subsidy::constants::testnet::EXPECTED_NU6_1_LOCKBOX_DISBURSEMENTS_TOTAL
             }
             Self::Testnet(params) => params.lockbox_disbursement_total_amount(),
         }
@@ -306,9 +325,9 @@ impl Network {
         };
 
         let expected_lockbox_disbursements = match self {
-            Self::Mainnet => subsidy::NU6_1_LOCKBOX_DISBURSEMENTS_MAINNET.to_vec(),
+            Self::Mainnet => subsidy::constants::mainnet::NU6_1_LOCKBOX_DISBURSEMENTS.to_vec(),
             Self::Testnet(params) if params.is_default_testnet() => {
-                subsidy::NU6_1_LOCKBOX_DISBURSEMENTS_TESTNET.to_vec()
+                subsidy::constants::testnet::NU6_1_LOCKBOX_DISBURSEMENTS.to_vec()
             }
             Self::Testnet(params) => return params.lockbox_disbursements(),
         };
@@ -322,6 +341,63 @@ impl Network {
                 )
             })
             .collect()
+    }
+
+    /// Returns the height at which the soft fork that temporarily disables Orchard
+    /// actions in transactions activates, if it is configured for this network.
+    pub fn temporary_orchard_disabling_soft_fork_height(&self) -> Option<Height> {
+        match self {
+            Network::Mainnet => Some(MAINNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT),
+            Network::Testnet(parameters) => {
+                parameters.temporary_orchard_disabling_soft_fork_height()
+            }
+        }
+    }
+
+    /// Returns whether Orchard has been temporarily disabled in transactions.
+    pub fn temporary_orchard_disabling_soft_fork_active(&self, height: Height) -> bool {
+        self.temporary_orchard_disabling_soft_fork_height()
+            .is_some_and(|h| height >= h)
+    }
+
+    /// Returns whether Orchard is temporarily disabled in transactions at `height`.
+    ///
+    /// The temporary-disable soft fork is bounded above by NU6.2, which re-enables
+    /// Orchard actions: once NU6.2 is active the temporary-disable rule no longer
+    /// applies. On networks where NU6.2 is unscheduled this matches
+    /// [`Self::temporary_orchard_disabling_soft_fork_active`].
+    pub fn is_orchard_temporarily_disabled(&self, height: Height) -> bool {
+        self.temporary_orchard_disabling_soft_fork_active(height)
+            && NetworkUpgrade::Nu6_2
+                .activation_height(self)
+                .is_none_or(|nu6_2| height < nu6_2)
+    }
+
+    /// Returns whether `height` is the first height at which the soft fork that
+    /// temporarily disables Orchard actions applies.
+    ///
+    /// This is the boundary at which the mempool must revalidate its contents, to drop
+    /// any transactions containing Orchard actions that were accepted before the soft
+    /// fork activated.
+    pub fn is_temporary_orchard_disabling_soft_fork_activation_height(
+        &self,
+        height: Height,
+    ) -> bool {
+        self.temporary_orchard_disabling_soft_fork_height() == Some(height)
+    }
+
+    /// Returns whether the consensus rule requiring a canonically-sized Orchard proof
+    /// is active at `height`.
+    ///
+    /// This rule activates with the network upgrade that re-enables Orchard actions
+    /// (NU6.2). On networks where NU6.2 is unscheduled the rule is always inactive. It is a
+    /// constricting rule, so it must stay height-gated, or it would reject historical
+    /// Orchard actions mined before the soft fork that temporarily disabled them, and
+    /// prevent syncing.
+    pub fn orchard_canonical_proof_size_rule_active(&self, height: Height) -> bool {
+        NetworkUpgrade::Nu6_2
+            .activation_height(self)
+            .is_some_and(|h| height >= h)
     }
 }
 

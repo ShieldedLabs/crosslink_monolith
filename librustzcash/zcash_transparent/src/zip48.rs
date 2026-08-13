@@ -1,8 +1,10 @@
 use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::num::NonZeroU8;
 
 use bip32::{ChildNumber, ExtendedPrivateKey, ExtendedPublicKey, Prefix};
+use nonempty::NonEmpty;
 use secp256k1::{PublicKey, SecretKey};
 use zcash_protocol::consensus::{self, NetworkConstants};
 use zcash_script::{
@@ -31,10 +33,19 @@ fn pub_prefix<P: consensus::Parameters>(params: &P) -> Prefix {
 /// A [ZIP 48] private key at the P2SH level `m/48'/<coin_type>'/<account>'/133000'`.
 ///
 /// [ZIP 48]: https://zips.z.cash/zip-0048
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AccountPrivKey {
     origin: KeyOrigin,
     key: ExtendedPrivateKey<SecretKey>,
+}
+
+impl core::fmt::Debug for AccountPrivKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AccountPrivKey")
+            .field("origin", &self.origin)
+            .field("key", &"...")
+            .finish()
+    }
 }
 
 impl AccountPrivKey {
@@ -45,11 +56,20 @@ impl AccountPrivKey {
         seed: &[u8],
         account: AccountId,
     ) -> Result<AccountPrivKey, bip32::Error> {
+        Self::from_seed_with_coin_type(seed, params.coin_type(), account)
+    }
+
+    /// Internal helper constructor that doesn't depend on [`consensus::Parameters`].
+    fn from_seed_with_coin_type(
+        seed: &[u8],
+        coin_type: u32,
+        account: AccountId,
+    ) -> Result<AccountPrivKey, bip32::Error> {
         let root = ExtendedPrivateKey::new(seed)?;
         let fingerprint = root.public_key().fingerprint();
         let derivation = vec![
             BIP_48_PURPOSE(),
-            ChildNumber::new(params.coin_type(), true)?,
+            ChildNumber::new(coin_type, true)?,
             ChildNumber::new(account.into(), true)?,
             ZCASH_P2SH_SCRIPT_TYPE(),
         ];
@@ -73,7 +93,7 @@ impl AccountPrivKey {
     pub fn to_account_pubkey(&self) -> AccountPubKey {
         AccountPubKey {
             origin: self.origin.clone(),
-            key: ExtendedPublicKey::from(&self.key),
+            key: self.key.public_key(),
         }
     }
 
@@ -141,6 +161,25 @@ impl AccountPubKey {
         }
     }
 
+    /// Returns the ZIP 48 coin type and account ID for this public key.
+    fn coin_type_and_account(&self) -> (u32, AccountId) {
+        // By construction, the derivation is always a ZIP 48 path.
+        let derivation = self.origin.derivation();
+        (
+            derivation
+                .get(1)
+                .expect("valid ZIP 48 derivation path")
+                .index(),
+            AccountId::try_from(
+                derivation
+                    .get(2)
+                    .expect("valid ZIP 48 derivation path")
+                    .index(),
+            )
+            .expect("valid"),
+        )
+    }
+
     /// Encodes this public key as a [BIP 388 `KEY_INFO` expression].
     ///
     /// [BIP 388 `KEY_INFO` expression]: https://github.com/bitcoin/bips/blob/master/bip-0388.mediawiki#key-information-vector
@@ -183,8 +222,8 @@ impl AccountPubKey {
 ///
 /// [ZIP 48]: https://zips.z.cash/zip-0048
 pub struct FullViewingKey {
-    threshold: u8,
-    key_info: Vec<AccountPubKey>,
+    threshold: NonZeroU8,
+    key_info: NonEmpty<AccountPubKey>,
 }
 
 impl FullViewingKey {
@@ -195,14 +234,13 @@ impl FullViewingKey {
     /// - `key_info.len() == 3`
     /// - Wallet descriptor template: `"sh(sortedmulti(2,@0/**,@1/**,@2/**))"`
     pub fn standard(
-        threshold: u8,
+        threshold: NonZeroU8,
         key_info: Vec<AccountPubKey>,
     ) -> Result<Self, FullViewingKeyError> {
-        if key_info.is_empty() {
-            Err(FullViewingKeyError::NoPubKeys)
-        } else if key_info.len() > 15 {
+        let key_info = NonEmpty::from_vec(key_info).ok_or(FullViewingKeyError::NoPubKeys)?;
+        if key_info.len() > 15 {
             Err(FullViewingKeyError::TooManyPubKeys)
-        } else if usize::from(threshold) > key_info.len() {
+        } else if usize::from(threshold.get()) > key_info.len() {
             Err(FullViewingKeyError::InvalidThreshold)
         } else {
             // Verify `key_info` in a scope so we can borrow from it.
@@ -227,6 +265,13 @@ impl FullViewingKey {
                 key_info,
             })
         }
+    }
+
+    /// Returns the ZIP 48 coin type and account ID for this full viewing key.
+    fn coin_type_and_account(&self) -> (u32, AccountId) {
+        // By construction of `Self`, all keys in `key_info` have the same derivation
+        // information, so we only need to look at the first.
+        self.key_info.first().coin_type_and_account()
     }
 
     /// Returns the [BIP 388 wallet descriptor template] for this full viewing key.
@@ -255,6 +300,28 @@ impl FullViewingKey {
         t
     }
 
+    /// Derives the [`AccountPrivKey`] from the given seed that matches this full viewing
+    /// key.
+    ///
+    /// Returns `Ok(None)` if the given seed does not match any of the public keys.
+    pub fn derive_matching_account_priv_key(
+        &self,
+        seed: &[u8],
+    ) -> Result<Option<AccountPrivKey>, bip32::Error> {
+        let (coin_type, account) = self.coin_type_and_account();
+        let candiate_privkey = AccountPrivKey::from_seed_with_coin_type(seed, coin_type, account)?;
+        let candiate_pubkey = candiate_privkey.to_account_pubkey();
+
+        for key in &self.key_info {
+            if key == &candiate_pubkey {
+                return Ok(Some(candiate_privkey));
+            }
+        }
+
+        // Nothing matched.
+        Ok(None)
+    }
+
     /// Derives the scoped P2SH address for this account at the given index, along with
     /// the corresponding redeem script.
     pub fn derive_address(
@@ -279,7 +346,7 @@ impl FullViewingKey {
         // Derive the P2SH script for the desired address. Because the only constructor
         // for `FullViewingKey` forces a specific wallet descriptor template, we can
         // fix it here.
-        let redeem_script = sortedmulti(self.threshold, &keys)
+        let redeem_script = sortedmulti(self.threshold.get(), &keys)
             .expect("child numbers are non-hardened, chance of failure is around 2^-127");
         let script_pubkey = sh(&redeem_script);
 
@@ -307,6 +374,7 @@ pub enum FullViewingKeyError {
 mod tests {
     use alloc::string::ToString;
     use alloc::vec::Vec;
+    use core::num::NonZeroU8;
 
     use bip32::Prefix;
     use zcash_protocol::consensus::{MainNetwork, Network, Parameters};
@@ -332,7 +400,7 @@ mod tests {
             })
             .collect();
 
-        let fvk = FullViewingKey::standard(2, key_info).unwrap();
+        let fvk = FullViewingKey::standard(NonZeroU8::new(2).unwrap(), key_info).unwrap();
 
         assert_eq!(
             fvk.wallet_descriptor_template(),
@@ -405,7 +473,8 @@ mod tests {
                 assert_eq!(actual.key.to_string(xpub_prefix).as_str(), *expected);
             }
 
-            let fvk = FullViewingKey::standard(tv.required, key_info).unwrap();
+            let fvk =
+                FullViewingKey::standard(NonZeroU8::new(tv.required).unwrap(), key_info).unwrap();
 
             assert_eq!(
                 fvk.wallet_descriptor_template(),
@@ -418,6 +487,20 @@ mod tests {
                     Some(key),
                 );
                 assert_eq!(&key.key_info_expression(&params), expected);
+            }
+
+            for (i, seed) in seeds.iter().enumerate() {
+                if i < tv.key_information_vector.len() {
+                    assert!(matches!(
+                        fvk.derive_matching_account_priv_key(seed),
+                        Ok(Some(_)),
+                    ));
+                } else {
+                    assert!(matches!(
+                        fvk.derive_matching_account_priv_key(seed),
+                        Ok(None),
+                    ));
+                }
             }
 
             for (i, address) in tv.external_addresses {

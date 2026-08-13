@@ -15,19 +15,18 @@ use rand::{
 
 use chrono::{TimeZone, Utc};
 
-use zcash_keys::address::Address;
-
 use zebra_chain::{
-    amount::NegativeOrZero,
+    amount::Amount,
     block::{self, merkle, FatPointerToBftBlock, Height, MAX_BLOCK_BYTES, ZCASH_BLOCK_VERSION},
     parameters::Network,
     serialization::ZcashSerialize,
-    transaction::{self, zip317::BLOCK_UNPAID_ACTION_LIMIT, Transaction, VerifiedUnminedTx},
+    transaction::{self, zip317::BLOCK_UNPAID_ACTION_LIMIT, VerifiedUnminedTx},
     work::{difficulty::CompactDifficulty, equihash::Solution},
 };
 use zebra_consensus::MAX_BLOCK_SIGOPS;
 use zebra_node_services::mempool::TransactionDependencies;
 
+use super::CoinbaseCache;
 use crate::methods::types::transaction::TransactionTemplate;
 
 #[cfg(test)]
@@ -36,7 +35,7 @@ mod tests;
 #[cfg(test)]
 use crate::methods::types::get_block_template::InBlockTxDependenciesDepth;
 
-use super::standard_coinbase_outputs;
+use super::MinerParams;
 
 /// Used in the return type of [`select_mempool_transactions()`] for test compilations.
 #[cfg(test)]
@@ -53,29 +52,35 @@ type SelectedMempoolTx = VerifiedUnminedTx;
 /// as the real coinbase transaction. (The real coinbase transaction depends on the total
 /// fees from the transactions returned by this function.)
 ///
-/// `fat_pointer` is the fat pointer the template will carry in its header. Its serialized
-/// size varies with the size of the finalizer roster, so it is measured rather than assumed.
-///
 /// Returns selected transactions from `mempool_txs`.
 ///
 /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
+#[allow(clippy::too_many_arguments)]
 pub fn select_mempool_transactions(
-    network: &Network,
-    next_block_height: Height,
-    miner_address: &Address,
+    net: &Network,
+    height: Height,
+    miner_params: &MinerParams,
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
-    extra_coinbase_data: Vec<u8>,
+    coinbase_cache: Option<&CoinbaseCache>,
     fat_pointer: &FatPointerToBftBlock,
 ) -> Vec<SelectedMempoolTx> {
     // Use a fake coinbase transaction to break the dependency between transaction
     // selection, the miner fee, and the fee payment in the coinbase transaction.
-    let fake_coinbase_tx = fake_coinbase_transaction(
-        network,
-        next_block_height,
-        miner_address,
-        extra_coinbase_data,
-    );
+    //
+    // The fake coinbase only depends on the height and miner parameters (its fee is always zero),
+    // so it's constant per block. Reuse the same per-block cache as the real coinbase to avoid
+    // re-proving a shielded coinbase on every `getblocktemplate` call just to read its size.
+    let fake_coinbase_tx = coinbase_cache
+        .and_then(|cache| cache.get(height, Amount::zero()))
+        .unwrap_or_else(|| {
+            let cb = TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero())
+                .expect("valid coinbase transaction template");
+            if let Some(cache) = coinbase_cache {
+                cache.store(height, Amount::zero(), cb.clone());
+            }
+            cb
+        });
 
     let tx_dependencies = mempool_tx_deps.dependencies();
     let (independent_mempool_txs, mut dependent_mempool_txs): (HashMap<_, _>, HashMap<_, _>) =
@@ -98,6 +103,10 @@ pub fn select_mempool_transactions(
 
     // Adjust the limits based on the coinbase transaction, and on the header and
     // transaction count that surround the transactions in the serialized block.
+    //
+    // `MAX_BLOCK_BYTES` limits the whole serialized block, so this space must be reserved
+    // before budgeting transactions, or the assembled block could exceed the consensus size
+    // limit (GHSA-95m2-vx53-v2jw).
     remaining_block_bytes = remaining_block_bytes
         .saturating_sub(fake_coinbase_tx.data.as_ref().len())
         .saturating_sub(non_transaction_block_bytes(fat_pointer));
@@ -147,6 +156,10 @@ pub fn select_mempool_transactions(
 /// Transaction selection must leave this much of [`MAX_BLOCK_BYTES`] free. A block over that
 /// limit cannot be deserialized by any node, including the one that produced it, so it can be
 /// neither submitted nor gossiped.
+///
+/// The fat pointer's serialized size varies with the size of the finalizer roster, so it is
+/// measured here rather than assumed -- this replaces the fixed `Header::serialized_size()`
+/// reservation, which cannot see the fat pointer.
 fn non_transaction_block_bytes(fat_pointer: &FatPointerToBftBlock) -> usize {
     // The header `proposal_block_from_template` builds from this template. Every field except
     // the solution and the fat pointer has a fixed size, and `Solution::for_proposal` is at
@@ -174,35 +187,6 @@ fn non_transaction_block_bytes(fat_pointer: &FatPointerToBftBlock) -> usize {
     // A block within `MAX_BLOCK_BYTES` cannot hold 65536 transactions, so the transaction
     // count never occupies more than three bytes.
     header_bytes + 3
-}
-
-/// Returns a fake coinbase transaction that can be used during transaction selection.
-///
-/// This avoids a data dependency loop involving the selected transactions, the miner fee,
-/// and the coinbase transaction.
-///
-/// This transaction's serialized size and sigops must be at least as large as the real coinbase
-/// transaction with the correct height and fee.
-pub fn fake_coinbase_transaction(
-    net: &Network,
-    height: Height,
-    miner_address: &Address,
-    extra_coinbase_data: Vec<u8>,
-) -> TransactionTemplate<NegativeOrZero> {
-    // Block heights are encoded as variable-length (script) and `u32` (lock time, expiry height).
-    // They can also change the `u32` consensus branch id.
-    // We use the template height here, which has the correct byte length.
-    // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
-    // https://github.com/zcash/zips/blob/main/zip-0203.rst#changes-for-nu5
-    //
-    // Transparent amounts are encoded as `i64`,
-    // so one zat has the same size as the real amount:
-    // https://developer.bitcoin.org/reference/transactions.html#txout-a-transaction-output
-    let miner_fee = 1.try_into().expect("amount is valid and non-negative");
-    let outputs = standard_coinbase_outputs(net, height, miner_address, miner_fee);
-    let coinbase = Transaction::new_v5_coinbase(net, height, outputs, extra_coinbase_data).into();
-
-    TransactionTemplate::from_coinbase(&coinbase, miner_fee)
 }
 
 /// Returns a fee-weighted index and the total weight of `transactions`.
@@ -397,14 +381,17 @@ impl TryUpdateBlockLimits for VerifiedUnminedTx {
         // > and block_unpaid_actions <=  block_unpaid_action_limit,
         // > add the transaction to the block template
         //
-        // Unpaid actions are always zero for transactions that pay the conventional fee,
-        // so the unpaid action check always passes for those transactions.
+        // Unpaid actions are always zero for transactions that pay the conventional fee, so the
+        // unpaid action check always passes for those transactions. Use the full block-level sigop
+        // count (legacy + P2SH) so template selection cannot produce blocks that the block verifier
+        // would reject for exceeding `MAX_BLOCK_SIGOPS`.
+        let tx_block_sigops = self.block_sigop_count();
         if self.transaction.size <= *remaining_block_bytes
-            && self.sigops <= *remaining_block_sigops
+            && tx_block_sigops <= *remaining_block_sigops
             && self.unpaid_actions <= *remaining_block_unpaid_actions
         {
             *remaining_block_bytes -= self.transaction.size;
-            *remaining_block_sigops -= self.sigops;
+            *remaining_block_sigops -= tx_block_sigops;
 
             // Unpaid actions are always zero for transactions that pay the conventional fee,
             // so this limit always remains the same after they are added.

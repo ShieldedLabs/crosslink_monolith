@@ -1,0 +1,53 @@
+[package]
+name = "wallet"
+version = "1.0.0-beta.1"
+edition = "2021"
+
+# Standalone crate: lives at the monolith root alongside tenderlink/ and zebra-gui/,
+# not inside the zebra-crosslink workspace, so it stays out of the zebra upstream diff.
+# Dependencies are spelled out here rather than inherited, since there is no workspace
+# to inherit from. Keep the shared crates in step with zebra-crosslink/Cargo.toml.
+
+[dependencies]
+secp256k1 = "0.29"
+bip39 = "2.2.0"
+
+ripemd = "0.1"
+sha2 = "0.10"
+
+zcash_primitives = { path = "../librustzcash/zcash_primitives" }
+zcash_client_backend = { path = "../librustzcash/zcash_client_backend", features = ["lightwalletd-tonic", "sync"] }
+zcash_client_sqlite = { path = "../librustzcash/zcash_client_sqlite", features = ["orchard", "transparent-inputs"] }
+zcash_keys = { path = "../librustzcash/zcash_keys", features = ["transparent-inputs"] }
+zcash_protocol = { path = "../librustzcash/components/zcash_protocol" }
+zcash_transparent = { path = "../librustzcash/zcash_transparent" }
+zcash_note_encryption = "0.4.1"
+zcash_proofs = { path = "../librustzcash/zcash_proofs", features = ["bundled-prover"] }
+zcash_script = "0.4.5"
+
+zip32 = { version = "0.2.1", default-features = false }
+
+rand = { version = "0.8", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+rand_distr = { version = "0.4", default-features = false }
+rand_chacha = "0.3.1"
+
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+prost = "0.14.1"
+tonic = { version = "0.14", features = ["transport", "channel", "tls-ring", "tls-webpki-roots"] }
+tonic-build = { version = "0.14", default-features = false }
+rustls = { version = "0.23.31", default-features = false, features = ["ring"] }
+tokio = { version = "1.44", features = ["time", "rt-multi-thread", "macros", "tracing", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false }
+tokio-stream = { version = "0.1.17", features = ["time"] }
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "rustls-tls"] }
+
+secrecy = "0.8.0"
+# Kept in step with zebra-crosslink/Cargo.toml: librustzcash is on orchard 0.15 /
+# sapling-crypto 0.7, and wallet exchanges those types with it across the crate
+# boundary, so a second major version in the graph would not typecheck.
+sapling-crypto = "0.7"
+orchard = "0.15.0"
+incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
+shardtree = "0.6.1"

@@ -1,6 +1,7 @@
 //! Tracing and logging infrastructure for Zebra.
 
 use std::{
+    io::IsTerminal,
     net::SocketAddr,
     ops::{Deref, DerefMut},
     path::PathBuf,
@@ -13,6 +14,9 @@ mod endpoint;
 
 #[cfg(feature = "flamegraph")]
 mod flame;
+
+#[cfg(feature = "opentelemetry")]
+mod otel;
 
 pub use component::Tracing;
 pub use endpoint::TracingEndpoint;
@@ -188,6 +192,39 @@ pub struct InnerConfig {
     ///
     /// Install Zebra using `cargo install --features=journald` to enable this config.
     pub use_journald: bool,
+
+    /// OpenTelemetry OTLP endpoint URL for distributed tracing.
+    ///
+    /// Install Zebra using `cargo install --features=opentelemetry` to enable this config.
+    ///
+    /// When `None` (default), OpenTelemetry is completely disabled with zero runtime overhead.
+    /// When set, traces are exported via OTLP HTTP protocol.
+    ///
+    /// Example: `"http://localhost:4318"`
+    ///
+    /// Can also be set via `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable (lower precedence).
+    pub opentelemetry_endpoint: Option<String>,
+
+    /// Service name reported to OpenTelemetry collector.
+    ///
+    /// Defaults to `"zebra"` if not specified.
+    ///
+    /// Can also be set via `OTEL_SERVICE_NAME` environment variable.
+    pub opentelemetry_service_name: Option<String>,
+
+    /// Trace sampling percentage between 0 and 100.
+    ///
+    /// Controls what percentage of traces are exported:
+    /// - `100` = 100% (all traces, default)
+    /// - `10` = 10% (recommended for high-traffic production)
+    /// - `0` = 0% (effectively disabled)
+    ///
+    /// Lower values reduce network/collector overhead for busy nodes.
+    ///
+    /// Note: This differs from the standard `OTEL_TRACES_SAMPLER_ARG` which uses
+    /// a ratio (0.0-1.0). Zebra uses percentage (0-100) for consistency with
+    /// other integer-based configuration options.
+    pub opentelemetry_sample_percent: Option<u8>,
 }
 
 /// The progress bars that Zebra will show while running.
@@ -209,20 +246,22 @@ impl Config {
     /// Returns `true` if standard output should use color escapes.
     /// Automatically checks if Zebra is running in a terminal.
     pub fn use_color_stdout(&self) -> bool {
-        self.force_use_color || (self.use_color && atty::is(atty::Stream::Stdout))
+        self.force_use_color || (self.use_color && std::io::stdout().is_terminal())
     }
 
     /// Returns `true` if standard error should use color escapes.
     /// Automatically checks if Zebra is running in a terminal.
     pub fn use_color_stderr(&self) -> bool {
-        self.force_use_color || (self.use_color && atty::is(atty::Stream::Stderr))
+        self.force_use_color || (self.use_color && std::io::stderr().is_terminal())
     }
 
     /// Returns `true` if output that could go to standard output or standard error
     /// should use color escapes. Automatically checks if Zebra is running in a terminal.
     pub fn use_color_stdout_and_stderr(&self) -> bool {
         self.force_use_color
-            || (self.use_color && atty::is(atty::Stream::Stdout) && atty::is(atty::Stream::Stderr))
+            || (self.use_color
+                && std::io::stdout().is_terminal()
+                && std::io::stderr().is_terminal())
     }
 }
 
@@ -241,6 +280,9 @@ impl Default for InnerConfig {
             progress_bar,
             log_file: runtime_default_log_file(None, progress_bar),
             use_journald: false,
+            opentelemetry_endpoint: None,
+            opentelemetry_service_name: None,
+            opentelemetry_sample_percent: None,
         }
     }
 }

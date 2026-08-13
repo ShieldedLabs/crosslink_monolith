@@ -10,9 +10,10 @@ use crate::wallet::init::WalletMigrationError;
 
 use super::shardtree_support;
 
-pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xeeec0d0d_fee0_4231_8c68_5f3a7c7c2245);
+/// This migration adds a birthday height to each account record.
+pub const MIGRATION_ID: Uuid = Uuid::from_u128(0xeeec0d0d_fee0_4231_8c68_5f3a7c7c2245);
 
-const DEPENDENCIES: &[Uuid] = &[shardtree_support::MIGRATION_ID];
+pub(super) const DEPENDENCIES: &[Uuid] = &[shardtree_support::MIGRATION_ID];
 
 pub(super) struct Migration<P> {
     pub(super) params: P,
@@ -58,11 +59,12 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
             DROP TABLE accounts;
             ALTER TABLE accounts_new RENAME TO accounts;
             PRAGMA legacy_alter_table = OFF;",
-            u32::from(
-                self.params
-                    .activation_height(NetworkUpgrade::Sapling)
-                    .unwrap()
-            )
+            // Sapling might not be active in regtest mode, in which case we fall back to
+            // the genesis block.
+            self.params
+                .activation_height(NetworkUpgrade::Sapling)
+                .map(u32::from)
+                .unwrap_or(0),
         ))?;
 
         Ok(())

@@ -1,20 +1,22 @@
 //! Error types for Zebra's state.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use chrono::{DateTime, Utc};
+use derive_new::new;
 use thiserror::Error;
 
 use zebra_chain::{
     amount::{self, NegativeAllowed, NonNegative},
     block,
     history_tree::HistoryTreeError,
-    orchard, sapling, sprout, transaction, transparent,
+    ironwood, orchard, sapling, sprout, transaction, transparent,
     value_balance::{ValueBalance, ValueBalanceError},
     work::difficulty::CompactDifficulty,
 };
 
-use crate::constants::MIN_TRANSPARENT_COINBASE_MATURITY;
+use crate::response::KnownBlockLocation;
+use crate::{constants::MIN_TRANSPARENT_COINBASE_MATURITY, HashOrHeight, KnownBlock};
 
 /// A wrapper for type erased errors that is itself clonable and implements the
 /// Error trait
@@ -41,36 +43,156 @@ impl From<BoxError> for CloneError {
 /// A boxed [`std::error::Error`].
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// An error describing the reason a semantically verified block could not be committed to the state.
-#[derive(Debug, Clone, Error, PartialEq, Eq)]
-#[error("block is not contextually valid: {}", .0)]
-pub struct CommitSemanticallyVerifiedError(#[from] pub ValidateContextError);
-
-/// An error describing the reason a block or its descendants could not be reconsidered after
-/// potentially being invalidated from the chain_set.
+/// An error describing why opening the finalized state database failed.
+///
+/// These errors are recoverable open-time failures that the caller can report,
+/// as opposed to invariant violations that indicate a bug.
 #[derive(Debug, Error)]
-pub enum ReconsiderError {
-    #[error("Block with hash {0} was not previously invalidated")]
-    MissingInvalidatedBlock(block::Hash),
+#[non_exhaustive]
+pub enum StateInitError {
+    /// A read-only state was requested, but the configured cache directory is
+    /// missing or unreadable.
+    ///
+    /// A read-only secondary instance must never create the primary's cache
+    /// directory, so a missing or unreadable directory is a fatal configuration
+    /// error rather than something to be created.
+    #[error(
+        "cannot open read-only state: cache directory {path:?} is missing or unreadable. \
+         Hint: a read-only state requires an existing Zebra cache directory; check that the \
+         state cache_dir in the Zebra config points at a running Zebra node's cache directory"
+    )]
+    ReadOnlyCacheDirUnreadable {
+        /// The configured cache directory that could not be read.
+        path: PathBuf,
+        /// The underlying I/O error returned while reading the directory.
+        source: std::io::Error,
+    },
 
-    #[error("Parent chain not found for block {0}")]
-    ParentChainNotFound(block::Hash),
+    /// A read-only state was requested, but no database exists at the expected
+    /// path.
+    ///
+    /// A read-only secondary instance cannot create a database, so the absence
+    /// of an existing database is a fatal configuration error.
+    #[error(
+        "cannot open read-only state: no database found at {path:?}. \
+         Hint: a read-only state requires an existing finalized database created by a running \
+         Zebra node; check that the state cache_dir in the Zebra config points at that node's \
+         cache directory"
+    )]
+    ReadOnlyDatabaseNotFound {
+        /// The database path at which no database was found.
+        path: PathBuf,
+    },
 
-    #[error("Invalidated blocks list is empty when it should contain at least one block")]
-    InvalidatedBlocksEmpty,
-
-    #[error("{0}")]
-    ValidationError(#[from] ValidateContextError),
+    /// A read-only state was requested together with an ephemeral database.
+    ///
+    /// A read-only secondary follows another process's primary database and must
+    /// never delete it, whereas an ephemeral database deletes its files on drop. The
+    /// two are mutually exclusive, so requesting both is a fatal configuration error.
+    #[error(
+        "cannot open read-only state: an ephemeral database was also requested. \
+         Hint: a read-only state follows an existing Zebra node's database and must not \
+         delete it; set `ephemeral = false`, or do not request a read-only state"
+    )]
+    ReadOnlyEphemeralConflict,
 }
+
+/// An error describing why a block could not be queued to be committed to the state.
+#[derive(Debug, Error, Clone, PartialEq, Eq, new)]
+pub enum CommitBlockError {
+    #[error("block hash is a duplicate: already in {location}")]
+    /// The block is a duplicate: it is already queued or committed in the state.
+    Duplicate {
+        /// Hash or height of the duplicated block.
+        hash_or_height: Option<HashOrHeight>,
+        /// Location in the state where the block can be found.
+        location: KnownBlock,
+    },
+
+    /// Contextual validation failed.
+    #[error("could not contextually validate semantically verified block")]
+    ValidateContextError(#[from] Box<ValidateContextError>),
+
+    /// The write task exited (likely during shutdown).
+    #[error("block commit task exited. Is Zebra shutting down?")]
+    #[non_exhaustive]
+    WriteTaskExited,
+}
+
+impl CommitBlockError {
+    /// Returns `true` if this is definitely a duplicate commit request.
+    /// Some duplicate requests might not be detected, and therefore return `false`.
+    pub fn is_duplicate_request(&self) -> bool {
+        matches!(self, CommitBlockError::Duplicate { .. })
+    }
+
+    /// Returns a suggested misbehaviour score increment for a certain error.
+    pub fn misbehavior_score(&self) -> u32 {
+        0
+    }
+}
+
+/// An error describing why a `CommitSemanticallyVerified` request failed.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[error("could not commit semantically-verified block")]
+pub struct CommitSemanticallyVerifiedError(#[from] CommitBlockError);
+
+impl CommitSemanticallyVerifiedError {
+    /// Returns the [`CommitBlockError`] describing why the commit failed.
+    pub fn inner(&self) -> &CommitBlockError {
+        &self.0
+    }
+}
+
+impl From<ValidateContextError> for CommitSemanticallyVerifiedError {
+    fn from(value: ValidateContextError) -> Self {
+        Self(CommitBlockError::ValidateContextError(Box::new(value)))
+    }
+}
+
+/// An error describing why a `CommitCheckpointVerifiedBlock` request failed.
+#[derive(Debug, Error, Clone)]
+#[error("could not commit checkpoint-verified block")]
+pub struct CommitCheckpointVerifiedError(#[from] CommitBlockError);
+
+impl CommitCheckpointVerifiedError {
+    /// Returns the [`CommitBlockError`] describing why the commit failed.
+    pub fn inner(&self) -> &CommitBlockError {
+        &self.0
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum LayeredStateError<E: std::error::Error + std::fmt::Display> {
+    #[error("{0}")]
+    State(E),
+    #[error("{0}")]
+    Layer(BoxError),
+}
+
+impl<E: std::error::Error + 'static> From<BoxError> for LayeredStateError<E> {
+    fn from(err: BoxError) -> Self {
+        match err.downcast::<E>() {
+            Ok(state_err) => Self::State(*state_err),
+            Err(layer_error) => Self::Layer(layer_error),
+        }
+    }
+}
+
+
+impl From<ValidateContextError> for CommitCheckpointVerifiedError {
+    fn from(value: ValidateContextError) -> Self {
+        Self(CommitBlockError::ValidateContextError(Box::new(value)))
+    }
+}
+
+
 
 /// An error describing why a block failed contextual validation.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum ValidateContextError {
-    #[error("block hash {block_hash} was previously invalidated")]
-    #[non_exhaustive]
-    BlockPreviouslyInvalidated { block_hash: block::Hash },
 
     #[error("block parent not found in any chain, or not enough blocks in chain")]
     #[non_exhaustive]
@@ -172,6 +294,13 @@ pub enum ValidateContextError {
         in_finalized_state: bool,
     },
 
+    #[error("ironwood double-spend: duplicate nullifier: {nullifier:?}, in finalized state: {in_finalized_state:?}")]
+    #[non_exhaustive]
+    DuplicateIronwoodNullifier {
+        nullifier: ironwood::Nullifier,
+        in_finalized_state: bool,
+    },
+
     #[error(
         "the remaining value in the transparent transaction value pool MUST be nonnegative:\n\
          {amount_error:?},\n\
@@ -236,8 +365,8 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     AddValuePool {
         value_balance_error: ValueBalanceError,
-        chain_value_pools: ValueBalance<NonNegative>,
-        block_value_pool_change: ValueBalance<NegativeAllowed>,
+        chain_value_pools: Box<ValueBalance<NonNegative>>,
+        block_value_pool_change: Box<ValueBalance<NegativeAllowed>>,
         height: Option<block::Height>,
     },
 
@@ -286,9 +415,18 @@ pub enum ValidateContextError {
         transaction_hash: transaction::Hash,
     },
 
-    #[error("block hash {block_hash} has already been sent to be commited to the state")]
+    #[error(
+        "unknown Ironwood anchor: {anchor:?},\n\
+         {height:?}, index in block: {tx_index_in_block:?}, {transaction_hash:?}"
+    )]
     #[non_exhaustive]
-    DuplicateCommitRequest { block_hash: block::Hash },
+    UnknownIronwoodAnchor {
+        // Ironwood reuses the Orchard tree root type.
+        anchor: orchard::tree::Root,
+        height: Option<block::Height>,
+        tx_index_in_block: Option<usize>,
+        transaction_hash: transaction::Hash,
+    },
 
     #[error("block height {block_height:?} is already committed in the finalized state")]
     #[non_exhaustive]
@@ -327,6 +465,12 @@ pub enum ValidateContextError {
     InvalidDelegationBond(String),
 }
 
+impl From<sprout::tree::NoteCommitmentTreeError> for ValidateContextError {
+    fn from(value: sprout::tree::NoteCommitmentTreeError) -> Self {
+        ValidateContextError::NoteCommitmentTreeError(value.into())
+    }
+}
+
 /// Trait for creating the corresponding duplicate nullifier error from a nullifier.
 pub trait DuplicateNullifierError {
     /// Returns the corresponding duplicate nullifier error for `self`.
@@ -357,5 +501,40 @@ impl DuplicateNullifierError for orchard::Nullifier {
             nullifier: *self,
             in_finalized_state,
         }
+    }
+}
+
+impl DuplicateNullifierError for ironwood::Nullifier {
+    fn duplicate_nullifier_error(&self, in_finalized_state: bool) -> ValidateContextError {
+        ValidateContextError::DuplicateIronwoodNullifier {
+            nullifier: *self,
+            in_finalized_state,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zebra_chain::block::Height;
+
+    #[test]
+    fn commit_block_error_misbehavior_scores() {
+        let context_err = CommitBlockError::ValidateContextError(Box::new(
+            ValidateContextError::NonSequentialBlock {
+                candidate_height: Height(5),
+                parent_height: Height(3),
+            },
+        ));
+        assert_eq!(context_err.misbehavior_score(), 0);
+
+        let dup_err = CommitBlockError::Duplicate {
+            hash_or_height: None,
+            location: KnownBlock {
+                location: KnownBlockLocation::BestChain,
+                height: block::Height(0),
+            },
+        };
+        assert_eq!(dup_err.misbehavior_score(), 0);
     }
 }

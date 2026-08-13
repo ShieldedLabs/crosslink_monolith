@@ -8,7 +8,7 @@ use std::{
 
 use zebra_chain::{
     block::Height,
-    orchard, sapling, sprout,
+    ironwood, orchard, sapling, sprout,
     transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
@@ -33,6 +33,7 @@ use zebra_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 /// - the Sprout nullifiers revealed by transactions in the mempool
 /// - the Sapling nullifiers revealed by transactions in the mempool
 /// - the Orchard nullifiers revealed by transactions in the mempool
+/// - the Ironwood nullifiers revealed by transactions in the mempool
 #[derive(Default)]
 pub struct VerifiedSet {
     /// The set of verified transactions in the mempool.
@@ -65,6 +66,9 @@ pub struct VerifiedSet {
 
     /// The set of revealed Orchard nullifiers.
     orchard_nullifiers: HashSet<orchard::Nullifier>,
+
+    /// The set of revealed Ironwood nullifiers.
+    ironwood_nullifiers: HashSet<ironwood::Nullifier>,
 }
 
 impl Drop for VerifiedSet {
@@ -89,6 +93,11 @@ impl VerifiedSet {
     /// [`transparent::OutPoint`] if one exists, or None otherwise.
     pub fn created_output(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Output> {
         self.created_outputs.get(outpoint).cloned()
+    }
+
+    /// Returns true if a tx in the set has spent the output at the provided outpoint.
+    pub fn has_spent_outpoint(&self, outpoint: &transparent::OutPoint) -> bool {
+        self.spent_outpoints.contains(outpoint)
     }
 
     /// Returns the number of verified transactions in the set.
@@ -127,6 +136,7 @@ impl VerifiedSet {
         self.sprout_nullifiers.clear();
         self.sapling_nullifiers.clear();
         self.orchard_nullifiers.clear();
+        self.ironwood_nullifiers.clear();
         self.created_outputs.clear();
         self.transactions_serialized_size = 0;
         self.total_cost = 0;
@@ -175,6 +185,7 @@ impl VerifiedSet {
         self.sprout_nullifiers.extend(tx.sprout_nullifiers());
         self.sapling_nullifiers.extend(tx.sapling_nullifiers());
         self.orchard_nullifiers.extend(tx.orchard_nullifiers());
+        self.ironwood_nullifiers.extend(tx.ironwood_nullifiers());
 
         self.transactions_serialized_size += transaction.transaction.size;
         self.total_cost += transaction.cost();
@@ -256,6 +267,11 @@ impl VerifiedSet {
         let mut removed_transactions = HashSet::new();
 
         for key_to_remove in keys_to_remove {
+            if !self.transactions.contains_key(&key_to_remove) {
+                // Skip any keys that may have already been removed as their dependencies were removed.
+                continue;
+            }
+
             removed_transactions.extend(
                 self.remove(&key_to_remove)
                     .into_iter()
@@ -281,17 +297,17 @@ impl VerifiedSet {
             .remove_all(key_to_remove)
             .iter()
             .chain(std::iter::once(key_to_remove))
-            .map(|key_to_remove| {
-                let removed_tx = self
-                    .transactions
-                    .remove(key_to_remove)
-                    .expect("invalid transaction key");
+            .filter_map(|key_to_remove| {
+                let Some(removed_tx) = self.transactions.remove(key_to_remove) else {
+                    tracing::warn!(?key_to_remove, "invalid transaction key");
+                    return None;
+                };
 
                 self.transactions_serialized_size -= removed_tx.transaction.size;
                 self.total_cost -= removed_tx.cost();
                 self.remove_outputs(&removed_tx.transaction);
 
-                removed_tx
+                Some(removed_tx)
             })
             .collect();
 
@@ -311,6 +327,8 @@ impl VerifiedSet {
             || Self::has_conflicts(&self.sprout_nullifiers, tx.sprout_nullifiers().copied())
             || Self::has_conflicts(&self.sapling_nullifiers, tx.sapling_nullifiers().copied())
             || Self::has_conflicts(&self.orchard_nullifiers, tx.orchard_nullifiers().copied())
+            // `ironwood_nullifiers()` already yields owned `ironwood::Nullifier`s.
+            || Self::has_conflicts(&self.ironwood_nullifiers, tx.ironwood_nullifiers())
     }
 
     /// Removes the tracked transaction outputs from the mempool.
@@ -329,11 +347,14 @@ impl VerifiedSet {
         let sprout_nullifiers = tx.sprout_nullifiers().map(Cow::Borrowed);
         let sapling_nullifiers = tx.sapling_nullifiers().map(Cow::Borrowed);
         let orchard_nullifiers = tx.orchard_nullifiers().map(Cow::Borrowed);
+        // `ironwood_nullifiers()` yields owned `ironwood::Nullifier`s, so wrap them as `Cow::Owned`.
+        let ironwood_nullifiers = tx.ironwood_nullifiers().map(Cow::Owned);
 
         Self::remove_from_set(&mut self.spent_outpoints, spent_outpoints);
         Self::remove_from_set(&mut self.sprout_nullifiers, sprout_nullifiers);
         Self::remove_from_set(&mut self.sapling_nullifiers, sapling_nullifiers);
         Self::remove_from_set(&mut self.orchard_nullifiers, orchard_nullifiers);
+        Self::remove_from_set(&mut self.ironwood_nullifiers, ironwood_nullifiers);
     }
 
     /// Returns `true` if the two sets have common items.

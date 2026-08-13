@@ -10,7 +10,7 @@ use super::Transaction;
 use crate::parameters::NetworkUpgrade;
 use crate::{transparent, Error};
 
-use crate::primitives::zcash_primitives::{sighash, PrecomputedTxData};
+use crate::primitives::zcash_primitives::{sighash, sighash_v4_raw, PrecomputedTxData};
 
 bitflags::bitflags! {
     /// The different SigHash types, as defined in <https://zips.z.cash/zip-0143>
@@ -124,11 +124,36 @@ impl SigHasher {
         )
     }
 
+    /// Calculate the sighash for the current pre-V5 (V4) transaction using the
+    /// raw `hash_type` byte taken directly from the signature.
+    ///
+    /// This preserves non-canonical bits (e.g. `0x41`) in the preimage so that
+    /// the resulting digest matches `zcashd`'s pre-V5 sighash semantics.
+    /// Callers handling V5+ transactions must use [`SigHasher::sighash`].
+    pub fn sighash_v4_raw(
+        &self,
+        raw_hash_type: u8,
+        input_index_script_code: Option<(usize, Vec<u8>)>,
+    ) -> SigHash {
+        sighash_v4_raw(
+            &self.precomputed_tx_data,
+            raw_hash_type,
+            input_index_script_code,
+        )
+    }
+
     /// Returns the Orchard bundle in the precomputed transaction data.
     pub fn orchard_bundle(
         &self,
     ) -> Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>> {
         self.precomputed_tx_data.orchard_bundle()
+    }
+
+    /// Returns the Ironwood bundle in the precomputed transaction data (NU6.3 onward).
+    pub fn ironwood_bundle(
+        &self,
+    ) -> Option<::orchard::bundle::Bundle<::orchard::bundle::Authorized, ZatBalance>> {
+        self.precomputed_tx_data.ironwood_bundle()
     }
 
     /// Returns the Sapling bundle in the precomputed transaction data.

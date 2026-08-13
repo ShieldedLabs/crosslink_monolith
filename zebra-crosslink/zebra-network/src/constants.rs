@@ -24,7 +24,7 @@ use zebra_chain::{
 
 /// A multiplier used to calculate the inbound connection limit for the peer set,
 ///
-/// When it starts up, Zebra opens [`Config.peerset_initial_target_size`]
+/// When it starts up, Zebra opens [`crate::Config::peerset_initial_target_size`]
 /// outbound connections.
 ///
 /// Then it opens additional outbound connections as needed for network requests,
@@ -33,11 +33,11 @@ use zebra_chain::{
 /// The inbound and outbound connection limits are calculated from:
 ///
 /// The inbound limit is:
-/// `Config.peerset_initial_target_size * INBOUND_PEER_LIMIT_MULTIPLIER`.
+/// `crate::Config::peerset_initial_target_size * INBOUND_PEER_LIMIT_MULTIPLIER`.
 /// (This is similar to `zcashd`'s default inbound limit.)
 ///
 /// The outbound limit is:
-/// `Config.peerset_initial_target_size * OUTBOUND_PEER_LIMIT_MULTIPLIER`.
+/// `crate::Config::peerset_initial_target_size * OUTBOUND_PEER_LIMIT_MULTIPLIER`.
 /// (This is a bit larger than `zcashd`'s default outbound limit.)
 ///
 /// # Security
@@ -310,7 +310,13 @@ pub const MAX_ADDRS_IN_MESSAGE: usize = 1000;
 ///
 /// This limit makes sure that Zebra does not reveal its entire address book
 /// in a single `Peers` response.
-pub const ADDR_RESPONSE_LIMIT_DENOMINATOR: usize = 4;
+///
+/// This is temporarily set to 2 (up from 4) to speed up peer discovery, so
+/// nodes can recover more quickly from network fragmentation. This reveals
+/// more of the address book to each requester, see #11103 for the tradeoff
+/// discussion and the follow-up conditions for reverting or replacing this
+/// value.
+pub const ADDR_RESPONSE_LIMIT_DENOMINATOR: usize = 2;
 
 /// The maximum number of addresses Zebra will keep in its address book.
 ///
@@ -318,8 +324,11 @@ pub const ADDR_RESPONSE_LIMIT_DENOMINATOR: usize = 4;
 /// - revealing the whole address book in a few requests,
 /// - sending the maximum number of peer addresses, and
 /// - making sure the limit code actually gets run.
-pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize =
-    MAX_ADDRS_IN_MESSAGE * (ADDR_RESPONSE_LIMIT_DENOMINATOR + 1);
+///
+/// This value is deliberately pinned rather than derived from
+/// [`ADDR_RESPONSE_LIMIT_DENOMINATOR`], so the temporary denominator change
+/// above does not shrink the address book (see #11103).
+pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize = MAX_ADDRS_IN_MESSAGE * 5;
 
 /// Truncate timestamps in outbound address messages to this time interval.
 ///
@@ -339,12 +348,13 @@ pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 /// network upgrades.
 ///
 /// This version of Zebra draws the current network protocol version from
-/// [ZIP-253](https://zips.z.cash/zip-0253).
-// TODO: Update this constant to the correct value after NU6.1 & NU7 activation (see NU deployment ZIPs),
-// pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_140); // NU6.1 Mainnet
-// pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_150); // NU7 Testnet.
-// pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_160); // NU7 Mainnet.
-pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_130);
+/// [ZIP-255](https://zips.z.cash/zip-0255).
+// TODO: The NU7 protocol version is provisional; update this constant and the mapping in
+// `Version::min_specified_for_upgrade` once NU7's deployment ZIP is published.
+// Next upgrade values, uncomment on activation:
+//   pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_170); // NU7 Testnet
+//   pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_180); // NU7 Mainnet
+pub const CURRENT_NETWORK_PROTOCOL_VERSION: Version = Version(170_160); // NU6.3 (Mainnet + Testnet)
 
 /// The default RTT estimate for peer responses.
 ///
@@ -391,6 +401,20 @@ pub const MIN_PEER_SET_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// disconnected and banned.
 pub const MAX_PEER_MISBEHAVIOR_SCORE: u32 = 100;
 
+/// The interval between flushes of batched peer misbehaviour updates into the address book.
+///
+/// Misbehaviour updates are batched so peers can't keep the address book mutex locked by
+/// repeatedly sending invalid blocks or transactions.
+#[cfg(not(test))]
+pub const MISBEHAVIOR_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The interval between flushes of batched peer misbehaviour updates into the address book.
+///
+/// Tests use a much shorter interval, so that tests which wait for a misbehaviour update to
+/// turn into a ban don't have to wait for a production flush cycle.
+#[cfg(test)]
+pub const MISBEHAVIOR_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+
 /// The maximum number of banned IP addresses to be stored in-memory at any time.
 pub const MAX_BANNED_IPS: usize = 20_000;
 
@@ -407,14 +431,14 @@ lazy_static! {
     ///
     /// The minimum network protocol version typically changes after Mainnet and
     /// Testnet network upgrades.
-    // TODO: Change `Nu6` to `Nu7` after NU7 activation.
+    // TODO: Change `Nu6_2` to `Nu7` after NU7 activation.
     // TODO: Move the value here to a field on `testnet::Parameters` (#8367)
     pub static ref INITIAL_MIN_NETWORK_PROTOCOL_VERSION: HashMap<NetworkKind, Version> = {
         let mut hash_map = HashMap::new();
 
-        hash_map.insert(NetworkKind::Mainnet, Version::min_specified_for_upgrade(&Mainnet, Nu6));
-        hash_map.insert(NetworkKind::Testnet, Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6));
-        hash_map.insert(NetworkKind::Regtest, Version::min_specified_for_upgrade(&Network::new_regtest(Default::default()), Nu6));
+        hash_map.insert(NetworkKind::Mainnet, Version::min_specified_for_upgrade(&Mainnet, Nu6_2));
+        hash_map.insert(NetworkKind::Testnet, Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6_2));
+        hash_map.insert(NetworkKind::Regtest, Version::min_specified_for_upgrade(&Network::new_regtest(Default::default()), Nu6_2));
 
         hash_map
     };

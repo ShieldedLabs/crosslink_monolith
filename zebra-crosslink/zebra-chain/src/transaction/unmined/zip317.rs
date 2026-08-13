@@ -20,7 +20,7 @@ mod tests;
 /// The marginal fee for the ZIP-317 fee calculation, in zatoshis per logical action.
 //
 // TODO: allow Amount<NonNegative> in constants
-const MARGINAL_FEE: u64 = 5_000;
+pub const MARGINAL_FEE: u64 = 5_000;
 
 /// The number of grace logical actions allowed by the ZIP-317 fee calculation.
 const GRACE_ACTIONS: u32 = 2;
@@ -165,6 +165,9 @@ pub fn conventional_actions(transaction: &Transaction) -> u32 {
     let n_spends_sapling = transaction.sapling_spends_per_anchor().count();
     let n_outputs_sapling = transaction.sapling_outputs().count();
     let n_actions_orchard = transaction.orchard_actions().count();
+    // Ironwood actions have the same structure and cost as Orchard actions, so they are counted
+    // the same way. This is zero for pre-v6 transactions.
+    let n_actions_ironwood = transaction.ironwood_actions().count();
 
     let tx_in_logical_actions = div_ceil(tx_in_total_size, P2PKH_STANDARD_INPUT_SIZE);
     let tx_out_logical_actions = div_ceil(tx_out_total_size, P2PKH_STANDARD_OUTPUT_SIZE);
@@ -172,7 +175,8 @@ pub fn conventional_actions(transaction: &Transaction) -> u32 {
     let logical_actions = max(tx_in_logical_actions, tx_out_logical_actions)
         + 2 * n_join_split
         + max(n_spends_sapling, n_outputs_sapling)
-        + n_actions_orchard;
+        + n_actions_orchard
+        + n_actions_ironwood;
     let logical_actions: u32 = logical_actions
         .try_into()
         .expect("transaction items are limited by serialized size limit");
@@ -222,20 +226,18 @@ pub fn mempool_checks(
 
     const KILOBYTE: usize = 1000;
 
-    // This calculation can't overflow, because transactions are limited to 2 MB,
-    // and usize is at least 4 GB.
-    assert!(
-        MIN_MEMPOOL_TX_FEE_RATE
-            < usize::MAX / usize::try_from(MAX_BLOCK_BYTES).expect("constant fits in usize"),
-        "the fee rate multiplication must never overflow",
-    );
+    let max_block_size = usize::try_from(MAX_BLOCK_BYTES).map_err(|_| Error::InvalidMinFee)?;
 
-    let min_fee = (MIN_MEMPOOL_TX_FEE_RATE * transaction_size / KILOBYTE)
-        .clamp(MIN_MEMPOOL_TX_FEE_RATE, MEMPOOL_TX_FEE_REQUIREMENT_CAP);
-    let min_fee: u64 = min_fee
+    // Blocks, and therefore, txs are limited to 2 MB and usize is at least 4 GB, implying that we
+    // can multiply MIN_MEMPOOL_TX_FEE_RATE by transaction_size without overflow.
+    assert!(MIN_MEMPOOL_TX_FEE_RATE < usize::MAX / max_block_size);
+
+    let min_fee: u64 = (MIN_MEMPOOL_TX_FEE_RATE * transaction_size / KILOBYTE)
+        .clamp(MIN_MEMPOOL_TX_FEE_RATE, MEMPOOL_TX_FEE_REQUIREMENT_CAP)
         .try_into()
-        .expect("clamped value always fits in u64");
-    let min_fee: Amount<NonNegative> = min_fee.try_into().expect("clamped value is positive");
+        .map_err(|_| Error::InvalidMinFee)?;
+
+    let min_fee = Amount::<NonNegative>::try_from(min_fee).map_err(|_| Error::InvalidMinFee)?;
 
     if miner_fee < min_fee {
         return Err(Error::FeeBelowMinimumRate);
@@ -245,7 +247,7 @@ pub fn mempool_checks(
 }
 
 /// Errors related to ZIP-317.
-#[derive(Error, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum Error {
     #[error("Unpaid actions is higher than the limit")]
@@ -253,4 +255,7 @@ pub enum Error {
 
     #[error("Transaction fee is below the minimum fee rate")]
     FeeBelowMinimumRate,
+
+    #[error("Minimum fee could not be calculated")]
+    InvalidMinFee,
 }

@@ -8,7 +8,7 @@ use crate::{
     LedgerState,
 };
 
-use super::{Address, CoinbaseData, Input, OutPoint, Script, GENESIS_COINBASE_DATA};
+use super::{serialize::GENESIS_COINBASE_SCRIPT_SIG, Address, Input, OutPoint, Script};
 
 impl Input {
     /// Construct a strategy for creating valid-ish vecs of Inputs.
@@ -28,13 +28,13 @@ impl Arbitrary for Input {
 
     fn arbitrary_with(height: Self::Parameters) -> Self::Strategy {
         if let Some(height) = height {
-            (vec(any::<u8>(), 0..95), any::<u32>())
+            (vec(any::<u8>(), 1..95), any::<u32>())
                 .prop_map(move |(data, sequence)| Input::Coinbase {
                     height,
-                    data: if height == block::Height(0) {
-                        CoinbaseData(GENESIS_COINBASE_DATA.to_vec())
+                    data: if height.is_min() {
+                        GENESIS_COINBASE_SCRIPT_SIG.to_vec()
                     } else {
-                        CoinbaseData(data)
+                        data
                     },
                     sequence,
                 })

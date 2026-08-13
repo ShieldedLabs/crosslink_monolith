@@ -49,17 +49,18 @@ use indexmap::IndexMap;
 use jsonrpsee::core::{async_trait, RpcResult as Result};
 use jsonrpsee_proc_macros::rpc;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
+use schemars::JsonSchema;
 use tokio::{
-    sync::{broadcast, watch},
+    sync::{broadcast, mpsc, watch},
     task::JoinHandle,
 };
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 use zcash_address::{unified::Encoding, TryFromAddress};
-use zcash_protocol::consensus::Parameters;
-use zcash_primitives::transaction::{ StakingActionRequest, RosterMember };
-use zcash_primitives::bft::{ FatPointerToBftBlock, ScanInfo };
+use zcash_protocol::consensus::{self, Parameters};
+use zcash_primitives::transaction::RosterMember;
+use zcash_primitives::bft::{FatPointerToBftBlock, ScanInfo};
 
 use zebra_chain::{
     amount::{self, Amount, NegativeAllowed, NonNegative},
@@ -70,12 +71,12 @@ use zebra_chain::{
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
     parameters::{
         subsidy::{
-            block_subsidy, funding_stream_values, miner_subsidy, FundingStreamReceiver,
-            ParameterSubsidy,
+            block_subsidy, founders_reward, funding_stream_values, miner_subsidy,
+            FundingStreamReceiver,
         },
         ConsensusBranchId, Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
     },
-    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
+    serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
     transaction::{self, SerializedTransaction, Transaction, UnminedTx},
     transparent::{self, Address, OutputIndex},
@@ -85,16 +86,24 @@ use zebra_chain::{
         equihash::Solution,
     },
 };
-use zebra_consensus::{funding_stream_address, ParameterCheckpoint, RouterError};
-use zebra_network::{address_book_peers::AddressBookPeers, PeerSocketAddr};
-use zebra_node_services::mempool;
+use zebra_consensus::{
+    funding_stream_address, router::service_trait::BlockVerifierService, RouterError,
+};
+use zebra_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
+use zebra_node_services::mempool::{self, CreatedOrSpent, MempoolService};
+use zebra_state::{
+    AnyTx, HashOrHeight, OutputLocation, ReadRequest, ReadResponse, ReadState as ReadStateService,
+    State as StateService, TransactionLocation,
+};
 use zebra_state::crosslink::{TFLBlockFinality, TFLServiceRequest, TFLServiceResponse};
-use zebra_state::{HashOrHeight, OutputLocation, ReadRequest, ReadResponse, TransactionLocation};
 
 use crate::{
+    client::TransactionTemplate,
     client::Treestate,
     config,
-    methods::types::{validate_address::validate_address, z_validate_address::z_validate_address},
+    methods::types::{
+        validate_address::validate_address, z_validate_address::z_validate_address, zec::Zec,
+    },
     queue::Queue,
     server::{
         self,
@@ -116,12 +125,15 @@ use types::{
         },
         proposal::proposal_block_from_template,
         BlockTemplateResponse, BlockTemplateTimeSource, GetBlockTemplateHandler,
-        GetBlockTemplateParameters, GetBlockTemplateResponse,
+        GetBlockTemplateParameters, GetBlockTemplateResponse, MinerParams,
     },
     get_blockchain_info::GetBlockchainInfoBalance,
+    get_mempool_info::GetMempoolInfoResponse,
     get_mining_info::GetMiningInfoResponse,
     get_raw_mempool::{self, GetRawMempoolResponse},
+    get_standard_fee::GetStandardFeeResponse,
     long_poll::LongPollInput,
+    network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
     submit_block::{SubmitBlockErrorResponse, SubmitBlockParameters, SubmitBlockResponse},
     subsidy::GetBlockSubsidyResponse,
@@ -129,8 +141,50 @@ use types::{
     unified_address::ZListUnifiedReceiversResponse,
     validate_address::ValidateAddressResponse,
     z_validate_address::ZValidateAddressResponse,
-    zec::Zec,
 };
+
+include!(concat!(env!("OUT_DIR"), "/rpc_openrpc.rs"));
+
+// TODO: Review the parameter descriptions below, and update them as needed:
+// https://github.com/ZcashFoundation/zebra/issues/10320
+pub(super) const PARAM_VERBOSE_DESC: &str =
+    "Boolean flag to indicate verbosity, true for a json object, false for hex encoded data.";
+pub(super) const PARAM_POOL_DESC: &str =
+    "The pool from which subtrees should be returned. Either \"sapling\" or \"orchard\".";
+pub(super) const PARAM_START_INDEX_DESC: &str =
+    "The index of the first 2^16-leaf subtree to return.";
+pub(super) const PARAM_LIMIT_DESC: &str = "The maximum number of subtrees to return.";
+pub(super) const PARAM_REQUEST_DESC: &str = "The request object containing the parameters.";
+pub(super) const PARAM_STRING_DESC: &str = "A Crosslink staking command string.";
+pub(super) const PARAM_STAKING_ACTION_DESC: &str =
+    "The staking action to submit from the attached wallet.";
+pub(super) const PARAM_BOND_KEY_DESC: &str = "The 32-byte delegation bond key, hex-encoded.";
+pub(super) const PARAM_HASH_DESC: &str = "The block or transaction hash, hex-encoded.";
+pub(super) const PARAM_UFVK_STRS_DESC: &str =
+    "Unified full viewing keys to scan, as encoded strings.";
+pub(super) const PARAM_FIRST_HEIGHT_DESC: &str = "The first block height to scan, inclusive.";
+pub(super) const PARAM_LAST_HEIGHT_DESC: &str = "The last block height to scan, inclusive.";
+pub(super) const PARAM_INDEX_DESC: &str = "The index of the subtree to return.";
+pub(super) const PARAM_RAW_TRANSACTION_HEX_DESC: &str = "The hex-encoded raw transaction bytes.";
+#[allow(non_upper_case_globals)]
+pub(super) const PARAM__ALLOW_HIGH_FEES_DESC: &str = "Whether to allow high fees.";
+pub(super) const PARAM_NUM_BLOCKS_DESC: &str = "The number of blocks to return.";
+pub(super) const PARAM_HEIGHT_DESC: &str = "The height of the block to return.";
+pub(super) const PARAM_COMMAND_DESC: &str = "The command to execute.";
+#[allow(non_upper_case_globals)]
+pub(super) const PARAM__PARAMETERS_DESC: &str = "The parameters for the command.";
+pub(super) const PARAM_BLOCK_HASH_DESC: &str = "The hash of the block to return.";
+pub(super) const PARAM_ADDRESS_DESC: &str = "The address to return.";
+pub(super) const PARAM_ADDRESS_STRINGS_DESC: &str = "The addresses to return.";
+pub(super) const PARAM_ADDR_DESC: &str = "The address to return.";
+pub(super) const PARAM_HEX_DATA_DESC: &str = "The hex-encoded data to return.";
+pub(super) const PARAM_TXID_DESC: &str = "The transaction ID to return.";
+pub(super) const PARAM_HASH_OR_HEIGHT_DESC: &str = "The block hash or height to return.";
+pub(super) const PARAM_PARAMETERS_DESC: &str = "The parameters for the command.";
+pub(super) const PARAM_VERBOSITY_DESC: &str = "Whether to include verbose output.";
+pub(super) const PARAM_N_DESC: &str = "The output index in the transaction.";
+pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
+    "Whether to include mempool transactions in the response.";
 
 #[cfg(test)]
 mod tests;
@@ -154,6 +208,28 @@ pub trait Rpc {
     /// [required for lightwalletd support.](https://github.com/zcash/lightwalletd/blob/v0.4.9/common/common.go#L91-L95)
     #[method(name = "getinfo")]
     async fn get_info(&self) -> Result<GetInfoResponse>;
+
+    /// Returns end of support information for this node release, as a
+    /// [`GetDeprecationInfoResponse`] JSON struct.
+    ///
+    /// zcashd reference: [`getdeprecationinfo`](https://zcash.github.io/rpc/getdeprecationinfo.html)
+    /// method: post
+    /// tags: network
+    ///
+    /// # Notes
+    ///
+    /// As in zcashd, the `end_of_service` object is only present on Mainnet, where end of
+    /// support is enforced. Zebra reports the estimated last height this release supports in
+    /// `end_of_service.block_height`; the node halts when the tip goes past it.
+    ///
+    /// Some fields from the zcashd reference are missing from Zebra's response: `version` and
+    /// `subversion` are available from `getinfo`, `deprecationheight` is deprecated in zcashd,
+    /// and Zebra does not have zcashd's feature deprecation framework.
+    ///
+    /// The estimate assumes the node is synced to the network tip; during initial sync it is
+    /// significantly overestimated.
+    #[method(name = "getdeprecationinfo")]
+    async fn get_deprecation_info(&self) -> Result<GetDeprecationInfoResponse>;
 
     /// Returns blockchain state information, as a [`GetBlockchainInfoResponse`] JSON struct.
     ///
@@ -452,7 +528,7 @@ pub trait Rpc {
     /// ```
     /// *(The `address:port` matches the value in `zebrad.toml > [rpc] > listen_addr`)*
     #[method(name = "stream_tfl_new_final_block_hash")]
-    async fn stream_tfl_new_final_block_hash(&self);
+    async fn stream_tfl_new_final_block_hash(&self) -> Result<()>;
 
     /// Placeholder function for streaming new final transaction changes (for testing).
     /// (JSON-RPC pub-sub not implemented, as that will be obviated my move to gRPC).
@@ -469,7 +545,7 @@ pub trait Rpc {
     /// ```
     /// *(The `address:port` matches the value in `zebrad.toml > [rpc] > listen_addr`)*
     #[method(name = "stream_tfl_new_final_txs")]
-    async fn stream_tfl_new_final_txs(&self);
+    async fn stream_tfl_new_final_txs(&self) -> Result<()>;
 
     /// Placeholder function for blocking until a particular block becomes final.
     ///
@@ -540,10 +616,6 @@ pub trait Rpc {
     #[method(name = "get_wallet_ufvk")]
     async fn get_wallet_ufvk(&self) -> Option<String>;
 
-    /// Send a staking action from the given wallet
-    #[method(name = "wallet_staking_action")]
-    async fn wallet_staking_action(&self, staking_action: StakingActionRequest) -> Result<String>;
-
     /// Get all staking positions for the wallet: active bonds grouped by target
     /// finalizer, withdrawable bonds as a flat list
     #[method(name = "wallet_staking_positions")]
@@ -589,9 +661,22 @@ pub trait Rpc {
     #[method(name = "getbestblockheightandhash")]
     fn get_best_block_height_and_hash(&self) -> Result<GetBlockHeightAndHashResponse>;
 
-    /// For crosslink testnet 1
+    /// Returns details on the active state of the TX memory pool.
+    ///
+    /// zcash reference: [`getmempoolinfo`](https://zcash.github.io/rpc/getmempoolinfo.html)
+    #[method(name = "getmempoolinfo")]
+    async fn get_mempool_info(&self) -> Result<GetMempoolInfoResponse>;
+    /// Scans the given viewing keys over a height range and reports total issuance.
+    ///
+    /// For crosslink testnet 1.
+    ///
+    /// # Parameters
+    ///
+    /// - `ufvk_strs`: (array of strings, required) Unified full viewing keys to scan.
+    /// - `first_height`: (numeric, required) The first block height to scan, inclusive.
+    /// - `last_height`: (numeric, required) The last block height to scan, inclusive.
     #[method(name = "get_total_issuance")]
-    async fn get_total_issuance(&self, ufvk_strs: Vec<String>, first_height: u32, last_height: u32) -> Result<Vec<ScanInfo>>;
+    async fn get_total_issuance(&self, ufvk_strs: UfvkList, first_height: u32, last_height: u32) -> Result<Vec<ScanInfo>>;
 
     /// Returns all transaction ids in the memory pool, as a JSON array.
     ///
@@ -677,7 +762,7 @@ pub trait Rpc {
     ///
     /// # Parameters
     ///
-    /// - `params`: (required) Either:
+    /// - `request`: (required) Either:
     ///     - A single address string (e.g., `"tmYXBYJj1K7vhejSec5osXK2QsGa5MTisUQ"`), or
     ///     - An object with the following named fields:
     ///         - `addresses`: (array of strings, required) The addresses to get transactions from.
@@ -699,7 +784,7 @@ pub trait Rpc {
     /// <https://github.com/zcash/lightwalletd/blob/631bb16404e3d8b045e74a7c5489db626790b2f6/common/common.go#L97-L102>
     /// - It is recommended that users call the method with start/end heights such that the response can't be too large.
     #[method(name = "getaddresstxids")]
-    async fn get_address_tx_ids(&self, params: GetAddressTxIdsParams) -> Result<Vec<String>>;
+    async fn get_address_tx_ids(&self, request: GetAddressTxIdsRequest) -> Result<Vec<String>>;
 
     /// Returns all unspent outputs for a list of addresses.
     ///
@@ -709,7 +794,11 @@ pub trait Rpc {
     ///
     /// # Parameters
     ///
-    /// - `addresses`: (array, required, example={\"addresses\": [\"tmYXBYJj1K7vhejSec5osXK2QsGa5MTisUQ\"]}) The addresses to get outputs from.
+    /// - `request`: (required) Either:
+    ///     - A single address string (e.g., `"tmYXBYJj1K7vhejSec5osXK2QsGa5MTisUQ"`), or
+    ///     - An object with the following named fields:
+    ///         - `addresses`: (array, required, example=[\"tmYXBYJj1K7vhejSec5osXK2QsGa5MTisUQ\"]) The addresses to get outputs from.
+    ///         - `chaininfo`: (boolean, optional, default=false) Include chain info with results
     ///
     /// # Notes
     ///
@@ -718,7 +807,7 @@ pub trait Rpc {
     #[method(name = "getaddressutxos")]
     async fn get_address_utxos(
         &self,
-        address_strings: AddressStrings,
+        request: GetAddressUtxosRequest,
     ) -> Result<GetAddressUtxosResponse>;
 
     /// Stop the running zebrad process.
@@ -850,6 +939,14 @@ pub trait Rpc {
         self.get_network_sol_ps(num_blocks, height).await
     }
 
+    /// Returns an object containing various state info regarding P2P networking.
+    ///
+    /// zcashd reference: [`getnetworkinfo`](https://zcash.github.io/rpc/getnetworkinfo.html)
+    /// method: post
+    /// tags: network
+    #[method(name = "getnetworkinfo")]
+    async fn get_network_info(&self) -> Result<GetNetworkInfoResponse>;
+
     /// Returns data about each connected network node.
     ///
     /// zcashd reference: [`getpeerinfo`](https://zcash.github.io/rpc/getpeerinfo.html)
@@ -857,6 +954,17 @@ pub trait Rpc {
     /// tags: network
     #[method(name = "getpeerinfo")]
     async fn get_peer_info(&self) -> Result<Vec<PeerInfo>>;
+
+    /// Requests that a ping be sent to all other nodes, to measure ping time.
+    ///
+    /// Results provided in getpeerinfo, pingtime and pingwait fields are decimal seconds.
+    /// Ping command is handled in queue with all other commands, so it measures processing backlog, not just network ping.
+    ///
+    /// zcashd reference: [`ping`](https://zcash.github.io/rpc/ping.html)
+    /// method: post
+    /// tags: network
+    #[method(name = "ping")]
+    async fn ping(&self) -> Result<()>;
 
     /// Checks if a zcash transparent address of type P2PKH, P2SH or TEX is valid.
     /// Returns information about the given address if valid.
@@ -887,6 +995,16 @@ pub trait Rpc {
     /// - No notes
     #[method(name = "z_validateaddress")]
     async fn z_validate_address(&self, address: String) -> Result<ZValidateAddressResponse>;
+
+    /// Returns the recommended standard fee per logical action, in zatoshis.
+    ///
+    /// Currently returns a static fee with `version` 0; this will be replaced by
+    /// a dynamic estimate without changing the parameters or result shape.
+    ///
+    /// method: post
+    /// tags: wallet
+    #[method(name = "getstandardfee")]
+    async fn get_standard_fee(&self) -> Result<GetStandardFeeResponse>;
 
     /// Returns the block subsidy reward of the block at `height`, taking into account the mining slow start.
     /// Returns an error if `height` is less than the height of the first halving for the current network.
@@ -948,6 +1066,39 @@ pub trait Rpc {
     /// tags: generating
     async fn generate(&self, num_blocks: u32) -> Result<Vec<GetBlockHashResponse>>;
 
+    #[method(name = "generatetoaddress")]
+    /// Mine blocks immediately, paying the coinbase to `address`. Returns the
+    /// block hashes of the generated blocks.
+    ///
+    /// # Parameters
+    ///
+    /// - `num_blocks`: (numeric, required, example=1) Number of blocks to generate.
+    /// - `address`: (string, required) The transparent or shielded address to
+    ///   pay the coinbase subsidy and fees to.
+    ///
+    /// # Notes
+    ///
+    /// Only works if the network of the running zebrad process is `Regtest`.
+    /// Unlike [`Self::generate`], the coinbase is paid to `address` instead of
+    /// the configured `mining.miner_address`, which lets a test harness fund
+    /// several wallets from one node.
+    ///
+    /// zcashd reference: [`generatetoaddress`](https://zcash.github.io/rpc/generatetoaddress.html)
+    /// method: post
+    /// tags: generating
+    async fn generate_to_address(
+        &self,
+        num_blocks: u32,
+        address: String,
+    ) -> Result<Vec<GetBlockHashResponse>> {
+        let _ = (num_blocks, address);
+        Err(ErrorObject::borrowed(
+            ErrorCode::MethodNotFound.code(),
+            "generatetoaddress is not implemented",
+            None,
+        ))
+    }
+
     #[method(name = "addnode")]
     /// Add or remove a node from the address book.
     ///
@@ -964,6 +1115,28 @@ pub trait Rpc {
     /// method: post
     /// tags: network
     async fn add_node(&self, addr: PeerSocketAddr, command: AddNodeCommand) -> Result<()>;
+
+    /// Returns an OpenRPC schema as a description of this service.
+    #[method(name = "rpc.discover")]
+    fn openrpc(&self) -> openrpsee::openrpc::Response;
+    /// Returns details about an unspent transaction output.
+    ///
+    /// zcashd reference: [`gettxout`](https://zcash.github.io/rpc/gettxout.html)
+    /// method: post
+    /// tags: transaction
+    ///
+    /// # Parameters
+    ///
+    /// - `txid`: (string, required, example="mytxid") The transaction ID that contains the output.
+    /// - `n`: (number, required) The output index number.
+    /// - `include_mempool` (bool, optional, default=true) Whether to include the mempool in the search.
+    #[method(name = "gettxout")]
+    async fn get_tx_out(
+        &self,
+        txid: String,
+        n: u32,
+        include_mempool: Option<bool>,
+    ) -> Result<GetTxOutResponse>;
 }
 
 /// RPC method implementations.
@@ -977,16 +1150,9 @@ pub struct RpcImpl<
     AddressBook,
     BlockVerifierRouter,
     SyncStatus,
-> where
-    Mempool: Service<
-            mempool::Request,
-            Response = mempool::Response,
-            Error = zebra_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    Mempool::Future: Send,
+>
+where
+    Mempool: MempoolService,
     TFLService: Service<
             TFLServiceRequest,
             Response = TFLServiceResponse,
@@ -996,32 +1162,11 @@ pub struct RpcImpl<
         + Sync
         + 'static,
     TFLService::Future: Send,
-    State: Service<
-            zebra_state::Request,
-            Response = zebra_state::Response,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    State::Future: Send,
-    ReadState: Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    ReadState::Future: Send,
+    State: StateService,
+    ReadState: ReadStateService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
-    BlockVerifierRouter: Service<zebra_consensus::Request, Response = block::Hash, Error = zebra_consensus::BoxError>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    <BlockVerifierRouter as Service<zebra_consensus::Request>>::Future: Send,
+    BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     // Configuration
@@ -1038,6 +1183,10 @@ pub struct RpcImpl<
     /// Test-only option that makes Zebra say it is at the chain tip,
     /// no matter what the estimated height or local clock is.
     debug_force_finished_sync: bool,
+
+    /// The estimated last height this node release supports before its end of support halt,
+    /// if end of support is enforced on `network`. Reported by the `getdeprecationinfo` RPC.
+    end_of_support_height: Option<Height>,
 
     // Services
     //
@@ -1086,15 +1235,7 @@ impl<Mempool, TFLService, State, ReadState, Tip, AddressBook, BlockVerifierRoute
         SyncStatus,
     >
 where
-    Mempool: Service<
-            mempool::Request,
-            Response = mempool::Response,
-            Error = zebra_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    Mempool::Future: Send,
+    Mempool: MempoolService,
     TFLService: Service<
             TFLServiceRequest,
             Response = TFLServiceResponse,
@@ -1104,32 +1245,11 @@ where
         + Sync
         + 'static,
     TFLService::Future: Send,
-    State: Service<
-            zebra_state::Request,
-            Response = zebra_state::Response,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    State::Future: Send,
-    ReadState: Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    ReadState::Future: Send,
+    State: StateService,
+    ReadState: ReadStateService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
-    BlockVerifierRouter: Service<zebra_consensus::Request, Response = block::Hash, Error = zebra_consensus::BoxError>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    <BlockVerifierRouter as Service<zebra_consensus::Request>>::Future: Send,
+    BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1156,15 +1276,7 @@ impl<Mempool, TFLService, State, ReadState, Tip, AddressBook, BlockVerifierRoute
         SyncStatus,
     >
 where
-    Mempool: Service<
-            mempool::Request,
-            Response = mempool::Response,
-            Error = zebra_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    Mempool::Future: Send,
+    Mempool: MempoolService,
     TFLService: Service<
             TFLServiceRequest,
             Response = TFLServiceResponse,
@@ -1174,32 +1286,11 @@ where
         + Sync
         + 'static,
     TFLService::Future: Send,
-    State: Service<
-            zebra_state::Request,
-            Response = zebra_state::Response,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    State::Future: Send,
-    ReadState: Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    ReadState::Future: Send,
+    State: StateService,
+    ReadState: ReadStateService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
-    BlockVerifierRouter: Service<zebra_consensus::Request, Response = block::Hash, Error = zebra_consensus::BoxError>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    <BlockVerifierRouter as Service<zebra_consensus::Request>>::Future: Send,
+    BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     /// Create a new instance of the RPC handler.
@@ -1222,7 +1313,7 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<watch::Sender<(block::Hash, block::Height)>>,
+        mined_block_sender: Option<mpsc::Sender<(block::Hash, block::Height)>>,
     ) -> (Self, JoinHandle<()>)
     where
         VersionString: ToString + Clone + Send + 'static,
@@ -1251,6 +1342,7 @@ where
             user_agent,
             network: network.clone(),
             debug_force_finished_sync,
+            end_of_support_height: None,
             mempool: mempool.clone(),
             tfl_service,
             state: state.clone(),
@@ -1276,6 +1368,14 @@ where
     pub fn network(&self) -> &Network {
         &self.network
     }
+
+    /// Sets the estimated end of support height reported by the `getdeprecationinfo` RPC.
+    ///
+    /// When unset, or set to `None`, `getdeprecationinfo` omits the `end_of_service` object.
+    pub fn with_end_of_support_height(mut self, end_of_support_height: Option<Height>) -> Self {
+        self.end_of_support_height = end_of_support_height;
+        self
+    }
 }
 
 #[async_trait]
@@ -1292,15 +1392,7 @@ impl<Mempool, TFLService, State, ReadState, Tip, AddressBook, BlockVerifierRoute
         SyncStatus,
     >
 where
-    Mempool: Service<
-            mempool::Request,
-            Response = mempool::Response,
-            Error = zebra_node_services::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    Mempool::Future: Send,
+    Mempool: MempoolService,
     TFLService: Service<
             TFLServiceRequest,
             Response = TFLServiceResponse,
@@ -1310,32 +1402,11 @@ where
         + Sync
         + 'static,
     TFLService::Future: Send,
-    State: Service<
-            zebra_state::Request,
-            Response = zebra_state::Response,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    State::Future: Send,
-    ReadState: Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    ReadState::Future: Send,
+    State: StateService,
+    ReadState: ReadStateService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
-    BlockVerifierRouter: Service<zebra_consensus::Request, Response = block::Hash, Error = zebra_consensus::BoxError>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    <BlockVerifierRouter as Service<zebra_consensus::Request>>::Future: Send,
+    BlockVerifierRouter: BlockVerifierService,
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     async fn get_info(&self) -> Result<GetInfoResponse> {
@@ -1383,10 +1454,48 @@ where
             pay_tx_fee,
             relay_fee,
             errors: last_error_log,
-            errors_timestamp: last_error_log_time.to_string(),
+            errors_timestamp: last_error_log_time.timestamp(),
         };
 
         Ok(response)
+    }
+
+    async fn get_deprecation_info(&self) -> Result<GetDeprecationInfoResponse> {
+        let end_of_service = self
+            .end_of_support_height
+            // End of support is only enforced on Mainnet, and the zcashd-compatible response
+            // omits `end_of_service` on other networks, even if a height was configured.
+            .filter(|_| self.network == Network::Mainnet)
+            .map(|end_of_support_height| {
+                // Estimate the halt time from the current tip and target block spacing. If the
+                // tip is not available yet, fall back to the highest compiled-in checkpoint,
+                // which is close to the network tip at release time.
+                let tip_height = self
+                    .latest_chain_tip
+                    .best_tip_height()
+                    .unwrap_or_else(|| self.network.checkpoint_list().max_height());
+                // Use the spacing at the end of support height: it is always post-Blossom, so
+                // this stays correct even when the tip is missing or before Blossom.
+                let target_block_spacing =
+                    NetworkUpgrade::target_spacing_for_height(&self.network, end_of_support_height);
+                // If the tip is already past the end of support height, the estimate is in the
+                // past, but never negative.
+                let remaining_blocks = i64::from(end_of_support_height.0) - i64::from(tip_height.0);
+                let estimated_time = Utc::now()
+                    .timestamp()
+                    .saturating_add(
+                        remaining_blocks.saturating_mul(target_block_spacing.num_seconds()),
+                    )
+                    .saturating_sub(END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN)
+                    .max(0);
+
+                EndOfService {
+                    block_height: end_of_support_height.0,
+                    estimated_time,
+                }
+            });
+
+        Ok(GetDeprecationInfoResponse { end_of_service })
     }
 
     #[allow(clippy::unwrap_in_result)]
@@ -1450,6 +1559,12 @@ where
             })
             // TODO: Add a `genesis_block_time()` method on `Network` to use here.
             .unwrap_or((Height::MIN, 0.0));
+
+        let verification_progress = if network.is_regtest() {
+            1.0
+        } else {
+            verification_progress
+        };
 
         // `upgrades` object
         //
@@ -1697,14 +1812,6 @@ where
     ) -> Result<GetBlockResponse> {
         let verbosity = verbosity.unwrap_or(1);
         let network = self.network.clone();
-        let original_hash_or_height = hash_or_height.clone();
-
-        // If verbosity requires a call to `get_block_header`, resolve it here
-        let get_block_header_future = if matches!(verbosity, 1 | 2) {
-            Some(self.get_block_header(original_hash_or_height.clone(), Some(true)))
-        } else {
-            None
-        };
 
         let hash_or_height =
             HashOrHeight::new(&hash_or_height, self.latest_chain_tip.best_tip_height())
@@ -1730,9 +1837,16 @@ where
                 }
                 _ => unreachable!("unmatched response to a block request"),
             }
-        } else if let Some(get_block_header_future) = get_block_header_future {
-            let get_block_header_result: Result<GetBlockHeaderResponse> =
-                get_block_header_future.await;
+        } else if matches!(verbosity, 1 | 2) {
+            // Reuse the already-resolved `hash_or_height` (rather than the
+            // caller-supplied string) so `get_block_header` resolves to the same
+            // block this call resolved above, even for tip-relative inputs like a
+            // negative height. Resolving the caller string a second time here would
+            // re-sample the best chain at a different instant and could pick a
+            // different block after a reorg or tip advance. See issue #10550.
+            let get_block_header_result: Result<GetBlockHeaderResponse> = self
+                .get_block_header(hash_or_height.to_string(), Some(true))
+                .await;
 
             let GetBlockHeaderResponse::Object(block_header) = get_block_header_result? else {
                 panic!("must return Object")
@@ -1756,17 +1870,25 @@ where
                 next_block_hash,
             } = *block_header;
 
+            // # Concurrency
+            //
+            // We look up by block hash so the hash, transaction IDs, and confirmations
+            // are consistent. Bind every follow-up read to the resolved block hash
+            // rather than the caller-supplied hash-or-height, so a reorg between the
+            // header lookup and these reads cannot mix block A's header with block B's
+            // contents. See issue #10550.
+            let hash_or_height = hash.into();
             let transactions_request = match verbosity {
                 1 => zebra_state::ReadRequest::TransactionIdsForBlock(hash_or_height),
                 2 => zebra_state::ReadRequest::BlockAndSize(hash_or_height),
                 _other => panic!("get_block_header_fut should be none"),
             };
 
-            // # Concurrency
-            //
-            // We look up by block hash so the hash, transaction IDs, and confirmations
-            // are consistent.
-            let hash_or_height = hash.into();
+            // Confirmations is `-1` when the resolved header is no longer on the
+            // best chain. Avoid panicking on `try_into()` in the verbosity-2 path,
+            // and label such transactions as not in the active chain.
+            let in_active_chain = confirmations >= 0;
+
             let requests = vec![
                 // Get transaction IDs from the transaction index by block hash
                 //
@@ -1778,6 +1900,8 @@ where
                 transactions_request,
                 // Orchard trees
                 zebra_state::ReadRequest::OrchardTree(hash_or_height),
+                // Ironwood trees
+                zebra_state::ReadRequest::IronwoodTree(hash_or_height),
                 // Block info
                 zebra_state::ReadRequest::BlockInfo(previous_block_hash.into()),
                 zebra_state::ReadRequest::BlockInfo(hash_or_height),
@@ -1802,27 +1926,24 @@ where
                 zebra_state::ReadResponse::BlockAndSize(block_and_size) => {
                     let (block, size) = block_and_size.ok_or_misc_error("Block not found")?;
                     let block_time = block.header.time;
-                    let transactions =
-                        block
-                            .transactions
-                            .iter()
-                            .map(|tx| {
-                                GetBlockTransaction::Object(Box::new(
-                                    TransactionObject::from_transaction(
-                                        tx.clone(),
-                                        Some(height),
-                                        Some(confirmations.try_into().expect(
-                                            "should be less than max block height, i32::MAX",
-                                        )),
-                                        &network,
-                                        Some(block_time),
-                                        Some(hash),
-                                        Some(true),
-                                        tx.hash(),
-                                    ),
-                                ))
-                            })
-                            .collect();
+                    let transactions = block
+                        .transactions
+                        .iter()
+                        .map(|tx| {
+                            GetBlockTransaction::Object(Box::new(
+                                TransactionObject::from_transaction(
+                                    tx.clone(),
+                                    Some(height),
+                                    Some(confirmations),
+                                    &network,
+                                    Some(block_time),
+                                    Some(hash),
+                                    Some(in_active_chain),
+                                    tx.hash(),
+                                ),
+                            ))
+                        })
+                        .collect();
                     (transactions, Some(size))
                 }
                 _ => unreachable!("unmatched response to a transaction_ids_for_block request"),
@@ -1856,7 +1977,25 @@ where
                 size: orchard_tree_size,
             };
 
-            let trees = GetBlockTrees { sapling, orchard };
+            let ironwood_tree_response = futs.next().await.expect("`futs` should not be empty");
+            let zebra_state::ReadResponse::IronwoodTree(ironwood_tree) =
+                ironwood_tree_response.map_misc_error()?
+            else {
+                unreachable!("unmatched response to an IronwoodTree request");
+            };
+
+            // This could be `None` if there's a chain reorg between state queries. Before NU6.3 the
+            // Ironwood tree is empty (size 0).
+            let ironwood_tree = ironwood_tree.ok_or_misc_error("missing Ironwood tree")?;
+            let ironwood = IronwoodTrees {
+                size: ironwood_tree.count(),
+            };
+
+            let trees = GetBlockTrees {
+                sapling,
+                orchard,
+                ironwood,
+            };
 
             let block_info_response = futs.next().await.expect("`futs` should not be empty");
             let zebra_state::ReadResponse::BlockInfo(prev_block_info) =
@@ -1892,6 +2031,7 @@ where
                 solution: Some(solution),
                 bits: Some(bits),
                 difficulty: Some(difficulty),
+                n_tx: tx.len(),
                 tx,
                 trees,
                 chain_supply: block_info
@@ -2151,7 +2291,7 @@ where
         });
     }
 
-    async fn stream_tfl_new_final_block_hash(&self) {
+    async fn stream_tfl_new_final_block_hash(&self) -> Result<()> {
         use rand::RngCore;
         // TODO: subscribe to TFL notifs
         // ALT: transfer ownership of channel to TFL
@@ -2177,6 +2317,8 @@ where
         } else {
             tracing::error!(?rx, "Bad tfl service return.");
         };
+    
+        Ok(())
     }
 
     async fn notify_tfl_block_becomes_final_by_hash(
@@ -2218,7 +2360,7 @@ where
         }
     }
 
-    async fn stream_tfl_new_final_txs(&self) {
+    async fn stream_tfl_new_final_txs(&self) -> Result<()> {
         use rand::RngCore;
         // TODO: subscribe to TFL notifs
         // ALT: transfer ownership of channel to TFL
@@ -2265,6 +2407,8 @@ where
         } else {
             tracing::error!(?rx, "Bad tfl service return.");
         };
+    
+        Ok(())
     }
 
     async fn notify_tfl_tx_becomes_final_by_hash(
@@ -2350,32 +2494,6 @@ where
         }
     }
 
-    async fn wallet_staking_action(&self, staking_action: StakingActionRequest) -> Result<String> {
-        let res = self
-            .tfl_service
-            .clone()
-            .ready()
-            .await
-            .unwrap()
-            .call(TFLServiceRequest::WalletStakingAction(staking_action.clone()))
-            .await;
-
-        match res {
-            Ok(TFLServiceResponse::WalletStakingAction(Ok(res))) => Ok(res),
-            Ok(TFLServiceResponse::WalletStakingAction(Err(err))) => Err(ErrorObject::owned(
-                    server::error::LegacyCode::Verify.into(),
-                    format!("Faucet request for \"{staking_action:?}\" failed: {err}"),
-                    None::<()>,
-            )),
-            Err(err) => Err(ErrorObject::owned(
-                    server::error::LegacyCode::Verify.into(),
-                    format!("Faucet request for \"{staking_action:?}\" failed: {err}"),
-                    None::<()>,
-            )),
-            _ => unreachable!(""),
-        }
-    }
-
     async fn wallet_staking_positions(&self) -> Result<serde_json::Value> {
         let res = self
             .tfl_service
@@ -2455,10 +2573,15 @@ where
         let response = if !verbose {
             GetBlockHeaderResponse::Raw(HexData(header.zcash_serialize_to_vec().map_misc_error()?))
         } else {
+            // Bind follow-up reads to the resolved block hash so the SaplingTree
+            // and Depth lookups are taken from the same chain view as the header.
+            // Using the caller-supplied `hash_or_height` here would re-sample the
+            // best chain and could mix a header from block A with a Sapling tree
+            // from block B at the same height. See issue #10550.
             let zebra_state::ReadResponse::SaplingTree(sapling_tree) = self
                 .read_state
                 .clone()
-                .oneshot(zebra_state::ReadRequest::SaplingTree(hash_or_height))
+                .oneshot(zebra_state::ReadRequest::SaplingTree(hash.into()))
                 .await
                 .map_misc_error()?
             else {
@@ -2554,7 +2677,35 @@ where
             .ok_or_misc_error("No blocks in state")
     }
 
-    async fn get_total_issuance(&self, ufvk_strs: Vec<String>, first_height: u32, last_height: u32) -> Result<Vec<ScanInfo>> {
+    async fn get_mempool_info(&self) -> Result<GetMempoolInfoResponse> {
+        let mut mempool = self.mempool.clone();
+
+        let response = mempool
+            .ready()
+            .and_then(|service| service.call(mempool::Request::QueueStats))
+            .await
+            .map_misc_error()?;
+
+        if let mempool::Response::QueueStats {
+            size,
+            bytes,
+            usage,
+            fully_notified,
+        } = response
+        {
+            Ok(GetMempoolInfoResponse {
+                size,
+                bytes,
+                usage,
+                fully_notified,
+            })
+        } else {
+            unreachable!("unexpected response to QueueStats request")
+        }
+    }
+
+    async fn get_total_issuance(&self, ufvk_strs: UfvkList, first_height: u32, last_height: u32) -> Result<Vec<ScanInfo>> {
+        let ufvk_strs = ufvk_strs.0;
         // TODO: @Prod @Testnet
         let network = &zcash_protocol::consensus::TEST_NETWORK;
         let mut ufvks = Vec::with_capacity(ufvk_strs.len());
@@ -2605,6 +2756,10 @@ where
                 last_seen_tip_hash: _,
             } => {
                 if verbose {
+                    let transactions_by_id = transactions
+                        .iter()
+                        .map(|unmined_tx| (unmined_tx.transaction.id.mined_id(), unmined_tx))
+                        .collect::<HashMap<_, _>>();
                     let map = transactions
                         .iter()
                         .map(|unmined_tx| {
@@ -2612,7 +2767,7 @@ where
                                 unmined_tx.transaction.id.mined_id().encode_hex(),
                                 get_raw_mempool::MempoolObject::from_verified_unmined_tx(
                                     unmined_tx,
-                                    &transactions,
+                                    &transactions_by_id,
                                     &transaction_dependencies,
                                 ),
                             )
@@ -2709,75 +2864,131 @@ where
             };
         }
 
-        // TODO: this should work for blocks in side chains
-        let txid = if let Some(block_hash) = block_hash {
+        let caller_block_context = if let Some(block_hash) = block_hash {
             let block_hash = block::Hash::from_hex(block_hash)
                 .map_error(server::error::LegacyCode::InvalidAddressOrKey)?;
             match self
                 .read_state
                 .clone()
-                .oneshot(zebra_state::ReadRequest::TransactionIdsForBlock(
+                .oneshot(zebra_state::ReadRequest::AnyChainTransactionIdsForBlock(
                     block_hash.into(),
                 ))
                 .await
                 .map_misc_error()?
             {
-                zebra_state::ReadResponse::TransactionIdsForBlock(tx_ids) => *tx_ids
-                    .ok_or_error(
+                zebra_state::ReadResponse::AnyChainTransactionIdsForBlock(tx_ids) => {
+                    let (ids, in_best_chain) = tx_ids.ok_or_error(
                         server::error::LegacyCode::InvalidAddressOrKey,
                         "block not found",
-                    )?
-                    .iter()
-                    .find(|id| **id == txid)
-                    .ok_or_error(
+                    )?;
+
+                    ids.iter().find(|id| **id == txid).ok_or_error(
                         server::error::LegacyCode::InvalidAddressOrKey,
                         "txid not found",
-                    )?,
-                _ => unreachable!("unmatched response to a `TransactionsByMinedId` request"),
+                    )?;
+
+                    Some((block_hash, in_best_chain))
+                }
+                _ => {
+                    unreachable!("unmatched response to a `AnyChainTransactionIdsForBlock` request")
+                }
             }
         } else {
-            txid
+            None
         };
 
         // If the tx wasn't in the mempool, check the state.
         match self
             .read_state
             .clone()
-            .oneshot(zebra_state::ReadRequest::Transaction(txid))
+            .oneshot(zebra_state::ReadRequest::AnyChainTransaction(txid))
             .await
             .map_misc_error()?
         {
-            zebra_state::ReadResponse::Transaction(Some(tx)) => Ok(if verbose {
-                let block_hash = match self
-                    .read_state
-                    .clone()
-                    .oneshot(zebra_state::ReadRequest::BestChainBlockHash(tx.height))
-                    .await
-                    .map_misc_error()?
-                {
-                    zebra_state::ReadResponse::BlockHash(block_hash) => block_hash,
-                    _ => unreachable!("unmatched response to a `TransactionsByMinedId` request"),
-                };
+            zebra_state::ReadResponse::AnyChainTransaction(Some(tx)) => Ok(if verbose {
+                if let Some((caller_block_hash, in_best_chain)) = caller_block_context {
+                    // Use the caller-provided block context to avoid TOCTOU races
+                    // between the validation query and the transaction fetch.
+                    let (raw_tx, height, confirmations, block_time) = match &tx {
+                        AnyTx::Mined(mined) if in_best_chain => (
+                            mined.tx.clone(),
+                            Some(mined.height),
+                            Some(mined.confirmations.into()),
+                            Some(mined.block_time),
+                        ),
+                        _ => {
+                            let raw_tx: Arc<Transaction> = tx.into();
+                            (raw_tx, None, None, None)
+                        }
+                    };
 
-                GetRawTransactionResponse::Object(Box::new(TransactionObject::from_transaction(
-                    tx.tx.clone(),
-                    Some(tx.height),
-                    Some(tx.confirmations),
-                    &self.network,
-                    // TODO: Performance gain:
-                    // https://github.com/ZcashFoundation/zebra/pull/9458#discussion_r2059352752
-                    Some(tx.block_time),
-                    block_hash,
-                    Some(true),
-                    txid,
-                )))
+                    GetRawTransactionResponse::Object(Box::new(
+                        TransactionObject::from_transaction(
+                            raw_tx,
+                            height,
+                            confirmations,
+                            &self.network,
+                            block_time,
+                            Some(caller_block_hash),
+                            Some(in_best_chain),
+                            txid,
+                        ),
+                    ))
+                } else {
+                    match tx {
+                        AnyTx::Mined(tx) => {
+                            let block_hash = match self
+                                .read_state
+                                .clone()
+                                .oneshot(zebra_state::ReadRequest::BestChainBlockHash(tx.height))
+                                .await
+                                .map_misc_error()?
+                            {
+                                zebra_state::ReadResponse::BlockHash(block_hash) => block_hash,
+                                _ => {
+                                    unreachable!(
+                                        "unmatched response to a `BestChainBlockHash` request"
+                                    )
+                                }
+                            };
+
+                            GetRawTransactionResponse::Object(Box::new(
+                                TransactionObject::from_transaction(
+                                    tx.tx.clone(),
+                                    Some(tx.height),
+                                    Some(tx.confirmations.into()),
+                                    &self.network,
+                                    // TODO: Performance gain:
+                                    // https://github.com/ZcashFoundation/zebra/pull/9458#discussion_r2059352752
+                                    Some(tx.block_time),
+                                    block_hash,
+                                    Some(true),
+                                    txid,
+                                ),
+                            ))
+                        }
+                        AnyTx::Side((tx, block_hash)) => GetRawTransactionResponse::Object(
+                            Box::new(TransactionObject::from_transaction(
+                                tx.clone(),
+                                None,
+                                None,
+                                &self.network,
+                                None,
+                                Some(block_hash),
+                                Some(false),
+                                txid,
+                            )),
+                        ),
+                    }
+                }
             } else {
-                let hex = tx.tx.into();
+                let tx: Arc<Transaction> = tx.into();
+                let hex = tx.into();
                 GetRawTransactionResponse::Raw(hex)
             }),
 
-            zebra_state::ReadResponse::Transaction(None) => {
-                Err("No such mempool or main chain transaction")
+            zebra_state::ReadResponse::AnyChainTransaction(None) => {
+                Err("Transaction not found in mempool or best chain")
                     .map_error(server::error::LegacyCode::InvalidAddressOrKey)
             }
 
@@ -2830,8 +3041,7 @@ where
         let time = u32::try_from(block.header.time.timestamp())
             .expect("Timestamps of valid blocks always fit into u32.");
 
-        let sapling_nu = zcash_protocol::consensus::NetworkUpgrade::Sapling;
-        let sapling = if network.is_nu_active(sapling_nu, height.into()) {
+        let sapling = if network.is_nu_active(consensus::NetworkUpgrade::Sapling, height.into()) {
             match read_state
                 .ready()
                 .and_then(|service| {
@@ -2851,8 +3061,7 @@ where
         let (sapling_tree, sapling_root) =
             sapling.map_or((None, None), |(tree, root)| (Some(tree), Some(root)));
 
-        let orchard_nu = zcash_protocol::consensus::NetworkUpgrade::Nu5;
-        let orchard = if network.is_nu_active(orchard_nu, height.into()) {
+        let orchard = if network.is_nu_active(consensus::NetworkUpgrade::Nu5, height.into()) {
             match read_state
                 .ready()
                 .and_then(|service| {
@@ -2872,6 +3081,27 @@ where
         let (orchard_tree, orchard_root) =
             orchard.map_or((None, None), |(tree, root)| (Some(tree), Some(root)));
 
+        let ironwood = if network.is_nu_active(consensus::NetworkUpgrade::Nu6_3, height.into()) {
+            match read_state
+                .ready()
+                .and_then(|service| {
+                    service.call(zebra_state::ReadRequest::IronwoodTree(hash.into()))
+                })
+                .await
+                .map_misc_error()?
+            {
+                zebra_state::ReadResponse::IronwoodTree(tree) => {
+                    tree.map(|t| (t.to_rpc_bytes(), t.root().bytes_in_display_order().to_vec()))
+                }
+                _ => unreachable!("unmatched response to an Ironwood tree request"),
+            }
+        } else {
+            None
+        };
+        // Only present from NU6.3, so pre-NU6.3 responses keep the sprout/sapling/orchard shape.
+        let ironwood = ironwood
+            .map(|(tree, root)| Treestate::new(trees::Commitments::new(Some(root), Some(tree))));
+
         Ok(GetTreestateResponse::new(
             hash,
             height,
@@ -2881,6 +3111,7 @@ where
             None,
             Treestate::new(trees::Commitments::new(sapling_root, sapling_tree)),
             Treestate::new(trees::Commitments::new(orchard_root, orchard_tree)),
+            ironwood,
         ))
     }
 
@@ -2892,7 +3123,7 @@ where
     ) -> Result<GetSubtreesByIndexResponse> {
         let mut read_state = self.read_state.clone();
 
-        const POOL_LIST: &[&str] = &["sapling", "orchard"];
+        const POOL_LIST: &[&str] = &["sapling", "orchard", "ironwood"];
 
         if pool == "sapling" {
             let request = zebra_state::ReadRequest::SaplingSubtrees { start_index, limit };
@@ -2910,7 +3141,7 @@ where
             let subtrees = subtrees
                 .values()
                 .map(|subtree| SubtreeRpcData {
-                    root: subtree.root.encode_hex(),
+                    root: subtree.root.to_bytes().encode_hex(),
                     end_height: subtree.end_height,
                 })
                 .collect();
@@ -2946,6 +3177,33 @@ where
                 start_index,
                 subtrees,
             })
+        } else if pool == "ironwood" {
+            let request = zebra_state::ReadRequest::IronwoodSubtrees { start_index, limit };
+            let response = read_state
+                .ready()
+                .and_then(|service| service.call(request))
+                .await
+                .map_misc_error()?;
+
+            let subtrees = match response {
+                zebra_state::ReadResponse::IronwoodSubtrees(subtrees) => subtrees,
+                _ => unreachable!("unmatched response to a subtrees request"),
+            };
+
+            // Ironwood reuses the Orchard note type, so the subtree root is encoded like Orchard's.
+            let subtrees = subtrees
+                .values()
+                .map(|subtree| SubtreeRpcData {
+                    root: subtree.root.encode_hex(),
+                    end_height: subtree.end_height,
+                })
+                .collect();
+
+            Ok(GetSubtreesByIndexResponse {
+                pool,
+                start_index,
+                subtrees,
+            })
         } else {
             Err(ErrorObject::owned(
                 server::error::LegacyCode::Misc.into(),
@@ -2955,9 +3213,7 @@ where
         }
     }
 
-    async fn get_address_tx_ids(&self, params: GetAddressTxIdsParams) -> Result<Vec<String>> {
-        let request = params.into_request();
-
+    async fn get_address_tx_ids(&self, request: GetAddressTxIdsRequest) -> Result<Vec<String>> {
         let mut read_state = self.read_state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
 
@@ -2967,10 +3223,7 @@ where
             best_chain_tip_height(&latest_chain_tip)?,
         )?;
 
-        let valid_addresses = AddressStrings {
-            addresses: request.addresses,
-        }
-        .valid_addresses()?;
+        let valid_addresses = request.valid_addresses()?;
 
         let request = zebra_state::ReadRequest::TransactionIdsByAddresses {
             addresses: valid_addresses,
@@ -3011,12 +3264,12 @@ where
 
     async fn get_address_utxos(
         &self,
-        address_strings: AddressStrings,
+        utxos_request: GetAddressUtxosRequest,
     ) -> Result<GetAddressUtxosResponse> {
         let mut read_state = self.read_state.clone();
         let mut response_utxos = vec![];
 
-        let valid_addresses = address_strings.valid_addresses()?;
+        let valid_addresses = utxos_request.valid_addresses()?;
 
         // get utxos data for addresses
         let request = zebra_state::ReadRequest::UtxosByAddresses(valid_addresses);
@@ -3062,7 +3315,21 @@ where
             last_output_location = output_location;
         }
 
-        Ok(response_utxos)
+        if !utxos_request.chain_info {
+            Ok(GetAddressUtxosResponse::Utxos(response_utxos))
+        } else {
+            let (height, hash) = utxos
+                .last_height_and_hash()
+                .ok_or_misc_error("No blocks in state")?;
+
+            Ok(GetAddressUtxosResponse::UtxosAndChainInfo(
+                GetAddressUtxosResponseObject {
+                    utxos: response_utxos,
+                    hash,
+                    height,
+                },
+            ))
+        }
     }
 
     fn stop(&self) -> Result<String> {
@@ -3127,14 +3394,9 @@ where
         parameters: Option<GetBlockTemplateParameters>,
     ) -> Result<GetBlockTemplateResponse> {
         use types::get_block_template::{
-            check_parameters, check_synced_to_tip, fetch_mempool_transactions,
-            fetch_state_tip_and_local_time, validate_block_proposal,
-            zip317::select_mempool_transactions,
+            check_parameters, check_synced_to_tip, fetch_chain_info, fetch_mempool_transactions,
+            validate_block_proposal, zip317::select_mempool_transactions,
         };
-
-        // Clone Configs
-        let network = self.network.clone();
-        let extra_coinbase_data = self.gbt.extra_coinbase_data();
 
         // Clone Services
         let mempool = self.mempool.clone();
@@ -3149,7 +3411,7 @@ where
             return validate_block_proposal(
                 self.gbt.block_verifier_router(),
                 block_proposal_bytes,
-                network,
+                &self.network,
                 latest_chain_tip,
                 sync_status,
             )
@@ -3161,31 +3423,24 @@ where
 
         let client_long_poll_id = parameters.as_ref().and_then(|params| params.long_poll_id);
 
-        let miner_address = self
+        let miner_params = self
             .gbt
-            .miner_address()
-            .ok_or_misc_error("miner_address not configured")?;
+            .miner_params()
+            .ok_or_error(0, "miner parameters are required for get_block_template")?;
 
         // - Checks and fetches that can change during long polling
         //
         // Set up the loop.
         let mut max_time_reached = false;
 
-        // The loop returns the server long poll ID,
-        // which should be different to the client long poll ID.
-        let (
-            server_long_poll_id,
-            chain_tip_and_local_time,
-            mempool_txs,
-            mempool_tx_deps,
-            submit_old,
-        ) = loop {
+        // The loop returns the server long poll ID, which should be different to the client one.
+        let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
             // Check if we are synced to the tip.
             // The result of this check can change during long polling.
             //
             // Optional TODO:
             // - add `async changed()` method to ChainSyncStatus (like `ChainTip`)
-            check_synced_to_tip(&network, latest_chain_tip.clone(), sync_status.clone())?;
+            check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
             // TODO: return an error if we have no peers, like `zcashd` does,
             //       and add a developer config that mines regardless of how many peers we have.
             // https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880
@@ -3201,13 +3456,13 @@ where
             //
             // We always return after 90 minutes on mainnet, even if we have the same response,
             // because the max time has been reached.
-            let chain_tip_and_local_time @ zebra_state::GetBlockTemplateChainInfo {
+            let chain_info @ zebra_state::GetBlockTemplateChainInfo {
                 tip_hash,
                 tip_height,
                 max_time,
                 cur_time,
                 ..
-            } = fetch_state_tip_and_local_time(read_state.clone()).await?;
+            } = fetch_chain_info(read_state.clone()).await?;
 
             // Fetch the mempool data for the block template:
             // - if the mempool transactions change, we might return from long polling.
@@ -3244,21 +3499,20 @@ where
             // - the server long poll ID is different to the client long poll ID, or
             // - the previous loop iteration waited until the max time.
             if Some(&server_long_poll_id) != client_long_poll_id.as_ref() || max_time_reached {
-                let mut submit_old = client_long_poll_id
-                    .as_ref()
-                    .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id));
-
-                // On testnet, the max time changes the block difficulty, so old shares are
-                // invalid. On mainnet, this means there has been 90 minutes without a new
-                // block or mempool transaction, which is very unlikely. So the miner should
-                // probably reset anyway.
-                if max_time_reached {
-                    submit_old = Some(false);
-                }
+                // On testnet, the max time changes the block difficulty, so old shares are invalid.
+                // On mainnet, this means there has been 90 minutes without a new block or mempool
+                // transaction, which is very unlikely. So the miner should probably reset anyway.
+                let submit_old = if max_time_reached {
+                    Some(false)
+                } else {
+                    client_long_poll_id
+                        .as_ref()
+                        .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id))
+                };
 
                 break (
                     server_long_poll_id,
-                    chain_tip_and_local_time,
+                    chain_info,
                     mempool_txs,
                     mempool_tx_deps,
                     submit_old,
@@ -3279,8 +3533,37 @@ where
 
             // Return immediately if the chain tip has changed.
             // The clone preserves the seen status of the chain tip.
-            let mut wait_for_best_tip_change = latest_chain_tip.clone();
-            let wait_for_best_tip_change = wait_for_best_tip_change.best_tip_changed();
+            let mut wait_for_new_tip = latest_chain_tip.clone();
+            let wait_for_new_tip = wait_for_new_tip.best_tip_changed();
+            // `+2`: we expect the tip to advance by one block before waking us up.
+            let precomputed_height = Height(chain_info.tip_height.0 + 2);
+            let wait_for_new_tip = async {
+                // Precompute the coinbase tx for an empty block that will sit on the new tip. We
+                // will return this provisional block upon a chain tip change so that miners can
+                // mine on the newest tip, and don't waste their effort on a shorter chain while we
+                // compute a new template for a properly filled block. We do this precomputation
+                // before we start waiting for a new tip since computing the coinbase tx takes a few
+                // seconds if the miner mines to a shielded address, and we want to return fast
+                // when the tip changes.
+                let precompute_coinbase = |network, height, params| {
+                    tokio::task::spawn_blocking(move || {
+                        TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
+                            .expect("valid coinbase tx")
+                    })
+                };
+
+                let precomputed_coinbase = precompute_coinbase(
+                    self.network.clone(),
+                    precomputed_height,
+                    miner_params.clone(),
+                )
+                .await
+                .expect("valid coinbase tx");
+
+                let _ = wait_for_new_tip.await;
+
+                precomputed_coinbase
+            };
 
             // Wait for the maximum block time to elapse. This can change the block header
             // on testnet. (On mainnet it can happen due to a network disconnection, or a
@@ -3324,59 +3607,94 @@ where
                     );
                 }
 
-                // The state changes after around a target block interval (75s)
-                tip_changed_result = wait_for_best_tip_change => {
-                    match tip_changed_result {
-                        Ok(()) => {
-                            // Spurious updates shouldn't happen in the state, because the
-                            // difficulty and hash ordering is a stable total order. But
-                            // since they could cause a busy-loop, guard against them here.
-                            latest_chain_tip.mark_best_tip_seen();
+                precomputed_coinbase = wait_for_new_tip => {
+                    let chain_info = fetch_chain_info(read_state.clone()).await?;
 
-                            let new_tip_hash = latest_chain_tip.best_tip_hash();
-                            if new_tip_hash == Some(tip_hash) {
-                                tracing::debug!(
-                                    ?max_time,
-                                    ?cur_time,
-                                    ?server_long_poll_id,
-                                    ?client_long_poll_id,
-                                    ?tip_hash,
-                                    ?tip_height,
-                                    "ignoring spurious state change notification"
-                                );
+                    let server_long_poll_id = LongPollInput::new(
+                        chain_info.tip_height,
+                        chain_info.tip_hash,
+                        chain_info.max_time,
+                        vec![]
+                    )
+                    .generate_id();
 
-                                // Wait for the mempool interval, then check for any changes.
-                                tokio::time::sleep(Duration::from_secs(
-                                    MEMPOOL_LONG_POLL_INTERVAL,
-                                )).await;
+                    let submit_old = client_long_poll_id
+                        .as_ref()
+                        .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id));
 
-                                continue;
-                            }
+                    // Discard the precomputed coinbase if our `+2` guess was wrong
+                    // (multi-block advance, reorg, or spurious notification) — its
+                    // BIP-34 height and subsidies wouldn't match the block.
+                    let next_height = chain_info.tip_height.next().map_misc_error()?;
+                    let precomputed_coinbase = (next_height == precomputed_height)
+                        .then_some(precomputed_coinbase);
 
-                            tracing::debug!(
-                                ?max_time,
-                                ?cur_time,
-                                ?server_long_poll_id,
-                                ?client_long_poll_id,
-                                "returning from long poll because state has changed"
-                            );
+                    // The BFT pointer must be fetched here too, not left null. Crosslink's
+                    // fat-pointer gate rejects -- PERMANENTLY -- any block whose pointer is null
+                    // when its parent's is not. Once BFT has decided even one block, every
+                    // ancestor-extending template carries a real pointer, so a null here produces
+                    // a block that can never be committed. The miner would re-mine that same
+                    // template forever and the chain would deadlock at that height.
+                    let fat_pointer = {
+                        let ret = self
+                            .tfl_service
+                            .clone()
+                            .ready()
+                            .await
+                            .unwrap()
+                            .call(TFLServiceRequest::FatPointerToBFTChainTip(
+                                next_height.0 as u64,
+                            ))
+                            .await;
+                        match ret {
+                            Ok(TFLServiceResponse::FatPointerToBFTChainTip(fp)) => fp,
+                            _ => zcash_primitives::bft::FatPointerToBftBlock::null(),
                         }
+                    };
 
-                        Err(recv_error) => {
-                            // This log is rare and helps with debugging, so it's ok to be info.
-                            tracing::info!(
-                                ?recv_error,
-                                ?max_time,
-                                ?cur_time,
-                                ?server_long_poll_id,
-                                ?client_long_poll_id,
-                                "returning from long poll due to a state error.\
-                                Is Zebra shutting down?"
-                            );
-
-                            return Err(recv_error).map_error(server::error::LegacyCode::default());
+                    // Upstream returns this empty provisional block on EVERY tip change. That is a
+                    // good trade on mainnet, where blocks are minutes apart and the miner gets a
+                    // full template moments later. On a short-block-time chain with more than one
+                    // miner the tip changes constantly, so this path dominates and no mempool
+                    // transaction is ever mined -- observed on a local 2-node testnet: a submitted
+                    // transaction sat through three consecutive blocks, every one of them
+                    // coinbase-only, and was then evicted unmined.
+                    //
+                    // So only take the fast path when there is nothing waiting to be mined. When the
+                    // mempool is non-empty, fall through and build a full template instead: a few
+                    // seconds of extra latency is worth far less than never confirming a
+                    // transaction.
+                    let mempool_is_empty = {
+                        let mut mempool = self.mempool.clone();
+                        match mempool
+                            .ready()
+                            .and_then(|svc| svc.call(mempool::Request::TransactionIds))
+                            .await
+                        {
+                            Ok(mempool::Response::TransactionIds(ids)) => ids.is_empty(),
+                            // On error, prefer the fast path: it is the pre-existing behaviour.
+                            _ => true,
                         }
+                    };
+                    if !mempool_is_empty {
+                        continue;
                     }
+
+                    // Respond instantly with an empty block upon a chain tip change so that
+                    // the miner doesn't waste their effort trying to extend a shorter
+                    // chain.
+                    return Ok(BlockTemplateResponse::new_internal(
+                        &self.network,
+                        precomputed_coinbase,
+                        None,
+                        miner_params,
+                        &chain_info,
+                        server_long_poll_id,
+                        vec![],
+                        submit_old,
+                        fat_pointer,
+                    )
+                    .into())
                 }
 
                 // The max time does not elapse during normal operation on mainnet,
@@ -3402,10 +3720,6 @@ where
         // the template only depends on the previously fetched data.
         // This processing never fails.
 
-        // Calculate the next block height.
-        let next_block_height =
-            (chain_tip_and_local_time.tip_height + 1).expect("tip is far below Height::MAX");
-
         tracing::debug!(
             mempool_tx_hashes = ?mempool_txs
                 .iter()
@@ -3416,9 +3730,16 @@ where
 
         // Fetched before selection because the fat pointer occupies header bytes that the
         // transactions cannot use.
+        let height = chain_info.tip_height.next().map_misc_error()?;
+
         let fat_pointer = {
-            let ret = self.tfl_service.clone().ready().await.unwrap()
-                .call(TFLServiceRequest::FatPointerToBFTChainTip(next_block_height.0 as u64))
+            let ret = self
+                .tfl_service
+                .clone()
+                .ready()
+                .await
+                .unwrap()
+                .call(TFLServiceRequest::FatPointerToBFTChainTip(height.0 as u64))
                 .await;
             match ret {
                 Ok(TFLServiceResponse::FatPointerToBFTChainTip(fp)) => fp,
@@ -3427,13 +3748,14 @@ where
         };
 
         // Randomly select some mempool transactions.
+        let coinbase_cache = self.gbt.coinbase_cache();
         let mempool_txs = select_mempool_transactions(
-            &network,
-            next_block_height,
-            &miner_address,
+            &self.network,
+            height,
+            miner_params,
             mempool_txs,
             mempool_tx_deps,
-            extra_coinbase_data.clone(),
+            Some(&coinbase_cache),
             &fat_pointer,
         );
 
@@ -3447,18 +3769,18 @@ where
 
         // - After this point, the template only depends on the previously fetched data.
 
-        let response = BlockTemplateResponse::new_internal(
-            &network,
-            &miner_address,
-            &chain_tip_and_local_time,
+        Ok(BlockTemplateResponse::new_internal(
+            &self.network,
+            None,
+            Some(self.gbt.coinbase_cache()),
+            miner_params,
+            &chain_info,
             server_long_poll_id,
             mempool_txs,
             submit_old,
-            extra_coinbase_data,
             fat_pointer,
-        );
-
-        Ok(response.into())
+        )
+        .into())
     }
 
     async fn submit_block(
@@ -3510,7 +3832,7 @@ where
 
                 self.gbt
                     .advertise_mined_block(hash, height)
-                    .map_error_with_prefix(0, "failed to send mined block")?;
+                    .map_error_with_prefix(0, "failed to send mined block to gossip task")?;
 
                 Ok(SubmitBlockResponse::Accepted)
             }
@@ -3614,6 +3936,54 @@ where
             .expect("per-second solution rate always fits in u64"))
     }
 
+    async fn get_network_info(&self) -> Result<GetNetworkInfoResponse> {
+        let version = GetInfoResponse::version_from_string(&self.build_version)
+            .expect("invalid version string");
+
+        let subversion = self.user_agent.clone();
+
+        let protocol_version = zebra_network::constants::CURRENT_NETWORK_PROTOCOL_VERSION.0;
+
+        // TODO: return actual supported local services when Zebra exposes them
+        let local_services = format!("{:016x}", PeerServices::NODE_NETWORK);
+
+        // Deprecated: zcashd always returns 0.
+        let timeoffset = 0;
+
+        let connections = self.address_book.recently_live_peers(Utc::now()).len();
+
+        // TODO: make `limited`, `reachable`, and `proxy` dynamic if Zebra supports network filtering
+        let networks = vec![
+            NetworkInfo::new("ipv4".to_string(), false, true, "".to_string(), false),
+            NetworkInfo::new("ipv6".to_string(), false, true, "".to_string(), false),
+            NetworkInfo::new("onion".to_string(), false, false, "".to_string(), false),
+        ];
+
+        let relay_fee = zebra_chain::transaction::zip317::MIN_MEMPOOL_TX_FEE_RATE as f64
+            / (zebra_chain::amount::COIN as f64);
+
+        // TODO: populate local addresses when Zebra supports exposing bound or advertised addresses
+        let local_addresses = vec![];
+
+        // TODO: return network-level warnings, if Zebra supports them in the future
+        let warnings = "".to_string();
+
+        let response = GetNetworkInfoResponse {
+            version,
+            subversion,
+            protocol_version,
+            local_services,
+            timeoffset,
+            connections,
+            networks,
+            relay_fee,
+            local_addresses,
+            warnings,
+        };
+
+        Ok(response)
+    }
+
     async fn get_peer_info(&self) -> Result<Vec<PeerInfo>> {
         let address_book = self.address_book.clone();
         Ok(address_book
@@ -3621,6 +3991,15 @@ where
             .into_iter()
             .map(PeerInfo::from)
             .collect())
+    }
+
+    async fn ping(&self) -> Result<()> {
+        tracing::debug!("Receiving ping request via RPC");
+
+        // TODO: Send Message::Ping(nonce) to all connected peers,
+        // and track response round-trip time for getpeerinfo's pingtime/pingwait fields.
+
+        Ok(())
     }
 
     async fn validate_address(&self, raw_address: String) -> Result<ValidateAddressResponse> {
@@ -3635,47 +4014,40 @@ where
         z_validate_address(network, raw_address)
     }
 
-    async fn get_block_subsidy(&self, height: Option<u32>) -> Result<GetBlockSubsidyResponse> {
-        let latest_chain_tip = self.latest_chain_tip.clone();
-        let network = self.network.clone();
+    async fn get_standard_fee(&self) -> Result<GetStandardFeeResponse> {
+        use zebra_chain::transaction::zip317::MARGINAL_FEE;
 
-        let height = if let Some(height) = height {
-            Height(height)
-        } else {
-            best_chain_tip_height(&latest_chain_tip)?
+        const VERSION: u32 = 0;
+
+        Ok(GetStandardFeeResponse::new(MARGINAL_FEE, VERSION))
+    }
+
+    async fn get_block_subsidy(&self, height: Option<u32>) -> Result<GetBlockSubsidyResponse> {
+        let net = self.network.clone();
+
+        let height = match height {
+            Some(h) => Height(h),
+            None => best_chain_tip_height(&self.latest_chain_tip)?,
         };
 
-        if height < network.height_for_first_halving() {
-            return Err(ErrorObject::borrowed(
-                0,
-                "Zebra does not support founders' reward subsidies, \
-                        use a block height that is after the first halving",
-                None,
-            ));
-        }
-
-        // Always zero for post-halving blocks
-        let founders = Amount::zero();
-
-        let total_block_subsidy =
-            block_subsidy(height, &network).map_error(server::error::LegacyCode::default())?;
-        let miner_subsidy = miner_subsidy(height, &network, total_block_subsidy)
-            .map_error(server::error::LegacyCode::default())?;
+        let subsidy = block_subsidy(height, &net).map_misc_error()?;
 
         let (lockbox_streams, mut funding_streams): (Vec<_>, Vec<_>) =
-            funding_stream_values(height, &network, total_block_subsidy)
-                .map_error(server::error::LegacyCode::default())?
+            funding_stream_values(height, &net, subsidy)
+                .map_misc_error()?
                 .into_iter()
                 // Separate the funding streams into deferred and non-deferred streams
                 .partition(|(receiver, _)| matches!(receiver, FundingStreamReceiver::Deferred));
 
-        let is_nu6 = NetworkUpgrade::current(&network, height) == NetworkUpgrade::Nu6;
-
-        let [lockbox_total, funding_streams_total]: [std::result::Result<
-            Amount<NonNegative>,
-            amount::Error,
-        >; 2] = [&lockbox_streams, &funding_streams]
-            .map(|streams| streams.iter().map(|&(_, amount)| amount).sum());
+        let [lockbox_total, funding_streams_total] =
+            [&lockbox_streams, &funding_streams].map(|streams| {
+                streams
+                    .iter()
+                    .map(|&(_, amount)| amount)
+                    .sum::<std::result::Result<Amount<_>, _>>()
+                    .map(Zec::from)
+                    .map_misc_error()
+            });
 
         // Use the same funding stream order as zcashd
         funding_streams.sort_by_key(|(receiver, _funding_stream)| {
@@ -3684,32 +4056,36 @@ where
                 .position(|zcashd_receiver| zcashd_receiver == receiver)
         });
 
+        // NU6.1 and later minor upgrades keep the NU6 funding stream structure (ZIP 1015).
+        let is_post_nu6 = NetworkUpgrade::current(&net, height) >= NetworkUpgrade::Nu6;
+
         // Format the funding streams and lockbox streams
-        let [funding_streams, lockbox_streams]: [Vec<_>; 2] = [funding_streams, lockbox_streams]
-            .map(|streams| {
+        let [funding_streams, lockbox_streams] =
+            [funding_streams, lockbox_streams].map(|streams| {
                 streams
                     .into_iter()
                     .map(|(receiver, value)| {
-                        let address = funding_stream_address(height, &network, receiver);
+                        let address = funding_stream_address(height, &net, receiver);
                         types::subsidy::FundingStream::new_internal(
-                            is_nu6, receiver, value, address,
+                            is_post_nu6,
+                            receiver,
+                            value,
+                            address,
                         )
                     })
                     .collect()
             });
 
         Ok(GetBlockSubsidyResponse {
-            miner: miner_subsidy.into(),
-            founders: founders.into(),
+            miner: miner_subsidy(height, &net, subsidy)
+                .map_misc_error()?
+                .into(),
+            founders: founders_reward(&net, height).into(),
             funding_streams,
             lockbox_streams,
-            funding_streams_total: funding_streams_total
-                .map_error(server::error::LegacyCode::default())?
-                .into(),
-            lockbox_total: lockbox_total
-                .map_error(server::error::LegacyCode::default())?
-                .into(),
-            total_block_subsidy: total_block_subsidy.into(),
+            funding_streams_total: funding_streams_total?,
+            lockbox_total: lockbox_total?,
+            total_block_subsidy: subsidy.into(),
         })
     }
 
@@ -3743,7 +4119,7 @@ where
                 }
                 zcash_address::unified::Receiver::Sapling(data) => {
                     let addr = zebra_chain::primitives::Address::try_from_sapling(network, data)
-                        .expect("using data already decoded as valid");
+                        .map_error(server::error::LegacyCode::InvalidParameter)?;
                     sapling = Some(addr.payment_address().unwrap_or_default());
                 }
                 zcash_address::unified::Receiver::P2pkh(data) => {
@@ -3769,7 +4145,7 @@ where
 
 
     async fn generate(&self, num_blocks: u32) -> Result<Vec<Hash>> {
-        let rpc = self.clone();
+        let mut rpc = self.clone();
         let network = self.network.clone();
 
         if !network.disable_pow() {
@@ -3782,6 +4158,11 @@ where
 
         let mut block_hashes = Vec::new();
         for _ in 0..num_blocks {
+            // Use random coinbase data in order to ensure the coinbase transaction is unique. This
+            // is useful for tests that exercise forks, since otherwise the coinbase txs of blocks
+            // with the same height across different forks would be identical.
+            rpc.gbt.randomize_coinbase_data();
+
             let block_template = rpc
                 .get_block_template(None)
                 .await
@@ -3808,14 +4189,60 @@ where
                     .map_error(server::error::LegacyCode::default())?,
             );
 
-            rpc.submit_block(hex_proposal_block, None)
+            let r = rpc
+                .submit_block(hex_proposal_block, None)
                 .await
                 .map_error(server::error::LegacyCode::default())?;
+            match r {
+                SubmitBlockResponse::Accepted => { /* pass */ }
+                SubmitBlockResponse::ErrorResponse(response) => {
+                    return Err(ErrorObject::owned(
+                        server::error::LegacyCode::Misc.into(),
+                        format!("block was rejected: {response:?}"),
+                        None::<()>,
+                    ));
+                }
+            }
 
             block_hashes.push(GetBlockHashResponse(proposal_block.hash()));
         }
 
         Ok(block_hashes)
+    }
+
+    async fn generate_to_address(
+        &self,
+        num_blocks: u32,
+        address: String,
+    ) -> Result<Vec<GetBlockHashResponse>> {
+        if !self.network.disable_pow() {
+            return Err(ErrorObject::borrowed(
+                0,
+                "generatetoaddress is only supported on networks where PoW is disabled",
+                None,
+            ));
+        }
+
+        // Build miner parameters that pay the coinbase to the requested address,
+        // reusing the same coinbase-data and marker handling as configured mining.
+        let miner_address = address
+            .parse()
+            .map_error(server::error::LegacyCode::default())?;
+        let miner_params = MinerParams::new(
+            &self.network,
+            crate::config::mining::Config {
+                miner_address: Some(miner_address),
+                ..Default::default()
+            },
+        )
+        .map_error(server::error::LegacyCode::default())?;
+
+        // Override the miner params on a clone, then reuse the whole `generate`
+        // path — it mines through its own `self.clone()`, which preserves the
+        // override, so the configured `mining.miner_address` is untouched.
+        let mut rpc = self.clone();
+        rpc.gbt.set_miner_params(miner_params);
+        rpc.generate(num_blocks).await
     }
 
     async fn add_node(
@@ -3831,7 +4258,7 @@ where
                         Ok(())
                     } else {
                         return Err(ErrorObject::owned(
-                            ErrorCode::InvalidParams.code(),
+                            server::error::LegacyCode::ClientNodeAlreadyAdded.into(),
                             format!("peer address was already present in the address book: {addr}"),
                             None::<()>,
                         ));
@@ -3844,6 +4271,135 @@ where
                 "addnode command is only supported on regtest",
                 None::<()>,
             ));
+        }
+    }
+
+    fn openrpc(&self) -> openrpsee::openrpc::Response {
+        let mut generator = openrpsee::openrpc::Generator::new();
+
+        let methods = METHODS
+            .into_iter()
+            .map(|(name, method)| method.generate(&mut generator, name))
+            .collect();
+
+        Ok(openrpsee::openrpc::OpenRpc {
+            openrpc: "1.3.2",
+            info: openrpsee::openrpc::Info {
+                title: env!("CARGO_PKG_NAME"),
+                description: env!("CARGO_PKG_DESCRIPTION"),
+                version: env!("CARGO_PKG_VERSION"),
+            },
+            methods,
+            components: generator.into_components(),
+        })
+    }
+    async fn get_tx_out(
+        &self,
+        txid: String,
+        n: u32,
+        include_mempool: Option<bool>,
+    ) -> Result<GetTxOutResponse> {
+        let txid = transaction::Hash::from_hex(txid)
+            .map_error(server::error::LegacyCode::InvalidParameter)?;
+
+        let outpoint = transparent::OutPoint {
+            hash: txid,
+            index: n,
+        };
+
+        // Optional mempool path
+        if include_mempool.unwrap_or(true) {
+            let rsp = self
+                .mempool
+                .clone()
+                .oneshot(mempool::Request::UnspentOutput(outpoint))
+                .await
+                .map_misc_error()?;
+
+            match rsp {
+                // Return the output found in the mempool
+                mempool::Response::TransparentOutput(Some(CreatedOrSpent::Created {
+                    output,
+                    tx_version,
+                    last_seen_hash,
+                })) => {
+                    return Ok(GetTxOutResponse(Some(
+                        types::transaction::OutputObject::from_output(
+                            &output,
+                            last_seen_hash.to_string(),
+                            0,
+                            tx_version,
+                            false,
+                            self.network(),
+                        ),
+                    )))
+                }
+                mempool::Response::TransparentOutput(Some(CreatedOrSpent::Spent)) => {
+                    return Ok(GetTxOutResponse(None))
+                }
+                mempool::Response::TransparentOutput(None) => {}
+                _ => unreachable!("unmatched response to an `UnspentOutput` request"),
+            };
+        }
+
+        // Issue the Transaction query first and reuse the best-chain tip hash
+        // captured in that same chain snapshot, instead of doing a separate Tip
+        // query that re-samples the chain. The follow-up IsTransparentOutputSpent
+        // query may still observe a later tip, but the response's `bestblock`
+        // field is now anchored to the same view used to compute confirmations.
+        // See issue #10550.
+        let rsp = self
+            .read_state
+            .clone()
+            .oneshot(zebra_state::ReadRequest::Transaction(txid))
+            .await
+            .map_misc_error()?;
+
+        match rsp {
+            zebra_state::ReadResponse::Transaction(Some(tx)) => {
+                let best_block_hash = tx.best_chain_tip_hash;
+                let outputs = tx.tx.outputs();
+                let index: usize = n.try_into().expect("u32 always fits in usize");
+                let output = match outputs.get(index) {
+                    Some(output) => output,
+                    // return null if the output is not found
+                    None => return Ok(GetTxOutResponse(None)),
+                };
+
+                // Prune state outputs that are spent
+                let is_spent = {
+                    let rsp = self
+                        .read_state
+                        .clone()
+                        .oneshot(zebra_state::ReadRequest::IsTransparentOutputSpent(outpoint))
+                        .await
+                        .map_misc_error()?;
+
+                    match rsp {
+                        zebra_state::ReadResponse::IsTransparentOutputSpent(spent) => spent,
+                        _ => unreachable!(
+                            "unmatched response to an `IsTransparentOutputSpent` request"
+                        ),
+                    }
+                };
+
+                if is_spent {
+                    return Ok(GetTxOutResponse(None));
+                }
+
+                Ok(GetTxOutResponse(Some(
+                    types::transaction::OutputObject::from_output(
+                        output,
+                        best_block_hash.to_string(),
+                        tx.confirmations,
+                        tx.tx.version(),
+                        tx.tx.is_coinbase(),
+                        self.network(),
+                    ),
+                )))
+            }
+            zebra_state::ReadResponse::Transaction(None) => Ok(GetTxOutResponse(None)),
+            _ => unreachable!("unmatched response to a `Transaction` request"),
         }
     }
 }
@@ -3910,7 +4466,7 @@ pub struct GetInfoResponse {
 
     /// The time of the last error or warning message, or "no errors timestamp" if there are no errors
     #[serde(rename = "errorstimestamp")]
-    errors_timestamp: String,
+    errors_timestamp: i64,
 }
 
 #[deprecated(note = "Use `GetInfoResponse` instead")]
@@ -3931,7 +4487,7 @@ impl Default for GetInfoResponse {
             pay_tx_fee: 0.0,
             relay_fee: 0.0,
             errors: "no errors".to_string(),
-            errors_timestamp: "no errors timestamp".to_string(),
+            errors_timestamp: Utc::now().timestamp(),
         }
     }
 }
@@ -3953,7 +4509,7 @@ impl GetInfoResponse {
         pay_tx_fee: f64,
         relay_fee: f64,
         errors: String,
-        errors_timestamp: String,
+        errors_timestamp: i64,
     ) -> Self {
         Self {
             version,
@@ -3988,7 +4544,7 @@ impl GetInfoResponse {
         f64,
         f64,
         String,
-        String,
+        i64,
     ) {
         (
             self.version,
@@ -4028,8 +4584,43 @@ impl GetInfoResponse {
     }
 }
 
+/// The number of seconds subtracted from the `end_of_service.estimated_time` reported by
+/// `getdeprecationinfo`.
+///
+/// Block times vary, so the halt can happen earlier than a spacing-based estimate. Reporting the
+/// estimate a day early gives consumers time to act before the actual halt.
+const END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN: i64 = 24 * 60 * 60;
+
+/// Response to a `getdeprecationinfo` RPC request.
+///
+/// See the notes for the [`Rpc::get_deprecation_info` method].
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct GetDeprecationInfoResponse {
+    /// End of service information for this node release. Only present on Mainnet, where end of
+    /// support is enforced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_of_service: Option<EndOfService>,
+}
+
+/// The `end_of_service` object in a [`GetDeprecationInfoResponse`].
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct EndOfService {
+    /// The estimated last height this server version supports, matching zcashd's threshold
+    /// semantics. The node halts when the chain tip goes past this height.
+    #[getter(copy)]
+    block_height: u32,
+
+    /// The approximate time of the end of support halt, in seconds since epoch, estimated from
+    /// the current chain tip height and the target block spacing.
+    ///
+    /// Reported 24 hours earlier than the spacing-based estimate, so consumers are warned early
+    /// rather than late when block times vary.
+    #[getter(copy)]
+    estimated_time: i64,
+}
+
 /// Type alias for the array of `GetBlockchainInfoBalance` objects
-pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 5];
+pub type BlockchainValuePoolBalances = [GetBlockchainInfoBalance; 6];
 
 /// Response to a `getblockchaininfo` RPC request.
 ///
@@ -4163,22 +4754,21 @@ impl GetBlockchainInfoResponse {
     }
 }
 
-/// A wrapper type with a list of transparent address strings.
-///
-/// This is used for the input parameter of [`RpcServer::get_address_balance`],
-/// [`RpcServer::get_address_tx_ids`] and [`RpcServer::get_address_utxos`].
-#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]
-#[serde(from = "DAddressStrings")]
-pub struct AddressStrings {
+/// A request for [`RpcServer::get_address_balance`].
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize, JsonSchema)]
+#[serde(from = "DGetAddressBalanceRequest")]
+pub struct GetAddressBalanceRequest {
     /// A list of transparent address strings.
     addresses: Vec<String>,
 }
 
-impl From<DAddressStrings> for AddressStrings {
-    fn from(address_strings: DAddressStrings) -> Self {
+impl From<DGetAddressBalanceRequest> for GetAddressBalanceRequest {
+    fn from(address_strings: DGetAddressBalanceRequest) -> Self {
         match address_strings {
-            DAddressStrings::Addresses { addresses } => AddressStrings { addresses },
-            DAddressStrings::Address(address) => AddressStrings {
+            DGetAddressBalanceRequest::Addresses { addresses } => {
+                GetAddressBalanceRequest { addresses }
+            }
+            DGetAddressBalanceRequest::Address(address) => GetAddressBalanceRequest {
                 addresses: vec![address],
             },
         }
@@ -4186,9 +4776,9 @@ impl From<DAddressStrings> for AddressStrings {
 }
 
 /// An intermediate type used to deserialize [`AddressStrings`].
-#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, JsonSchema)]
 #[serde(untagged)]
-enum DAddressStrings {
+enum DGetAddressBalanceRequest {
     /// A list of address strings.
     Addresses { addresses: Vec<String> },
     /// A single address string.
@@ -4196,33 +4786,20 @@ enum DAddressStrings {
 }
 
 /// A request to get the transparent balance of a set of addresses.
-pub type GetAddressBalanceRequest = AddressStrings;
+#[deprecated(note = "Use `GetAddressBalanceRequest` instead.")]
+pub type AddressStrings = GetAddressBalanceRequest;
 
-impl AddressStrings {
-    /// Creates a new `AddressStrings` given a vector.
-    pub fn new(addresses: Vec<String>) -> AddressStrings {
-        AddressStrings { addresses }
-    }
-
-    /// Creates a new [`AddressStrings`] from a given vector, returns an error if any addresses are incorrect.
-    #[deprecated(
-        note = "Use `AddressStrings::new` instead. Validity will be checked by the server."
-    )]
-    pub fn new_valid(addresses: Vec<String>) -> Result<AddressStrings> {
-        let address_strings = Self { addresses };
-        address_strings.clone().valid_addresses()?;
-        Ok(address_strings)
-    }
-
+/// A collection of validatable addresses
+pub trait ValidateAddresses {
     /// Given a list of addresses as strings:
     /// - check if provided list have all valid transparent addresses.
     /// - return valid addresses as a set of `Address`.
-    pub fn valid_addresses(self) -> Result<HashSet<Address>> {
+    fn valid_addresses(&self) -> Result<HashSet<Address>> {
         // Reference for the legacy error code:
         // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/misc.cpp#L783-L784>
         let valid_addresses: HashSet<Address> = self
-            .addresses
-            .into_iter()
+            .addresses()
+            .iter()
             .map(|address| {
                 address
                     .parse()
@@ -4233,12 +4810,30 @@ impl AddressStrings {
         Ok(valid_addresses)
     }
 
-    /// Given a list of addresses as strings:
-    /// - check if provided list have all valid transparent addresses.
-    /// - return valid addresses as a vec of strings.
-    pub fn valid_address_strings(self) -> Result<Vec<String>> {
-        self.clone().valid_addresses()?;
-        Ok(self.addresses)
+    /// Returns string-encoded Zcash addresses in the type implementing this trait.
+    fn addresses(&self) -> &[String];
+}
+
+impl ValidateAddresses for GetAddressBalanceRequest {
+    fn addresses(&self) -> &[String] {
+        &self.addresses
+    }
+}
+
+impl GetAddressBalanceRequest {
+    /// Creates a new `AddressStrings` given a vector.
+    pub fn new(addresses: Vec<String>) -> GetAddressBalanceRequest {
+        GetAddressBalanceRequest { addresses }
+    }
+
+    /// Creates a new [`AddressStrings`] from a given vector, returns an error if any addresses are incorrect.
+    #[deprecated(
+        note = "Use `AddressStrings::new` instead. Validity will be checked by the server."
+    )]
+    pub fn new_valid(addresses: Vec<String>) -> Result<GetAddressBalanceRequest> {
+        let req = Self { addresses };
+        req.valid_addresses()?;
+        Ok(req)
     }
 }
 
@@ -4265,6 +4860,61 @@ pub struct GetAddressBalanceResponse {
 
 #[deprecated(note = "Use `GetAddressBalanceResponse` instead.")]
 pub use self::GetAddressBalanceResponse as AddressBalance;
+
+/// Parameters of [`RpcServer::get_address_utxos`] RPC method.
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new, JsonSchema,
+)]
+#[serde(from = "DGetAddressUtxosRequest")]
+pub struct GetAddressUtxosRequest {
+    /// A list of addresses to get transactions from.
+    addresses: Vec<String>,
+    /// The height to start looking for transactions.
+    #[serde(default)]
+    #[serde(rename = "chainInfo")]
+    chain_info: bool,
+}
+
+impl From<DGetAddressUtxosRequest> for GetAddressUtxosRequest {
+    fn from(request: DGetAddressUtxosRequest) -> Self {
+        match request {
+            DGetAddressUtxosRequest::Single(addr) => GetAddressUtxosRequest {
+                addresses: vec![addr],
+                chain_info: false,
+            },
+            DGetAddressUtxosRequest::Object {
+                addresses,
+                chain_info,
+            } => GetAddressUtxosRequest {
+                addresses,
+                chain_info,
+            },
+        }
+    }
+}
+
+/// An intermediate type used to deserialize [`GetAddressUtxosRequest`].
+#[derive(Debug, serde::Deserialize, JsonSchema)]
+#[serde(untagged)]
+enum DGetAddressUtxosRequest {
+    /// A single address string.
+    Single(String),
+    /// A full request object with address list and chainInfo flag.
+    Object {
+        /// A list of addresses to get transactions from.
+        addresses: Vec<String>,
+        /// The height to start looking for transactions.
+        #[serde(default)]
+        #[serde(rename = "chainInfo")]
+        chain_info: bool,
+    },
+}
+
+impl ValidateAddresses for GetAddressUtxosRequest {
+    fn addresses(&self) -> &[String] {
+        &self.addresses
+    }
+}
 
 /// Response to a `getbondinfo` RPC request.
 #[derive(
@@ -4300,6 +4950,7 @@ pub struct GetBondInfoResponse {
     serde::Deserialize,
     // Getters,
     // new,
+    schemars::JsonSchema,
 )]
 pub struct FaucetRequest {
     pub address: String,
@@ -4477,6 +5128,7 @@ impl Default for GetBlockResponse {
             confirmations: 0,
             height: None,
             time: None,
+            n_tx: 0,
             tx: Vec::new(),
             trees: GetBlockTrees::default(),
             size: None,
@@ -4554,6 +5206,10 @@ pub struct BlockObject {
 
     // `chainhistoryroot` would be here. Undocumented. TODO: decide if we want to support it
     //
+    /// The number of transactions in this block.
+    #[serde(rename = "nTx")]
+    n_tx: usize,
+
     /// List of transactions in block order, hex-encoded if verbosity=1 or
     /// as objects if verbosity=2.
     tx: Vec<GetBlockTransaction>,
@@ -4763,7 +5419,12 @@ impl Default for BlockHeaderObject {
 /// Also see the notes for the [`RpcServer::get_best_block_hash`] and `get_block_hash` methods.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(transparent)]
-pub struct GetBlockHashResponse(#[serde(with = "hex")] pub(crate) block::Hash);
+#[derive(schemars::JsonSchema)]
+pub struct GetBlockHashResponse(
+    #[serde(with = "hex")]
+    #[schemars(with = "String")]
+    pub(crate) block::Hash,
+);
 
 impl GetBlockHashResponse {
     /// Constructs a new [`GetBlockHashResponse`] from a block hash.
@@ -4777,10 +5438,24 @@ impl GetBlockHashResponse {
     }
 }
 
+/// A list of unified full viewing keys to scan.
+///
+/// A newtype rather than a bare `Vec<String>`: the OpenRPC schema generator cannot infer whether
+/// a bare `Vec` parameter is required, and falls back to a helper const it cannot resolve through
+/// the `Result` alias.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct UfvkList(pub Vec<String>);
+
 /// Hex-encoded hash of a specific transaction.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(transparent)]
-pub struct GetTxHash(#[serde(with = "hex")] pub transaction::Hash);
+#[derive(schemars::JsonSchema)]
+pub struct GetTxHash(
+    #[serde(with = "hex")]
+    #[schemars(with = "String")]
+    pub transaction::Hash,
+);
 
 #[deprecated(note = "Use `GetBlockHashResponse` instead")]
 pub use self::GetBlockHashResponse as GetBlockHash;
@@ -4839,7 +5514,25 @@ impl Default for GetRawTransactionResponse {
 }
 
 /// Response to a `getaddressutxos` RPC request.
-pub type GetAddressUtxosResponse = Vec<Utxo>;
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum GetAddressUtxosResponse {
+    /// Response when `chainInfo` is false or not provided.
+    Utxos(Vec<Utxo>),
+    /// Response when `chainInfo` is true.
+    UtxosAndChainInfo(GetAddressUtxosResponseObject),
+}
+
+/// Response to a `getaddressutxos` RPC request, when `chainInfo` is true.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct GetAddressUtxosResponseObject {
+    utxos: Vec<Utxo>,
+    #[serde(with = "hex")]
+    #[getter(copy)]
+    hash: block::Hash,
+    #[getter(copy)]
+    height: block::Height,
+}
 
 /// A UTXO returned by the `getaddressutxos` RPC request.
 ///
@@ -4925,7 +5618,7 @@ impl Utxo {
         Height,
     ) {
         (
-            self.address.clone(),
+            self.address,
             self.txid,
             self.output_index,
             self.script.clone(),
@@ -4935,12 +5628,16 @@ impl Utxo {
     }
 }
 
-/// A struct to use as parameter of the `getaddresstxids`.
+/// Parameters of [`RpcServer::get_address_tx_ids`] RPC method.
 ///
-/// See the notes for the [`Rpc::get_address_tx_ids` method].
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new)]
+/// See [`RpcServer::get_address_tx_ids`] for more details.
+#[derive(
+    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new, JsonSchema,
+)]
+#[serde(from = "DGetAddressTxIdsRequest")]
 pub struct GetAddressTxIdsRequest {
-    // A list of addresses to get transactions from.
+    /// A list of addresses. The RPC method will get transactions IDs that sent or received
+    /// funds to or from these addresses.
     addresses: Vec<String>,
     // The height to start looking for transactions.
     start: Option<u32>,
@@ -4969,27 +5666,47 @@ impl GetAddressTxIdsRequest {
     }
 }
 
-/// Parameters for the `getaddresstxids` RPC method.
-#[derive(Debug, serde::Deserialize)]
-#[serde(untagged)]
-pub enum GetAddressTxIdsParams {
-    /// A single address string.
-    Single(String),
-    /// A full request object with address list and optional height range.
-    Object(GetAddressTxIdsRequest),
-}
-
-impl GetAddressTxIdsParams {
-    /// Converts the enum into a `GetAddressTxIdsRequest`, normalizing the input format.
-    pub fn into_request(self) -> GetAddressTxIdsRequest {
-        match self {
-            GetAddressTxIdsParams::Single(addr) => GetAddressTxIdsRequest {
+impl From<DGetAddressTxIdsRequest> for GetAddressTxIdsRequest {
+    fn from(request: DGetAddressTxIdsRequest) -> Self {
+        match request {
+            DGetAddressTxIdsRequest::Single(addr) => GetAddressTxIdsRequest {
                 addresses: vec![addr],
                 start: None,
                 end: None,
             },
-            GetAddressTxIdsParams::Object(req) => req,
+            DGetAddressTxIdsRequest::Object {
+                addresses,
+                start,
+                end,
+            } => GetAddressTxIdsRequest {
+                addresses,
+                start,
+                end,
+            },
         }
+    }
+}
+
+/// An intermediate type used to deserialize [`GetAddressTxIdsRequest`].
+#[derive(Debug, serde::Deserialize, JsonSchema)]
+#[serde(untagged)]
+enum DGetAddressTxIdsRequest {
+    /// A single address string.
+    Single(String),
+    /// A full request object with address list and optional height range.
+    Object {
+        /// A list of addresses to get transactions from.
+        addresses: Vec<String>,
+        /// The height to start looking for transactions.
+        start: Option<u32>,
+        /// The height to end looking for transactions.
+        end: Option<u32>,
+    },
+}
+
+impl ValidateAddresses for GetAddressTxIdsRequest {
+    fn addresses(&self) -> &[String] {
+        &self.addresses
     }
 }
 
@@ -5000,6 +5717,10 @@ pub struct GetBlockTrees {
     sapling: SaplingTrees,
     #[serde(skip_serializing_if = "OrchardTrees::is_empty")]
     orchard: OrchardTrees,
+    // `default` so responses and fixtures from before Ironwood (which have no `ironwood` field)
+    // still deserialize, as the empty tree.
+    #[serde(default, skip_serializing_if = "IronwoodTrees::is_empty")]
+    ironwood: IronwoodTrees,
 }
 
 impl Default for GetBlockTrees {
@@ -5007,16 +5728,18 @@ impl Default for GetBlockTrees {
         GetBlockTrees {
             sapling: SaplingTrees { size: 0 },
             orchard: OrchardTrees { size: 0 },
+            ironwood: IronwoodTrees { size: 0 },
         }
     }
 }
 
 impl GetBlockTrees {
     /// Constructs a new instance of ['GetBlockTrees'].
-    pub fn new(sapling: u64, orchard: u64) -> Self {
+    pub fn new(sapling: u64, orchard: u64, ironwood: u64) -> Self {
         GetBlockTrees {
             sapling: SaplingTrees { size: sapling },
             orchard: OrchardTrees { size: orchard },
+            ironwood: IronwoodTrees { size: ironwood },
         }
     }
 
@@ -5028,6 +5751,11 @@ impl GetBlockTrees {
     /// Returns orchard data held by ['GetBlockTrees'].
     pub fn orchard(self) -> u64 {
         self.orchard.size
+    }
+
+    /// Returns ironwood data held by ['GetBlockTrees'].
+    pub fn ironwood(self) -> u64 {
+        self.ironwood.size
     }
 }
 
@@ -5050,6 +5778,18 @@ pub struct OrchardTrees {
 }
 
 impl OrchardTrees {
+    fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+}
+
+/// Ironwood note commitment tree information. Ironwood reuses the Orchard tree type.
+#[derive(Copy, Clone, Default, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct IronwoodTrees {
+    size: u64,
+}
+
+impl IronwoodTrees {
     fn is_empty(&self) -> bool {
         self.size == 0
     }
@@ -5103,10 +5843,15 @@ fn build_height_range(
 /// <https://github.com/zcash/zcash/blob/c267c3ee26510a974554f227d40a89e3ceb5bb4d/src/rpc/blockchain.cpp#L589-L618>
 //
 // TODO: also use this function in `get_block` and `z_get_treestate`
-#[allow(dead_code)]
 pub fn height_from_signed_int(index: i32, tip_height: Height) -> Result<Height> {
     if index >= 0 {
-        let height = index.try_into().expect("Positive i32 always fits in u32");
+        let height = index.try_into().map_err(|_| {
+            ErrorObject::borrowed(
+                ErrorCode::InvalidParams.code(),
+                "Index conversion failed",
+                None,
+            )
+        })?;
         if height > tip_height.0 {
             return Err(ErrorObject::borrowed(
                 ErrorCode::InvalidParams.code(),
@@ -5118,7 +5863,13 @@ pub fn height_from_signed_int(index: i32, tip_height: Height) -> Result<Height> 
     } else {
         // `index + 1` can't overflow, because `index` is always negative here.
         let height = i32::try_from(tip_height.0)
-            .expect("tip height fits in i32, because Height::MAX fits in i32")
+            .map_err(|_| {
+                ErrorObject::borrowed(
+                    ErrorCode::InvalidParams.code(),
+                    "Tip height conversion failed",
+                    None,
+                )
+            })?
             .checked_add(index + 1);
 
         let sanitized_height = match height {
@@ -5137,7 +5888,13 @@ pub fn height_from_signed_int(index: i32, tip_height: Height) -> Result<Height> 
                         None,
                     ));
                 }
-                let h: u32 = h.try_into().expect("Positive i32 always fits in u32");
+                let h: u32 = h.try_into().map_err(|_| {
+                    ErrorObject::borrowed(
+                        ErrorCode::InvalidParams.code(),
+                        "Height conversion failed",
+                        None,
+                    )
+                })?;
                 if h > tip_height.0 {
                     return Err(ErrorObject::borrowed(
                         ErrorCode::InvalidParams.code(),
@@ -5240,15 +5997,7 @@ pub async fn chain_tip_difficulty<State>(
     should_use_default: bool,
 ) -> Result<f64>
 where
-    State: Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = zebra_state::BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    State::Future: Send,
+    State: ReadStateService,
 {
     let request = ReadRequest::ChainInfo;
 
@@ -5316,12 +6065,18 @@ where
 }
 
 /// Commands for the `addnode` RPC method.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub enum AddNodeCommand {
     /// Add a node to the address book.
     #[serde(rename = "add")]
     Add,
 }
 
+/// Response to a `gettxout` RPC request.
+///
+/// See the notes for the [`Rpc::get_tx_out` method].
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct GetTxOutResponse(Option<types::transaction::OutputObject>);
 #[derive(Clone, serde::Serialize)]
 pub struct TFLStakerZec(#[serde(with = "hex")] [u8; 32], Zec<NonNegative>);

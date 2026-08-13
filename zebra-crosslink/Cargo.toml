@@ -7,10 +7,10 @@ keywords = ["zebra", "zcash"]
 license = "MIT OR Apache-2.0"
 readme = "../README.md"
 repository = "https://github.com/ZcashFoundation/zebra"
+rust-version = "1.88"
 
 [workspace]
 members = [
-        "wallet",
         "zebrad",
         "zebra-chain",
         "zebra-network",
@@ -24,7 +24,6 @@ members = [
         "zebra-crosslink",
         "tower-batch-control",
         "tower-fallback",
-        "zebra-crosslink"
 ]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
@@ -33,7 +32,10 @@ resolver = "2"
 # `cargo release` settings
 
 [workspace.dependencies]
-wallet = { path = "./wallet" }
+# NOTE: the zcash_* crates are NOT listed with crates.io versions here on purpose --
+# they are path dependencies on the monolith's local librustzcash/ subtree, declared
+# above. Upstream lists them as registry versions; re-adding those lines here would be
+# duplicate keys. Keep this in mind on the next upstream sync.
 zcash_address = { path = "../librustzcash/components/zcash_address" }
 zcash_encoding = { path = "../librustzcash/components/zcash_encoding" }
 zcash_history = { path = "../librustzcash/zcash_history" }
@@ -48,10 +50,9 @@ zebra-gui = { path = "../zebra-gui" }
 
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 shardtree = "0.6.1"
-orchard = "0.11"
-sapling-crypto = "0.5"
+orchard = "0.15.0"
+sapling-crypto = "0.7"
 abscissa_core = "0.7"
-atty = "0.2.14"
 base64 = "0.22.1"
 bech32 = "0.11.0"
 bellman = "0.14"
@@ -62,28 +63,31 @@ bitvec = "1.0"
 blake2b_simd = "1.0"
 blake2s_simd = "1.0"
 bls12_381 = "0.8"
+bounded-vec = "0.9.0"
 bs58 = "0.5"
 byteorder = "1.5"
 bytes = "1.10"
 chrono = { version = "0.4.40", default-features = false }
 clap = "4.5"
 color-eyre = { version = "0.6.3", default-features = false }
-console-subscriber = "0.4"
+console-subscriber = "0.5"
 criterion = "0.5"
 crossbeam-channel = "0.5.14"
 derive-getters = "0.5"
 derive-new = "0.5"
 dirs = "6.0"
-ed25519-zebra = "4.0.3"
+ed25519-zebra = "4.2"
 elasticsearch = { version = "8.17.0-alpha.1", default-features = false }
-equihash = "0.2.2"
-futures = "0.3.31"
+equihash = "0.3"
+ff = "0.13"
+futures = "0.3.32"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
 group = "0.13"
 hex = "0.4.3"
 hex-literal = "0.4"
 howudoin = "0.1"
+http-body = "1.0.1"
 http-body-util = "0.1.3"
 human_bytes = { version = "0.4", default-features = false }
 humantime = "2.2"
@@ -106,11 +110,13 @@ log = "0.4.27"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 mset = "0.1"
-nix = "0.29"
+nix = "0.30"
 num-integer = "0.1.46"
 once_cell = "1.21"
+openrpsee = "0.1.0"
 ordered-map = "0.4.2"
 owo-colors = "4.2.0"
+phf = "0.12"
 pin-project = "1.1.10"
 primitive-types = "0.12"
 proptest = "1.6"
@@ -123,24 +129,29 @@ rand_core = "0.6"
 rayon = "1.10"
 reddsa = "0.5"
 redjubjub = "0.8"
-regex = "1.11.0"
-reqwest = { version = "0.12.15", default-features = false }
-ripemd = "0.1.3"
-rlimit = "0.10.2"
-rocksdb = { version = "0.23.0", default-features = false, features = ["bindgen-runtime"] }
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false }
+ripemd = "0.1"
+rlimit = "0.10"
+rocksdb = { version = "0.24", default-features = false }
 secp256k1 = "0.29"
 semver = "1.0.26"
-sentry = { version = "0.40", default-features = false }
+sentry = { version = "0.47", default-features = false }
 serde = "1.0.219"
 serde-big-array = "0.5"
 serde_json = "1.0.140"
 serde_with = "3.12"
 serde_yml = "0.0"
 sha2 = "0.10"
+sinsemilla = "0.1"
+schemars = "1"
 spandoc = "0.2"
 static_assertions = "1.1"
-structopt = "0.3"
+anyhow = "1.0"
+strum = "0.27"
+strum_macros = "0.27"
 syn = "2.0.100"
+subtle = { version = "2.6", default-features = false }
 tempfile = "3.20"
 thiserror = "2.0"
 thread-priority = "1.2"
@@ -149,11 +160,11 @@ tokio = "1.44"
 tokio-stream = "0.1.17"
 tokio-test = "0.4"
 tokio-util = "0.7.14"
-toml = "0.9.5"
-tonic = "0.14.2"
-tonic-prost = "0.14.2"
-tonic-build = "0.14.2"
-tonic-prost-build = "0.14.2"
+toml = "1.0"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
 tonic-reflection = "0.14"
 tower = "0.4.13"
 tower-test = "0.4"
@@ -165,12 +176,18 @@ tracing-futures = "0.2.5"
 tracing-journald = "0.3"
 tracing-subscriber = "0.3.19"
 tracing-test = "0.2.4"
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry_sdk = "0.31"
+opentelemetry-otlp = "0.31"
 uint = "0.10"
+vergen-git2 = { version = "9", default-features = false }
 x25519-dalek = "2.0.1"
 zcash_note_encryption = "0.4.1"
-zcash_script = "0.4"
+zcash_script = "0.4.5"
 zip32 = { version = "0.2.1", default-features = false }
 config = { version = "0.15.14", features = ["toml"] }
+which = "8.0.0"
 
 [workspace.metadata.release]
 
@@ -247,6 +264,20 @@ codegen-units = 1
 opt-level = 3
 codegen-units = 1
 
+# The advisory
+# https://github.com/ZcashFoundation/zebra/security/advisories/GHSA-gq4h-3grw-2rhv
+# only reproduces reliably when the bundled libzcash_script C++ code is compiled
+# in release mode since it relies on a buffer to not be zeroed out (arrays in
+# C++ are usually zeroed out when allocated in debug mode). To reliably test
+# against that issue, and to also better simulate real-world usage of
+# libzcash_script, we enable optimizations for it in dev builds.
+[profile.dev.package.libzcash_script]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 16
+
 [profile.release]
 panic = "abort"
 debug = "full" # Don't change. We need debug=full for server debugging!
@@ -275,6 +306,57 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu7"))' # Used in Zebra and librustzcash
 ] }
 
+# High-risk code
+unsafe_code = "deny"
+non_ascii_idents = "deny"
+
+# Compatibility
+rust_2021_compatibility = { level = "warn", priority = -1 }
+nonstandard_style = { level = "warn", priority = -1 }
+future_incompatible = { level = "warn", priority = -1 }
+
+# Documentation
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Async code
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+
+# Pointers
+cast_ptr_alignment = "warn"
+fn_to_numeric_cast_any = "warn"
+
+# Integers
+checked_conversions = "warn"
+implicit_saturating_sub = "warn"
+invalid_upcast_comparisons = "warn"
+range_minus_one = "warn"
+range_plus_one = "warn"
+unnecessary_cast = "warn"
+
+# Incomplete code
+dbg_macro = "warn"
+todo = "warn"
+
+# Manual debugging output — use tracing::trace!() or tracing::debug!() instead
+print_stdout = "warn"
+print_stderr = "warn"
+
+# Code styles we want to accept
+try_err = "allow"
+
+# Panics
+fallible_impl_from = "warn"
+unwrap_in_result = "warn"
+
+# TODOs: fix this lint eventually
+result_large_err = "allow"
+
+# Crosslink patches. These must stay at the end of the file: they are top-level tables,
+# so anything placed after them would be parsed as part of a [patch] table rather than
+# as workspace config.
+
 # core2 has been yanked from crates.io
 #
 # Pinned by commit (rather than by the mutable `v0.3.3` tag) because `cargo`'s
@@ -287,4 +369,3 @@ rev = "7bf2611bd9a52b438300c640e142ad5c1298b05b"
 # Widen libsqlite3-sys requirement to be compatible with rusqlite 0.37
 [patch.crates-io.sqlx-sqlite]
 path = "../patches/sqlx-sqlite-0.8.6"
-

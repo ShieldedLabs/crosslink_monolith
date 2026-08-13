@@ -1,11 +1,13 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{Cursor, Write},
+    sync::Arc,
 };
 
 use chrono::{DateTime, Duration, LocalResult, TimeZone, Utc};
 
 use crate::{
+    amount::{Amount, DeferredPoolBalanceChange, NonNegative, MAX_MONEY},
     block::{
         serialize::MAX_BLOCK_BYTES, Block, BlockTimeError, Commitment::*, Hash, Header, Height,
     },
@@ -14,7 +16,8 @@ use crate::{
     serialization::{
         sha256d, SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
     },
-    transaction::LockTime,
+    transaction::{LockTime, Transaction},
+    transparent,
 };
 
 use super::generate; // TODO: this should be rewritten as strategies
@@ -60,6 +63,56 @@ fn blockheaderhash_from_blockheader() {
         .expect("these bytes to deserialize into a blockheader without issue");
 
     assert_eq!(blockheader, other_header);
+}
+
+/// Regression test for https://github.com/ZcashFoundation/zebra/issues/10585.
+///
+/// `Block::chain_value_pool_change()` previously aggregated transaction value
+/// balances with `flat_map(|tx| tx.value_balance(utxos))`. Because
+/// `Result<T, E>` implements `IntoIterator`, `Err(_)` yielded zero items and
+/// silently dropped the failing transaction from the block sum. The block
+/// helper now uses `try_fold` so transaction-level value-balance errors
+/// propagate.
+#[test]
+fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
+    let _init_guard = zebra_test::init();
+
+    let max_money: Amount<NonNegative> = MAX_MONEY.try_into().expect("MAX_MONEY is a valid amount");
+    // Two `MAX_MONEY` transparent outputs make the transaction-level output
+    // sum exceed `MAX_MONEY`, so `value_balance` returns `Err`.
+    let coinbase = Transaction::V1 {
+        inputs: vec![transparent::Input::Coinbase {
+            height: Height(1),
+            data: vec![],
+            sequence: 0xFFFF_FFFF,
+        }],
+        outputs: vec![
+            transparent::Output::new(max_money, transparent::Script::new(&[])),
+            transparent::Output::new(max_money, transparent::Script::new(&[])),
+        ],
+        lock_time: LockTime::unlocked(),
+    };
+    let utxos = HashMap::new();
+
+    assert!(
+        coinbase.value_balance(&utxos).is_err(),
+        "transaction-level value balance should reject an output sum above MAX_MONEY"
+    );
+
+    let header: Header = zebra_test::vectors::DUMMY_HEADER
+        .zcash_deserialize_into()
+        .expect("dummy header should deserialize");
+    let block = Block {
+        header: Arc::new(header),
+        transactions: vec![Arc::new(coinbase)],
+    };
+
+    assert!(
+        block
+            .chain_value_pool_change(&utxos, DeferredPoolBalanceChange::zero())
+            .is_err(),
+        "block-level aggregation should propagate transaction value-balance errors"
+    );
 }
 
 #[test]
@@ -132,6 +185,46 @@ fn blockheader_serialization() {
             .expect("there should be an inner error");
 
         assert_eq!(err_msg.to_string(), "high bit was set in version field");
+    }
+}
+
+/// Checks that [`Header::serialized_size`] matches the actual size of serialized headers
+/// on every network.
+#[test]
+fn blockheader_serialized_size() {
+    let _init_guard = zebra_test::init();
+
+    // `BLOCKS` contains Mainnet and Testnet blocks, whose headers have the same size.
+    for block in zebra_test::vectors::BLOCKS.iter() {
+        let mut header = block[..Header::serialized_size(&Network::Mainnet)]
+            .zcash_deserialize_into::<Header>()
+            .expect("blockheader test vector should deserialize");
+
+        let serialized_header = header
+            .zcash_serialize_to_vec()
+            .expect("blockheader test vector should serialize");
+
+        assert_eq!(
+            serialized_header.len(),
+            Header::serialized_size(&Network::Mainnet),
+            "serialized header size should match Header::serialized_size on Mainnet"
+        );
+
+        // Regtest headers only differ in the size of the Equihash solution.
+        header.solution = crate::work::equihash::Solution::from_bytes(
+            &[0; crate::work::equihash::REGTEST_SOLUTION_SIZE],
+        )
+        .expect("Regtest solution size should be valid");
+
+        let serialized_header = header
+            .zcash_serialize_to_vec()
+            .expect("Regtest blockheader should serialize");
+
+        assert_eq!(
+            serialized_header.len(),
+            Header::serialized_size(&Network::new_regtest(Default::default())),
+            "serialized header size should match Header::serialized_size on Regtest"
+        );
     }
 }
 

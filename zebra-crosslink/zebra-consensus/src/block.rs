@@ -8,7 +8,6 @@
 //! verification, where it may be accepted or rejected.
 
 use std::{
-    collections::HashSet,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -26,7 +25,7 @@ use zebra_chain::{
     amount::Amount,
     block,
     parameters::{subsidy::SubsidyError, Network},
-    transaction, transparent,
+    transparent,
     work::equihash,
 };
 use zebra_state as zs;
@@ -75,9 +74,9 @@ pub enum VerifyBlockError {
     #[error(transparent)]
     Time(zebra_chain::block::BlockTimeError),
 
+    /// Error when attempting to commit a block after semantic verification.
     #[error("unable to commit block after semantic verification: {0}")]
-    // TODO: make this into a concrete type, and add it to is_duplicate_request() (#2908)
-    Commit(#[source] BoxError),
+    Commit(#[from] zs::CommitBlockError),
 
     #[error("unable to validate block proposal: failed semantic verification (proof of work is not checked for proposals): {0}")]
     // TODO: make this into a concrete type (see #5732)
@@ -88,6 +87,11 @@ pub enum VerifyBlockError {
 
     #[error("invalid block subsidy: {0}")]
     Subsidy(#[from] SubsidyError),
+
+    /// Errors originating from the state service, which may arise from general failures in interacting with the state.
+    /// This is for errors that are not specifically related to block depth or commit failures.
+    #[error("state service error for block {hash}: {source}")]
+    StateService { source: BoxError, hash: block::Hash },
 }
 
 impl VerifyBlockError {
@@ -96,36 +100,72 @@ impl VerifyBlockError {
     pub fn is_duplicate_request(&self) -> bool {
         match self {
             VerifyBlockError::Block { source, .. } => source.is_duplicate_request(),
+            VerifyBlockError::Commit(commit_err) => commit_err.is_duplicate_request(),
             _ => false,
         }
     }
 
     /// Returns a suggested misbehaviour score increment for a certain error.
     pub fn misbehavior_score(&self) -> u32 {
-        // TODO: Adjust these values based on zcashd (#9258).
         use VerifyBlockError::*;
         match self {
             Block { source } => source.misbehavior_score(),
-            Equihash { .. } => 100,
+            Equihash { .. } | Subsidy(_) => 100,
+            Transaction(err) => err.mempool_misbehavior_score(),
+            Commit(err) => err.misbehavior_score(),
             _other => 0,
         }
     }
 }
 
-/// The maximum allowed number of legacy signature check operations in a block.
+/// Converts an error from a `CommitSemanticallyVerifiedBlock` state request
+/// into a [`VerifyBlockError`].
 ///
-/// This consensus rule is not documented, so Zebra follows the `zcashd` implementation.
-/// We re-use some `zcashd` C++ script code via `zebra-script` and `zcash_script`.
+/// The state boxes commit errors as [`zs::CommitSemanticallyVerifiedError`], a
+/// newtype around [`zs::CommitBlockError`], so the wrapper must be unwrapped
+/// here for `is_duplicate_request()` and `misbehavior_score()` to classify
+/// duplicate blocks as benign.
+fn map_commit_error(source: BoxError, hash: block::Hash) -> VerifyBlockError {
+    if let Some(commit_err) = source
+        .downcast_ref::<zs::CommitSemanticallyVerifiedError>()
+        .map(zs::CommitSemanticallyVerifiedError::inner)
+        .or_else(|| source.downcast_ref::<zs::CommitBlockError>())
+    {
+        return VerifyBlockError::Commit(commit_err.clone());
+    }
+
+    VerifyBlockError::StateService { source, hash }
+}
+
+/// The maximum number of transparent signature operations allowed in a block.
 ///
-/// See:
-/// <https://github.com/zcash/zcash/blob/bad7f7eadbbb3466bebe3354266c7f69f607fcfd/src/consensus/consensus.h#L30>
+/// # Consensus
+///
+/// For every block, the sum of legacy and P2SH transparent signature operations across all
+/// transactions must not exceed [20_000].
+///
+/// ## Notes
+///
+/// This rule is inherited from pre-SegWit Bitcoin, and is not explicitly stated in the Zcash
+/// protocol spec. It is covered implicitly in [§7.6], which closes with "Other rules inherited from
+/// Bitcoin". The inclusion of this rule is tracked in [`zcash/zips#568`].
+///
+/// Zebra mirrors `zcashd`'s `ConnectBlock`, which sums `GetLegacySigOpCount()` and
+/// `GetP2SHSigOpCount()` per transaction before comparing against this constant.
+///
+/// [20_000]: <https://github.com/zcash/zcash/blob/bad7f7eadbbb3466bebe3354266c7f69f607fcfd/src/consensus/consensus.h#L30>
+/// [`zcash/zips#568`]: <https://github.com/zcash/zips/issues/568>
+/// [§7.6]: <https://zips.z.cash/protocol/protocol.pdf#blockheader>
 pub const MAX_BLOCK_SIGOPS: u32 = 20_000;
 
 impl<S, V> SemanticBlockVerifier<S, V>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
-    V: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
+    V: Service<tx::BlockRequest, Response = tx::BlockResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     V::Future: Send + 'static,
 {
     /// Creates a new SemanticBlockVerifier
@@ -142,7 +182,10 @@ impl<S, V> Service<Request> for SemanticBlockVerifier<S, V>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
-    V: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
+    V: Service<tx::BlockRequest, Response = tx::BlockResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     V::Future: Send + 'static,
 {
     type Response = block::Hash;
@@ -247,9 +290,6 @@ where
                 &transaction_hashes,
             ));
 
-            let known_outpoint_hashes: Arc<HashSet<transaction::Hash>> =
-                Arc::new(known_utxos.keys().map(|outpoint| outpoint.hash).collect());
-
             for (&transaction_hash, transaction) in
                 transaction_hashes.iter().zip(block.transactions.iter())
             {
@@ -257,10 +297,9 @@ where
                     .ready()
                     .await
                     .expect("transaction verifier is always ready")
-                    .call(tx::Request::Block {
+                    .call(tx::BlockRequest {
                         transaction_hash,
                         transaction: transaction.clone(),
-                        known_outpoint_hashes: known_outpoint_hashes.clone(),
                         known_utxos: known_utxos.clone(),
                         height,
                         time: block.header.time,
@@ -282,16 +321,11 @@ where
                     .map_err(Into::into)
                     .map_err(VerifyBlockError::Transaction)?;
 
-                assert!(
-                    matches!(response, tx::Response::Block { .. }),
-                    "unexpected response from transaction verifier: {response:?}"
-                );
-
-                sigops += response.sigops();
+                sigops += response.sigops;
 
                 // Coinbase transactions consume the miner fee,
                 // so they don't add any value to the block's total miner fee.
-                if let Some(miner_fee) = response.miner_fee() {
+                if let Some(miner_fee) = response.miner_fee {
                     block_miner_fees += miner_fee;
                 }
             }
@@ -332,7 +366,6 @@ where
                 height,
                 new_outputs,
                 transaction_hashes,
-                deferred_pool_balance_change: Some(deferred_pool_balance_change),
             };
 
             // Return early for proposal requests.
@@ -353,15 +386,17 @@ where
             match state_service
                 .ready()
                 .await
-                .map_err(VerifyBlockError::Commit)?
+                .map_err(|source| VerifyBlockError::StateService { source, hash })?
                 .call(zs::Request::CommitSemanticallyVerifiedBlock(prepared_block))
                 .await
-                .map_err(VerifyBlockError::Commit)?
             {
-                zs::Response::Committed(committed_hash) => {
+                Ok(zs::Response::Committed(committed_hash)) => {
                     assert_eq!(committed_hash, hash, "state must commit correct hash");
                     Ok(hash)
                 }
+
+                Err(source) => Err(map_commit_error(source, hash)),
+
                 _ => unreachable!("wrong response for CommitSemanticallyVerifiedBlock"),
             }
         }

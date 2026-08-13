@@ -1,5 +1,3 @@
-use ripemd::Ripemd160;
-use sha2::{Digest, Sha256};
 use zcash_script::script::Evaluable;
 
 use crate::address::TransparentAddress;
@@ -16,10 +14,10 @@ impl super::Input {
                 }
             }
             Some(TransparentAddress::ScriptHash(hash)) => {
-                if let Some(redeem_script) = self.redeem_script() {
-                    if hash[..] != Ripemd160::digest(Sha256::digest(redeem_script.to_bytes()))[..] {
-                        return Err(VerifyError::WrongRedeemScript);
-                    }
+                if let Some(redeem_script) = self.redeem_script()
+                    && hash[..] != crate::util::hash160::hash(&redeem_script.to_bytes())[..]
+                {
+                    return Err(VerifyError::WrongRedeemScript);
                 }
             }
             None => return Err(VerifyError::UnsupportedScriptPubkey),
@@ -41,10 +39,10 @@ impl super::Output {
                 }
             }
             Some(TransparentAddress::ScriptHash(hash)) => {
-                if let Some(redeem_script) = self.redeem_script() {
-                    if hash[..] != Ripemd160::digest(Sha256::digest(redeem_script.to_bytes()))[..] {
-                        return Err(VerifyError::WrongRedeemScript);
-                    }
+                if let Some(redeem_script) = self.redeem_script()
+                    && hash[..] != crate::util::hash160::hash(&redeem_script.to_bytes())[..]
+                {
+                    return Err(VerifyError::WrongRedeemScript);
                 }
             }
             None => return Err(VerifyError::UnsupportedScriptPubkey),

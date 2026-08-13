@@ -1,6 +1,9 @@
 //! State [`tower::Service`] response types.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use chrono::{DateTime, Utc};
 
@@ -8,9 +11,7 @@ use zebra_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, ChainHistoryMmrRootHash},
     block_info::BlockInfo,
-    orchard,
-    parameters::Network,
-    sapling,
+    orchard, sapling,
     serialization::DateTime32,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     transaction::{self, Transaction},
@@ -26,15 +27,18 @@ use zebra_chain::work::difficulty::CompactDifficulty;
 use crate::{ReadRequest, Request};
 
 use crate::{
-    service::read::AddressUtxos,
-    NonFinalizedState, TransactionLocation, WatchReceiver,
+    service::read::AddressUtxos, ContextuallyVerifiedBlock, NonFinalizedState, TransactionLocation,
+    WatchReceiver, MAX_BLOCK_REORG_HEIGHT,
 };
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
 pub enum Response {
-    /// Response to [`Request::CommitSemanticallyVerifiedBlock`] indicating that a block was
-    /// successfully committed to the state.
+    /// Response to [`Request::CommitSemanticallyVerifiedBlock`] and [`Request::CommitCheckpointVerifiedBlock`]
+    /// indicating that a block was successfully committed to the state.
     Committed(block::Hash),
 
     /// Response to [`Request::Depth`] with the depth of the specified block.
@@ -55,6 +59,9 @@ pub enum Response {
 
     /// Response to [`Request::Transaction`] with the specified transaction.
     Transaction(Option<MinedTx>),
+
+    /// Response to [`Request::AnyChainTransaction`] with the specified transaction.
+    AnyChainTransaction(Option<AnyTx>),
 
     /// Response to [`Request::UnspentBestChainUtxo`] with the UTXO
     UnspentBestChainUtxo(Option<transparent::Utxo>),
@@ -111,15 +118,61 @@ pub enum Response {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// An enum of block stores in the state where a block hash could be found.
+///
+/// Crosslink keeps `KnownBlock` as a struct (location + height), so upstream's variants live
+/// here instead. `WriteChannel` is new from upstream; `Finalized` joins the Crosslink set so
+/// every upstream location is representable.
 pub enum KnownBlockLocation {
+    /// Block is in the finalized portion of the best chain.
+    Finalized,
+
     /// Block is in the best chain.
     BestChain,
 
     /// Block is in a side chain.
     SideChain,
 
+    /// Block is in a block write channel
+    WriteChannel,
+
     /// Block is queued to be validated and committed, or rejected and dropped.
     Queue,
+}
+
+impl std::fmt::Display for KnownBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at height {:?}", self.location, self.height)
+    }
+}
+
+impl std::fmt::Display for KnownBlockLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KnownBlockLocation::Finalized => write!(f, "finalized state"),
+            KnownBlockLocation::BestChain => write!(f, "best chain"),
+            KnownBlockLocation::SideChain => write!(f, "side chain"),
+            KnownBlockLocation::WriteChannel => write!(f, "block write channel"),
+            KnownBlockLocation::Queue => write!(f, "validation/commit queue"),
+        }
+    }
+}
+
+/// Information about a transaction in any chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnyTx {
+    /// A transaction in the best chain.
+    Mined(MinedTx),
+    /// A transaction in a side chain, and the hash of the block it is in.
+    Side((Arc<Transaction>, block::Hash)),
+}
+
+impl From<AnyTx> for Arc<Transaction> {
+    fn from(any_tx: AnyTx) -> Self {
+        match any_tx {
+            AnyTx::Mined(mined_tx) => mined_tx.tx,
+            AnyTx::Side((tx, _)) => tx,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,6 +200,16 @@ pub struct MinedTx {
 
     /// The time of the block where the transaction was mined.
     pub block_time: DateTime<Utc>,
+
+    /// The best-chain tip hash captured in the same state snapshot used to
+    /// compute `confirmations`.
+    ///
+    /// Callers that combine this response with other state queries should
+    /// pin those follow-up queries to this hash (or to the resolved block
+    /// hash for the transaction) rather than issuing a separate `Tip` /
+    /// `BestChainBlockHash` request, which would re-sample the chain and
+    /// can race with reorgs or new blocks. See issue #10550.
+    pub best_chain_tip_hash: block::Hash,
 }
 
 impl MinedTx {
@@ -156,12 +219,14 @@ impl MinedTx {
         height: block::Height,
         confirmations: u32,
         block_time: DateTime<Utc>,
+        best_chain_tip_hash: block::Hash,
     ) -> Self {
         Self {
             tx,
             height,
             confirmations,
             block_time,
+            best_chain_tip_hash,
         }
     }
 }
@@ -173,9 +238,11 @@ impl MinedTx {
 /// This should be large enough to typically avoid blocking the sender when the non-finalized state is full so
 /// that the [`NonFinalizedBlocksListener`] reliably receives updates whenever the non-finalized state changes.
 ///
-/// It's okay to occasionally miss updates when the buffer is full, as the new blocks in the missed change will be
-/// sent to the listener on the next change to the non-finalized state.
-const NON_FINALIZED_STATE_CHANGE_BUFFER_SIZE: usize = 1_000;
+/// If the buffer does fill, sends apply backpressure (the sender awaits a free slot) rather than
+/// dropping blocks, so the listener still receives every block once the consumer catches up.
+// `MAX_BLOCK_REORG_HEIGHT` is a small `u32` constant (the reorg limit), so widening it to `usize`
+// and doubling it cannot overflow on any supported platform.
+const NON_FINALIZED_STATE_CHANGE_BUFFER_SIZE: usize = 2 * MAX_BLOCK_REORG_HEIGHT as usize;
 
 /// A listener for changes in the non-finalized state.
 #[derive(Clone, Debug)]
@@ -184,58 +251,97 @@ pub struct NonFinalizedBlocksListener(
 );
 
 impl NonFinalizedBlocksListener {
+    /// Sends the blocks in `non_finalized_state` that satisfy `take_cond` to `sender`, in
+    /// ascending height order.
+    ///
+    /// Walks each chain from its tip downwards, taking blocks while `take_cond` holds and stopping
+    /// at the first block that fails it, so it sends the blocks a listener hasn't been sent yet by
+    /// stopping at the first block it already has.
+    ///
+    /// Returns an error if the receiver has been dropped.
+    async fn take_and_send_blocks<'a>(
+        sender: &tokio::sync::mpsc::Sender<(block::Hash, Arc<Block>)>,
+        non_finalized_state: &'a NonFinalizedState,
+        take_cond: impl Fn(&&ContextuallyVerifiedBlock) -> bool + Copy + 'a,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<(block::Hash, Arc<Block>)>> {
+        let new_blocks = non_finalized_state
+            .chain_iter()
+            .flat_map(move |chain| {
+                // Take blocks from the chain in reverse height order until we reach a block the
+                // listener already has, then restore ascending height order.
+                let mut blocks: Vec<_> =
+                    chain.blocks.values().rev().take_while(take_cond).collect();
+                blocks.reverse();
+                blocks
+            })
+            .map(|cv_block| (cv_block.hash, cv_block.block.clone()));
+
+        for new_block_with_hash in new_blocks {
+            sender.send(new_block_with_hash).await?;
+        }
+
+        Ok(())
+    }
+
     /// Spawns a task to listen for changes in the non-finalized state and sends any blocks in the non-finalized state
     /// to the caller that have not already been sent.
     ///
+    /// `known_chain_tips` holds the hashes of chain tips the caller already has. On the first send
+    /// only, each non-finalized chain is walked from its tip downwards and blocks are sent until a
+    /// hash in this set is reached, so any block at or below a known tip on the same chain is
+    /// skipped. If it is empty, every block currently in the non-finalized state is sent. After the
+    /// first send, those blocks are already tracked as sent, so later sends only forward blocks that
+    /// weren't in the previously seen non-finalized state.
+    ///
     /// Returns a new instance of [`NonFinalizedBlocksListener`] for the caller to listen for new blocks in the non-finalized state.
     pub fn spawn(
-        network: Network,
         mut non_finalized_state_receiver: WatchReceiver<NonFinalizedState>,
+        known_chain_tips: HashSet<block::Hash>,
     ) -> Self {
         let (sender, receiver) = tokio::sync::mpsc::channel(NON_FINALIZED_STATE_CHANGE_BUFFER_SIZE);
 
         tokio::spawn(async move {
-            // Start with an empty non-finalized state with the expectation that the caller doesn't yet have
-            // any blocks from the non-finalized state.
-            let mut prev_non_finalized_state = NonFinalizedState::new(&network, Default::default());
+            // `prev_non_finalized_state` starts as the current non-finalized state. The first send
+            // below skips blocks at or below the caller's known chain tips; afterwards those blocks
+            // are already in `prev_non_finalized_state`, so later sends only need to check it.
+            let mut prev_non_finalized_state = non_finalized_state_receiver.cloned_watch_data();
 
+            // Send the blocks the caller is missing relative to its known chain tips. This checks
+            // `known_chain_tips` once; from here on those blocks are covered by the state check.
+            if Self::take_and_send_blocks(&sender, &prev_non_finalized_state, |b| {
+                !known_chain_tips.contains(&b.hash)
+            })
+            .await
+            .is_err()
+            {
+                tracing::debug!("non-finalized blocks receiver closed, ending task");
+                return;
+            }
+
+            // # Correctness
+            //
+            // This loop should check that the non-finalized state receiver has changed sooner
+            // than the non-finalized state could possibly have changed to avoid missing updates, so
+            // the logic here should be quicker than the contextual verification logic that precedes
+            // commits to the non-finalized state.
+            //
+            // See the `NON_FINALIZED_STATE_CHANGE_BUFFER_SIZE` documentation for more details.
             loop {
-                // # Correctness
-                //
-                // This loop should check that the non-finalized state receiver has changed sooner
-                // than the non-finalized state could possibly have changed to avoid missing updates, so
-                // the logic here should be quicker than the contextual verification logic that precedes
-                // commits to the non-finalized state.
-                //
-                // See the `NON_FINALIZED_STATE_CHANGE_BUFFER_SIZE` documentation for more details.
-                let latest_non_finalized_state = non_finalized_state_receiver.cloned_watch_data();
+                let non_finalized_state = non_finalized_state_receiver.cloned_watch_data();
 
-                let new_blocks = latest_non_finalized_state
-                    .chain_iter()
-                    .flat_map(|chain| {
-                        // Take blocks from the chain in reverse height order until we reach a block that was
-                        // present in the last seen copy of the non-finalized state.
-                        let mut new_blocks: Vec<_> = chain
-                            .blocks
-                            .values()
-                            .rev()
-                            .take_while(|cv_block| {
-                                !prev_non_finalized_state.any_chain_contains(&cv_block.hash)
-                            })
-                            .collect();
-                        new_blocks.reverse();
-                        new_blocks
-                    })
-                    .map(|cv_block| (cv_block.hash, cv_block.block.clone()));
-
-                for new_block_with_hash in new_blocks {
-                    if sender.send(new_block_with_hash).await.is_err() {
-                        tracing::debug!("non-finalized state change receiver closed, ending task");
-                        return;
-                    }
+                // Send blocks that weren't in the last seen copy of the non-finalized state. The
+                // caller's known tips are already covered by `prev_non_finalized_state`.
+                if Self::take_and_send_blocks(&sender, &non_finalized_state, |b| {
+                    !prev_non_finalized_state.any_chain_contains(&b.hash)
+                })
+                .await
+                .is_err()
+                {
+                    tracing::debug!("non-finalized blocks receiver closed, ending task");
+                    return;
                 }
 
-                prev_non_finalized_state = latest_non_finalized_state;
+                prev_non_finalized_state = non_finalized_state;
                 
                 /*  Note(Sam): THIS IS A HUGE BUG WAITING TO HAPPEN. Since tokio scheduling is cooperative
                     multitasking, it offers no fairness guarantees. It is under the assumption that we are
@@ -244,9 +350,12 @@ impl NonFinalizedBlocksListener {
                     under load. This lack of correctness makes it unusable for our sync work.
                 */
 
-                // Wait for the next update to the non-finalized state
+                // Wait for the next update to the non-finalized state.
                 if let Err(error) = non_finalized_state_receiver.changed().await {
-                    warn!(?error, "non-finalized state receiver closed, ending task");
+                    warn!(
+                        ?error,
+                        "non-finalized state receiver closed, is Zebra shutting down?"
+                    );
                     break;
                 }
             }
@@ -330,10 +439,18 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::Transaction`] with the specified transaction.
     Transaction(Option<MinedTx>),
 
+    /// Response to [`Request::Transaction`] with the specified transaction.
+    AnyChainTransaction(Option<AnyTx>),
+
     /// Response to [`ReadRequest::TransactionIdsForBlock`],
     /// with an list of transaction hashes in block order,
     /// or `None` if the block was not found.
     TransactionIdsForBlock(Option<Arc<[transaction::Hash]>>),
+
+    /// Response to [`ReadRequest::AnyChainTransactionIdsForBlock`], with an list of
+    /// transaction hashes in block order and a flag indicating if the block is
+    /// in the best chain, or `None` if the block was not found.
+    AnyChainTransactionIdsForBlock(Option<(Arc<[transaction::Hash]>, bool)>),
 
     /// Response to [`ReadRequest::SpendingTransactionId`],
     /// with an list of transaction hashes in block order,
@@ -349,6 +466,11 @@ pub enum ReadResponse {
 
     /// The response to a `FindBlockHeaders` request.
     BlockHeaders(Vec<block::CountedHeader>),
+
+    /// The response to a `FindForkPoint` request.
+    /// Returns the height and hash of the fork point, or `None` if no locator entry is
+    /// on the best chain.
+    ForkPoint(Option<(block::Height, block::Hash)>),
 
     /// The response to a `UnspentBestChainUtxo` request, from verified blocks in the
     /// _best_ non-finalized chain, or the finalized chain.
@@ -367,15 +489,24 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::OrchardTree`] with the specified Orchard note commitment tree.
     OrchardTree(Option<Arc<orchard::tree::NoteCommitmentTree>>),
 
+    /// Response to [`ReadRequest::IronwoodTree`] with the specified Ironwood note commitment tree.
+    IronwoodTree(Option<Arc<orchard::tree::NoteCommitmentTree>>),
+
     /// Response to [`ReadRequest::SaplingSubtrees`] with the specified Sapling note commitment
     /// subtrees.
     SaplingSubtrees(
-        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling::tree::Node>>,
+        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>>,
     ),
 
     /// Response to [`ReadRequest::OrchardSubtrees`] with the specified Orchard note commitment
     /// subtrees.
     OrchardSubtrees(
+        BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
+    ),
+
+    /// Response to [`ReadRequest::IronwoodSubtrees`] with the specified Ironwood note commitment
+    /// subtrees. Ironwood reuses the Orchard note type.
+    IronwoodSubtrees(
         BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>>,
     ),
 
@@ -423,6 +554,8 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::NonFinalizedBlocksListener`]
     NonFinalizedBlocksListener(NonFinalizedBlocksListener),
 
+    /// Response to [`ReadRequest::IsTransparentOutputSpent`]
+    IsTransparentOutputSpent(bool),
     /// Response to [`ReadRequest::BondInfo`] with bond value and status.
     ///
     /// Returns `None` if the bond does not exist.
@@ -527,6 +660,7 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::Transaction(tx_info) => {
                 Ok(Response::Transaction(tx_info))
             }
+            ReadResponse::AnyChainTransaction(tx) => Ok(Response::AnyChainTransaction(tx)),
             ReadResponse::UnspentBestChainUtxo(utxo) => Ok(Response::UnspentBestChainUtxo(utxo)),
 
 
@@ -545,15 +679,20 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::BlockInfo(_)
             | ReadResponse::TransactionIdsForBlock(_)
+            | ReadResponse::AnyChainTransactionIdsForBlock(_)
             | ReadResponse::SaplingTree(_)
             | ReadResponse::OrchardTree(_)
+            | ReadResponse::IronwoodTree(_)
             | ReadResponse::SaplingSubtrees(_)
             | ReadResponse::OrchardSubtrees(_)
+            | ReadResponse::IronwoodSubtrees(_)
             | ReadResponse::AddressBalance { .. }
             | ReadResponse::AddressesTransactionIds(_)
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)
-            | ReadResponse::NonFinalizedBlocksListener(_) => {
+            | ReadResponse::NonFinalizedBlocksListener(_)
+            | ReadResponse::IsTransparentOutputSpent(_)
+            | ReadResponse::ForkPoint(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
 

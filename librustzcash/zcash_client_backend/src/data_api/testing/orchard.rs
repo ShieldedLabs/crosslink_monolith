@@ -5,7 +5,7 @@ use ::orchard::{
     note_encryption::OrchardDomain,
     tree::MerkleHashOrchard,
 };
-use incrementalmerkletree::{Hashable, Level};
+use incrementalmerkletree::{Address as TreeAddress, Hashable, Level, Position};
 use shardtree::error::ShardTreeError;
 
 use zcash_keys::{
@@ -15,7 +15,7 @@ use zcash_keys::{
 use zcash_note_encryption::try_output_recovery_with_ovk;
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{
-    ShieldedProtocol,
+    ShieldedPool,
     consensus::{self, BlockHeight},
     memo::MemoBytes,
     value::Zatoshis,
@@ -27,7 +27,10 @@ use crate::{
         WalletTest,
         chain::{CommitmentTreeRoot, ScanSummary},
         testing::{TestState, pool::ShieldedPoolTester},
-        wallet::{ConfirmationsPolicy, TargetHeight},
+        wallet::{
+            ConfirmationsPolicy, TargetHeight,
+            input_selection::{LockFilter, LockedInputPolicy},
+        },
     },
     wallet::{Note, ReceivedNote},
 };
@@ -35,7 +38,7 @@ use crate::{
 /// Type for running pool-agnostic tests on the Orchard pool.
 pub struct OrchardPoolTester;
 impl ShieldedPoolTester for OrchardPoolTester {
-    const SHIELDED_PROTOCOL: ShieldedProtocol = ShieldedProtocol::Orchard;
+    const SHIELDED_PROTOCOL: ShieldedPool = ShieldedPool::Orchard;
     // const MERKLE_TREE_DEPTH: u8 = {orchard::NOTE_COMMITMENT_TREE_DEPTH as u8};
 
     type Sk = SpendingKey;
@@ -102,6 +105,17 @@ impl ShieldedPoolTester for OrchardPoolTester {
             .put_orchard_subtree_roots(start_index, roots)
     }
 
+    fn shard_root<Cache, DbT: WalletTest + WalletCommitmentTrees, P>(
+        st: &mut TestState<Cache, DbT, P>,
+        shard_index: u64,
+    ) -> Result<Self::MerkleTreeHash, ShardTreeError<<DbT as WalletCommitmentTrees>::Error>> {
+        let shard_height = crate::data_api::ORCHARD_SHARD_HEIGHT;
+        let addr = TreeAddress::from_parts(Level::from(shard_height), shard_index);
+        let end_position = Position::from((shard_index + 1) << shard_height);
+        st.wallet_mut()
+            .with_orchard_tree_mut(|tree| tree.root(addr, end_position))
+    }
+
     fn next_subtree_index<A: Hash + Eq>(s: &WalletSummary<A>) -> u64 {
         s.next_orchard_subtree_index()
     }
@@ -122,10 +136,11 @@ impl ShieldedPoolTester for OrchardPoolTester {
             .select_spendable_notes(
                 account,
                 target_value,
-                &[ShieldedProtocol::Orchard],
+                &[ShieldedPool::Orchard],
                 target_height,
                 confirmations_policy,
                 exclude,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map(|n| n.take_orchard())
     }
@@ -139,19 +154,20 @@ impl ShieldedPoolTester for OrchardPoolTester {
         st.wallet()
             .select_unspent_notes(
                 account,
-                &[ShieldedProtocol::Orchard],
+                &[ShieldedPool::Orchard],
                 target_height,
                 exclude,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map(|n| n.take_orchard())
     }
 
-    fn decrypted_pool_outputs_count<A>(d_tx: &DecryptedTransaction<'_, A>) -> usize {
+    fn decrypted_pool_outputs_count<A>(d_tx: &DecryptedTransaction<Transaction, A>) -> usize {
         d_tx.orchard_outputs().len()
     }
 
     fn with_decrypted_pool_memos<A>(
-        d_tx: &DecryptedTransaction<'_, A>,
+        d_tx: &DecryptedTransaction<Transaction, A>,
         mut f: impl FnMut(&MemoBytes),
     ) {
         for output in d_tx.orchard_outputs() {
@@ -178,7 +194,10 @@ impl ShieldedPoolTester for OrchardPoolTester {
             if result.is_some() {
                 return result.map(|(note, addr, memo)| {
                     (
-                        Note::Orchard(note),
+                        Note::Orchard {
+                            note,
+                            pool: orchard::ValuePool::Orchard,
+                        },
                         UnifiedAddress::from_receivers(Some(addr), None, None)
                             .unwrap()
                             .into(),

@@ -1,29 +1,35 @@
 //! A tonic RPC server for Zebra's indexer API.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use tokio::task::JoinHandle;
 use tonic::transport::{server::TcpIncoming, Server};
 use tower::BoxError;
 use zebra_chain::chain_tip::ChainTip;
 use zebra_node_services::mempool::MempoolTxSubscriber;
+use zebra_state::ReadState;
 
 use crate::{indexer::indexer_server::IndexerServer, server::OPENED_RPC_ENDPOINT_MSG};
+
+/// Maximum concurrent HTTP/2 streams per connection.
+///
+/// The primary clients (Zaino and Zallet) each open 1-2 streams via
+/// `init_read_state_with_syncer`. 20 provides generous headroom while
+/// bounding resource usage from untrusted clients.
+const MAX_CONCURRENT_STREAMS: u32 = 20;
+
+/// Interval between HTTP/2 keepalive pings sent to detect dead connections.
+const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Timeout for HTTP/2 keepalive pings before the connection is closed.
+const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type ServerTask = JoinHandle<Result<(), BoxError>>;
 
 /// Indexer RPC service.
 pub struct IndexerRPC<ReadStateService, Tip>
 where
-    ReadStateService: tower::Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <ReadStateService as tower::Service<zebra_state::ReadRequest>>::Future: Send,
+    ReadStateService: ReadState,
     Tip: ChainTip + Clone + Send + Sync + 'static,
 {
     pub(super) read_state: ReadStateService,
@@ -40,15 +46,7 @@ pub async fn init<ReadStateService, Tip>(
     mempool_change: MempoolTxSubscriber,
 ) -> Result<(ServerTask, SocketAddr), BoxError>
 where
-    ReadStateService: tower::Service<
-            zebra_state::ReadRequest,
-            Response = zebra_state::ReadResponse,
-            Error = BoxError,
-        > + Clone
-        + Send
-        + Sync
-        + 'static,
-    <ReadStateService as tower::Service<zebra_state::ReadRequest>>::Future: Send,
+    ReadStateService: ReadState,
     Tip: ChainTip + Clone + Send + Sync + 'static,
 {
     let indexer_service = IndexerRPC {
@@ -71,6 +69,9 @@ where
 
     let server_task: JoinHandle<Result<(), BoxError>> = tokio::spawn(async move {
         Server::builder()
+            .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
+            .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
+            .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
             .add_service(reflection_service)
             .add_service(IndexerServer::new(indexer_service))
             .serve_with_incoming(TcpIncoming::from(tcp_listener))

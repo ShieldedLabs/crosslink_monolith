@@ -36,13 +36,21 @@ pub const V5_TX_VERSION: u32 = 5;
 /// The version group ID for Zcash v5 transactions.
 pub const V5_VERSION_GROUP_ID: u32 = 0x26A7270A;
 
-/// Transaction version 6, specified in [ZIP 230](https://zips.z.cash/zip-0230).
-#[cfg(zcash_unstable = "nu7")]
+/// Transaction version 6, specified in [ZIP 229](https://zips.z.cash/zip-0229).
 pub const V6_TX_VERSION: u32 = 6;
 /// The version group ID for Zcash v6 transactions.
-#[cfg(zcash_unstable = "nu7")]
-pub const V6_VERSION_GROUP_ID: u32 = 0xFFFFFFFF;
+pub const V6_VERSION_GROUP_ID: u32 = 0xD884B698;
 
+/// The maximum size in bytes of a Zcash block, and therefore the maximum size of any single
+/// transaction within one.
+///
+/// It is specified as `MAX_BLOCK_SIZE` in
+/// [§ 7.6 Block Header Encoding and Consensus](https://zips.z.cash/protocol/protocol.pdf#blockheader).
+///
+/// This constant is called `MAX_BLOCK_SIZE` in the zcashd source.
+pub const MAX_BLOCK_BYTES: usize = 2_000_000;
+
+/// Crosslink transaction version and version group ID.
 pub const VCROSSLINK_TX_VERSION: u32 = 7;
 pub const VCROSSLINK_VERSION_GROUP_ID: u32 = 0xFFFF_FFFE;
 

@@ -3,6 +3,7 @@
 use core::cmp::{Ord, Ordering};
 use core::convert::TryFrom;
 use core::fmt;
+use core::num::TryFromIntError;
 use core::ops::{Add, Bound, RangeBounds, Sub};
 
 #[cfg(feature = "std")]
@@ -12,8 +13,8 @@ use crate::constants::{mainnet, regtest, testnet};
 
 /// A wrapper type representing blockchain heights.
 ///
-/// Safe conversion from various integer types, as well as addition and subtraction, are
-/// provided.
+/// Safe conversion from various integer types, as well as addition and subtraction, are provided.
+/// Subtraction of block heights, and of deltas to block heights, are always saturating.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlockHeight(pub u32);
@@ -23,6 +24,12 @@ memuse::impl_no_dynamic_usage!(BlockHeight);
 
 /// The height of the genesis block on a network.
 pub const H0: BlockHeight = BlockHeight(0);
+
+/// The target time between blocks, in seconds (the post-Blossom target spacing).
+pub const SECONDS_PER_BLOCK: u32 = 75;
+
+/// The approximate number of blocks produced per hour at [`SECONDS_PER_BLOCK`].
+pub const BLOCKS_PER_HOUR: u32 = 3600 / SECONDS_PER_BLOCK;
 
 impl BlockHeight {
     pub const fn from_u32(v: u32) -> BlockHeight {
@@ -76,7 +83,7 @@ impl TryFrom<u64> for BlockHeight {
 
 impl From<BlockHeight> for u64 {
     fn from(value: BlockHeight) -> u64 {
-        value.0 as u64
+        u64::from(value.0)
     }
 }
 
@@ -98,7 +105,7 @@ impl TryFrom<i64> for BlockHeight {
 
 impl From<BlockHeight> for i64 {
     fn from(value: BlockHeight) -> i64 {
-        value.0 as i64
+        i64::from(value.0)
     }
 }
 
@@ -125,6 +132,64 @@ impl Sub<BlockHeight> for BlockHeight {
         self.0.saturating_sub(other.0)
     }
 }
+
+/// A wrapper type the index of a transaction within a block.
+///
+/// Safe conversion from various integer types are provided.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TxIndex(u16);
+
+impl From<TxIndex> for u16 {
+    fn from(value: TxIndex) -> Self {
+        value.0
+    }
+}
+
+impl From<TxIndex> for u32 {
+    fn from(value: TxIndex) -> Self {
+        value.0.into()
+    }
+}
+
+impl From<TxIndex> for u64 {
+    fn from(value: TxIndex) -> Self {
+        value.0.into()
+    }
+}
+
+impl From<u16> for TxIndex {
+    fn from(value: u16) -> Self {
+        TxIndex(value)
+    }
+}
+
+impl TryFrom<u32> for TxIndex {
+    type Error = TryFromIntError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Ok(TxIndex(u16::try_from(value)?))
+    }
+}
+
+impl TryFrom<u64> for TxIndex {
+    type Error = TryFromIntError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Ok(TxIndex(u16::try_from(value)?))
+    }
+}
+
+impl TryFrom<usize> for TxIndex {
+    type Error = TryFromIntError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        Ok(TxIndex(u16::try_from(value)?))
+    }
+}
+
+#[cfg(feature = "std")]
+memuse::impl_no_dynamic_usage!(TxIndex);
 
 /// The enumeration of known Zcash network types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -433,10 +498,10 @@ impl Parameters for MainNetwork {
             NetworkUpgrade::Nu5 => Some(BlockHeight(1_687_104)),
             NetworkUpgrade::Nu6 => Some(BlockHeight(2_726_400)),
             NetworkUpgrade::Nu6_1 => Some(BlockHeight(3_146_400)),
+            NetworkUpgrade::Nu6_2 => Some(BlockHeight(3_364_600)),
+            NetworkUpgrade::Nu6_3 => Some(BlockHeight(3_428_143)),
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => None,
-            #[cfg(zcash_unstable = "zfuture")]
-            NetworkUpgrade::ZFuture => None,
         }
     }
 }
@@ -476,11 +541,19 @@ impl Parameters for TestNetwork {
             NetworkUpgrade::Nu5 => Some(BlockHeight(1)),
             NetworkUpgrade::Nu6 => Some(BlockHeight(1)),
             NetworkUpgrade::Nu6_1 => Some(BlockHeight(3_536_500)),
-
+            NetworkUpgrade::Nu6_2 => Some(BlockHeight(4_052_000)),
+            // Crosslink testnets activate NU6.3 immediately (height 2, just above the NU6 block
+            // at height 1), because the Ironwood-shaped `VCrosslink` transaction only exists from
+            // NU6.3 onward. The wallet builds transactions against these hardcoded parameters
+            // rather than the node's configured activation heights, so leaving this at the mainnet
+            // height made every wallet transaction carry the NU6 branch id and be rejected with
+            // "transaction uses an incorrect consensus branch id".
+            //
+            // @todo(crosslink): derive these from the node's configured network parameters instead
+            // of hardcoding them here; this mirrors the existing NU6-at-height-1 hack above.
+            NetworkUpgrade::Nu6_3 => Some(BlockHeight(2)),
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => None,
-            #[cfg(zcash_unstable = "zfuture")]
-            NetworkUpgrade::ZFuture => None,
         }
     }
 }
@@ -551,18 +624,17 @@ pub enum NetworkUpgrade {
     ///
     /// [Nu6.1]: https://z.cash/upgrade/nu6.1/
     Nu6_1,
+    /// The [Nu6.2] network upgrade.
+    ///
+    /// [Nu6.2]: https://z.cash/upgrade/nu6.2/
+    Nu6_2,
+    /// The Ironwood / NU6.3 network upgrade.
+    Nu6_3,
     /// The [Nu7 (proposed)] network upgrade.
     ///
     /// [Nu7 (proposed)]: https://z.cash/upgrade/nu7/
     #[cfg(zcash_unstable = "nu7")]
     Nu7,
-    /// The ZFUTURE network upgrade.
-    ///
-    /// This upgrade is expected never to activate on mainnet;
-    /// it is intended for use in integration testing of functionality
-    /// that is a candidate for integration in a future network upgrade.
-    #[cfg(zcash_unstable = "zfuture")]
-    ZFuture,
 }
 
 #[cfg(feature = "std")]
@@ -579,16 +651,19 @@ impl fmt::Display for NetworkUpgrade {
             NetworkUpgrade::Nu5 => write!(f, "Nu5"),
             NetworkUpgrade::Nu6 => write!(f, "Nu6"),
             NetworkUpgrade::Nu6_1 => write!(f, "Nu6.1"),
+            NetworkUpgrade::Nu6_2 => write!(f, "Nu6.2"),
+            NetworkUpgrade::Nu6_3 => write!(f, "Nu6.3"),
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => write!(f, "Nu7"),
-            #[cfg(zcash_unstable = "zfuture")]
-            NetworkUpgrade::ZFuture => write!(f, "ZFUTURE"),
         }
     }
 }
 
 impl NetworkUpgrade {
-    fn branch_id(self) -> BranchId {
+    /// Returns the consensus branch ID activated by this network upgrade.
+    ///
+    /// This is the inverse of [`BranchId::network_upgrade`].
+    pub fn branch_id(self) -> BranchId {
         match self {
             NetworkUpgrade::Overwinter => BranchId::Overwinter,
             NetworkUpgrade::Sapling => BranchId::Sapling,
@@ -598,10 +673,10 @@ impl NetworkUpgrade {
             NetworkUpgrade::Nu5 => BranchId::Nu5,
             NetworkUpgrade::Nu6 => BranchId::Nu6,
             NetworkUpgrade::Nu6_1 => BranchId::Nu6_1,
+            NetworkUpgrade::Nu6_2 => BranchId::Nu6_2,
+            NetworkUpgrade::Nu6_3 => BranchId::Nu6_3,
             #[cfg(zcash_unstable = "nu7")]
             NetworkUpgrade::Nu7 => BranchId::Nu7,
-            #[cfg(zcash_unstable = "zfuture")]
-            NetworkUpgrade::ZFuture => BranchId::ZFuture,
         }
     }
 }
@@ -619,6 +694,8 @@ const UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
     NetworkUpgrade::Nu5,
     NetworkUpgrade::Nu6,
     NetworkUpgrade::Nu6_1,
+    NetworkUpgrade::Nu6_2,
+    NetworkUpgrade::Nu6_3,
     #[cfg(zcash_unstable = "nu7")]
     NetworkUpgrade::Nu7,
 ];
@@ -637,6 +714,14 @@ pub const ZIP212_GRACE_PERIOD: u32 = 32256;
 /// their state back across any reorg the node will accept, derive their rewind depth
 /// from the same value the node enforces.
 pub const MAX_BLOCK_REORG_HEIGHT: u32 = 100 - 1;
+/// The number of blocks after which a coinbase output is considered mature and spendable.
+///
+/// From [§ 7.1.2 of the Zcash Protocol Specification][txnconsensus]:
+/// > A transaction MUST NOT spend a transparent output of a coinbase transaction from a
+/// > block less than 100 blocks prior to the spend.
+///
+/// [txnconsensus]: https://zips.z.cash/protocol/protocol.pdf#txnconsensus
+pub const COINBASE_MATURITY_BLOCKS: u32 = 100;
 
 /// A globally-unique identifier for a set of consensus rules within the Zcash chain.
 ///
@@ -671,13 +756,13 @@ pub enum BranchId {
     Nu6,
     /// The consensus rules deployed by [`NetworkUpgrade::Nu6_1`].
     Nu6_1,
+    /// The consensus rules deployed by [`NetworkUpgrade::Nu6_2`].
+    Nu6_2,
+    /// The consensus rules to be deployed by [`NetworkUpgrade::Nu6_3`].
+    Nu6_3,
     /// The consensus rules to be deployed by [`NetworkUpgrade::Nu7`].
     #[cfg(zcash_unstable = "nu7")]
     Nu7,
-    /// Candidates for future consensus rules; this branch will never
-    /// activate on mainnet.
-    #[cfg(zcash_unstable = "zfuture")]
-    ZFuture,
 }
 
 #[cfg(feature = "std")]
@@ -697,10 +782,10 @@ impl TryFrom<u32> for BranchId {
             0xc2d6_d0b4 => Ok(BranchId::Nu5),
             0xc8e7_1055 => Ok(BranchId::Nu6),
             0x4dec_4df0 => Ok(BranchId::Nu6_1),
+            0x5437_f330 => Ok(BranchId::Nu6_2),
+            0x37a5_165b => Ok(BranchId::Nu6_3),
             #[cfg(zcash_unstable = "nu7")]
             0xffff_ffff => Ok(BranchId::Nu7),
-            #[cfg(zcash_unstable = "zfuture")]
-            0xffff_ffff => Ok(BranchId::ZFuture),
             _ => Err("Unknown consensus branch ID"),
         }
     }
@@ -718,10 +803,10 @@ impl From<BranchId> for u32 {
             BranchId::Nu5 => 0xc2d6_d0b4,
             BranchId::Nu6 => 0xc8e7_1055,
             BranchId::Nu6_1 => 0x4dec_4df0,
+            BranchId::Nu6_2 => 0x5437_f330,
+            BranchId::Nu6_3 => 0x37a5_165b,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => 0xffff_ffff,
-            #[cfg(zcash_unstable = "zfuture")]
-            BranchId::ZFuture => 0xffff_ffff,
         }
     }
 }
@@ -740,6 +825,28 @@ impl BranchId {
 
         // Sprout rules apply before any network upgrade
         BranchId::Sprout
+    }
+
+    /// Returns the network upgrade that activates this set of consensus rules, or
+    /// `None` for the pre-Overwinter Sprout rules, which have no activation height.
+    ///
+    /// This is the inverse of [`NetworkUpgrade::branch_id`].
+    pub fn network_upgrade(&self) -> Option<NetworkUpgrade> {
+        Some(match self {
+            BranchId::Sprout => return None,
+            BranchId::Overwinter => NetworkUpgrade::Overwinter,
+            BranchId::Sapling => NetworkUpgrade::Sapling,
+            BranchId::Blossom => NetworkUpgrade::Blossom,
+            BranchId::Heartwood => NetworkUpgrade::Heartwood,
+            BranchId::Canopy => NetworkUpgrade::Canopy,
+            BranchId::Nu5 => NetworkUpgrade::Nu5,
+            BranchId::Nu6 => NetworkUpgrade::Nu6,
+            BranchId::Nu6_1 => NetworkUpgrade::Nu6_1,
+            BranchId::Nu6_2 => NetworkUpgrade::Nu6_2,
+            BranchId::Nu6_3 => NetworkUpgrade::Nu6_3,
+            #[cfg(zcash_unstable = "nu7")]
+            BranchId::Nu7 => NetworkUpgrade::Nu7,
+        })
     }
 
     /// Returns the range of heights for the consensus epoch associated with this branch id.
@@ -793,12 +900,16 @@ impl BranchId {
                 .map(|lower| (lower, params.activation_height(NetworkUpgrade::Nu6_1))),
             BranchId::Nu6_1 => params
                 .activation_height(NetworkUpgrade::Nu6_1)
+                .map(|lower| (lower, params.activation_height(NetworkUpgrade::Nu6_2))),
+            BranchId::Nu6_2 => params
+                .activation_height(NetworkUpgrade::Nu6_2)
+                .map(|lower| (lower, params.activation_height(NetworkUpgrade::Nu6_3))),
+            BranchId::Nu6_3 => params
+                .activation_height(NetworkUpgrade::Nu6_3)
                 .map(|lower| {
                     #[cfg(zcash_unstable = "nu7")]
                     let upper = params.activation_height(NetworkUpgrade::Nu7);
-                    #[cfg(zcash_unstable = "zfuture")]
-                    let upper = params.activation_height(NetworkUpgrade::ZFuture);
-                    #[cfg(not(any(zcash_unstable = "nu7", zcash_unstable = "zfuture")))]
+                    #[cfg(not(zcash_unstable = "nu7"))]
                     let upper = None;
                     (lower, upper)
                 }),
@@ -806,16 +917,86 @@ impl BranchId {
             BranchId::Nu7 => params
                 .activation_height(NetworkUpgrade::Nu7)
                 .map(|lower| (lower, None)),
-            #[cfg(zcash_unstable = "zfuture")]
-            BranchId::ZFuture => params
-                .activation_height(NetworkUpgrade::ZFuture)
-                .map(|lower| (lower, None)),
         }
     }
 
     pub fn sprout_uses_groth_proofs(&self) -> bool {
         !matches!(self, BranchId::Sprout | BranchId::Overwinter)
     }
+
+    // Returns `true` for consensus branches that support the Sprout protocol, `false` otherwise..
+    pub fn has_sprout(&self) -> bool {
+        use BranchId::*;
+        match self {
+            Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1
+            | Nu6_2 => true,
+            BranchId::Nu6_3 => true,
+            #[cfg(zcash_unstable = "nu7")]
+            BranchId::Nu7 => false,
+        }
+    }
+
+    // Returns `true` for consensus branches that support the Sapling protocol, `false` otherwise..
+    pub fn has_sapling(&self) -> bool {
+        use BranchId::*;
+        match self {
+            Sprout | Overwinter => false,
+            Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
+            BranchId::Nu6_3 => true,
+            #[cfg(zcash_unstable = "nu7")]
+            BranchId::Nu7 => true,
+        }
+    }
+
+    // Returns `true` for consensus branches that support the Orchard protocol, `false` otherwise.
+    pub fn has_orchard(&self) -> bool {
+        use BranchId::*;
+        match self {
+            Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => false,
+            Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
+            BranchId::Nu6_3 => true,
+            #[cfg(zcash_unstable = "nu7")]
+            BranchId::Nu7 => true,
+        }
+    }
+
+    /// Returns the revision of the Orchard protocol in effect under this consensus
+    /// branch, or `None` for branches that predate NU5 (under which the Orchard
+    /// protocol is not supported).
+    pub fn orchard_protocol_revision(&self) -> Option<OrchardProtocolRevision> {
+        use BranchId::*;
+        match self {
+            Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => None,
+            Nu5 | Nu6 | Nu6_1 => Some(OrchardProtocolRevision::InsecureV1),
+            Nu6_2 => Some(OrchardProtocolRevision::V2),
+            Nu6_3 => Some(OrchardProtocolRevision::V3),
+            #[cfg(zcash_unstable = "nu7")]
+            Nu7 => Some(OrchardProtocolRevision::V3),
+        }
+    }
+}
+
+/// The revision of the Orchard protocol deployed by a network upgrade.
+///
+/// The revisions correspond one-to-one to the `orchard` crate's `ProtocolVersion`;
+/// this type exists so that crates that do not depend on `orchard` can express which
+/// protocol revision a consensus branch selects. Use
+/// [`BranchId::orchard_protocol_revision`] to obtain the revision in effect under a
+/// given consensus branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OrchardProtocolRevision {
+    /// The original revision of the Orchard protocol, deployed at NU5 and used prior
+    /// to NU6.2. Uses the historical unsound Orchard circuit; cross-address transfers
+    /// are permitted.
+    InsecureV1,
+    /// The revision of the Orchard protocol deployed at NU6.2. Uses the post-NU6.2
+    /// fixed circuit; cross-address transfers are permitted.
+    V2,
+    /// The revision of the Orchard protocol deployed at NU6.3, which introduces the
+    /// Ironwood value pool. Uses the post-NU6.3 circuit; cross-address transfers are
+    /// prohibited for the Orchard value pool and permitted for the Ironwood value
+    /// pool.
+    V3,
 }
 
 #[cfg(any(test, feature = "test-dependencies"))]
@@ -836,14 +1017,21 @@ pub mod testing {
             BranchId::Nu5,
             BranchId::Nu6,
             BranchId::Nu6_1,
+            BranchId::Nu6_2,
+            BranchId::Nu6_3,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7,
-            #[cfg(zcash_unstable = "zfuture")]
-            BranchId::ZFuture,
         ])
     }
 
-    pub fn arb_height<P: Parameters>(
+    /// An arbitrary [`BlockHeight`], within the range heights realistically take.
+    pub fn arb_block_height() -> impl Strategy<Value = BlockHeight> {
+        (0u32..5_000_000).prop_map(BlockHeight::from_u32)
+    }
+
+    /// An arbitrary [`BlockHeight`], within the range of heights for the given consensus branch on
+    /// the specified network.
+    pub fn arb_height_for_branch<P: Parameters>(
         branch_id: BranchId,
         params: &P,
     ) -> impl Strategy<Value = Option<BlockHeight>> {
@@ -854,6 +1042,16 @@ pub mod testing {
                     (lower.0..upper.map_or(u32::MAX, |u| u.0)).prop_map(|h| Some(BlockHeight(h))),
                 )
             })
+    }
+
+    /// An arbitrary [`BlockHeight`], within the range of heights for the given consensus branch on
+    /// the specified network.
+    #[deprecated(note = "Use arb_height_for_branch instead.")]
+    pub fn arb_height<P: Parameters>(
+        branch_id: BranchId,
+        params: &P,
+    ) -> impl Strategy<Value = Option<BlockHeight>> {
+        arb_height_for_branch(branch_id, params)
     }
 
     #[cfg(feature = "test-dependencies")]
@@ -867,7 +1065,7 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockHeight, BranchId, NetworkUpgrade, Parameters, MAIN_NETWORK, UPGRADES_IN_ORDER,
+        BlockHeight, BranchId, MAIN_NETWORK, NetworkUpgrade, Parameters, UPGRADES_IN_ORDER,
     };
 
     #[test]
@@ -901,6 +1099,34 @@ mod tests {
     fn branch_id_from_u32() {
         assert_eq!(BranchId::try_from(0), Ok(BranchId::Sprout));
         assert!(BranchId::try_from(1).is_err());
+    }
+
+    #[test]
+    fn orchard_protocol_revision() {
+        use super::OrchardProtocolRevision;
+
+        assert_eq!(BranchId::Canopy.orchard_protocol_revision(), None);
+        assert_eq!(
+            BranchId::Nu5.orchard_protocol_revision(),
+            Some(OrchardProtocolRevision::InsecureV1)
+        );
+        assert_eq!(
+            BranchId::Nu6_1.orchard_protocol_revision(),
+            Some(OrchardProtocolRevision::InsecureV1)
+        );
+        assert_eq!(
+            BranchId::Nu6_2.orchard_protocol_revision(),
+            Some(OrchardProtocolRevision::V2)
+        );
+        assert_eq!(
+            BranchId::Nu6_3.orchard_protocol_revision(),
+            Some(OrchardProtocolRevision::V3)
+        );
+        #[cfg(zcash_unstable = "nu7")]
+        assert_eq!(
+            BranchId::Nu7.orchard_protocol_revision(),
+            Some(OrchardProtocolRevision::V3)
+        );
     }
 
     #[test]
@@ -942,8 +1168,24 @@ mod tests {
             BranchId::Nu6_1,
         );
         assert_eq!(
-            BranchId::for_height(&MAIN_NETWORK, BlockHeight(5_000_000)),
+            BranchId::for_height(&MAIN_NETWORK, BlockHeight(3_364_599)),
             BranchId::Nu6_1,
+        );
+        assert_eq!(
+            BranchId::for_height(&MAIN_NETWORK, BlockHeight(3_364_600)),
+            BranchId::Nu6_2,
+        );
+        assert_eq!(
+            BranchId::for_height(&MAIN_NETWORK, BlockHeight(3_428_142)),
+            BranchId::Nu6_2,
+        );
+        assert_eq!(
+            BranchId::for_height(&MAIN_NETWORK, BlockHeight(3_428_143)),
+            BranchId::Nu6_3,
+        );
+        assert_eq!(
+            BranchId::for_height(&MAIN_NETWORK, BlockHeight(5_000_000)),
+            BranchId::Nu6_3,
         );
     }
 }

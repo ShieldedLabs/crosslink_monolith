@@ -10,8 +10,37 @@ workspace.
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-07-23
+
+### Changed
+- Migrated to `zcash_primitives 0.30.0`.
+
+## [0.29.0] - 2026-07-09
+
+### Changed
+- Migrated to `zcash_primitives 0.29.0`.
+
+## [0.29.0-pre.0] - 2026-06-30
+
+### Changed
+- MSRV is now 1.88
+- Migrated to `zcash_primitives 0.29.0-pre.0`.
+
+## [0.28.0] - 2026-06-02
+
+### Changed
+- Migrated to `zcash_primitives 0.28.0`.
+
+### Fixed
+- Updated to crate versions that fix an Orchard soundness vulnerability
+  (GHSA-ww9q-8r59-xv46) and Orchard non-canonical proof size issue
+  (GHSA-2x4w-pxqw-58v9).
+
+## [0.27.0] - 2026-04-27
+
 ### Changed
 - MSRV is now 1.85.1.
+- Migrated to `sapling-crypto 0.7`, `zcash_primitives 0.27`.
 
 ## [0.26.1] - 2025-10-18
 

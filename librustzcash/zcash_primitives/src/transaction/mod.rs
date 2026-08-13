@@ -6,11 +6,9 @@ pub mod sighash;
 pub mod sighash_v4;
 pub mod sighash_v5;
 pub mod sighash_vcrosslink;
-#[cfg(any(zcash_unstable = "nu7", zcash_unstable = "zfuture"))]
 pub mod sighash_v6;
 
 pub mod txid;
-pub mod util;
 
 #[cfg(any(test, feature = "test-dependencies"))]
 pub mod tests;
@@ -21,7 +19,7 @@ use blake2b_simd::Hash as Blake2bHash;
 use core::convert::TryFrom;
 use core::fmt::Debug;
 use core::ops::Deref;
-use core2::io::{self, Read, Write};
+use corez::io::{self, Read, Write};
 
 use ::transparent::bundle::{self as transparent, OutPoint, TxIn, TxOut};
 use zcash_encoding::{CompactSize, Vector};
@@ -29,6 +27,8 @@ use zcash_protocol::{
     consensus::{BlockHeight, BranchId},
     value::{BalanceError, ZatBalance, Zatoshis},
 };
+// `valid_in_branch` matches on every branch by bare name.
+use zcash_protocol::consensus::BranchId::*;
 
 use self::{
     components::{
@@ -36,8 +36,8 @@ use self::{
         sprout::{self, JsDescription},
     },
     txid::{BlockTxCommitmentDigester, TxIdDigester, to_txid},
-    util::sha256d::{HashReader, HashWriter},
 };
+use ::transparent::util::sha256d::{HashReader, HashWriter};
 
 #[cfg(feature = "circuits")]
 use ::sapling::builder as sapling_builder;
@@ -49,14 +49,7 @@ use zcash_protocol::constants::{
     VCROSSLINK_VERSION_GROUP_ID,
 };
 
-#[cfg(zcash_unstable = "nu7")]
 use zcash_protocol::constants::{V6_TX_VERSION, V6_VERSION_GROUP_ID};
-
-#[cfg(zcash_unstable = "zfuture")]
-use {
-    self::components::tze::{self, TzeIn, TzeOut},
-    zcash_protocol::constants::{ZFUTURE_TX_VERSION, ZFUTURE_VERSION_GROUP_ID},
-};
 
 pub use zcash_protocol::TxId;
 use serde::Serialize;
@@ -86,8 +79,7 @@ pub enum TxVersion {
     /// It is specified in [§ 7.1 Transaction Encoding and Consensus](https://zips.z.cash/protocol/protocol.pdf#txnencoding)
     /// and [ZIP 225](https://zips.z.cash/zip-0225).
     V5,
-    /// Transaction version 6, specified in [ZIP 230](https://zips.z.cash/zip-0230).
-    #[cfg(zcash_unstable = "nu7")]
+    /// Transaction version 6, specified in [ZIP 229](https://zips.z.cash/zip-0229).
     V6,
     VCrosslink,
     /// This version is used exclusively for in-development transaction
@@ -110,7 +102,6 @@ impl TxVersion {
                 (V3_TX_VERSION, V3_VERSION_GROUP_ID) => Ok(TxVersion::V3),
                 (V4_TX_VERSION, V4_VERSION_GROUP_ID) => Ok(TxVersion::V4),
                 (V5_TX_VERSION, V5_VERSION_GROUP_ID) => Ok(TxVersion::V5),
-                #[cfg(zcash_unstable = "nu7")]
                 (V6_TX_VERSION, V6_VERSION_GROUP_ID) => Ok(TxVersion::V6),
                 (VCROSSLINK_TX_VERSION, VCROSSLINK_VERSION_GROUP_ID) => Ok(TxVersion::VCrosslink),
                 #[cfg(zcash_unstable = "zfuture")]
@@ -143,7 +134,6 @@ impl TxVersion {
                 TxVersion::V3 => V3_TX_VERSION,
                 TxVersion::V4 => V4_TX_VERSION,
                 TxVersion::V5 => V5_TX_VERSION,
-                #[cfg(zcash_unstable = "nu7")]
                 TxVersion::V6 => V6_TX_VERSION,
                 TxVersion::VCrosslink => VCROSSLINK_TX_VERSION,
                 #[cfg(zcash_unstable = "zfuture")]
@@ -158,10 +148,7 @@ impl TxVersion {
             TxVersion::V4 => V4_VERSION_GROUP_ID,
             TxVersion::V5 => V5_VERSION_GROUP_ID,
             TxVersion::VCrosslink => VCROSSLINK_VERSION_GROUP_ID,
-            #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => V6_VERSION_GROUP_ID,
-            #[cfg(zcash_unstable = "zfuture")]
-            TxVersion::ZFuture => ZFUTURE_VERSION_GROUP_ID,
         }
     }
 
@@ -180,10 +167,7 @@ impl TxVersion {
             TxVersion::V3 | TxVersion::V4 => true,
             TxVersion::V5 => false,
             TxVersion::VCrosslink => false,
-            #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => false,
-            #[cfg(zcash_unstable = "zfuture")]
-            TxVersion::ZFuture => false,
         }
     }
 
@@ -198,10 +182,7 @@ impl TxVersion {
             TxVersion::V4 => true,
             TxVersion::V5 => true,
             TxVersion::VCrosslink => true,
-            #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => true,
-            #[cfg(zcash_unstable = "zfuture")]
-            TxVersion::ZFuture => true,
         }
     }
 
@@ -211,30 +192,24 @@ impl TxVersion {
             TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 => false,
             TxVersion::V5 => true,
             TxVersion::VCrosslink => true,
-            #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => true,
-            #[cfg(zcash_unstable = "zfuture")]
-            TxVersion::ZFuture => true,
         }
     }
 
-    #[cfg(all(
-        any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-        feature = "zip-233"
-    ))]
+    /// Returns `true` if this transaction version supports the Ironwood protocol.
+    pub fn has_ironwood(&self) -> bool {
+        match self {
+            TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 | TxVersion::V5 => false,
+            TxVersion::V6 | TxVersion::VCrosslink => true,
+        }
+    }
+
+    #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
     pub fn has_zip233(&self) -> bool {
         match self {
             TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 | TxVersion::V5 => false,
-            #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => true,
-            #[cfg(zcash_unstable = "zfuture")]
-            TxVersion::ZFuture => true,
         }
-    }
-
-    #[cfg(zcash_unstable = "zfuture")]
-    pub fn has_tze(&self) -> bool {
-        matches!(self, TxVersion::ZFuture)
     }
 
     /// Suggests the transaction version that should be used in the given Zcash epoch.
@@ -248,10 +223,43 @@ impl TxVersion {
             BranchId::Nu5 => TxVersion::V5,
             BranchId::Nu6 => TxVersion::V5,
             BranchId::Nu6_1 => TxVersion::V5,
+            BranchId::Nu6_2 => TxVersion::V5,
+            BranchId::Nu6_3 => TxVersion::V6,
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => TxVersion::V6,
-            #[cfg(zcash_unstable = "zfuture")]
-            BranchId::ZFuture => TxVersion::ZFuture,
+        }
+    }
+
+    /// Returns `true` if this transaction version is valid for us in the specified consensus
+    /// branch, `false` otherwise.
+    pub fn valid_in_branch(&self, consensus_branch_id: BranchId) -> bool {
+        // Note: we intentionally use `match` expressions instead of the `matches!`
+        // macro below because we want exhaustivity.
+        match self {
+            TxVersion::Sprout(_) => consensus_branch_id == Sprout,
+            TxVersion::V3 => consensus_branch_id == Overwinter,
+            TxVersion::VCrosslink => matches!(consensus_branch_id, Nu6_3),
+            TxVersion::V4 => match consensus_branch_id {
+                Sprout | Overwinter => false,
+                Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
+                Nu6_3 => true,
+                #[cfg(zcash_unstable = "nu7")]
+                Nu7 => false, // ZIP 2003
+            },
+            TxVersion::V5 => match consensus_branch_id {
+                Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy => false,
+                Nu5 | Nu6 | Nu6_1 | Nu6_2 => true,
+                Nu6_3 => true,
+                #[cfg(zcash_unstable = "nu7")]
+                Nu7 => true,
+            },
+            TxVersion::V6 => match consensus_branch_id {
+                Sprout | Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6
+                | Nu6_1 | Nu6_2 => false,
+                Nu6_3 => true, // Ironwood / NU6.3
+                #[cfg(zcash_unstable = "nu7")]
+                Nu7 => true, // ZIP 230 or ZIP 248, whichever is chosen for activation
+            },
         }
     }
 }
@@ -261,25 +269,19 @@ pub trait Authorization {
     type TransparentAuth: transparent::Authorization;
     type SaplingAuth: sapling::bundle::Authorization;
     type OrchardAuth: orchard::bundle::Authorization;
-
-    #[cfg(zcash_unstable = "zfuture")]
-    type TzeAuth: tze::Authorization;
 }
 
 /// [`Authorization`] marker type for fully-authorized transactions.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Authorized;
 
 impl Authorization for Authorized {
     type TransparentAuth = transparent::Authorized;
     type SaplingAuth = sapling::bundle::Authorized;
     type OrchardAuth = orchard::bundle::Authorized;
-
-    #[cfg(zcash_unstable = "zfuture")]
-    type TzeAuth = tze::Authorized;
 }
 
-/// [`Authorization`] marker type for transactions without authorization data.
+/// [`Authorization`] marker type for non-coinbase transactions without authorization data.
 ///
 /// Currently this includes Sapling proofs because the types in this crate support v4
 /// transactions, which commit to the Sapling proofs in the transaction digest.
@@ -292,9 +294,19 @@ impl Authorization for Unauthorized {
         sapling_builder::InProgress<sapling_builder::Proven, sapling_builder::Unsigned>;
     type OrchardAuth =
         orchard::builder::InProgress<orchard::builder::Unproven, orchard::builder::Unauthorized>;
+}
 
-    #[cfg(zcash_unstable = "zfuture")]
-    type TzeAuth = tze::builder::Unauthorized;
+/// [`Authorization`] marker type for coinbase transactions without authorization data.
+#[cfg(feature = "circuits")]
+struct Coinbase;
+
+#[cfg(feature = "circuits")]
+impl Authorization for Coinbase {
+    type TransparentAuth = ::transparent::builder::Coinbase;
+    type SaplingAuth =
+        sapling_builder::InProgress<sapling_builder::Proven, sapling_builder::Unsigned>;
+    type OrchardAuth =
+        orchard::builder::InProgress<orchard::builder::Unproven, orchard::builder::Unauthorized>;
 }
 
 /// A Zcash transaction.
@@ -325,18 +337,49 @@ pub struct TransactionData<A: Authorization> {
     consensus_branch_id: BranchId,
     lock_time: u32,
     expiry_height: BlockHeight,
-    #[cfg(all(
-        any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-        feature = "zip-233"
-    ))]
+    #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
     zip233_amount: Zatoshis,
     transparent_bundle: Option<transparent::Bundle<A::TransparentAuth>>,
     sprout_bundle: Option<sprout::Bundle>,
     sapling_bundle: Option<sapling::Bundle<A::SaplingAuth, ZatBalance>>,
     orchard_bundle: Option<orchard::bundle::Bundle<A::OrchardAuth, ZatBalance>>,
+    ironwood_bundle: Option<orchard::bundle::Bundle<A::OrchardAuth, ZatBalance>>,
     staking_action: Option<StakingAction>,
     #[cfg(zcash_unstable = "zfuture")]
     tze_bundle: Option<tze::Bundle<A::TzeAuth>>,
+}
+
+impl Clone for TransactionData<Authorized> {
+    fn clone(&self) -> Self {
+        TransactionData {
+            version: self.version,
+            consensus_branch_id: self.consensus_branch_id,
+            lock_time: self.lock_time,
+            expiry_height: self.expiry_height,
+            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
+            zip233_amount: self.zip233_amount,
+            transparent_bundle: self.transparent_bundle.clone(),
+            sprout_bundle: self.sprout_bundle.clone(),
+            sapling_bundle: self.sapling_bundle.clone(),
+            orchard_bundle: self.orchard_bundle.clone(),
+            ironwood_bundle: self.ironwood_bundle.clone(),
+            staking_action: self.staking_action.clone(),
+            #[cfg(zcash_unstable = "zfuture")]
+            tze_bundle: self.tze_bundle.clone(),
+        }
+    }
+}
+
+impl Clone for Transaction {
+    fn clone(&self) -> Self {
+        // SAFETY: We're reconstructing the Transaction from its data.
+        // The txid is deterministic from the data, so cloning data and
+        // re-computing txid would be equivalent.
+        Transaction {
+            txid: self.txid,
+            data: self.data.clone(),
+        }
+    }
 }
 
 impl<A: Authorization> TransactionData<A> {
@@ -347,11 +390,7 @@ impl<A: Authorization> TransactionData<A> {
         consensus_branch_id: BranchId,
         lock_time: u32,
         expiry_height: BlockHeight,
-        #[cfg(all(
-            any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-            feature = "zip-233"
-        ))]
-        zip233_amount: Zatoshis,
+        #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))] zip233_amount: Zatoshis,
         transparent_bundle: Option<transparent::Bundle<A::TransparentAuth>>,
         sprout_bundle: Option<sprout::Bundle>,
         sapling_bundle: Option<sapling::Bundle<A::SaplingAuth, ZatBalance>>,
@@ -363,49 +402,55 @@ impl<A: Authorization> TransactionData<A> {
             consensus_branch_id,
             lock_time,
             expiry_height,
-            #[cfg(all(
-                any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-                feature = "zip-233"
-            ))]
+            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
             zip233_amount,
             transparent_bundle,
             sprout_bundle,
             sapling_bundle,
             orchard_bundle,
+            ironwood_bundle: None,
             staking_action,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: None,
         }
     }
 
-    /// Constructs a `TransactionData` from its constituent parts, including speculative
-    /// future parts that are not in the current Zcash consensus rules.
-    #[cfg(zcash_unstable = "zfuture")]
+    /// Constructs a V6 [`TransactionData`] from its constituent parts,
+    /// including the Ironwood bundle.
+    ///
+    /// Both the Orchard and Ironwood bundle fields use [`orchard::Bundle`], but
+    /// they are distinct V6 transaction fields with distinct bundle versions.
+    /// The `orchard_bundle` argument must contain a bundle constructed for
+    /// [`orchard::bundle::BundleVersion::orchard_v3`], while `ironwood_bundle`
+    /// must contain a bundle constructed for
+    /// [`orchard::bundle::BundleVersion::ironwood_v3`]. Supplying a bundle for
+    /// the wrong field is invalid and can be rejected by later serialization or
+    /// commitment construction because the bundle flags and domains are protocol
+    /// specific.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_parts_zfuture(
-        version: TxVersion,
+    pub fn from_parts_v6(
         consensus_branch_id: BranchId,
         lock_time: u32,
         expiry_height: BlockHeight,
-        #[cfg(feature = "zip-233")] zip233_amount: Zatoshis,
+        #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))] zip233_amount: Zatoshis,
         transparent_bundle: Option<transparent::Bundle<A::TransparentAuth>>,
-        sprout_bundle: Option<sprout::Bundle>,
         sapling_bundle: Option<sapling::Bundle<A::SaplingAuth, ZatBalance>>,
         orchard_bundle: Option<orchard::Bundle<A::OrchardAuth, ZatBalance>>,
-        tze_bundle: Option<tze::Bundle<A::TzeAuth>>,
+        ironwood_bundle: Option<orchard::Bundle<A::OrchardAuth, ZatBalance>>,
     ) -> Self {
         TransactionData {
-            version,
+            version: TxVersion::V6,
             consensus_branch_id,
             lock_time,
             expiry_height,
-            #[cfg(feature = "zip-233")]
+            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
             zip233_amount,
+            staking_action: None,
             transparent_bundle,
-            sprout_bundle,
+            sprout_bundle: None,
             sapling_bundle,
             orchard_bundle,
-            tze_bundle,
+            ironwood_bundle,
         }
     }
 
@@ -443,6 +488,10 @@ impl<A: Authorization> TransactionData<A> {
         self.orchard_bundle.as_ref()
     }
 
+    pub fn ironwood_bundle(&self) -> Option<&orchard::Bundle<A::OrchardAuth, ZatBalance>> {
+        self.ironwood_bundle.as_ref()
+    }
+
     pub fn staking_action(&self) -> Option<StakingAction> {
         self.staking_action.clone()
     }
@@ -455,9 +504,9 @@ impl<A: Authorization> TransactionData<A> {
         self.zip233_amount
     }
 
-    #[cfg(zcash_unstable = "zfuture")]
-    pub fn tze_bundle(&self) -> Option<&tze::Bundle<A::TzeAuth>> {
-        self.tze_bundle.as_ref()
+    #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
+    pub fn zip233_amount(&self) -> Zatoshis {
+        self.zip233_amount
     }
 
     /// Returns the total fees paid by the transaction, given a function that can be used to
@@ -487,10 +536,10 @@ impl<A: Authorization> TransactionData<A> {
                     self.orchard_bundle
                         .as_ref()
                         .map_or_else(ZatBalance::zero, |b| *b.value_balance()),
-                    #[cfg(all(
-                        any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-                        feature = "zip-233"
-                    ))]
+                    self.ironwood_bundle
+                        .as_ref()
+                        .map_or_else(ZatBalance::zero, |b| *b.value_balance()),
+                    #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
                     -ZatBalance::from(self.zip233_amount),
                 ];
 
@@ -505,6 +554,11 @@ impl<A: Authorization> TransactionData<A> {
             .map_err(E::from)
     }
 
+    /// Computes this transaction's digest using the provided digest strategy.
+    ///
+    /// Version 6 transactions include the Ironwood bundle digest as a separate
+    /// Orchard-shaped digest with Ironwood personalization. Earlier transaction
+    /// versions do not include Ironwood in their digest.
     pub fn digest<D: TransactionDigest<A>>(&self, digester: D) -> D::Digest {
         digester.combine(
             digester.digest_header(
@@ -512,25 +566,42 @@ impl<A: Authorization> TransactionData<A> {
                 self.consensus_branch_id,
                 self.lock_time,
                 self.expiry_height,
-                #[cfg(all(
-                    any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-                    feature = "zip-233"
-                ))]
+                #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
                 &self.zip233_amount,
             ),
             digester.digest_transparent(self.transparent_bundle.as_ref()),
-            digester.digest_sapling(self.sapling_bundle.as_ref()),
-            digester.digest_orchard(self.orchard_bundle.as_ref()),
+            digester.digest_sapling(self.version, self.sapling_bundle.as_ref()),
+            digester.digest_orchard(self.version, self.orchard_bundle.as_ref()),
+            digester.digest_ironwood(self.ironwood_bundle.as_ref()),
             digester.digest_crosslink(&self.staking_action),
             #[cfg(zcash_unstable = "zfuture")]
             digester.digest_tze(self.tze_bundle.as_ref()),
         )
     }
 
+    /// Changes the consensus branch ID stored in this transaction for pre-v5 transactions.
+    ///
+    /// This can be used to fix an incorrect value passed to [`Transaction::read`]. Just
+    /// like that method, this method does nothing for v5+ transactions.
+    pub(crate) fn fix_consensus_branch_id(mut self, consensus_branch_id: BranchId) -> Self {
+        match self.version() {
+            TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 => {
+                self.consensus_branch_id = consensus_branch_id;
+            }
+            // All later tx versions directly commit to the consensus branch ID, so what
+            // we parse is what we trust.
+            _ => (),
+        }
+        self
+    }
+
     /// Maps the bundles from one type to another.
     ///
     /// This shouldn't be necessary for most use cases; it is provided for handling the
     /// cross-FFI builder logic in `zcashd`.
+    ///
+    /// `f_orchard` is also applied to the Ironwood bundle because Ironwood is
+    /// represented with the Orchard bundle type.
     pub fn map_bundles<B: Authorization>(
         self,
         f_transparent: impl FnOnce(
@@ -539,28 +610,23 @@ impl<A: Authorization> TransactionData<A> {
         f_sapling: impl FnOnce(
             Option<sapling::Bundle<A::SaplingAuth, ZatBalance>>,
         ) -> Option<sapling::Bundle<B::SaplingAuth, ZatBalance>>,
-        f_orchard: impl FnOnce(
+        mut f_orchard: impl FnMut(
             Option<orchard::bundle::Bundle<A::OrchardAuth, ZatBalance>>,
-        ) -> Option<orchard::bundle::Bundle<B::OrchardAuth, ZatBalance>>,
-        #[cfg(zcash_unstable = "zfuture")] f_tze: impl FnOnce(
-            Option<tze::Bundle<A::TzeAuth>>,
         )
-            -> Option<tze::Bundle<B::TzeAuth>>,
+            -> Option<orchard::bundle::Bundle<B::OrchardAuth, ZatBalance>>,
     ) -> TransactionData<B> {
         TransactionData {
             version: self.version,
             consensus_branch_id: self.consensus_branch_id,
             lock_time: self.lock_time,
             expiry_height: self.expiry_height,
-            #[cfg(all(
-                any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-                feature = "zip-233"
-            ))]
+            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
             zip233_amount: self.zip233_amount,
             transparent_bundle: f_transparent(self.transparent_bundle),
             sprout_bundle: self.sprout_bundle,
             sapling_bundle: f_sapling(self.sapling_bundle),
             orchard_bundle: f_orchard(self.orchard_bundle),
+            ironwood_bundle: f_orchard(self.ironwood_bundle),
             staking_action: self.staking_action,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: f_tze(self.tze_bundle),
@@ -571,6 +637,9 @@ impl<A: Authorization> TransactionData<A> {
     ///
     /// This shouldn't be necessary for most use cases; it is provided for handling the
     /// transaction extraction logic in the `pczt` crate.
+    ///
+    /// `f_orchard` is also applied to the Ironwood bundle because Ironwood is
+    /// represented with the Orchard bundle type.
     pub fn try_map_bundles<B: Authorization, E>(
         self,
         f_transparent: impl FnOnce(
@@ -581,14 +650,10 @@ impl<A: Authorization> TransactionData<A> {
             Option<sapling::Bundle<A::SaplingAuth, ZatBalance>>,
         )
             -> Result<Option<sapling::Bundle<B::SaplingAuth, ZatBalance>>, E>,
-        f_orchard: impl FnOnce(
+        mut f_orchard: impl FnMut(
             Option<orchard::bundle::Bundle<A::OrchardAuth, ZatBalance>>,
-        )
-            -> Result<Option<orchard::bundle::Bundle<B::OrchardAuth, ZatBalance>>, E>,
-        #[cfg(zcash_unstable = "zfuture")] f_tze: impl FnOnce(
-            Option<tze::Bundle<A::TzeAuth>>,
         ) -> Result<
-            Option<tze::Bundle<B::TzeAuth>>,
+            Option<orchard::bundle::Bundle<B::OrchardAuth, ZatBalance>>,
             E,
         >,
     ) -> Result<TransactionData<B>, E> {
@@ -597,15 +662,13 @@ impl<A: Authorization> TransactionData<A> {
             consensus_branch_id: self.consensus_branch_id,
             lock_time: self.lock_time,
             expiry_height: self.expiry_height,
-            #[cfg(all(
-                any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-                feature = "zip-233"
-            ))]
+            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
             zip233_amount: self.zip233_amount,
             transparent_bundle: f_transparent(self.transparent_bundle)?,
             sprout_bundle: self.sprout_bundle,
             sapling_bundle: f_sapling(self.sapling_bundle)?,
             orchard_bundle: f_orchard(self.orchard_bundle)?,
+            ironwood_bundle: f_orchard(self.ironwood_bundle)?,
             staking_action: self.staking_action,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: f_tze(self.tze_bundle)?,
@@ -617,17 +680,13 @@ impl<A: Authorization> TransactionData<A> {
         f_transparent: impl transparent::MapAuth<A::TransparentAuth, B::TransparentAuth>,
         mut f_sapling: impl sapling_serialization::MapAuth<A::SaplingAuth, B::SaplingAuth>,
         mut f_orchard: impl orchard_serialization::MapAuth<A::OrchardAuth, B::OrchardAuth>,
-        #[cfg(zcash_unstable = "zfuture")] f_tze: impl tze::MapAuth<A::TzeAuth, B::TzeAuth>,
     ) -> TransactionData<B> {
         TransactionData {
             version: self.version,
             consensus_branch_id: self.consensus_branch_id,
             lock_time: self.lock_time,
             expiry_height: self.expiry_height,
-            #[cfg(all(
-                any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-                feature = "zip-233"
-            ))]
+            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
             zip233_amount: self.zip233_amount,
             transparent_bundle: self
                 .transparent_bundle
@@ -643,6 +702,13 @@ impl<A: Authorization> TransactionData<A> {
                 )
             }),
             orchard_bundle: self.orchard_bundle.map(|b| {
+                b.map_authorization(
+                    &mut f_orchard,
+                    |f, _, s| f.map_spend_auth(s),
+                    |f, a| f.map_authorization(a),
+                )
+            }),
+            ironwood_bundle: self.ironwood_bundle.map(|b| {
                 b.map_authorization(
                     &mut f_orchard,
                     |f, _, s| f.map_spend_auth(s),
@@ -670,12 +736,11 @@ impl TransactionData<Authorized> {
     }
 }
 
-#[cfg(any(zcash_unstable = "nu7", zcash_unstable = "zfuture"))]
 struct V6HeaderFragment {
     consensus_branch_id: BranchId,
     lock_time: u32,
     expiry_height: BlockHeight,
-    #[cfg(feature = "zip-233")]
+    #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
     zip233_amount: Zatoshis,
 }
 
@@ -685,10 +750,7 @@ impl Transaction {
             TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 => Self::from_data_v4(data),
             TxVersion::V5 => Ok(Self::from_data_v5(data)),
             TxVersion::VCrosslink => Ok(Self::from_data_vcrosslink(data)),
-            #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => Ok(Self::from_data_v6(data)),
-            #[cfg(zcash_unstable = "zfuture")]
-            TxVersion::ZFuture => Ok(Self::from_data_v6(data)),
         }
     }
 
@@ -723,7 +785,6 @@ impl Transaction {
         Transaction { txid, data }
     }
 
-    #[cfg(any(zcash_unstable = "nu7", zcash_unstable = "zfuture"))]
     fn from_data_v6(data: TransactionData<Authorized>) -> Self {
         let txid = to_txid(
             data.version,
@@ -752,10 +813,7 @@ impl Transaction {
             }
             TxVersion::V5 => Self::read_v5(reader.into_base_reader(), version),
             TxVersion::VCrosslink => Self::read_vcrosslink(reader.into_base_reader(), version),
-            #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => Self::read_v6(reader.into_base_reader(), version),
-            #[cfg(zcash_unstable = "zfuture")]
-            TxVersion::ZFuture => Self::read_v6(reader.into_base_reader(), version),
         }
     }
 
@@ -819,10 +877,7 @@ impl Transaction {
                 consensus_branch_id,
                 lock_time,
                 expiry_height,
-                #[cfg(all(
-                    any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-                    feature = "zip-233"
-                ))]
+                #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
                 zip233_amount: Zatoshis::ZERO,
                 transparent_bundle,
                 sprout_bundle,
@@ -835,6 +890,7 @@ impl Transaction {
                     )
                 }),
                 orchard_bundle: None,
+                ironwood_bundle: None,
                 staking_action: None,
                 #[cfg(zcash_unstable = "zfuture")]
                 tze_bundle: None,
@@ -869,30 +925,26 @@ impl Transaction {
         let (consensus_branch_id, lock_time, expiry_height) =
             Self::read_header_fragment(&mut reader)?;
 
-        #[cfg(all(
-            any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-            feature = "zip-233"
-        ))]
+        #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
         let zip233_amount = Zatoshis::ZERO;
 
         let transparent_bundle = Self::read_transparent(&mut reader)?;
         let sapling_bundle = sapling_serialization::read_v5_bundle(&mut reader)?;
-        let orchard_bundle = orchard_serialization::read_v5_bundle(&mut reader)?;
+        let orchard_bundle =
+            orchard_serialization::read_v5_bundle(&mut reader, consensus_branch_id)?;
 
         let data = TransactionData {
             version,
             consensus_branch_id,
             lock_time,
             expiry_height,
-            #[cfg(all(
-                any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-                feature = "zip-233"
-            ))]
+            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
             zip233_amount,
             transparent_bundle,
             sprout_bundle: None,
             sapling_bundle,
             orchard_bundle,
+            ironwood_bundle: None,
             staking_action: None,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: None,
@@ -913,11 +965,22 @@ impl Transaction {
 
         let transparent_bundle = Self::read_transparent(&mut reader)?;
         let sapling_bundle = sapling_serialization::read_v5_bundle(&mut reader)?;
-        let orchard_bundle = orchard_serialization::read_vcrosslink_bundle(&mut reader)?;
+        let orchard_bundle = orchard_serialization::read_vcrosslink_bundle(
+            &mut reader,
+            consensus_branch_id,
+            orchard::ValuePool::Orchard,
+        )?;
+        let ironwood_bundle = orchard_serialization::read_vcrosslink_bundle(
+            &mut reader,
+            consensus_branch_id,
+            orchard::ValuePool::Ironwood,
+        )?;
         let staking_action = StakingAction::read(&mut reader)?;
 
         let data = TransactionData {
             version,
+            ironwood_bundle,
+            staking_action,
             consensus_branch_id,
             lock_time,
             expiry_height,
@@ -930,7 +993,6 @@ impl Transaction {
             sprout_bundle: None,
             sapling_bundle,
             orchard_bundle,
-            staking_action,
             #[cfg(zcash_unstable = "zfuture")]
             tze_bundle: None,
         };
@@ -938,37 +1000,38 @@ impl Transaction {
         Ok(Self::from_data_vcrosslink(data))
     }
 
-    #[cfg(any(zcash_unstable = "nu7", zcash_unstable = "zfuture"))]
     fn read_v6<R: Read>(mut reader: R, version: TxVersion) -> io::Result<Self> {
         let header_fragment = Self::read_v6_header_fragment(&mut reader)?;
 
         let transparent_bundle = Self::read_transparent(&mut reader)?;
         let sapling_bundle = sapling_serialization::read_v5_bundle(&mut reader)?;
-        let orchard_bundle = orchard_serialization::read_v6_bundle(&mut reader)?;
-
-        #[cfg(zcash_unstable = "zfuture")]
-        let tze_bundle = version
-            .has_tze()
-            .then(|| Self::read_tze(&mut reader))
-            .transpose()?
-            .flatten();
+        let orchard_bundle = orchard_serialization::read_v6_bundle(
+            &mut reader,
+            header_fragment.consensus_branch_id,
+            orchard::ValuePool::Orchard,
+        )?;
+        let ironwood_bundle = orchard_serialization::read_v6_bundle(
+            &mut reader,
+            header_fragment.consensus_branch_id,
+            orchard::ValuePool::Ironwood,
+        )?;
 
         let data = TransactionData {
             version,
+            staking_action: None,
             consensus_branch_id: header_fragment.consensus_branch_id,
             lock_time: header_fragment.lock_time,
             expiry_height: header_fragment.expiry_height,
-            #[cfg(feature = "zip-233")]
+            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
             zip233_amount: header_fragment.zip233_amount,
             transparent_bundle,
             sprout_bundle: None,
             sapling_bundle,
             orchard_bundle,
-            #[cfg(zcash_unstable = "zfuture")]
-            tze_bundle,
+            ironwood_bundle,
         };
 
-        Ok(Self::from_data_v5(data))
+        Ok(Self::from_data_v6(data))
     }
 
     /// Utility function for reading header data common to v5 and v6 transactions.
@@ -992,7 +1055,6 @@ impl Transaction {
         Ok((consensus_branch_id, lock_time, expiry_height))
     }
 
-    #[cfg(any(zcash_unstable = "nu7", zcash_unstable = "zfuture"))]
     fn read_v6_header_fragment<R: Read>(mut reader: R) -> io::Result<V6HeaderFragment> {
         let (consensus_branch_id, lock_time, expiry_height) =
             Self::read_header_fragment(&mut reader)?;
@@ -1001,7 +1063,7 @@ impl Transaction {
             consensus_branch_id,
             lock_time,
             expiry_height,
-            #[cfg(feature = "zip-233")]
+            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
             zip233_amount: Self::read_zip233_amount(&mut reader)?,
         })
     }
@@ -1013,28 +1075,10 @@ impl Transaction {
         sapling_serialization::read_v5_bundle(reader)
     }
 
-    #[cfg(all(
-        any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-        feature = "zip-233"
-    ))]
+    #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
     fn read_zip233_amount<R: Read>(mut reader: R) -> io::Result<Zatoshis> {
         Zatoshis::from_u64(reader.read_u64_le()?)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "zip233Amount out of range"))
-    }
-
-    #[cfg(zcash_unstable = "zfuture")]
-    fn read_tze<R: Read>(mut reader: &mut R) -> io::Result<Option<tze::Bundle<tze::Authorized>>> {
-        let vin = Vector::read(&mut reader, TzeIn::read)?;
-        let vout = Vector::read(&mut reader, TzeOut::read)?;
-        Ok(if vin.is_empty() && vout.is_empty() {
-            None
-        } else {
-            Some(tze::Bundle {
-                vin,
-                vout,
-                authorization: tze::Authorized,
-            })
-        })
     }
 
     pub fn write<W: Write>(&self, writer: W) -> io::Result<()> {
@@ -1042,10 +1086,7 @@ impl Transaction {
             TxVersion::Sprout(_) | TxVersion::V3 | TxVersion::V4 => self.write_v4(writer),
             TxVersion::V5 => self.write_v5(writer),
             TxVersion::VCrosslink => self.write_vcrosslink(writer),
-            #[cfg(zcash_unstable = "nu7")]
             TxVersion::V6 => self.write_v6(writer),
-            #[cfg(zcash_unstable = "zfuture")]
-            TxVersion::ZFuture => self.write_v6(writer),
         }
     }
 
@@ -1081,10 +1122,10 @@ impl Transaction {
             }
         }
 
-        if self.version.has_sapling() {
-            if let Some(bundle) = self.sapling_bundle.as_ref() {
-                writer.write_all(&<[u8; 64]>::from(bundle.authorization().binding_sig))?;
-            }
+        if self.version.has_sapling()
+            && let Some(bundle) = self.sapling_bundle.as_ref()
+        {
+            writer.write_all(&<[u8; 64]>::from(bundle.authorization().binding_sig))?;
         }
 
         Ok(())
@@ -1128,12 +1169,15 @@ impl Transaction {
         self.write_transparent(&mut writer)?;
         self.write_v5_sapling(&mut writer)?;
         orchard_serialization::write_vcrosslink_bundle(self.orchard_bundle.as_ref(), &mut writer)?;
+        // The Ironwood bundle sits between the Orchard bundle and the Crosslink extras, exactly as
+        // `read_vcrosslink` expects and as `write_v6` orders them. Omitting it here desynchronised
+        // the writer from its own reader.
+        orchard_serialization::write_vcrosslink_bundle(self.ironwood_bundle.as_ref(), &mut writer)?;
         StakingAction::write(&self.staking_action, &mut writer)?;
 
         Ok(())
     }
 
-    #[cfg(any(zcash_unstable = "nu7", zcash_unstable = "zfuture"))]
     pub fn write_v6<W: Write>(&self, mut writer: W) -> io::Result<()> {
         if self.sprout_bundle.is_some() {
             return Err(io::Error::new(
@@ -1146,9 +1190,8 @@ impl Transaction {
         self.write_transparent(&mut writer)?;
         self.write_v5_sapling(&mut writer)?;
         orchard_serialization::write_v6_bundle(self.orchard_bundle.as_ref(), &mut writer)?;
+        orchard_serialization::write_v6_bundle(self.ironwood_bundle.as_ref(), &mut writer)?;
 
-        #[cfg(zcash_unstable = "zfuture")]
-        self.write_tze(&mut writer)?;
         Ok(())
     }
 
@@ -1168,14 +1211,13 @@ impl Transaction {
         Ok(())
     }
 
-    #[cfg(any(zcash_unstable = "nu7", zcash_unstable = "zfuture"))]
     pub fn write_v6_header<W: Write>(&self, mut writer: W) -> io::Result<()> {
         self.version.write(&mut writer)?;
         writer.write_u32_le(u32::from(self.consensus_branch_id))?;
         writer.write_u32_le(self.lock_time)?;
         writer.write_u32_le(u32::from(self.expiry_height))?;
 
-        #[cfg(feature = "zip-233")]
+        #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
         writer.write_u64_le(self.zip233_amount.into())?;
         Ok(())
     }
@@ -1192,19 +1234,6 @@ impl Transaction {
         sapling_serialization::write_v5_bundle(writer, self.sapling_bundle.as_ref())
     }
 
-    #[cfg(zcash_unstable = "zfuture")]
-    pub fn write_tze<W: Write>(&self, mut writer: W) -> io::Result<()> {
-        if let Some(bundle) = &self.tze_bundle {
-            Vector::write(&mut writer, &bundle.vin, |w, e| e.write(w))?;
-            Vector::write(&mut writer, &bundle.vout, |w, e| e.write(w))?;
-        } else {
-            CompactSize::write(&mut writer, 0)?;
-            CompactSize::write(&mut writer, 0)?;
-        }
-
-        Ok(())
-    }
-
     // TODO: should this be moved to `from_data` and stored?
     pub fn auth_commitment(&self) -> Blake2bHash {
         self.data.digest(BlockTxCommitmentDigester)
@@ -1219,18 +1248,17 @@ pub struct TransparentDigests<A> {
 }
 
 #[derive(Clone, Debug)]
-pub struct TzeDigests<A> {
-    pub inputs_digest: A,
-    pub outputs_digest: A,
-    pub per_input_digest: Option<A>,
-}
-
-#[derive(Clone, Debug)]
 pub struct TxDigests<A> {
     pub header_digest: A,
     pub transparent_digests: Option<TransparentDigests<A>>,
     pub sapling_digest: Option<A>,
     pub orchard_digest: Option<A>,
+    /// The digest of the Ironwood bundle used by version 6 transactions.
+    ///
+    /// This is `None` when the transaction has no Ironwood bundle. When a version 6 transaction
+    /// ID is derived from these digests, `None` is combined as the empty Ironwood bundle digest
+    /// using the Ironwood bundle personalization.
+    pub ironwood_digest: Option<A>,
     pub crosslink_digest: Option<A>,
     #[cfg(zcash_unstable = "zfuture")]
     pub tze_digests: Option<TzeDigests<A>>,
@@ -1241,6 +1269,9 @@ pub trait TransactionDigest<A: Authorization> {
     type TransparentDigest;
     type SaplingDigest;
     type OrchardDigest;
+    /// The digest type produced for the Ironwood bundle in version 6 transactions.
+    type IronwoodDigest;
+
     type CrosslinkDigest;
 
     #[cfg(zcash_unstable = "zfuture")]
@@ -1254,11 +1285,7 @@ pub trait TransactionDigest<A: Authorization> {
         consensus_branch_id: BranchId,
         lock_time: u32,
         expiry_height: BlockHeight,
-        #[cfg(all(
-            any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-            feature = "zip-233"
-        ))]
-        zip233_amount: &Zatoshis,
+        #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))] zip233_amount: &Zatoshis,
     ) -> Self::HeaderDigest;
 
     fn digest_transparent(
@@ -1268,13 +1295,28 @@ pub trait TransactionDigest<A: Authorization> {
 
     fn digest_sapling(
         &self,
+        version: TxVersion,
         sapling_bundle: Option<&sapling::Bundle<A::SaplingAuth, ZatBalance>>,
     ) -> Self::SaplingDigest;
 
     fn digest_orchard(
         &self,
+        version: TxVersion,
         orchard_bundle: Option<&orchard::Bundle<A::OrchardAuth, ZatBalance>>,
     ) -> Self::OrchardDigest;
+
+    /// Computes the digest for the Ironwood bundle.
+    ///
+    /// Ironwood bundles are Orchard-shaped, but they use a distinct bundle personalization.
+    /// Transaction ID digesters should return `None` when no Ironwood bundle is present;
+    /// version 6 transaction ID combination substitutes the empty Ironwood bundle digest for
+    /// `None`. Transaction commitment digesters may instead return an empty authorizing data
+    /// digest when no Ironwood bundle is present, and may use a different anchor commitment
+    /// policy than transaction ID digesters.
+    fn digest_ironwood(
+        &self,
+        ironwood_bundle: Option<&orchard::Bundle<A::OrchardAuth, ZatBalance>>,
+    ) -> Self::IronwoodDigest;
 
     fn digest_crosslink(
         &self,
@@ -1290,6 +1332,7 @@ pub trait TransactionDigest<A: Authorization> {
         transparent_digest: Self::TransparentDigest,
         sapling_digest: Self::SaplingDigest,
         orchard_digest: Self::OrchardDigest,
+        ironwood_digest: Self::IronwoodDigest,
         crosslink_digest: Self::CrosslinkDigest,
         #[cfg(zcash_unstable = "zfuture")] tze_digest: Self::TzeDigest,
     ) -> Self::Digest;
@@ -1962,14 +2005,8 @@ pub mod testing {
         },
     };
 
-    #[cfg(all(
-        any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-        feature = "zip-233"
-    ))]
+    #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
     use zcash_protocol::value::{MAX_MONEY, Zatoshis};
-
-    #[cfg(zcash_unstable = "zfuture")]
-    use super::components::tze::testing::{self as tze};
 
     pub fn arb_txid() -> impl Strategy<Value = TxId> {
         prop::array::uniform32(any::<u8>()).prop_map(TxId::from_bytes)
@@ -1985,36 +2022,12 @@ pub mod testing {
             BranchId::Nu5 => Just(TxVersion::V5).boxed(),
             BranchId::Nu6 => Just(TxVersion::V5).boxed(),
             BranchId::Nu6_1 => Just(TxVersion::V5).boxed(),
+            BranchId::Nu6_2 => Just(TxVersion::V5).boxed(),
+            BranchId::Nu6_3 => Just(TxVersion::V6).boxed(),
             #[cfg(zcash_unstable = "nu7")]
             BranchId::Nu7 => Just(TxVersion::V6).boxed(),
             #[cfg(zcash_unstable = "zfuture")]
             BranchId::ZFuture => Just(TxVersion::ZFuture).boxed(),
-        }
-    }
-
-    #[cfg(all(not(zcash_unstable = "nu7"), not(zcash_unstable = "zfuture")))]
-    prop_compose! {
-        pub fn arb_txdata(consensus_branch_id: BranchId)(
-            version in arb_tx_version(consensus_branch_id),
-        )(
-            lock_time in any::<u32>(),
-            expiry_height in any::<u32>(),
-            transparent_bundle in transparent::arb_bundle(),
-            sapling_bundle in sapling::arb_bundle_for_version(version),
-            orchard_bundle in orchard::arb_bundle_for_version(version),
-            version in Just(version),
-        ) -> TransactionData<Authorized> {
-            TransactionData {
-                version,
-                consensus_branch_id,
-                lock_time,
-                expiry_height: expiry_height.into(),
-                transparent_bundle,
-                sprout_bundle: None,
-                sapling_bundle,
-                orchard_bundle,
-                staking_action: None,
-            }
         }
     }
 
@@ -2028,6 +2041,7 @@ pub mod testing {
             transparent_bundle in transparent::arb_bundle(),
             sapling_bundle in sapling::arb_bundle_for_version(version),
             orchard_bundle in orchard::arb_bundle_for_version(version),
+            ironwood_bundle in orchard::arb_ironwood_bundle_for_version(version),
             version in Just(version),
         ) -> TransactionData<Authorized> {
             TransactionData {
@@ -2039,6 +2053,8 @@ pub mod testing {
                 sprout_bundle: None,
                 sapling_bundle,
                 orchard_bundle,
+                ironwood_bundle,
+                staking_action: None,
             }
         }
     }
@@ -2054,6 +2070,7 @@ pub mod testing {
             transparent_bundle in transparent::arb_bundle(),
             sapling_bundle in sapling::arb_bundle_for_version(version),
             orchard_bundle in orchard::arb_bundle_for_version(version),
+            ironwood_bundle in orchard::arb_ironwood_bundle_for_version(version),
             version in Just(version),
         ) -> TransactionData<Authorized> {
             TransactionData {
@@ -2066,22 +2083,24 @@ pub mod testing {
                 sprout_bundle: None,
                 sapling_bundle,
                 orchard_bundle,
+                ironwood_bundle,
+                staking_action: None,
             }
         }
     }
 
-    #[cfg(all(zcash_unstable = "zfuture", not(feature = "zip-233")))]
+    #[cfg(not(zcash_unstable = "nu7"))]
     prop_compose! {
         pub fn arb_txdata(consensus_branch_id: BranchId)(
-            version in arb_tx_version(consensus_branch_id),
+            version in arb_tx_version(consensus_branch_id)
         )(
             lock_time in any::<u32>(),
             expiry_height in any::<u32>(),
             transparent_bundle in transparent::arb_bundle(),
             sapling_bundle in sapling::arb_bundle_for_version(version),
             orchard_bundle in orchard::arb_bundle_for_version(version),
-            tze_bundle in tze::arb_bundle(consensus_branch_id),
-            version in Just(version)
+            ironwood_bundle in orchard::arb_ironwood_bundle_for_version(version),
+            version in Just(version),
         ) -> TransactionData<Authorized> {
             TransactionData {
                 version,
@@ -2092,36 +2111,8 @@ pub mod testing {
                 sprout_bundle: None,
                 sapling_bundle,
                 orchard_bundle,
-                tze_bundle
-            }
-        }
-    }
-
-    #[cfg(all(zcash_unstable = "zfuture", feature = "zip-233"))]
-    prop_compose! {
-        pub fn arb_txdata(consensus_branch_id: BranchId)(
-            version in arb_tx_version(consensus_branch_id),
-        )(
-            lock_time in any::<u32>(),
-            expiry_height in any::<u32>(),
-            zip233_amount in 0..=MAX_MONEY,
-            transparent_bundle in transparent::arb_bundle(),
-            sapling_bundle in sapling::arb_bundle_for_version(version),
-            orchard_bundle in orchard::arb_bundle_for_version(version),
-            tze_bundle in tze::arb_bundle(consensus_branch_id),
-            version in Just(version)
-        ) -> TransactionData<Authorized> {
-            TransactionData {
-                version,
-                consensus_branch_id,
-                lock_time,
-                expiry_height: expiry_height.into(),
-                zip233_amount: Zatoshis::from_u64(zip233_amount).unwrap(),
-                transparent_bundle,
-                sprout_bundle: None,
-                sapling_bundle,
-                orchard_bundle,
-                tze_bundle
+                ironwood_bundle,
+                staking_action: None,
             }
         }
     }

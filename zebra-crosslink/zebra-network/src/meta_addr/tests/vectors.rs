@@ -1,6 +1,9 @@
 //! Fixed test cases for MetaAddr and MetaAddrChange.
 
-use std::time::Instant;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::{Duration, Instant},
+};
 
 use chrono::Utc;
 
@@ -11,7 +14,8 @@ use zebra_chain::{
 
 use crate::{
     constants::{CONCURRENT_ADDRESS_CHANGE_PERIOD, MAX_PEER_ACTIVE_FOR_GOSSIP},
-    protocol::types::PeerServices,
+    meta_addr::MetaAddrChange,
+    protocol::{external::canonical_peer_addr, types::PeerServices},
     PeerSocketAddr,
 };
 
@@ -33,11 +37,15 @@ fn sanitize_extremes() {
         services: Default::default(),
         untrusted_last_seen: Some(u32::MIN.into()),
         last_response: Some(u32::MIN.into()),
+        rtt: Some(Duration::ZERO),
+        ping_sent_at: None,
         last_attempt: None,
         last_failure: None,
         last_connection_state: Default::default(),
         misbehavior_score: Default::default(),
         is_inbound: false,
+        user_agent: None,
+        negotiated_version: None,
     };
 
     let max_time_entry = MetaAddr {
@@ -45,11 +53,15 @@ fn sanitize_extremes() {
         services: Default::default(),
         untrusted_last_seen: Some(u32::MAX.into()),
         last_response: Some(u32::MAX.into()),
+        rtt: Some(Duration::ZERO),
+        ping_sent_at: None,
         last_attempt: None,
         last_failure: None,
         last_connection_state: Default::default(),
         misbehavior_score: Default::default(),
         is_inbound: false,
+        user_agent: None,
+        negotiated_version: None,
     };
 
     if let Some(min_sanitized) = min_time_entry.sanitize(&Mainnet) {
@@ -154,7 +166,7 @@ fn recently_responded_peer_is_gossipable() {
     let peer_seed = MetaAddr::new_initial_peer(address).into_new_meta_addr(instant_now, local_now);
 
     // Create a peer that has responded
-    let peer = MetaAddr::new_responded(address)
+    let peer = MetaAddr::new_responded(address, None)
         .apply_to_meta_addr(peer_seed, instant_now, chrono_now)
         .expect("Failed to create MetaAddr for responded peer");
 
@@ -174,7 +186,7 @@ fn not_so_recently_responded_peer_is_still_gossipable() {
     let peer_seed = MetaAddr::new_initial_peer(address).into_new_meta_addr(instant_now, local_now);
 
     // Create a peer that has responded
-    let mut peer = MetaAddr::new_responded(address)
+    let mut peer = MetaAddr::new_responded(address, None)
         .apply_to_meta_addr(peer_seed, instant_now, chrono_now)
         .expect("Failed to create MetaAddr for responded peer");
 
@@ -204,7 +216,7 @@ fn responded_long_ago_peer_is_not_gossipable() {
     let peer_seed = MetaAddr::new_initial_peer(address).into_new_meta_addr(instant_now, local_now);
 
     // Create a peer that has responded
-    let mut peer = MetaAddr::new_responded(address)
+    let mut peer = MetaAddr::new_responded(address, None)
         .apply_to_meta_addr(peer_seed, instant_now, chrono_now)
         .expect("Failed to create MetaAddr for responded peer");
 
@@ -234,7 +246,7 @@ fn long_delayed_change_is_not_applied() {
     let peer_seed = MetaAddr::new_initial_peer(address).into_new_meta_addr(instant_now, local_now);
 
     // Create a peer that has responded
-    let peer = MetaAddr::new_responded(address)
+    let peer = MetaAddr::new_responded(address, None)
         .apply_to_meta_addr(peer_seed, instant_now, chrono_now)
         .expect("Failed to create MetaAddr for responded peer");
 
@@ -251,7 +263,7 @@ fn long_delayed_change_is_not_applied() {
             .expect("constant is valid");
 
     let change = MetaAddr::new_errored(address, PeerServices::NODE_NETWORK);
-    let outcome = change.apply_to_meta_addr(peer, instant_early, chrono_early);
+    let outcome = change.apply_to_meta_addr(peer.clone(), instant_early, chrono_early);
 
     assert_eq!(
         outcome, None,
@@ -277,7 +289,7 @@ fn later_revert_change_is_applied() {
     let peer_seed = MetaAddr::new_initial_peer(address).into_new_meta_addr(instant_now, local_now);
 
     // Create a peer that has responded
-    let peer = MetaAddr::new_responded(address)
+    let peer = MetaAddr::new_responded(address, None)
         .apply_to_meta_addr(peer_seed, instant_now, chrono_now)
         .expect("Failed to create MetaAddr for responded peer");
 
@@ -294,7 +306,7 @@ fn later_revert_change_is_applied() {
             .expect("constant is valid");
 
     let change = MetaAddr::new_reconnect(address);
-    let outcome = change.apply_to_meta_addr(peer, instant_late, chrono_late);
+    let outcome = change.apply_to_meta_addr(peer.clone(), instant_late, chrono_late);
 
     assert!(
         outcome.is_some(),
@@ -319,7 +331,7 @@ fn concurrent_state_revert_change_is_not_applied() {
     let peer_seed = MetaAddr::new_initial_peer(address).into_new_meta_addr(instant_now, local_now);
 
     // Create a peer that has responded
-    let peer = MetaAddr::new_responded(address)
+    let peer = MetaAddr::new_responded(address, None)
         .apply_to_meta_addr(peer_seed, instant_now, chrono_now)
         .expect("Failed to create MetaAddr for responded peer");
 
@@ -335,7 +347,7 @@ fn concurrent_state_revert_change_is_not_applied() {
             .expect("constant is valid");
 
     let change = MetaAddr::new_reconnect(address);
-    let outcome = change.apply_to_meta_addr(peer, instant_early, chrono_early);
+    let outcome = change.apply_to_meta_addr(peer.clone(), instant_early, chrono_early);
 
     assert_eq!(
         outcome, None,
@@ -353,7 +365,7 @@ fn concurrent_state_revert_change_is_not_applied() {
             .expect("constant is valid");
 
     let change = MetaAddr::new_reconnect(address);
-    let outcome = change.apply_to_meta_addr(peer, instant_late, chrono_late);
+    let outcome = change.apply_to_meta_addr(peer.clone(), instant_late, chrono_late);
 
     assert_eq!(
         outcome, None,
@@ -378,7 +390,7 @@ fn concurrent_state_progress_change_is_applied() {
     let peer_seed = MetaAddr::new_initial_peer(address).into_new_meta_addr(instant_now, local_now);
 
     // Create a peer that has responded
-    let peer = MetaAddr::new_responded(address)
+    let peer = MetaAddr::new_responded(address, None)
         .apply_to_meta_addr(peer_seed, instant_now, chrono_now)
         .expect("Failed to create MetaAddr for responded peer");
 
@@ -394,7 +406,7 @@ fn concurrent_state_progress_change_is_applied() {
             .expect("constant is valid");
 
     let change = MetaAddr::new_errored(address, None);
-    let outcome = change.apply_to_meta_addr(peer, instant_early, chrono_early);
+    let outcome = change.apply_to_meta_addr(peer.clone(), instant_early, chrono_early);
 
     assert!(
         outcome.is_some(),
@@ -412,7 +424,7 @@ fn concurrent_state_progress_change_is_applied() {
             .expect("constant is valid");
 
     let change = MetaAddr::new_errored(address, None);
-    let outcome = change.apply_to_meta_addr(peer, instant_late, chrono_late);
+    let outcome = change.apply_to_meta_addr(peer.clone(), instant_late, chrono_late);
 
     assert!(
         outcome.is_some(),
@@ -422,4 +434,135 @@ fn concurrent_state_progress_change_is_applied() {
          times: {instant_late:?} {chrono_late}\n\
          peer: {peer:?}"
     );
+}
+
+#[test]
+fn rtt_is_stored_correctly_in_meta_addr() {
+    let _init_guard = zebra_test::init();
+
+    let instant_now = Instant::now();
+    let chrono_now = Utc::now();
+    let local_now: DateTime32 = chrono_now.try_into().expect("will succeed until 2038");
+
+    let address = PeerSocketAddr::from(([192, 168, 180, 9], 10_000));
+    let peer_seed = MetaAddr::new_initial_peer(address).into_new_meta_addr(instant_now, local_now);
+
+    let rtt = Duration::from_millis(128);
+
+    // Create a peer that has responded
+    let peer = MetaAddr::new_responded(address, Some(rtt))
+        .apply_to_meta_addr(peer_seed, instant_now, chrono_now)
+        .expect("Failed to create MetaAddr for responded peer");
+
+    assert_eq!(peer.rtt, Some(rtt));
+}
+
+/// Proof-of-concept for GHSA-63wg-wjjj-7cp8:
+/// IPv4-mapped misbehavior update panics at address-book invariant.
+///
+/// On dual-stack listeners, an inbound IPv4 peer arrives as `::ffff:A.B.C.D`.
+/// The handshake stores the canonical `A.B.C.D` form in the address book, but
+/// the mempool misbehavior path forwards the raw IPv4-mapped address. The
+/// `assert_eq!` in `apply_to_meta_addr` then panics, aborting the node.
+///
+/// This test MUST panic before the fix is applied.
+#[test]
+#[should_panic(expected = "unexpected addr mismatch")]
+fn ipv4_mapped_misbehavior_panics_without_fix() {
+    let _init_guard = zebra_test::init();
+
+    let instant_now = Instant::now();
+    let chrono_now = Utc::now();
+
+    // Simulate what the OS delivers on a dual-stack `[::]` listener for an
+    // incoming IPv4 connection: the kernel presents the address as IPv4-mapped IPv6.
+    let raw_addr = PeerSocketAddr::from(SocketAddr::new(
+        IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+        8233,
+    ));
+    let canonical_addr = canonical_peer_addr(*raw_addr);
+
+    // Sanity: the raw and canonical forms must differ for this bug to fire.
+    assert_ne!(
+        raw_addr, canonical_addr,
+        "test setup: need an IPv4-mapped addr"
+    );
+
+    // Handshake succeeds → address book stores the canonical (IPv4) address.
+    let previous = MetaAddr::new_connected(
+        raw_addr,
+        &PeerServices::NODE_NETWORK,
+        true,
+        String::new(),
+        crate::protocol::external::types::Version(170_100),
+    )
+    .into_new_meta_addr(
+        instant_now,
+        chrono_now.try_into().expect("will succeed until 2038"),
+    );
+
+    assert_eq!(
+        previous.addr(),
+        canonical_addr,
+        "handshake must canonicalize"
+    );
+
+    // Mempool misbehavior path constructs the change with the raw IPv4-mapped
+    // address (as initialize.rs currently does), bypassing canonicalization.
+    let misbehavior_change = MetaAddrChange::UpdateMisbehavior {
+        addr: raw_addr, // ← the unfixed, raw address
+        score_increment: 100,
+    };
+
+    // This call hits `assert_eq!(previous.addr, self.addr())` in apply_to_meta_addr
+    // and panics, aborting the node in production.
+    let _ = misbehavior_change.apply_to_meta_addr(previous, instant_now, chrono_now);
+}
+
+/// Regression test for GHSA-63wg-wjjj-7cp8:
+/// `MetaAddr::new_misbehavior` canonicalizes IPv4-mapped addresses.
+///
+/// After the fix, misbehavior updates for IPv4-mapped IPv6 peers must succeed
+/// and apply to the canonical IPv4 address stored by the handshake.
+#[test]
+fn new_misbehavior_canonicalizes_ipv4_mapped_addr() {
+    let _init_guard = zebra_test::init();
+
+    let instant_now = Instant::now();
+    let chrono_now = Utc::now();
+
+    let raw_addr = PeerSocketAddr::from(SocketAddr::new(
+        IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+        8233,
+    ));
+    let canonical_addr = canonical_peer_addr(*raw_addr);
+
+    assert_ne!(raw_addr, canonical_addr);
+
+    // Handshake stores canonical IPv4 address.
+    let previous = MetaAddr::new_connected(
+        raw_addr,
+        &PeerServices::NODE_NETWORK,
+        true,
+        String::new(),
+        crate::protocol::external::types::Version(170_100),
+    )
+    .into_new_meta_addr(
+        instant_now,
+        chrono_now.try_into().expect("will succeed until 2038"),
+    );
+
+    assert_eq!(previous.addr(), canonical_addr);
+
+    // Fix: new_misbehavior canonicalizes the address.
+    let change = MetaAddr::new_misbehavior(raw_addr, 100);
+
+    assert_eq!(change.addr(), canonical_addr);
+
+    let updated = change
+        .apply_to_meta_addr(previous, instant_now, chrono_now)
+        .expect("canonical misbehavior update should apply to existing peer");
+
+    assert_eq!(updated.addr(), canonical_addr);
+    assert_eq!(updated.misbehavior(), 100);
 }

@@ -11,6 +11,7 @@ expression: block
   "merkleroot": "851bf6fbf7a976327817c738c489d7fa657752445430922d94c983c0b9ed4609",
   "blockcommitments": "0000000000000000000000000000000000000000000000000000000000000000",
   "finalsaplingroot": "0000000000000000000000000000000000000000000000000000000000000000",
+  "nTx": 1,
   "tx": [
     "851bf6fbf7a976327817c738c489d7fa657752445430922d94c983c0b9ed4609"
   ],
@@ -59,6 +60,14 @@ expression: block
     },
     {
       "id": "lockbox",
+      "chainValue": 0.0,
+      "chainValueZat": 0,
+      "monitored": false,
+      "valueDelta": 0.0,
+      "valueDeltaZat": 0
+    },
+    {
+      "id": "ironwood",
       "chainValue": 0.0,
       "chainValueZat": 0,
       "monitored": false,

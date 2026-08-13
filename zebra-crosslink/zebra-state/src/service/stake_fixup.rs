@@ -76,7 +76,8 @@ pub fn fixup_aggregated_stakes(
         false,
         STATE_COLUMN_FAMILIES_IN_CODE.iter().map(ToString::to_string),
         false,
-    );
+    )
+    .expect("opening the finalized state database failed");
 
     let Some(tip_height) = db.finalized_tip_height() else {
         println!("the state cache has no finalized blocks; nothing to do");

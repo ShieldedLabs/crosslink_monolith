@@ -77,7 +77,7 @@ where
         while combined_changes <= MAX_CHANGES_BEFORE_SEND && txs.len() < max_tx_inv_in_message {
             match receiver.try_recv() {
                 Ok(mempool_change) if mempool_change.is_added() => {
-                    txs.extend(mempool_change.into_tx_ids().into_iter())
+                    txs.extend(mempool_change.into_tx_ids())
                 }
                 Ok(_) => {
                     // ignore other changes, we only want to gossip added transactions
@@ -95,7 +95,8 @@ where
         }
 
         let txs_len = txs.len();
-        let request = zn::Request::AdvertiseTransactionIds(txs);
+        // Zebra is the originator of this advertisement, so no peer source.
+        let request = zn::Request::AdvertiseTransactionIds(txs, None);
 
         info!(%request, changes = %combined_changes, "sending mempool transaction broadcast");
         debug!(

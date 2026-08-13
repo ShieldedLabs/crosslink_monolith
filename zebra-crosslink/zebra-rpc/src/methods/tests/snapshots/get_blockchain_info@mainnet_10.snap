@@ -49,6 +49,12 @@ expression: info
       "chainValue": 0.0,
       "chainValueZat": 0,
       "monitored": false
+    },
+    {
+      "id": "ironwood",
+      "chainValue": 0.0,
+      "chainValueZat": 0,
+      "monitored": false
     }
   ],
   "upgrades": {
@@ -85,6 +91,21 @@ expression: info
     "c8e71055": {
       "name": "NU6",
       "activationheight": 2726400,
+      "status": "pending"
+    },
+    "4dec4df0": {
+      "name": "NU6.1",
+      "activationheight": 3146400,
+      "status": "pending"
+    },
+    "5437f330": {
+      "name": "NU6.2",
+      "activationheight": 3364600,
+      "status": "pending"
+    },
+    "37a5165b": {
+      "name": "NU6.3",
+      "activationheight": 3428143,
       "status": "pending"
     }
   },

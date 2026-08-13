@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use bincode::Options;
+use serde_big_array::BigArray;
 
 use zebra_chain::{
     amount::NonNegative,
@@ -22,7 +23,7 @@ use zebra_chain::{
 use crate::service::finalized_state::disk_format::{FromDisk, IntoDisk};
 
 impl IntoDisk for ValueBalance<NonNegative> {
-    type Bytes = [u8; 56];
+    type Bytes = [u8; 64];
 
     fn as_bytes(&self) -> Self::Bytes {
         self.to_bytes()
@@ -87,10 +88,75 @@ impl IntoDisk for HistoryTreeParts {
     }
 }
 
+/// The width of a history-tree [`zcash_history::Entry`] as serialized by database formats written
+/// before NU6.3 (Ironwood) widened `zcash_history::NodeData`. Equal to the pre-Ironwood
+/// `MAX_ENTRY_SIZE`: a `MAX_NODE_DATA_SIZE` of 244 bytes plus the 9-byte entry header.
+const LEGACY_MAX_ENTRY_SIZE: usize = 253;
+
+/// A mirror of [`HistoryTreeParts`] using the pre-NU6.3 [`zcash_history::Entry`] width.
+///
+/// Used to read history trees written by earlier database formats, whose entries are too narrow to
+/// parse at the current width. The field order must match [`HistoryTreeParts`] so the two share a
+/// bincode layout (bincode ignores field names and identifies fields by position).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyHistoryTreeParts {
+    network_kind: NetworkKind,
+    size: u32,
+    peaks: BTreeMap<u32, LegacyEntry>,
+    current_height: Height,
+}
+
+/// A history-tree entry serialized at the pre-NU6.3 [`LEGACY_MAX_ENTRY_SIZE`] width.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyEntry {
+    #[serde(with = "BigArray")]
+    inner: [u8; LEGACY_MAX_ENTRY_SIZE],
+}
+
+impl From<LegacyHistoryTreeParts> for HistoryTreeParts {
+    fn from(legacy: LegacyHistoryTreeParts) -> Self {
+        HistoryTreeParts {
+            network_kind: legacy.network_kind,
+            size: legacy.size,
+            peaks: legacy
+                .peaks
+                .into_iter()
+                .map(|(index, entry)| {
+                    (
+                        index,
+                        zcash_history::Entry::from_raw_bytes_padded(&entry.inner),
+                    )
+                })
+                .collect(),
+            current_height: legacy.current_height,
+        }
+    }
+}
+
 impl FromDisk for HistoryTreeParts {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        bincode::DefaultOptions::new()
-            .deserialize(bytes.as_ref())
+        let bytes = bytes.as_ref();
+        let options = bincode::DefaultOptions::new();
+
+        // Try the current entry width first. Databases written before NU6.3 (Ironwood) widened
+        // `zcash_history::Entry` store narrower entries that fail to parse at the current width, so
+        // fall back to the legacy width and zero-pad each entry up to the current width. New data
+        // always parses at the current width, so it never reaches the fallback.
+        //
+        // The fallback must run on *any* current-width parse error, not just `UnexpectedEof`.
+        // Entries are fixed-size arrays with no length prefix, so parsing a multi-peak legacy record
+        // at the wider width reads later `BTreeMap` keys from the middle of an entry's bytes; bincode
+        // then fails with a varint/integer-range error (not `UnexpectedEof`) whenever a misread key
+        // byte is out of range. Gating on `UnexpectedEof` alone panicked on those records. A genuine
+        // current-format record only reaches the fallback if it is corrupt, in which case the legacy
+        // parse fails too and the error still surfaces.
+        options
+            .deserialize::<HistoryTreeParts>(bytes)
+            .or_else(|_| {
+                options
+                    .deserialize::<LegacyHistoryTreeParts>(bytes)
+                    .map(HistoryTreeParts::from)
+            })
             .expect("deserialization format should match the serialization format used by IntoDisk")
     }
 }
@@ -110,10 +176,25 @@ impl IntoDisk for BlockInfo {
 
 impl FromDisk for BlockInfo {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        // We want to be forward-compatible, so this must work even if the
-        // size of the buffer is larger than expected.
-        // ValueBalance is 56 bytes (7 pools * 8 bytes each), plus 4 bytes for size = 60 bytes total.
+        // A record is a serialized `ValueBalance` followed by a 4-byte block size, so its
+        // length identifies the pool layout that wrote it. `ValueBalance` grew as pools were
+        // added: 40 bytes (pre-Crosslink), 56 bytes (Crosslink staking pools), and 64 bytes
+        // (Crosslink staking pools + the NU6.3 ironwood pool). The open ranges keep this
+        // forward-compatible with any longer record a later version writes.
+        //
+        // NOTE: upstream's 52-byte layout (48-byte pool, ironwood at bytes[40..48]) is absent
+        // on purpose -- Crosslink writes `staking_bonded` at that offset, so a 52-byte record
+        // would be misread. See `ValueBalance::from_bytes`.
         match bytes.as_ref().len() {
+            // Crosslink with ironwood: 64-byte pool + 4-byte size.
+            68.. => {
+                let value_pools = ValueBalance::<NonNegative>::from_bytes(&bytes.as_ref()[0..64])
+                    .expect("must work for 64 bytes");
+                let size =
+                    u32::from_le_bytes(bytes.as_ref()[64..68].try_into().expect("must be 4 bytes"));
+                BlockInfo::new(value_pools, size)
+            }
+            // Legacy Crosslink records: 56-byte pool (staking, no ironwood) + 4-byte size.
             60.. => {
                 let value_pools = ValueBalance::<NonNegative>::from_bytes(&bytes.as_ref()[0..56])
                     .expect("must work for 56 bytes");
@@ -121,7 +202,18 @@ impl FromDisk for BlockInfo {
                     u32::from_le_bytes(bytes.as_ref()[56..60].try_into().expect("must be 4 bytes"));
                 BlockInfo::new(value_pools, size)
             }
+            // Pre-Crosslink records: 40-byte pool + 4-byte size.
+            44.. => {
+                let value_pools = ValueBalance::<NonNegative>::from_bytes(&bytes.as_ref()[0..40])
+                    .expect("must work for 40 bytes");
+                let size =
+                    u32::from_le_bytes(bytes.as_ref()[40..44].try_into().expect("must be 4 bytes"));
+                BlockInfo::new(value_pools, size)
+            }
             _ => panic!("invalid format"),
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

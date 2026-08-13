@@ -13,9 +13,11 @@ use crate::wallet::{init::WalletMigrationError, scanning::priority_code};
 
 use super::add_account_birthdays;
 
-pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0xfa934bdc_97b6_4980_8a83_b2cb1ac465fd);
+/// This migration adds a view that returns the un-scanned ranges associated with each sapling note
+/// commitment tree shard.
+pub const MIGRATION_ID: Uuid = Uuid::from_u128(0xfa934bdc_97b6_4980_8a83_b2cb1ac465fd);
 
-const DEPENDENCIES: &[Uuid] = &[add_account_birthdays::MIGRATION_ID];
+pub(super) const DEPENDENCIES: &[Uuid] = &[add_account_birthdays::MIGRATION_ID];
 
 pub(super) struct Migration<P> {
     pub(super) params: P,
@@ -64,11 +66,12 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                 )",
             SAPLING_SHARD_HEIGHT,
             SAPLING_SHARD_HEIGHT,
-            u32::from(
-                self.params
-                    .activation_height(NetworkUpgrade::Sapling)
-                    .unwrap()
-            ),
+            // Sapling might not be active in regtest mode.
+            self.params
+                .activation_height(NetworkUpgrade::Sapling)
+                .map(|h| u32::from(h).to_string())
+                .as_deref()
+                .unwrap_or("NULL"),
         ))?;
 
         transaction.execute_batch(&format!(

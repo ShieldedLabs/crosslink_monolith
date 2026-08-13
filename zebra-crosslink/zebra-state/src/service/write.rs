@@ -1,6 +1,9 @@
 //! Writing blocks to the finalized and non-finalized states.
 
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use indexmap::IndexMap;
 use tokio::sync::{
@@ -11,8 +14,7 @@ use tokio::sync::{
 use tracing::Span;
 use zebra_chain::{
     block::{self, Height},
-    parallel::tree::NoteCommitmentTrees,
-    transparent::EXTRA_ZEBRA_COINBASE_DATA,
+    parameters::Network,
 };
 
 use crate::{
@@ -22,10 +24,11 @@ use crate::{
         finalized_state::{FinalizedState, ZebraDb},
         non_finalized_state::NonFinalizedState,
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
-        BoxError, ChainTipBlock, ChainTipSender,
+        ChainTipBlock, ChainTipSender,
     },
-    CommitSemanticallyVerifiedError, SemanticallyVerifiedBlock,
+    BoxError, CommitSemanticallyVerifiedError, SemanticallyVerifiedBlock, ValidateContextError,
 };
+use zebra_chain::parallel::tree::NoteCommitmentTrees;
 
 // These types are used in doc links
 #[allow(unused_imports)]
@@ -54,7 +57,7 @@ pub(crate) fn validate_and_commit_non_finalized(
     finalized_state: &ZebraDb,
     non_finalized_state: &mut NonFinalizedState,
     prepared: SemanticallyVerifiedBlock,
-) -> Result<(), CommitSemanticallyVerifiedError> {
+) -> Result<(), ValidateContextError> {
     check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared)?;
     let parent_hash = prepared.block.header.previous_block_hash;
 
@@ -71,7 +74,9 @@ pub(crate) fn validate_and_commit_non_finalized(
 /// channels with the latest non-finalized [`ChainTipBlock`] and
 /// [`Chain`].
 ///
-/// `last_zebra_mined_log_height` is used to rate-limit logging.
+///
+/// If `backup_dir_path` is `Some`, the non-finalized state is written to the backup
+/// directory before updating the channels.
 ///
 /// Returns the latest non-finalized chain tip height.
 ///
@@ -84,7 +89,7 @@ pub(crate) fn validate_and_commit_non_finalized(
         non_finalized_state,
         chain_tip_sender,
         non_finalized_state_sender,
-        last_zebra_mined_log_height
+        backup_dir_path,
     ),
     fields(chains = non_finalized_state.chain_count())
 )]
@@ -92,7 +97,7 @@ fn update_latest_chain_channels(
     non_finalized_state: &NonFinalizedState,
     chain_tip_sender: &mut ChainTipSender,
     non_finalized_state_sender: &watch::Sender<NonFinalizedState>,
-    last_zebra_mined_log_height: &mut Option<Height>,
+    backup_dir_path: Option<&Path>,
 ) -> block::Height {
     let best_chain = non_finalized_state.best_chain().expect("unexpected empty non-finalized state: must commit at least one block before updating channels");
 
@@ -102,9 +107,11 @@ fn update_latest_chain_channels(
         .clone();
     let tip_block = ChainTipBlock::from(tip_block);
 
-    log_if_mined_by_zebra(&tip_block, last_zebra_mined_log_height);
-
     let tip_block_height = tip_block.height;
+
+    if let Some(backup_dir_path) = backup_dir_path {
+        non_finalized_state.write_to_backup(backup_dir_path);
+    }
 
     // If the final receiver was just dropped, ignore the error.
     let _ = non_finalized_state_sender.send(non_finalized_state.clone());
@@ -128,11 +135,10 @@ pub struct WriteBlockWorkerTask {
 
     // Carried across messages. These were locals inside `run()`; they became fields so the
     // per-message work could be extracted into methods without changing what it does.
-    last_zebra_mined_log_height: Option<Height>,
     prev_finalized_note_commitment_trees: Option<NoteCommitmentTrees>,
     /// Errors propagated down to queued child blocks: if a parent was rejected, every
     /// descendant is rejected with the same error.
-    parent_error_map: IndexMap<block::Hash, CommitSemanticallyVerifiedError>,
+    parent_error_map: IndexMap<block::Hash, ValidateContextError>,
 }
 
 impl WriteBlockWorkerTask {
@@ -159,22 +165,11 @@ impl WriteBlockWorkerTask {
             non_finalized_state,
             chain_tip_sender,
             non_finalized_state_sender,
-            last_zebra_mined_log_height: None,
             prev_finalized_note_commitment_trees: None,
             parent_error_map: IndexMap::new(),
         }
     }
 
-    /// Reads blocks from the channels, writes them to the `finalized_state` or `non_finalized_state`,
-    /// sends any errors on the `invalid_block_reset_sender`, then updates the `chain_tip_sender` and
-    /// `non_finalized_state_sender`.
-    #[instrument(
-        level = "debug",
-        skip(self),
-        fields(
-            network = %self.non_finalized_state.network
-        )
-    )]
     /// Commit a checkpoint-verified block straight to the finalized state.
     ///
     /// Used by `zebrad copy-state` and tests, which have an already-validated chain and so
@@ -196,7 +191,6 @@ impl WriteBlockWorkerTask {
         // `latest_chain_tip` -- the sync progress task, the mempool, lightwallet_server -- reads this watch
         // channel, not the database. Committing without publishing leaves them seeing an empty
         // chain forever. The old finalized write loop did this immediately after committing.
-        log_if_mined_by_zebra(&tip_block, &mut self.last_zebra_mined_log_height);
         self.chain_tip_sender.set_finalized_tip(tip_block);
 
         Ok(hash)
@@ -227,7 +221,7 @@ impl WriteBlockWorkerTask {
                 &self.non_finalized_state,
                 &mut self.chain_tip_sender,
                 &self.non_finalized_state_sender,
-                &mut self.last_zebra_mined_log_height,
+                None,
             );
 
             info!("finalized {}, which implicitly finalizes:", hash);
@@ -272,7 +266,7 @@ impl WriteBlockWorkerTask {
     pub fn handle_commit(
         &mut self,
         queued_child: SemanticallyVerifiedBlock,
-    ) -> Result<(), CommitSemanticallyVerifiedError> {
+    ) -> Result<(), ValidateContextError> {
         let child_hash = queued_child.hash;
         let parent_hash = queued_child.block.header.previous_block_hash;
 
@@ -313,7 +307,7 @@ impl WriteBlockWorkerTask {
             &self.non_finalized_state,
             &mut self.chain_tip_sender,
             &self.non_finalized_state_sender,
-            &mut self.last_zebra_mined_log_height,
+            None,
         );
 
         while self
@@ -349,71 +343,3 @@ impl WriteBlockWorkerTask {
 }
 
 
-/// Log a message if this block was mined by Zebra.
-///
-/// Does not detect early Zebra blocks, and blocks with custom coinbase transactions.
-/// Rate-limited to every 1000 blocks using `last_zebra_mined_log_height`.
-fn log_if_mined_by_zebra(
-    tip_block: &ChainTipBlock,
-    last_zebra_mined_log_height: &mut Option<Height>,
-) {
-    // This logs at most every 2-3 checkpoints, which seems fine.
-    const LOG_RATE_LIMIT: u32 = 1000;
-
-    let height = tip_block.height.0;
-
-    if let Some(last_height) = last_zebra_mined_log_height {
-        if height < last_height.0 + LOG_RATE_LIMIT {
-            // If we logged in the last 1000 blocks, don't log anything now.
-            return;
-        }
-    };
-
-    // This code is rate-limited, so we can do expensive transformations here.
-    let coinbase_data = tip_block.transactions[0].inputs()[0]
-        .extra_coinbase_data()
-        .expect("valid blocks must start with a coinbase input")
-        .clone();
-
-    if coinbase_data
-        .as_ref()
-        .starts_with(EXTRA_ZEBRA_COINBASE_DATA.as_bytes())
-    {
-        let text = String::from_utf8_lossy(coinbase_data.as_ref());
-
-        *last_zebra_mined_log_height = Some(Height(height));
-
-        // No need for hex-encoded data if it's exactly what we expected.
-        if coinbase_data.as_ref() == EXTRA_ZEBRA_COINBASE_DATA.as_bytes() {
-            info!(
-                %text,
-                %height,
-                hash = %tip_block.hash,
-                "looks like this block was mined by Zebra!"
-            );
-        } else {
-            // # Security
-            //
-            // Use the extra data as an allow-list, replacing unknown characters.
-            // This makes sure control characters and harmful messages don't get logged
-            // to the terminal.
-            let text = text.replace(
-                |c: char| {
-                    !EXTRA_ZEBRA_COINBASE_DATA
-                        .to_ascii_lowercase()
-                        .contains(c.to_ascii_lowercase())
-                },
-                "?",
-            );
-            let data = hex::encode(coinbase_data.as_ref());
-
-            info!(
-                %text,
-                %data,
-                %height,
-                hash = %tip_block.hash,
-                "looks like this block was mined by Zebra!"
-            );
-        }
-    }
-}

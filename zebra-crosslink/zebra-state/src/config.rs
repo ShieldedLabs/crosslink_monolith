@@ -1,6 +1,7 @@
 //! Cached state configuration for Zebra.
 
 use std::{
+    fmt,
     fs::{self, canonicalize, remove_dir_all, DirEntry, ReadDir},
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -22,6 +23,37 @@ use crate::{
 use zebra_chain::parameters::HardForkSchedule;
 
 use std::sync::Arc;
+
+/// A wrapper for [`String`] which hides its contents from `Debug` output, so that secrets
+/// are not written to logs by types that derive `Debug`.
+///
+/// Serialization is unaffected, so the value still round-trips through the config file. Use
+/// [`RedactedString::as_str()`] to reach the contents deliberately.
+#[derive(Clone, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct RedactedString(String);
+
+impl fmt::Debug for RedactedString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad("[REDACTED]")
+    }
+}
+
+impl RedactedString {
+    /// Return the wrapped string, which exposes its sensitive contents.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<S> From<S> for RedactedString
+where
+    S: Into<String>,
+{
+    fn from(value: S) -> Self {
+        Self(value.into())
+    }
+}
 
 /// Configuration for the state service.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -85,6 +117,17 @@ pub struct Config {
     /// [`cache_dir`]: struct.Config.html#structfield.cache_dir
     pub ephemeral: bool,
 
+    /// Whether to cache non-finalized blocks on disk to be restored when Zebra restarts.
+    ///
+    /// Set to `true` by default. If this is set to `false`, Zebra will irrecoverably drop
+    /// non-finalized blocks when the process exits and will have to re-download them from
+    /// the network when it restarts, if those blocks are still available in the network.
+    ///
+    /// Note: The non-finalized state will be written to a backup cache once per 5 seconds at most.
+    ///       If blocks are added to the non-finalized state more frequently, the backup may not reflect
+    ///       Zebra's last non-finalized state before it shut down.
+    pub should_backup_non_finalized_state: bool,
+
     /// Whether to delete the old database directories when present.
     ///
     /// Set to `true` by default. If this is set to `false`,
@@ -105,6 +148,18 @@ pub struct Config {
     #[serde(with = "humantime_serde")]
     pub debug_validity_check_interval: Option<Duration>,
 
+    /// If true, skip spawning the non-finalized state backup task and instead write
+    /// the non-finalized state to the backup directory synchronously before each update
+    /// to the latest chain tip or non-finalized state channels.
+    ///
+    /// Set to `false` by default. When `true`, the non-finalized state is still restored
+    /// from the backup directory on startup, but updates are written synchronously on every
+    /// block commit rather than asynchronously every 5 seconds.
+    ///
+    /// This is intended for testing scenarios where blocks are committed rapidly and the
+    /// async backup task may not flush all blocks before shutdown.
+    pub debug_skip_non_finalized_state_backup_task: bool,
+
     // Elasticsearch configs
     //
     #[cfg(feature = "elasticsearch")]
@@ -117,6 +172,7 @@ pub struct Config {
 
     #[cfg(feature = "elasticsearch")]
     /// The elasticsearch database password.
+    pub elasticsearch_password: RedactedString,
     pub elasticsearch_password: String,
     
     /// New Networking
@@ -203,6 +259,20 @@ impl Config {
         }
     }
 
+    /// Returns the path for the non-finalized state backup directory, based on the network.
+    /// Non-finalized state backup files are encoded in the network protocol format and remain
+    /// valid across db format upgrades.
+    pub fn non_finalized_state_backup_dir(&self, network: &Network) -> Option<PathBuf> {
+        if self.ephemeral || !self.should_backup_non_finalized_state {
+            // Ephemeral databases are intended to be irrecoverable across restarts and don't
+            // require a backup for the non-finalized state.
+            return None;
+        }
+
+        let net_dir = network.lowercase_name();
+        Some(self.cache_dir.join("non_finalized_state").join(net_dir))
+    }
+
     /// Returns the path for the database format minor/patch version file,
     /// based on the kind, major version and network.
     pub fn version_file_path(
@@ -232,14 +302,17 @@ impl Default for Config {
         Self {
             cache_dir: default_cache_dir(),
             ephemeral: false,
+            should_backup_non_finalized_state: true,
             delete_old_database: true,
             debug_stop_at_height: None,
             debug_validity_check_interval: None,
+            debug_skip_non_finalized_state_backup_task: false,
             #[cfg(feature = "elasticsearch")]
             elasticsearch_url: "https://localhost:9200".to_string(),
             #[cfg(feature = "elasticsearch")]
             elasticsearch_username: "elastic".to_string(),
             #[cfg(feature = "elasticsearch")]
+            elasticsearch_password: RedactedString::default(),
             elasticsearch_password: "".to_string(),
             network_identity_seed_string: None,
             network_local_port: 0,
@@ -314,6 +387,8 @@ fn delete_old_databases(config: Config, db_kind: String, major_version: u64, net
 
     info!(db_kind, "checking for old database versions");
 
+    let restorable_db_versions = restorable_db_versions();
+
     let mut db_path = config.db_path(&db_kind, major_version, network);
     // Check and remove the network path.
     assert_eq!(
@@ -340,7 +415,8 @@ fn delete_old_databases(config: Config, db_kind: String, major_version: u64, net
 
     if let Some(db_kind_dir) = read_dir(&db_path) {
         for entry in db_kind_dir.flatten() {
-            let deleted_db = check_and_delete_database(&config, major_version, &entry);
+            let deleted_db =
+                check_and_delete_database(&config, major_version, &restorable_db_versions, &entry);
 
             if let Some(deleted_db) = deleted_db {
                 info!(?deleted_db, "deleted outdated {db_kind} database directory");
@@ -368,6 +444,7 @@ fn read_dir(dir: &Path) -> Option<ReadDir> {
 fn check_and_delete_database(
     config: &Config,
     major_version: u64,
+    restorable_db_versions: &[u64],
     entry: &DirEntry,
 ) -> Option<PathBuf> {
     let dir_name = parse_dir_name(entry)?;
@@ -378,7 +455,7 @@ fn check_and_delete_database(
     }
 
     // Don't delete databases that can be reused.
-    if restorable_db_versions()
+    if restorable_db_versions
         .iter()
         .map(|v| v - 1)
         .any(|v| v == dir_major_version)
@@ -586,5 +663,29 @@ pub(crate) mod hidden {
         )??;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacted_string_hides_contents_from_debug() {
+        let secret = RedactedString::from("hunter2");
+
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
+        assert_eq!(secret.as_str(), "hunter2");
+    }
+
+    #[cfg(feature = "elasticsearch")]
+    #[test]
+    fn config_debug_does_not_contain_elasticsearch_password() {
+        let config = Config {
+            elasticsearch_password: RedactedString::from("hunter2"),
+            ..Config::default()
+        };
+
+        assert!(!format!("{config:?}").contains("hunter2"));
     }
 }

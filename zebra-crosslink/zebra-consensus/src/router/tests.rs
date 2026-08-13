@@ -1,5 +1,7 @@
 //! Tests for chain verification
 
+#![allow(clippy::unwrap_in_result)]
+
 use std::{sync::Arc, time::Duration};
 
 use color_eyre::eyre::Report;
@@ -45,24 +47,10 @@ pub fn block_no_transactions() -> Block {
 async fn verifiers_from_network(
     network: Network,
 ) -> (
-    impl Service<
-            Request,
-            Response = block::Hash,
-            Error = BoxError,
-            Future = impl Future<Output = Result<block::Hash, BoxError>>,
-        > + Send
-        + Clone
-        + 'static,
-    impl Service<
-            zs::Request,
-            Response = zs::Response,
-            Error = BoxError,
-            Future = impl Future<Output = Result<zs::Response, BoxError>>,
-        > + Send
-        + Clone
-        + 'static,
+    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<BoxService<zs::Request, zs::Response, BoxError>, zs::Request>,
 ) {
-    let state_service = zs::init_test(&network);
+    let state_service = zs::init_test(&network).await;
     let (
         block_verifier_router,
         _transaction_verifier,
@@ -169,7 +157,7 @@ async fn verify_checkpoint(config: Config) -> Result<(), Report> {
         _transaction_verifier,
         _groth16_download_handle,
         _max_checkpoint_height,
-    ) = super::init_test(config.clone(), &network, zs::init_test(&network)).await;
+    ) = super::init_test(config.clone(), &network, zs::init_test(&network).await).await;
 
     // Add a timeout layer
     let block_verifier_router =

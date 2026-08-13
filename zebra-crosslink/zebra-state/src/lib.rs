@@ -11,6 +11,9 @@
 #![doc(html_favicon_url = "https://zfnd.org/wp-content/uploads/2022/03/zebra-favicon-128.png")]
 #![doc(html_logo_url = "https://zfnd.org/wp-content/uploads/2022/03/zebra-icon.png")]
 #![doc(html_root_url = "https://docs.rs/zebra_state")]
+// Remove if possible if MSRV is increased
+#![allow(unknown_lints)]
+#![allow(clippy::manual_is_multiple_of)]
 
 #[macro_use]
 extern crate tracing;
@@ -38,23 +41,26 @@ mod tests;
 
 pub use config::{
     check_and_delete_old_databases, check_and_delete_old_state_databases,
-    database_format_version_on_disk, state_database_format_version_on_disk, Config,
+    database_format_version_on_disk, state_database_format_version_on_disk, Config, RedactedString,
 };
-pub use constants::{state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT};
+pub use constants::{
+    state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT, MAX_NON_FINALIZED_CHAIN_FORKS,
+};
 pub use error::{
-    BoxError, CloneError, CommitSemanticallyVerifiedError, DuplicateNullifierError,
-    ValidateContextError,
+    BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
+    CommitSemanticallyVerifiedError, DuplicateNullifierError, StateInitError, ValidateContextError,
 };
 pub use request::{
-    CheckpointVerifiedBlock, HashOrHeight, ReadRequest, Request, SemanticallyVerifiedBlock,
+    CheckpointVerifiedBlock, CommitSemanticallyVerifiedBlockRequest, HashOrHeight, MappedRequest,
+    ReadRequest, Request, SemanticallyVerifiedBlock,
 };
 
 #[cfg(feature = "indexer")]
 pub use request::Spend;
 
 pub use response::{
-    GetBlockTemplateChainInfo, KnownBlock, KnownBlockLocation, MinedTx, ReadResponse, Response,
-    SidechainFork,
+    AnyTx, GetBlockTemplateChainInfo, KnownBlock, KnownBlockLocation, MinedTx,
+    NonFinalizedBlocksListener, ReadResponse, Response, SidechainFork,
 };
 pub use service::write::WriteBlockWorkerTask;
 pub use service::{
@@ -65,8 +71,8 @@ pub use service::{
     non_finalized_state::NonFinalizedState,
     spawn_init, spawn_init_read_only,
     watch_receiver::WatchReceiver,
-    OutputLocation, TransactionIndex, TransactionLocation,
-    ClosureToCallIntoCrosslinkFromState,
+    ClosureToCallIntoCrosslinkFromState, OutputLocation, ReadState, State, TransactionIndex,
+    TransactionLocation,
 };
 
 // Allow use in the scanner and external tests

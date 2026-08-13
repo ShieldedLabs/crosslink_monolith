@@ -28,6 +28,7 @@ pub mod diagnostic;
 pub mod error;
 pub mod fmt;
 pub mod history_tree;
+pub mod ironwood;
 pub mod orchard;
 pub mod parallel;
 pub mod parameters;
@@ -42,6 +43,7 @@ pub mod transparent;
 pub mod value_balance;
 pub mod work;
 
+pub use bounded_vec::BoundedVec;
 pub use error::Error;
 
 #[cfg(any(test, feature = "proptest-impl"))]

@@ -1,4 +1,4 @@
-//! Provides TestType enum with shared code for acceptance tests
+//! Provides TestType enum with shared code for zebrad tests
 
 use std::{
     env,
@@ -86,6 +86,9 @@ pub enum TestType {
     /// Sync to tip from a lightwalletd cached state.
     ///
     /// This test requires a cached Zebra and lightwalletd state.
+    // Only used with the `lightwalletd-grpc-tests` feature.
+    // Only used with the `lightwalletd-grpc-tests` feature.
+    #[allow(dead_code)]
     UpdateCachedState,
 
     /// Launch `zebrad` and sync it to the tip, but don't launch `lightwalletd`.
@@ -225,7 +228,7 @@ impl TestType {
             // This is what we recommend our users configure.
             random_known_rpc_port_config(true, network)
         } else {
-            default_test_config(network)
+            Ok(default_test_config(network))
         };
 
         let mut config = match config {
@@ -312,6 +315,18 @@ impl TestType {
                     "running {test_name:?} {self:?} lightwalletd test without cached state (no default found)",
                 );
                 None
+            }
+        } else if self.can_create_lightwalletd_cached_state() {
+            // Ensure the directory exists so FullSyncFromGenesis can populate it.
+            if let Err(error) = std::fs::create_dir_all(&default_path) {
+                tracing::warn!(
+                    ?default_path,
+                    ?error,
+                    "failed to create default lightwalletd cache directory; using an ephemeral temp dir instead",
+                );
+                None
+            } else {
+                Some(default_path)
             }
         } else {
             None

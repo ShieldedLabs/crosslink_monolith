@@ -13,7 +13,7 @@ rustybuzz = "0.20.1"
 swash = "0.2.6"
 copypasta = "0.10.1"
 clay-layout = { path = "../clay-rs" }
-wallet = { path = "../zebra-crosslink/wallet" }
+wallet = { path = "../wallet" }
 chrono = "0.4.44"
 
 # Vorbis decode at the packet level; the ogg demuxer is ours.

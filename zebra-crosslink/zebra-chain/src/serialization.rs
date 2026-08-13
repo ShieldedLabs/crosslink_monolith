@@ -15,6 +15,7 @@ mod write_zcash;
 mod zcash_deserialize;
 mod zcash_serialize;
 
+pub mod display_order;
 pub mod sha256d;
 
 pub(crate) mod serde_helpers;
@@ -28,6 +29,7 @@ pub mod tests;
 pub use compact_size::{CompactSize64, CompactSizeMessage};
 pub use constraint::AtLeastOne;
 pub use date_time::{DateTime32, Duration32};
+pub use display_order::BytesInDisplayOrder;
 pub use error::SerializationError;
 pub use read_zcash::ReadZcashExt;
 pub use write_zcash::WriteZcashExt;
@@ -38,5 +40,6 @@ pub use zcash_deserialize::{
 };
 pub use zcash_serialize::{
     zcash_serialize_bytes, zcash_serialize_bytes_external_count, zcash_serialize_empty_list,
-    zcash_serialize_external_count, FakeWriter, ZcashSerialize, MAX_PROTOCOL_MESSAGE_LEN,
+    zcash_serialize_external_count, FakeWriter, ZcashSerialize, MAX_HEADERS_PER_MESSAGE,
+    MAX_PROTOCOL_MESSAGE_LEN,
 };

@@ -97,7 +97,7 @@ pub async fn service_viz_requests(
             else {
                 continue 'main_loop;
             };
-            let orchard_pool_balance = value_balance.orchard_amount().zatoshis();
+            let ironwood_pool_balance = value_balance.ironwood_amount().zatoshis();
             let staking_bonded_pool_balance = value_balance.staking_bonded_amount().zatoshis();
             let staking_unbonded_pool_balance = value_balance.staking_unbonded_amount().zatoshis();
 
@@ -411,7 +411,7 @@ pub async fn service_viz_requests(
                     response.instr_done_n = *TEST_INSTR_C.lock().unwrap();
                     response.instr_failed = TEST_FAILED_INSTR_IDXS.lock().unwrap().clone();
 
-                    response.orchard_pool_balance = orchard_pool_balance;
+                    response.ironwood_pool_balance = ironwood_pool_balance;
                     response.staking_bonded_pool_balance = staking_bonded_pool_balance;
                     response.staking_unbonded_pool_balance = staking_unbonded_pool_balance;
 

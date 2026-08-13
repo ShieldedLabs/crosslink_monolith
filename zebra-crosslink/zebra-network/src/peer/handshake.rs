@@ -9,6 +9,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use chrono::{TimeZone, Utc};
@@ -27,12 +28,14 @@ use tracing::{span, Level, Span};
 use tracing_futures::Instrument;
 
 use zebra_chain::{
+    block,
     chain_tip::{ChainTip, NoChainTip},
     parameters::Network,
     serialization::{DateTime32, SerializationError},
 };
 
 use crate::{
+    connection_metrics::RemoteVersionOutcomeGuard,
     constants,
     meta_addr::MetaAddrChange,
     peer::{
@@ -648,6 +651,13 @@ where
         .single()
         .expect("in-range number of seconds and valid nanosecond");
 
+    // Whether this node is still syncing, used below to decide whether outbound peers must
+    // advertise `NODE_NETWORK`. Read before the match below, which can move `config.network`.
+    let is_syncing = !minimum_peer_version
+        .chain_tip()
+        .is_at_or_near_network_tip(&config.network);
+
+    let network = config.network.clone();
     let (their_addr, our_services, our_listen_addr) = match connected_addr {
         // Version messages require an address, so we use
         // an unspecified address for Isolated connections
@@ -673,6 +683,11 @@ where
         }
     };
 
+    let start_height = minimum_peer_version
+        .chain_tip()
+        .best_tip_height()
+        .unwrap_or(block::Height(0));
+
     let our_version = VersionMessage {
         version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         services: our_services,
@@ -682,7 +697,7 @@ where
         address_from: AddrInVersion::new(our_listen_addr, our_services),
         nonce: local_nonce,
         user_agent: user_agent.clone(),
-        start_height: minimum_peer_version.chain_tip_height(),
+        start_height,
         relay,
     }
     .into();
@@ -713,6 +728,8 @@ where
     };
 
     let remote_address_services = remote.address_from.untrusted_services();
+    let mut remote_version_outcome =
+        RemoteVersionOutcomeGuard::new(&network, connected_addr, &remote.user_agent);
     if remote_address_services != remote.services {
         info!(
             ?remote.services,
@@ -737,7 +754,7 @@ where
     let nonce_reuse = nonces.lock().await.contains(&remote.nonce);
     if nonce_reuse {
         info!(?connected_addr, "rejecting self-connection attempt");
-        Err(HandshakeError::RemoteNonceReuse)?;
+        return Err(remote_version_outcome.record_error(HandshakeError::RemoteNonceReuse));
     }
 
     // # Security
@@ -773,7 +790,48 @@ where
         .set(remote.version.0 as f64);
 
         // Disconnect if peer is using an obsolete version.
-        return Err(HandshakeError::ObsoleteVersion(remote.version));
+        return Err(
+            remote_version_outcome.record_error(HandshakeError::ObsoleteVersion(remote.version))
+        );
+    }
+
+    // # Security
+    //
+    // While syncing, require `NODE_NETWORK` from outbound peers: peers without it can't serve
+    // us historic blocks, but still occupy outbound slots and receive syncer block requests.
+    // When many reachable listeners are non-serving, those slots can fill up and stall a fresh
+    // sync (#11061). This mirrors Bitcoin Core, which requires block-serving peers during
+    // initial block download.
+    //
+    // At or near the network tip the requirement is dropped, because non-serving peers (like
+    // pruned nodes) can still serve recent blocks and transactions. Inbound and isolated
+    // connections are always exempt, so light clients can still connect to us.
+    if is_syncing
+        && matches!(connected_addr, OutboundDirect { .. } | OutboundProxy { .. })
+        && !remote.services.contains(PeerServices::NODE_NETWORK)
+    {
+        debug!(
+            remote_ip = ?their_addr,
+            ?remote.services,
+            ?remote.user_agent,
+            "disconnecting from non-serving peer",
+        );
+
+        // the value is the number of rejected handshakes, by peer IP and advertised services
+        metrics::counter!(
+            "zcash.net.peers.missing_services",
+            "remote_ip" => their_addr.to_string(),
+            "remote_services" => format!("{:?}", remote.services),
+            "user_agent" => remote.user_agent.clone(),
+        )
+        .increment(1);
+
+        // Disconnect if the outbound peer doesn't advertise the required services.
+        return Err(
+            remote_version_outcome.record_error(HandshakeError::MissingRequiredServices {
+                services: remote.services,
+            }),
+        );
     }
 
     let negotiated_version = min(constants::CURRENT_NETWORK_PROTOCOL_VERSION, remote.version);
@@ -812,12 +870,19 @@ where
     )
     .set(connection_info.remote.version.0 as f64);
 
-    peer_conn.send(Message::Verack).await?;
+    if let Err(error) = peer_conn.send(Message::Verack).await {
+        return Err(remote_version_outcome.record_error(HandshakeError::from(error)));
+    }
 
-    let mut remote_msg = peer_conn
-        .next()
-        .await
-        .ok_or(HandshakeError::ConnectionClosed)??;
+    let mut remote_msg = match peer_conn.next().await {
+        Some(Ok(message)) => message,
+        Some(Err(error)) => {
+            return Err(remote_version_outcome.record_error(HandshakeError::from(error)));
+        }
+        None => {
+            return Err(remote_version_outcome.record_error(HandshakeError::ConnectionClosed));
+        }
+    };
 
     // Wait for next message if the one we got is not Verack
     loop {
@@ -827,15 +892,25 @@ where
                 break;
             }
             _ => {
-                remote_msg = peer_conn
-                    .next()
-                    .await
-                    .ok_or(HandshakeError::ConnectionClosed)??;
+                remote_msg = match peer_conn.next().await {
+                    Some(Ok(message)) => message,
+                    Some(Err(error)) => {
+                        return Err(
+                            remote_version_outcome.record_error(HandshakeError::from(error))
+                        );
+                    }
+                    None => {
+                        return Err(
+                            remote_version_outcome.record_error(HandshakeError::ConnectionClosed)
+                        );
+                    }
+                };
                 debug!(?remote_msg, "ignoring non-verack message from remote peer");
             }
         }
     }
 
+    remote_version_outcome.record_success();
     Ok(connection_info)
 }
 
@@ -879,7 +954,7 @@ where
         let HandshakeRequest {
             data_stream,
             connected_addr,
-            connection_tracker,
+            mut connection_tracker,
         } = req;
 
         let negotiator_span = debug_span!("negotiator", peer = ?connected_addr);
@@ -910,6 +985,9 @@ where
                 "negotiating protocol version with remote peer"
             );
 
+            // Start timing the handshake for metrics
+            let handshake_start = Instant::now();
+
             let mut peer_conn = Framed::new(
                 data_stream,
                 Codec::builder()
@@ -918,7 +996,7 @@ where
                     .finish(),
             );
 
-            let connection_info = negotiate_version(
+            let connection_info = match negotiate_version(
                 &mut peer_conn,
                 &connected_addr,
                 config,
@@ -928,12 +1006,57 @@ where
                 relay,
                 minimum_peer_version,
             )
-            .await?;
+            .await
+            {
+                Ok(info) => {
+                    // Record successful handshake duration
+                    let duration = handshake_start.elapsed().as_secs_f64();
+                    metrics::histogram!(
+                        "zcash.net.peer.handshake.duration_seconds",
+                        "result" => "success"
+                    )
+                    .record(duration);
+                    info
+                }
+                Err(err) => {
+                    // Record failed handshake duration and failure reason
+                    let duration = handshake_start.elapsed().as_secs_f64();
+                    let reason = match &err {
+                        HandshakeError::UnexpectedMessage(_) => "unexpected_message",
+                        HandshakeError::RemoteNonceReuse => "nonce_reuse",
+                        HandshakeError::LocalDuplicateNonce => "duplicate_nonce",
+                        HandshakeError::ConnectionClosed => "connection_closed",
+                        HandshakeError::Io(_) => "io_error",
+                        HandshakeError::Serialization(_) => "serialization",
+                        HandshakeError::ObsoleteVersion(_) => "obsolete_version",
+                        HandshakeError::MissingRequiredServices { .. } => {
+                            "missing_required_services"
+                        }
+                        HandshakeError::Timeout => "timeout",
+                    };
+                    metrics::histogram!(
+                        "zcash.net.peer.handshake.duration_seconds",
+                        "result" => "failure"
+                    )
+                    .record(duration);
+                    metrics::counter!(
+                        "zcash.net.peer.handshake.failures.total",
+                        "reason" => reason
+                    )
+                    .increment(1);
+
+                    // Rejected non-serving peers are reported by the crawler's `report_failed`
+                    // without their services, so they get the standard failure backoff and can
+                    // be dialed again once the node is near the network tip (#11061).
+                    return Err(err);
+                }
+            };
 
             let remote_services = connection_info.remote.services;
 
             // The handshake succeeded: update the peer status from AttemptPending to Responded,
-            // and send initial connection info.
+            // send initial connection info, and update the active connection counter.
+            connection_tracker.mark_open();
             if let Some(book_addr) = connected_addr.get_address_book_addr() {
                 // the collector doesn't depend on network activity,
                 // so this await should not hang
@@ -942,6 +1065,8 @@ where
                         book_addr,
                         &remote_services,
                         connected_addr.is_inbound(),
+                        connection_info.remote.user_agent.clone(),
+                        connection_info.negotiated_version,
                     ))
                     .await;
             }
@@ -953,6 +1078,7 @@ where
             // stream from the unversioned Framed wrapper and construct a new one with a versioned codec.
             let bare_codec = peer_conn.codec_mut();
             bare_codec.reconfigure_version(connection_info.negotiated_version);
+            bare_codec.reconfigure_full_body_len();
 
             debug!("constructing client, spawning server");
 
@@ -1312,8 +1438,15 @@ async fn send_periodic_heartbeats_run_loop(
     while let Some(_instant) = interval_stream.next().await {
         // We've reached another heartbeat interval without
         // shutting down, so do a heartbeat request.
+        let ping_sent_at = Instant::now();
+        if let Some(book_addr) = connected_addr.get_address_book_addr() {
+            let _ = heartbeat_ts_collector
+                .send(MetaAddr::new_ping_sent(book_addr, ping_sent_at.into()))
+                .await;
+        }
+
         let heartbeat = send_one_heartbeat(&mut server_tx);
-        heartbeat_timeout(heartbeat, &heartbeat_ts_collector, &connected_addr).await?;
+        let rtt = heartbeat_timeout(heartbeat, &heartbeat_ts_collector, &connected_addr).await?;
 
         // # Security
         //
@@ -1322,11 +1455,13 @@ async fn send_periodic_heartbeats_run_loop(
         // - the number of connections is limited
         // - Zebra initiates each heartbeat using a timer
         if let Some(book_addr) = connected_addr.get_address_book_addr() {
-            // the collector doesn't depend on network activity,
-            // so this await should not hang
-            let _ = heartbeat_ts_collector
-                .send(MetaAddr::new_responded(book_addr))
-                .await;
+            if let Some(rtt) = rtt {
+                // the collector doesn't depend on network activity,
+                // so this await should not hang
+                let _ = heartbeat_ts_collector
+                    .send(MetaAddr::new_responded(book_addr, Some(rtt)))
+                    .await;
+            }
         }
     }
 
@@ -1336,7 +1471,7 @@ async fn send_periodic_heartbeats_run_loop(
 /// Send one heartbeat using `server_tx`.
 async fn send_one_heartbeat(
     server_tx: &mut futures::channel::mpsc::Sender<ClientRequest>,
-) -> Result<(), BoxError> {
+) -> Result<Response, BoxError> {
     // We just reached a heartbeat interval, so start sending
     // a heartbeat.
     let (tx, rx) = oneshot::channel();
@@ -1376,23 +1511,20 @@ async fn send_one_heartbeat(
     // Heartbeats are checked internally to the
     // connection logic, but we need to wait on the
     // response to avoid canceling the request.
-    rx.await??;
-    tracing::trace!("got heartbeat response");
+    let response = rx.await??;
+    tracing::trace!(?response, "got heartbeat response");
 
-    Ok(())
+    Ok(response)
 }
 
 /// Wrap `fut` in a timeout, handing any inner or outer errors using
 /// `handle_heartbeat_error`.
-async fn heartbeat_timeout<F, T>(
-    fut: F,
+async fn heartbeat_timeout(
+    fut: impl Future<Output = Result<Response, BoxError>>,
     address_book_updater: &tokio::sync::mpsc::Sender<MetaAddrChange>,
     connected_addr: &ConnectedAddr,
-) -> Result<T, BoxError>
-where
-    F: Future<Output = Result<T, BoxError>>,
-{
-    let t = match timeout(constants::HEARTBEAT_INTERVAL, fut).await {
+) -> Result<Option<Duration>, BoxError> {
+    let response = match timeout(constants::HEARTBEAT_INTERVAL, fut).await {
         Ok(inner_result) => {
             handle_heartbeat_error(inner_result, address_book_updater, connected_addr).await?
         }
@@ -1401,7 +1533,12 @@ where
         }
     };
 
-    Ok(t)
+    let rtt = match response {
+        Response::Pong(rtt) => Some(rtt),
+        _ => None,
+    };
+
+    Ok(rtt)
 }
 
 /// If `result.is_err()`, mark `connected_addr` as failed using `address_book_updater`.

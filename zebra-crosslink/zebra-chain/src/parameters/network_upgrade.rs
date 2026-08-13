@@ -4,6 +4,7 @@ use NetworkUpgrade::*;
 
 use crate::block;
 use crate::parameters::{Network, Network::*};
+use crate::serialization::BytesInDisplayOrder;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -11,30 +12,20 @@ use std::fmt;
 use chrono::{DateTime, Duration, Utc};
 use hex::{FromHex, ToHex};
 
+use strum::{EnumIter, IntoEnumIterator};
+
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
-
-/// A list of network upgrades in the order that they must be activated.
-const NETWORK_UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
-    Genesis,
-    BeforeOverwinter,
-    Overwinter,
-    Sapling,
-    Blossom,
-    Heartwood,
-    Canopy,
-    Nu5,
-    Nu6,
-    Nu6_1,
-    #[cfg(any(test, feature = "zebra-test"))]
-    Nu7,
-];
 
 /// A Zcash network upgrade.
 ///
 /// Network upgrades change the Zcash network protocol or consensus rules. Note that they have no
 /// designated codenames from NU5 onwards.
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Ord, PartialOrd)]
+///
+/// Enum variants must be ordered by activation height.
+#[derive(
+    Copy, Clone, EnumIter, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Ord, PartialOrd,
+)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum NetworkUpgrade {
     /// The Zcash protocol for a Genesis block.
@@ -67,6 +58,12 @@ pub enum NetworkUpgrade {
     /// The Zcash protocol after the NU6.1 upgrade.
     #[serde(rename = "NU6.1")]
     Nu6_1,
+    /// The Zcash protocol after the NU6.2 upgrade.
+    #[serde(rename = "NU6.2")]
+    Nu6_2,
+    /// The Zcash protocol after the NU6.3 (Ironwood) upgrade.
+    #[serde(rename = "NU6.3")]
+    Nu6_3,
     /// The Zcash protocol after the NU7 upgrade.
     #[serde(rename = "NU7")]
     Nu7,
@@ -104,23 +101,23 @@ impl fmt::Display for NetworkUpgrade {
 /// Don't use this directly; use NetworkUpgrade::activation_list() so that
 /// we can switch to fake activation heights for some tests.
 #[allow(unused)]
-pub(super) const MAINNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = &[
-    (block::Height(0), Genesis),
-    (block::Height(1), BeforeOverwinter),
-    (block::Height(347_500), Overwinter),
-    (block::Height(419_200), Sapling),
-    (block::Height(653_600), Blossom),
-    (block::Height(903_000), Heartwood),
-    (block::Height(1_046_400), Canopy),
-    (block::Height(1_687_104), Nu5),
-    (block::Height(2_726_400), Nu6),
-];
-
-/// The block height at which NU6.1 activates on the default Testnet.
-// See NU6.1 Testnet activation height in zcashd:
-// <https://github.com/zcash/zcash/blob/b65b008a7b334a2f7c2eaae1b028e011f2e21dd1/src/chainparams.cpp#L472>
-pub const NU6_1_ACTIVATION_HEIGHT_TESTNET: block::Height = block::Height(3_536_500);
-
+pub(super) const MAINNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = {
+    use super::constants::activation_heights::mainnet::*;
+    &[
+        (block::Height(0), Genesis),
+        (BEFORE_OVERWINTER, BeforeOverwinter),
+        (OVERWINTER, Overwinter),
+        (SAPLING, Sapling),
+        (BLOSSOM, Blossom),
+        (HEARTWOOD, Heartwood),
+        (CANOPY, Canopy),
+        (NU5, Nu5),
+        (NU6, Nu6),
+        (NU6_1, Nu6_1),
+        (NU6_2, Nu6_2),
+        (NU6_3, Nu6_3),
+    ]
+};
 /// Testnet network upgrade activation heights.
 ///
 /// This is actually a bijective map, but it is const, so we use a vector, and
@@ -130,32 +127,20 @@ pub const NU6_1_ACTIVATION_HEIGHT_TESTNET: block::Height = block::Height(3_536_5
 ///
 /// Don't use this directly; use NetworkUpgrade::activation_list() so that
 /// we can switch to fake activation heights for some tests.
+///
+/// Crosslink overrides the public testnet schedule: the Crosslink testnet activates
+/// straight into a single upgrade at height 1 rather than replaying Zcash's history.
+/// Upstream's schedule (which now runs through NU6.3) is deliberately not used here.
+///
+/// @todo(crosslink): this activates NU6 only, so a NU6.3 consensus branch ID is never
+/// reached on this network -- and `Transaction::V6` / `Transaction::VCrosslink` carry
+/// NU6.3-era branch IDs. Until this is bumped to `Nu6_3`, the Ironwood-based Crosslink
+/// transaction cannot be used on the Crosslink testnet. Bumping it forks any running
+/// testnet (including ClT0), so it is left as-is pending that decision.
 #[allow(unused)]
 pub(super) const TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = &[
     (block::Height(0), Genesis),
     (block::Height(1), Nu6),
-    // (block::Height(1), BeforeOverwinter),
-    // (block::Height(207_500), Overwinter),
-    // (block::Height(280_000), Sapling),
-    // (block::Height(584_000), Blossom),
-    // (block::Height(903_800), Heartwood),
-    // (block::Height(1_028_500), Canopy),
-    // (block::Height(1_842_420), Nu5),
-    // (block::Height(2_976_000), Nu6),
-];
-
-/// Fake testnet network upgrade activation heights, used in tests.
-#[allow(unused)]
-const FAKE_TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = &[
-    (block::Height(0), Genesis),
-    (block::Height(5), BeforeOverwinter),
-    (block::Height(10), Overwinter),
-    (block::Height(15), Sapling),
-    (block::Height(20), Blossom),
-    (block::Height(25), Heartwood),
-    (block::Height(30), Canopy),
-    (block::Height(35), Nu5),
-    (block::Height(40), Nu6),
 ];
 
 /// The Consensus Branch Id, used to bind transactions and blocks to a
@@ -163,13 +148,13 @@ const FAKE_TESTNET_ACTIVATION_HEIGHTS: &[(block::Height, NetworkUpgrade)] = &[
 #[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ConsensusBranchId(pub(crate) u32);
 
-impl ConsensusBranchId {
-    /// Return the hash bytes in big-endian byte-order suitable for printing out byte by byte.
-    ///
-    /// Zebra displays consensus branch IDs in big-endian byte-order,
-    /// following the convention set by zcashd.
-    fn bytes_in_display_order(&self) -> [u8; 4] {
+impl BytesInDisplayOrder<false, 4> for ConsensusBranchId {
+    fn bytes_in_serialized_order(&self) -> [u8; 4] {
         self.0.to_be_bytes()
+    }
+
+    fn from_bytes_in_serialized_order(bytes: [u8; 4]) -> Self {
+        ConsensusBranchId(u32::from_be_bytes(bytes))
     }
 }
 
@@ -248,10 +233,17 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     (Nu5, ConsensusBranchId(0xc2d6d0b4)),
     (Nu6, ConsensusBranchId(0xc8e71055)),
     (Nu6_1, ConsensusBranchId(0x4dec4df0)),
+    (Nu6_2, ConsensusBranchId(0x5437f330)),
+    // The NU6.3 (Ironwood) consensus branch id, matching zcash_protocol's `BranchId::Nu6_3`.
+    (Nu6_3, ConsensusBranchId(0x37a5165b)),
+    // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
     #[cfg(any(test, feature = "zebra-test"))]
-    (Nu7, ConsensusBranchId(0x77190ad8)),
+    (Nu7, ConsensusBranchId(0xfffffffe)),
+    // Distinct test placeholder so it never collides with the `Nu7` placeholder above
+    // (which is gated on `test`/`zebra-test`, independent of `zfuture`); a collision would break
+    // the `branch_id_bijective` test under `--cfg zcash_unstable="zfuture"`.
     #[cfg(zcash_unstable = "zfuture")]
-    (ZFuture, ConsensusBranchId(0xffffffff)),
+    (ZFuture, ConsensusBranchId(0xfffffffd)),
 ];
 
 /// The target block spacing before Blossom.
@@ -303,9 +295,8 @@ impl Network {
     /// Returns a vector of all implicit and explicit network upgrades for `network`,
     /// in ascending height order.
     pub fn full_activation_list(&self) -> Vec<(block::Height, NetworkUpgrade)> {
-        NETWORK_UPGRADES_IN_ORDER
-            .iter()
-            .map_while(|&nu| Some((NetworkUpgrade::activation_height(&nu, self)?, nu)))
+        NetworkUpgrade::iter()
+            .filter_map(|nu| Some((NetworkUpgrade::activation_height(&nu, self)?, nu)))
             .collect()
     }
 }
@@ -417,7 +408,7 @@ impl NetworkUpgrade {
     pub fn target_spacing(&self) -> Duration {
         let spacing_seconds = match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling => PRE_BLOSSOM_POW_TARGET_SPACING,
-            Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu7 => {
+            Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7 => {
                 POST_BLOSSOM_POW_TARGET_SPACING.into()
             }
 
@@ -527,7 +518,7 @@ impl NetworkUpgrade {
 
     /// Returns an iterator over [`NetworkUpgrade`] variants.
     pub fn iter() -> impl DoubleEndedIterator<Item = NetworkUpgrade> {
-        NETWORK_UPGRADES_IN_ORDER.iter().copied()
+        <Self as IntoEnumIterator>::iter()
     }
 }
 
@@ -542,7 +533,12 @@ impl From<zcash_protocol::consensus::NetworkUpgrade> for NetworkUpgrade {
             zcash_protocol::consensus::NetworkUpgrade::Nu5 => Self::Nu5,
             zcash_protocol::consensus::NetworkUpgrade::Nu6 => Self::Nu6,
             zcash_protocol::consensus::NetworkUpgrade::Nu6_1 => Self::Nu6_1,
-            // zcash_protocol::consensus::NetworkUpgrade::Nu7 => Self::Nu7,
+            zcash_protocol::consensus::NetworkUpgrade::Nu6_2 => Self::Nu6_2,
+            zcash_protocol::consensus::NetworkUpgrade::Nu6_3 => Self::Nu6_3,
+            #[cfg(zcash_unstable = "nu7")]
+            zcash_protocol::consensus::NetworkUpgrade::Nu7 => Self::Nu7,
+            #[cfg(zcash_unstable = "zfuture")]
+            zcash_protocol::consensus::NetworkUpgrade::ZFuture => Self::ZFuture,
         }
     }
 }

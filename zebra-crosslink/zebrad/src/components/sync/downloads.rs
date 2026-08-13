@@ -108,6 +108,7 @@ pub enum BlockDownloadVerifyError {
     AboveLookaheadHeightLimit {
         height: block::Height,
         hash: block::Hash,
+        advertiser_addr: Option<PeerSocketAddr>,
     },
 
     #[error("downloaded block was too far behind the chain tip: {height:?} {hash:?}")]
@@ -117,7 +118,10 @@ pub enum BlockDownloadVerifyError {
     },
 
     #[error("downloaded block had an invalid height: {hash:?}")]
-    InvalidHeight { hash: block::Hash },
+    InvalidHeight {
+        hash: block::Hash,
+        advertiser_addr: Option<PeerSocketAddr>,
+    },
 
     #[error("block failed consensus validation: {error:?} {height:?} {hash:?}")]
     Invalid {
@@ -379,11 +383,14 @@ where
             async move {
                 // Download the block.
                 // Prefer the cancel handle if both are ready.
+                let download_start = std::time::Instant::now();
                 let rsp = tokio::select! {
                     biased;
                     _ = &mut cancel_rx => {
                         trace!("task cancelled prior to download completion");
                         metrics::counter!("sync.cancelled.download.count").increment(1);
+                        metrics::histogram!("sync.block.download.duration_seconds", "result" => "cancelled")
+                            .record(download_start.elapsed().as_secs_f64());
                         return Err(BlockDownloadVerifyError::CancelledDuringDownload { hash })
                     }
                     rsp = block_req => rsp.map_err(|error| BlockDownloadVerifyError::DownloadFailed { error, hash})?,
@@ -405,6 +412,8 @@ where
                     unreachable!("wrong response to block request");
                 };
                 metrics::counter!("sync.downloaded.block.count").increment(1);
+                metrics::histogram!("sync.block.download.duration_seconds", "result" => "success")
+                    .record(download_start.elapsed().as_secs_f64());
 
                 // Security & Performance: reject blocks that are too far ahead of our tip.
                 // Avoids denial of service attacks, and reduces wasted work on high blocks
@@ -457,11 +466,11 @@ where
                     );
                     metrics::counter!("sync.no.height.dropped.block.count").increment(1);
 
-                    return Err(BlockDownloadVerifyError::InvalidHeight { hash });
+                    return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr });
                 };
 
                 if block_height > lookahead_drop_height {
-                    Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit { height: block_height, hash })?;
+                    Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit { height: block_height, hash, advertiser_addr })?;
                 } else if block_height > lookahead_pause_height {
                     // This log can be very verbose, usually hundreds of blocks are dropped.
                     // So we only log at info level for the first above-height block.

@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use incrementalmerkletree::{Hashable, Level};
+use incrementalmerkletree::{Address as TreeAddress, Hashable, Level, Position};
 use sapling::{
     note_encryption::try_sapling_output_recovery,
     zip32::{DiversifiableFullViewingKey, ExtendedSpendingKey},
@@ -9,7 +9,7 @@ use shardtree::error::ShardTreeError;
 use zcash_keys::{address::Address, keys::UnifiedSpendingKey};
 use zcash_primitives::transaction::{Transaction, components::sapling::zip212_enforcement};
 use zcash_protocol::{
-    ShieldedProtocol,
+    ShieldedPool,
     consensus::{self, BlockHeight},
     memo::MemoBytes,
     value::Zatoshis,
@@ -21,7 +21,10 @@ use crate::{
         DecryptedTransaction, InputSource, TargetValue, WalletCommitmentTrees, WalletSummary,
         WalletTest,
         chain::{CommitmentTreeRoot, ScanSummary},
-        wallet::{ConfirmationsPolicy, TargetHeight},
+        wallet::{
+            ConfirmationsPolicy, TargetHeight,
+            input_selection::{LockFilter, LockedInputPolicy},
+        },
     },
     wallet::{Note, ReceivedNote},
 };
@@ -31,7 +34,7 @@ use super::{TestState, pool::ShieldedPoolTester};
 /// Type for running pool-agnostic tests on the Sapling pool.
 pub struct SaplingPoolTester;
 impl ShieldedPoolTester for SaplingPoolTester {
-    const SHIELDED_PROTOCOL: ShieldedProtocol = ShieldedProtocol::Sapling;
+    const SHIELDED_PROTOCOL: ShieldedPool = ShieldedPool::Sapling;
     // const MERKLE_TREE_DEPTH: u8 = sapling::NOTE_COMMITMENT_TREE_DEPTH;
 
     type Sk = ExtendedSpendingKey;
@@ -86,6 +89,17 @@ impl ShieldedPoolTester for SaplingPoolTester {
             .put_sapling_subtree_roots(start_index, roots)
     }
 
+    fn shard_root<Cache, DbT: WalletTest + WalletCommitmentTrees, P>(
+        st: &mut TestState<Cache, DbT, P>,
+        shard_index: u64,
+    ) -> Result<Self::MerkleTreeHash, ShardTreeError<<DbT as WalletCommitmentTrees>::Error>> {
+        let shard_height = crate::data_api::SAPLING_SHARD_HEIGHT;
+        let addr = TreeAddress::from_parts(Level::from(shard_height), shard_index);
+        let end_position = Position::from((shard_index + 1) << shard_height);
+        st.wallet_mut()
+            .with_sapling_tree_mut(|tree| tree.root(addr, end_position))
+    }
+
     fn next_subtree_index<A: Hash + Eq>(s: &WalletSummary<A>) -> u64 {
         s.next_sapling_subtree_index()
     }
@@ -106,10 +120,11 @@ impl ShieldedPoolTester for SaplingPoolTester {
             .select_spendable_notes(
                 account,
                 target_value,
-                &[ShieldedProtocol::Sapling],
+                &[ShieldedPool::Sapling],
                 target_height,
                 confirmations_policy,
                 exclude,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map(|n| n.take_sapling())
     }
@@ -123,19 +138,20 @@ impl ShieldedPoolTester for SaplingPoolTester {
         st.wallet()
             .select_unspent_notes(
                 account,
-                &[ShieldedProtocol::Sapling],
+                &[ShieldedPool::Sapling],
                 target_height,
                 exclude,
+                LockFilter::Policy(&LockedInputPolicy::Exclude),
             )
             .map(|n| n.take_sapling())
     }
 
-    fn decrypted_pool_outputs_count<A>(d_tx: &DecryptedTransaction<'_, A>) -> usize {
+    fn decrypted_pool_outputs_count<A>(d_tx: &DecryptedTransaction<Transaction, A>) -> usize {
         d_tx.sapling_outputs().len()
     }
 
     fn with_decrypted_pool_memos<A>(
-        d_tx: &DecryptedTransaction<'_, A>,
+        d_tx: &DecryptedTransaction<Transaction, A>,
         mut f: impl FnMut(&MemoBytes),
     ) {
         for output in d_tx.sapling_outputs() {

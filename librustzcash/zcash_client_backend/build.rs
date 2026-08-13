@@ -71,6 +71,14 @@ fn build(out_dir: &Path) -> io::Result<()> {
             "crate::proto::compact_formats::CompactTx",
         )
         .extern_path(
+            ".cash.z.wallet.sdk.rpc.CompactTxIn",
+            "crate::proto::compact_formats::CompactTxIn",
+        )
+        .extern_path(
+            ".cash.z.wallet.sdk.rpc.TxOut",
+            "crate::proto::compact_formats::TxOut",
+        )
+        .extern_path(
             ".cash.z.wallet.sdk.rpc.CompactSaplingSpend",
             "crate::proto::compact_formats::CompactSaplingSpend",
         )

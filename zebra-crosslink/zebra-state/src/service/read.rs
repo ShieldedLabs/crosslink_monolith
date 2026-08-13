@@ -30,8 +30,9 @@ pub use address::{
     utxo::{address_utxos, AddressUtxos},
 };
 pub use block::{
-    any_utxo, block, block_and_size, block_header, block_info, mined_transaction,
-    transaction_hashes_for_block, unspent_utxo,
+    any_block, any_transaction, any_utxo, block, block_and_size, block_header, block_info,
+    mined_transaction, transaction_hashes_for_any_block, transaction_hashes_for_block,
+    unspent_utxo,
 };
 
 #[cfg(feature = "indexer")]
@@ -39,11 +40,14 @@ pub use block::spending_transaction_hash;
 
 pub use find::{
     best_tip, block_locator, block_sequence, depth, finalized_state_contains_block_hash,
-    find_chain_hashes, find_chain_headers, hash_by_height, height_by_hash, next_median_time_past,
-    non_finalized_state_contains_block_hash, sidechain_forks, tip, tip_height,
-    tip_with_value_balance,
+    find_chain_hashes, find_chain_headers, find_fork_point, hash_by_height, height_by_hash,
+    next_median_time_past, non_finalized_state_contains_block_hash, sidechain_forks, tip,
+    tip_height, tip_with_value_balance,
 };
-pub use tree::{orchard_subtrees, orchard_tree, sapling_subtrees, sapling_tree};
+pub use tree::{
+    ironwood_subtrees, ironwood_tree, orchard_subtrees, orchard_tree, sapling_subtrees,
+    sapling_tree,
+};
 pub use delegation::{
     bond_exists, delegation_bond, is_bond_active, is_bond_unbonding, is_bond_withdrawn,
 };

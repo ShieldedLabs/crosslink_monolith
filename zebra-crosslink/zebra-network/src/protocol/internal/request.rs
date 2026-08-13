@@ -6,6 +6,7 @@ use zebra_chain::{
 };
 
 use super::super::types::Nonce;
+use crate::PeerSocketAddr;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
@@ -141,10 +142,16 @@ pub enum Request {
     ///
     /// This is implemented by sending an unsolicited `tx` message.
     ///
+    /// The second field is the address of the peer that pushed this `tx` to us:
+    /// `Some(addr)` when a remote peer sent us the full transaction directly,
+    /// and `None` when Zebra originates the push itself. Used by the mempool
+    /// downloader to enforce a per-peer queue cap, mirroring
+    /// [`Request::AdvertiseTransactionIds`]. See `GHSA-m9xx-8rcj-vmgp`.
+    ///
     /// # Returns
     ///
     /// Returns [`Response::Nil`](super::Response::Nil).
-    PushTransaction(UnminedTx),
+    PushTransaction(UnminedTx, Option<PeerSocketAddr>),
 
     /// Advertise a set of unmined transactions to all peers.
     ///
@@ -164,10 +171,16 @@ pub enum Request {
     /// The peer set routes this request specially, sending it to *half of*
     /// the available peers.
     ///
+    /// The second field is the address of the peer that sent us this `inv`:
+    /// `Some(addr)` when the advertisement was relayed from a remote peer,
+    /// and `None` when Zebra originates the advertisement itself (e.g. the
+    /// mempool gossip task). Used by the mempool downloader to enforce a
+    /// per-peer queue cap. See `GHSA-4fc2-h7jh-287c`.
+    ///
     /// # Returns
     ///
     /// Returns [`Response::Nil`](super::Response::Nil).
-    AdvertiseTransactionIds(HashSet<UnminedTxId>),
+    AdvertiseTransactionIds(HashSet<UnminedTxId>, Option<PeerSocketAddr>),
 
     /// Advertise a block to all peers.
     ///
@@ -177,13 +190,26 @@ pub enum Request {
     /// [`Request::BlocksByHash`] against the "inbound" service passed to
     /// [`init`](crate::init).
     ///
-    /// The peer set routes this request specially, sending it to *half of*
-    /// the available peers.
+    /// The peer set routes this request specially, sending it to *a fraction of*
+    /// the available peers. See [`number_of_peers_to_broadcast()`](crate::PeerSet::number_of_peers_to_broadcast)
+    /// for more details.
+    ///
+    /// The second field is the address of the peer that sent us this `inv`:
+    /// `Some(addr)` when the advertisement was relayed from a remote peer,
+    /// and `None` when Zebra originates the advertisement itself (for
+    /// example from the sync gossip task). Consumers use the address to
+    /// apply per-peer policies such as the inbound download per-IP cap.
     ///
     /// # Returns
     ///
     /// Returns [`Response::Nil`](super::Response::Nil).
-    AdvertiseBlock(block::Hash),
+    AdvertiseBlock(block::Hash, Option<PeerSocketAddr>),
+
+    /// Advertise a block to all ready peers. This is equivalent to
+    /// [`Request::AdvertiseBlock`] except that the peer set will route
+    /// this request to all available ready peers. Used by the gossip task
+    /// to broadcast mined blocks to all ready peers.
+    AdvertiseBlockToAll(block::Hash),
 
     /// Request the contents of this node's mempool.
     ///
@@ -215,12 +241,13 @@ impl fmt::Display for Request {
                 if stop.is_some() { "Some" } else { "None" },
             ),
 
-            Request::PushTransaction(_) => "PushTransaction".to_string(),
-            Request::AdvertiseTransactionIds(ids) => {
+            Request::PushTransaction(..) => "PushTransaction".to_string(),
+            Request::AdvertiseTransactionIds(ids, _) => {
                 format!("AdvertiseTransactionIds({})", ids.len())
             }
 
-            Request::AdvertiseBlock(_) => "AdvertiseBlock".to_string(),
+            Request::AdvertiseBlock(_, _) => "AdvertiseBlock".to_string(),
+            Request::AdvertiseBlockToAll(_) => "AdvertiseBlockToAll".to_string(),
             Request::MempoolTransactionIds => "MempoolTransactionIds".to_string(),
         })
     }
@@ -239,10 +266,10 @@ impl Request {
             Request::FindBlocks { .. } => "FindBlocks",
             Request::FindHeaders { .. } => "FindHeaders",
 
-            Request::PushTransaction(_) => "PushTransaction",
-            Request::AdvertiseTransactionIds(_) => "AdvertiseTransactionIds",
+            Request::PushTransaction(..) => "PushTransaction",
+            Request::AdvertiseTransactionIds(_, _) => "AdvertiseTransactionIds",
 
-            Request::AdvertiseBlock(_) => "AdvertiseBlock",
+            Request::AdvertiseBlock(_, _) | Request::AdvertiseBlockToAll(_) => "AdvertiseBlock",
             Request::MempoolTransactionIds => "MempoolTransactionIds",
         }
     }

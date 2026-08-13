@@ -67,7 +67,7 @@
 //!
 //! // Functions that return a pointer to a heap-allocated address of the given kind in
 //! // the target language. These should be augmented to return any relevant errors.
-//! extern {
+//! unsafe extern {
 //!     fn addr_from_sapling(data: *const u8) -> *mut c_void;
 //!     fn addr_from_transparent_p2pkh(data: *const u8) -> *mut c_void;
 //! }
@@ -144,7 +144,7 @@ mod convert;
 mod encoding;
 mod kind;
 
-#[cfg(any(test, feature = "test-dependencies"))]
+#[cfg(feature = "test-dependencies")]
 pub mod test_vectors;
 
 pub use convert::{ConversionError, Converter, ToAddress, TryFromAddress, UnsupportedAddress};
@@ -152,10 +152,7 @@ pub use encoding::ParseError;
 pub use kind::unified;
 use kind::unified::Receiver;
 
-#[deprecated(note = "use ::zcash_protocol::consensus::NetworkType instead")]
-pub type Network = zcash_protocol::consensus::NetworkType;
-
-use zcash_protocol::{consensus::NetworkType, PoolType};
+use zcash_protocol::{PoolType, consensus::NetworkType};
 
 /// A Zcash address.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -186,7 +183,7 @@ impl ZcashAddress {
     /// [`Display` implementation]: core::fmt::Display
     /// [`address.to_string()`]: alloc::string::ToString
     pub fn encode(&self) -> String {
-        format!("{}", self)
+        format!("{self}")
     }
 
     /// Attempts to parse the given string as a Zcash address.
@@ -320,6 +317,25 @@ impl ZcashAddress {
         }
     }
 
+    /// Returns whether the only recognized receivers of this address are transparent protocol
+    /// receivers.
+    ///
+    /// A unified address with unknown receivers may be considered transparent-only if it does not
+    /// also contain a Sapling or Orchard receiver, i.e. if ordinary transaction construction
+    /// methods would produce a transaction sending to a transparent address.
+    pub fn is_transparent_only(&self) -> bool {
+        use AddressKind::*;
+        match &self.kind {
+            Sprout(_) | Sapling(_) => false,
+            Unified(addr) => {
+                addr.has_receiver_of_type(PoolType::Transparent)
+                    && !(addr.has_receiver_of_type(PoolType::SAPLING)
+                        || addr.has_receiver_of_type(PoolType::ORCHARD))
+            }
+            P2pkh(_) | P2sh(_) | Tex(_) => true,
+        }
+    }
+
     /// Returns whether or not this address contains or corresponds to the given unified address
     /// receiver.
     pub fn matches_receiver(&self, receiver: &Receiver) -> bool {
@@ -340,7 +356,7 @@ pub mod testing {
 
     use proptest::{array::uniform20, collection::vec, prelude::any, prop_compose, prop_oneof};
 
-    use crate::{unified::address::testing::arb_unified_address, AddressKind, ZcashAddress};
+    use crate::{AddressKind, ZcashAddress, unified::address::testing::arb_unified_address};
     use zcash_protocol::consensus::NetworkType;
 
     prop_compose! {

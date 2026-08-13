@@ -10,8 +10,52 @@ workspace.
 
 ## [Unreleased]
 
+## [0.9.0-rc.1] - 2026-07-12
+
+### Changed
+- MSRV is now 1.88
+- Migrated to `zcash_protocol 0.10.0`, `zcash_address 0.13.0`.
+
+## [0.8.0] - 2026-06-02
+
+### Changed
+- Migrated to `zcash_protocol 0.9.0`, `zcash_address 0.12.0`.
+
+### Fixed
+- Updated to crate versions that fix an Orchard soundness vulnerability
+  (GHSA-ww9q-8r59-xv46) and Orchard non-canonical proof size issue
+  (GHSA-2x4w-pxqw-58v9).
+
+## [0.7.0] - 2026-04-23
+
+### Added
+- `zip321::PaymentError` enum for errors in constructing a `Payment`.
+- `zip321::PaymentError::with_index` method to convert a `PaymentError` into a
+  `Zip321Error` with an associated payment index.
+
 ### Changed
 - MSRV is now 1.85.1.
+- Migrated to `zcash_protocol 0.8`, `zcash_address 0.11`.
+- `zip321::Payment::new` now returns `Result<Self, PaymentError>` instead of
+  `Option<Self>`, providing a meaningful error when a memo is sent to a
+  transparent recipient or a zero-valued output is sent to a transparent address.
+- `zip321::Payment::amount` now returns `Option<Zatoshis>` instead of `Zatoshis`.
+  Previously, the amount field of the payment would be set to zero if no amount
+  parameter was present; however, this behavior is not specified by ZIP 321.
+  The semantics of this field have now been altered such that if no amount is
+  specified by a payment request, this should be interpreted to mean that the
+  sender of the transaction should specify an amount for the payment.
+- `zip321::Payment::new` now takes its `amount` parameter as `Option<Zatoshis>`
+  instead of `Zatoshis`.
+- `zip321::Zip321Error` has added variant `Zip321Error::ZeroValuedTransparentOutput`.
+  Zero-valued transparent outputs are rejected by the Zcash consensus rules,
+  and so payments to transparent addresses with the `amount` parameter explicitly
+  set to zero are now disallowed.
+- The return type of `zip321::TransactionRequest::total` has been modified;
+  it now returns `Ok(None)` if any payment amount is `None`, as the total
+  is not well-defined in this case.
+- `zip321::Zip321Error` has been marked `#[non_exhaustive]` to permit future
+  semver-compatible additions to the errors that can be identified at parse time.
 
 ## [0.6.0] - 2025-10-02
 

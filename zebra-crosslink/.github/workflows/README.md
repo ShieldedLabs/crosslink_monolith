@@ -19,88 +19,75 @@ Zebra's CI/CD system is built on GitHub Actions, providing a unified platform fo
 
 ## CI/CD Workflow Diagram
 
-Below is a Mermaid diagram illustrating how our CI workflows relate to each other, with a focus on parallel execution patterns and job dependencies. The diagram shows the main CI pipeline, integration test flow, unit test flow, underlying infrastructure, and the various triggers that initiate the pipeline.
+Below is a simplified Mermaid diagram showing the current workflows, their key triggers, and major dependencies.
 
 ```mermaid
 graph TB
-    %% Define Triggers subgraph with parallel triggers
-    subgraph "Triggers"
-        direction TB
-        P[Pull Request] & Q[Push to main] & R[Weekly Schedule] & S[Manual Trigger] & T[Merge Queue]
-    end
+  %% Triggers
+  subgraph Triggers
+    PR[Pull Request] & Push[Push to main] & ReleaseEvent[GitHub Release] & Schedule[Weekly] & Manual[Manual]
+  end
 
-    %% Main CI Pipeline with parallel flows after build
-    subgraph "Main CI Pipeline"
-        direction TB
-        A[ci-tests.yml]
-        B[sub-build-docker-image.yml]
-        A --> B
-    end
+  %% Reusable build
+  subgraph Build
+    BuildDocker[zfnd-build-docker-image.yml]
+    PrepareBinaries[zfnd-release-binaries.yml]
+    AttachBinaries[zfnd-attach-release-binaries.yml]
+  end
 
-    %% Infrastructure dependencies
-    subgraph "Infrastructure"
-        direction TB
-        M[Docker Build Cloud]
-        N[GCP Resources]
-        O[GitHub Runners]
-    end
+  %% Release automation
+  subgraph Release
+    ReleaseWorkflow[release.yml]
+    ReleaseBinaries[release-binaries.yml]
+  end
 
-    %% Unit Test Flow with parallel test execution
-    subgraph "Unit Test Flow"
-        direction TB
-        C[sub-ci-unit-tests-docker.yml]
-        H[test-all] & I[test-fake-activation-heights] & J[test-empty-sync] & K[test-lightwalletd-integration] & L[test-docker-configurations]
-        C --> H
-        C --> I
-        C --> J
-        C --> K
-        C --> L
-    end
+  %% CI workflows
+  subgraph CI
+    Unit[tests-unit.yml]
+    Lint[lint.yml]
+    Coverage[coverage.yml]
+    DockerCfg[test-docker.yml]
+    CrateBuild[test-crates.yml]
+    PRGate[pr-gate.yml]
+    Docs[book.yml]
+    Security[zizmor.yml]
+  end
 
-    %% Integration Test Flow with some parallel and some sequential steps
-    subgraph "Integration Test Flow"
-        direction TB
-        D[sub-ci-integration-tests-gcp.yml]
-        E[sub-find-cached-disks.yml]
-        F[sub-deploy-integration-tests-gcp.yml]
-        G[sub-test-zebra-config.yml]
-        D --> E
-        D --> F
-        E --> F
-        F --> G
-    end
+  %% Integration tests on GCP
+  subgraph GCP Integration
+    IT[zfnd-ci-integration-tests-gcp.yml]
+    FindDisks[zfnd-find-cached-disks.yml]
+    Deploy[zfnd-deploy-integration-tests-gcp.yml]
+    DeployNodes[zfnd-deploy-nodes-gcp.yml]
+    Cleanup[zfnd-delete-gcp-resources.yml]
+  end
 
-    %% Connect triggers to main pipeline
-    P --> A
-    Q --> A
-    R --> A
-    S --> A
-    T --> A
+  %% Trigger wiring
+  PR --> Unit & Lint & DockerCfg & CrateBuild & PRGate & IT & Security
+  Push --> Unit & Lint & Coverage & PRGate & Docs & Security & ReleaseWorkflow
+  ReleaseWorkflow --> ReleaseEvent
+  ReleaseEvent --> ReleaseBinaries & DeployNodes
+  Schedule --> IT
+  Manual --> IT & DeployNodes & Cleanup
 
-    %% Connect infrastructure to respective components
-    M --> B
-    N --> D
-    O --> C
+  %% Build dependency
+  ReleaseBinaries --> BuildDocker & PrepareBinaries
+  PrepareBinaries --> AttachBinaries
+  BuildDocker --> IT
+  IT --> FindDisks --> Deploy
 
-    %% Connect main pipeline to test flows
-    B --> C
-    B --> D
-
-    %% Style definitions
-    classDef primary fill:#2374ab,stroke:#2374ab,color:white
-    classDef secondary fill:#48a9a6,stroke:#48a9a6,color:white
-    classDef infra fill:#4b4e6d,stroke:#4b4e6d,color:white
-    classDef trigger fill:#95a5a6,stroke:#95a5a6,color:white
-
-    %% Apply styles
-    class A,B primary
-    class C,D,E,F,G secondary
-    class H,I,J,K,L secondary
-    class M,N,O infra
-    class P,Q,R,S,T trigger
+  %% Styling
+  classDef primary fill:#2374ab,stroke:#2374ab,color:white
+  classDef secondary fill:#48a9a6,stroke:#48a9a6,color:white
+  classDef trigger fill:#95a5a6,stroke:#95a5a6,color:white
+  class BuildDocker,PrepareBinaries,AttachBinaries primary
+  class ReleaseWorkflow,ReleaseBinaries primary
+  class Unit,Lint,Coverage,DockerCfg,CrateBuild,PRGate,Docs,Security secondary
+  class IT,FindDisks,Deploy,DeployNodes,Cleanup secondary
+  class PR,Push,ReleaseEvent,Schedule,Manual trigger
 ```
 
-*The diagram above illustrates the parallel execution patterns in our CI/CD system. All triggers can initiate the pipeline concurrently, unit tests run in parallel after the Docker image build, and integration tests follow a mix of parallel and sequential steps. The infrastructure components support their respective workflow parts concurrently.*
+_The diagram above illustrates the parallel execution patterns in our CI/CD system. All triggers can initiate the pipeline concurrently, unit tests run in parallel after the Docker image build, and integration tests follow a mix of parallel and sequential steps. The infrastructure components support their respective workflow parts concurrently._
 
 ## Core Infrastructure
 
@@ -120,8 +107,8 @@ graph TB
 
 #### Docker-based Testing
 
-- Most tests run in containers defined by our [Dockerfile](http://../../docker/Dockerfile)
-- The [entrypoint script](http://../../docker/entrypoint.sh) manages:
+- Most tests run in containers defined by our [Dockerfile](../../docker/Dockerfile)
+- The [entrypoint script](../../docker/entrypoint.sh) manages:
   - Test execution
   - Environment configuration
   - Resource cleanup
@@ -155,85 +142,106 @@ graph TB
 
 **Note**: Self-hosted Runners are just used to keep the logs running in the GitHub Actions UI for over 6 hours, the Integration Tests are not run in the Self-hosted Runner itself, but in the deployed VMs in GCP through GitHub Actions.
 
-### 5. Queue Management
+### 5. Rust build caching
 
-[Mergify](https://mergify.yml)
+Rust jobs cache `~/.cargo` and dependency artifacts in `target/` through
+[`actions-rust-lang/setup-rust-toolchain`](https://github.com/actions-rust-lang/setup-rust-toolchain),
+which wraps [`Swatinem/rust-cache`](https://github.com/Swatinem/rust-cache). Caching is on by
+default, so a job opts _out_ with `cache: false` rather than opting in.
+
+GitHub gives each repository 10 GB of cache storage by default; administrators can configure a
+higher paid limit. Least-recently-used entries are evicted when the configured limit is exceeded.
+Caches are also branch-scoped: a branch can read its own caches and the default branch's,
+caches written by PRs can never be read by anyone else, but they still evict main's caches, which
+are the only ones every PR does restore from.
+
+Three rules keep the quota usable:
+
+1. **Only main writes.** The main building jobs set
+   `cache-save-if: ${{ github.ref == 'refs/heads/main' }}`. PRs restore from main and write nothing. (There are some minor exceptions to this rule.)
+2. **Wide matrices share one key.** The `test-crates.yml` matrices use
+   `cache-shared-key` and seed the shared cache from a single build (`zebrad`
+   which has the widest dependency closure; `zebra-rpc` for the MSRV build since
+   it does not build `zebrad` and `zebra-rpc` is second widest option).
+3. **Jobs that don't build don't cache.** `fmt`, `no-test-deps`, `deny` (12 jobs wide), and the
+   crate-matrix generator in `test-crates.yml` set `cache: false`.
+
+To inspect the current state:
+
+```bash
+gh api repos/ZcashFoundation/zebra/actions/cache/usage
+gh api 'repos/ZcashFoundation/zebra/actions/caches?per_page=100' \
+  --jq '[.actions_caches[] | {ref, mb: (.size_in_bytes/1048576|round)}]
+        | group_by(.ref)[] | "\(.[0].ref) n=\(length) \(map(.mb)|add)MB"'
+```
+
+### 6. Queue Management
+
+[Mergify](https://mergify.com)
 
 - Automated PR merging and queue-based testing
 - Priority management
 - Ensures code quality before merge
-- See our [`.mergify.yml`](http://../../.mergify.yml) for configuration
+- See our [`.mergify.yml`](../../.mergify.yml) for configuration
 
 ## Workflow Organization
 
 ### Main Workflows
 
-- **CI Tests** (`ci-*.yml`): Core testing workflows
-  - Unit tests
-  - Integration tests
-  - Code coverage
-  - Linting
-- **CD Deployments** (`cd-*.yml`): Deployment workflows
-  - Node deployment to GCP
-  - Documentation deployment
-- **Release Management** (`release-*.yml`): Version and release workflows
+- **Unit Tests** (`tests-unit.yml`): OS matrix unit tests via nextest
+- **Lint** (`lint.yml`): Clippy, fmt, deny, features, docs build checks
+- **Coverage** (`coverage.yml`): llvm-cov with nextest, uploads to Codecov
+- **Test Docker Config** (`test-docker.yml`): Validates zebrad configs against built test image
+- **Test Crate Build** (`test-crates.yml`): Builds each crate under various feature sets
+- **PR Gate** (`pr-gate.yml`): Validates PR declarations, changelog policy, API compatibility, and complete generated Release PR readiness
+- **Docs (Book + internal)** (`book.yml`): Builds mdBook and internal rustdoc, publishes to Pages
+- **Security Analysis** (`zizmor.yml`): GitHub Actions security lint (SARIF)
+- **Release** (`release.yml`): Creates or updates Release PRs with release-plz, then uses `ZcashFoundation/cargo-release` and native Cargo to reconcile crates, tags, and one `zebrad` GitHub Release. See the [release process](../../book/src/dev/release-process.md#release-candidate--release-process) for operational instructions.
+- **Release Binaries** (`release-binaries.yml`): Orchestrates release images, prepares and attaches downloadable binaries, and supports manual preparation validation without release attachment
+- **Integration Tests on GCP** (`zfnd-ci-integration-tests-gcp.yml`): Stateful tests, E2E tests, cached disks, lwd flows
 
-### Supporting Workflows
+### Supporting/Re-usable Workflows
 
-- **Sub-workflows** (`sub-*.yml`): Reusable workflow components
-  - Docker image building
-  - Test configurations
-  - GCP resource management
-- **Patch Workflows** (`*.patch.yml`, `*.patch-external.yml`): Handle GitHub Actions limitations for required checks
+- **Build docker image** (`zfnd-build-docker-image.yml`): Reusable image build with caching and tagging
+- **Prepare release binaries** (`zfnd-release-binaries.yml`): Builds, attests, checksums, signs, and uploads the immutable binary bundle
+- **Attach release binaries** (`zfnd-attach-release-binaries.yml`): Attaches the prepared binary bundle to an existing GitHub Release
+- **Find cached disks** (`zfnd-find-cached-disks.yml`): Discovers GCP disks for stateful tests
+- **Deploy integration tests** (`zfnd-deploy-integration-tests-gcp.yml`): Orchestrates GCP VMs and test runs
+- **Deploy nodes** (`zfnd-deploy-nodes-gcp.yml`): Provision long-lived nodes
+- **Delete GCP resources** (`zfnd-delete-gcp-resources.yml`): Cleanup utilities
+- Helper scripts in `.github/workflows/scripts/` used by the above
 
-### Patch Workflows Rationale
-
-Our use of patch workflows (`.patch.yml` and `.patch-external.yml`) is a workaround for a [known limitation in GitHub Actions](https://github.com/orgs/community/discussions/44490) regarding path filters and required checks. When a workflow is marked as required for PR merging:
-
-1. **Path Filtering Limitation**: GitHub Actions does not properly handle the case where a required workflow is skipped due to path filters. Instead of marking the check as "skipped" or "passed", it remains in a "pending" state, blocking PR merges.  
-
-2. **Our Solution**: We maintain parallel "patch" workflows that:  
-
-   - Run without path filters  
-   - Contain minimal steps that always pass when the original workflow would have been skipped  
-   - Allow PRs to merge when changes don't affect relevant paths
-
-3. **Impact**:  
-
-   - Doubled number of workflow files to maintain  
-   - Additional complexity in workflow management  
-   - Extra status checks in PR UI
+Required-check workflows follow a `changes` (paths-filter) + gated workers + aggregator pattern. File-to-workflow mapping lives in [`.github/path-filters.yml`](../path-filters.yml). The aggregator job ID matches the workflow basename and the GitHub ruleset context (`lint`, `unit-tests`, `test-crates`, ...). See [`book/src/dev/continuous-integration.md`](../../book/src/dev/continuous-integration.md).
 
 ## Test Execution Strategy
 
 ### Test Orchestration with Nextest
 
-Our test execution is centralized through our Docker [entrypoint script](http://../../docker/entrypoint.sh) and orchestrated by `cargo nextest`. This provides a unified and efficient way to run tests both in CI and locally.
+Our test execution is centralized through our Docker [entrypoint script](../../docker/entrypoint.sh) and orchestrated by `cargo nextest`. This provides a unified and efficient way to run tests both in CI and locally.
 
 #### Nextest Profile-driven Testing
 
 We use `nextest` profiles defined in [`.config/nextest.toml`](../../.config/nextest.toml) to manage test suites. A single environment variable, `NEXTEST_PROFILE`, selects the profile to run.
 
 ```bash
-# Run the full test suite using the 'all-tests' profile
-docker run --rm -e NEXTEST_PROFILE=all-tests zebra-tests
+# Run unit + integration tests using the 'ci' profile
+docker run --rm -e NEXTEST_PROFILE=ci zebra-tests
 
-# Run a specific test suite, like the lightwalletd integration tests
-docker run --rm -e NEXTEST_PROFILE=lwd-integration zebra-tests
+# Run a specific stateful test on GCP
+docker run --rm -e NEXTEST_PROFILE=ci-stateful -e "NEXTEST_FILTER=test(=stateful::sync::sync_update_mainnet)" zebra-tests
+
+# Run a specific E2E test on GCP
+docker run --rm -e NEXTEST_PROFILE=ci-e2e -e "NEXTEST_FILTER=test(=e2e::sync::sync_full_mainnet)" zebra-tests
 ```
 
 #### Test Categories
 
-Our tests are organized into different categories:
+The canonical test tier definitions and local nextest examples live in
+[`zebrad/tests/main.rs`](../../zebrad/tests/main.rs). The nextest profile filters
+live in [`.config/nextest.toml`](../../.config/nextest.toml).
 
-- **Unit & Integration Tests**: Basic functionality and component testing
-- **Network Sync Tests**: Testing blockchain synchronization from various states
-- **Lightwalletd Tests**: Integration with the lightwalletd service
-- **RPC Tests**: JSON-RPC endpoint functionality
-- **Checkpoint Tests**: Blockchain checkpoint generation and validation
-
-Each test category has specific profiles that can be run individually using the `NEXTEST_PROFILE` environment variable.
-
+The `ci` profile runs the fast PR test set. The `ci-stateful` and `ci-e2e`
+profiles are used on GCP VMs with `NEXTEST_FILTER` selecting specific tests.
 
 ### Pull Request Testing
 

@@ -807,19 +807,40 @@ async fn handle_new_decided_bft_block(
     if got_stakes.len() > 0 {
         internal.finalizers_at_current_height = got_stakes.into_iter().map(|s| RosterMember { pub_key: s.0, voting_power: s.1, txids: Vec::new() }).collect();
     } else {
-        let mut any_non_zero = false;
-        for val in &internal.finalizers_at_current_height {
-            if val.voting_power > 1 {
-                any_non_zero = true;
-            }
-        }
+        // Zero aggregated stakes, having previously had real stake.
+        //
+        // This is legitimately reachable: unbonding every active bond drives total stake to
+        // zero, and the chain has to keep running across that gap. It used to be a `panic!`,
+        // on the assumption that only a torn stake cache could produce it -- which killed the
+        // node outright the first time a testnet was fully unbonded.
+        //
+        // Neither adopting the empty set nor dying is right. An empty roster would leave BFT
+        // with no validators at all, and that is not what the chain means: the last
+        // known-consistent validator set is still the best available answer. So the previous
+        // roster is carried forward unchanged -- a "ghost" roster -- and stays in force until
+        // a new bond yields a fresh, consistent stake set, at which point the `if` branch
+        // above replaces it wholesale.
+        //
+        // Carrying over is implicit: `finalizers_at_current_height` is deliberately NOT
+        // written in this branch. Do not "fix" that by clearing it.
+        //
+        // A torn stake cache presents identically, so this is still logged loudly. If the
+        // roster never recovers once new bonds exist, that is the case to suspect, and
+        // `zebrad --fixup-db-stake` remains the repair path.
+        let any_non_zero = internal
+            .finalizers_at_current_height
+            .iter()
+            .any(|val| val.voting_power > 1);
         if any_non_zero {
-            panic!(
-                "We must never get zero stakes except at init! The finalized state has no \
-                 usable aggregated-stakes row for block {new_final_hash} at height \
-                 {new_final_height:?}, most likely a state cache torn by the pre-atomic \
-                 snapshot write. Stop this node, run \
-                 `zebrad --fixup-db-stake` to check and repair the cache, then start it again."
+            warn!(
+                "No aggregated stakes for block {} at height {:?}; carrying the previous \
+                 roster forward as a ghost roster ({} finalizers) until a new bond \
+                 establishes a consistent stake set. Expected when every bond has been \
+                 unbonded. If it persists once new bonds exist the stake cache may be torn \
+                 -- stop the node and run `zebrad --fixup-db-stake` to repair it.",
+                new_final_hash,
+                new_final_height,
+                internal.finalizers_at_current_height.len(),
             );
         }
     }
@@ -1890,7 +1911,40 @@ async fn tfl_service_incoming_request(
             Ok(TFLServiceResponse::FinalizersRecencyStatus(internal.recency_status.clone()))
         }
 
-        TFLServiceRequest::StakingCmd(String) => Err(TFLServiceError::NotImplemented),
+        // `staking_command` takes the request as a JSON string so the RPC surface stays a single
+        // stringly-typed method, and dispatches it down the same staging path as
+        // `WalletStakingAction`. The wallet is the only thing that can build and fund a staking
+        // transaction, so both entry points must funnel into `wallet::STAKING_STAGE`.
+        TFLServiceRequest::StakingCmd(cmd) => {
+            let request: zcash_primitives::transaction::StakingActionRequest = serde_json::from_str(&cmd).map_err(|err| {
+                TFLServiceError::Misc(format!(
+                    "staking command must be a JSON StakingActionRequest, e.g. \
+                     {{\"CreateNewDelegationBond\":{{\"amount_zats\":100000,\"target_finalizer\":\"<hex32>\"}}}}: {err}"
+                ))
+            })?;
+
+            let rx = {
+                let mut lock = wallet::STAKING_STAGE.lock().unwrap();
+                match *lock {
+                    None => {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        *lock = Some((request, tx));
+                        rx
+                    }
+                    Some(_) => {
+                        return Err(TFLServiceError::Misc(
+                            "Another stake in progress, please try again soon".to_string(),
+                        ))
+                    }
+                }
+            };
+
+            match rx.await {
+                Ok(Ok(_)) => Ok(TFLServiceResponse::StakingCmd),
+                Ok(Err(err)) => Err(TFLServiceError::Misc(err)),
+                Err(err) => Err(TFLServiceError::Misc(format!("{err}"))),
+            }
+        }
 
         TFLServiceRequest::WalletUfvk => Ok(TFLServiceResponse::WalletUfvk(wallet::USER_UFVK_STRING.lock().unwrap().clone())),
     }

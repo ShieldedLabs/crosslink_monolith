@@ -181,7 +181,7 @@ fn compact_extremes() {
     // value. Therefore, a block can never pass with this threshold.
     //
     // zcashd rejects these blocks without comparing the hash.
-    let difficulty_max = CompactDifficulty(u32::MAX & !SIGN_BIT);
+    let difficulty_max = CompactDifficulty(!SIGN_BIT);
     assert_eq!(difficulty_max.to_expanded(), None);
     assert_eq!(difficulty_max.to_work(), None);
 
@@ -403,7 +403,7 @@ fn testnet_minimum_difficulty() -> Result<(), Report> {
         block::Height(1_028_500),
     ];
 
-    for (&height, _block) in zebra_test::vectors::TESTNET_BLOCKS.iter() {
+    for &height in zebra_test::vectors::TESTNET_BLOCKS.keys() {
         let height = block::Height(height);
 
         /// SPANDOC: Do minimum difficulty checks for testnet block {?height}

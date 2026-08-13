@@ -2,6 +2,7 @@
 
 use std::{array::TryFromSliceError, io, num::TryFromIntError, str::Utf8Error, sync::Arc};
 
+use bounded_vec::BoundedVecOutOfBounds;
 use hex::FromHexError;
 use thiserror::Error;
 
@@ -50,6 +51,45 @@ pub enum SerializationError {
     /// rule](https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus).
     #[error("transaction balance is non-zero but doesn't have Sapling shielded spends or outputs")]
     BadTransactionBalance,
+
+    /// Could not de/serialize a transparent script.
+    #[error("script error: {0}")]
+    Script(#[from] zcash_script::script::Error),
+
+    /// Errors that occur when parsing opcodes in transparent scripts.
+    #[error("script opcode error: {0}")]
+    Opcode(#[from] zcash_script::opcode::Error),
+
+    /// Errors that occur when parsing integers in transparent scripts.
+    #[error("script number error: {0}")]
+    Num(#[from] zcash_script::num::Error),
+}
+
+impl From<SerializationError> for io::Error {
+    fn from(e: SerializationError) -> Self {
+        match e {
+            SerializationError::Io(e) => {
+                Arc::try_unwrap(e).unwrap_or_else(|e| io::Error::new(e.kind(), e.to_string()))
+            }
+            SerializationError::Parse(msg) => io::Error::new(io::ErrorKind::InvalidData, msg),
+            SerializationError::Utf8Error(e) => io::Error::new(io::ErrorKind::InvalidData, e),
+            SerializationError::TryFromSliceError(e) => {
+                io::Error::new(io::ErrorKind::InvalidData, e)
+            }
+            SerializationError::TryFromIntError(e) => io::Error::new(io::ErrorKind::InvalidData, e),
+            SerializationError::FromHexError(e) => io::Error::new(io::ErrorKind::InvalidData, e),
+            SerializationError::Amount { source } => {
+                io::Error::new(io::ErrorKind::InvalidData, source)
+            }
+            SerializationError::BadTransactionBalance => io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad transaction balance: non-zero with no Sapling shielded spends or outputs",
+            ),
+            SerializationError::Script(e) => io::Error::new(io::ErrorKind::InvalidData, e),
+            SerializationError::Opcode(e) => io::Error::new(io::ErrorKind::InvalidData, e),
+            SerializationError::Num(e) => io::Error::new(io::ErrorKind::InvalidData, e),
+        }
+    }
 }
 
 impl From<crate::Error> for SerializationError {
@@ -71,5 +111,11 @@ impl From<crate::Error> for SerializationError {
 impl From<io::Error> for SerializationError {
     fn from(value: io::Error) -> Self {
         Arc::new(value).into()
+    }
+}
+
+impl From<BoundedVecOutOfBounds> for SerializationError {
+    fn from(_: BoundedVecOutOfBounds) -> Self {
+        SerializationError::Parse("vector length out of bounds")
     }
 }

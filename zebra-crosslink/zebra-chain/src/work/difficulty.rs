@@ -19,7 +19,7 @@ use std::{
 
 use hex::{FromHex, ToHex};
 
-use crate::{block, parameters::Network, BoxError};
+use crate::{block, parameters::Network, serialization::BytesInDisplayOrder, BoxError};
 
 pub use crate::work::u256::U256;
 
@@ -291,28 +291,49 @@ impl CompactDifficulty {
         Ok(difficulty)
     }
 
-    /// Returns a floating-point number representing a difficulty as a multiple
-    /// of the minimum difficulty for the provided network.
+    /// Returns a floating-point number representing this block's difficulty
+    /// as a multiple of the minimum network difficulty.
+    ///
+    /// A result of 1.0 means the block was mined at minimum difficulty.
+    /// Values above 1.0 mean proportionally more work was done.
+    ///
+    /// # How it works
+    ///
+    /// `CompactDifficulty` encodes a target as `mantissa × 256^(exponent - 3)`.
+    /// Since difficulty is inversely proportional to the target threshold:
+    ///
+    /// ```text
+    /// result = network_min_target / self_target
+    ///        = (network_mantissa / self_mantissa) × 256^(network_exponent - self_exponent)
+    /// ```
+    ///
+    /// The mantissa ratio is computed first by stripping both exponent bytes (`<< 8`),
+    /// then the result is scaled up or down by 256 once per unit of exponent difference.
     // Copied from <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L34-L74>
-    // TODO: Explain here what this ported code is doing and why, request help to do so with the ECC team.
+    // Used for RPC functions only, not consensus-critical.
     pub fn relative_to_network(&self, network: &Network) -> f64 {
         let network_difficulty = network.target_difficulty_limit().to_compact();
 
-        let [mut n_shift, ..] = self.0.to_be_bytes();
-        let [n_shift_amount, ..] = network_difficulty.0.to_be_bytes();
-        let mut d_diff = f64::from(network_difficulty.0 << 8) / f64::from(self.0 << 8);
+        // get exponent byte from both values
+        let [self_exponent_byte, ..] = self.0.to_be_bytes();
+        let [network_exponent_byte, ..] = network_difficulty.0.to_be_bytes();
+        // take the ratio of network mantissa difficulty to self mantissa difficulty
+        let mantissa_ratio = f64::from(network_difficulty.0 << 8) / f64::from(self.0 << 8);
 
-        while n_shift < n_shift_amount {
-            d_diff *= 256.0;
-            n_shift += 1;
+        let mut ratio = mantissa_ratio;
+        let mut exponent_cursor = self_exponent_byte;
+        // multiply by 256 for each exponent byte difference
+        while exponent_cursor < network_exponent_byte {
+            ratio *= 256.0;
+            exponent_cursor += 1;
         }
 
-        while n_shift > n_shift_amount {
-            d_diff /= 256.0;
-            n_shift -= 1;
+        while exponent_cursor > network_exponent_byte {
+            ratio /= 256.0;
+            exponent_cursor -= 1;
         }
 
-        d_diff
+        ratio
     }
 }
 
@@ -389,6 +410,16 @@ impl TryFrom<ExpandedDifficulty> for Work {
 impl From<ExpandedDifficulty> for CompactDifficulty {
     fn from(value: ExpandedDifficulty) -> Self {
         value.to_compact()
+    }
+}
+
+impl BytesInDisplayOrder for ExpandedDifficulty {
+    fn bytes_in_serialized_order(&self) -> [u8; 32] {
+        self.0.to_big_endian()
+    }
+
+    fn from_bytes_in_serialized_order(bytes: [u8; 32]) -> Self {
+        ExpandedDifficulty(U256::from_big_endian(&bytes))
     }
 }
 
@@ -473,29 +504,6 @@ impl ExpandedDifficulty {
             // should also be unreachable, but they aren't caught here.
             unreachable!("converted CompactDifficulty values must be valid")
         }
-    }
-
-    /// Return the difficulty bytes in big-endian byte-order,
-    /// suitable for printing out byte by byte.
-    ///
-    /// Zebra displays difficulties in big-endian byte-order,
-    /// following the u256 convention set by Bitcoin and zcashd.
-    pub fn bytes_in_display_order(&self) -> [u8; 32] {
-        self.0.to_big_endian()
-    }
-
-    /// Convert bytes in big-endian byte-order into an [`ExpandedDifficulty`].
-    ///
-    /// Zebra displays difficulties in big-endian byte-order,
-    /// following the u256 convention set by Bitcoin and zcashd.
-    ///
-    /// Preserves the exact difficulty value represented by the bytes,
-    /// even if it can't be generated from a [`CompactDifficulty`].
-    /// This means a round-trip conversion to [`CompactDifficulty`] can be lossy.
-    pub fn from_bytes_in_display_order(bytes_in_display_order: &[u8; 32]) -> ExpandedDifficulty {
-        let internal_byte_order = U256::from_big_endian(bytes_in_display_order);
-
-        ExpandedDifficulty(internal_byte_order)
     }
 }
 

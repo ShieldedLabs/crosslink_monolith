@@ -1,6 +1,10 @@
 //! Implements methods for testing [`Handshake`]
 
+#![allow(clippy::unwrap_in_result)]
+
 use super::*;
+
+mod vectors;
 
 impl<S, C> Handshake<S, C>
 where

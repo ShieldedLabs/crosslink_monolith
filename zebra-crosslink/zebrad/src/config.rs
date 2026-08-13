@@ -7,6 +7,9 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+use zebra_rpc::config::mining::{default_miner_address, MinerAddressType};
+
+use crate::components::With;
 
 /// Centralized, case-insensitive suffix-based deny-list to ban setting config fields with
 /// environment variables if those config field names end with any of these suffixes.
@@ -72,12 +75,23 @@ pub struct ZebradConfig {
     /// Mempool configuration
     pub mempool: crate::components::mempool::Config,
 
+    /// Block notify configuration
+    pub notify: crate::components::notify::Config,
+
     /// RPC configuration
     pub rpc: zebra_rpc::config::rpc::Config,
 
     /// Mining configuration
     pub mining: zebra_rpc::config::mining::Config,
 
+    /// Health check HTTP server configuration.
+    ///
+    /// See the Zebra Book for details and examples:
+    /// <https://zebra.zfnd.org/user/health.html>
+    pub health: crate::components::health::Config,
+
+    /// zcashd-compat mode configuration.
+    pub zcashd_compat: crate::components::zcashd_compat::Config,
     /// CrossLink configuration
     pub crosslink: zebra_crosslink::config::Config,
 }
@@ -129,7 +143,11 @@ impl ZebradConfig {
 
         // 2. Add TOML configuration file as a source if provided
         if let Some(path) = config_path {
-            builder = builder.add_source(config::File::from(path).required(true));
+            builder = builder.add_source(
+                config::File::from(path)
+                    .format(config::FileFormat::Toml)
+                    .required(true),
+            );
         }
 
         // 3. Load from environment variables (with a sensitive-leaf deny-list)
@@ -275,8 +293,10 @@ impl ZebradConfig {
                 network: testnet::Parameters::build()
                     // .with_network_name("Crosslink_Testnet_0")
                     .with_network_magic(Magic([67, 108, 84, 48]))
+                    .expect("Crosslink testnet magic is not a reserved value")
                     .with_slow_start_interval(Height(0))
                     .with_genesis_hash("05a60a92d99d85997cce3b87616c089f6124d7342af37106edc76126334a2c38")
+                    .expect("Crosslink testnet genesis hash is well-formed")
                     .with_funding_streams(vec![testnet::ConfiguredFundingStreams {
                         height_range: Some(Height(1)..Height(99_999_999)),
                         recipients: Some(vec![testnet::ConfiguredFundingStreamRecipient {
@@ -285,7 +305,8 @@ impl ZebradConfig {
                             addresses: Some(vec!["t27tjLaUJZ53JKqWPkgd1XCTNWF636eLQRg".to_string()]),
                         }]),
                     }])
-                .to_network(),
+                .to_network()
+                .expect("Crosslink testnet parameters are valid"),
 
                 ..Default::default()
             },
@@ -308,5 +329,17 @@ impl ZebradConfig {
 
             ..Default::default()
         }
+    }
+}
+
+impl With<MinerAddressType> for ZebradConfig {
+    fn with(mut self, miner_address_type: MinerAddressType) -> Self {
+        self.mining.miner_address = Some(
+            default_miner_address(self.network.network.kind(), &miner_address_type)
+                .parse()
+                .expect("valid hard-coded address"),
+        );
+
+        self
     }
 }

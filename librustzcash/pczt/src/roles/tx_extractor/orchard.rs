@@ -1,40 +1,38 @@
-use orchard::{Bundle, bundle::Authorized, circuit::VerifyingKey, pczt::Unbound};
+use orchard::{Bundle, bundle::Authorized, circuit::VerifyingKey};
 use rand_core::OsRng;
 use zcash_protocol::value::ZatBalance;
-
-pub(super) fn extract_bundle(
-    bundle: crate::orchard::Bundle,
-) -> Result<Option<Bundle<Unbound, ZatBalance>>, OrchardError> {
-    bundle
-        .into_parsed()
-        .map_err(OrchardError::Parse)?
-        .extract()
-        .map_err(OrchardError::Extract)
-}
 
 pub(super) fn verify_bundle(
     bundle: &Bundle<Authorized, ZatBalance>,
     orchard_vk: Option<&VerifyingKey>,
     sighash: [u8; 32],
 ) -> Result<(), OrchardError> {
-    let mut validator = orchard::bundle::BatchValidator::new();
-    let rng = OsRng;
+    match orchard_vk {
+        Some(vk) => verify_bundle_with_key(bundle, vk, sighash),
+        // The circuit version is fixed by the bundle's own `BundleVersion`, which
+        // `extract_tx_data` derives from the PCZT's consensus branch ID.
+        None => verify_bundle_with_key(
+            bundle,
+            &VerifyingKey::build(bundle.bundle_version().circuit_version()),
+            sighash,
+        ),
+    }
+}
 
-    validator.add_bundle(bundle, sighash);
+fn verify_bundle_with_key(
+    bundle: &Bundle<Authorized, ZatBalance>,
+    vk: &VerifyingKey,
+    sighash: [u8; 32],
+) -> Result<(), OrchardError> {
+    let mut validator = orchard::bundle::BatchValidator::new(vk);
+    validator
+        .add_bundle(bundle, sighash)
+        .map_err(|_| OrchardError::InvalidProof)?;
 
-    if let Some(vk) = orchard_vk {
-        if validator.validate(vk, rng) {
-            Ok(())
-        } else {
-            Err(OrchardError::InvalidProof)
-        }
+    if validator.validate(OsRng) {
+        Ok(())
     } else {
-        let vk = VerifyingKey::build();
-        if validator.validate(&vk, rng) {
-            Ok(())
-        } else {
-            Err(OrchardError::InvalidProof)
-        }
+        Err(OrchardError::InvalidProof)
     }
 }
 
@@ -42,5 +40,4 @@ pub(super) fn verify_bundle(
 pub enum OrchardError {
     Extract(orchard::pczt::TxExtractorError),
     InvalidProof,
-    Parse(orchard::pczt::ParseError),
 }

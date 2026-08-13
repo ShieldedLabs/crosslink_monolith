@@ -1,5 +1,6 @@
 //! Converting Zcash consensus-critical data structures into bytes.
 
+use byteorder::WriteBytesExt;
 use std::{io, net::Ipv6Addr};
 
 use super::{AtLeastOne, CompactSizeMessage};
@@ -8,6 +9,11 @@ use super::{AtLeastOne, CompactSizeMessage};
 ///
 /// This value is used to calculate safe preallocation limits for some types
 pub const MAX_PROTOCOL_MESSAGE_LEN: usize = 2 * 1024 * 1024;
+
+/// The maximum number of block headers in a single `headers` protocol message.
+///
+/// <https://zips.z.cash/protocol/protocol.pdf#page=108>
+pub const MAX_HEADERS_PER_MESSAGE: usize = 160;
 
 /// Consensus-critical serialization for Zcash.
 ///
@@ -42,6 +48,12 @@ pub trait ZcashSerialize: Sized {
         self.zcash_serialize(&mut writer)
             .expect("writer should never fail");
         writer.0
+    }
+}
+
+impl ZcashSerialize for u8 {
+    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+        writer.write_u8(*self)
     }
 }
 
@@ -97,11 +109,7 @@ impl<T: ZcashSerialize> ZcashSerialize for AtLeastOne<T> {
 // we specifically want to serialize `Vec`s here, rather than generic slices
 #[allow(clippy::ptr_arg)]
 pub fn zcash_serialize_bytes<W: io::Write>(vec: &Vec<u8>, mut writer: W) -> Result<(), io::Error> {
-    let len: CompactSizeMessage = vec
-        .len()
-        .try_into()
-        .expect("len fits in MAX_PROTOCOL_MESSAGE_LEN");
-    len.zcash_serialize(&mut writer)?;
+    CompactSizeMessage::try_from(vec.len())?.zcash_serialize(&mut writer)?;
 
     zcash_serialize_bytes_external_count(vec, writer)
 }
@@ -109,8 +117,7 @@ pub fn zcash_serialize_bytes<W: io::Write>(vec: &Vec<u8>, mut writer: W) -> Resu
 /// Serialize an empty list of items, by writing a zero CompactSize length.
 /// (And no items.)
 pub fn zcash_serialize_empty_list<W: io::Write>(writer: W) -> Result<(), io::Error> {
-    let len: CompactSizeMessage = 0.try_into().expect("zero fits in MAX_PROTOCOL_MESSAGE_LEN");
-    len.zcash_serialize(writer)
+    CompactSizeMessage::default().zcash_serialize(writer)
 }
 
 /// Serialize a typed `Vec` **without** writing the number of items as a

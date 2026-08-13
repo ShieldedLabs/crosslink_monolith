@@ -4,12 +4,8 @@ use static_assertions::const_assert;
 use zebra_chain::{
     block::Height,
     parameters::{
-        subsidy::{
-            FundingStreamReceiver, FundingStreamRecipient, FundingStreams, FUNDING_STREAMS_TESTNET,
-            FUNDING_STREAM_ECC_ADDRESSES_TESTNET, FUNDING_STREAM_MG_ADDRESSES_TESTNET,
-            FUNDING_STREAM_ZF_ADDRESSES_TESTNET, POST_NU6_FUNDING_STREAM_FPF_ADDRESSES_TESTNET,
-        },
-        testnet::{self, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams},
+        testnet::{self, ConfiguredFundingStreams},
+        Network,
     },
 };
 
@@ -75,7 +71,8 @@ fn testnet_params_serialization_roundtrip() {
     let config = Config {
         network: testnet::Parameters::build()
             .with_disable_pow(true)
-            .to_network(),
+            .to_network()
+            .expect("failed to build configured network"),
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
@@ -100,47 +97,17 @@ fn default_config_uses_ipv6() {
 fn funding_streams_serialization_roundtrip() {
     let _init_guard = zebra_test::init();
 
-    let fs = vec![
-        ConfiguredFundingStreams::from(&FundingStreams::new(
-            Height(1_028_500)..Height(2_796_000),
-            vec![
-                (
-                    FundingStreamReceiver::Ecc,
-                    FundingStreamRecipient::new(7, FUNDING_STREAM_ECC_ADDRESSES_TESTNET),
-                ),
-                (
-                    FundingStreamReceiver::ZcashFoundation,
-                    FundingStreamRecipient::new(5, FUNDING_STREAM_ZF_ADDRESSES_TESTNET),
-                ),
-                (
-                    FundingStreamReceiver::MajorGrants,
-                    FundingStreamRecipient::new(8, FUNDING_STREAM_MG_ADDRESSES_TESTNET),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        )),
-        ConfiguredFundingStreams::from(&FundingStreams::new(
-            Height(2_976_000)..Height(2_796_000 + 420_000),
-            vec![
-                (
-                    FundingStreamReceiver::Deferred,
-                    FundingStreamRecipient::new::<[&str; 0], &str>(12, []),
-                ),
-                (
-                    FundingStreamReceiver::MajorGrants,
-                    FundingStreamRecipient::new(8, POST_NU6_FUNDING_STREAM_FPF_ADDRESSES_TESTNET),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        )),
-    ];
+    let fs = testnet::Parameters::default()
+        .funding_streams()
+        .iter()
+        .map(ConfiguredFundingStreams::from)
+        .collect();
 
     let config = Config {
         network: testnet::Parameters::build()
             .with_funding_streams(fs)
-            .to_network(),
+            .to_network()
+            .expect("failed to build configured network"),
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
@@ -151,74 +118,81 @@ fn funding_streams_serialization_roundtrip() {
     assert_eq!(config, deserialized);
 }
 
-#[ignore] // [ACTIVATION HEIGHT PROBLEM]
+/// Checks that a configured Testnet's temporary Orchard-disabling soft fork height
+/// survives a serialization round-trip.
 #[test]
-fn funding_streams_default_values() {
+fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
     let _init_guard = zebra_test::init();
 
-    let fs = vec![
-        ConfiguredFundingStreams {
-            height_range: Some(Height(1_028_500 - 1)..Height(2_796_000 - 1)),
-            // Will read from existing values
-            recipients: None,
-        },
-        ConfiguredFundingStreams {
-            // Will read from existing values
-            height_range: None,
-            recipients: Some(vec![
-                ConfiguredFundingStreamRecipient {
-                    receiver: FundingStreamReceiver::Deferred,
-                    numerator: 1,
-                    addresses: None,
-                },
-                ConfiguredFundingStreamRecipient {
-                    receiver: FundingStreamReceiver::MajorGrants,
-                    numerator: 2,
-                    addresses: Some(
-                        POST_NU6_FUNDING_STREAM_FPF_ADDRESSES_TESTNET
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                    ),
-                },
-            ]),
-        },
-    ];
+    let soft_fork_height = Height(2_000_000);
 
-    let network = testnet::Parameters::build()
-        .with_funding_streams(fs)
-        .to_network();
+    let config = Config {
+        network: testnet::Parameters::build()
+            .with_temporary_orchard_disabling_soft_fork_height(soft_fork_height)
+            .to_network()
+            .expect("failed to build configured network"),
+        initial_testnet_peers: [].into(),
+        ..Config::default()
+    };
 
-    // Check if value hasn't changed
+    let serialized = toml::to_string(&config).unwrap();
+    let deserialized: Config = toml::from_str(&serialized).unwrap();
+
+    assert_eq!(config, deserialized);
+
+    // The configured height must be preserved through the round-trip.
+    let Network::Testnet(params) = &deserialized.network else {
+        panic!("deserialized network must be a Testnet");
+    };
     assert_eq!(
-        network.all_funding_streams()[0].height_range().clone(),
-        Height(1_028_500 - 1)..Height(2_796_000 - 1)
+        params.temporary_orchard_disabling_soft_fork_height(),
+        Some(soft_fork_height),
     );
-    // Check if value was copied from default
-    assert_eq!(
-        network.all_funding_streams()[0]
-            .recipients()
-            .get(&FundingStreamReceiver::ZcashFoundation)
-            .unwrap()
-            .addresses(),
-        FUNDING_STREAMS_TESTNET[0]
-            .recipients()
-            .get(&FundingStreamReceiver::ZcashFoundation)
-            .unwrap()
-            .addresses()
-    );
-    // Check if value was copied from default
-    assert_eq!(
-        network.all_funding_streams()[1].height_range(),
-        FUNDING_STREAMS_TESTNET[1].height_range()
-    );
-    // Check if value hasn't changed
-    assert_eq!(
-        network.all_funding_streams()[1]
-            .recipients()
-            .get(&FundingStreamReceiver::Deferred)
-            .unwrap()
-            .numerator(),
-        1
+}
+
+/// Checks that a Regtest configured to forbid unshielded coinbase spends survives a
+/// serialization round-trip, and that the flag does not change the network's identity.
+#[test]
+fn regtest_should_allow_unshielded_coinbase_spends_serialization_roundtrip() {
+    let _init_guard = zebra_test::init();
+
+    let config = Config {
+        network: Network::new_regtest(testnet::RegtestParameters {
+            should_allow_unshielded_coinbase_spends: Some(false),
+            ..Default::default()
+        }),
+        initial_testnet_peers: [].into(),
+        ..Config::default()
+    };
+
+    // Forbidding unshielded coinbase spends must not stop the network from being Regtest.
+    assert!(config.network.is_regtest());
+
+    let serialized = toml::to_string(&config).unwrap();
+    let deserialized: Config = toml::from_str(&serialized).unwrap();
+
+    assert_eq!(config, deserialized);
+    assert!(deserialized.network.is_regtest());
+
+    let Network::Testnet(params) = &deserialized.network else {
+        panic!("deserialized network must be Regtest");
+    };
+    assert!(!params.should_allow_unshielded_coinbase_spends());
+}
+
+/// Checks that the Regtest-only `should_allow_unshielded_coinbase_spends` knob is rejected
+/// on a configured Testnet rather than silently ignored.
+#[test]
+fn should_allow_unshielded_coinbase_spends_rejected_on_testnet() {
+    let _init_guard = zebra_test::init();
+
+    let toml = "network = 'Testnet'\n\n[testnet_parameters]\nshould_allow_unshielded_coinbase_spends = true\n";
+    let err = toml::from_str::<Config>(toml)
+        .expect_err("configured Testnet must reject the Regtest-only field");
+
+    assert!(
+        err.to_string()
+            .contains("should_allow_unshielded_coinbase_spends"),
+        "unexpected error: {err}"
     );
 }

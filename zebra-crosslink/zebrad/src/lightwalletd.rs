@@ -906,6 +906,9 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                     };
                                                     Ok(Work::Items(
                                                         [enc(&TreeState {
+                                                            // Crosslink does not build Ironwood
+                                                            // bundles yet, so its tree is empty.
+                                                            ironwood_tree: String::new(),
                                                             network: c.network.bip70_network_name(),
                                                             height: height.0 as u64,
                                                             // display-order hex, what the wallet parses
@@ -1169,7 +1172,7 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                     let mut items = VecDeque::new();
                                                     for vtx in &transactions {
                                                         let display =
-                                                            vtx.transaction.id.mined_id().bytes_in_display_order();
+                                                            zebra_chain::serialization::BytesInDisplayOrder::bytes_in_display_order(&vtx.transaction.id.mined_id());
                                                         if excludes
                                                             .iter()
                                                             .any(|e| !e.is_empty() && display.starts_with(e))
@@ -1200,14 +1203,31 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                                 ciphertext: <[u8; 580]>::from(a.enc_ciphertext)[..52].to_vec(),
                                                             })
                                                             .collect();
-                                                        if spends.is_empty() && outputs.is_empty() && actions.is_empty() {
+                                                        // Ironwood actions are a separate bundle with its own note commitment
+                                                        // tree. From NU6.3 they carry every cross-address transfer (the Orchard
+                                                        // pool is change-only), so a wallet that never sees them cannot find
+                                                        // its funds at all.
+                                                        let ironwood_actions: Vec<CompactOrchardAction> = tx
+                                                            .ironwood_actions()
+                                                            .map(|a| CompactOrchardAction {
+                                                                nullifier: <[u8; 32]>::from(a.nullifier).to_vec(),
+                                                                cmx: <[u8; 32]>::from(a.cm_x).to_vec(),
+                                                                ephemeral_key: <[u8; 32]>::from(a.ephemeral_key).to_vec(),
+                                                                ciphertext: <[u8; 580]>::from(a.enc_ciphertext)[..52].to_vec(),
+                                                            })
+                                                            .collect();
+                                                        if spends.is_empty() && outputs.is_empty() && actions.is_empty()
+                                                            && ironwood_actions.is_empty() {
                                                             continue;
                                                         }
                                                         items.push_back(enc(&CompactTx {
                                                             index: 0,
-                                                            hash: tx.hash().0.to_vec(),
+                                                            txid: tx.hash().0.to_vec(),
                                                             fee: 0,
                                                             spends,
+                                                            vin: Vec::new(),
+                                                            vout: Vec::new(),
+                                                            ironwood_actions,
                                                             outputs,
                                                             actions,
                                                         }));
@@ -1287,7 +1307,7 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                                                         {
                                                             ReadResponse::SaplingSubtrees(map) => map
                                                                 .values()
-                                                                .map(|d| (d.root.encode_hex::<String>(), d.end_height))
+                                                                .map(|d| (hex::encode(d.root.to_bytes()), d.end_height))
                                                                 .collect(),
                                                             _ => return Err((GRPC_INTERNAL, "unexpected state response".into())),
                                                         },
@@ -2029,21 +2049,45 @@ fn compact_block(b: &Block, nulls: bool) -> CompactBlock {
             } else {
                 outputs.len()
             };
-            if spends.is_empty() && sapling_output_count == 0 && actions.is_empty() {
+            // See the note above: Ironwood is where NU6.3 cross-address transfers live.
+            let ironwood_actions: Vec<CompactOrchardAction> = tx
+                .ironwood_actions()
+                .map(|a| {
+                    if nulls {
+                        CompactOrchardAction {
+                            nullifier: <[u8; 32]>::from(a.nullifier).to_vec(),
+                            cmx: Vec::new(),
+                            ephemeral_key: Vec::new(),
+                            ciphertext: Vec::new(),
+                        }
+                    } else {
+                        CompactOrchardAction {
+                            nullifier: <[u8; 32]>::from(a.nullifier).to_vec(),
+                            cmx: <[u8; 32]>::from(a.cm_x).to_vec(),
+                            ephemeral_key: <[u8; 32]>::from(a.ephemeral_key).to_vec(),
+                            ciphertext: <[u8; 580]>::from(a.enc_ciphertext)[..52].to_vec(),
+                        }
+                    }
+                })
+                .collect();
+            if spends.is_empty() && sapling_output_count == 0 && actions.is_empty()
+                && ironwood_actions.is_empty() {
                 return None;
             }
             Some(CompactTx {
                 index: i as u64,
-                hash: tx.hash().0.to_vec(),
+                txid: tx.hash().0.to_vec(),
                 fee: 0,
                 spends,
                 outputs,
+                vin: Vec::new(),
+                vout: Vec::new(),
+                ironwood_actions,
                 actions,
             })
         })
         .collect();
     CompactBlock {
-        proto_version: 4,
         height,
         hash: b.hash().0.to_vec(),
         prev_hash: b.header.previous_block_hash.0.to_vec(),

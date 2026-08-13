@@ -1548,6 +1548,7 @@ pub fn sync(
             }
         }
 
+
         // Drain externally submitted blocks (submit_block RPC, miner, test harness) into the
         // same commit queue the network path uses, so they go through identical verification.
         loop {
@@ -2913,7 +2914,6 @@ pub fn sync(
                         height: cheap.height,
                         new_outputs: new_outputs.clone(),
                         transaction_hashes: cheap.transaction_hashes.clone(),
-                        deferred_pool_balance_change: Some(cheap.deferred_pool_balance_change),
                     };
                     block_writer
                         .handle_commit(semantically_verified)

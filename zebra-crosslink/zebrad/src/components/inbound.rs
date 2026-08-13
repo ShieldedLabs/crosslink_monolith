@@ -113,6 +113,7 @@ pub struct InboundSetupData {
 }
 
 /// Tracks the internal state of the [`Inbound`] service during setup.
+#[allow(clippy::large_enum_variant)]
 pub enum Setup {
     /// Waiting for service setup to complete.
     ///
@@ -517,31 +518,57 @@ impl Service<zn::Request> for Inbound {
             zn::Request::FindHeaders { known_blocks, stop } => {
                 let request = zs::Request::FindBlockHeaders { known_blocks, stop };
                 state.clone().oneshot(request).map_ok(|resp| match resp {
-                    zs::Response::BlockHeaders(headers) if headers.is_empty() => zn::Response::Nil,
+                    // Always reply with a `headers` message, even when empty: the
+                    // `getheaders` protocol requires a `headers` response, and
+                    // returning `Nil` (which sends nothing) leaves a peer's
+                    // `getheaders` request pending forever. A zcashd sidecar
+                    // following Zebra defers every later inv-triggered
+                    // `getheaders` behind that stuck request and never syncs.
                     zs::Response::BlockHeaders(headers) => zn::Response::BlockHeaders(headers),
                     _ => unreachable!("zebra-state should always respond to a `FindBlockHeaders` request with a `BlockHeaders` response"),
                 })
                     .boxed()
             }
-            zn::Request::PushTransaction(transaction) => {
+            zn::Request::PushTransaction(transaction, sender) => {
+                // Tag a directly pushed transaction with the sending peer so the
+                // mempool downloader can enforce a per-peer queue cap, mirroring
+                // the advertisement path below. See `GHSA-m9xx-8rcj-vmgp`.
+                let request = match sender {
+                    Some(peer_addr) => mempool::Request::QueueFromPeer {
+                        candidates: vec![transaction.into()],
+                        source: *peer_addr,
+                    },
+                    None => mempool::Request::Queue(vec![transaction.into()]),
+                };
                 mempool
                     .clone()
-                    .oneshot(mempool::Request::Queue(vec![transaction.into()]))
+                    .oneshot(request)
                     // The response just indicates if processing was queued or not; ignore it
                     .map_ok(|_resp| zn::Response::Nil)
                     .boxed()
             }
-            zn::Request::AdvertiseTransactionIds(transactions) => {
-                let transactions = transactions.into_iter().map(Into::into).collect();
+            zn::Request::AdvertiseTransactionIds(transactions, advertiser) => {
+                // Tag the advertised txids with the announcing peer so the
+                // mempool downloader can enforce a per-peer queue cap.
+                // See `GHSA-4fc2-h7jh-287c`.
+                let request = match advertiser {
+                    Some(peer_addr) => mempool::Request::QueueFromPeer {
+                        candidates: transactions.into_iter().map(Into::into).collect(),
+                        source: *peer_addr,
+                    },
+                    None => mempool::Request::Queue(
+                        transactions.into_iter().map(Into::into).collect(),
+                    ),
+                };
                 mempool
                     .clone()
-                    .oneshot(mempool::Request::Queue(transactions))
+                    .oneshot(request)
                     // The response just indicates if processing was queued or not; ignore it
                     .map_ok(|_resp| zn::Response::Nil)
                     .boxed()
             }
-            zn::Request::AdvertiseBlock(hash) => {
-                block_downloads.download_and_verify(hash);
+            zn::Request::AdvertiseBlock(hash, advertiser) => {
+                block_downloads.download_and_verify(hash, advertiser);
                 async { Ok(zn::Response::Nil) }.boxed()
             }
             // The size of this response is limited by the `Connection` state machine in the network layer
@@ -556,6 +583,8 @@ impl Service<zn::Request> for Inbound {
             zn::Request::Ping(_) => {
                 unreachable!("ping requests are handled internally");
             }
+
+            zn::Request::AdvertiseBlockToAll(_) => unreachable!("should always be decoded as `AdvertiseBlock` request")
         }
     }
 }

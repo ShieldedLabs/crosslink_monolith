@@ -1,12 +1,16 @@
 //! StateService test vectors.
-//!
-//! TODO: move these tests into tests::vectors and tests::prop modules.
+
+#![allow(clippy::unwrap_in_result)]
+
+// TODO: move these tests into tests::vectors and tests::prop modules.
 
 use std::{env, sync::Arc, time::Duration};
 
+use tokio::runtime::Runtime;
 use tower::{buffer::Buffer, util::BoxService};
 
 use zebra_chain::{
+    amount::DeferredPoolBalanceChange,
     block::{self, Block, CountedHeader, Height},
     chain_tip::ChainTip,
     fmt::SummaryDebug,
@@ -83,6 +87,7 @@ async fn test_populated_state_responds_correctly(
                     Request::Transaction(transaction_hash),
                     Ok(Response::Transaction(Some(crate::MinedTx {
                         tx: transaction.clone(),
+                        best_chain_tip_hash: block.hash(),
                         height,
                         // TODO: fix
                         confirmations: 0,
@@ -260,7 +265,7 @@ async fn empty_state_still_responds_to_requests() -> Result<()> {
     let transcript = Transcript::from(iter);
 
     let network = Network::Mainnet;
-    let state = init_test(&network);
+    let state = init_test(&network).await;
 
     transcript.check(state).await?;
 
@@ -346,7 +351,7 @@ proptest! {
     /// Test the `Block.check_transaction_network_upgrade()` error inside the legacy check.
     #[test]
     fn at_least_one_transaction_with_inconsistent_network_upgrade(
-        (network, nu_activation_height, chain) in partial_nu5_chain_strategy(5, false, OVER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Canopy)
+        (network, nu_activation_height, chain) in partial_nu5_chain_strategy(5, false, OVER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Nu5)
     ) {
         // this test requires that an invalid block is encountered
         // before a valid block (and before the check gives up),
@@ -388,7 +393,7 @@ proptest! {
     #[ignore] // [ACTIVATION HEIGHT PROBLEM]
     #[test]
     fn at_least_one_transaction_with_valid_network_upgrade(
-        (network, nu_activation_height, chain) in partial_nu5_chain_strategy(5, true, UNDER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Canopy)
+        (network, nu_activation_height, chain) in partial_nu5_chain_strategy(5, true, UNDER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Nu5)
     ) {
         let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev(), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
@@ -413,7 +418,9 @@ proptest! {
 
         // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
         // Commits go straight through the writer now; StateService no longer queues them.
-        let (state_service, _, _, _, mut block_writer) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
+        let (state_service, _, _, _, mut block_writer) = Runtime::new().unwrap().block_on(async {
+            StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true))).await
+        });
 
         prop_assert_eq!(state_service.read_service.db.finalized_value_pool(), ValueBalance::zero());
         prop_assert_eq!(
@@ -432,7 +439,7 @@ proptest! {
             // which is not included in the UTXO set
             if block.height > block::Height(0) {
                 let utxos = &block.new_outputs.iter().map(|(k, ordered_utxo)| (*k, ordered_utxo.utxo.clone())).collect();
-                let block_value_pool = &block.block.chain_value_pool_change(utxos, None)?;
+                let block_value_pool = &block.block.chain_value_pool_change(utxos, DeferredPoolBalanceChange::zero())?;
                 expected_finalized_value_pool += *block_value_pool;
             }
 
@@ -458,7 +465,7 @@ proptest! {
         let mut expected_non_finalized_value_pool = Ok(expected_finalized_value_pool?);
         for block in non_finalized_blocks {
             let utxos = block.new_outputs.clone();
-            let block_value_pool = &block.block.chain_value_pool_change(&transparent::utxos_from_ordered_utxos(utxos), None)?;
+            let block_value_pool = &block.block.chain_value_pool_change(&transparent::utxos_from_ordered_utxos(utxos), DeferredPoolBalanceChange::zero())?;
             expected_non_finalized_value_pool += *block_value_pool;
 
             let result = block_writer.handle_commit(block.clone());
@@ -509,7 +516,10 @@ proptest! {
         // queue_and_commit_to_finalized_state() did), so the latest_chain_tip /
         // chain_tip_change assertions in the first loop hold as written once more.
         // Ported to keep the crate's test target building, not revived.
-        let (_state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change, mut block_writer) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
+        let (_state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change, mut block_writer) =
+            Runtime::new().unwrap().block_on(async {
+                StateService::new(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true))).await
+            });
 
         prop_assert_eq!(latest_chain_tip.best_tip_height(), None);
         prop_assert_eq!(chain_tip_change.last_tip_change(), None);
@@ -517,9 +527,14 @@ proptest! {
         for block in finalized_blocks {
             let expected_block = block.clone();
 
-            let expected_action = if expected_block.height <= block::Height(1) {
-                // 0: reset by both initialization and the Genesis network upgrade
-                // 1: reset by the BeforeOverwinter network upgrade
+            let expected_action = if expected_block.height == block::Height(0) {
+                // 0: reset on initialization.
+                //
+                // The mempool verifies transactions against the next block height, so the
+                // reset for an upgrade activating at height `H` happens when the tip reaches
+                // `H - 1`. The only activation height whose predecessor is in the test vectors
+                // is BeforeOverwinter (height 1), so its reset coincides with the genesis block
+                // at height 0, which already resets on initialization.
                 TipAction::reset_with(expected_block.clone().into())
             } else {
                 TipAction::grow_with(expected_block.clone().into())
@@ -540,12 +555,13 @@ proptest! {
         for block in non_finalized_blocks {
             let expected_block = block.clone();
 
-            let expected_action = if expected_block.height == block::Height(1) {
-                // 1: reset by the BeforeOverwinter network upgrade
-                TipAction::reset_with(expected_block.clone().into())
-            } else {
-                TipAction::grow_with(expected_block.clone().into())
-            };
+            // Non-finalized blocks are continuous with the finalized tip and always at height
+            // >= 1 (genesis is always finalized). The reset for an upgrade activating at height
+            // `H` happens when the tip reaches `H - 1`, and the only activation height with a
+            // predecessor in the test vectors is BeforeOverwinter (height 1, predecessor height
+            // 0, which is always finalized). So no non-finalized block triggers an activation
+            // reset: they all grow.
+            let expected_action = TipAction::grow_with(expected_block.clone().into());
 
             let result = block_writer.handle_commit(block);
 
@@ -609,4 +625,81 @@ fn continuous_empty_blocks_from_test_vectors() -> impl Strategy<
                 non_finalized_blocks.into(),
             )
         })
+}
+
+/// Opening a read-only state against an existing but empty cache directory (no database on
+/// disk) must fail with [`StateInitError::ReadOnlyDatabaseNotFound`] rather than silently
+/// creating a new, empty database.
+#[test]
+fn read_only_open_with_no_database_returns_error() {
+    let network = Network::Mainnet;
+
+    // An existing, readable, but empty cache directory: it contains no database.
+    let cache_dir =
+        tempfile::tempdir().expect("creating a temporary cache directory should succeed");
+    let config = Config {
+        cache_dir: cache_dir.path().to_path_buf(),
+        ephemeral: false,
+        ..Config::default()
+    };
+
+    match super::init_read_only(config, &network) {
+        Err(crate::StateInitError::ReadOnlyDatabaseNotFound { .. }) => {}
+        Err(other) => panic!("expected ReadOnlyDatabaseNotFound, got: {other:?}"),
+        Ok(_) => panic!("expected an error when opening a read-only state with no database"),
+    }
+}
+
+/// Opening a read-only state against a missing or unreadable cache directory must fail with a
+/// typed [`StateInitError::ReadOnlyCacheDirUnreadable`] rather than panicking while reading the
+/// on-disk format version.
+#[test]
+fn read_only_open_with_unreadable_cache_dir_returns_error() {
+    let network = Network::Mainnet;
+
+    // A cache directory that does not exist. `read_dir` fails for a missing directory the same way
+    // it does for an unreadable one, without depending on filesystem permissions (which `root`
+    // ignores, so a chmod-based unreadable directory would not be a reliable test under CI).
+    let parent = tempfile::tempdir().expect("creating a temporary directory should succeed");
+    let config = Config {
+        cache_dir: parent.path().join("missing"),
+        ephemeral: false,
+        ..Config::default()
+    };
+
+    match super::init_read_only(config, &network) {
+        Err(crate::StateInitError::ReadOnlyCacheDirUnreadable { .. }) => {}
+        Err(other) => panic!("expected ReadOnlyCacheDirUnreadable, got: {other:?}"),
+        Ok(_) => {
+            panic!("expected an error when opening a read-only state with an unreadable cache dir")
+        }
+    }
+}
+
+/// Opening a read-only state with an ephemeral database configured must fail with
+/// [`StateInitError::ReadOnlyEphemeralConflict`]: a read-only secondary follows another
+/// process's primary database and must never delete it, so it cannot also be ephemeral
+/// (which would delete the primary's files on drop).
+#[test]
+fn read_only_open_with_ephemeral_config_returns_error() {
+    let network = Network::Mainnet;
+
+    // While `ephemeral: true` should make `cache_dir` irrelevant, we had
+    // instances where a bug would try to read the `cache_dir` before checking
+    // `ephemeral`, so we use a missing directory to ensure that `ephemeral` is
+    // checked first.
+    let parent = tempfile::tempdir().expect("creating a temporary directory should succeed");
+    let config = Config {
+        ephemeral: true,
+        cache_dir: parent.path().join("missing"),
+        ..Config::default()
+    };
+
+    match super::init_read_only(config, &network) {
+        Err(crate::StateInitError::ReadOnlyEphemeralConflict) => {}
+        Err(other) => panic!("expected ReadOnlyEphemeralConflict, got: {other:?}"),
+        Ok(_) => {
+            panic!("expected an error when opening a read-only state with an ephemeral config")
+        }
+    }
 }

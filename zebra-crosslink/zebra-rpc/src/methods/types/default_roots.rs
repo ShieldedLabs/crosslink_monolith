@@ -1,13 +1,23 @@
 //! The `DefaultRoots` type is part of the `getblocktemplate` RPC method output.
 
+use std::iter;
+
 use derive_getters::Getters;
 use derive_new::new;
-use zebra_chain::block::{
-    merkle::{self, AuthDataRoot},
-    ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash,
+use zebra_chain::{
+    amount::NegativeOrZero,
+    block::{
+        self,
+        merkle::{self, AuthDataRoot, AUTH_DIGEST_PLACEHOLDER},
+        ChainHistoryBlockTxAuthCommitmentHash, ChainHistoryMmrRootHash, Height,
+    },
+    parameters::{Network, NetworkUpgrade},
+    transaction::VerifiedUnminedTx,
 };
 
-/// The block header roots for [`GetBlockTemplate.transactions`].
+use crate::client::TransactionTemplate;
+
+/// The block header roots for the transactions in a block template.
 ///
 /// If the transactions in the block template are modified, these roots must be recalculated
 /// [according to the specification](https://zcash.github.io/rpc/getblocktemplate.html).
@@ -41,4 +51,62 @@ pub struct DefaultRoots {
     #[serde(with = "hex")]
     #[getter(copy)]
     pub(crate) block_commitments_hash: ChainHistoryBlockTxAuthCommitmentHash,
+}
+
+impl DefaultRoots {
+    /// Creates a new [`DefaultRoots`] instance from the given coinbase tx template.
+    pub fn from_coinbase(
+        net: &Network,
+        height: Height,
+        coinbase: &TransactionTemplate<NegativeOrZero>,
+        chain_history_root: Option<ChainHistoryMmrRootHash>,
+        mempool_txs: &[VerifiedUnminedTx],
+    ) -> Self {
+        let chain_history_root = chain_history_root
+            .or_else(|| {
+                (NetworkUpgrade::Heartwood.activation_height(net) == Some(height))
+                    .then_some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into())
+            })
+            .expect("history root is required for block templates");
+
+        // TODO:
+        // Computing `auth_data_root` and `merkle_root` gets more expensive as `mempool_txs` grows.
+        // It might be worth doing it in rayon.
+
+        let auth_data_root = iter::once(coinbase.auth_digest)
+            .chain(mempool_txs.iter().map(|tx| {
+                tx.transaction
+                    .id
+                    .auth_digest()
+                    .unwrap_or(AUTH_DIGEST_PLACEHOLDER)
+            }))
+            .collect();
+
+        Self {
+            merkle_root: iter::once(coinbase.hash)
+                .chain(mempool_txs.iter().map(|tx| tx.transaction.id.mined_id()))
+                .collect(),
+            chain_history_root,
+            auth_data_root,
+            // Key off *being at* the Heartwood activation height, not off `current()` returning
+            // `Heartwood`. `current()` returns the latest upgrade active at a height, so on a
+            // network that activates several upgrades at the same low height -- Regtest, and
+            // Crosslink's testnets, which activate everything at height 0/1 -- it returns NU5+
+            // here and this template would carry a computed commitment. The validator
+            // (`Commitment::from_bytes`) expects the reserved all-zero value at the Heartwood
+            // activation height regardless of which upgrade is current, so the miner would build
+            // blocks its own node rejects with `InvalidChainHistoryActivationReserved`.
+            block_commitments_hash: if Some(height)
+                == NetworkUpgrade::Heartwood.activation_height(net)
+                && chain_history_root == block::CHAIN_HISTORY_ACTIVATION_RESERVED.into()
+            {
+                block::CHAIN_HISTORY_ACTIVATION_RESERVED.into()
+            } else {
+                ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                    &chain_history_root,
+                    &auth_data_root,
+                )
+            },
+        }
+    }
 }

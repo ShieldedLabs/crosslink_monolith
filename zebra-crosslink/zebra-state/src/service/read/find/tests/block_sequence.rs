@@ -46,7 +46,7 @@ fn fixture() -> (
         &network,
         #[cfg(feature = "elasticsearch")]
         false,
-    );
+    ).expect("opening an ephemeral database should succeed");
     finalized_state.set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
 
     non_finalized_state

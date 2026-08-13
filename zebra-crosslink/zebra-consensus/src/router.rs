@@ -16,6 +16,7 @@ use core::fmt;
 use std::{
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -27,7 +28,7 @@ use tracing::{instrument, Instrument, Span};
 
 use zebra_chain::{
     block::{self, Height},
-    parameters::Network,
+    parameters::{checkpoint::list::CheckpointList, Network},
 };
 
 use zebra_node_services::mempool;
@@ -35,10 +36,12 @@ use zebra_state as zs;
 
 use crate::{
     block::{Request, SemanticBlockVerifier, VerifyBlockError},
-    checkpoint::{CheckpointList, CheckpointVerifier, VerifyCheckpointError},
+    checkpoint::{CheckpointVerifier, VerifyCheckpointError},
     error::TransactionError,
-    transaction, BoxError, Config, ParameterCheckpoint as _,
+    transaction, BoxError, Config,
 };
+
+pub mod service_trait;
 
 #[cfg(test)]
 mod tests;
@@ -69,7 +72,7 @@ struct BlockVerifierRouter<S, V>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
-    V: Service<transaction::Request, Response = transaction::Response, Error = BoxError>
+    V: Service<transaction::BlockRequest, Response = transaction::BlockResponse, Error = BoxError>
         + Send
         + Clone
         + 'static,
@@ -154,7 +157,7 @@ impl<S, V> Service<Request> for BlockVerifierRouter<S, V>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
-    V: Service<transaction::Request, Response = transaction::Response, Error = BoxError>
+    V: Service<transaction::BlockRequest, Response = transaction::BlockResponse, Error = BoxError>
         + Send
         + Clone
         + 'static,
@@ -216,7 +219,7 @@ where
 
 /// Initialize block and transaction verification services.
 ///
-/// Returns a block verifier, transaction verifier,
+/// Returns a block verifier, mempool transaction verifier,
 /// a [`BackgroundTaskHandles`] with the state checkpoint verify task,
 /// and the maximum configured checkpoint verification height.
 ///
@@ -248,8 +251,8 @@ pub async fn init<S, Mempool>(
 ) -> (
     Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
-        transaction::Request,
+        BoxService<transaction::MempoolRequest, transaction::MempoolResponse, TransactionError>,
+        transaction::MempoolRequest,
     >,
     BackgroundTaskHandles,
     Height,
@@ -348,8 +351,13 @@ where
 
     // transaction verification
 
-    let transaction = transaction::Verifier::new(network, state_service.clone(), mempool);
-    let transaction = Buffer::new(BoxService::new(transaction), VERIFIER_BUFFER_BOUND);
+    let block_transaction = transaction::BlockTxVerifier::new(network, state_service.clone());
+    let block_transaction = Buffer::new(BoxService::new(block_transaction), VERIFIER_BUFFER_BOUND);
+
+    let mempool_transaction =
+        transaction::MempoolTxVerifier::new(network, state_service.clone(), mempool);
+    let mempool_transaction =
+        Buffer::new(BoxService::new(mempool_transaction), VERIFIER_BUFFER_BOUND);
 
     // block verification
     let (list, max_checkpoint_height) = init_checkpoint_list(config, network);
@@ -371,7 +379,8 @@ where
         "initializing block verifier router"
     );
 
-    let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
+    let block =
+        SemanticBlockVerifier::new(network, state_service.clone(), block_transaction.clone());
     let checkpoint = CheckpointVerifier::from_checkpoint_list(list, network, tip, state_service);
     let router = BlockVerifierRouter {
         checkpoint,
@@ -385,12 +394,17 @@ where
         state_checkpoint_verify_handle,
     };
 
-    (router, transaction, task_handles, max_checkpoint_height)
+    (
+        router,
+        mempool_transaction,
+        task_handles,
+        max_checkpoint_height,
+    )
 }
 
 /// Parses the checkpoint list for `network` and `config`.
 /// Returns the checkpoint list and maximum checkpoint height.
-pub fn init_checkpoint_list(config: Config, network: &Network) -> (CheckpointList, Height) {
+pub fn init_checkpoint_list(config: Config, network: &Network) -> (Arc<CheckpointList>, Height) {
     // TODO: Zebra parses the checkpoint list three times at startup.
     //       Instead, cache the checkpoint list for each `network`.
     let list = network.checkpoint_list();
@@ -424,8 +438,8 @@ pub async fn init_test<S>(
 ) -> (
     Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
     Buffer<
-        BoxService<transaction::Request, transaction::Response, TransactionError>,
-        transaction::Request,
+        BoxService<transaction::MempoolRequest, transaction::MempoolResponse, TransactionError>,
+        transaction::MempoolRequest,
     >,
     BackgroundTaskHandles,
     Height,

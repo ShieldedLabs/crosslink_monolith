@@ -2,7 +2,7 @@
 
 use std::{
     cmp::{max, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -12,7 +12,10 @@ use zebra_chain::{parameters::Network, serialization::DateTime32};
 use crate::{
     constants,
     peer::{address_is_valid_for_outbound_connections, PeerPreference},
-    protocol::{external::canonical_peer_addr, types::PeerServices},
+    protocol::{
+        external::{canonical_peer_addr, types::Version},
+        types::PeerServices,
+    },
 };
 
 use MetaAddrChange::*;
@@ -64,6 +67,17 @@ pub enum PeerAddrState {
 
     /// We just started a connection attempt to this peer.
     AttemptPending,
+}
+
+impl std::fmt::Display for PeerAddrState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Responded => write!(f, "connected"),
+            NeverAttemptedGossiped => write!(f, "never_connected"),
+            Failed => write!(f, "failed"),
+            AttemptPending => write!(f, "connecting"),
+        }
+    }
 }
 
 impl PeerAddrState {
@@ -146,7 +160,7 @@ impl PartialOrd for PeerAddrState {
 /// This struct can be created from `addr` or `addrv2` messages.
 ///
 /// [Bitcoin reference](https://en.bitcoin.it/wiki/Protocol_documentation#Network_address)
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub struct MetaAddr {
     /// The peer's canonical socket address.
@@ -189,6 +203,17 @@ pub struct MetaAddr {
     /// See the [`MetaAddr::last_seen`] method for details.
     last_response: Option<DateTime32>,
 
+    /// The last measured round-trip time (RTT) for this peer, if available.
+    ///
+    /// This value is updated when the peer responds to a ping (Pong).
+    rtt: Option<Duration>,
+
+    /// The last time we sent a ping to this peer.
+    ///
+    /// This value is updated each time a heartbeat ping is sent,
+    /// even if we never receive a response.
+    ping_sent_at: Option<Instant>,
+
     /// The last time we tried to open an outbound connection to this peer.
     ///
     /// See the [`MetaAddr::last_attempt`] method for details.
@@ -212,10 +237,16 @@ pub struct MetaAddr {
     /// Whether this peer address was added to the address book
     /// when the peer made an inbound connection.
     is_inbound: bool,
+
+    /// The user agent string reported by the peer during handshake, if available.
+    user_agent: Option<String>,
+
+    /// The protocol version negotiated with the peer during handshake, if available.
+    negotiated_version: Option<Version>,
 }
 
 /// A change to an existing `MetaAddr`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum MetaAddrChange {
     // TODO:
@@ -269,6 +300,18 @@ pub enum MetaAddrChange {
         addr: PeerSocketAddr,
         services: PeerServices,
         is_inbound: bool,
+        user_agent: String,
+        negotiated_version: Version,
+    },
+
+    /// Updates an existing `MetaAddr` when we send a ping to a peer.
+    UpdatePingSent {
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "canonical_peer_addr_strategy()")
+        )]
+        addr: PeerSocketAddr,
+        ping_sent_at: Instant,
     },
 
     /// Updates an existing `MetaAddr` when a peer responds with a message.
@@ -278,6 +321,7 @@ pub enum MetaAddrChange {
             proptest(strategy = "canonical_peer_addr_strategy()")
         )]
         addr: PeerSocketAddr,
+        rtt: Option<Duration>,
     },
 
     /// Updates an existing `MetaAddr` when a peer fails.
@@ -320,11 +364,15 @@ impl MetaAddr {
             services: Some(untrusted_services),
             untrusted_last_seen: Some(untrusted_last_seen),
             last_response: None,
+            rtt: None,
+            ping_sent_at: None,
             last_attempt: None,
             last_failure: None,
             last_connection_state: NeverAttemptedGossiped,
             misbehavior_score: 0,
             is_inbound: false,
+            user_agent: None,
+            negotiated_version: None,
         }
     }
 
@@ -361,11 +409,23 @@ impl MetaAddr {
         addr: PeerSocketAddr,
         services: &PeerServices,
         is_inbound: bool,
+        user_agent: String,
+        negotiated_version: Version,
     ) -> MetaAddrChange {
         UpdateConnected {
             addr: canonical_peer_addr(*addr),
             services: *services,
             is_inbound,
+            user_agent,
+            negotiated_version,
+        }
+    }
+
+    /// Returns a [`MetaAddrChange::UpdatePingSent`] for a peer that we just sent a ping to.
+    pub fn new_ping_sent(addr: PeerSocketAddr, ping_sent_at: Instant) -> MetaAddrChange {
+        UpdatePingSent {
+            addr: canonical_peer_addr(*addr),
+            ping_sent_at,
         }
     }
 
@@ -380,9 +440,10 @@ impl MetaAddr {
     /// - malicious peers could interfere with other peers' [`AddressBook`](crate::AddressBook)
     ///   state, or
     /// - Zebra could advertise unreachable addresses to its own peers.
-    pub fn new_responded(addr: PeerSocketAddr) -> MetaAddrChange {
+    pub fn new_responded(addr: PeerSocketAddr, rtt: Option<Duration>) -> MetaAddrChange {
         UpdateResponded {
             addr: canonical_peer_addr(*addr),
+            rtt,
         }
     }
 
@@ -409,6 +470,19 @@ impl MetaAddr {
         UpdateFailed {
             addr: canonical_peer_addr(*addr),
             services: services.into(),
+        }
+    }
+
+    /// Returns a [`MetaAddrChange::UpdateMisbehavior`] for a peer that has misbehaved.
+    ///
+    /// Canonicalizes the address to match the form stored by a successful handshake
+    /// (`new_connected`). On Linux dual-stack sockets, inbound IPv4 connections
+    /// arrive as IPv4-mapped IPv6 addresses (`::ffff:A.B.C.D`); without
+    /// canonicalization, `apply_to_meta_addr` panics on the addr invariant.
+    pub fn new_misbehavior(addr: PeerSocketAddr, score_increment: u32) -> MetaAddrChange {
+        UpdateMisbehavior {
+            addr: canonical_peer_addr(*addr),
+            score_increment,
         }
     }
 
@@ -448,6 +522,16 @@ impl MetaAddr {
     /// Returns whether the address is from an inbound peer connection
     pub fn is_inbound(&self) -> bool {
         self.is_inbound
+    }
+
+    /// Returns the round-trip time (RTT) for this peer, if available.
+    pub fn rtt(&self) -> Option<Duration> {
+        self.rtt
+    }
+
+    /// Returns the time this peer was last pinged, if available.
+    pub fn ping_sent_at(&self) -> Option<Instant> {
+        self.ping_sent_at
     }
 
     /// Returns the unverified "last seen time" gossiped by the remote peer that
@@ -652,6 +736,26 @@ impl MetaAddr {
         }
     }
 
+    /// Returns the services advertised by the peer, if available.
+    pub fn services(&self) -> Option<PeerServices> {
+        self.services
+    }
+
+    /// Returns the last known connection state for this peer.
+    pub fn last_connection_state(&self) -> PeerAddrState {
+        self.last_connection_state
+    }
+
+    /// Returns the user agent string reported by this peer, if available.
+    pub fn user_agent(&self) -> Option<&str> {
+        self.user_agent.as_deref()
+    }
+
+    /// Returns the negotiated protocol version for this peer, if available.
+    pub fn negotiated_version(&self) -> Option<Version> {
+        self.negotiated_version
+    }
+
     /// Returns a score of misbehavior encountered in a peer at this address.
     pub fn misbehavior(&self) -> u32 {
         self.misbehavior_score
@@ -691,11 +795,15 @@ impl MetaAddr {
             untrusted_last_seen: Some(last_seen),
             last_response: None,
             // these fields aren't sent to the remote peer, but sanitize them anyway
+            rtt: None,
+            ping_sent_at: None,
             last_attempt: None,
             last_failure: None,
             last_connection_state: NeverAttemptedGossiped,
             misbehavior_score: 0,
             is_inbound: false,
+            user_agent: None,
+            negotiated_version: None,
         })
     }
 }
@@ -719,6 +827,7 @@ impl MetaAddrChange {
             | NewLocal { addr, .. }
             | UpdateAttempt { addr }
             | UpdateConnected { addr, .. }
+            | UpdatePingSent { addr, .. }
             | UpdateResponded { addr, .. }
             | UpdateFailed { addr, .. }
             | UpdateMisbehavior { addr, .. } => *addr,
@@ -736,6 +845,7 @@ impl MetaAddrChange {
             | NewLocal { addr, .. }
             | UpdateAttempt { addr }
             | UpdateConnected { addr, .. }
+            | UpdatePingSent { addr, .. }
             | UpdateResponded { addr, .. }
             | UpdateFailed { addr, .. }
             | UpdateMisbehavior { addr, .. } => *addr = new_addr,
@@ -754,6 +864,7 @@ impl MetaAddrChange {
             NewLocal { .. } => Some(PeerServices::NODE_NETWORK),
             UpdateAttempt { .. } => None,
             UpdateConnected { services, .. } => Some(*services),
+            UpdatePingSent { .. } => None,
             UpdateResponded { .. } => None,
             UpdateFailed { services, .. } => *services,
             UpdateMisbehavior { .. } => None,
@@ -772,6 +883,7 @@ impl MetaAddrChange {
             NewLocal { .. } => Some(now),
             UpdateAttempt { .. }
             | UpdateConnected { .. }
+            | UpdatePingSent { .. }
             | UpdateResponded { .. }
             | UpdateFailed { .. }
             | UpdateMisbehavior { .. } => None,
@@ -806,6 +918,7 @@ impl MetaAddrChange {
             // handshake time.
             UpdateAttempt { .. } => Some(now),
             UpdateConnected { .. }
+            | UpdatePingSent { .. }
             | UpdateResponded { .. }
             | UpdateFailed { .. }
             | UpdateMisbehavior { .. } => None,
@@ -823,6 +936,31 @@ impl MetaAddrChange {
             //   reconnection attempts.
             UpdateConnected { .. } | UpdateResponded { .. } => Some(now),
             UpdateFailed { .. } | UpdateMisbehavior { .. } => None,
+            UpdatePingSent { .. } => None,
+        }
+    }
+
+    /// Return the timestamp when a ping was last sent, if available.
+    pub fn ping_sent(&self) -> Option<Instant> {
+        match self {
+            UpdatePingSent { ping_sent_at, .. } => Some(*ping_sent_at),
+            _ => None,
+        }
+    }
+
+    /// Return the RTT for this change, if available
+    pub fn rtt(&self) -> Option<Duration> {
+        match self {
+            UpdateResponded { rtt, .. } => *rtt,
+            _ => None,
+        }
+    }
+
+    /// Returns the timestamp when a ping was last sent, if available.
+    pub fn ping_sent_at(&self) -> Option<Instant> {
+        match self {
+            UpdatePingSent { ping_sent_at, .. } => Some(*ping_sent_at),
+            _ => None,
         }
     }
 
@@ -834,6 +972,7 @@ impl MetaAddrChange {
             | NewLocal { .. }
             | UpdateAttempt { .. }
             | UpdateConnected { .. }
+            | UpdatePingSent { .. }
             | UpdateResponded { .. } => None,
             // If there is a large delay applying this change, then:
             // - the peer might stay in the `AttemptPending` or `Responded`
@@ -852,23 +991,34 @@ impl MetaAddrChange {
             // local listeners get sanitized, so the state doesn't matter here
             NewLocal { .. } => NeverAttemptedGossiped,
             UpdateAttempt { .. } => AttemptPending,
-            UpdateConnected { .. } | UpdateResponded { .. } | UpdateMisbehavior { .. } => Responded,
+            UpdateConnected { .. }
+            // Sending a ping is an interaction with a connected peer, but does not indicate new liveness.
+            // Peers stay in Responded once connected, so we keep them in that state for UpdatePingSent.
+            | UpdatePingSent { .. }
+            | UpdateResponded { .. }
+            | UpdateMisbehavior { .. } => Responded,
             UpdateFailed { .. } => Failed,
         }
     }
 
     /// Returns the corresponding `MetaAddr` for this change.
     pub fn into_new_meta_addr(self, instant_now: Instant, local_now: DateTime32) -> MetaAddr {
+        let user_agent = self.user_agent();
+        let negotiated_version = self.negotiated_version();
         MetaAddr {
             addr: self.addr(),
             services: self.untrusted_services(),
             untrusted_last_seen: self.untrusted_last_seen(local_now),
             last_response: self.last_response(local_now),
+            rtt: self.rtt(),
+            ping_sent_at: self.ping_sent_at(),
             last_attempt: self.last_attempt(instant_now),
             last_failure: self.last_failure(instant_now),
             last_connection_state: self.peer_addr_state(),
             misbehavior_score: self.misbehavior_score(),
             is_inbound: self.is_inbound(),
+            user_agent,
+            negotiated_version,
         }
     }
 
@@ -891,6 +1041,27 @@ impl MetaAddrChange {
         }
     }
 
+    /// Returns the user agent from this change, if available.
+    pub fn user_agent(&self) -> Option<String> {
+        if let MetaAddrChange::UpdateConnected { user_agent, .. } = self {
+            Some(user_agent.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Returns the negotiated protocol version from this change, if available.
+    pub fn negotiated_version(&self) -> Option<Version> {
+        if let MetaAddrChange::UpdateConnected {
+            negotiated_version, ..
+        } = self
+        {
+            Some(*negotiated_version)
+        } else {
+            None
+        }
+    }
+
     /// Returns the corresponding [`MetaAddr`] for a local listener change.
     ///
     /// This method exists so we don't have to provide an unused [`Instant`] to get a local
@@ -907,11 +1078,15 @@ impl MetaAddrChange {
             services: self.untrusted_services(),
             untrusted_last_seen: self.untrusted_last_seen(local_now),
             last_response: self.last_response(local_now),
+            rtt: None,
+            ping_sent_at: None,
             last_attempt: None,
             last_failure: None,
             last_connection_state: self.peer_addr_state(),
             misbehavior_score: self.misbehavior_score(),
             is_inbound: self.is_inbound(),
+            user_agent: None,
+            negotiated_version: None,
         }
     }
 
@@ -930,7 +1105,7 @@ impl MetaAddrChange {
 
         let Some(previous) = previous.into() else {
             // no previous: create a new entry
-            return Some(self.into_new_meta_addr(instant_now, local_now));
+            return Some(self.clone().into_new_meta_addr(instant_now, local_now));
         };
 
         assert_eq!(previous.addr, self.addr(), "unexpected addr mismatch");
@@ -1061,11 +1236,15 @@ impl MetaAddrChange {
                     .or_else(|| self.untrusted_last_seen(local_now)),
                 // The peer has not been attempted, so these fields must be None
                 last_response: None,
+                rtt: None,
+                ping_sent_at: None,
                 last_attempt: None,
                 last_failure: None,
                 last_connection_state: self.peer_addr_state(),
                 misbehavior_score: previous.misbehavior_score + self.misbehavior_score(),
                 is_inbound: previous.is_inbound || self.is_inbound(),
+                user_agent: None,
+                negotiated_version: None,
             })
         } else {
             // Existing entry and change are both Attempt, Responded, Failed,
@@ -1083,6 +1262,8 @@ impl MetaAddrChange {
                 // This is a wall clock time, but we already checked that responses are in order.
                 // Even if the wall clock time has jumped, we want to use the latest time.
                 last_response: self.last_response(local_now).or(previous.last_response),
+                rtt: self.rtt(),
+                ping_sent_at: self.ping_sent_at(),
                 // These are monotonic times, we already checked the responses are in order.
                 last_attempt: self.last_attempt(instant_now).or(previous.last_attempt),
                 last_failure: self.last_failure(instant_now).or(previous.last_failure),
@@ -1090,6 +1271,8 @@ impl MetaAddrChange {
                 last_connection_state: self.peer_addr_state(),
                 misbehavior_score: previous.misbehavior_score + self.misbehavior_score(),
                 is_inbound: previous.is_inbound || self.is_inbound(),
+                user_agent: self.user_agent().or(previous.user_agent),
+                negotiated_version: self.negotiated_version().or(previous.negotiated_version),
             })
         }
     }

@@ -7,9 +7,10 @@ use serde_big_array::BigArray;
 
 use crate::{
     block::Header,
+    parameters::Network,
     serialization::{
-        zcash_serialize_bytes, SerializationError, ZcashDeserialize, ZcashDeserializeInto,
-        ZcashSerialize,
+        zcash_deserialize_bytes_external_count, zcash_serialize_bytes, CompactSizeMessage,
+        SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
     },
 };
 
@@ -109,6 +110,27 @@ impl Solution {
             _unexpected_len => Err(SerializationError::Parse(
                 "incorrect equihash solution size",
             )),
+        }
+    }
+
+    /// The serialized size of a solution on Mainnet and Testnet (except Regtest), in bytes:
+    /// the 1344-byte solution and its 3-byte CompactSize length prefix (`0xfd` + `u16`).
+    pub const SERIALIZED_SIZE: usize = 3 + SOLUTION_SIZE;
+
+    /// The serialized size of a solution on Regtest, in bytes:
+    /// the 36-byte solution and its 1-byte CompactSize length prefix.
+    pub const REGTEST_SERIALIZED_SIZE: usize = 1 + REGTEST_SOLUTION_SIZE;
+
+    /// Returns the size of the serialized solution on `network`, in bytes,
+    /// including its CompactSize length prefix.
+    ///
+    /// The solution size is constant per network, so this is also constant per network:
+    /// [`Self::REGTEST_SERIALIZED_SIZE`] on Regtest, [`Self::SERIALIZED_SIZE`] everywhere else.
+    pub fn serialized_size(network: &Network) -> usize {
+        if network.is_regtest() {
+            Self::REGTEST_SERIALIZED_SIZE
+        } else {
+            Self::SERIALIZED_SIZE
         }
     }
 
@@ -262,7 +284,19 @@ impl ZcashSerialize for Solution {
 
 impl ZcashDeserialize for Solution {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let solution: Vec<u8> = (&mut reader).zcash_deserialize_into()?;
+        let len: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+        let len: usize = len.into();
+
+        // Validate the length against the consensus-required sizes before
+        // allocating, so an attacker-controlled CompactSize cannot force a
+        // multi-megabyte allocation.
+        if len > SOLUTION_SIZE {
+            return Err(SerializationError::Parse(
+                "incorrect equihash solution size",
+            ));
+        }
+
+        let solution = zcash_deserialize_bytes_external_count(len, &mut reader)?;
         Self::from_bytes(&solution)
     }
 }

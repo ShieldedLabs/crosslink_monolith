@@ -381,7 +381,7 @@ mod tests {
             true,
             STATE_COLUMN_FAMILIES_IN_CODE.iter().map(ToString::to_string),
             false,
-        )
+        ).expect("opening an ephemeral database should succeed")
     }
 
     fn put(db: &ZebraDb, finalizer: [u8; 32], start: u32, bond: [u8; 32], end: Height) {

@@ -5,11 +5,13 @@ use std::{collections::BTreeMap, env, sync::Arc};
 use zebra_test::prelude::*;
 
 use zebra_chain::{
-    amount::NonNegative,
+    amount::{DeferredPoolBalanceChange, NonNegative},
     block::{self, arbitrary::allow_all_transparent_coinbase_spends, Block, Height},
     history_tree::{HistoryTree, NonEmptyHistoryTree},
+    parallel::tree::NoteCommitmentTrees,
     parameters::NetworkUpgrade::*,
     parameters::*,
+    primitives::zcash_history::BlockCommitmentTreeRoots,
     value_balance::ValueBalance,
     LedgerState,
 };
@@ -41,7 +43,7 @@ fn push_genesis_chain() -> Result<()> {
     |((chain, count, network, empty_tree) in PreparedChain::default())| {
         prop_assert!(empty_tree.is_none());
 
-        let mut only_chain = Chain::new(&network, Height(0), Default::default(), Default::default(), Default::default(), empty_tree, ValueBalance::zero(), Vec::new());
+        let mut only_chain = Chain::new(&network, Height(0), Default::default(), empty_tree, ValueBalance::zero(), Vec::new());
         // contains the block value pool changes and chain value pool balances for each height
         let mut chain_values = BTreeMap::new();
 
@@ -52,6 +54,7 @@ fn push_genesis_chain() -> Result<()> {
             ContextuallyVerifiedBlock::with_block_and_spent_utxos(
                     block,
                     only_chain.unspent_utxos(),
+                    DeferredPoolBalanceChange::zero(),
                 )
                 .map_err(|e| (e, chain_values.clone()))
                 .expect("invalid block value pool change");
@@ -93,7 +96,7 @@ fn push_history_tree_chain() -> Result<()> {
         let count = std::cmp::min(count, chain.len() - 1);
         let chain = &chain[1..];
 
-        let mut only_chain = Chain::new(&network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree, ValueBalance::zero(), Vec::new());
+        let mut only_chain = Chain::new(&network, Height(0), Default::default(), finalized_tree, ValueBalance::zero(), Vec::new());
 
         for block in chain
             .iter()
@@ -138,9 +141,7 @@ fn forked_equals_pushed_genesis() -> Result<()> {
         let mut partial_chain = Chain::new(
             &network,
             Height(0),
-            Default::default(),
-            Default::default(),
-            Default::default(),
+            NoteCommitmentTrees::default(),
             empty_tree.clone(),
             ValueBalance::zero(),
             Vec::new(),
@@ -149,6 +150,7 @@ fn forked_equals_pushed_genesis() -> Result<()> {
             let block = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
                 block,
                 partial_chain.unspent_utxos(),
+                DeferredPoolBalanceChange::zero(),
             )?;
             partial_chain = partial_chain
                 .push(block)
@@ -159,9 +161,7 @@ fn forked_equals_pushed_genesis() -> Result<()> {
         let mut full_chain = Chain::new(
             &network,
             Height(0),
-            Default::default(),
-            Default::default(),
-            Default::default(),
+            NoteCommitmentTrees::default(),
             empty_tree,
             ValueBalance::zero(),
             Vec::new()
@@ -169,7 +169,7 @@ fn forked_equals_pushed_genesis() -> Result<()> {
 
         for block in chain.iter().cloned() {
             let block =
-            ContextuallyVerifiedBlock::with_block_and_spent_utxos(block, full_chain.unspent_utxos())?;
+            ContextuallyVerifiedBlock::with_block_and_spent_utxos(block, full_chain.unspent_utxos(), DeferredPoolBalanceChange::zero())?;
 
             // Check some properties of the genesis block and don't push it to the chain.
             if block.height == block::Height(0) {
@@ -212,7 +212,7 @@ fn forked_equals_pushed_genesis() -> Result<()> {
         // same original full chain.
         for block in chain.iter().skip(fork_at_count).cloned() {
             let block =
-            ContextuallyVerifiedBlock::with_block_and_spent_utxos(block, forked.unspent_utxos())?;
+            ContextuallyVerifiedBlock::with_block_and_spent_utxos(block, forked.unspent_utxos(), DeferredPoolBalanceChange::zero())?;
             forked = forked.push(block).expect("forked chain push is valid");
         }
 
@@ -246,8 +246,8 @@ fn forked_equals_pushed_history_tree() -> Result<()> {
         // use `fork_at_count` as the fork tip
         let fork_tip_hash = chain[fork_at_count - 1].hash;
 
-        let mut full_chain = Chain::new(&network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree.clone(), ValueBalance::zero(), Vec::new());
-        let mut partial_chain = Chain::new(&network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree, ValueBalance::zero(), Vec::new());
+        let mut full_chain = Chain::new(&network, Height(0), Default::default(), finalized_tree.clone(), ValueBalance::zero(), Vec::new());
+        let mut partial_chain = Chain::new(&network, Height(0), Default::default(), finalized_tree, ValueBalance::zero(), Vec::new());
 
         for block in chain
             .iter()
@@ -314,7 +314,7 @@ fn finalized_equals_pushed_genesis() -> Result<()> {
 
         let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
 
-        let mut full_chain = Chain::new(&network, Height(0), Default::default(), Default::default(), Default::default(), empty_tree, fake_value_pool, Vec::new());
+        let mut full_chain = Chain::new(&network, Height(0), Default::default(), empty_tree, fake_value_pool, Vec::new());
         for block in chain
             .clone()
             .take(finalized_count) {
@@ -324,9 +324,13 @@ fn finalized_equals_pushed_genesis() -> Result<()> {
         let mut partial_chain = Chain::new(
             &network,
             full_chain.non_finalized_tip_height(),
-            full_chain.sprout_note_commitment_tree_for_tip(),
-            full_chain.sapling_note_commitment_tree_for_tip(),
-            full_chain.orchard_note_commitment_tree_for_tip(),
+            NoteCommitmentTrees {
+                sprout: full_chain.sprout_note_commitment_tree_for_tip(),
+                sapling: full_chain.sapling_note_commitment_tree_for_tip(),
+                orchard: full_chain.orchard_note_commitment_tree_for_tip(),
+                ironwood: full_chain.ironwood_note_commitment_tree_for_tip(),
+                ..Default::default()
+            },
             full_chain.history_block_commitment_tree(),
             full_chain.chain_value_pools,
             Vec::new(),
@@ -392,7 +396,7 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
 
         let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
 
-        let mut full_chain = Chain::new(&network, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree, fake_value_pool, Vec::new());
+        let mut full_chain = Chain::new(&network, Height(0), Default::default(), finalized_tree, fake_value_pool, Vec::new());
         for block in chain
             .iter()
             .take(finalized_count)
@@ -403,9 +407,13 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
         let mut partial_chain = Chain::new(
             &network,
             Height(finalized_count.try_into().unwrap()),
-            full_chain.sprout_note_commitment_tree_for_tip(),
-            full_chain.sapling_note_commitment_tree_for_tip(),
-            full_chain.orchard_note_commitment_tree_for_tip(),
+            NoteCommitmentTrees {
+                sprout: full_chain.sprout_note_commitment_tree_for_tip(),
+                sapling: full_chain.sapling_note_commitment_tree_for_tip(),
+                orchard: full_chain.orchard_note_commitment_tree_for_tip(),
+                ironwood: full_chain.ironwood_note_commitment_tree_for_tip(),
+                ..Default::default()
+            },
             full_chain.history_block_commitment_tree(),
             full_chain.chain_value_pools,
             Vec::new(),
@@ -450,7 +458,6 @@ fn finalized_equals_pushed_history_tree() -> Result<()> {
 /// in a non-finalized state.
 #[ignore] // [ACTIVATION HEIGHT PROBLEM]
 #[test]
-#[cfg(not(target_os = "windows"))]
 fn rejection_restores_internal_state_genesis() -> Result<()> {
     use zebra_chain::fmt::DisplayToDebug;
 
@@ -485,7 +492,7 @@ fn rejection_restores_internal_state_genesis() -> Result<()> {
       }
       ))| {
         let mut state = NonFinalizedState::new(&network, Default::default());
-        let finalized_state = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false);
+        let finalized_state = FinalizedState::new(&Config::ephemeral(), &network, #[cfg(feature = "elasticsearch")] false).expect("opening an ephemeral database should succeed");
 
         let fake_value_pool = ValueBalance::<NonNegative>::fake_populated_pool();
         finalized_state.set_finalized_value_pool(fake_value_pool);
@@ -577,21 +584,21 @@ fn different_blocks_different_chains() -> Result<()> {
 
         let finalized_tree1: Arc<HistoryTree> = if height1 >= Heartwood.activation_height(&Network::Mainnet).unwrap() {
             Arc::new(
-                NonEmptyHistoryTree::from_block(&Network::Mainnet, prev_block1, &Default::default(), &Default::default()).unwrap().into()
+                NonEmptyHistoryTree::from_block(&Network::Mainnet, prev_block1, BlockCommitmentTreeRoots { sapling: &Default::default(), orchard: &Default::default(), ironwood: &Default::default() }).unwrap().into()
             )
         } else {
             Default::default()
         };
         let finalized_tree2: Arc<HistoryTree> = if height2 >= NetworkUpgrade::Heartwood.activation_height(&Network::Mainnet).unwrap() {
             Arc::new(
-                NonEmptyHistoryTree::from_block(&Network::Mainnet, prev_block2, &Default::default(), &Default::default()).unwrap().into()
+                NonEmptyHistoryTree::from_block(&Network::Mainnet, prev_block2, BlockCommitmentTreeRoots { sapling: &Default::default(), orchard: &Default::default(), ironwood: &Default::default() }).unwrap().into()
             )
         } else {
             Default::default()
         };
 
-        let chain1 = Chain::new(&Network::Mainnet, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree1, ValueBalance::fake_populated_pool(), Vec::new());
-        let chain2 = Chain::new(&Network::Mainnet, Height(0), Default::default(), Default::default(), Default::default(), finalized_tree2, ValueBalance::fake_populated_pool(), Vec::new());
+        let chain1 = Chain::new(&Network::Mainnet, Height(0), Default::default(), finalized_tree1, ValueBalance::fake_populated_pool(), Vec::new());
+        let chain2 = Chain::new(&Network::Mainnet, Height(0), Default::default(), finalized_tree2, ValueBalance::fake_populated_pool(), Vec::new());
 
         let block1 = vec1[1].clone().prepare().test_with_zero_spent_utxos();
         let block2 = vec2[1].clone().prepare().test_with_zero_spent_utxos();

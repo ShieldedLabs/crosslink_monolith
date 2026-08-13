@@ -53,8 +53,8 @@ use zebra_script::{CachedFfiTransaction, Sigops};
 use crate::{
     block::{check, VerifyBlockError, MAX_BLOCK_SIGOPS},
     error::BlockError,
-    groth16::SAPLING,
-    primitives::halo2::VERIFYING_KEY,
+    primitives::halo2::orchard_verifying_key_for,
+    primitives::sapling::SAPLING,
     transaction as tx,
 };
 
@@ -354,13 +354,24 @@ pub fn block_verify_expensive(
     }
 
     if !orchard_bundles.is_empty() {
-        let mut validator = orchard::bundle::BatchValidator::new();
+        // orchard 0.15 moved the verifying key from `validate()` into `new()`, so the era's key is
+        // fixed when the batch is created. Resolve it from this block's upgrade rather than
+        // assuming NU6.3: a Crosslink testnet at NU6 carries Orchard proofs built under the
+        // pre-NU6.2 circuit, which do not verify under the NU6.3 key.
+        let mut validator = orchard::bundle::BatchValidator::new(orchard_verifying_key_for(nu));
 
         for (bundle, sighash) in orchard_bundles {
-            validator.add_bundle(&bundle, sighash.0);
+            // `add_bundle` rejects a bundle whose cross-address restriction is not supported by
+            // this era's verifying key. Ignoring that would accept an invalid bundle.
+            if validator.add_bundle(&bundle, sighash.0).is_err() {
+                return Err(BlockVerifyError {
+                    msg: "Orchard bundle is invalid for this consensus era".to_string(),
+                    misbehavior_score: 100,
+                });
+            }
         }
 
-        if !validator.validate(&VERIFYING_KEY, thread_rng()) {
+        if !validator.validate(thread_rng()) {
             return Err(BlockVerifyError { msg: "invalid Orchard bundle in block".to_string(), misbehavior_score: 100 });
         }
     }

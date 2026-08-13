@@ -13,9 +13,11 @@ use zcash_protocol::consensus::{self, BlockHeight, NetworkUpgrade};
 use super::shardtree_support;
 use crate::wallet::{chain_tip_height, init::WalletMigrationError, scanning::priority_code};
 
-pub(super) const MIGRATION_ID: Uuid = Uuid::from_u128(0x3a6487f7_e068_42bb_9d12_6bb8dbe6da00);
+/// This migration adds tables to the wallet database that are needed to persist Orchard note
+/// commitment tree data using the `shardtree` crate.
+pub const MIGRATION_ID: Uuid = Uuid::from_u128(0x3a6487f7_e068_42bb_9d12_6bb8dbe6da00);
 
-const DEPENDENCIES: &[Uuid] = &[shardtree_support::MIGRATION_ID];
+pub(super) const DEPENDENCIES: &[Uuid] = &[shardtree_support::MIGRATION_ID];
 
 pub(super) struct Migration<P> {
     pub(super) params: P,
@@ -99,7 +101,12 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                 )",
             16, // ORCHARD_SHARD_HEIGHT is only available when `feature = "orchard"` is enabled.
             16, // ORCHARD_SHARD_HEIGHT is only available when `feature = "orchard"` is enabled.
-            u32::from(self.params.activation_height(NetworkUpgrade::Nu5).unwrap()),
+            // NU5 might not be active in regtest mode.
+            self.params
+                .activation_height(NetworkUpgrade::Nu5)
+                .map(|h| u32::from(h).to_string())
+                .as_deref()
+                .unwrap_or("NULL"),
         ))?;
 
         transaction.execute_batch(&format!(

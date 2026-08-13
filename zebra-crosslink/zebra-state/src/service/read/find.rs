@@ -65,6 +65,23 @@ where
         .or_else(|| db.tip())
 }
 
+/// Returns the tip block of `chain`.
+/// If there is no chain, returns the tip of `db`.
+pub fn tip_block<C>(chain: Option<C>, db: &ZebraDb) -> Option<Arc<Block>>
+where
+    C: AsRef<Chain>,
+{
+    // # Correctness
+    //
+    // If there is an overlap between the non-finalized and finalized states,
+    // where the finalized tip is above the non-finalized tip,
+    // Zebra is receiving a lot of blocks, or this request has been delayed for a long time,
+    // so it is acceptable to return either tip.
+    chain
+        .and_then(|chain| chain.as_ref().tip_block().map(|b| b.block.clone()))
+        .or_else(|| db.tip_block())
+}
+
 /// Returns the tip [`Height`] of `chain`.
 /// If there is no chain, returns the tip of `db`.
 pub fn tip_height<C>(chain: Option<C>, db: &ZebraDb) -> Option<Height>
@@ -169,14 +186,12 @@ pub fn non_finalized_state_contains_block_hash(
 /// Returns the location of the block if present in the finalized state.
 /// Returns None if the block hash is not found in the finalized state.
 pub fn finalized_state_contains_block_hash(db: &ZebraDb, hash: block::Hash) -> Option<KnownBlock> {
-    if let Some(height) = db.height(hash) {
-        Some(KnownBlock {
-            location: KnownBlockLocation::BestChain,
-            height,
-        })
-    } else {
-        None
-    }
+    // Crosslink reported `BestChain` here because its `KnownBlockLocation` had no `Finalized`
+    // variant; upstream's does, and this function only looks at the finalized state.
+    db.height(hash).map(|height| KnownBlock {
+        location: KnownBlockLocation::Finalized,
+        height,
+    })
 }
 
 /// Return the height for the block at `hash`, if `hash` is in `chain` or `db`.
@@ -582,6 +597,34 @@ where
     let intersection = find_chain_intersection(chain, db, known_blocks);
 
     collect_chain_hashes(chain, db, intersection, stop, max_len)
+}
+
+/// Finds the fork point between the locator `known_blocks` and the best chain.
+///
+/// `known_blocks` is a block locator: hashes ordered from highest height to lowest
+/// height. Returns the height and hash of the highest locator entry that is on the best
+/// chain (in `chain` or the finalized `db`) — the most recent common ancestor — or
+/// `None` if no locator entry is on the best chain.
+///
+/// Returns `None` if the state is empty.
+pub fn find_fork_point<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    known_blocks: Vec<block::Hash>,
+) -> Option<(Height, block::Hash)>
+where
+    C: AsRef<Chain>,
+{
+    // # Correctness
+    //
+    // See the note in `block_locator()`.
+
+    let chain = chain.as_ref();
+
+    let fork_hash = find_chain_intersection(chain, db, known_blocks)?;
+    let fork_height = height_by_hash(chain, db, fork_hash)?;
+
+    Some((fork_height, fork_hash))
 }
 
 /// Finds the first hash that's in the peer's `known_blocks` and the chain.

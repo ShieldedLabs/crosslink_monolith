@@ -42,6 +42,9 @@
 //!  * Block Gossip Task
 //!    * runs in the background and continuously queries the state for
 //!      newly committed blocks to be gossiped to peers
+//!  * Block Notify Task
+//!    * if the user has configured a `notify.block_notify_command`, runs that command
+//!      whenever the best chain tip changes (Zebra's equivalent of zcashd's `-blocknotify`)
 //!  * Progress Task
 //!    * logs progress towards the chain tip
 //!
@@ -78,23 +81,27 @@ use std::{sync::Arc, time::Duration};
 use abscissa_core::{config, Command, FrameworkError};
 use color_eyre::eyre::{eyre, Report};
 use futures::FutureExt;
-use tokio::{pin, select, sync::oneshot, time::timeout};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::Path;
+use tokio::{pin, select, sync::{oneshot, watch}, time::timeout};
 use tower::{builder::ServiceBuilder, util::BoxService, ServiceExt};
 use tracing_futures::Instrument;
 
 use zebra_chain::block::genesis::regtest_genesis_block;
 use zebra_chain::parameters::{Network, HardForkSchedule};
-use zebra_consensus::{router::BackgroundTaskHandles, ParameterCheckpoint};
+use zebra_consensus::router::BackgroundTaskHandles;
 use zebra_rpc::{methods::RpcImpl, server::RpcServer, SubmitBlockChannel};
 
 use crate::{
     application::{build_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
     components::{
+        health,
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
         mempool::{self, Mempool},
+        notify::{self, BlockNotifyError},
         sync::{self, show_block_chain_progress, VERIFICATION_PIPELINE_SCALING_MULTIPLIER},
         tokio::{RuntimeRun, TokioComponent},
-        ChainSync, Inbound,
+        zcashd_compat, ChainSync, Inbound,
     },
     config::ZebradConfig,
     prelude::*,
@@ -111,9 +118,145 @@ pub struct StartCmd {
     /// Filter strings which override the config file and defaults
     #[clap(help = "tracing filters which override the zebrad.toml config")]
     filters: Vec<String>,
+
+    /// Enable zcashd-compat mode.
+    #[clap(long)]
+    zcashd_compat: bool,
+
+    /// Continue startup even when zcashd-compat preflight detects minimum hardware shortfalls.
+    #[clap(long = "unsafe-low-specs")]
+    unsafe_low_specs: bool,
 }
 
+/// Warns if Linux TCP slow-start-after-idle is enabled, which significantly
+/// reduces single-peer throughput for block propagation.
+///
+/// See `book/src/user/troubleshooting.md`.
+#[cfg(target_os = "linux")]
+fn check_tcp_slow_start_after_idle() {
+    const PATH: &str = "/proc/sys/net/ipv4/tcp_slow_start_after_idle";
+
+    let raw = match std::fs::read_to_string(PATH) {
+        Ok(raw) => raw,
+        Err(error) => {
+            debug!(
+                ?error,
+                path = PATH,
+                "could not read TCP sysctl, skipping check"
+            );
+            return;
+        }
+    };
+
+    if raw.trim() == "0" {
+        return;
+    }
+
+    warn!(
+        setting = "net.ipv4.tcp_slow_start_after_idle",
+        "TCP slow-start-after-idle is enabled, which resets TCP's congestion window \
+         between block requests and significantly reduces single-peer throughput for \
+         block propagation. \
+         Hint: set `net.ipv4.tcp_slow_start_after_idle=0` via sysctl. \
+         See https://zebra.zfnd.org/user/troubleshooting.html#linux-tcp-tuning-for-block-propagation"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_tcp_slow_start_after_idle() {}
+
 impl StartCmd {
+    /// Extra time Zebra waits for the zcashd-compat supervisor task beyond the
+    /// child's `shutdown_grace_period`. The supervisor's `terminate_child` waits
+    /// the full grace period before its SIGKILL last resort, so the outer wait
+    /// must be strictly longer or aborting the task races the graceful path.
+    const ZCASHD_COMPAT_SHUTDOWN_TIMEOUT_MARGIN: std::time::Duration =
+        std::time::Duration::from_secs(30);
+
+    /// Returns the Zebra P2P address supervised zcashd should `-connect` to.
+    ///
+    /// Uses `zcashd_compat.p2p_connect_addr` when set, otherwise Zebra's bound
+    /// P2P listener, substituting loopback for unspecified addresses so
+    /// zcashd gets a dialable target on the same host.
+    fn zcashd_compat_p2p_connect_addr(
+        config: &ZebradConfig,
+        local_listener: SocketAddr,
+    ) -> SocketAddr {
+        if let Some(addr) = config.zcashd_compat.p2p_connect_addr {
+            return addr;
+        }
+
+        if local_listener.ip().is_unspecified() {
+            // Substitute the loopback address of the same IP family: an
+            // IPv6-only listener is not reachable via 127.0.0.1.
+            match local_listener.ip() {
+                IpAddr::V4(_) => SocketAddr::from(([127, 0, 0, 1], local_listener.port())),
+                IpAddr::V6(_) => {
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), local_listener.port())
+                }
+            }
+        } else {
+            local_listener
+        }
+    }
+
+    /// Returns the default inbound peer IPs that always receive block gossip in
+    /// zcashd-compat mode.
+    fn zcashd_compat_default_block_gossip_peer_ips() -> Vec<IpAddr> {
+        vec![
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ]
+    }
+
+    /// Returns the supervisor shutdown timeout when zcashd-compat `zcashd` supervision is active.
+    ///
+    /// This is the configured `shutdown_grace_period` plus a fixed margin, so the
+    /// supervisor task always gets to finish its own SIGTERM → grace → SIGKILL
+    /// sequence before Zebra gives up on the task.
+    fn zcashd_compat_supervisor_shutdown_timeout(
+        config: &ZebradConfig,
+    ) -> Option<std::time::Duration> {
+        (config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd).then_some(
+            config
+                .zcashd_compat
+                .shutdown_grace_period
+                .saturating_add(Self::ZCASHD_COMPAT_SHUTDOWN_TIMEOUT_MARGIN),
+        )
+    }
+
+    /// Returns `false` so Zebra keeps running if zcashd-compat supervision exits unexpectedly.
+    fn zcashd_compat_supervisor_should_exit(
+        zcashd_compat_result: Result<Result<(), Report>, tokio::task::JoinError>,
+    ) -> bool {
+        zcashd_compat::set_supervision_unexpectedly_disabled_metrics();
+
+        match zcashd_compat_result {
+            Ok(Ok(())) => {
+                warn!(
+                    "zcashd-compat supervisor task exited unexpectedly in supervision mode; \
+                     continuing without zcashd supervision"
+                );
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    ?err,
+                    "zcashd-compat supervisor task failed in supervision mode; \
+                     continuing without zcashd supervision"
+                );
+            }
+            Err(join_err) => {
+                warn!(
+                    ?join_err,
+                    "zcashd-compat supervisor task panicked in supervision mode; \
+                     continuing without zcashd supervision"
+                );
+            }
+        }
+
+        false
+    }
+
     async fn start(&self) -> Result<(), Report> {
 
         let config = APPLICATION.config();
@@ -240,6 +383,67 @@ impl StartCmd {
             &config.network.network,
         );
 
+        let zcashd_compat_block_gossip_peer_ips = if config.zcashd_compat.enabled {
+            if config.zcashd_compat.block_gossip_peer_ips.is_empty() {
+                // The sidecar privileges (pinned gossip, reserved slot, stall
+                // exemption) match on the sidecar's *source* IP. In
+                // cross-container/cross-host topologies that source is not
+                // loopback, so the default list would silently strip the
+                // sidecar of everything this mode provides.
+                if config
+                    .zcashd_compat
+                    .p2p_connect_addr
+                    .is_some_and(|addr| !addr.ip().is_loopback())
+                {
+                    warn!(
+                        p2p_connect_addr = ?config.zcashd_compat.p2p_connect_addr,
+                        "zcashd_compat.p2p_connect_addr is not loopback, but \
+                         zcashd_compat.block_gossip_peer_ips defaults to loopback only; \
+                         if the sidecar connects from a non-loopback IP, set \
+                         block_gossip_peer_ips to that IP or it will not receive \
+                         pinned block gossip"
+                    );
+                }
+
+                Self::zcashd_compat_default_block_gossip_peer_ips()
+            } else {
+                config.zcashd_compat.block_gossip_peer_ips.clone()
+            }
+        } else {
+            Vec::new()
+        };
+
+        if config.zcashd_compat.enabled {
+            // Preflight does blocking filesystem and /proc reads, and can hash
+            // the cached zcashd binary, so keep it off the async runtime.
+            let preflight_config = config.clone();
+            let unsafe_low_specs = self.unsafe_low_specs;
+            tokio::task::spawn_blocking(move || {
+                zcashd_compat::run_preflight(&preflight_config, unsafe_low_specs)
+            })
+            .await
+            .map_err(|err| eyre!("failed to join zcashd-compat preflight task: {err}"))??;
+        }
+
+        let resolved_zcashd_path = if config.zcashd_compat.enabled
+            && config.zcashd_compat.manage_zcashd
+        {
+            let zcashd_compat_config = config.zcashd_compat.clone();
+            let state_cache_dir = config.state.cache_dir.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    zcashd_compat::resolve_zcashd_binary_path(
+                        &zcashd_compat_config,
+                        &state_cache_dir,
+                    )
+                })
+                .await
+                .map_err(|err| eyre!("failed to join managed zcashd binary resolver: {err}"))??,
+            )
+        } else {
+            None
+        };
+
         info!("opening database, this may take a few minutes");
 
         let actual_closure: Arc<std::sync::Mutex<Option<zebra_state::ClosureToCallIntoCrosslinkFromState>>> = Arc::new(std::sync::Mutex::new(None));
@@ -266,7 +470,8 @@ impl StartCmd {
                     }
                 }),
             )
-            .await?;
+            .await
+            .expect("failed to join the state initialisation task");
 
         info!("logging database metrics on startup");
         read_only_state_service.log_db_metrics();
@@ -310,13 +515,17 @@ impl StartCmd {
                 setup_rx,
             ));
 
-        let (peer_set, address_book, misbehavior_sender) = zebra_network::init(
-            config.network.clone(),
-            inbound,
-            latest_chain_tip.clone(),
-            user_agent(),
-        )
-        .await;
+        let (peer_set, address_book, misbehavior_sender) =
+            zebra_network::init_with_block_gossip_peer_ips(
+                config.network.clone(),
+                inbound,
+                latest_chain_tip.clone(),
+                user_agent(),
+                zcashd_compat_block_gossip_peer_ips,
+            )
+            .await;
+
+        // Start health server if configured (after sync_status is available)
 
         info!("initializing verifiers");
         let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();
@@ -342,6 +551,7 @@ impl StartCmd {
 
         info!("initializing mempool");
         let (mempool, mempool_transaction_subscriber) = Mempool::new(
+            &config.network.network,
             &config.mempool,
             peer_set.clone(),
             state.clone(),
@@ -475,12 +685,50 @@ impl StartCmd {
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
         );
+        let rpc_impl = rpc_impl.with_end_of_support_height(
+            sync::end_of_support::end_of_support_height(&config.network.network),
+        );
 
         let rpc_task_handle = if config.rpc.listen_addr.is_some() {
             RpcServer::start(rpc_impl.clone(), config.rpc.clone())
                 .await
                 .expect("server should start")
         } else {
+            tokio::spawn(std::future::pending().in_current_span())
+        };
+
+        let zcashd_compat_shutdown_timeout =
+            Self::zcashd_compat_supervisor_shutdown_timeout(&config);
+        let (zcashd_compat_shutdown_tx, zcashd_compat_shutdown_rx) = watch::channel(false);
+        let mut zcashd_compat_task_handle = if let Some(resolved_zcashd_path) = resolved_zcashd_path
+        {
+            let local_listener = address_book
+                .lock()
+                .expect("unexpected panic in address book mutex guard")
+                .local_listener_socket_addr();
+            let supervisor_config = zcashd_compat::SupervisorConfig::new(
+                &config.zcashd_compat,
+                resolved_zcashd_path,
+                &config.state.cache_dir,
+                config.network.network.kind(),
+                Self::zcashd_compat_p2p_connect_addr(&config, local_listener),
+            );
+
+            info!(
+                connect = %supervisor_config.zebra_p2p_addr,
+                "zcashd-compat mode enabled"
+            );
+
+            tokio::spawn(
+                zcashd_compat::run_supervisor(supervisor_config, zcashd_compat_shutdown_rx)
+                    .in_current_span(),
+            )
+        } else {
+            if config.zcashd_compat.enabled {
+                zcashd_compat::set_supervision_config_disabled_metrics();
+                info!("zcashd-compat mode enabled: zcashd supervision disabled");
+            }
+
             tokio::spawn(std::future::pending().in_current_span())
         };
 
@@ -517,6 +765,21 @@ impl StartCmd {
             .in_current_span(),
         );
 
+        info!("spawning block notify task");
+        let block_notify_task_handle: tokio::task::JoinHandle<Result<(), BlockNotifyError>> =
+            if let Some(command) = config.notify.block_notify_command.clone() {
+                tokio::spawn(
+                    notify::run_block_notify(
+                        command,
+                        sync_status.clone(),
+                        chain_tip_change.clone(),
+                    )
+                    .in_current_span(),
+                )
+            } else {
+                tokio::spawn(std::future::pending().in_current_span())
+            };
+
         info!("spawning mempool queue checker task");
         let mempool_queue_checker_task_handle = mempool::QueueChecker::spawn(mempool.clone());
 
@@ -536,14 +799,28 @@ impl StartCmd {
         );
 
         info!("spawning progress logging task");
+        let (chain_tip_metrics_sender, chain_tip_metrics_receiver) =
+            health::ChainTipMetrics::channel();
         let progress_task_handle = tokio::spawn(
             show_block_chain_progress(
                 config.network.network.clone(),
                 latest_chain_tip.clone(),
                 sync_status.clone(),
+                chain_tip_metrics_sender,
             )
             .in_current_span(),
         );
+
+        // Start health server if configured
+        info!("initializing health endpoints");
+        let (health_task_handle, _) = health::init(
+            config.health.clone(),
+            config.network.network.clone(),
+            chain_tip_metrics_receiver,
+            sync_status.clone(),
+            address_book.clone(),
+        )
+        .await;
 
         // Spawn never ending end of support task.
         info!("spawning end of support checking task");
@@ -628,10 +905,17 @@ impl StartCmd {
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
 
         // ongoing tasks
+        // The managed zcashd sidecar can exit on its own (it is optional and may fail) while
+        // Zebra keeps running, so its handle must be fused.
+        let mut zcashd_compat_task_finished = false;
+        let zcashd_compat_task_handle_fused = (&mut zcashd_compat_task_handle).fuse();
+        pin!(zcashd_compat_task_handle_fused);
+
         pin!(rpc_task_handle);
         pin!(indexer_rpc_task_handle);
         pin!(syncer_task_handle);
         pin!(block_gossip_task_handle);
+        pin!(block_notify_task_handle);
         pin!(mempool_crawler_task_handle);
         pin!(mempool_queue_checker_task_handle);
         pin!(tx_gossip_task_handle);
@@ -705,6 +989,11 @@ impl StartCmd {
                     .map(|_| info!("chain tip block gossip task exited"))
                     .map_err(|e| eyre!(e)),
 
+                block_notify_result = &mut block_notify_task_handle => block_notify_result
+                    .expect("unexpected panic in the block notify task")
+                    .map(|_| info!("block notify task exited"))
+                    .map_err(|e| eyre!(e)),
+
                 mempool_crawl_result = &mut mempool_crawler_task_handle => mempool_crawl_result
                     .expect("unexpected panic in the mempool crawler")
                     .map(|_| info!("mempool crawler task exited"))
@@ -760,6 +1049,13 @@ impl StartCmd {
                 miner_result = &mut miner_task_handle => miner_result
                     .expect("unexpected panic in the miner task")
                     .map(|_| info!("miner task exited")),
+
+                zcashd_compat_result = &mut zcashd_compat_task_handle_fused => {
+                    zcashd_compat_task_finished = true;
+                    exit_when_task_finishes =
+                        Self::zcashd_compat_supervisor_should_exit(zcashd_compat_result);
+                    Ok(())
+                },
             };
 
             // Stop Zebra if a task finished and returned an error,
@@ -778,8 +1074,10 @@ impl StartCmd {
         // ongoing tasks
         rpc_task_handle.abort();
         rpc_tx_queue_handle.abort();
+        health_task_handle.abort();
         syncer_task_handle.abort();
         block_gossip_task_handle.abort();
+        block_notify_task_handle.abort();
         mempool_crawler_task_handle.abort();
         mempool_queue_checker_task_handle.abort();
         tx_gossip_task_handle.abort();
@@ -787,6 +1085,37 @@ impl StartCmd {
         progress_task_handle.abort();
         end_of_support_task_handle.abort();
         miner_task_handle.abort();
+        if zcashd_compat_task_finished {
+            debug!("zcashd-compat supervisor task already exited before shutdown");
+        } else if let Some(zcashd_compat_shutdown_timeout) = zcashd_compat_shutdown_timeout {
+            info!(
+                ?zcashd_compat_shutdown_timeout,
+                "requesting zcashd-compat supervisor shutdown"
+            );
+            if zcashd_compat_shutdown_tx.send(true).is_err() {
+                warn!("zcashd-compat supervisor shutdown request was not delivered");
+            }
+            if tokio::time::timeout(
+                zcashd_compat_shutdown_timeout,
+                &mut zcashd_compat_task_handle,
+            )
+            .await
+            .is_err()
+            {
+                warn!(
+                    ?zcashd_compat_shutdown_timeout,
+                    "zcashd-compat supervisor did not finish before shutdown timeout; \
+                     abandoning child process handle"
+                );
+                // The supervisor spawns zcashd without kill_on_drop, so this
+                // abort abandons an already-signalled child rather than
+                // SIGKILLing it mid-flush.
+                zcashd_compat_task_handle.abort();
+            }
+        } else {
+            debug!("aborting zcashd-compat supervisor task without managed child shutdown");
+            zcashd_compat_task_handle.abort();
+        }
 
         // startup tasks
         state_checkpoint_verify_handle.abort();
@@ -848,6 +1177,271 @@ impl config::Override<ZebradConfig> for StartCmd {
             config.tracing.filter = Some(self.filters.join(","));
         }
 
+        // `--zcashd-compat` is a one-way override that enables zcashd-compat mode.
+        // The actual zcashd-compat guardrails are applied below using
+        // `config.zcashd_compat.enabled` so CLI and config-file activation share one path.
+        if self.zcashd_compat {
+            config.zcashd_compat.enabled = true;
+        }
+
+        if !config.zcashd_compat.enabled && !config.zcashd_compat.block_gossip_peer_ips.is_empty() {
+            return Err(std::io::Error::other(
+                "zcashd_compat.block_gossip_peer_ips requires zcashd_compat.enabled = true",
+            )
+            .into());
+        }
+
+        if config.zcashd_compat.enabled && config.zcashd_compat.manage_zcashd {
+            zcashd_compat::reject_peer_selection_extra_args(
+                &config.zcashd_compat.zcashd_extra_args,
+            )
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+            match zcashd_compat::effective_zcashd_source(&config.zcashd_compat) {
+                Ok(zcashd_compat::ZcashdBinarySource::Path(path))
+                    if !zcashd_compat::is_command_resolvable(Path::new(&path)) =>
+                {
+                    return Err(std::io::Error::other(format!(
+                        "zcashd-compat mode could not resolve zcashd_path={}",
+                        path.display()
+                    ))
+                    .into());
+                }
+                Ok(_) => {}
+                Err(err) => return Err(std::io::Error::other(err.to_string()).into()),
+            }
+        }
+
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use abscissa_core::config::Override;
+    use color_eyre::eyre::eyre;
+
+    use super::StartCmd;
+    use crate::components::zcashd_compat;
+    use crate::config::ZebradConfig;
+
+    #[test]
+    fn zcashd_compat_flag_enables_mode() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: true,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.manage_zcashd = false;
+
+        let config = cmd
+            .override_config(config)
+            .expect("zcashd-compat override config should succeed");
+
+        assert!(config.zcashd_compat.enabled);
+    }
+
+    #[test]
+    fn zcashd_compat_config_enables_mode() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = false;
+
+        let config = cmd
+            .override_config(config)
+            .expect("zcashd-compat override config should succeed");
+
+        assert!(config.zcashd_compat.enabled);
+    }
+
+    #[test]
+    fn block_gossip_peer_ips_require_zcashd_compat() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.block_gossip_peer_ips =
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("block gossip peers should require zcashd-compat");
+
+        assert!(
+            error
+                .to_string()
+                .contains("zcashd_compat.block_gossip_peer_ips requires"),
+            "error should explain the zcashd-compat requirement: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_config_rejects_peer_selection_extra_args() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Embedded;
+        config.zcashd_compat.zcashd_extra_args = vec!["-addnode=1.2.3.4".to_string()];
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("peer-selection extra args should be rejected");
+        assert!(
+            error.to_string().contains("peer-selection"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_manage_zcashd_requires_resolvable_path() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: true,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.zcashd_path = Some("/definitely/missing/zcashd-compat".into());
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("zcashd-compat override should fail for an unresolvable zcashd path");
+
+        assert!(
+            error
+                .to_string()
+                .contains("zcashd-compat mode could not resolve zcashd_path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_path_source_requires_explicit_path() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: true,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Path;
+        config.zcashd_compat.zcashd_path = None;
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("path source should require explicit zcashd_path");
+        assert!(
+            error.to_string().contains("zcashd_source=path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_embedded_source_allows_missing_local_path() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: true,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.zcashd_source = zcashd_compat::ConfigZcashdBinarySource::Embedded;
+        config.zcashd_compat.zcashd_path = None;
+
+        cmd.override_config(config)
+            .expect("embedded source should be validated at runtime, not override-time");
+    }
+
+    #[test]
+    fn zcashd_compat_config_manage_zcashd_requires_resolvable_path() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZebradConfig::default();
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.zcashd_path = Some("/definitely/missing/zcashd-compat".into());
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("zcashd-compat config should fail for an unresolvable zcashd path");
+
+        assert!(
+            error
+                .to_string()
+                .contains("zcashd-compat mode could not resolve zcashd_path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_supervisor_shutdown_timeout_matches_config() {
+        let mut config = ZebradConfig::default();
+
+        config.zcashd_compat.enabled = true;
+        config.zcashd_compat.manage_zcashd = true;
+        config.zcashd_compat.shutdown_grace_period = std::time::Duration::from_secs(42);
+        assert_eq!(
+            StartCmd::zcashd_compat_supervisor_shutdown_timeout(&config),
+            Some(
+                std::time::Duration::from_secs(42)
+                    + StartCmd::ZCASHD_COMPAT_SHUTDOWN_TIMEOUT_MARGIN
+            ),
+            "outer supervisor wait must exceed the child grace period so task \
+             abort cannot preempt graceful termination",
+        );
+
+        config.zcashd_compat.manage_zcashd = false;
+        assert_eq!(
+            StartCmd::zcashd_compat_supervisor_shutdown_timeout(&config),
+            None
+        );
+
+        config.zcashd_compat.enabled = false;
+        config.zcashd_compat.manage_zcashd = true;
+        assert_eq!(
+            StartCmd::zcashd_compat_supervisor_shutdown_timeout(&config),
+            None
+        );
+    }
+
+    #[test]
+    fn zcashd_compat_supervisor_ok_exit_does_not_exit_zebra() {
+        assert!(!StartCmd::zcashd_compat_supervisor_should_exit(Ok(Ok(()))));
+    }
+
+    #[test]
+    fn zcashd_compat_supervisor_error_does_not_exit_zebra() {
+        assert!(!StartCmd::zcashd_compat_supervisor_should_exit(Ok(Err(
+            eyre!("simulated zcashd supervisor runtime failure"),
+        ))));
+    }
+
+    #[tokio::test]
+    async fn zcashd_compat_supervisor_panic_does_not_exit_zebra() {
+        let join_err = tokio::spawn(async {
+            panic!("simulated zcashd supervisor panic");
+        })
+        .await
+        .expect_err("task should panic");
+
+        assert!(!StartCmd::zcashd_compat_supervisor_should_exit(Err(
+            join_err
+        )));
     }
 }

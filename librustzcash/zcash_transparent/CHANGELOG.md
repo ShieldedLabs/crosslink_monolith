@@ -10,8 +10,133 @@ workspace.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-23
+
+### Changed
+- `zcash_transparent::pczt::ParseError` has a new `InvalidPartialSignature`
+  variant. The `ParseError` enum is now marked `#[non_exhaustive]`.
+
+### Fixed
+- `zcash_transparent::pczt` spend finalization no longer panics on a
+  `partial_signatures` entry larger than the maximum script push-value size.
+  Such entries are now rejected at parse time.
+
+## [0.9.0] - 2026-07-09
+
+### Changed
+- Migrated to `zcash_protocol 0.10.0`, `zcash_address 0.13.0`.
+
+## [0.9.0-pre.0] - 2026-06-30
+
+### Added
+- `transparent::bundle::OutPoint` now implements `std::hash::Hash`.
+
+### Changed
+- MSRV is now 1.88
+- Migrated to `zcash_protocol 0.10.0-pre.0`, `zcash_address 0.13.0-pre.0`.
+
+### Changed
+- `zcash_transparent::zip48::FullViewingKey::standard` now takes its `threshold`
+  argument as a `NonZeroU8` instead of a `u8`. This makes the
+  threshold-must-be-nonzero invariant explicit in the type and unrepresentable
+  by construction. Previously a zero threshold was accepted, producing a 0-of-N
+  (anyone-can-spend) P2SH multisig redeem script.
+
+## [0.8.0] - 2026-06-02
+
+### Changed
+- Migrated to `zcash_protocol 0.9.0`, `zcash_address 0.12.0`.
+
+### Fixed
+- Updated to crate versions that fix an Orchard soundness vulnerability
+  (GHSA-ww9q-8r59-xv46) and Orchard non-canonical proof size issue
+  (GHSA-2x4w-pxqw-58v9).
+
+## [0.7.0] - 2026-04-23
+
+### Added
+- `zcash_transparent::util::hash160` module
+- `zcash_transparent::util::sha256d` (moved from
+  `zcash_primitives::transaction::util::sha256d`)
+- `zcash_transparent::address::TransparentAddress::from_script_kind`
+- `zcash_transparent::bundle::TxOut::script_kind`
+- `zcash_transparent::pczt`:
+  - `Input::with_signable_input`
+  - `Input::append_signature`
+- `impl core::error::Error` for:
+  -` zcash_transparent::builder::Error`
+  - `zcash_transparent::coinbase::Error`
+- `zcash_transparent::builder::SpendInfo`
+- `zcash_transparent::builder::TransparentInputInfo::{from_parts, spend_info}`
+- `zcash_transparent::builder::Builder::add_p2pkh_input`
+- `impl {PartialEq, Eq} for zcash_transparent::keys::AccountPubKey` (compares
+  chain code and public key only; BIP 32 derivation metadata is ignored since
+  it is not preserved by the UFVK encoding)
+- `impl {PartialEq, Eq} for zcash_transparent::keys::ExternalIvk`
+- `impl Hash for zcash_transparent::keys::TransparentKeyScope`
+- `zcash_transparent::builder::p2sh_input_serialized_len`
+
 ### Changed
 - MSRV is now 1.85.1.
+- Migrated to `zcash_encoding 0.4`, `zcash_protocol 0.8`, `zcash_address 0.11`.
+- Migrated from the yanked `core2` crate to `corez 0.1.1`.
+- `zcash_transparent::sighash::SignableInput::from_parts` now validates the
+  referenced transparent input index against `&Bundle<_>` and returns
+  `Result<_, InvalidInputIndex>`.
+- `zcash_transparent::builder::TransparentBuilder::add_p2sh_input` is no longer
+  restricted to the PCZT workflow; `Bundle::apply_signatures`,
+  `Bundle::prepare_transparent_signatures`, and
+  `TransparentSignatureContext::finalize_signatures` now support P2SH (multisig)
+  inputs.
+- `zcash_transparent::pczt`:
+  - `Bundle::extract` now takes its `self` argument by reference.
+  - `SignerError` has added variants:
+    - `InvalidExternalSignature`
+    - `MissingPreimage`
+    - `UnsupportedPubkey`
+- `zcash_transparent::builder::Builder::add_input` now takes a `TransparentInputInfo`
+  instead of its constituent parts. Use `Builder::add_p2pkh_input` if you need the
+  previous API.
+
+### Fixed
+- `Debug` output for `zcash_transparent::keys::{AccountPrivKey,
+  AccountPubKey, ExternalIvk, InternalIvk, EphemeralIvk, InternalOvk,
+  ExternalOvk}` now redacts key material.
+- `Debug` output for `zcash_transparent::zip48::{AccountPrivKey}`
+  now redacts the embedded extended key material.
+
+## [0.6.4] - 2026-04-16
+
+### Added
+- `zcash_transparent::sighash::SighashType::from_raw`
+
+## [0.6.3] - 2025-12-17
+
+### Added
+- `zcash_transparent::zip48`:
+  - `FullViewingKey::derive_matching_account_priv_key`
+
+### Changed
+- Enabling the `std` feature now enables `zcash_address/std`, `zcash_script/std`,
+  and `secp256k1?/std`. This change is intended to improve the ergonomics for
+  downstream users of this crate, to eliminate the need for users to manually
+  enable the `std` feature of those dependencies.
+
+## [0.6.2] - 2025-12-12
+
+### Added
+- `zcash_transparent`:
+  - `builder`:
+    - `Coinbase` marker type
+    - `impl Authorization for Coinbase`
+    - `impl MapAuth<Coinbase, Authorized> for Coinbase`
+    - `impl TransparentAuthorizingContext for Coinbase`
+    - `TransparentBuilder::build_coinbase`
+    - `std::error::Error for Error` when the `std` feature is enabled.
+  - `bundle`:
+    - `Outpoint::NULL`
+    - `TxIn::<builder::Coinbase>::coinbase`
+  - `coinbase` module, containing helpers for constructing coinbase transactions.
 
 ## [0.6.1] - 2025-10-27
 
@@ -107,7 +232,7 @@ workspace.
 - The type of `zcash_transparent::bundle::Bundle::value_balance` has changed.
   The closure provided to this method for input retrieval can now indicate that
   an input for the given outpoint is not available, and `value_balance` will
-  return `Ok(None)` when this is the case. 
+  return `Ok(None)` when this is the case.
 
 ### Removed
 - Removed deprecated method `zcash_transparent::keys::pubkey_to_address`;

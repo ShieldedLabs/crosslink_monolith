@@ -158,7 +158,7 @@ pub struct ResponseFromZebra {
     pub block_inspection: BlockInspection,
     pub start_bc_height: u64,
 
-    pub orchard_pool_balance: i64,
+    pub ironwood_pool_balance: i64,
     pub staking_bonded_pool_balance: i64,
     pub staking_unbonded_pool_balance: i64,
 
@@ -198,7 +198,7 @@ impl ResponseFromZebra {
             what_block_it_is: Hash32::from_u64(0),
             block_inspection: BlockInspection::None,
             start_bc_height: 0,
-            orchard_pool_balance: 0,
+            ironwood_pool_balance: 0,
             staking_bonded_pool_balance: 0,
             staking_unbonded_pool_balance: 0,
             peer_strings: Vec::new(),
@@ -455,7 +455,7 @@ pub struct VizState {
     pub bft_ack_height: u64,
     pub bc_ack_height: u64,
 
-    pub orchard_pool_balance: i64,
+    pub ironwood_pool_balance: i64,
     pub staking_bonded_pool_balance: i64,
     pub staking_unbonded_pool_balance: i64,
 
@@ -727,7 +727,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         bft_ack_height: 0,
         bc_ack_height: 0,
 
-        orchard_pool_balance: 0,
+        ironwood_pool_balance: 0,
         staking_bonded_pool_balance: 0,
         staking_unbonded_pool_balance: 0,
         peer_strings: Vec::new(),
@@ -867,7 +867,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         anything_happened |= viz_state.instr_failed != message.instr_failed;
         viz_state.instr_failed = message.instr_failed;
 
-        viz_state.orchard_pool_balance = message.orchard_pool_balance;
+        viz_state.ironwood_pool_balance = message.ironwood_pool_balance;
         viz_state.staking_bonded_pool_balance = message.staking_bonded_pool_balance;
         viz_state.staking_unbonded_pool_balance = message.staking_unbonded_pool_balance;
 

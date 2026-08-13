@@ -13,16 +13,17 @@ use std::{ffi::OsString, process::Stdio};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
+use clap::Parser;
 use color_eyre::{
     eyre::{ensure, eyre, Result},
     Help,
 };
 use itertools::Itertools;
 use serde_json::Value;
-use structopt::StructOpt;
 
 use zebra_chain::{
     block::{self, Block, Height, HeightDiff, TryIntoHeight},
+    parameters::constants::MAX_BLOCK_REORG_HEIGHT,
     serialization::ZcashDeserializeInto,
     transparent::MIN_TRANSPARENT_COINBASE_MATURITY,
 };
@@ -31,6 +32,14 @@ use zebra_node_services::{
     rpc_client::RpcRequestClient,
 };
 use zebra_utils::init_tracing;
+
+// Checkpoints are generated past Zebra's rollback window (`MAX_BLOCK_REORG_HEIGHT`),
+// which must be at least the coinbase maturity so that checkpointed coinbase outputs
+// are already settled.
+const _: () = assert!(
+    MAX_BLOCK_REORG_HEIGHT >= MIN_TRANSPARENT_COINBASE_MATURITY,
+    "checkpoint settlement margin must be at least the coinbase maturity",
+);
 
 pub mod args;
 
@@ -137,7 +146,7 @@ where
 
 /// Process entry point for `zebra-checkpoints`
 #[tokio::main]
-#[allow(clippy::print_stdout, clippy::print_stderr)]
+#[allow(clippy::print_stdout, clippy::print_stderr, clippy::unwrap_in_result)]
 async fn main() -> Result<()> {
     eprintln!("zebra-checkpoints launched");
 
@@ -145,7 +154,7 @@ async fn main() -> Result<()> {
     init_tracing();
     color_eyre::install()?;
 
-    let args = args::Args::from_args();
+    let args = args::Args::parse();
 
     eprintln!("Command-line arguments: {args:?}");
     eprintln!("Fetching block info and calculating checkpoints...\n\n");
@@ -162,14 +171,15 @@ async fn main() -> Result<()> {
         .try_into_height()
         .expect("height: unexpected invalid value, missing field, or field type");
 
-    // Checkpoints must be on the main chain, so we skip blocks that are within the
-    // Zcash reorg limit.
-    let height_limit = height_limit - HeightDiff::from(MIN_TRANSPARENT_COINBASE_MATURITY);
+    // Checkpoints must be on a settled part of the best chain, so we skip blocks
+    // within Zebra's rollback window (`MAX_BLOCK_REORG_HEIGHT`). A smaller margin
+    // could let a reorg that Zebra would still follow orphan a shipped checkpoint.
+    let height_limit = height_limit - HeightDiff::from(MAX_BLOCK_REORG_HEIGHT);
     let height_limit = height_limit
         .ok_or_else(|| {
             eyre!(
                 "checkpoint generation needs at least {:?} blocks",
-                MIN_TRANSPARENT_COINBASE_MATURITY
+                MAX_BLOCK_REORG_HEIGHT
             )
         })
         .with_suggestion(|| "Hint: wait for the node to sync more blocks")?;
@@ -212,15 +222,16 @@ async fn main() -> Result<()> {
                 // get the values we are interested in
                 let hash: block::Hash = get_block["hash"]
                     .as_str()
-                    .expect("hash: unexpected missing field or field type")
+                    .ok_or_else(|| eyre!("hash: unexpected missing field or field type"))?
                     .parse()?;
-                let response_height: Height = get_block["height"]
-                    .try_into_height()
-                    .expect("height: unexpected invalid value, missing field, or field type");
+                let response_height: Height =
+                    get_block["height"].try_into_height().map_err(|_| {
+                        eyre!("height: unexpected invalid value, missing field, or field type")
+                    })?;
 
-                let size = get_block["size"]
-                    .as_u64()
-                    .expect("size: unexpected invalid value, missing field, or field type");
+                let size = get_block["size"].as_u64().ok_or_else(|| {
+                    eyre!("size: unexpected invalid value, missing field, or field type")
+                })?;
 
                 (hash, response_height, size)
             }
@@ -234,7 +245,7 @@ async fn main() -> Result<()> {
                 .await?;
                 let block_bytes = block_bytes
                     .as_str()
-                    .expect("block bytes: unexpected missing field or field type");
+                    .ok_or_else(|| eyre!("block bytes: unexpected missing field or field type"))?;
 
                 let block_bytes: Vec<u8> = hex::decode(block_bytes)?;
 

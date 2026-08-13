@@ -53,6 +53,8 @@ pub fn run(
                         .chain(tx.sprout_nullifiers().cloned().map(Spend::from))
                         .chain(tx.sapling_nullifiers().cloned().map(Spend::from))
                         .chain(tx.orchard_nullifiers().cloned().map(Spend::from))
+                        // `ironwood_nullifiers()` already yields owned `ironwood::Nullifier`s.
+                        .chain(tx.ironwood_nullifiers().map(Spend::from))
                         .next()
                     {
                         if read::spending_transaction_hash::<Arc<Chain>>(None, zebra_db, spend)
@@ -87,9 +89,7 @@ pub fn run(
                         .zs_insert(&spent_output_location, &tx_loc);
                 }
 
-                batch
-                    .prepare_nullifier_batch(zebra_db, &tx, tx_loc)
-                    .expect("method should never return an error");
+                batch.prepare_nullifier_batch(zebra_db, &tx, tx_loc);
             }
 
             if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {

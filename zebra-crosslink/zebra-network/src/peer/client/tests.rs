@@ -1,12 +1,12 @@
 //! Tests for the [`Client`] part of peer connections, and some test utilities for mocking
 //! [`Client`] instances.
 
+#![allow(clippy::unwrap_in_result)]
 #![cfg_attr(feature = "proptest-impl", allow(dead_code))]
 
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     sync::Arc,
-    time::Duration,
 };
 
 use chrono::Utc;
@@ -24,8 +24,8 @@ use zebra_chain::block::Height;
 use crate::{
     constants,
     peer::{
-        error::SharedPeerError, CancelHeartbeatTask, Client, ClientRequest, ConnectionInfo,
-        ErrorSlot,
+        error::SharedPeerError, CancelHeartbeatTask, Client, ClientRequest, ConnectedAddr,
+        ConnectionInfo, ErrorSlot,
     },
     peer_set::InventoryChange,
     protocol::{
@@ -37,9 +37,6 @@ use crate::{
 
 #[cfg(test)]
 mod vectors;
-
-/// The maximum time a mocked peer connection should be alive during a test.
-const MAX_PEER_CONNECTION_TIME: Duration = Duration::from_secs(10);
 
 /// A harness with mocked channels for testing a [`Client`] instance.
 pub struct ClientTestHarness {
@@ -61,6 +58,7 @@ impl ClientTestHarness {
             version: None,
             connection_task: None,
             heartbeat_task: None,
+            connected_addr: None,
         }
     }
 
@@ -126,12 +124,12 @@ impl ClientTestHarness {
             .client_request_receiver
             .as_mut()
             .expect("request receiver endpoint has been dropped")
-            .try_next();
+            .try_recv();
 
         match receive_result {
-            Ok(Some(request)) => ReceiveRequestAttempt::Request(request),
-            Ok(None) => ReceiveRequestAttempt::Closed,
-            Err(_) => ReceiveRequestAttempt::Empty,
+            Ok(request) => ReceiveRequestAttempt::Request(request),
+            Err(mpsc::TryRecvError::Closed) => ReceiveRequestAttempt::Closed,
+            Err(mpsc::TryRecvError::Empty) => ReceiveRequestAttempt::Empty,
         }
     }
 
@@ -208,6 +206,10 @@ impl ClientTestHarness {
 /// The result of an attempt to receive a [`ClientRequest`] sent by the [`Client`] instance.
 ///
 /// The remote peer that would receive the request is mocked for testing.
+// The size disparity between the empty `Closed`/`Empty` variants and the
+// request-carrying variant is intrinsic to this test helper, which is only
+// constructed once per receive attempt.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ReceiveRequestAttempt {
     /// The [`Client`] instance has closed the sender endpoint of the channel.
     Closed,
@@ -250,6 +252,7 @@ pub struct ClientTestHarnessBuilder<C = future::Ready<()>, H = future::Ready<()>
     connection_task: Option<C>,
     heartbeat_task: Option<H>,
     version: Option<Version>,
+    connected_addr: Option<ConnectedAddr>,
 }
 
 impl<C, H> ClientTestHarnessBuilder<C, H>
@@ -263,6 +266,12 @@ where
         self
     }
 
+    /// Configure the mocked connection address metadata for the peer.
+    pub fn with_connected_addr(mut self, connected_addr: ConnectedAddr) -> Self {
+        self.connected_addr = Some(connected_addr);
+        self
+    }
+
     /// Configure the mock connection task future to use.
     pub fn with_connection_task<NewC>(
         self,
@@ -272,6 +281,7 @@ where
             connection_task: Some(connection_task),
             heartbeat_task: self.heartbeat_task,
             version: self.version,
+            connected_addr: self.connected_addr,
         }
     }
 
@@ -284,6 +294,7 @@ where
             connection_task: self.connection_task,
             heartbeat_task: Some(heartbeat_task),
             version: self.version,
+            connected_addr: self.connected_addr,
         }
     }
 
@@ -323,7 +334,7 @@ where
         };
 
         let connection_info = Arc::new(ConnectionInfo {
-            connected_addr: crate::peer::ConnectedAddr::Isolated,
+            connected_addr: self.connected_addr.unwrap_or(ConnectedAddr::Isolated),
             remote,
             negotiated_version,
         });
@@ -354,14 +365,14 @@ where
     /// Spawn a mock background abortable task `task_future` if provided, or a fallback task
     /// otherwise.
     ///
-    /// The fallback task lives as long as [`MAX_PEER_CONNECTION_TIME`].
+    /// The fallback task stays alive until explicitly aborted.
     fn spawn_background_task_or_fallback<T>(task_future: Option<T>) -> (JoinHandle<()>, AbortHandle)
     where
         T: Future<Output = ()> + Send + 'static,
     {
         match task_future {
             Some(future) => Self::spawn_background_task(future),
-            None => Self::spawn_background_task(tokio::time::sleep(MAX_PEER_CONNECTION_TIME)),
+            None => Self::spawn_background_task(future::pending()),
         }
     }
 
@@ -390,9 +401,7 @@ where
     {
         match task_future {
             Some(future) => Self::spawn_background_task_with_result(future),
-            None => Self::spawn_background_task_with_result(tokio::time::sleep(
-                MAX_PEER_CONNECTION_TIME,
-            )),
+            None => Self::spawn_background_task_with_result(future::pending()),
         }
     }
 

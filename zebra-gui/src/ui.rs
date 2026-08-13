@@ -4320,7 +4320,7 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
 
                             if let _ = elem().decl(group_decl) {
                                 ui.text("Pool Balances", hdr_text_decl);
-                                row(ui, data, "Orchard", &format!("{}", viz.orchard_pool_balance));
+                                row(ui, data, "Ironwood", &format!("{}", viz.ironwood_pool_balance));
                                 row(ui, data, "Staking Bonded", &format!("{}", viz.staking_bonded_pool_balance));
                                 row(ui, data, "Staking Unbonded", &format!("{}", viz.staking_unbonded_pool_balance));
                             }

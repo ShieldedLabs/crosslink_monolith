@@ -27,6 +27,7 @@
 //! [`Mempool::poll_ready`]: super::Mempool::poll_ready
 use std::{
     collections::{HashMap, HashSet},
+    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -46,6 +47,7 @@ use tracing_futures::Instrument;
 
 use zebra_chain::{
     block::Height,
+    parameters::NetworkUpgrade,
     transaction::{self, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
@@ -102,7 +104,17 @@ pub(crate) const TRANSACTION_VERIFY_TIMEOUT: Duration = BLOCK_VERIFY_TIMEOUT;
 /// Therefore, this attack can be carried out by a single malicious node.
 //
 // TODO: replace with the configured value of network.peerset_initial_target_size
-pub const MAX_INBOUND_CONCURRENCY: usize = 25;
+pub const MAX_INBOUND_CONCURRENCY: usize = 500;
+
+/// The maximum number of concurrent inbound download tasks attributable to a
+/// single advertising peer.
+///
+/// Caps how many slots of [`MAX_INBOUND_CONCURRENCY`] one peer's `Inv`
+/// advertisements can occupy, so a single peer cannot saturate the global
+/// queue with fake txids and deny gossip-path mempool admission for honest
+/// peers. See `GHSA-4fc2-h7jh-287c`. Crawler-driven and locally-pushed
+/// transactions have no source peer and are not counted against the cap.
+pub const MAX_INBOUND_CONCURRENCY_PER_PEER: usize = 5;
 
 /// A marker struct for the oneshot channels which cancel a pending download and verify.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -128,6 +140,10 @@ pub enum TransactionDownloadVerifyError {
     Invalid {
         error: zebra_consensus::error::TransactionError,
         advertiser_addr: Option<PeerSocketAddr>,
+        /// The transaction's consensus branch upgrade, if its version contains one.
+        transaction_upgrade: Option<NetworkUpgrade>,
+        /// The candidate block height used for mempool consensus verification.
+        verification_height: Height,
     },
 }
 
@@ -138,7 +154,10 @@ pub struct Downloads<ZN, ZV, ZS>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
-    ZV: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
+    ZV: Service<tx::MempoolRequest, Response = tx::MempoolResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     ZV::Future: Send,
     ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     ZS::Future: Send,
@@ -167,23 +186,42 @@ where
                         Option<Height>,
                         Option<oneshot::Sender<Result<(), BoxError>>>,
                     ),
-                    (TransactionDownloadVerifyError, UnminedTxId),
+                    Box<(TransactionDownloadVerifyError, UnminedTxId)>,
                 >,
-                tokio::time::error::Elapsed,
+                (UnminedTxId, tokio::time::error::Elapsed),
             >,
         >,
     >,
 
-    /// A list of channels that can be used to cancel pending transaction download and
-    /// verify tasks. Each channel also has the corresponding request.
-    cancel_handles: HashMap<UnminedTxId, (oneshot::Sender<CancelDownloadAndVerify>, Gossip)>,
+    /// A list of channels that can be used to cancel pending transaction
+    /// download and verify tasks. Each entry also stores the corresponding
+    /// gossip request and the announcing peer (when known), so completion can
+    /// release the per-peer slot by `UnminedTxId` lookup.
+    cancel_handles: HashMap<
+        UnminedTxId,
+        (
+            oneshot::Sender<CancelDownloadAndVerify>,
+            Gossip,
+            Option<SocketAddr>,
+        ),
+    >,
+
+    /// The number of currently in-flight download tasks per advertising peer.
+    ///
+    /// Invariant: a peer is present here iff some entry in [`Self::cancel_handles`]
+    /// has it as the third tuple element. Enforces
+    /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`]. See `GHSA-4fc2-h7jh-287c`.
+    pending_per_peer: HashMap<SocketAddr, usize>,
 }
 
 impl<ZN, ZV, ZS> Stream for Downloads<ZN, ZV, ZS>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
-    ZV: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
+    ZV: Service<tx::MempoolRequest, Response = tx::MempoolResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     ZV::Future: Send,
     ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     ZS::Future: Send,
@@ -196,9 +234,9 @@ where
                 Option<Height>,
                 Option<oneshot::Sender<Result<(), BoxError>>>,
             ),
-            (UnminedTxId, TransactionDownloadVerifyError),
+            Box<(UnminedTxId, TransactionDownloadVerifyError)>,
         >,
-        tokio::time::error::Elapsed,
+        (UnminedTxId, tokio::time::error::Elapsed),
     >;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -214,17 +252,33 @@ where
         // TODO: this would be cleaner with poll_map (#2693)
         let item = if let Some(join_result) = ready!(this.pending.poll_next(cx)) {
             let result = join_result.expect("transaction download and verify tasks must not panic");
-            let result = match result {
+            let (result, completed_txid) = match result {
                 Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))) => {
-                    this.cancel_handles.remove(&tx.transaction.id);
-                    Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx)))
+                    let hash = tx.transaction.id;
+                    (
+                        Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))),
+                        Some(hash),
+                    )
                 }
-                Ok(Err((e, hash))) => {
-                    this.cancel_handles.remove(&hash);
-                    Ok(Err((hash, e)))
+                Ok(Err(boxed_err)) => {
+                    let (e, hash) = *boxed_err;
+                    (Ok(Err(Box::new((hash, e)))), Some(hash))
                 }
-                Err(elapsed) => Err(elapsed),
+                Err((txid, elapsed)) => {
+                    // Remove the cancel handle so the spawned task's queued `Gossip`
+                    // doesn't stay resident in `cancel_handles` after a verification
+                    // timeout. Without this, a peer that gets each transaction to
+                    // hit `RATE_LIMIT_DELAY` can leak ~2 MB per tx until OOM.
+                    this.cancel_handles.remove(&txid);
+                    (Err((txid, elapsed)), None)
+                }
             };
+
+            if let Some(hash) = completed_txid {
+                if let Some((_, _gossip, Some(source))) = this.cancel_handles.remove(&hash) {
+                    Self::release_peer_slot(this.pending_per_peer, source);
+                }
+            }
 
             Some(result)
         } else {
@@ -243,7 +297,10 @@ impl<ZN, ZV, ZS> Downloads<ZN, ZV, ZS>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
-    ZV: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
+    ZV: Service<tx::MempoolRequest, Response = tx::MempoolResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     ZV::Future: Send,
     ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     ZS::Future: Send,
@@ -264,17 +321,23 @@ where
             state,
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
+            pending_per_peer: HashMap::new(),
         }
     }
 
     /// Queue a transaction for download (if needed) and verification.
     ///
     /// Returns the action taken in response to the queue request.
+    ///
+    /// When `source` is `Some`, the per-peer cap
+    /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`] is enforced; crawler-driven and
+    /// locally-pushed transactions pass `None` and are not capped per peer.
     #[instrument(skip(self, gossiped_tx), fields(txid = %gossiped_tx.id()))]
     #[allow(clippy::unwrap_in_result)]
     pub fn download_if_needed_and_verify(
         &mut self,
         gossiped_tx: Gossip,
+        source: Option<SocketAddr>,
         mut rsp_tx: Option<oneshot::Sender<Result<(), BoxError>>>,
     ) -> Result<(), MempoolError> {
         let txid = gossiped_tx.id();
@@ -305,12 +368,29 @@ where
             return Err(MempoolError::FullQueue);
         }
 
+        // Per-peer cap: a single advertising peer cannot saturate the queue
+        // with attacker-supplied fake txids. See `GHSA-4fc2-h7jh-287c`.
+        if let Some(source) = source {
+            let count = self.pending_per_peer.get(&source).copied().unwrap_or(0);
+            if count >= MAX_INBOUND_CONCURRENCY_PER_PEER {
+                debug!(
+                    ?txid,
+                    peer_queue_len = count,
+                    ?MAX_INBOUND_CONCURRENCY_PER_PEER,
+                    "too many transactions queued for this peer: ignored transaction"
+                );
+                metrics::counter!("mempool.full_queue.per_peer.total").increment(1);
+                return Err(MempoolError::FullQueue);
+            }
+        }
+
         // This oneshot is used to signal cancellation to the download task.
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<CancelDownloadAndVerify>();
 
         let network = self.network.clone();
         let verifier = self.verifier.clone();
         let mut state = self.state.clone();
+        let pushed_advertiser_addr = source.map(PeerSocketAddr::from);
 
         let gossiped_tx_req = gossiped_tx.clone();
 
@@ -366,21 +446,20 @@ where
                         "mempool.pushed.transactions.total",
                         "version" => format!("{}",tx.transaction.version()),
                     ).increment(1);
-                    (tx, None)
+                    (tx, pushed_advertiser_addr)
                 }
             };
 
             trace!(?txid, "got tx");
 
+            let transaction_upgrade = tx.transaction.network_upgrade();
             let result = verifier
-                .oneshot(tx::Request::Mempool {
+                .oneshot(tx::MempoolRequest {
                     transaction: tx.clone(),
                     height: next_height,
                 })
                 .map_ok(|rsp| {
-                    let tx::Response::Mempool { transaction, spent_mempool_outpoints } = rsp else {
-                        panic!("unexpected non-mempool response to mempool request")
-                    };
+                    let tx::MempoolResponse { transaction, spent_mempool_outpoints } = rsp;
 
                     (transaction, spent_mempool_outpoints, tip_height)
                 })
@@ -389,7 +468,12 @@ where
             // Hide the transaction data to avoid filling the logs
             trace!(?txid, result = ?result.as_ref().map(|_tx| ()), "verified transaction for the mempool");
 
-            result.map_err(|e| TransactionDownloadVerifyError::Invalid { error: e.into(), advertiser_addr } )
+            result.map_err(|error| TransactionDownloadVerifyError::Invalid {
+                error: error.into(),
+                advertiser_addr,
+                transaction_upgrade,
+                verification_height: next_height,
+            })
         }
         .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
             metrics::counter!(
@@ -400,7 +484,7 @@ where
         })
         // Tack the hash onto the error so we can remove the cancel handle
         // on failure as well as on success.
-        .map_err(move |e| (e, txid))
+        .map_err(move |e| Box::new((e, txid)))
         .inspect(move |result| {
             // Hide the transaction data to avoid filling the logs
             let result = result.as_ref().map(|_tx| txid);
@@ -421,7 +505,7 @@ where
                         let _ = rsp_tx.send(Err("verification cancelled".into()));
                     }
 
-                    Ok(Err((TransactionDownloadVerifyError::Cancelled, txid)))
+                    Ok(Err(Box::new((TransactionDownloadVerifyError::Cancelled, txid))))
                 }
                 verification = fut => {
                     verification
@@ -430,10 +514,12 @@ where
                                 let _ = rsp_tx.send(Err("timeout waiting for verification result".into()));
                             }
                         })
+                        .map_err(|elapsed| (txid, elapsed))
                         .map(|inner_result| {
                             match inner_result {
                                 Ok((transaction, spent_mempool_outpoints, tip_height)) => Ok((transaction, spent_mempool_outpoints, tip_height, rsp_tx)),
-                                Err((tx_verifier_error, tx_id)) => {
+                                Err(boxed_err) => {
+                                    let (tx_verifier_error, tx_id) = *boxed_err;
                                     if let Some(rsp_tx) = rsp_tx.take() {
                                         let error_msg = format!(
                                             "failed to validate tx: {tx_id}, error: {tx_verifier_error}"
@@ -441,7 +527,7 @@ where
                                         let _ = rsp_tx.send(Err(error_msg.into()));
                                     };
 
-                                    Err((tx_verifier_error, tx_id))
+                                    Err(Box::new((tx_verifier_error, tx_id)))
                                 }
                             }
                         })
@@ -454,10 +540,15 @@ where
         self.pending.push(task);
         assert!(
             self.cancel_handles
-                .insert(txid, (cancel_tx, gossiped_tx_req))
+                .insert(txid, (cancel_tx, gossiped_tx_req, source))
                 .is_none(),
             "transactions are only queued once"
         );
+        if let Some(source) = source {
+            // The per-peer cap check above ensures this can't exceed
+            // `MAX_INBOUND_CONCURRENCY_PER_PEER`.
+            *self.pending_per_peer.entry(source).or_insert(0) += 1;
+        }
 
         debug!(
             ?txid,
@@ -484,8 +575,11 @@ where
             .collect();
 
         for txid in removed_txids {
-            if let Some(handle) = self.cancel_handles.remove(&txid) {
-                let _ = handle.0.send(CancelDownloadAndVerify);
+            if let Some((cancel_tx, _gossip, source)) = self.cancel_handles.remove(&txid) {
+                let _ = cancel_tx.send(CancelDownloadAndVerify);
+                if let Some(source) = source {
+                    Self::release_peer_slot(&mut self.pending_per_peer, source);
+                }
             }
         }
     }
@@ -498,12 +592,24 @@ where
         // Signal cancellation to all running tasks.
         // Since we already dropped the JoinHandles above, they should
         // fail silently.
-        for (_hash, cancel) in self.cancel_handles.drain() {
-            let _ = cancel.0.send(CancelDownloadAndVerify);
+        for (_hash, (cancel_tx, _gossip, _source)) in self.cancel_handles.drain() {
+            let _ = cancel_tx.send(CancelDownloadAndVerify);
         }
+        self.pending_per_peer.clear();
         assert!(self.pending.is_empty());
         assert!(self.cancel_handles.is_empty());
         metrics::gauge!("mempool.currently.queued.transactions",).set(self.pending.len() as f64);
+    }
+
+    /// Decrement the per-peer pending count for `source`, removing the entry
+    /// when it reaches zero.
+    fn release_peer_slot(pending_per_peer: &mut HashMap<SocketAddr, usize>, source: SocketAddr) {
+        if let Some(count) = pending_per_peer.get_mut(&source) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                pending_per_peer.remove(&source);
+            }
+        }
     }
 
     /// Get the number of currently in-flight download tasks.
@@ -514,7 +620,9 @@ where
 
     /// Get a list of the currently pending transaction requests.
     pub fn transaction_requests(&self) -> impl Iterator<Item = &Gossip> {
-        self.cancel_handles.iter().map(|(_tx_id, (_handle, tx))| tx)
+        self.cancel_handles
+            .iter()
+            .map(|(_tx_id, (_handle, tx, _source))| tx)
     }
 
     /// Check if transaction is already in the best chain.
@@ -545,7 +653,10 @@ impl<ZN, ZV, ZS> PinnedDrop for Downloads<ZN, ZV, ZS>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
-    ZV: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
+    ZV: Service<tx::MempoolRequest, Response = tx::MempoolResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
     ZV::Future: Send,
     ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     ZS::Future: Send,
@@ -556,3 +667,6 @@ where
         metrics::gauge!("mempool.currently.queued.transactions").set(0 as f64);
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -1,9 +1,6 @@
 //! Randomised property tests for transaction verification.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use chrono::{DateTime, Duration, Utc};
 use proptest::{collection::vec, prelude::*};
@@ -55,7 +52,7 @@ proptest! {
             "Unexpected validation error: {}",
             result.unwrap_err()
         );
-        prop_assert_eq!(result.unwrap().tx_id(), transaction_id);
+        prop_assert_eq!(result.unwrap().tx_id, transaction_id);
     }
 
     /// Test if having [`u32::MAX`] as the sequence number of all inputs disables the lock time.
@@ -90,7 +87,7 @@ proptest! {
             "Unexpected validation error: {}",
             result.unwrap_err()
         );
-        prop_assert_eq!(result.unwrap().tx_id(), transaction_id);
+        prop_assert_eq!(result.unwrap().tx_id, transaction_id);
     }
 
     /// Test if a transaction locked at a certain block height is rejected.
@@ -191,7 +188,7 @@ proptest! {
             "Unexpected validation error: {}",
             result.unwrap_err()
         );
-        prop_assert_eq!(result.unwrap().tx_id(), transaction_id);
+        prop_assert_eq!(result.unwrap().tx_id, transaction_id);
     }
 
     /// Test if transaction unlocked at a previous block time is accepted.
@@ -232,7 +229,7 @@ proptest! {
             "Unexpected validation error: {}",
             result.unwrap_err()
         );
-        prop_assert_eq!(result.unwrap().tx_id(), transaction_id);
+        prop_assert_eq!(result.unwrap().tx_id, transaction_id);
     }
 }
 
@@ -321,6 +318,16 @@ fn mock_transparent_transaction(
             orchard_shielded_data: None,
             network_upgrade,
         },
+        6 => Transaction::V6 {
+            inputs,
+            outputs,
+            lock_time,
+            expiry_height,
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+            network_upgrade,
+        },
         invalid_version => unreachable!("invalid transaction version: {}", invalid_version),
     };
 
@@ -348,7 +355,10 @@ fn sanitize_transaction_version(
             Overwinter => 3,
             Sapling | Blossom | Heartwood | Canopy => 4,
             // FIXME: Use 6 for Nu7
-            Nu5 | Nu6 | Nu6_1 | Nu7 => 5,
+            Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7 => 5,
+
+            #[cfg(zcash_unstable = "zfuture")]
+            NetworkUpgrade::ZFuture => u8::MAX,
         }
     };
 
@@ -439,7 +449,7 @@ fn scale_block_height(
     block::Height(new_height_value as u32)
 }
 
-/// Validate a `transaction` using a [`transaction::Verifier`] and return the result.
+/// Validate a `transaction` using a [`transaction::BlockTxVerifier`] and return the result.
 ///
 /// Configures an asynchronous runtime to run the verifier, sets it up and then uses it verify a
 /// `transaction` using the provided parameters.
@@ -449,23 +459,22 @@ fn validate(
     block_time: DateTime<Utc>,
     known_utxos: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     network: Network,
-) -> Result<transaction::Response, TransactionError> {
+) -> Result<transaction::BlockResponse, TransactionError> {
     zebra_test::MULTI_THREADED_RUNTIME.block_on(async {
         // Initialize the verifier
         let state_service =
             tower::service_fn(|_| async { unreachable!("State service should not be called") });
-        let verifier = transaction::Verifier::new_for_tests(&network, state_service);
+        let verifier = transaction::BlockTxVerifier::new(&network, state_service);
         let verifier = Buffer::new(verifier, 10);
         let transaction_hash = transaction.hash();
 
         // Test the transaction verifier
         verifier
             .clone()
-            .oneshot(transaction::Request::Block {
+            .oneshot(transaction::BlockRequest {
                 transaction_hash,
                 transaction: Arc::new(transaction),
                 known_utxos: Arc::new(known_utxos),
-                known_outpoint_hashes: Arc::new(HashSet::new()),
                 height,
                 time: block_time,
             })

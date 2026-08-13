@@ -1,5 +1,7 @@
 //! Basic integration tests for zebra-state
 
+#![allow(clippy::unwrap_in_result)]
+
 use std::sync::Arc;
 
 use color_eyre::eyre::Report;
@@ -81,7 +83,7 @@ async fn check_transcripts(network: Network) -> Result<(), Report> {
 
     for transcript_data in net_data {
         // We're not verifying UTXOs here.
-        let (service, _, _, _, _block_writer) = zebra_state::init(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
+        let (service, _, _, _, _block_writer) = zebra_state::init(Config::ephemeral(), &network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true))).await;
         let transcript = Transcript::from(transcript_data.iter().cloned());
         /// SPANDOC: check the on disk service against the transcript
         transcript.check(service).await?;

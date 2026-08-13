@@ -5,7 +5,10 @@ use tracing::Instrument;
 use zebra_chain::transparent;
 use zebra_script::CachedFfiTransaction;
 
-use crate::BoxError;
+use crate::{primitives::spawn_fifo_and_convert, BoxError};
+
+#[cfg(test)]
+mod tests;
 
 /// Asynchronous script verification.
 ///
@@ -52,26 +55,31 @@ impl tower::Service<Request> for Verifier {
             cached_ffi_transaction,
             input_index,
         } = req;
-        let input = &cached_ffi_transaction.inputs()[input_index];
-        match input {
-            transparent::Input::PrevOut { outpoint, .. } => {
-                let outpoint = *outpoint;
 
-                // Avoid calling the state service if the utxo is already known
-                let span = tracing::trace_span!("script", ?outpoint);
+        let span = tracing::trace_span!("script");
+        async move {
+            let input = cached_ffi_transaction
+                .inputs()
+                .get(input_index)
+                .ok_or_else(|| {
+                    format!("cached_ffi_transaction missing input at index {input_index}")
+                })?;
 
-                async move {
-                    cached_ffi_transaction.is_valid(input_index)?;
-                    tracing::trace!("script verification succeeded");
+            match input {
+                transparent::Input::PrevOut { outpoint, .. } => {
+                    let outpoint = *outpoint;
+
+                    // Script verification is CPU-bound so run in Rayon thread
+                    spawn_fifo_and_convert(move || cached_ffi_transaction.is_valid(input_index))
+                        .await?;
+                    tracing::trace!(?outpoint, "script verification succeeded");
 
                     Ok(())
                 }
-                .instrument(span)
-                .boxed()
-            }
-            transparent::Input::Coinbase { .. } => {
-                async { Err("unexpected coinbase input".into()) }.boxed()
+                transparent::Input::Coinbase { .. } => Err("unexpected coinbase input".into()),
             }
         }
+        .instrument(span)
+        .boxed()
     }
 }

@@ -17,6 +17,7 @@ use zebra_chain::{
     fmt::{humantime_seconds, SummaryDebug},
     history_tree::HistoryTree,
     parameters::{Network, NetworkUpgrade},
+    primitives::zcash_history::BlockCommitmentTreeRoots,
     LedgerState,
 };
 
@@ -172,8 +173,11 @@ impl Strategy for PreparedChain {
                 &network,
                 blocks[0].block.clone(),
                 // Dummy roots since this is only used for tests
-                &Default::default(),
-                &Default::default(),
+                BlockCommitmentTreeRoots {
+                    sapling: &Default::default(),
+                    orchard: &Default::default(),
+                    ironwood: &Default::default(),
+                },
             )
             .expect("history tree should be created");
             *chain = Some((
@@ -214,7 +218,7 @@ pub async fn populated_state(
     // TODO: write a test that checks the finalized to non-finalized transition with UTXOs,
     //       and set max_checkpoint_height and checkpoint_verify_concurrency_limit correctly.
     let (state, read_state, latest_chain_tip, chain_tip_change, mut block_writer) =
-        StateService::new(Config::ephemeral(), network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true)));
+        StateService::new(Config::ephemeral(), network, Height::MAX, 0, std::sync::Arc::new(|_,_,_| Some(true))).await;
 
     // Commit straight through the writer, the way new_network does. The state service does not
     // accept blocks any more, and there is no separate write thread left to wait on, so this

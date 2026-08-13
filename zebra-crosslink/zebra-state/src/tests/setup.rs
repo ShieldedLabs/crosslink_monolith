@@ -103,7 +103,7 @@ pub(crate) fn new_state_with_mainnet_genesis(
         #[cfg(feature = "elasticsearch")]
         false,
         false,
-    );
+    ).expect("opening an ephemeral database should succeed");
     let non_finalized_state = NonFinalizedState::new(&network, Default::default());
 
     assert_eq!(

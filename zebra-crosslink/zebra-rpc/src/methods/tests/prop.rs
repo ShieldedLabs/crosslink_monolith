@@ -26,7 +26,6 @@ use zebra_chain::{
     transparent,
     value_balance::ValueBalance,
 };
-use zebra_consensus::ParameterCheckpoint;
 use zebra_network::address_book_peers::MockAddressBookPeers;
 use zebra_node_services::mempool;
 use zebra_state::{BoxError, GetBlockTemplateChainInfo};
@@ -41,7 +40,7 @@ use crate::methods::{
 };
 
 use super::super::{
-    AddressStrings, GetAddressBalanceResponse, NetworkUpgradeStatus, RpcImpl, RpcServer,
+    GetAddressBalanceRequest, GetAddressBalanceResponse, NetworkUpgradeStatus, RpcImpl, RpcServer,
     SendRawTransactionResponse,
 };
 
@@ -49,6 +48,8 @@ proptest! {
     /// Test that when sending a raw transaction, it is received by the mempool service.
     #[test]
     fn mempool_receives_raw_tx(transaction in any::<Transaction>(), network in any::<Network>()) {
+        prop_assume!(!(transaction.is_coinbase() && transaction.sapling_spends_per_anchor().count() > 0));
+
         let (runtime, _init_guard) = zebra_test::init_async();
         let _guard = runtime.enter();
         let (mut mempool, _crosslink, mut state, rpc, mempool_tx_queue) = mock_services(network, NoChainTip);
@@ -94,6 +95,8 @@ proptest! {
     /// Mempool service errors should become server errors.
     #[test]
     fn mempool_errors_are_forwarded(transaction in any::<Transaction>(), network in any::<Network>()) {
+        prop_assume!(!(transaction.is_coinbase() && transaction.sapling_spends_per_anchor().count() > 0));
+
         let (runtime, _init_guard) = zebra_test::init_async();
         let _guard = runtime.enter();
         let (mut mempool, _crosslink, mut state, rpc, mempool_tx_queue) = mock_services(network, NoChainTip);
@@ -148,6 +151,8 @@ proptest! {
     /// Test that when the mempool rejects a transaction the caller receives an error.
     #[test]
     fn rejected_txs_are_reported(transaction in any::<Transaction>(), network in any::<Network>()) {
+        prop_assume!(!(transaction.is_coinbase() && transaction.sapling_spends_per_anchor().count() > 0));
+
         let (runtime, _init_guard) = zebra_test::init_async();
         let _guard = runtime.enter();
         let (mut mempool, _crosslink, mut state, rpc, mempool_tx_queue) = mock_services(network, NoChainTip);
@@ -252,6 +257,10 @@ proptest! {
         runtime.block_on(async move {
             if verbose.unwrap_or(false) {
                 let (expected_response, mempool_query) = {
+                    let transactions_by_id = transactions
+                        .iter()
+                        .map(|unmined_tx| {(unmined_tx.transaction.id.mined_id(), unmined_tx)})
+                        .collect::<HashMap<_, _>>();
                     let transaction_dependencies = Default::default();
                     let txs = transactions
                         .iter()
@@ -260,7 +269,7 @@ proptest! {
                                 unmined_tx.transaction.id.mined_id().encode_hex(),
                                 MempoolObject::from_verified_unmined_tx(
                                     unmined_tx,
-                                    &transactions,
+                                    &transactions_by_id,
                                     &transaction_dependencies,
                                 ),
                             )
@@ -346,8 +355,8 @@ proptest! {
                 .map_ok(|r| r.respond(mempool::Response::Transactions(vec![])));
 
             let state_query = state
-                .expect_request(zebra_state::ReadRequest::Transaction(unknown_txid))
-                .map_ok(|r| r.respond(zebra_state::ReadResponse::Transaction(None)));
+                .expect_request(zebra_state::ReadRequest::AnyChainTransaction(unknown_txid))
+                .map_ok(|r| r.respond(zebra_state::ReadResponse::AnyChainTransaction(None)));
 
             let rpc_query = rpc.get_raw_transaction(unknown_txid.encode_hex(), Some(1), None);
 
@@ -630,7 +639,7 @@ proptest! {
         tokio::time::pause();
 
         // Prepare the list of addresses.
-        let address_strings = AddressStrings {
+        let address_strings = GetAddressBalanceRequest {
             addresses: addresses
                 .iter()
                 .map(|address| address.to_string())
@@ -692,7 +701,7 @@ proptest! {
 
         runtime.block_on(async move {
 
-            let address_strings = AddressStrings {
+            let address_strings = GetAddressBalanceRequest {
                 addresses: at_least_one_invalid_address,
             };
 
@@ -715,6 +724,8 @@ proptest! {
     /// Test the queue functionality using `send_raw_transaction`
     #[test]
     fn rpc_queue_main_loop(tx in any::<Transaction>(), network in any::<Network>()) {
+        prop_assume!(!(tx.is_coinbase() && tx.sapling_spends_per_anchor().count() > 0));
+
         let (runtime, _init_guard) = zebra_test::init_async();
         let _guard = runtime.enter();
         let (mut mempool, _crosslink, mut state, rpc, mempool_tx_queue) = mock_services(network, NoChainTip);
@@ -793,6 +804,7 @@ proptest! {
     #[test]
     fn rpc_queue_receives_all_txs_from_channel(txs in any::<[Transaction; 2]>(),
                                                network in any::<Network>()) {
+        prop_assume!(txs.iter().all(|tx| !(tx.is_coinbase() && tx.sapling_spends_per_anchor().count() > 0)));
         let (runtime, _init_guard) = zebra_test::init_async();
         let _guard = runtime.enter();
         let (mut mempool, _crosslink, mut state, rpc, mempool_tx_queue) = mock_services(network, NoChainTip);

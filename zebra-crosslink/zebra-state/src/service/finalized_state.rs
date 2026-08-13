@@ -19,7 +19,13 @@ use std::{
     sync::Arc,
 };
 
-use zebra_chain::{block, parallel::tree::NoteCommitmentTrees, parameters::Network};
+use zebra_chain::{
+    amount::DeferredPoolBalanceChange,
+    block,
+    parallel::tree::NoteCommitmentTrees,
+    parameters::{subsidy::block_subsidy, Network},
+    primitives::zcash_history::BlockCommitmentTreeRoots,
+};
 use zebra_db::{
     chain::BLOCK_INFO,
     transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
@@ -27,9 +33,10 @@ use zebra_db::{
 
 use crate::{
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
+    error::CommitCheckpointVerifiedError,
     request::{FinalizableBlock, FinalizedBlock, Treestate},
     service::{check, QueuedCheckpointVerified},
-    BoxError, CheckpointVerifiedBlock, CloneError, Config,
+    CheckpointVerifiedBlock, Config, StateInitError, ValidateContextError,
 };
 
 pub use zcash_primitives::transaction::SLASH_ANALYSIS_WINDOW;
@@ -96,6 +103,12 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "orchard_anchors",
     "orchard_note_commitment_tree",
     "orchard_note_commitment_subtree",
+    // Ironwood (NU6.3). Always registered so the database format is stable across build
+    // flags; these stay empty until NU6.3 transactions appear.
+    "ironwood_nullifiers",
+    "ironwood_anchors",
+    "ironwood_note_commitment_tree",
+    "ironwood_note_commitment_subtree",
     // Chain
     "history_tree",
     "tip_chain_value_pool",
@@ -156,7 +169,7 @@ impl FinalizedState {
         config: &Config,
         network: &Network,
         #[cfg(feature = "elasticsearch")] enable_elastic_db: bool,
-    ) -> Self {
+    ) -> Result<Self, StateInitError> {
         Self::new_with_debug(
             config,
             network,
@@ -171,13 +184,14 @@ impl FinalizedState {
     /// If there is no existing database, creates a new database on disk.
     ///
     /// This method is intended for use in tests.
+    #[allow(clippy::unwrap_in_result)]
     pub(crate) fn new_with_debug(
         config: &Config,
         network: &Network,
         debug_skip_format_upgrades: bool,
         #[cfg(feature = "elasticsearch")] enable_elastic_db: bool,
         read_only: bool,
-    ) -> Self {
+    ) -> Result<Self, StateInitError> {
         #[cfg(feature = "elasticsearch")]
         let elastic_db = if enable_elastic_db {
             use elasticsearch::{
@@ -195,8 +209,8 @@ impl FinalizedState {
             let transport = TransportBuilder::new(conn_pool)
                 .cert_validation(CertificateValidation::None)
                 .auth(Basic(
-                    config.clone().elasticsearch_username,
-                    config.clone().elasticsearch_password,
+                    config.elasticsearch_username.clone(),
+                    config.elasticsearch_password.as_str().to_string(),
                 ))
                 .build()
                 .expect("elasticsearch transport builder should not fail");
@@ -216,7 +230,7 @@ impl FinalizedState {
                 .iter()
                 .map(ToString::to_string),
             read_only,
-        );
+        )?;
 
         #[cfg(feature = "elasticsearch")]
         let new_state = Self {
@@ -269,9 +283,7 @@ impl FinalizedState {
             }
         }
 
-        tracing::info!(tip = ?new_state.db.tip(), "loaded Zebra state cache");
-
-        new_state
+        Ok(new_state)
     }
 
     /// Returns the configured network for this database.
@@ -287,7 +299,7 @@ impl FinalizedState {
         &mut self,
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-    ) -> Result<(CheckpointVerifiedBlock, NoteCommitmentTrees), BoxError> {
+    ) -> Result<(CheckpointVerifiedBlock, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let (checkpoint_verified, rsp_tx) = ordered_block;
         let result = self.commit_finalized_direct(
             checkpoint_verified.clone().into(),
@@ -312,15 +324,9 @@ impl FinalizedState {
                 .set(checkpoint_verified.height.0 as f64);
         };
 
-        // Make the error cloneable, so we can send it to the block verify future,
-        // and the block write task.
-        let result = result.map_err(CloneError::from);
+        let _ = rsp_tx.send(result.clone().map(|(hash, _)| hash));
 
-        let _ = rsp_tx.send(result.clone().map(|(hash, _)| hash).map_err(BoxError::from));
-
-        result
-            .map(|(_hash, note_commitment_trees)| (checkpoint_verified, note_commitment_trees))
-            .map_err(BoxError::from)
+        result.map(|(_hash, note_commitment_trees)| (checkpoint_verified, note_commitment_trees))
     }
 
     /// Immediately commit a `finalized` block to the finalized state.
@@ -342,7 +348,7 @@ impl FinalizedState {
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         source: &str,
-    ) -> Result<(block::Hash, NoteCommitmentTrees), BoxError> {
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let (height, hash, finalized, prev_note_commitment_trees) = match finalizable_block {
             FinalizableBlock::Checkpoint {
                 checkpoint_verified,
@@ -360,7 +366,9 @@ impl FinalizedState {
 
                 // Update the note commitment trees.
                 let mut note_commitment_trees = prev_note_commitment_trees.clone();
-                note_commitment_trees.update_trees_parallel(&block)?;
+                note_commitment_trees
+                    .update_trees_parallel(&block)
+                    .map_err(ValidateContextError::from)?;
 
                 // Check the block commitment if the history tree was not
                 // supplied by the non-finalized state. Note that we don't do
@@ -392,21 +400,35 @@ impl FinalizedState {
                 let history_tree_mut = Arc::make_mut(&mut history_tree);
                 let sapling_root = note_commitment_trees.sapling.root();
                 let orchard_root = note_commitment_trees.orchard.root();
-                history_tree_mut.push(
-                    &self.network(),
-                    block.clone(),
-                    &sapling_root,
-                    &orchard_root,
-                )?;
+                let ironwood_root = note_commitment_trees.ironwood.root();
+                history_tree_mut
+                    .push(
+                        &self.network(),
+                        block.clone(),
+                        BlockCommitmentTreeRoots {
+                            sapling: &sapling_root,
+                            orchard: &orchard_root,
+                            ironwood: &ironwood_root,
+                        },
+                    )
+                    .map_err(Arc::new)
+                    .map_err(ValidateContextError::from)?;
+
                 let treestate = Treestate {
                     note_commitment_trees,
                     history_tree,
                 };
 
+                let height = checkpoint_verified.height;
+
                 (
-                    checkpoint_verified.height,
+                    height,
                     checkpoint_verified.hash,
-                    FinalizedBlock::from_checkpoint_verified(checkpoint_verified, treestate),
+                    FinalizedBlock::from_checkpoint_verified(
+                        checkpoint_verified,
+                        treestate,
+                        calculate_deferred_pool_balance_change(height, &self.network()),
+                    ),
                     Some(prev_note_commitment_trees),
                 )
             }
@@ -416,12 +438,22 @@ impl FinalizedState {
                 bond_rewards,
                 bond_burns,
                 unbonding_amounts,
-            } => (
-                contextually_verified.height,
-                contextually_verified.hash,
-                FinalizedBlock::from_contextually_verified(contextually_verified, treestate, bond_rewards, bond_burns, unbonding_amounts),
-                prev_note_commitment_trees,
-            ),
+            } => {
+                let height = contextually_verified.height;
+                (
+                    height,
+                    contextually_verified.hash,
+                    FinalizedBlock::from_contextually_verified(
+                        contextually_verified,
+                        treestate,
+                        calculate_deferred_pool_balance_change(height, &self.network()),
+                        bond_rewards,
+                        bond_burns,
+                        unbonding_amounts,
+                    ),
+                    prev_note_commitment_trees,
+                )
+            }
         };
 
         let committed_tip_hash = self.db.finalized_tip_hash();
@@ -614,5 +646,29 @@ impl FinalizedState {
         // dropping any lines that haven't already been written to stdout.
         // This is okay for now because this is test-only code
         std::process::exit(0);
+    }
+}
+
+/// Calculates the deferred pool balance change for a given height and network.
+///
+/// Returns a deferred pool balance change of zero if it cannot be calculated.
+pub(crate) fn calculate_deferred_pool_balance_change(
+    height: block::Height,
+    network: &Network,
+) -> DeferredPoolBalanceChange {
+    if height > network.slow_start_interval() {
+        zebra_chain::parameters::subsidy::funding_stream_values(
+            height,
+            network,
+            block_subsidy(height, network).unwrap_or_default(),
+        )
+        .unwrap_or_default()
+        .remove(&zebra_chain::parameters::subsidy::FundingStreamReceiver::Deferred)
+        .unwrap_or_default()
+        .checked_sub(network.lockbox_disbursement_total_amount(height))
+        .map(DeferredPoolBalanceChange::new)
+        .unwrap_or_default()
+    } else {
+        DeferredPoolBalanceChange::zero()
     }
 }
