@@ -3399,6 +3399,10 @@ fn rewind_wallet_state_to_last_valid_h(
 
     match orchard_tree.truncate_to_checkpoint(&last_block_h) {
         Ok(true) => {}
+        Ok(false) if orchard_tree
+            .max_leaf_position(None)
+            .expect("Infallible Memory Store")
+            .is_none() => {}
         Ok(false) => {
             return Err(format!(
                 "Orchard checkpoint at {last_block_h} is unavailable; refusing to rewind wallet state"
@@ -3609,29 +3613,44 @@ fn publish_loaded_wallet_snapshot(
     let (miner_unshielded_funds, miner_shielded_pending_funds, miner_shielded_spendable_funds) = balances(miner_wallet);
     let (user_unshielded_funds, user_shielded_pending_funds, user_shielded_spendable_funds) = balances(user_wallet);
 
-    let mut stake_positions_bonded = Vec::new();
-    let mut stake_positions_unbonded = Vec::new();
+    let mut stake_positions_bonded: Vec<(ScanBond, [u8; 32], u64)> = Vec::new();
+    let mut stake_positions_unbonded: Vec<(ScanBond, u64)> = Vec::new();
     for tx in &user_wallet.txs {
         if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
         if let Some(staking_action) = &tx.staking_action {
             if let Some(create_bond) = StakingAction_CreateNewDelegationBond::try_from_union(staking_action) {
-                stake_positions_bonded.push((create_bond.unique_pubkey, create_bond.target_finalizer, create_bond.amount_zats));
+                stake_positions_bonded.push((ScanBond {
+                    pk: PubKeyID(create_bond.unique_pubkey),
+                    initial_val: create_bond.amount_zats,
+                    create_height: tx.h.0,
+                    create_txid: PubKeyID(<[u8; 32]>::from(tx.txid)),
+                }, create_bond.target_finalizer, create_bond.amount_zats));
             }
+        }
+    }
+    for tx in &user_wallet.txs {
+        if !(tx.is_on_bc() && tx.h.is_in_block()) { continue; }
+        if let Some(staking_action) = &tx.staking_action {
             if let Some(retarget) = StakingAction_RetargetDelegationBond::try_from_union(staking_action) {
-                if let Some(existing_i) = stake_positions_bonded.iter().position(|p| p.0 == retarget.unique_pubkey) {
-                    stake_positions_bonded[existing_i].1 = retarget.target_finalizer;
+                if let Some((_bond, finalizer, _latest_zats)) = stake_positions_bonded.iter_mut().find(|(bond, _, _)| bond.pk.0 == retarget.unique_pubkey) {
+                    *finalizer = retarget.target_finalizer;
                 }
             }
             if let Some(unbond) = StakingAction_BeginDelegationUnbonding::try_from_union(staking_action) {
-                if let Some(existing_i) = stake_positions_bonded.iter().position(|p| p.0 == unbond.unique_pubkey) {
-                    stake_positions_unbonded.push((unbond.unique_pubkey, stake_positions_bonded[existing_i].1, stake_positions_bonded[existing_i].2));
-                    stake_positions_bonded.remove(existing_i);
+                if let Some(existing_i) = stake_positions_bonded.iter().position(|(bond, _, _)| bond.pk.0 == unbond.unique_pubkey) {
+                    let (bond, _finalizer, latest) = stake_positions_bonded.remove(existing_i);
+                    stake_positions_unbonded.push((bond, latest));
                 } else {
-                    stake_positions_unbonded.push((unbond.unique_pubkey, [0; 32], u64::MAX));
+                    stake_positions_unbonded.push((ScanBond {
+                        pk: PubKeyID(unbond.unique_pubkey),
+                        initial_val: u64::MAX,
+                        create_height: 0,
+                        create_txid: PubKeyID::NIL,
+                    }, u64::MAX));
                 }
             }
             if let Some(unbond) = StakingAction_WithdrawDelegationBond::try_from_union(staking_action) {
-                if let Some(existing_i) = stake_positions_unbonded.iter().position(|p| p.0 == unbond.unique_pubkey) {
+                if let Some(existing_i) = stake_positions_unbonded.iter().position(|(bond, _)| bond.pk.0 == unbond.unique_pubkey) {
                     stake_positions_unbonded.remove(existing_i);
                 }
             }
@@ -3640,17 +3659,31 @@ fn publish_loaded_wallet_snapshot(
 
     let mut user_staked_funds = 0;
     let mut user_withdrawable_funds = 0;
-    for p in &mut stake_positions_bonded {
-        if let Some(zats) = user_wallet.seen_bond_values.get(&p.0) {
-            p.2 = *zats;
+    for (bond, _finalizer, latest_zats) in &mut stake_positions_bonded {
+        if let Some(zats) = user_wallet.seen_bond_values.get(&bond.pk.0) {
+            *latest_zats = *zats;
         }
-        user_staked_funds += p.2;
+        user_staked_funds += *latest_zats;
     }
-    for p in &mut stake_positions_unbonded {
-        if let Some(zats) = user_wallet.seen_bond_values.get(&p.0) {
-            p.2 = *zats;
+    for (bond, latest_zats) in &mut stake_positions_unbonded {
+        if let Some(zats) = user_wallet.seen_bond_values.get(&bond.pk.0) {
+            *latest_zats = *zats;
         }
-        user_withdrawable_funds += p.2;
+        if *latest_zats != u64::MAX {
+            user_withdrawable_funds += *latest_zats;
+        }
+    }
+
+    {
+        let mut active: BTreeMap<PubKeyID, Vec<(ScanBond, u64)>> = BTreeMap::new();
+        for (bond, finalizer, latest) in &stake_positions_bonded {
+            active.entry(PubKeyID(*finalizer)).or_default().push((bond.clone(), *latest));
+        }
+        let withdrawable = stake_positions_unbonded.iter()
+            .filter(|(bond, latest_zats)| *latest_zats != u64::MAX && bond.initial_val != u64::MAX)
+            .cloned()
+            .collect();
+        *STAKING_POSITIONS.lock().unwrap() = (active, withdrawable);
     }
 
     let mut lock = wallet_state.lock().unwrap();
