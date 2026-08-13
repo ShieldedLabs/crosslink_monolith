@@ -33,7 +33,8 @@ pub const POS_BLOCK_REWARD_ZATS: u64 = 500_000_000; // TODO: directly contribute
 // pub const MAX_BLOCK_REORG_HEIGHT: u32 = MIN_TRANSPARENT_COINBASE_MATURITY - 1;
 // Note(Sam): Because of Judah's change to MIN_TRANSPARENT_COINBASE_MATURITY we have to change this to be a manual constant.
 //          ---->     pub const MIN_TRANSPARENT_COINBASE_MATURITY: u32 = 2; // @TODO(JUDAH): This is hardcoded so we can spend coinbase transactions before they mature. This is very temporary!
-pub const MAX_BLOCK_REORG_HEIGHT: u32 = 100 - 1;
+// Defined in zcash_protocol so the wallet derives its reorg rewind from the same value.
+pub use zcash_protocol::consensus::MAX_BLOCK_REORG_HEIGHT;
 
 /// The directory name used to distinguish the state database from Zebra's other databases or flat files.
 pub const STATE_DATABASE_KIND: &str = "state";

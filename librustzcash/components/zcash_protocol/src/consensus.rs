@@ -628,6 +628,16 @@ const UPGRADES_IN_ORDER: &[NetworkUpgrade] = &[
 /// [ZIP 212]: https://zips.z.cash/zip-0212#changes-to-the-process-of-receiving-sapling-or-orchard-notes
 pub const ZIP212_GRACE_PERIOD: u32 = 32256;
 
+/// The maximum chain reorganisation depth.
+///
+/// This threshold determines the maximum length of the best non-finalized chain.
+/// Larger reorganisations would allow double-spends of coinbase transactions.
+///
+/// It lives here rather than in the node so that wallets, which must be able to roll
+/// their state back across any reorg the node will accept, derive their rewind depth
+/// from the same value the node enforces.
+pub const MAX_BLOCK_REORG_HEIGHT: u32 = 100 - 1;
+
 /// A globally-unique identifier for a set of consensus rules within the Zcash chain.
 ///
 /// Each branch ID in this enum corresponds to one of the epochs between a pair of Zcash

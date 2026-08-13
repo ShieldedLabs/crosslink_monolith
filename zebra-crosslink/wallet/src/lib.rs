@@ -59,7 +59,7 @@ use zcash_primitives::transaction::txid::TxIdDigester;
 use zcash_primitives::transaction::{Authorized, StakingAction_BeginDelegationUnbonding, StakingAction_CreateNewDelegationBond, StakingAction_RetargetDelegationBond, StakingAction_WithdrawDelegationBond, Transaction, TransactionData, TxVersion, Unauthorized};
 use zcash_primitives::transaction::{RosterMember, StakingAction, StakingActionKind, StakingActionRequest, StakeTxId};
 use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::consensus::{BlockHeight as LRZBlockHeight, BranchId};
+use zcash_protocol::consensus::{BlockHeight as LRZBlockHeight, BranchId, MAX_BLOCK_REORG_HEIGHT};
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::{ZatBalance, Zatoshis};
 use zcash_protocol::{PoolType, ShieldedProtocol, TxId};
@@ -3339,9 +3339,13 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         println!("faucet: {:?}", client.request_faucet_donation(FaucetRequest{ address: user_ua_str.clone() }).await);
     }
 
+    const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u64 = 1024;
+
     // NOTE: current model is to reorg this many blocks back
     // ALT: have checkpoints every 16/32 blocks and always sync from the start of one of these
-    const MAX_BLOCKS_TO_DOWNLOAD_AT_TIME: u64 = 1024;
+    const REWIND_DISTANCE: u64 = (MAX_BLOCK_REORG_HEIGHT as u64 + 1); // must exceed max reorg height
+
+    const T_ADDR_RECHECK_WINDOW: u64 = REWIND_DISTANCE;
 
     let mut stupid_thing_because_judah_is_tired_and_wants_this_to_work_properly = Vec::<TxId>::new();
 
@@ -3355,8 +3359,9 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
     let mut roster: Vec<RosterMember> = Vec::new();
     let mut pow_cache = PoWCache::new(0, genesis_hash);
-    // NOTE: checkpoints allow us to reset the tree after a reorg & also create spend anchors
-    const CHECKPOINTS_N: usize = 100;
+    // NOTE: checkpoints allow us to reset the tree after a reorg & also create spend anchors.
+    // Retention must exceed the deepest reorg rewind.
+    const CHECKPOINTS_N: usize = (REWIND_DISTANCE + 1) as usize;
     let mut orchard_tree = OrchardShardTree::new(shardtree::store::memory::MemoryShardStore::empty(), CHECKPOINTS_N);
     orchard_tree.checkpoint(BlockHeight(0)).unwrap();
 
@@ -3435,6 +3440,11 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     let mut wallet_state_push_time = Instant::now();
 
     let mut just_init_new_tx = false;
+    // Debug: WALLET_FORCE_REWIND_AT=<height> fires a single deep rewind of the request
+    // window once the scan front passes that height, reproducing the reorg rewind path
+    // without needing a real reorg.
+    let mut forced_rewind_at: Option<u64> = std::env::var("WALLET_FORCE_REWIND_AT").ok().and_then(|s| s.parse().ok());
+
     let mut resync_c = 0;
     'outer_sync: loop {
         if TEST_FAUCET {
@@ -3451,6 +3461,14 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
         // NOTE: this is desynced from local_tip because we need to speculatively request blocks
         // further back than the chain divergence on reorg to find out where it occurred
         let mut req_start_h = pow_cache.next_tip_h-1;
+
+        if let Some(at) = forced_rewind_at {
+            if req_start_h > at {
+                forced_rewind_at = None;
+                req_start_h = req_start_h.saturating_sub(REWIND_DISTANCE);
+                println!("****** FORCING {REWIND_DISTANCE}-block rewind at scan front {} (debug)", pow_cache.next_tip_h - 1);
+            }
+        }
 
         // NOTE: if you're dealing with multiple wallets, you don't want to resync all blocks for each
         // of them. They can all sync from the same blocks.
@@ -3691,16 +3709,15 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                         let mut needs_resync = false;
                         if prev_hash != prev_tip_chain_state.block_hash().0 {
                             println!("non-atomic API meant block range & chain-state are torn reads: {} vs {}", LEHash(prev_hash), LEHash(prev_tip_chain_state.block_hash().0));
-                            req_start_h = req_start_h.saturating_sub(MAX_BLOCKS_TO_DOWNLOAD_AT_TIME / 2);
                             needs_resync = true;
                         }
                         if Some(prev_hash) != expected_prev_hash {
                             if DUMP_SYNC { println!("reorg occurred before height {}; hash mismatch {prev_hash:?} vs {expected_prev_hash:?}", new_blocks[0].height); }
-                            req_start_h = req_start_h.saturating_sub(MAX_BLOCKS_TO_DOWNLOAD_AT_TIME);
                             needs_resync = true;
                         }
                         if needs_resync {
                             if DUMP_SYNC { println!("hit discontinuity; handling reorg!"); }
+                            req_start_h = req_start_h.saturating_sub(REWIND_DISTANCE);
                             continue 'sync_find_continuation_point;
                         }
                     }
@@ -3790,7 +3807,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     let strm_sync_h = wallets[wallet_i].strms[strm_i].sync_h;
                     let t_addr_str = wallets[wallet_i].strms[strm_i].t_addr.encode(network);
                     let t_req_rng = (
-                        (strm_sync_h.0 as u64).saturating_sub(MAX_BLOCKS_TO_DOWNLOAD_AT_TIME).max(1),
+                        (strm_sync_h.0 as u64).saturating_sub(T_ADDR_RECHECK_WINDOW).max(1),
                         compact_block_max_h.min(strm_sync_h.0 as u64 + MAX_BLOCKS_TO_DOWNLOAD_AT_TIME)
                     );
                     let t_txs_res = client.get_taddress_txids(TransparentAddressBlockFilter {
@@ -3930,7 +3947,10 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             let block_h = BlockHeight(sync_start_h);
             let last_block_h = block_h.sat_sub(1);
 
-            orchard_tree.truncate_to_checkpoint(&last_block_h); // N.B. checkpoints are at the *end* of their block
+            match orchard_tree.truncate_to_checkpoint(&last_block_h) { // N.B. checkpoints are at the *end* of their block
+                Ok(true) => (),
+                res => println!("****** WALLET TREE DESYNC: truncate_to_checkpoint({last_block_h}) = {res:?} with tree size {}; the rewind passed checkpoint retention, so spends will be invalid until restart", shard_tree_size(&orchard_tree)),
+            }
 
             for (wallet_i, wallet) in [&mut miner_wallet, &mut user_wallet].into_iter().enumerate() {
                 //-- INVALIDATE SYNC >= NEW BLOCKS HEIGHT
@@ -4058,6 +4078,21 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
             }
         }
 
+        // Cross-check our commitment tree against the node's own, at the height just
+        // before the downloaded range. Silent while healthy; prints every iteration once
+        // the tree has diverged (e.g. after a rewind deeper than checkpoint retention).
+        if sync_from_i.is_some() {
+            let check_h = req_rng.0.saturating_sub(1);
+            if (u32::from(prev_tip_chain_state.block_height()) as u64) == check_h {
+                if let Ok(Some(wallet_root)) = orchard_tree.root_at_checkpoint_id_caching(&BlockHeight(check_h as u32)) {
+                    let node_root = prev_tip_chain_state.final_orchard_tree().root();
+                    if wallet_root.to_bytes() != node_root.to_bytes() {
+                        println!("****** WALLET TREE ROOT MISMATCH at {check_h}: wallet {} vs node {} (tree size {})",
+                            LEHash(wallet_root.to_bytes()), LEHash(node_root.to_bytes()), shard_tree_size(&orchard_tree));
+                    }
+                }
+            }
+        }
 
         //-- ADD/REVALIDATE TRANSPARENT TXS (and attached shielded data)
         {
@@ -4146,9 +4181,22 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
 
                     // NOTE: simple approach: checkpoint every block
                     // => allows for easy reorgs & witnesses
+                    // @Cleanup: the tree is shared by every wallet, so the block loop should be
+                    // the outer one and each block checkpointed once, after every wallet has
+                    // scanned it. As written, later passes only ever re-offer ids the tree already
+                    // has, and the equality guard exists solely to suppress that.
                     if next_orchard_pos == shard_tree_size(&orchard_tree) {
                         orchard_tree.checkpoint(block_h);
                         // println!("checkpoint: orchard root at {:?} tree: size={} {:?}", block_h, shard_tree_size(&orchard_tree), shard_tree_root(&orchard_tree));
+                    } else if wallet_i == 0 {
+                        // Only the first wallet scanned appends leaves. By the time the later ones
+                        // walk the same blocks the tree already holds the whole range, so being
+                        // unequal here is normal for them and means nothing. On the appending pass
+                        // the scan position and the tree size advance in step, so being unequal
+                        // means the tree holds leaves this scan did not put there. That block then
+                        // gets no checkpoint, checkpoint ids stop being consecutive, and a reorg
+                        // rewind can no longer find the exact id it truncates to.
+                        println!("****** WALLET TREE DESYNC: no checkpoint at {block_h}; scan is at position {next_orchard_pos} but tree size is {}; the rewind target may not exist, so spends will be invalid until restart", shard_tree_size(&orchard_tree));
                     }
                 }
             }

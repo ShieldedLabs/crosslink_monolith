@@ -9638,6 +9638,7 @@ dependencies = [
  "tracing",
  "zcash_keys",
  "zcash_primitives",
+ "zcash_protocol",
  "zebra-chain",
  "zebra-test",
 ]
