@@ -41,7 +41,7 @@
 				<WorkingDirectory>C:\Work\ShieldedLabs\crosslink_monolith\zebra-gui</WorkingDirectory>
 				<DebugCommand></DebugCommand>
 				<DebuggerExe></DebuggerExe>
-				<DebugSln>visualizer_zcash.sln</DebugSln>
+				<DebugSln>zebra-gui.sln</DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
 				<PrioritiseFiles></PrioritiseFiles>
@@ -59,7 +59,7 @@
 				<WorkingDirectory></WorkingDirectory>
 				<DebugCommand></DebugCommand>
 				<DebuggerExe></DebuggerExe>
-				<DebugSln>visualizer_zcash.sln</DebugSln>
+				<DebugSln>zebra-gui.sln</DebugSln>
 				<Defines></Defines>
 				<ForceIncludes></ForceIncludes>
 				<PrioritiseFiles></PrioritiseFiles>

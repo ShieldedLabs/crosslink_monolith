@@ -4294,26 +4294,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "visualizer_zcash"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "chrono",
- "clay-layout",
- "copypasta",
- "embed-resource",
- "lewton",
- "num_cpus",
- "png",
- "rand 0.9.2",
- "rustybuzz",
- "softbuffer",
- "swash",
- "wallet",
- "winit",
-]
-
-[[package]]
 name = "vswhom"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5527,6 +5507,26 @@ dependencies = [
  "zcash_script",
  "zcash_spec",
  "zip32",
+]
+
+[[package]]
+name = "zebra-gui"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "chrono",
+ "clay-layout",
+ "copypasta",
+ "embed-resource",
+ "lewton",
+ "num_cpus",
+ "png",
+ "rand 0.9.2",
+ "rustybuzz",
+ "softbuffer",
+ "swash",
+ "wallet",
+ "winit",
 ]
 
 [[package]]

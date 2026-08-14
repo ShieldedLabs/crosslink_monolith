@@ -5,13 +5,13 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug executable 'visualizer_zcash'",
+            "name": "Debug executable 'zebra-gui'",
             "type": "lldb",
             "request": "launch",
             "cargo": {
                 "args": [
                     "run",
-                    "--bin=visualizer_zcash"
+                    "--bin=zebra-gui"
                 ]
             },
             "args": []

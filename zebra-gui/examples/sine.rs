@@ -3,7 +3,7 @@
 // then a left-only note and a right-only note. A swapped or strided channel order is
 // instantly audible on headphones.
 
-use visualizer_zcash::audio;
+use zebra_gui::audio;
 
 fn sleep_ms(ms: u64) { std::thread::sleep(std::time::Duration::from_millis(ms)); }
 

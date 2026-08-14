@@ -85,6 +85,6 @@ fn main() {
         ];
     }
 
-    visualizer_zcash::main_thread_run_program(wallet_state, true);
-    // visualizer_zcash::main_thread_run_program(wallet_state, false);
+    zebra_gui::main_thread_run_program(wallet_state, true);
+    // zebra_gui::main_thread_run_program(wallet_state, false);
 }

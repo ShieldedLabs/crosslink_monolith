@@ -7785,26 +7785,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "visualizer_zcash"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "chrono",
- "clay-layout",
- "copypasta",
- "embed-resource",
- "lewton",
- "num_cpus",
- "png",
- "rand 0.9.2",
- "rustybuzz",
- "softbuffer",
- "swash",
- "wallet",
- "winit",
-]
-
-[[package]]
 name = "void"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9384,17 +9364,37 @@ dependencies = [
  "tracing-error",
  "tracing-futures",
  "tracing-subscriber",
- "visualizer_zcash",
  "wallet",
  "zcash_keys",
  "zcash_primitives",
  "zcash_protocol",
  "zebra-chain",
+ "zebra-gui",
  "zebra-node-services",
  "zebra-state",
  "zebra-test",
  "zerocopy",
  "zerocopy-derive",
+]
+
+[[package]]
+name = "zebra-gui"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "chrono",
+ "clay-layout",
+ "copypasta",
+ "embed-resource",
+ "lewton",
+ "num_cpus",
+ "png",
+ "rand 0.9.2",
+ "rustybuzz",
+ "softbuffer",
+ "swash",
+ "wallet",
+ "winit",
 ]
 
 [[package]]

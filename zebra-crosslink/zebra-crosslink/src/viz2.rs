@@ -1,5 +1,5 @@
 
-use visualizer_zcash::{
+use zebra_gui::{
     BftBlockInspection, BftPowHeaderInspection, BlockInspection, Hash32, PowBlockInspection,
     TxInspection,
 };
@@ -19,18 +19,18 @@ pub fn viz_main(tokio_root_thread_handle: Option<std::thread::JoinHandle<()>>, w
 
     let test_name: &'static str = *TEST_NAME.lock().unwrap();
     if test_name != "‰‰TEST_NAME_NOT_SET‰‰" {
-        *visualizer_zcash::WINDOW_TITLE.lock().unwrap() = format!("TEST: {}", test_name);
+        *zebra_gui::WINDOW_TITLE.lock().unwrap() = format!("TEST: {}", test_name);
     }
 
     // @Dev @Debug: detect which instance we are to position viz window
-    #[cfg(target_os = "windows")] if visualizer_zcash::DEV_WIN32_WINDOW_ARRANGEMENT {
+    #[cfg(target_os = "windows")] if zebra_gui::DEV_WIN32_WINDOW_ARRANGEMENT {
         let args: Vec<String> = std::env::args().collect();
         let args_str = args.join(" ");
         let bottom_right = args_str.contains("12302") || args_str.contains("12002") || args_str.contains("_1.local");
-        visualizer_zcash::DEV_WIN32_WINDOW_RIGHT.store(bottom_right, std::sync::atomic::Ordering::Relaxed);
+        zebra_gui::DEV_WIN32_WINDOW_RIGHT.store(bottom_right, std::sync::atomic::Ordering::Relaxed);
     }
 
-    visualizer_zcash::main_thread_run_program(wallet_state, false);
+    zebra_gui::main_thread_run_program(wallet_state, false);
 }
 
 
@@ -78,8 +78,8 @@ pub async fn service_viz_requests(
     let mut bft_resolved_at_tip: u64 = u64::MAX; // PoW tip at the last resolution round
 
     loop {
-        let request_queue = visualizer_zcash::REQUESTS_TO_ZEBRA.lock().unwrap();
-        let response_queue = visualizer_zcash::RESPONSES_FROM_ZEBRA.lock().unwrap();
+        let request_queue = zebra_gui::REQUESTS_TO_ZEBRA.lock().unwrap();
+        let response_queue = zebra_gui::RESPONSES_FROM_ZEBRA.lock().unwrap();
         if request_queue.is_none() || response_queue.is_none() {
             continue;
         }
@@ -350,7 +350,7 @@ pub async fn service_viz_requests(
                     }
 
                     let mut internal = tfl_handle.internal.lock().await;
-                    let mut response = visualizer_zcash::ResponseFromZebra::_0();
+                    let mut response = zebra_gui::ResponseFromZebra::_0();
                     response.bc_attested = bc_attested.clone();
                     response.bft_recency = internal.recency_status.clone(); // TODO: do we want a better way of communicating singleton data
                     {
@@ -425,7 +425,7 @@ pub async fn service_viz_requests(
                             previous_hash: Hash32::from_bytes(b.previous_block_hash().0),
                             finalization_candidate_height: 0,
                             do_not_include_until_bc_height: b.do_not_include_until_bc_height,
-                            hardforks: b.hardforks.iter().map(|hf| visualizer_zcash::HardforkInspection {
+                            hardforks: b.hardforks.iter().map(|hf| zebra_gui::HardforkInspection {
                                 pow_activation_height: hf.pow_activation_height,
                                 bft_certificate_height: hf.bft_certificate_height,
                                 terminated_finalizers: hf.terminated_finalizers.iter().map(|id| Hash32::from_bytes(id.0)).collect(),
@@ -442,7 +442,7 @@ pub async fn service_viz_requests(
                         })
                     };
 
-                    let push_bc_block = |response: &mut visualizer_zcash::ResponseFromZebra,
+                    let push_bc_block = |response: &mut zebra_gui::ResponseFromZebra,
                                          height: &ZebBlockHeight,
                                          hash: &ZebBlockHash,
                                          bc: &Block,
@@ -452,14 +452,14 @@ pub async fn service_viz_requests(
                             response.what_block_it_is = this_hash;
                             response.block_inspection = pow_inspection(bc);
                         }
-                        response.bc_blocks.push(visualizer_zcash::BcBlock {
+                        response.bc_blocks.push(zebra_gui::BcBlock {
                             this_hash,
                             parent_hash: Hash32::from_bytes(bc.header.previous_block_hash.0),
                             this_height: height.0 as u64,
                             txs_n: bc.transactions.len(),
                             is_best_chain,
                             is_finalized: false,
-                            knowledge: visualizer_zcash::BcKnowledge::FullBlock,
+                            knowledge: zebra_gui::BcKnowledge::FullBlock,
                             points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash().0),
                             work: bc.header.difficulty_threshold.to_work()
                                 .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
@@ -545,14 +545,14 @@ pub async fn service_viz_requests(
                             response.what_block_it_is = this_hash;
                             response.block_inspection = bft_inspection(b);
                         }
-                        response.bft_blocks.push(visualizer_zcash::BftBlock {
+                        response.bft_blocks.push(zebra_gui::BftBlock {
                             this_hash: this_hash,
                             parent_hash: Hash32::from_bytes(b.previous_block_hash().0),
                             this_height: i as u64,
                             points_at_bc_block: candidate_hash,
                             points_at_bc_height: candidate_height,
                             // full header data, so the GUI can show proven blocks it never received
-                            proving_blocks: b.headers.iter().skip(1).map(|x| visualizer_zcash::ProvingHeader {
+                            proving_blocks: b.headers.iter().skip(1).map(|x| zebra_gui::ProvingHeader {
                                 hash: Hash32::from_bytes(BlockHash::from_header_data(x).0),
                                 parent_hash: Hash32::from_bytes(x.prev_block.0),
                                 utc: x.time as i64,

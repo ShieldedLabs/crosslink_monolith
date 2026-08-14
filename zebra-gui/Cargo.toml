@@ -1,5 +1,5 @@
 [package]
-name = "visualizer_zcash"
+name = "zebra-gui"
 version = "0.1.0"
 edition = "2024"
 

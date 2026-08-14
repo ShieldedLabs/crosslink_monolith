@@ -44,7 +44,7 @@ zcash_transparent = { path = "../librustzcash/zcash_transparent" }
 zcash_protocol = { path = "../librustzcash/components/zcash_protocol" }
 
 tenderlink = { path = "../tenderlink" }
-visualizer_zcash = { path = "../zebra-gui" }
+zebra-gui = { path = "../zebra-gui" }
 
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
 shardtree = "0.6.1"
@@ -224,7 +224,7 @@ opt-level = 3
 [profile.dev.package.zcash_proofs]
 opt-level = 3
 
-[profile.dev.package.visualizer_zcash]
+[profile.dev.package.zebra-gui]
 opt-level = 3
 
 [profile.dev.package.orchard]

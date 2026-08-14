@@ -1224,7 +1224,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                     })
                     .with_title({
                         let title = WINDOW_TITLE.lock().unwrap();
-                        if title.is_empty() { "Zcash Visualizer".to_string() } else { title.clone() }
+                        if title.is_empty() { "Zcash Crosslink Visualizer".to_string() } else { title.clone() }
                     })
                     .with_inner_size(Size::Physical(winit::dpi::PhysicalSize { width: 1600, height: 900 }))
                     .with_window_icon(window_icon());

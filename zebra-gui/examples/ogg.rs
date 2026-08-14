@@ -1,7 +1,7 @@
 // Ogg decode test through the real play_sound path: build with --features audio.
 // Expect: UI woosh, same woosh again (cached), then a staking voice line.
 
-use visualizer_zcash as viz;
+use zebra_gui as viz;
 
 fn sleep_ms(ms: u64) { std::thread::sleep(std::time::Duration::from_millis(ms)); }
 

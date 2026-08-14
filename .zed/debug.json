@@ -24,7 +24,7 @@
       "args": ["build"],
       "cwd": "$ZED_WORKTREE_ROOT/zebra-gui/"
     },
-    "program": "$ZED_WORKTREE_ROOT/zebra-gui/target/debug/visualizer_zcash",
+    "program": "$ZED_WORKTREE_ROOT/zebra-gui/target/debug/zebra-gui",
     "args": [],
     // sourceLanguages is required for CodeLLDB (not GDB) when using Rust
     "sourceLanguages": ["rust"],

@@ -7,8 +7,8 @@
 //   - Leave it running: the beep cadence must stay metronomic.
 // Press Enter (or Ctrl+C) to quit.
 
-use visualizer_zcash as viz;
-use visualizer_zcash::audio;
+use zebra_gui as viz;
+use zebra_gui::audio;
 
 fn sleep_ms(ms: u64) { std::thread::sleep(std::time::Duration::from_millis(ms)); }
 
