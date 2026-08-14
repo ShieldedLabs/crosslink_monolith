@@ -22,6 +22,11 @@ lewton = { version = "0.10.2", optional = true, default-features = false }
 [build-dependencies]
 png = "0.17"
 
+# Host-gated rather than target-gated: cross-building a Windows binary from another OS
+# would need this unconditionally, which no build here does.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 [features]
 # Off by default so headless builds skip all of this
 audio = ["dep:lewton"]

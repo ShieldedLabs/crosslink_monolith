@@ -1,9 +1,15 @@
-//! Decodes the window icon to raw RGBA at build time, so the crate itself carries no PNG decoder.
+//! Decodes the window icon to raw RGBA at build time, so the crate itself carries no PNG decoder,
+//! and embeds the Win32 icon resource that Explorer and the taskbar read off the .exe.
 
 use std::{env, fs, path::PathBuf};
 
 fn main() {
-    let src = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("assets/favicon.png");
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
+    #[cfg(windows)]
+    embed_icon_resource(&manifest_dir.parent().unwrap().join("packaging/icons/zebra-crosslink.ico"));
+
+    let src = manifest_dir.join("assets/favicon.png");
     println!("cargo:rerun-if-changed={}", src.display());
 
     let mut decoder = png::Decoder::new(fs::File::open(&src).unwrap());
@@ -31,4 +37,20 @@ fn main() {
         ),
     )
     .unwrap();
+}
+
+// The icon set on the window at runtime only skins the live window; Explorer, pinned
+// shortcuts and the taskbar read RT_GROUP_ICON out of the binary itself. Compiling the
+// resource needs rc.exe from the Windows SDK, so a missing one warns instead of failing.
+#[cfg(windows)]
+fn embed_icon_resource(ico: &std::path::Path) {
+    println!("cargo:rerun-if-changed={}", ico.display());
+
+    let rc = PathBuf::from(env::var("OUT_DIR").unwrap()).join("app_icon.rc");
+    let ico = ico.display().to_string().replace('\\', "/");
+    fs::write(&rc, format!("1 ICON \"{}\"\n", ico)).unwrap();
+
+    if let Err(err) = embed_resource::compile(&rc, embed_resource::NONE).manifest_optional() {
+        println!("cargo:warning=application icon not embedded: {err}");
+    }
 }
