@@ -19,6 +19,9 @@ chrono = "0.4.44"
 # Vorbis decode at the packet level; the ogg demuxer is ours.
 lewton = { version = "0.10.2", optional = true, default-features = false }
 
+[build-dependencies]
+png = "0.17"
+
 [features]
 # Off by default so headless builds skip all of this
 audio = ["dep:lewton"]

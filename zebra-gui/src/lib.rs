@@ -995,6 +995,12 @@ pub static FONT_PIXEL_TINY5: &[u8] = include_bytes!("../assets/Tiny5-Regular.ttf
 pub static FONT_PIXEL_GOHU_11: &[u8] = include_bytes!("../assets/gohufont-uni-11.ttf");
 pub static FONT_PIXEL_GOHU_14: &[u8] = include_bytes!("../assets/gohufont-uni-14.ttf");
 
+include!(concat!(env!("OUT_DIR"), "/window_icon.rs")); // Written by build.rs from assets/favicon.png
+
+fn window_icon() -> Option<winit::window::Icon> {
+    winit::window::Icon::from_rgba(WINDOW_ICON_RGBA.to_vec(), WINDOW_ICON_W, WINDOW_ICON_H).ok()
+}
+
 const GLOBAL_AUDIO_SCALE_FACTOR: f32 = 0.316; // 0.316 ~= perceptually "half volume"
 
 #[cfg(not(feature = "audio"))]
@@ -1211,8 +1217,7 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
 
         match event {
             winit::event::Event::Resumed => { // Runs at startup and is where we have to do init.
-                let twindow = Rc::new(elwt.create_window(
-                    winit::window::WindowAttributes::default()
+                let window_attributes = winit::window::WindowAttributes::default()
                     .with_maximized({
                         #[cfg(target_os = "windows")]      if DEV_WIN32_WINDOW_ARRANGEMENT { false } else { true }
                         #[cfg(not(target_os = "windows"))] true
@@ -1222,7 +1227,16 @@ pub fn main_thread_run_program(wallet_state: Arc<Mutex<wallet::WalletState>>, fa
                         if title.is_empty() { "Zcash Visualizer".to_string() } else { title.clone() }
                     })
                     .with_inner_size(Size::Physical(winit::dpi::PhysicalSize { width: 1600, height: 900 }))
-                ).unwrap());
+                    .with_window_icon(window_icon());
+
+                // On Windows the title-bar icon and the taskbar icon are separate slots
+                #[cfg(target_os = "windows")]
+                let window_attributes = {
+                    use winit::platform::windows::WindowAttributesExtWindows;
+                    window_attributes.with_taskbar_icon(window_icon())
+                };
+
+                let twindow = Rc::new(elwt.create_window(window_attributes).unwrap());
                 let context = softbuffer::Context::new(twindow.clone()).unwrap();
                 let surface = softbuffer::Surface::new(&context, twindow.clone()).unwrap();
 
