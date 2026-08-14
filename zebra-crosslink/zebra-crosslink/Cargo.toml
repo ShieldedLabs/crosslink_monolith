@@ -61,13 +61,7 @@ static_assertions = { workspace = true }
 # snow = { version = "0.10.0", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
 
 
-macroquad = { version = "0.4.14", optional = true, default-features = false }
-macroquad-profiler = { version = "0.2.0", optional = true }
-# macroquad transitive dependencies:
-image = { version = "0.24", default-features = false, features = ["png", "tga"], optional = true }
-miniquad = { version = "0.4.8", optional = true }
 hex = { version = "0.4.3", features = ["serde"] }
-lazy_static = "1.5.0"
 
 tenderlink = { workspace = true }
 visualizer_zcash = { workspace = true, optional = true }
@@ -77,8 +71,7 @@ zebra-test = { path = "../zebra-test", version = "1.0.0-beta.45" }
 
 [features]
 default = []
-viz_gui = ["macroquad", "macroquad-profiler", "image", "miniquad", "visualizer_zcash", "visualizer_zcash/audio"]
-audio = []
+viz_gui = ["visualizer_zcash", "visualizer_zcash/audio"]
 
 [build-dependencies]
 prost-build = "0.13"

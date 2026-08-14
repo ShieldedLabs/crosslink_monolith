@@ -3,9 +3,6 @@
 #![allow(clippy::print_stdout)]
 #![allow(unexpected_cfgs, unused, missing_docs)]
 
-#[macro_use]
-extern crate lazy_static;
-
 use color_eyre::install;
 
 use async_trait::async_trait;
@@ -163,8 +160,6 @@ pub mod config {
 }
 
 pub mod test_format;
-#[cfg(feature = "viz_gui")]
-pub mod viz;
 
 #[cfg(feature = "viz_gui")]
 pub mod viz2;
@@ -582,13 +577,6 @@ async fn push_new_bft_msg_flags(
 async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock> {
     if BFT_PAUSE.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
-    }
-
-    #[cfg(feature = "viz_gui")]
-    if let Some(state) = viz::VIZ_G.lock().unwrap().as_ref() {
-        if state.bft_pause_button {
-            return None;
-        }
     }
 
     let call = tfl_handle.call.clone();

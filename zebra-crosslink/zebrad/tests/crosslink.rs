@@ -80,14 +80,27 @@ pub fn test_start() {
 
     #[cfg(feature = "viz_gui")]
     {
-        // TODO: gate behind feature-flag
-        // TODO: only open the visualization window for the `start` command.
-        // i.e.: can we move it to that code without major refactor to make compiler happy?
+        // Mirrors the GUI path in `zebrad::application::boot`: the visualization owns the
+        // main thread, so zebrad and the wallet each get one of their own.
+        let wallet_state = Arc::new(std::sync::Mutex::new(zebra_crosslink::wallet::WalletState::new()));
+        let wallet_state2 = wallet_state.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_time()
+                .enable_io()
+                .build()
+                .unwrap();
+
+            rt.block_on(zebra_crosslink::wallet::wallet_main(wallet_state2));
+        });
+
         let tokio_root_thread_handle = std::thread::spawn(move || {
             ZebradApp::run(&APPLICATION, args);
         });
 
-        zebra_crosslink::viz::main(Some(tokio_root_thread_handle));
+        zebra_crosslink::viz2::viz_main(Some(tokio_root_thread_handle), wallet_state);
     }
 
     #[cfg(not(feature = "viz_gui"))]
