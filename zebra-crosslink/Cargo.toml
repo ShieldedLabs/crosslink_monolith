@@ -275,9 +275,13 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 ] }
 
 # core2 has been yanked from crates.io
+#
+# Pinned by commit (rather than by the mutable `v0.3.3` tag) because `cargo`'s
+# vendored-source replacement (used by the `nix` build, see `../flake/toolchain.nix`)
+# cannot resolve tag-based git patches against a vendor directory.
 [patch.crates-io.core2]
 git = "https://github.com/technocreatives/core2.git"
-tag = "v0.3.3"
+rev = "7bf2611bd9a52b438300c640e142ad5c1298b05b"
 
 # Widen libsqlite3-sys requirement to be compatible with rusqlite 0.37
 [patch.crates-io.sqlx-sqlite]
