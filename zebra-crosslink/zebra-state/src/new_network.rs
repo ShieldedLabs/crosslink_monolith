@@ -1254,6 +1254,12 @@ static BLOCK_SUBMISSION_SENDER: std::sync::OnceLock<tokio::sync::mpsc::Sender<Bl
 /// the state if that matters.
 pub static PEER_ATTESTED_BLOCKS: std::sync::Mutex<Vec<ShadowBlock>> = std::sync::Mutex::new(Vec::new());
 
+/// How many STP peers this node is currently connected to. Written by the sync loop
+/// whenever the connection set is refreshed; readers (e.g. the visualizer) load it at
+/// any time. This is the PoW peer count: on the crosslink networks the legacy
+/// zebra-network syncer is not spawned, so these are the only block-carrying peers.
+pub static POW_PEER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Submit a block to new_network and wait for its verdict.
 ///
 /// Applies backpressure rather than dropping: nothing re-submits a miner's solved block, so a
@@ -2348,6 +2354,7 @@ pub fn sync(
             send_unreliable: packets_to_send,
         });
         current_connections = resp.current_connections;
+        POW_PEER_COUNT.store(current_connections.len(), std::sync::atomic::Ordering::Relaxed);
         let mut packets_received = resp.received_unreliable_messages;
         initiate_connections = Vec::new();
         packets_to_send = Vec::new();

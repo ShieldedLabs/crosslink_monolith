@@ -4149,7 +4149,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                         let state = wallet_state.lock().unwrap();
                         (state.wallets_sync_h, state.wallets_tip_h)
                     };
-                    let peer_count = viz.peer_strings.len();
+                    let pos_peer_count = viz.peer_strings.len();
+                    let pow_peer_count = viz.pow_peer_count;
                     let behind = wallets_tip_h.saturating_sub(wallets_sync_h);
                     let sync_pct = if wallets_tip_h > 0 {
                         100.0 * (wallets_sync_h as f64 / wallets_tip_h as f64)
@@ -4307,7 +4308,8 @@ pub fn run_ui(ui: &mut Context, wallet_state: Arc<Mutex<WalletState>>, data: &mu
                                 row(ui, data, "PoS Height", &format!("{}", viz.bft_tip_height));
                                 row(ui, data, "PoW Height", &format!("{}", viz.bc_tip_height));
                                 row(ui, data, "PoW Finalized", &format!("{}", viz.bc_finalized_tip_height));
-                                row(ui, data, "BFT Peers", &format!("{}", peer_count));
+                                row(ui, data, "BFT Peers", &format!("{}", pos_peer_count));
+                                row(ui, data, "PoW Peers", &format!("{}", pow_peer_count));
                             }
 
                             if let _ = elem().decl(group_decl) {

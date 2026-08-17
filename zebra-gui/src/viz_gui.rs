@@ -162,6 +162,10 @@ pub struct ResponseFromZebra {
 
     pub peer_strings: Vec<String>,
 
+    /// Peers this node is connected to on NewNet. The BFT peer count is
+    /// `peer_strings.len()`.
+    pub pow_peer_count: usize,
+
     /// One display line per mempool transaction: truncated txid plus any staking action.
     pub mempool_tx_strings: Vec<String>,
     /// One display line per instruction in the last-loaded test-format file.
@@ -196,6 +200,7 @@ impl ResponseFromZebra {
             staking_bonded_pool_balance: 0,
             staking_unbonded_pool_balance: 0,
             peer_strings: Vec::new(),
+            pow_peer_count: 0,
             mempool_tx_strings: Vec::new(),
             instr_strings: Vec::new(),
             instr_done_n: 0,
@@ -446,6 +451,7 @@ pub struct VizState {
     pub staking_unbonded_pool_balance: i64,
 
     pub peer_strings: Vec<String>,
+    pub pow_peer_count: usize,
     pub mempool_tx_strings: Vec<String>,
     pub pos_tip_signers: Vec<Hash32>,
 }
@@ -700,6 +706,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         staking_bonded_pool_balance: 0,
         staking_unbonded_pool_balance: 0,
         peer_strings: Vec::new(),
+        pow_peer_count: 0,
         mempool_tx_strings: Vec::new(),
         pos_tip_signers: Vec::new(),
     };
@@ -810,6 +817,9 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         viz_state.bc_finalized_tip_height = message.bc_finalized_tip_height;
 
         viz_state.peer_strings = message.peer_strings;
+
+        anything_happened |= viz_state.pow_peer_count != message.pow_peer_count;
+        viz_state.pow_peer_count = message.pow_peer_count;
 
         anything_happened |= viz_state.mempool_tx_strings != message.mempool_tx_strings;
         viz_state.mempool_tx_strings = message.mempool_tx_strings;

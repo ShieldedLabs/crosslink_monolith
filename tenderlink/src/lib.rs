@@ -169,9 +169,9 @@ impl std::fmt::Debug for ClosureToUpdatePeers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToUpdatePeers(..)") }
 }
 #[derive(Clone)]
-pub struct ClosureToAllowBftAccess(pub Arc<dyn for<'a> Fn(&'a TMState, &'a BftAddressMap) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send + Sync + 'static>);
-impl std::fmt::Debug for ClosureToAllowBftAccess {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToAllowBftAccess(..)") }
+pub struct ClosureToAccessBft(pub Arc<dyn for<'a> Fn(&'a TMState, &'a BftAddressMap) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send + Sync + 'static>);
+impl std::fmt::Debug for ClosureToAccessBft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("ClosureToAccessBft(..)") }
 }
 
 fn round_data_to_fat_pointer(round_data: &RoundData, roster: &[SortedRosterMember]) -> FatPointerToBftBlock {
@@ -481,7 +481,7 @@ pub struct TMState {
     push_block_closure: ClosureToPushDecidedBlock,
 
     update_peers_cmd_closure: ClosureToUpdatePeers,
-    bft_access_closure: ClosureToAllowBftAccess,
+    bft_access_closure: ClosureToAccessBft,
 }
 impl TMState {
     fn init(
@@ -490,7 +490,7 @@ impl TMState {
         validate_closure: ClosureToValidateProposedBlock,
         push_block_closure: ClosureToPushDecidedBlock,
         update_peers_cmd_closure: ClosureToUpdatePeers,
-        bft_access_closure: ClosureToAllowBftAccess,
+        bft_access_closure: ClosureToAccessBft,
     ) -> Self {
         Self {
             hash_keys: HashKeys::default(),
@@ -1397,7 +1397,7 @@ async fn instance(
         ClosureToUpdatePeers(Arc::new(move |_all_peers| { Box::pin(async move {
         })})),
 
-        ClosureToAllowBftAccess(Arc::new(move |_bft_state, _key_addr_map| { Box::pin(async move {
+        ClosureToAccessBft(Arc::new(move |_bft_state, _key_addr_map| { Box::pin(async move {
         })})),
 
         Vec::new(),
@@ -1475,7 +1475,7 @@ pub async fn entry_point(my_root_private_key: SigningKey,
                          validate_closure: ClosureToValidateProposedBlock,
                          push_block_closure: ClosureToPushDecidedBlock,
                          peer_cmd_closure: ClosureToUpdatePeers,
-                         bft_access_closure: ClosureToAllowBftAccess,
+                         bft_access_closure: ClosureToAccessBft,
                          ingest_startup_data: Vec<RoundData>,
                          // Vote-namespacing domain separator for the startup height
                          // (`ingest_startup_data.len()`); `[0; 32]` when no hardforks are in effect.
@@ -2248,17 +2248,17 @@ pub async fn entry_point(my_root_private_key: SigningKey,
 
                     let now: u64 = chrono::Utc::now().timestamp().try_into().expect("should fit in a u64");
                     if peer_attestation.expiry + 60 <= now {
-                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent peer attestation that will expire too soon (<60s)"); }
+                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent peer attestation that will expire too soon (<60s). Current time is {now}, expiry is {}.", peer_attestation.expiry); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     }
                     if peer_attestation.issued >= peer_attestation.expiry {
-                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Issued after expired"); }
+                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Issued after expired. Issued at {}, expiry is {}.", peer_attestation.issued, peer_attestation.expiry); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     }
                     if peer_attestation.issued + 60 > peer_attestation.expiry {
-                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Expires less than 60 seconds after issued"); }
+                        if PRINT_PROTOCOL { println!("{ctx_str} {ANSI_RED}PROTOCOL{ANSI_RST}: Peer sent invalid peer attestation: Expires less than 60 seconds after issued. Issued at {}, expiry is {}.", peer_attestation.issued, peer_attestation.expiry); }
                         connection_keys_to_disconnect.push(connection_key);
                         continue;
                     }

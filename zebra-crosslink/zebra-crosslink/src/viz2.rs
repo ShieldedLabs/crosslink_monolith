@@ -375,6 +375,8 @@ pub async fn service_viz_requests(
                     };
                     response.bft_tip_height = (internal.bft_blocks.len() as u64).saturating_sub(1);
                     response.peer_strings = internal.peer_strings.clone();
+                    response.pow_peer_count = zebra_state::new_network::POW_PEER_COUNT
+                        .load(std::sync::atomic::Ordering::Relaxed);
                     response.mempool_tx_strings = mempool_tx_strings.clone();
                     response.pos_tip_signers = internal.fat_pointer_to_tip.signatures.iter()
                         .map(|sig| Hash32::from_bytes(sig.pub_key.0))

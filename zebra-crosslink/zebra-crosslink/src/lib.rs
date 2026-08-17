@@ -1472,7 +1472,7 @@ async fn tfl_service_main_loop(internal_handle: TFLServiceHandle, global_seed: [
                     }
                 })
             })),
-            tenderlink::ClosureToAllowBftAccess(Arc::new(move |bft_state: &tenderlink::TMState, bft_key_address_map: &tenderlink::BftAddressMap| {
+            tenderlink::ClosureToAccessBft(Arc::new(move |bft_state: &tenderlink::TMState, bft_key_address_map: &tenderlink::BftAddressMap| {
                 let tfl_handle = tfl_handle9.clone();
                 Box::pin(async move {
                     let now_utc = chrono::Utc::now().timestamp();
