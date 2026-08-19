@@ -399,7 +399,7 @@ pub fn get_tfl_recency_status_str() -> Option<String> {
     closure.0()
 }
 
-async fn wait_for_zainod() {
+async fn wait_for_lightwalletd() {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
     for _ in 0..10 {
         let client = reqwest::Client::builder()
@@ -417,7 +417,7 @@ async fn wait_for_zainod() {
 
         if let Ok(res) = request_builder.send().await {
             if res.status().is_success() {
-                println!("ZAINO IS READY: {}", res.text().await.unwrap());
+                println!("LIGHTWALLET_SERVER IS READY: {}", res.text().await.unwrap());
                 return;
             }
         }
@@ -1095,7 +1095,7 @@ impl<'a> Default for TxOptions<'a> {
     }
 }
 
-pub static wallet_main_zaino_port : Mutex<u16> = Mutex::new(0);
+pub static wallet_main_lightwalletd_port : Mutex<u16> = Mutex::new(0);
 
 pub enum TxPool<'a> {
     Transparent,
@@ -1384,7 +1384,7 @@ pub struct ManualWallet {
 
     // TODO: tiered tx definitiveness:
     // - local-only
-    // - sent to lightwalletd
+    // - sent to lightwallet_server
     // - seen in mempool
     // - any best-chain block
     // - best-chain block confirmed by N
@@ -3309,22 +3309,22 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
     }
 
 
-    println!("waiting for zaino to be ready...");
-    wait_for_zainod().await;
+    println!("waiting for lightwallet_server to be ready...");
+    wait_for_lightwalletd().await;
     //////////////////////////////////////////////////////////////////////////////////
 
     // TODO: use tenderlink types & printing routines
-    let mut zaino_port = 0;
+    let mut lightwalletd_port = 0;
     loop {
-        zaino_port = *wallet_main_zaino_port.lock().unwrap();
-        if zaino_port != 0 { break; }
+        lightwalletd_port = *wallet_main_lightwalletd_port.lock().unwrap();
+        if lightwalletd_port != 0 { break; }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 
     // @todo(judah): investigate why requests get randomly dropped in a strange way:
     // transport error, service not ready, etc.
     let mut client = loop {
-        if let Ok(channel) = Channel::from_shared(format!("http://localhost:{}", zaino_port)).unwrap().connect().await {
+        if let Ok(channel) = Channel::from_shared(format!("http://localhost:{}", lightwalletd_port)).unwrap().connect().await {
             break CompactTxStreamerClient::new(channel);
         }
 
@@ -3801,7 +3801,7 @@ pub async fn wallet_main(wallet_state: Arc<Mutex<WalletState>>) {
                     // TODO IMPORTANT: the indexer can "succeed" without actually giving us all the txs
                     // in the range we requested...
                     // So we keep re-requesting the info in a trailing window...
-                    // LRZ/Zaino/Zebra *should* return an error when iterating through the t_txs
+                    // LRZ/lightwallet_server/Zebra *should* return an error when iterating through the t_txs
                     // they also *shouldn't* return out-of-range responses
                     // ********************************************************************************
                     let strm_sync_h = wallets[wallet_i].strms[strm_i].sync_h;

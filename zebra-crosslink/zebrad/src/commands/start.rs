@@ -652,8 +652,8 @@ impl StartCmd {
         pin!(old_databases_task_handle_fused);
 
         // Lightwalletd gRPC server, served straight from the read state
-        // service and mempool. Takes over the port zaino used to serve; the
-        // wallet connects to it unchanged.
+        // service and mempool. This is lightwallet_server; it takes over the
+        // legacy port, and the wallet connects to it unchanged.
         {
             let zebra_port_base = config.network.listen_addr.port();
             let lwd_port = zebra_port_base + 10001;
@@ -667,7 +667,7 @@ impl StartCmd {
                 network: config.network.network.clone(),
             };
             crate::lightwalletd::lightwalletd_spawn(lwd_ctx, lwd_port, zebra_port_base + 10000);
-            *zebra_crosslink::wallet::wallet_main_zaino_port.lock().unwrap() = lwd_port;
+            *zebra_crosslink::wallet::wallet_main_lightwalletd_port.lock().unwrap() = lwd_port;
         }
 
         // Wait for tasks to finish

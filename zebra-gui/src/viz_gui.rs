@@ -418,7 +418,7 @@ pub struct VizState {
     pub send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
     pub receive_from_zebra: std::sync::mpsc::Receiver<ResponseFromZebra>,
 
-    // TODO: move to zaino
+    // TODO: move to lightwallet_server
     pub bft_recency_status: wallet::TFLRecencyStatus,
     /// 32-byte ids of terminated finalizers (the rolling blacklist), used by the
     /// right-hand pane to move them to the bottom with a cancel (X) icon.

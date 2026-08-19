@@ -131,7 +131,7 @@ pub mod config {
         pub bft_peers: Vec<String>,
         /// Disable the headless wallet.
         pub disable_the_headless_wallet: bool,
-        /// Disable zaino.
+        /// Disable lightwallet_server.
         pub disable_zaino: bool,
         /// User-led hardfork rules, as supplied in the config file. These are
         /// merged with [`shipped_hardforks`] and validated by building a

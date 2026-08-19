@@ -239,11 +239,11 @@ struct Conn {
 
 /// Spawn the server thread. Binds the wildcard address on `port`, dual-stack
 /// IPv6 + IPv4 (h2c plaintext). Also answers any HTTP/1.1 POST on `ready_port`
-/// (zaino's old JSON-RPC port) with a 200, which is what the wallet's
-/// `wait_for_zainod()` readiness probe needs.
+/// (lightwallet_server's legacy JSON-RPC port) with a 200, which is what the wallet's
+/// `wait_for_lightwalletd()` readiness probe needs.
 pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name("lightwalletd-grpc".into())
+        .name("lightwallet_server-grpc".into())
         .spawn(move || {
             // serve
             //
@@ -255,12 +255,12 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
             for addr in [format!("[::]:{port}"), format!("0.0.0.0:{port}")] {
                 if let Ok(l) = TcpListener::bind(&*addr) {
                     l.set_nonblocking(true).expect("nonblocking listener");
-                    tracing::info!("lightwalletd gRPC serving on {addr}");
+                    tracing::info!("lightwallet_server gRPC serving on {addr}");
                     listeners.push(l);
                 }
             }
             if listeners.is_empty() {
-                tracing::error!("lightwalletd: cannot bind port {port} on any stack");
+                tracing::error!("lightwallet_server: cannot bind port {port} on any stack");
                 return;
             }
 
@@ -419,7 +419,7 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                             }
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(e) => {
-                                tracing::warn!("lightwalletd: accept error: {e}");
+                                tracing::warn!("lightwallet_server: accept error: {e}");
                                 break;
                             }
                         }
@@ -1771,7 +1771,7 @@ pub fn lightwalletd_spawn(ctx: Ctx, port: u16, ready_port: u16) -> std::thread::
                 }
             }
         })
-        .expect("can spawn lightwalletd thread")
+        .expect("can spawn lightwallet_server thread")
 }
 
 // -------------------------------------------------------------------------

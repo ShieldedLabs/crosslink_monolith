@@ -193,7 +193,7 @@ impl WriteBlockWorkerTask {
         self.prev_finalized_note_commitment_trees = Some(trees);
 
         // @Volatile: publishing the tip is not optional. Everything downstream of
-        // `latest_chain_tip` -- the sync progress task, the mempool, Zaino -- reads this watch
+        // `latest_chain_tip` -- the sync progress task, the mempool, lightwallet_server -- reads this watch
         // channel, not the database. Committing without publishing leaves them seeing an empty
         // chain forever. The old finalized write loop did this immediately after committing.
         log_if_mined_by_zebra(&tip_block, &mut self.last_zebra_mined_log_height);
