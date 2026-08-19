@@ -1381,7 +1381,7 @@ dependencies = [
 [[package]]
 name = "core2"
 version = "0.3.3"
-source = "git+https://github.com/technocreatives/core2.git?tag=v0.3.3#7bf2611bd9a52b438300c640e142ad5c1298b05b"
+source = "git+https://github.com/technocreatives/core2.git?rev=7bf2611bd9a52b438300c640e142ad5c1298b05b#7bf2611bd9a52b438300c640e142ad5c1298b05b"
 dependencies = [
  "memchr",
 ]
