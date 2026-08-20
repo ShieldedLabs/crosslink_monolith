@@ -1,14 +1,27 @@
+# Rust build artifacts.
 */target
+
+# Visual Studio developer files.
 .vs
-.claude
 *.user
 */x64/Release
 */*/x64/Release
+
+# JetBrains developer files.
 *.idea
 *.scratch
+
+# AI agents.
+.claude
+
+# Mac artifacts.
 *.DS_Store
-*.local.toml
+
+# Developer tooling artifacts for fonts.
 zebra-gui/icon-font/fontello-*/
+
+# Developer testing configs and database directories.
+*.local.toml
 ignored_dir/**
 BB_*
 NN_*
@@ -17,7 +30,10 @@ ZZ*
 zebra-crosslink/testnet_online*
 zebra-crosslink/profile.json.gz
 zebra.rad
+
+# Deploylink feature net scripts for connecting to servers.
 servers/*
-# `nix build` result symlinks
+
+# `nix build` result symlinks.
 /result
 /result-*
