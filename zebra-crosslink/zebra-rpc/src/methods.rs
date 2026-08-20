@@ -3414,24 +3414,8 @@ where
             "selecting transactions for the template from the mempool"
         );
 
-        // Randomly select some mempool transactions.
-        let mempool_txs = select_mempool_transactions(
-            &network,
-            next_block_height,
-            &miner_address,
-            mempool_txs,
-            mempool_tx_deps,
-            extra_coinbase_data.clone(),
-        );
-
-        tracing::debug!(
-            selected_mempool_tx_hashes = ?mempool_txs
-                .iter()
-                .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id.mined_id())
-                .collect::<Vec<_>>(),
-            "selected transactions for the template from the mempool"
-        );
-
+        // Fetched before selection because the fat pointer occupies header bytes that the
+        // transactions cannot use.
         let fat_pointer = {
             let ret = self.tfl_service.clone().ready().await.unwrap()
                 .call(TFLServiceRequest::FatPointerToBFTChainTip(next_block_height.0 as u64))
@@ -3441,6 +3425,25 @@ where
                 _ => zcash_primitives::bft::FatPointerToBftBlock::null(),
             }
         };
+
+        // Randomly select some mempool transactions.
+        let mempool_txs = select_mempool_transactions(
+            &network,
+            next_block_height,
+            &miner_address,
+            mempool_txs,
+            mempool_tx_deps,
+            extra_coinbase_data.clone(),
+            &fat_pointer,
+        );
+
+        tracing::debug!(
+            selected_mempool_tx_hashes = ?mempool_txs
+                .iter()
+                .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id.mined_id())
+                .collect::<Vec<_>>(),
+            "selected transactions for the template from the mempool"
+        );
 
         // - After this point, the template only depends on the previously fetched data.
 
@@ -3463,6 +3466,18 @@ where
         HexData(block_bytes): HexData,
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
+        // The block deserializer reads at most `MAX_BLOCK_BYTES` and reports anything longer
+        // as a truncated block. Checking the length first names the real problem.
+        if block_bytes.len() > zebra_chain::block::MAX_BLOCK_BYTES as usize {
+            tracing::warn!(
+                block_bytes = block_bytes.len(),
+                max_block_bytes = zebra_chain::block::MAX_BLOCK_BYTES,
+                "submit block failed: serialized block is over the block size limit"
+            );
+
+            return Ok(SubmitBlockErrorResponse::Rejected.into());
+        }
+
         let block: Block = match block_bytes.zcash_deserialize_into() {
             Ok(block_bytes) => block_bytes,
             Err(error) => {

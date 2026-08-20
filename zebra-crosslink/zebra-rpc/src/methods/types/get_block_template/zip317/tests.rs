@@ -3,10 +3,39 @@
 use zcash_keys::address::Address;
 
 use zcash_transparent::address::TransparentAddress;
-use zebra_chain::{block::Height, parameters::Network, transaction, transparent::OutPoint};
+use zebra_chain::{
+    block::{FatPointerSignature, FatPointerToBftBlock, Height, PubKeyID},
+    parameters::Network,
+    transaction,
+    transparent::OutPoint,
+};
 use zebra_node_services::mempool::TransactionDependencies;
 
-use super::select_mempool_transactions;
+use super::{non_transaction_block_bytes, select_mempool_transactions};
+
+/// The bytes reserved for the header and transaction count must cover what
+/// `Block::zcash_serialize` writes around the transactions, otherwise a full template
+/// produces a block that no node can deserialize.
+#[test]
+fn reserves_header_and_transaction_count_bytes() {
+    // 140 bytes of fixed-size header fields, a 1344-byte solution behind its 3-byte
+    // length, an empty fat pointer, and the transaction count.
+    let empty = non_transaction_block_bytes(&FatPointerToBftBlock::null());
+    assert_eq!(empty, 140 + 3 + 1344 + 44 + 2 + 3);
+
+    // Each signature adds a 32-byte key and a 64-byte signature.
+    let signed = FatPointerToBftBlock {
+        vote_for_block_without_finalizer_public_key: [0; 44],
+        signatures: vec![
+            FatPointerSignature {
+                pub_key: PubKeyID([0; 32]),
+                vote_signature: [0; 64],
+            };
+            12
+        ],
+    };
+    assert_eq!(non_transaction_block_bytes(&signed), empty + 12 * 96);
+}
 
 #[test]
 fn excludes_tx_with_unselected_dependencies() {
@@ -34,6 +63,7 @@ fn excludes_tx_with_unselected_dependencies() {
             vec![unmined_tx],
             mempool_tx_deps,
             extra_coinbase_data,
+            &FatPointerToBftBlock::null(),
         ),
         vec![],
         "should not select any transactions when dependencies are unavailable"
@@ -78,6 +108,7 @@ fn includes_tx_with_selected_dependencies() {
         unmined_txs.clone(),
         mempool_tx_deps.clone(),
         extra_coinbase_data,
+        &FatPointerToBftBlock::null(),
     );
 
     assert_eq!(

@@ -13,13 +13,17 @@ use rand::{
     prelude::thread_rng,
 };
 
+use chrono::{TimeZone, Utc};
+
 use zcash_keys::address::Address;
 
 use zebra_chain::{
     amount::NegativeOrZero,
-    block::{Height, MAX_BLOCK_BYTES},
+    block::{self, merkle, FatPointerToBftBlock, Height, MAX_BLOCK_BYTES, ZCASH_BLOCK_VERSION},
     parameters::Network,
+    serialization::ZcashSerialize,
     transaction::{self, zip317::BLOCK_UNPAID_ACTION_LIMIT, Transaction, VerifiedUnminedTx},
+    work::{difficulty::CompactDifficulty, equihash::Solution},
 };
 use zebra_consensus::MAX_BLOCK_SIGOPS;
 use zebra_node_services::mempool::TransactionDependencies;
@@ -49,6 +53,9 @@ type SelectedMempoolTx = VerifiedUnminedTx;
 /// as the real coinbase transaction. (The real coinbase transaction depends on the total
 /// fees from the transactions returned by this function.)
 ///
+/// `fat_pointer` is the fat pointer the template will carry in its header. Its serialized
+/// size varies with the size of the finalizer roster, so it is measured rather than assumed.
+///
 /// Returns selected transactions from `mempool_txs`.
 ///
 /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
@@ -59,6 +66,7 @@ pub fn select_mempool_transactions(
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
     extra_coinbase_data: Vec<u8>,
+    fat_pointer: &FatPointerToBftBlock,
 ) -> Vec<SelectedMempoolTx> {
     // Use a fake coinbase transaction to break the dependency between transaction
     // selection, the miner fee, and the fee payment in the coinbase transaction.
@@ -88,8 +96,11 @@ pub fn select_mempool_transactions(
     let mut remaining_block_sigops = MAX_BLOCK_SIGOPS;
     let mut remaining_block_unpaid_actions: u32 = BLOCK_UNPAID_ACTION_LIMIT;
 
-    // Adjust the limits based on the coinbase transaction
-    remaining_block_bytes -= fake_coinbase_tx.data.as_ref().len();
+    // Adjust the limits based on the coinbase transaction, and on the header and
+    // transaction count that surround the transactions in the serialized block.
+    remaining_block_bytes = remaining_block_bytes
+        .saturating_sub(fake_coinbase_tx.data.as_ref().len())
+        .saturating_sub(non_transaction_block_bytes(fat_pointer));
     remaining_block_sigops -= fake_coinbase_tx.sigops;
 
     // > Repeat while there is any candidate transaction
@@ -128,6 +139,41 @@ pub fn select_mempool_transactions(
     }
 
     selected_txs
+}
+
+/// Returns the number of bytes a block uses outside its transaction data: the block header,
+/// which on Crosslink also carries the fat pointer to the BFT chain, and the transaction count.
+///
+/// Transaction selection must leave this much of [`MAX_BLOCK_BYTES`] free. A block over that
+/// limit cannot be deserialized by any node, including the one that produced it, so it can be
+/// neither submitted nor gossiped.
+fn non_transaction_block_bytes(fat_pointer: &FatPointerToBftBlock) -> usize {
+    // The header `proposal_block_from_template` builds from this template. Every field except
+    // the solution and the fat pointer has a fixed size, and `Solution::for_proposal` is at
+    // least as large as any solution a miner can find.
+    let header = block::Header {
+        version: ZCASH_BLOCK_VERSION + 2,
+        previous_block_hash: block::Hash([0; 32]),
+        merkle_root: merkle::Root([0; 32]),
+        commitment_bytes: [0; 32].into(),
+        time: Utc
+            .timestamp_opt(0, 0)
+            .single()
+            .expect("0 is a valid timestamp"),
+        difficulty_threshold: CompactDifficulty(0),
+        nonce: [0; 32].into(),
+        solution: Solution::for_proposal(),
+        fat_pointer_to_bft_block: fat_pointer.clone(),
+    };
+
+    let header_bytes = header
+        .zcash_serialize_to_vec()
+        .expect("header with a valid version serializes")
+        .len();
+
+    // A block within `MAX_BLOCK_BYTES` cannot hold 65536 transactions, so the transaction
+    // count never occupies more than three bytes.
+    header_bytes + 3
 }
 
 /// Returns a fake coinbase transaction that can be used during transaction selection.
