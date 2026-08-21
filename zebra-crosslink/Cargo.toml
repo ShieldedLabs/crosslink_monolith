@@ -249,10 +249,8 @@ codegen-units = 1
 
 [profile.release]
 panic = "abort"
-
-[profile.release-debug]
-inherits = "release"
-debug = true
+debug = "full" # Don't change. We need debug=full for server debugging!
+strip = "none"
 
 # Speed up release builds and sync tests using link-time optimization.
 # Some of Zebra's code is CPU-intensive, and needs extra optimizations for peak performance.
@@ -265,6 +263,9 @@ debug = true
 #     - add "-flto=thin" to all C/C++ code builds
 #     - see https://doc.rust-lang.org/rustc/linker-plugin-lto.html#cc-code-as-a-dependency-in-rust
 lto = "thin"
+
+# [profile.release-debug]
+# inherits = "release"
 
 
 [workspace.lints.rust]
