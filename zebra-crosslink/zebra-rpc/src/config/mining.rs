@@ -7,7 +7,7 @@ pub use zcash_address::ZcashAddress;
 
 /// Mining configuration section.
 #[serde_as]
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Address for receiving miner subsidy and tx fees.
@@ -34,6 +34,34 @@ pub struct Config {
     /// The internal miner is off by default.
     #[serde(default)]
     pub internal_miner: bool,
+
+    /// The number of internal miner solver threads used by Zebra.
+    ///
+    /// These threads are scheduled at low priority. The configured count is clamped to the
+    /// available parallelism reported by the OS, if that can be detected.
+    ///
+    /// Defaults to 1 thread, which is the internal miner's original (and, until sibling-solver
+    /// cancellation landed, only supported) behaviour.
+    #[serde(default = "default_internal_miner_threads")]
+    pub internal_miner_threads: usize,
+}
+
+/// Returns the default value for [`Config::internal_miner_threads`].
+fn default_internal_miner_threads() -> usize {
+    1
+}
+
+// Written by hand, rather than derived, so `internal_miner_threads` defaults to 1 (matching
+// `default_internal_miner_threads()`) instead of a derived `Default`'s 0.
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            miner_address: None,
+            extra_coinbase_data: None,
+            internal_miner: false,
+            internal_miner_threads: default_internal_miner_threads(),
+        }
+    }
 }
 
 impl Config {

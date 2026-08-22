@@ -72,6 +72,7 @@ pub fn spawn_init<
 >(
     network: &Network,
     config: &Config,
+    mining_config: &zebra_rpc::config::mining::Config,
     rpc: RpcImpl<
         Mempool,
         TFLService,
@@ -132,7 +133,7 @@ where
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
     // TODO: spawn an entirely new executor here, so mining is isolated from higher priority tasks.
-    tokio::spawn(init(network.clone(), config.clone(), rpc).in_current_span())
+    tokio::spawn(init(network.clone(), config.clone(), mining_config.clone(), rpc).in_current_span())
 }
 
 /// Initialize the miner based on its config.
@@ -153,6 +154,7 @@ pub async fn init<
 >(
     network: Network,
     _config: Config,
+    mining_config: zebra_rpc::config::mining::Config,
     rpc: RpcImpl<
         Mempool,
         TFLService,
@@ -211,8 +213,10 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
-    // TODO: change this to `config.internal_miner_threads` once mining tasks are cancelled when the best tip changes (#8797)
-    let configured_threads = 1;
+    // Sibling solvers now cancel each other once a template is won (see `won_template`
+    // below), so it's safe to honour `config.internal_miner_threads` instead of the
+    // hardcoded 1 the #8797 TODO called for.
+    let configured_threads = mining_config.internal_miner_threads.clamp(1, 256);
     // If we can't detect the number of cores, use the configured number.
     let available_threads = available_parallelism()
         .map(usize::from)
