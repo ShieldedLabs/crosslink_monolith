@@ -979,6 +979,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
         extra_coinbase_data: None,
         // TODO: Use default field values when optional features are enabled in tests #8183
         internal_miner: true,
+        internal_miner_threads: 1,
     };
 
     // nu5 block height

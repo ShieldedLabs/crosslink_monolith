@@ -2062,6 +2062,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
         miner_address: Some(addr.clone()),
         extra_coinbase_data: None,
         internal_miner: true,
+        internal_miner_threads: 1,
     };
 
     // nu5 block height
@@ -2683,6 +2684,7 @@ async fn rpc_getdifficulty() {
         miner_address: None,
         extra_coinbase_data: None,
         internal_miner: true,
+        internal_miner_threads: 1,
     };
 
     // nu5 block height

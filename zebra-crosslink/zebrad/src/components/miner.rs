@@ -72,6 +72,7 @@ pub fn spawn_init<
 >(
     network: &Network,
     config: &Config,
+    mining_config: &zebra_rpc::config::mining::Config,
     rpc: RpcImpl<
         Mempool,
         TFLService,
@@ -132,7 +133,7 @@ where
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
     // TODO: spawn an entirely new executor here, so mining is isolated from higher priority tasks.
-    tokio::spawn(init(network.clone(), config.clone(), rpc).in_current_span())
+    tokio::spawn(init(network.clone(), config.clone(), mining_config.clone(), rpc).in_current_span())
 }
 
 /// Initialize the miner based on its config.
@@ -153,6 +154,7 @@ pub async fn init<
 >(
     network: Network,
     _config: Config,
+    mining_config: zebra_rpc::config::mining::Config,
     rpc: RpcImpl<
         Mempool,
         TFLService,
@@ -211,8 +213,10 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
-    // TODO: change this to `config.internal_miner_threads` once mining tasks are cancelled when the best tip changes (#8797)
-    let configured_threads = 1;
+    // Sibling solvers now cancel each other once a template is won (see `won_template`
+    // below), so it's safe to honour `config.internal_miner_threads` instead of the
+    // hardcoded 1 the #8797 TODO called for.
+    let configured_threads = mining_config.internal_miner_threads.clamp(1, 256);
     // If we can't detect the number of cores, use the configured number.
     let available_threads = available_parallelism()
         .map(usize::from)
@@ -228,6 +232,13 @@ where
 
     let (template_sender, template_receiver) = watch::channel(None);
     let template_receiver = WatchReceiver::new(template_receiver);
+
+    // Cross-solver won-template marker: set when any solver's block is accepted, so
+    // sibling solvers grinding the SAME template cancel instead of racing it with a
+    // second solution at the same height (self-orphan). Keyed on the template header
+    // (not height) so a post-reorg template at the same height mines normally.
+    let won_template: Arc<std::sync::Mutex<Option<zebra_chain::block::Header>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     // Spawn these tasks, to avoid blocked cooperative futures, and improve shutdown responsiveness.
     // This is particularly important when there are a large number of solver threads.
@@ -247,7 +258,13 @@ where
             .expect("just limited to u8::MAX");
 
         let solver = tokio::task::spawn(
-            run_mining_solver(solver_id, template_receiver.clone(), rpc.clone()).in_current_span(),
+            run_mining_solver(
+                solver_id,
+                template_receiver.clone(),
+                won_template.clone(),
+                rpc.clone(),
+            )
+            .in_current_span(),
         );
         abort_handles.push(solver.abort_handle());
 
@@ -458,6 +475,7 @@ pub async fn run_mining_solver<
 >(
     solver_id: u8,
     mut template_receiver: WatchReceiver<Option<Arc<Block>>>,
+    won_template: Arc<std::sync::Mutex<Option<zebra_chain::block::Header>>>,
     rpc: RpcImpl<
         Mempool,
         TFLService,
@@ -551,28 +569,42 @@ where
         // Set up the cancellation conditions for the miner.
         let mut cancel_receiver = template_receiver.clone();
         let old_header = zebra_chain::block::Header::clone(&template.header);
-        let cancel_fn = move || match cancel_receiver.has_changed() {
-            // Guard against get_block_template() providing an identical header. This could happen
-            // if something irrelevant to the block data changes, the time was within 1 second, or
-            // there is a spurious channel change.
-            Ok(has_changed) => {
-                cancel_receiver.mark_as_seen();
-
-                // We only need to check header equality, because the block data is bound to the
-                // header.
-                if has_changed
-                    && Some(old_header.clone())
-                        != cancel_receiver
-                            .cloned_watch_data()
-                            .map(|b| zebra_chain::block::Header::clone(&b.header))
-                {
-                    Err(SolverCancelled)
-                } else {
-                    Ok(())
-                }
+        // Kept outside the closure: the submit loop below needs the template identity
+        // after `old_header` has moved into `cancel_fn`.
+        let template_header = old_header.clone();
+        let won_for_cancel = won_template.clone();
+        let header_for_cancel = old_header.clone();
+        let cancel_fn = move || {
+            // A sibling solver already won this exact template — stop grinding it;
+            // any further solution at this height would only orphan our own block.
+            if won_for_cancel.lock().expect("won-template lock poisoned").as_ref()
+                == Some(&header_for_cancel)
+            {
+                return Err(SolverCancelled);
             }
-            // If the sender was dropped, we're likely shutting down, so cancel the solver.
-            Err(_sender_dropped) => Err(SolverCancelled),
+            match cancel_receiver.has_changed() {
+                // Guard against get_block_template() providing an identical header. This could
+                // happen if something irrelevant to the block data changes, the time was within
+                // 1 second, or there is a spurious channel change.
+                Ok(has_changed) => {
+                    cancel_receiver.mark_as_seen();
+
+                    // We only need to check header equality, because the block data is bound to
+                    // the header.
+                    if has_changed
+                        && Some(old_header.clone())
+                            != cancel_receiver
+                                .cloned_watch_data()
+                                .map(|b| zebra_chain::block::Header::clone(&b.header))
+                    {
+                        Err(SolverCancelled)
+                    } else {
+                        Ok(())
+                    }
+                }
+                // If the sender was dropped, we're likely shutting down, so cancel the solver.
+                Err(_sender_dropped) => Err(SolverCancelled),
+            }
         };
 
         // Mine at least one block using the equihash solver.
@@ -612,6 +644,15 @@ where
         //       blocks.
         let mut any_success = false;
         for block in blocks {
+            // A sibling solver won this template while we were solving; submitting now
+            // would only race our own accepted block at the same height.
+            if won_template.lock().expect("won-template lock poisoned").as_ref()
+                == Some(&template_header)
+            {
+                debug!(?height, ?solver_id, "dropping solution: sibling already won this template");
+                break;
+            }
+
             let data = block
                 .zcash_serialize_to_vec()
                 .expect("serializing to Vec never fails");
@@ -626,6 +667,11 @@ where
                         "successfully mined a new block",
                     );
                     any_success = true;
+                    // Mark this template as won and stop: a second solution at the same
+                    // height can only orphan the block we just submitted.
+                    *won_template.lock().expect("won-template lock poisoned") =
+                        Some(template_header.clone());
+                    break;
                 }
                 Err(error) => info!(
                     ?height,
