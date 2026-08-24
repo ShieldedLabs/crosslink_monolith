@@ -40,10 +40,10 @@ fn funding_stream_address_index(
         ))
         .expect("no overflow should happen in this sub") as usize;
 
-    assert!(index > 0 && index <= num_addresses);
-    // spec formula will output an index starting at 1 but
-    // Zebra indices for addresses start at zero, return converted.
-    Some(index - 1)
+    assert!(index > 0);
+    // Wrap the index to prevent out-of-bounds panic when the address
+    // period spans more intervals than there are addresses (Crosslink fix).
+    Some((index - 1) % num_addresses)
 }
 
 /// Return the address corresponding to given height, network and funding stream receiver.
