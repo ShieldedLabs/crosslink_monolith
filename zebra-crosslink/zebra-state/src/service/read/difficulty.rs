@@ -287,10 +287,11 @@ fn adjust_difficulty_and_time_for_testnet(
     // > then the block is a minimum-difficulty block.
     //
     // The max time is always a minimum difficulty block, because the minimum difficulty
-    // gap is 7.5 minutes, but the maximum gap is 90 minutes. This means that testnet blocks
-    // have two valid time ranges with different difficulties:
-    // * 1s - 7m30s: standard difficulty
-    // * 7m31s - 90m: minimum difficulty
+    // gap is 6 * PoWTargetSpacing, but the maximum gap is 90 minutes. This means that testnet
+    // blocks have two valid time ranges with different difficulties. With this fork's
+    // post-Blossom spacing of 25s the gap is 2m30s (upstream's 75s spacing gives 7m30s):
+    // * 1s - 2m30s: standard difficulty
+    // * 2m31s - 90m: minimum difficulty
     //
     // In rare cases, this could make some testnet miners produce invalid blocks,
     // if they use the full 90 minute time gap in the consensus rules.
@@ -392,14 +393,16 @@ mod tests {
     //! clock (the `DateTime32::now()` call lives only in its caller).
 
     use super::*;
+    use zebra_chain::parameters::POST_BLOSSOM_POW_TARGET_SPACING as SPACING;
     use zebra_chain::work::difficulty::ParameterDifficulty as _;
 
     // A Testnet height at which the minimum-difficulty rule is active (>= 299188) and the
-    // target spacing is the post-Blossom 25 s used by this fork, so the minimum-difficulty
-    // gap is 6 * 25 = 150 s.
+    // target spacing is the post-Blossom one, so the minimum-difficulty gap is 6 * SPACING
+    // (150s at this fork's 25s spacing). Derived from the constant rather than written out,
+    // so lowering the block time again can't leave these tests asserting the wrong boundary.
     const ACTIVE_HEIGHT: Height = Height(2_000_000);
     const PREV: u32 = 1_600_000_000;
-    const GAP: u32 = 6 * 25;
+    const GAP: u32 = 6 * SPACING;
 
     /// Recent block difficulties and times in reverse order from the tip, with the most
     /// recent (first) block time equal to `PREV`. The difficulty thresholds are irrelevant
@@ -426,13 +429,14 @@ mod tests {
         }
     }
 
-    /// A candidate time inside the old "eager" window (`PREV + 100 .. PREV + 150`) must stay
-    /// standard-difficulty and must not be future-dated. Zebra used to switch this to a
-    /// minimum-difficulty template with `cur_time` clamped up to `PREV + 151`.
+    /// A candidate time inside the old "eager" window (the `2 * SPACING` before `PREV + GAP`,
+    /// which is `PREV + 100 .. PREV + 150` at 25s spacing) must stay standard-difficulty and
+    /// must not be future-dated. Zebra used to switch this to a minimum-difficulty template
+    /// with `cur_time` clamped up to `PREV + GAP + 1`.
     #[test]
     fn eager_window_stays_standard_difficulty_and_is_not_future_dated() {
         let network = Network::new_default_testnet();
-        let cur = PREV + 120;
+        let cur = PREV + GAP - SPACING;
         let mut result = chain_info(cur);
 
         adjust_difficulty_and_time_for_testnet(
@@ -446,15 +450,15 @@ mod tests {
         assert_eq!(result.expected_difficulty, CompactDifficulty::default());
         // Not future-dated: cur_time unchanged, still before the consensus threshold.
         assert_eq!(result.cur_time, DateTime32::from(cur));
-        // max_time clamped down to the standard-difficulty boundary (PREV + 150).
+        // max_time clamped down to the standard-difficulty boundary (PREV + GAP).
         assert_eq!(result.max_time, DateTime32::from(PREV + GAP));
     }
 
-    /// A candidate time strictly past `PREV + 150` switches to a minimum-difficulty template.
+    /// A candidate time strictly past `PREV + GAP` switches to a minimum-difficulty template.
     #[test]
     fn past_the_threshold_switches_to_minimum_difficulty() {
         let network = Network::new_default_testnet();
-        let cur = PREV + 200;
+        let cur = PREV + GAP + 2 * SPACING;
         let mut result = chain_info(cur);
 
         adjust_difficulty_and_time_for_testnet(
@@ -469,12 +473,12 @@ mod tests {
             result.expected_difficulty,
             network.target_difficulty_limit().to_compact()
         );
-        // min_time raised to PREV + 151; cur_time is already past it, so it is unchanged.
+        // min_time raised to PREV + GAP + 1; cur_time is already past it, so it is unchanged.
         assert_eq!(result.min_time, DateTime32::from(PREV + GAP + 1));
         assert_eq!(result.cur_time, DateTime32::from(cur));
     }
 
-    /// The gap is a strict `>`: exactly `PREV + 150` is standard, `PREV + 151` is minimum.
+    /// The gap is a strict `>`: exactly `PREV + GAP` is standard, `PREV + GAP + 1` is minimum.
     #[test]
     fn threshold_is_inclusive_for_standard_difficulty() {
         let network = Network::new_default_testnet();
@@ -508,7 +512,7 @@ mod tests {
     #[test]
     fn mainnet_is_a_no_op() {
         let network = Network::Mainnet;
-        let cur = PREV + 120;
+        let cur = PREV + GAP - SPACING;
         let mut result = chain_info(cur);
 
         adjust_difficulty_and_time_for_testnet(
@@ -532,7 +536,7 @@ mod tests {
     #[test]
     fn below_start_height_is_a_no_op() {
         let network = Network::new_default_testnet();
-        let cur = PREV + 120;
+        let cur = PREV + GAP - SPACING;
         let mut result = chain_info(cur);
 
         adjust_difficulty_and_time_for_testnet(
