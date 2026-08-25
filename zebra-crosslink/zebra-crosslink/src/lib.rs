@@ -375,64 +375,14 @@ fn call_from_state_to_crosslink_to_ask_about_fat_pointers(internal_handle: &TFLS
     Some(child_rank >= parent_rank)
 }
 
-/// Why a state lookup produced no block.
-///
-/// The difference matters to anyone who intends to wait. Waiting for a block the state has
-/// simply not received yet is correct and routine. Waiting for a block from a state service
-/// that is no longer answering is a spin that can only ever end when the process does, because
-/// the buffered service behind these calls has no way to come back inside one run.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum StateMiss {
-    /// The state answered, and does not hold this block. The block pipeline may still deliver
-    /// it, so a caller that can wait should.
-    Absent,
-    /// The state did not answer at all. Nothing will change by asking again.
-    Unavailable,
-}
-
-async fn try_block_height_from_hash(
-    call: &TFLServiceCalls,
-    hash: ZebBlockHash,
-) -> Result<ZebBlockHeight, StateMiss> {
-    match (call.state)(StateRequest::KnownBlock(hash.into())).await {
-        Ok(StateResponse::KnownBlock(Some(known_block))) => Ok(known_block.height),
-        Ok(StateResponse::KnownBlock(None)) => Err(StateMiss::Absent),
-        Ok(other) => {
-            error!("KnownBlock({}) answered with the wrong response type: {:?}", hash, other);
-            Err(StateMiss::Unavailable)
-        }
-        Err(err) => {
-            error!("KnownBlock({}) call failed: {:?}", hash, err);
-            Err(StateMiss::Unavailable)
-        }
-    }
-}
-
 // TODO: Result?
-/// Look up the height of `hash` in the state, collapsing both kinds of miss into `None`.
-///
-/// Callers that intend to wait for the block should use [`try_block_height_from_hash`] instead
-/// and act on the distinction.
 async fn block_height_from_hash(call: &TFLServiceCalls, hash: ZebBlockHash) -> Option<ZebBlockHeight> {
-    try_block_height_from_hash(call, hash).await.ok()
-}
-
-/// The state's best-chain tip, for diagnostics when a block lookup misses.
-///
-/// Where the tip sits decides what a miss means. A tip below the missing block is ordinary
-/// pipeline lag. A tip at or above it, on a chain that contains it, means the state reported a
-/// block it holds as unknown, which is a different problem entirely.
-async fn state_best_tip(call: &TFLServiceCalls) -> Option<(ZebBlockHeight, ZebBlockHash)> {
-    match (call.state)(StateRequest::Tip).await {
-        Ok(StateResponse::Tip(tip)) => tip,
-        Ok(other) => {
-            error!("Tip answered with the wrong response type: {:?}", other);
-            None
-        }
-        Err(err) => {
-            error!("Tip call failed: {:?}", err);
-            None
-        }
+    if let Ok(StateResponse::KnownBlock(Some(known_block))) =
+        (call.state)(StateRequest::KnownBlock(hash.into())).await
+    {
+        Some(known_block.height)
+    } else {
+        None
     }
 }
 
@@ -755,52 +705,6 @@ async fn propose_new_bft_block(tfl_handle: &TFLServiceHandle) -> Option<BftBlock
     }
 }
 
-/// What `handle_new_decided_bft_block` has already written into the in-memory BFT chain, and
-/// what was there before it, so that giving up part-way can put it all back.
-#[derive(Clone, Debug)]
-struct AppliedBftBlock {
-    insert_i: usize,
-    prev_fat_pointer_to_tip: FatPointerToBftBlock,
-    prev_latest_final_block: Option<(ZebBlockHeight, ZebBlockHash)>,
-}
-
-/// Give up on applying a decided BFT block, and hand tenderlink back the roster it already had.
-///
-/// Nothing this node keeps is left changed: `applied` undoes any in-memory write already made,
-/// and nothing has been appended to the proof-of-stake store, so a restart resumes at the
-/// height that store records. The missed decision is not lost, because every peer serves any
-/// earlier decided round out of its commit cache to a node whose status height is behind. The
-/// node therefore comes back in exactly the state it would have been in had the shutdown
-/// arrived a moment earlier.
-///
-/// Tenderlink advances its own height on return regardless, but that lives only in memory and
-/// only for as long as the process does, which by the time this is called is not long.
-async fn abandon_decided_bft_block(
-    tfl_handle: &TFLServiceHandle,
-    new_block: &BftBlock,
-    applied: Option<AppliedBftBlock>,
-    why: &str,
-) -> Vec<tenderlink::SortedRosterMember> {
-    let mut internal = tfl_handle.internal.lock().await;
-
-    if let Some(applied) = applied {
-        internal.bft_block_hash_to_height.remove(&new_block.blake3_hash());
-        internal.bft_blocks.truncate(applied.insert_i);
-        internal.fat_pointer_to_tip = applied.prev_fat_pointer_to_tip;
-        internal.latest_final_block = applied.prev_latest_final_block;
-    }
-
-    warn!(
-        "Not applying decided BFT block {} at height {} because {}. It will be recovered from peers on restart.",
-        new_block.blake3_hash(), new_block.height, why,
-    );
-
-    let next_bft_height = internal.bft_blocks.len() as u64;
-    let finalized_bc_height = internal.latest_final_block.map_or(0, |(height, _hash)| height.0 as u64);
-    let terminated = terminated_finalizers_at(&tfl_handle.config.hardforks, next_bft_height, finalized_bc_height);
-    tenderlink_roster_from_internal(&internal.finalizers_at_current_height, &terminated)
-}
-
 async fn handle_new_decided_bft_block(
     tfl_handle: &TFLServiceHandle,
     new_block: &BftBlock,
@@ -825,101 +729,19 @@ async fn handle_new_decided_bft_block(
             error!("Signatures are not valid. Rejecting block.");
             panic!();
         }
+
+        assert_eq!(validate_bft_block(&tfl_handle, new_block).await,
+            (tenderlink::TMStatus::Pass, tenderlink::TMStatusReason::None)
+        );
     }
 
     let call = tfl_handle.call.clone();
     let new_final_hash = ZebBlockHash(BlockHash::from_header_data(new_block.headers.first().expect("at least 1 header")).0);
-
-    // Re-validating a decided block can say "no" for two very different reasons, and only one
-    // of them is a broken invariant.
-    //
-    // `Fail` means consensus-invalid. 2f+1 of stake voted for a block this node rejects, so
-    // there is no safe way to continue. Every `Fail` in `validate_bft_block` is decided from
-    // the in-memory BFT chain alone, so it stays trustworthy no matter what the state service
-    // is doing.
-    //
-    // `Indeterminate` means the PoW block this decision names is not visible here yet. That is
-    // reversible, and routine for any node whose block pipeline is momentarily behind the BFT
-    // chain. Wait for the block and re-check, the same way the finalize call below waits for
-    // the state to catch up; do not take the node down over it.
-    //
-    // The validation and the height lookup are retried as one unit. Each is a separate state
-    // query and either answer only holds while the block is still visible, so a pass followed
-    // by an unwrap on a second lookup reproduces the same crash from the other query.
-    //
-    // The wait gives up when there is nothing left to wait for: the node is shutting down, or
-    // the state service has stopped answering. Both mean this process is finished, and there
-    // is no honest answer to be had by asking again.
-    let new_final_height = {
-        const RETRY_INTERVAL: Duration = Duration::from_millis(250);
-        const LOG_EVERY_N_RETRIES: u32 = 20;
-
-        let mut attempt: u32 = 0;
-        loop {
-            if zebra_chain::shutdown::is_shutting_down() {
-                return abandon_decided_bft_block(
-                    tfl_handle,
-                    new_block,
-                    None,
-                    "the node is shutting down",
-                ).await;
-            }
-
-            let (status, reason) = validate_bft_block(&tfl_handle, new_block).await;
-
-            if status == tenderlink::TMStatus::Fail {
-                error!(
-                    "Decided BFT block {} at height {} does not validate: {:?}. 2f+1 of stake decided a block this node rejects.",
-                    new_block.blake3_hash(), new_block.height, reason,
-                );
-                panic!();
-            }
-
-            match try_block_height_from_hash(&call, new_final_hash).await {
-                Ok(height) if status == tenderlink::TMStatus::Pass => {
-                    if attempt > 0 {
-                        info!(
-                            "PoW block {} became visible after {} retries; applying BFT decision at height {}",
-                            new_final_hash, attempt, new_block.height,
-                        );
-                    }
-                    break height;
-                }
-                Err(StateMiss::Unavailable) => {
-                    return abandon_decided_bft_block(
-                        tfl_handle,
-                        new_block,
-                        None,
-                        "the state service is no longer answering",
-                    ).await;
-                }
-                _ => {}
-            }
-
-            if attempt % LOG_EVERY_N_RETRIES == 0 {
-                warn!(
-                    "Waiting for PoW block {} named by decided BFT block {} at height {}: validation says {:?}/{:?}, best tip {:?}",
-                    new_final_hash, new_block.blake3_hash(), new_block.height,
-                    status, reason, state_best_tip(&call).await,
-                );
-            }
-
-            attempt = attempt.saturating_add(1);
-            tokio::time::sleep(RETRY_INTERVAL).await;
-        }
-    };
+    let new_final_height = block_height_from_hash(&call, new_final_hash).await.unwrap();
     // `height` is now the 0-based canonical height, i.e. the chain index directly.
     let insert_i = new_block.height as usize;
 
     let mut internal = tfl_handle.internal.lock().await;
-
-    // Everything the writes below overwrite, so that abandoning the decision after this point
-    // can leave the chain exactly as it was found.
-    let applied = AppliedBftBlock {
-        insert_i,
-        prev_fat_pointer_to_tip: internal.fat_pointer_to_tip.clone(),
-        prev_latest_final_block: internal.latest_final_block,
-    };
 
     // HACK: ensure there are enough blocks to overwrite this at the correct index
     for i in internal.bft_blocks.len()..=insert_i {
@@ -962,18 +784,6 @@ async fn handle_new_decided_bft_block(
     // call graph stops being circular.
     drop(internal);
     let got_stakes = loop {
-        // Same reasoning as the validation wait above: once the node is on its way out there is
-        // no finalization to be had, and retrying only spins until the runtime gives up on this
-        // task. Put the in-memory chain back and let the shutdown proceed.
-        if zebra_chain::shutdown::is_shutting_down() {
-            return abandon_decided_bft_block(
-                tfl_handle,
-                new_block,
-                Some(applied),
-                "the node is shutting down",
-            ).await;
-        }
-
         match (call.state)(zebra_state::Request::CrosslinkFinalizeBlock(new_final_hash)).await {
             Ok(zebra_state::Response::CrosslinkFinalized(hash, aggregated_stakes)) => {
                 info!("Successfully crosslink-finalized {}, active stakes: {:?}", hash, aggregated_stakes);
@@ -983,18 +793,7 @@ async fn handle_new_decided_bft_block(
                 );
                 break aggregated_stakes;
             }
-            Ok(other) => {
-                error!(
-                    "CrosslinkFinalizeBlock({}) answered with the wrong response type: {:?}",
-                    new_final_hash, other,
-                );
-                return abandon_decided_bft_block(
-                    tfl_handle,
-                    new_block,
-                    Some(applied),
-                    "the state answered the finalize request with the wrong response type",
-                ).await;
-            }
+            Ok(_) => unreachable!("wrong response type"),
             Err(err) => {
                 error!(?err);
                 warn!("I'm just going to sleep for one second and try the race condition again.");
@@ -1212,9 +1011,8 @@ async fn validate_bft_block(
             new_final_height.0
         } else {
             warn!(
-                "Didn't have hash available for confirmation: {}, best tip {:?}",
-                new_final_hash,
-                state_best_tip(&call).await,
+                "Didn't have hash available for confirmation: {}",
+                new_final_hash
             );
             // The PoW block we need is most likely sitting deferred in the state's non-finalized
             // queue (held back by the crosslink commit gate — e.g. a transient try_lock miss, or
