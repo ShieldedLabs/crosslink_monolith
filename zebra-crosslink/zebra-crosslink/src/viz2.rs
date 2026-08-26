@@ -73,6 +73,11 @@ pub async fn service_viz_requests(
     // wait in bft_unresolved_heights and retry a few per cycle.
     let mut bft_checked_n: usize = 0;
     let mut bft_candidate_hashes: Vec<Hash32> = Vec::new();
+    // Inverse of bft_candidate_hashes: candidate PoW hash -> the BFT height pointing
+    // at it (latest wins when several share a candidate). Served on each PoW block as
+    // pointed_at_by_bft_height, so the GUI can tell that a block it already holds
+    // should have a BFT block beside it, and fetch eras its page response missed.
+    let mut bft_pointing_heights: std::collections::HashMap<Hash32, u64> = std::collections::HashMap::new();
     let mut bft_candidate_heights: std::collections::HashMap<Hash32, u64> = std::collections::HashMap::new();
     let mut bft_unresolved_heights: std::collections::HashSet<Hash32> = std::collections::HashSet::new();
     let mut bft_resolved_at_tip: u64 = u64::MAX; // PoW tip at the last resolution round
@@ -183,6 +188,7 @@ pub async fn service_viz_requests(
                         if b.headers.is_empty() { break; } // placeholder: recheck once filled
                         let hash = Hash32::from_bytes(BlockHash::from_header_data(b.finalization_candidate()).0);
                         bft_candidate_hashes.push(hash);
+                        bft_pointing_heights.insert(hash, bft_checked_n as u64);
                         if !bft_candidate_heights.contains_key(&hash) {
                             bft_unresolved_heights.insert(hash);
                         }
@@ -483,6 +489,7 @@ pub async fn service_viz_requests(
                             is_finalized: false,
                             knowledge: zebra_gui::BcKnowledge::FullBlock,
                             points_at_bft_block: Hash32::from_bytes(bc.header.fat_pointer_to_bft_block.points_at_block_hash().0),
+                            pointed_at_by_bft_height: bft_pointing_heights.get(&this_hash).copied().unwrap_or(u64::MAX),
                             work: bc.header.difficulty_threshold.to_work()
                                 .map(|w| u64::try_from(w.as_u128()).unwrap_or(u64::MAX))
                                 .unwrap_or(0xdeadbeef),

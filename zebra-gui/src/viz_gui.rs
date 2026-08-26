@@ -23,7 +23,7 @@ pub struct RequestToZebra {
     /// Path for zebra to serialize its current chains to as a .zeccltf. Empty = no request.
     pub serialize_instrs_path: String,
     pub bc_want_below: u64, // camera can see missing best-chain coverage: serve a page of best-chain blocks below this height; 0 = nothing wanted
-    pub bft_want_height: u64, // PoS jump: serve the PoW page around this BFT height's finalization candidate, pulling that BFT era with it; u64::MAX = nothing wanted
+    pub bft_want_height: u64, // PoS jump or BFT fill: serve the PoW page around this BFT height's finalization candidate, pulling that BFT era with it; u64::MAX = nothing wanted
 }
 impl RequestToZebra {
     pub fn _0() -> Self {
@@ -234,6 +234,11 @@ pub struct BcBlock {
     pub is_finalized: bool,
     pub knowledge: BcKnowledge,
     pub points_at_bft_block: Hash32,
+    /// Height of the BFT block whose finalization candidate this block is
+    /// (u64::MAX = none/unknown). Server-derived: how the GUI notices that a
+    /// loaded PoW block should have a BFT block hanging beside it, so it can
+    /// fetch eras the block's own page response missed.
+    pub pointed_at_by_bft_height: u64,
     // #[cfg(debug_assertions)]
     pub work: u64,
     pub utc: i64,
@@ -254,6 +259,7 @@ impl Default for BcBlock {
             is_finalized: false,
             knowledge: BcKnowledge::PeerAttested,
             points_at_bft_block: Hash32::from_u64(0),
+            pointed_at_by_bft_height: u64::MAX,
             // #[cfg(debug_assertions)]
             work: 0,
             utc: 0,
@@ -416,6 +422,8 @@ pub struct VizState {
     pub bc_best_heights: std::collections::HashSet<u64>, // heights with a best-chain full block on screen: the loaded-coverage set that camera paging fills in; coverage may be any number of disjoint islands
     pub bc_wanted_page_end: u64, // jump target: ask for the page of best-chain blocks ending at this height until it arrives; 0 = none
     pub bft_wanted_jump: u64, // PoS jump target: page in this BFT height's era and move the camera there once the block can hang from its candidate; u64::MAX = none
+    pub bft_loaded_heights: std::collections::HashSet<u64>, // BFT heights with a block on screen (mirror of on_screen_bfts; never evicted, like it)
+    pub bft_wanted_fill: u64, // BFT height being fetched because a visible PoW block is pointed at by it but it isn't loaded; recomputed every quiescent frame; u64::MAX = none
     pub send_to_zebra: std::sync::mpsc::SyncSender<RequestToZebra>,
     pub receive_from_zebra: std::sync::mpsc::Receiver<ResponseFromZebra>,
 
@@ -691,6 +699,8 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
         bc_best_heights: std::collections::HashSet::new(),
         bc_wanted_page_end: 0,
         bft_wanted_jump: u64::MAX,
+        bft_loaded_heights: std::collections::HashSet::new(),
+        bft_wanted_fill: u64::MAX,
         send_to_zebra: me_send,
         receive_from_zebra: me_receive,
         bc_tip_height: 0,
@@ -744,7 +754,7 @@ pub fn viz_gui_init(fake_data: bool) -> VizState {
 
             *seq += 1;
             let this_hash = Hash32::from_u64(*seq);
-            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, knowledge: BcKnowledge::FullBlock, points_at_bft_block, work:1234, utc:0, serialized_size: 0, is_hardfork_activation: false }, ..Default::default() };
+            let block = OnScreenBc { block: BcBlock { this_hash, parent_hash, this_height, txs_n, is_best_chain, is_finalized, knowledge: BcKnowledge::FullBlock, points_at_bft_block, pointed_at_by_bft_height: u64::MAX, work:1234, utc:0, serialized_size: 0, is_hardfork_activation: false }, ..Default::default() };
             viz_state.on_screen_bcs.insert(block.block.this_hash, block);
             this_hash
         };
@@ -800,11 +810,13 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
         viz_state.time_since_last_animation = Instant::now();
     }
 
-    // A page requested by an explicit Jump To (PoW or PoS) height lands as a burst of
-    // many blocks at once; fly/fade-in animation reads fine for one new tip block but
-    // as a synchronized slide/fade across a whole loaded page. Spawn those already at
-    // their resting look; only genuine near-tip arrivals animate in.
-    let is_bulk_jump = viz_state.bc_wanted_page_end != 0 || viz_state.bft_wanted_jump != u64::MAX;
+    // A page requested by an explicit Jump To (PoW or PoS) height, or by a BFT fill,
+    // lands as a burst of many blocks at once; fly/fade-in animation reads fine for
+    // one new tip block but as a synchronized slide/fade across a whole loaded page.
+    // Spawn those already at their resting look; only genuine near-tip arrivals animate in.
+    let is_bulk_jump = viz_state.bc_wanted_page_end != 0
+        || viz_state.bft_wanted_jump != u64::MAX
+        || viz_state.bft_wanted_fill != u64::MAX;
 
     let mut new_blocks_n = 0usize;
     while let Ok(message) = viz_state.receive_from_zebra.try_recv() {
@@ -904,6 +916,11 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                         is_best_chain:          r.block.is_best_chain          || bc.is_best_chain,
                         is_finalized:           r.block.is_finalized           || bc.is_finalized,
                         is_hardfork_activation: r.block.is_hardfork_activation || bc.is_hardfork_activation,
+                        pointed_at_by_bft_height: if bc.pointed_at_by_bft_height != u64::MAX {
+                            bc.pointed_at_by_bft_height
+                        } else {
+                            r.block.pointed_at_by_bft_height
+                        },
                         ..*bc
                     }
                 } else {
@@ -930,6 +947,11 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                             bc.points_at_bft_block
                         } else {
                             r.block.points_at_bft_block
+                        },
+                        pointed_at_by_bft_height: if bc.pointed_at_by_bft_height != u64::MAX {
+                            bc.pointed_at_by_bft_height
+                        } else {
+                            r.block.pointed_at_by_bft_height
                         },
                     }
                 };
@@ -974,6 +996,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                 is_finalized: false,
                 knowledge: BcKnowledge::PeerAttested,
                 points_at_bft_block: Hash32::from_u64(0),
+                pointed_at_by_bft_height: u64::MAX,
                 work: 0,
                 utc: 0,
                 serialized_size: 0,
@@ -1005,6 +1028,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                         is_finalized: false,
                         knowledge: BcKnowledge::HeaderSeen,
                         points_at_bft_block: Hash32::from_u64(0),
+                        pointed_at_by_bft_height: u64::MAX,
                         work: ph.work,
                         utc: ph.utc,
                         serialized_size: 0,
@@ -1033,6 +1057,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
                 new_blocks_n += 1;
                 let bft_spawn_y = if bft.points_at_bc_height > 0 { y_for_height(bft.points_at_bc_height as f32) - BLOCK_SPACING / 2.0 } else { spawn_y };
                 let (x0, alpha0) = if is_bulk_jump { (5.0, 1.0) } else { (0.0, 0.0) };
+                viz_state.bft_loaded_heights.insert(bft.this_height);
                 viz_state.on_screen_bfts.insert(bft.this_hash, OnScreenBft { x: x0, block: bft, alpha: alpha0, y: bft_spawn_y, ..Default::default() });
             }
         }
@@ -1070,41 +1095,80 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
     }
 
     if anything_happened == false {
+        // The height span the camera can see, shared by both fill rules below. Only
+        // while zoomed in enough that block detail is the point: fully zoomed out the
+        // whole chain is visible and these would page everything down to 0.
+        let screen_unit = SCREEN_UNIT_CONST * ZOOM_FACTOR.powf(viz_state.zoom);
+        let camera_h = height_for_y(viz_state.camera_y);
+        let half_span_h = (1500.0 / screen_unit) / BLOCK_SPACING; // ~half a viewport's worth, in heights
+        let visible_span = if half_span_h < 4096.0 && viz_state.bc_tip_height > 0 {
+            let lo = ((camera_h - half_span_h) as i64).clamp(0, viz_state.bc_tip_height as i64) as u64;
+            let hi = ((camera_h + half_span_h) as i64).clamp(0, viz_state.bc_tip_height as i64) as u64;
+            Some((lo, hi))
+        } else {
+            None
+        };
+
         let bc_want_below = if viz_state.bc_wanted_page_end != 0 {
             // A jump target: ask for the page ending at the wanted height, so it
             // arrives in one response however far below the tip it is. Re-asked every
             // quiescent frame until the height shows up, since a page anchored on a
             // tip that has since moved comes back empty.
             viz_state.bc_wanted_page_end + 1
-        } else {
+        } else if let Some((lo, hi)) = visible_span {
             // Ask for the highest missing best-chain height the camera can see: pages
             // extend downward from the height they end at, so the highest missing
             // height pulls in the most visible coverage per response. This one rule
             // pages in everything the old contiguous-coverage model did (backfill
             // below the loaded floor) plus what it could not: seams between
             // separately-loaded islands and the landing zones of arbitrary jumps.
-            // Only while zoomed in enough that block detail is the point: fully
-            // zoomed out the whole chain is visible and this would page everything
-            // down to 0.
-            let screen_unit = SCREEN_UNIT_CONST * ZOOM_FACTOR.powf(viz_state.zoom);
-            let camera_h = height_for_y(viz_state.camera_y);
-            let half_span_h = (1500.0 / screen_unit) / BLOCK_SPACING; // ~half a viewport's worth, in heights
             let mut want_below = 0;
-            if half_span_h < 4096.0 && viz_state.bc_tip_height > 0 {
-                let lo = ((camera_h - half_span_h) as i64).clamp(0, viz_state.bc_tip_height as i64) as u64;
-                let hi = ((camera_h + half_span_h) as i64).clamp(0, viz_state.bc_tip_height as i64) as u64;
-                let mut h = hi;
-                loop {
-                    if !viz_state.bc_best_heights.contains(&h) {
-                        want_below = h + 1;
-                        break;
-                    }
-                    if h == lo { break; }
-                    h -= 1;
+            let mut h = hi;
+            loop {
+                if !viz_state.bc_best_heights.contains(&h) {
+                    want_below = h + 1;
+                    break;
                 }
+                if h == lo { break; }
+                h -= 1;
             }
             want_below
+        } else {
+            0
         };
+
+        // BFT fill: each loaded PoW block can name the BFT block whose finalization
+        // candidate it is (pointed_at_by_bft_height). If the camera can see such a
+        // block whose pointing BFT block isn't loaded, ask for that BFT height — the
+        // highest one, since the PoW page served around its candidate extends
+        // downward, mirroring the PoW rule. This is what re-fetches BFT eras whose
+        // page response missed them: BFT blocks are otherwise only served as extents
+        // over the fat pointers of the PoW blocks in the same response, and a block
+        // pointing near the top of a page is referenced only by PoW blocks above it.
+        // A pending PoS jump owns the request field this fill shares.
+        viz_state.bft_wanted_fill = u64::MAX;
+        if viz_state.bft_wanted_jump == u64::MAX {
+            if let Some((lo, hi)) = visible_span {
+                let mut fill = u64::MAX;
+                for on_screen in viz_state.on_screen_bcs.values() {
+                    let b = &on_screen.block;
+                    if b.this_height >= lo && b.this_height <= hi
+                        && b.pointed_at_by_bft_height != u64::MAX
+                        && !viz_state.bft_loaded_heights.contains(&b.pointed_at_by_bft_height)
+                        && (fill == u64::MAX || b.pointed_at_by_bft_height > fill)
+                    {
+                        fill = b.pointed_at_by_bft_height;
+                    }
+                }
+                viz_state.bft_wanted_fill = fill;
+            }
+        }
+        let bft_want_height = if viz_state.bft_wanted_jump != u64::MAX {
+            viz_state.bft_wanted_jump
+        } else {
+            viz_state.bft_wanted_fill
+        };
+
         let sent = viz_state.send_to_zebra.try_send(RequestToZebra {
             want_to_inspect_block: viz_state.inspecting_block_hash,
             bft_ack_height: viz_state.bft_ack_height,
@@ -1113,7 +1177,7 @@ pub fn viz_gui_anything_happened_at_all(viz_state: &mut VizState) -> bool {
             load_instrs_path: viz_state.load_instrs_path_pending.clone(),
             serialize_instrs_path: viz_state.serialize_instrs_path_pending.clone(),
             bc_want_below,
-            bft_want_height: viz_state.bft_wanted_jump,
+            bft_want_height,
         });
         if sent.is_ok() {
             viz_state.load_instrs_path_pending = String::new();
