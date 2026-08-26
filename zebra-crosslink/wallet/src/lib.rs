@@ -926,8 +926,8 @@ impl Default for FinalizerFilters {
         Self {
             show_popup: false,
             popup_pos: None,
-            filter_height: true,
-            filter_seconds_since_connected: 0,
+            filter_height: false,
+            filter_seconds_since_connected: 15,
         }
     }
 }

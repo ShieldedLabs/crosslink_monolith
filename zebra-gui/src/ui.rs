@@ -3503,7 +3503,7 @@ pub fn ui_right_pane(ui: &mut Context,
                             "∞",
                             TextDecl { h: ui.scale(14.0), colour: WHITE, align: AlignX::Left, ..TextDecl },
                         );
-                        let mut textbox_state = &mut data.textboxes.entry(textbox_id.id).or_default();
+                        let textbox_state = data.textboxes.entry(textbox_id.id).or_insert_with(|| TextboxState { text_buf: vec!['1', '5'], ..Default::default() });
                         textbox_state.text_buf.retain(|c| (*c >= '0' && *c <= '9') || *c == '∞');
                         let len = textbox_state.text_buf.len();
                         textbox_state.selection.0 = textbox_state.selection.0.min(len); // @Todo: this is very likely not the best thing to do here
