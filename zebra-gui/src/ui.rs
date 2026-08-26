@@ -1834,7 +1834,7 @@ pub fn ui_left_pane(ui: &mut Context,
                         if button_ex(ui, id("Jump To Selected Height"), "Jump", can_jump) || (ui.input().key_pressed(KeyCode::Enter) && ui.nav_id == jump_input_id.id) {
                             if let Ok(h) = jump_text.trim().parse::<u64>() {
                                 if data.jump_target_pos {
-                                    let _ = viz.goto_pos_height(h);
+                                    viz.request_pos_height(h);
                                 } else {
                                     viz.goto_pow_height(h);
                                 }

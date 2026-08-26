@@ -331,6 +331,26 @@ pub async fn service_viz_requests(
                         backfill_blocks = tfl_block_sequence(&call, tip_height_hash.1, hi_h, lo_h, BC_PAGE_SIZE as u32).await;
                     }
 
+                    // PoS jump: the GUI wants a BFT height whose era may be nowhere near the
+                    // PoW blocks otherwise served. Serve the PoW page around its finalization
+                    // candidate; the jump extent below then pulls the era's BFT blocks in via
+                    // this page's fat pointers. A candidate whose height hasn't resolved yet
+                    // serves nothing and the GUI re-asks. Anchored on the tip hash like the
+                    // pages above.
+                    let mut pos_jump_blocks: Vec<(ZebBlockHeight, ZebBlockHash, Arc<Block>)> = Vec::new();
+                    if request.bft_want_height != u64::MAX {
+                        let candidate_height = bft_candidate_hashes.get(request.bft_want_height as usize)
+                            .and_then(|hash| bft_candidate_heights.get(hash))
+                            .copied();
+                        if let Some(ch) = candidate_height {
+                            // a little above the candidate, so the blocks whose fat pointers
+                            // name the target and its successors ride along
+                            let hi_h = ZebBlockHeight((ch + 64).min(bc_tip_height) as u32);
+                            let lo_h = ZebBlockHeight(hi_h.0.saturating_sub(BC_PAGE_SIZE as u32 - 1));
+                            pos_jump_blocks = tfl_block_sequence(&call, tip_height_hash.1, hi_h, lo_h, BC_PAGE_SIZE as u32).await;
+                        }
+                    }
+
                     // Forks alongside the best chain, each read as its own sequence anchored on
                     // its tip: a real branch with real heights whose lowest block is the child
                     // of a best-chain block in the same response. A fork rooted below the page
@@ -478,9 +498,10 @@ pub async fn service_viz_requests(
                     for (height, hash, bc) in seq_blocks.iter() {
                         push_bc_block(&mut response, height, hash, bc, true);
                     }
-                    // backfill page (older best-chain blocks below the GUI's coverage)
-                    // and finality-frontier page (real blocks where the BFT candidates point)
-                    for (height, hash, bc) in backfill_blocks.iter().chain(frontier_blocks.iter()) {
+                    // backfill page (older best-chain blocks the GUI's camera wants),
+                    // finality-frontier page (real blocks where the BFT candidates point),
+                    // and PoS-jump page (blocks around a wanted BFT era's candidate)
+                    for (height, hash, bc) in backfill_blocks.iter().chain(frontier_blocks.iter()).chain(pos_jump_blocks.iter()) {
                         push_bc_block(&mut response, height, hash, bc, true);
                     }
                     for (height, hash, bc) in fork_blocks.iter() {
@@ -488,40 +509,62 @@ pub async fn service_viz_requests(
                     }
 
                     // BFT blocks strictly in sync with the PoW blocks served: each PoW block's
-                    // fat pointer names a BFT block, so the [min..max] index extent over the
-                    // window's and backfill page's pointers covers exactly the BFT blocks
-                    // decided over the served PoW spans, plus a small margin above the newest
-                    // pointer so just-decided blocks (not yet referenced by any PoW block)
-                    // still appear. Nothing else is served: a BFT catch-up burst past the
-                    // margin stays hidden until PoW blocks referencing it exist.
-                    let mut bft_extent: Option<(usize, usize)> = None;
-                    let mut fold = |h: usize| {
-                        bft_extent = Some(match bft_extent {
-                            None => (h, h),
-                            Some((lo, hi)) => (lo.min(h), hi.max(h)),
-                        });
+                    // fat pointer names a BFT block, so the [min..max] index extent over a
+                    // served PoW span covers exactly the BFT blocks decided over it, plus a
+                    // small margin above the newest pointer so just-decided blocks (not yet
+                    // referenced by any PoW block) still appear. Two extents, not one: the
+                    // near-tip extent (window + frontier pages) and the jump extent (backfill +
+                    // PoS-jump pages, which may sit arbitrarily deep below the tip). A single
+                    // extent over both spans would cover the whole index range in between, and
+                    // its page cap — which cuts the oldest indices — would cut exactly the era
+                    // that was jumped to. Nothing else is served: a BFT catch-up burst past
+                    // the margin stays hidden until PoW blocks referencing it exist.
+                    let bft_hash_to_height = &internal.bft_block_hash_to_height;
+                    let extent_over = |lists: &[&Vec<(ZebBlockHeight, ZebBlockHash, Arc<Block>)>]| -> Option<(usize, usize)> {
+                        let mut extent: Option<(usize, usize)> = None;
+                        for list in lists {
+                            for (_, _, bc) in list.iter() {
+                                let ptr = bc.header.fat_pointer_to_bft_block.points_at_block_hash();
+                                if let Some(&h) = bft_hash_to_height.get(&ptr) {
+                                    let h = h as usize;
+                                    extent = Some(match extent {
+                                        None => (h, h),
+                                        Some((lo, hi)) => (lo.min(h), hi.max(h)),
+                                    });
+                                }
+                            }
+                        }
+                        extent
                     };
-                    for (_, _, bc) in seq_blocks.iter().chain(backfill_blocks.iter()).chain(frontier_blocks.iter()) {
-                        let ptr = bc.header.fat_pointer_to_bft_block.points_at_block_hash();
-                        if let Some(&h) = internal.bft_block_hash_to_height.get(&ptr) { fold(h as usize); }
-                    }
 
                     const BFT_TIP_MARGIN: usize = 16;
                     // No served PoW block names any BFT block yet (fat pointers are null
                     // until the first decided block gets referenced, e.g. a fresh chain):
                     // the just-decided tail is still news, same as the margin above the
                     // newest pointer.
-                    let bft_extent = bft_extent.or_else(|| {
+                    let near_tip_extent = extent_over(&[&seq_blocks, &frontier_blocks]).or_else(|| {
                         let n = internal.bft_blocks.len();
                         (n > 0).then(|| (n.saturating_sub(BFT_TIP_MARGIN), n - 1))
                     });
-                    let mut bft_indices: Vec<usize> = Vec::new();
-                    if let Some((lo, hi)) = bft_extent {
-                        // the page cap cuts the oldest indices, never the newest: under
-                        // pressure (catch-up, deep scrolling) the tip lane must keep moving
-                        let hi = (hi + BFT_TIP_MARGIN).min(internal.bft_blocks.len().saturating_sub(1));
-                        let lo = lo.max((hi + 1).saturating_sub(BFT_PAGE_SIZE));
-                        bft_indices.extend(lo..=hi);
+                    let mut jump_extent = extent_over(&[&backfill_blocks, &pos_jump_blocks]);
+                    // the asked-for BFT block itself, in case the era's fat pointers just miss it
+                    if request.bft_want_height != u64::MAX && (request.bft_want_height as usize) < internal.bft_blocks.len() {
+                        let want = request.bft_want_height as usize;
+                        jump_extent = Some(match jump_extent {
+                            None => (want, want),
+                            Some((lo, hi)) => (lo.min(want), hi.max(want)),
+                        });
+                    }
+                    let mut bft_indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+                    for extent in [near_tip_extent, jump_extent] {
+                        if let Some((lo, hi)) = extent {
+                            // each extent's page cap cuts its oldest indices, never the newest:
+                            // under pressure (catch-up, deep scrolling) the tip lane must keep
+                            // moving, and a jumped-to era must show the era that was asked for
+                            let hi = (hi + BFT_TIP_MARGIN).min(internal.bft_blocks.len().saturating_sub(1));
+                            let lo = lo.max((hi + 1).saturating_sub(BFT_PAGE_SIZE));
+                            bft_indices.extend(lo..=hi);
+                        }
                     }
 
                     for i in bft_indices {
